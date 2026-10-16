@@ -1,24 +1,24 @@
-/* rad_encoding.h -- what a stored weight's numbers ARE, independently of how any kernel wants them
+/* rad_encoding.h -- what a stored weight's numbers are, independent of how any kernel wants them
  * arranged. spec.md §4.1.
  *
- * An ENCODING is the code type, the codebook the codes index if any, the grouping of the scales,
- * zero points and minimums over the weight, and the transform the weight went through before it
- * was quantised. It is a property of the model: choosing one is lossy and can be expensive (GPTQ
- * wants a calibration run), and changing one means quantising again. A LAYOUT -- fragment order, a
- * scale carried in each row's tail, a nibble order that suits one unpack -- is a property of a
- * kernel, lossless and cheap, and it is applied when the model loads (rad_abi.h). A container holds
- * encodings only, so a kernel library can change every layout it has without a reconvert.
+ * An encoding is the code type, the codebook the codes index (if any), the grouping of the scales,
+ * zero points and minimums over the weight, and the transform applied before quantisation. It is a
+ * property of the model: choosing one is lossy and can be expensive (GPTQ needs a calibration
+ * run), and changing one means quantising again. A layout (fragment order, a scale carried in each
+ * row's tail, a nibble order that suits one unpack) is a property of a kernel, lossless and cheap,
+ * applied when the model loads (rad_abi.h). A container holds encodings only, so a kernel library
+ * can change any layout without a reconvert.
  *
- * AN ENCODING IS DATA RATHER THAN A NAME IN AN ENUM, so a quantiser plugin can invent one without
- * the core learning about it: the core can size, slice and place any encoding from this struct
- * alone, and it decodes every encoding of the one scheme it defines, "affine", which is wide enough
- * to hold every format in common use -- per-channel and grouped integers of any width, block FP8,
- * MXFP4/6/8, NVFP4, llama.cpp's legacy, K- and I-quants, AWQ's column scales, GPTQ's act-order
- * permutation, Hadamard and Givens rotations.
+ * An encoding is data rather than an enum value, so a quantiser plugin can invent one without the
+ * core knowing it. The core can size, slice and place any encoding from this struct alone, and
+ * decodes every encoding of the one scheme it defines, "affine". That scheme covers the common
+ * formats: per-channel and grouped integers of any width, block FP8, MXFP4/6/8, NVFP4, llama.cpp's
+ * legacy, K- and I-quants, AWQ's column scales, GPTQ's act-order permutation, Hadamard and Givens
+ * rotations.
  *
  * ===================================================================== PLANES
  *
- * An encoding is up to RAD_ENC_MAX_PLANES planes, each a dense ROW-MAJOR array of one core dtype.
+ * An encoding is up to RAD_ENC_MAX_PLANES planes, each a dense row-major array of one core dtype.
  * A plane is one of two kinds:
  *
  *   TILED   it covers the weight. A weight of logical shape [d0, ..., dn] is seen as [rows, cols]
@@ -30,25 +30,24 @@
  *   TABLE   it does not: a codebook, a lattice grid, a rotation's parameters. Its extents are its
  *           own, [extent0 x extent1], and every slice of the weight carries all of it.
  *
- * SUB-BYTE AND ODD-WIDTH ELEMENTS ARE A BIT STREAM ALONG THE ROW, lowest bits first: element j of a
- * b-bit row occupies bits [j*b, (j+1)*b) counted from bit 0 of the row's first byte, so two 4-bit
- * codes share a byte with element 0 in bits 0-3, and a 3-bit code may straddle a byte. Every row
- * starts on a byte. That is the order a reference implementation and a person reading a hex dump
- * assume; a kernel that wants its nibbles permuted for its own unpack does it in its relayout.
+ * Sub-byte and odd-width elements are a bit stream along the row, lowest bits first: element j of a
+ * b-bit row occupies bits [j*b, (j+1)*b) from bit 0 of the row's first byte, so two 4-bit codes
+ * share a byte with element 0 in bits 0-3, and a 3-bit code may straddle a byte. Every row starts
+ * on a byte. A kernel that wants its nibbles permuted for its own unpack does so in its relayout.
  *
  * ===================================================================== THE AFFINE SCHEME
  *
- * The planes are found by ROLE, and only "codes" is required. A weight element decodes as
+ * The planes are found by role, and only "codes" is required. A weight element decodes as
  *
  *   q  = code                        codes is TILED; its block is [1 x 1] -- one code a value -- or
  *                                    [1 x V] with a "grid", one code a V-vector
- *   q  = grid[code][k]               grid  TABLE [entries x V]: a VECTOR codebook (the IQ2/IQ3/IQ1
+ *   q  = grid[code][k]               grid  TABLE [entries x V]: a vector codebook (the IQ2/IQ3/IQ1
  *                                    lattices); value k of the code's V-vector
- *   q  = table[code]                 table TABLE [1 x entries]: a SCALAR codebook (IQ4_NL)
+ *   q  = table[code]                 table TABLE [1 x entries]: a scalar codebook (IQ4_NL)
  *   q  = -q if the sign bit is set   signs TILED u1 [1 x 1], one bit a value
- *   q  = q - zero                    zero  TILED; an integer or real offset in the CODE's domain
+ *   q  = q - zero                    zero  TILED; an integer or real offset in the code's domain
  *   v  = q * scale * scale.1 * ...   scale, scale.1, ... TILED: every scale level, multiplied
- *   v  = v - min * min.1 * ...       min, min.1, ... TILED: a minimum in the VALUE's domain
+ *   v  = v - min * min.1 * ...       min, min.1, ... TILED: a minimum in the value's domain
  *   w  = v . T^-1                    the transform, per row, over the columns (below)
  *
  * so NVFP4 is fp4 codes, an e4m3 scale per [1 x 16] and an f32 scale.1 per tensor; Q4_K is u4
@@ -59,23 +58,23 @@
  * ===================================================================== TRANSFORMS
  *
  * `transform` names what was done to each row before it was quantised: the stored row is v = w . T,
- * so a kernel computes <w, x> = <v, x . T^-T> and transforms its ACTIVATION, never the weight.
+ * so a kernel computes <w, x> = <v, x . T^-T> and transforms its activation, never the weight.
  *
  *   ""         none.
- *   "fwhtN"    T = H_N / N block-diagonally over groups of N columns, H_N the UNNORMALISED
+ *   "fwhtN"    T = H_N / N block-diagonally over groups of N columns, H_N the unnormalised
  *              Sylvester Hadamard (entries +-1, H H = N I). Decoding applies H_N once (w = H v);
- *              the activation is rotated by H_N, unnormalised, with nothing folded at runtime --
+ *              the activation is rotated by the unnormalised H_N with nothing folded at runtime:
  *              the 1/N lives in the stored scale.
  *   "perm"     T is a column permutation: TABLE "t.perm" i32 [1 x cols], v[j] = w[perm[j]] --
- *              GPTQ's act-order, which quantises the columns in a different order than they sit.
+ *              GPTQ's act-order, which quantises the columns in a different order than stored.
  *   "givens"   T = D . G_1 . ... . G_S: D = diag(t.scale) when TABLE "t.scale" f32 [1 x cols]
  *              is present, and G_s a stage of disjoint Givens rotations -- TABLE "t.pairs" i32
  *              [S x cols] lists stage s's pairs as (pairs[s][2p], pairs[s][2p+1]), TABLE "t.angle"
  *              f32 [S x cols/2] their angles, and a row vector's pair (a, b) at angle t becomes
  *              (a cos t + b sin t, b cos t - a sin t). ParoQuant's scaled pairwise rotation.
- *              A weight whose row PARTS were rotated independently (a fused gate_up, a fused
+ *              A weight whose row parts were rotated independently (a fused gate_up, a fused
  *              q|k|v: each projection has its own rotation) carries P parts: TABLE "t.part" i32
- *              [1 x P] holds the END ROW (exclusive) of each part, and the other tables stack the
+ *              [1 x P] holds the end row (exclusive) of each part, and the other tables stack the
  *              parts in order -- t.pairs and t.angle S rows a part (P*S rows), t.scale one row a
  *              part (P rows). Without "t.part" the weight is one part. The stages of a part are
  *              applied in table order, and a part's pairs address columns of the whole row.
@@ -233,8 +232,8 @@ static inline int64_t rad_enc_givens_parts(const RadEncoding* e) {
            e->plane[i].extent[1] >= 1 ? e->plane[i].extent[1] : 0;
 }
 
-/* Byte-for-byte equality, which is what two encodings agreeing means: the strings are
- * zero-padded by construction, so there is nothing a memcmp could see that a reader cannot. */
+/* Byte-for-byte equality. Valid because the strings are always zero-padded, so memcmp sees only
+ * meaningful bytes. */
 static inline int rad_enc_equal(const RadEncoding* a, const RadEncoding* b) {
     return a && b && memcmp(a, b, sizeof *a) == 0;
 }

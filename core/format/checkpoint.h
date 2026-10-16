@@ -1,25 +1,24 @@
 /* checkpoint.h -- a safetensors or GGUF checkpoint as a source of logical weights.
  *
- * A checkpoint is read twice in this engine: by rad-convert, which writes a container from it, and
- * by the loader, which serves a checkpoint whose encoding is trivial directly (spec §4.3). Both
- * need the same three things, and this is the one copy of each:
+ * Read by rad-convert (to write a container) and by the loader (to serve a checkpoint with
+ * trivial encodings directly, spec §4.3). Both need:
  *
- *   - the tensors, as one row-major namespace however many shards and drafters they came in;
- *   - the model's metadata, from config.json (and its siblings) or the GGUF header;
- *   - a LOGICAL WEIGHT for a declared name: the tensors the architecture plugin's name map
- *     resolves it to -- concatenations, alternatives and expert slices included -- with the
- *     encoding they already are when that encoding is trivial, and the rows of it on demand.
+ *   - the tensors, as one row-major namespace across shards and drafters;
+ *   - the metadata, from config.json and its siblings or the GGUF header;
+ *   - the logical weight for a declared name: the tensors the plugin's name map resolves it to
+ *     (concatenations, alternatives, expert slices), with their encoding when trivial, and its rows
+ *     on demand.
  *
- * Trivial is the set spec §4.3 names: plain f32, f16 and bf16 (GGUF's too), block-scaled FP8,
- * where `X.weight_scale_inv` is the scale plane of `X.weight`, and MXFP4 as AMD Quark ships it
- * (`X.weight` U8 codes, `X.weight_scale` U8 exponents), which is `fp4_e2m1*e8m0[1x32]` byte for
- * byte. Anything else is a weight whose served form needs quantisation work, which a recipe does
- * ahead of time -- or, for a published GPTQ-packed release (AutoRound, GPTQ), an IMPORT: the
- * shipped integer codes and group scales re-laid as an encoding the kernels read, at convert time.
+ * Trivial (spec §4.3): plain f32, f16 and bf16 (GGUF's too); FP8 with a block or per-row scale
+ * plane (`X.weight_scale_inv`, or `X.weight_scale`); and MXFP4 as AMD Quark ships it (`X.weight`
+ * U8 codes, `X.weight_scale` U8 exponents), byte for byte `fp4_e2m1*e8m0[1x32]`. Anything else
+ * needs a recipe ahead of time, or for a published release in a form listed under
+ * Checkpoint::Import an import: the shipped codes and scales re-laid, or decoded for a recipe, at
+ * convert time.
  *
- * AN IMPORTED QUANTISATION IS STATED WEIGHT BY WEIGHT. The checkpoint's quantisation descriptor
- * (`auto-round`, `gptq`, `quark`) names the tool that made it, not a served form, so no
- * architecture plugin claims it; the plugin is chosen as Checkpoint::imports() describes.
+ * An imported quantisation's descriptor (`auto-round`, `gptq`, `quark`, `compressed-tensors`,
+ * `paroquant`) names the tool, not a served form, so no plugin claims it; Checkpoint::imports()
+ * describes how the plugin is chosen.
  */
 #pragma once
 #include "../rad_internal.h"
@@ -39,9 +38,8 @@ namespace rad {
 class Program;
 
 /* ================================================================== tensors */
-/* One shape convention from here on: ROW-MAJOR, shape[0] slowest. GGUF stores ne[] fastest-first,
- * so it is reversed on the way in. Getting this backwards transposes every matrix in the model
- * and produces fluent wrong output, so it is done exactly once, in Checkpoint::open. */
+/* Shapes are row-major, shape[0] slowest. GGUF stores ne[] fastest-first, so Checkpoint::open
+ * reverses it, once; getting it wrong transposes every matrix. */
 struct SrcTensor {
     std::string          name;
     uint32_t             ggml = 0;
@@ -49,18 +47,18 @@ struct SrcTensor {
     std::vector<int64_t> shape;                        /* row-major */
     const void*          data = nullptr;
     int64_t              bytes = 0;
-    /* GPTQ-PACKED (auto_gptq's layout, which AutoRound's `auto_round:auto_gptq` export shares):
-     * `data` is the qweight's int32 words [K * bits / 32, N], each packing 32 / bits codes along
-     * K from the low bits up, stored unsigned with the zero point 2^(bits-1). The tensor this
-     * describes is the logical [N, K] code matrix, `rad_dtype` RAD_I4 or RAD_I8; `gptq_group` is
-     * the K columns one row of its scale tensor covers. 0 for any other tensor. */
+    /* GPTQ-packed (auto_gptq's layout, shared by AutoRound's `auto_round:auto_gptq` export):
+     * `data` is the qweight's int32 words [K * bits / 32, N], each packing 32 / bits codes along K
+     * from the low bits up, unsigned with zero point 2^(bits-1). The tensor described is the
+     * logical [N, K] code matrix, `rad_dtype` RAD_I4 or RAD_I8; `gptq_group` is the K columns one
+     * scale row covers. 0 for other tensors. */
     int32_t              gptq_bits = 0;
     int64_t              gptq_group = 0;
-    /* CT-INT4 (compressed-tensors' pack-quantized int4, symmetric): `data` is X.weight_packed's
-     * int32 words [N, K / 8], eight codes a word along K from the low bits up, stored unsigned with
-     * the zero point 8. The tensor this describes is the logical [N, K] code matrix, `rad_dtype`
-     * RAD_I4; `ct_group` is the K columns one scale of X.weight_scale [N, K / group] covers. 0 for
-     * any other tensor. */
+    /* CT-INT4 (compressed-tensors' symmetric pack-quantized int4): `data` is X.weight_packed's
+     * int32 words [N, K / 8], eight codes per word along K from the low bits up, unsigned with zero
+     * point 8. The tensor described is the logical [N, K] code matrix, `rad_dtype` RAD_I4;
+     * `ct_group` is the K columns one scale of X.weight_scale [N, K / group] covers. 0 for other
+     * tensors. */
     int64_t              ct_group = 0;
     /* ParoQuant's int5-bitplane (Import::ParoI5): `data` is the AWQ-packed low nibbles qweight
      * [K, N/8] and the tensor described is the logical [N, K] u5 code matrix; `aux` are the fifth-bit
@@ -85,13 +83,13 @@ struct MetaOwn {
     RadModelMeta m{};
 
     void kv(const std::string& k, const std::string& v) { keys.push_back(k); vals.push_back(v); }
-    /* A key given LAST that must also WIN: a lookup takes the first row with the key, so
-     * appending a key the checkpoint already set would write both and read the old one. */
+    /* Set a key that must win over an existing one: lookups take the first row with a key, so
+     * kv() would leave the old value in effect. */
     void set(const std::string& k, const std::string& v);
     bool has(const std::string& k) const;
     const char* get(const std::string& k) const;     /* null when absent */
-    /* Republish the pointers RadModelMeta carries. Every kv()/set() may move the strings, so this
-     * runs after the last of them and before `m` is read. */
+    /* Republish RadModelMeta's pointers. kv()/set() may move the strings, so call this after the
+     * last of them and before reading `m`. */
     void finish();
 };
 
@@ -110,13 +108,12 @@ public:
     Checkpoint(const Checkpoint&) = delete;
     Checkpoint& operator=(const Checkpoint&) = delete;
 
-    /* A .gguf, a .safetensors, a model.safetensors.index.json, or the directory holding one --
-     * and the metadata beside it. */
+    /* A .gguf, a .safetensors, a model.safetensors.index.json, or the directory holding one,
+     * plus the metadata beside it. */
     int open(const std::string& path);
-    /* A SECOND checkpoint, merged into this one's namespace and metadata under `prefix`: a
-     * drafter that ships as its own repository (DFlash2) borrows the target's embedding and head,
-     * so it belongs in the target's container, its tensors under `draft.` and its config.json
-     * under `draft.` keys. */
+    /* Merge a second checkpoint under `prefix`: a drafter shipped as its own repository (DFlash2)
+     * borrows the target's embedding and head, so it goes into the target's container with its
+     * tensors and config.json keys under `draft.`. */
     int add_draft(const std::string& dir, const std::string& prefix);
 
     const SrcTensor* find(const std::string& n) const;
@@ -131,37 +128,40 @@ public:
     MetaOwn&           meta() { return meta_; }
     const MetaOwn&     meta() const { return meta_; }
 
-    /* Sub-tensor `index` of a STACKED tensor -- dim 0 of a rank >= 2 tensor -- as a view, owned
-     * here so every pointer handed out stays valid for the checkpoint's life. Null, with the
-     * reason logged, when there is no such slice. */
+    /* Sub-tensor `index` along dim 0 of a stacked (rank >= 2) tensor, as a view owned here and
+     * valid for the checkpoint's life. Null, with the reason logged, if there is no such slice. */
     const SrcTensor* slice(const SrcTensor& st, int index, const char* declared);
 
     /* FP8's block, from quantization_config.weight_block_size; 128x128 when it says nothing. */
     int64_t fp8_block_rows() const { return fp8_br_; }
     int64_t fp8_block_cols() const { return fp8_bc_; }
 
-    /* THE CHECKPOINT'S QUANTISATION, IMPORTED WEIGHT BY WEIGHT, or None. Read from
-     * quantization_config at open: AutoRound's `auto_round:auto_gptq` export and GPTQ's own (v1,
-     * the zero point stored less one) are Gptq; Quark's MXFP4 (fp4 weights, per_group 32, e8m0
-     * scales, no per-layer overrides) is QuarkMx; ParoQuant's MXFP4 (`paroquant_mxfp4`: Quark's
-     * codes and exponents in a ROTATED basis, with the rotations beside them) is ParoMx. A quantisation of one of those tools in a form
-     * this does not read stays None, with the reason in import_refusal(). */
-    /* Its quantization_config keys are then renamed `imported_quantization_config.*`: they
-     * describe the tool, not a served format, and a plugin reads the latter there. */
-    enum class Import { None, Gptq, QuarkMx, CtInt4, ParoMx, ParoI5, ParoI4 };
+    /* The checkpoint's quantisation imported weight by weight, or None; read from
+     * quantization_config at open. Gptq: AutoRound's `auto_round:auto_gptq` export and GPTQ v1
+     * (zero point stored less one). QuarkMx: Quark's MXFP4 (fp4 weights, per_group 32, e8m0
+     * scales, no per-layer overrides). ParoMx: ParoQuant's `paroquant_mxfp4` (Quark's codes and
+     * exponents in a rotated basis, rotations beside them). CtInt4, Nvfp4, CtFp8:
+     * compressed-tensors' pack-quantized int4, a release with an nvfp4-pack-quantized group, and
+     * one whose groups are all float-quantized FP8 (detect_import). In an Nvfp4 or CtFp8 release
+     * every weight without the NVFP4 tensors reads stock, so FP8 and bf16 linears beside the
+     * NVFP4 ones read by their own form. An unreadable form of these stays None, with the reason
+     * in import_refusal(). The quantization_config keys are then renamed
+     * `imported_quantization_config.*`, since they describe the tool, not a served format. */
+    enum class Import { None, Gptq, QuarkMx, CtInt4, ParoMx, ParoI5, ParoI4, Nvfp4, CtFp8 };
     Import imports() const { return import_; }
     const std::string& import_refusal() const { return import_why_; }
 
-    /* The pieces an imported weight is read from, as views owned here: for `name` (a `.weight`)
-     * the GPTQ-packed codes and their scale tensor, or Quark's codes and exponents as their RAD
-     * dtypes. RAD_E_NOTFOUND when the checkpoint ships `name` as an ordinary tensor or not at
-     * all; another error, with `why`, when it ships an imported form this cannot read. */
+    /* The pieces an imported `name` (a `.weight`) is read from, as views owned here: GPTQ-packed
+     * codes and their scales, Quark's codes and exponents as RAD dtypes, or NVFP4's codes as fp4
+     * beside an f32 scale plane derived from the e4m3 scales and the global scale. RAD_E_NOTFOUND
+     * when `name` is an ordinary tensor or absent; another error, with `why`, for an unreadable
+     * imported form. */
     int import_piece(const std::string& name, const SrcTensor** codes, const SrcTensor** scale,
                      std::string* why);
 
 private:
-    /* `owner`, when the checkpoint has an index, is its weight_map: a tensor the index places in
-     * another shard is not read from this one. */
+    /* `owner` is the index's weight_map, if any: a tensor it places in another shard is skipped
+     * here. */
     int add_shard(const std::string& p, const std::string& prefix = "",
                   const std::unordered_map<std::string, std::string>* owner = nullptr);
     int open_safetensors(const std::string& path);
@@ -178,11 +178,14 @@ private:
     std::unordered_map<std::string, size_t> index_;
     std::unordered_map<std::string, size_t> index_shard_;   /* name -> shards_ position */
     std::deque<SrcTensor> sliced_;            /* views; a deque never moves what it holds */
+    /* Bytes a view's data points at when they are derived, not mapped (NVFP4's f32 scale
+     * plane); they live as long as the views. */
+    std::vector<std::unique_ptr<uint8_t[]>> owned_;
     int64_t fp8_br_ = 128, fp8_bc_ = 128;
     Import      import_ = Import::None;
     std::string import_why_;
     int64_t     ct_group_ = 0;   /* CtInt4: the group every weight's config states */
-    /* import_piece's answers by name, so a weight resolved twice reads one pair of views. */
+    /* import_piece's answers by name, so a weight resolved twice reuses its views. */
     std::unordered_map<std::string, std::pair<const SrcTensor*, const SrcTensor*>> imported_;
 };
 
@@ -197,18 +200,20 @@ struct CkptWeight {
     uint32_t rank = 0;
     int64_t  shape[RAD_MAX_RANK] = {0};       /* the logical shape */
     int64_t  rows = 0, cols = 0;              /* its [rows, cols] view (rad_enc_view) */
-    /* The encoding the pieces ARE, when it is trivial; `why` says what is not when it is not. */
+    /* `enc` is the pieces' encoding when trivial; otherwise `why` says what is not. */
     bool        trivial = false;
-    /* GPTQ-PACKED PIECES, read into `enc` (`i4` or `i8` codes, bf16 scales a 128 of K) by
-     * ckpt_plane_rows: the codes transposed and offset to signed, the f16 scales rounded to bf16.
-     * Not trivial -- the rounding means the numbers are not served as shipped -- so the loader
-     * refuses one and rad-convert keeps it in `enc`, as it keeps a trivial weight. */
+    /* Imported pieces, read into `enc` by ckpt_plane_rows and ckpt_rows_f32. GPTQ-packed: `i4` or
+     * `i8` codes transposed and offset to signed, f16 scales rounded to bf16 per 128 of K.
+     * NVFP4: fp4 codes beside the f32 scale e4m3 / global per 16 of K. Not trivial (the scales
+     * are changed or derived), so the loader refuses it; rad-convert writes it as `enc` or
+     * quantises it by a recipe rule. A non-trivial FP8 weight may also state `enc` when it
+     * still reads piece by piece (a row join ending inside a scale block); one that cannot be
+     * read leaves `enc` unstated, and ckpt_rows_f32 refuses it with `why`. */
     bool        imported = false;
-    /* PAROQUANT MXFP4, IMPORTED (Import::ParoMx): `imported` too, so the loader refuses it and
-     * rad-convert writes it plane by plane through ckpt_plane_rows. Planes 0 and 1 are Quark's
-     * codes and exponents byte for byte; the rest are the "givens" transform's tables, built here
-     * from `pq_pairs`/`pq_theta`/`pq_scale`, one set per piece (a piece is a row PART: gate and up,
-     * or q, k and v, each rotated on its own). */
+    /* ParoQuant MXFP4 (Import::ParoMx), also `imported`: written plane by plane through
+     * ckpt_plane_rows. Planes 0 and 1 are Quark's codes and exponents byte for byte; the rest are
+     * the "givens" transform's tables, built from `pq_pairs`/`pq_theta`/`pq_scale`, one set per
+     * piece (a row part: gate and up, or q, k and v, each rotated separately). */
     bool        paro = false;
     std::vector<const SrcTensor*> pq_pairs, pq_theta, pq_scale;
     RadEncoding enc{};
@@ -230,17 +235,17 @@ std::string ckpt_tensor_of(const SrcTensor& t);
 bool ckpt_reads_any(const CkptWeight& w, const std::unordered_set<std::string>& names,
                     std::unordered_set<std::string>* hit = nullptr);
 
-/* One (part, group) of a ParoQuant rotation as its dense matrix: `S` stages of 64 pairs, the pair's two
- * group-local columns `ia`/`ib` and angle `th`, stage-major; out[j * 128 + i] (f16) is output j for the
- * unit vector e_i. It is the "givens" encoding's "t.dense" table, row for row. */
+/* One (part, group) of a ParoQuant rotation as a dense matrix: `S` stages of 64 pairs, each with
+ * group-local columns `ia`/`ib` and angle `th`, stage-major; out[j * 128 + i] (f16) is output j for
+ * unit vector e_i. This is the "givens" encoding's "t.dense" table. */
 void paro_compose_dense(int64_t S, const int32_t* ia, const int32_t* ib, const float* th, uint16_t* out);
 
 /* Logical rows [r0, r0 + nr) of `w` as f32 [nr, cols], whatever the pieces are stored as: a
  * plain float widened, FP8 times its block scale, a GGUF block type dequantised. */
 int ckpt_rows_f32(const CkptWeight& w, int64_t r0, int64_t nr, float* out, std::string* why);
 
-/* Rows [r0, r0 + nr) of plane `k` of a TRIVIAL or IMPORTED `w`, in the plane's own elements, dense
- * into `dst`: the bytes a container entry holds for it. */
+/* Rows [r0, r0 + nr) of plane `k` of a trivial or imported `w`, in the plane's own elements, dense
+ * into `dst`: the bytes a container entry holds. */
 int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* dst,
                     std::string* why);
 

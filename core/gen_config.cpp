@@ -1,4 +1,4 @@
-/* gen_config.cpp -- reading a checkpoint's own sampling. The header carries the argument. */
+/* gen_config.cpp -- reading a checkpoint's own sampling; see gen_config.h. */
 #include "gen_config.h"
 
 #include "rad_internal.h"
@@ -13,8 +13,7 @@
 namespace rad {
 namespace {
 
-/* A numeric field, taken only if it lands in range. Out of range is warned about and dropped:
- * the value came with the model, and one implausible entry is not a reason to refuse the rest. */
+/* A numeric field, taken only if in range; otherwise warned about and dropped. */
 void take(const char* what, const char* src, double v, double lo, double hi, bool lo_open,
           float* dst) {
     const bool ok = (lo_open ? v > lo : v >= lo) && v <= hi;
@@ -34,9 +33,10 @@ SamplingParams GenSampling::onto(SamplingParams base) const {
 }
 
 std::string GenSampling::describe(const SamplingParams& sp) {
-    char buf[160];
+    char buf[200];
     std::snprintf(buf, sizeof buf, "temperature %.2f, top_k %d%s, top_p %.2f, min_p %.2f",
-                  (double)sp.temp, sp.top_k, sp.top_k == 0 ? " (off)" : "",
+                  (double)sp.temp, sp.top_k,
+                  sp.top_k == 0 ? " (the 1024 most likely tokens, the sampler's candidate width)" : "",
                   (double)sp.top_p, (double)sp.min_p);
     return buf;
 }
@@ -70,9 +70,8 @@ bool gen_sampling_parse(const std::string& json_text, const char* src, GenSampli
     catch (const std::exception& e) { RAD_WARN("%s: %s; ignoring it", src, e.what()); return false; }
     if (!j.is_object()) { RAD_WARN("%s: not a JSON object; ignoring it", src); return false; }
 
-    /* `do_sample: false` IS THE WHOLE ANSWER when it is there. transformers ignores every other
-     * sampler field under it, and greedy is the one thing this sampler spells as a temperature --
-     * so taking top_k or top_p as well would describe a sampler the checkpoint did not ask for. */
+    /* `do_sample: false` means greedy, and transformers then ignores every other sampler field,
+     * so take nothing else. */
     auto it = j.find("do_sample");
     if (it != j.end() && it->is_boolean() && !it->get<bool>()) { out->temp = 0.0f; return true; }
 
@@ -85,8 +84,7 @@ bool gen_sampling_parse(const std::string& json_text, const char* src, GenSampli
     it = j.find("top_k");
     if (it != j.end() && it->is_number_integer()) {
         const int64_t v = it->get<int64_t>();
-        /* -1 is transformers' spelling of "no top_k" and this sampler's is 0; anything below that
-         * is not a count at all. */
+        /* -1 is transformers' "no top_k", this sampler's 0; below -1 is invalid. */
         if (v >= -1) out->top_k = (int)(v < 0 ? 0 : v);
         else RAD_WARN("%s states top_k %lld, which is not a count; ignoring it", src, (long long)v);
     }
@@ -104,9 +102,8 @@ bool gen_sampling_from_file(const std::string& path, bool required, GenSampling*
 }
 
 bool gen_sampling_from_kv(const std::function<const char*(const char*)>& get, GenSampling* out) {
-    /* REBUILT AS JSON RATHER THAN PARSED FIELD BY FIELD, so that a value written by rad-convert
-     * and a value read out of the original file go through exactly one set of range checks and
-     * one reading of `do_sample`. Two parsers for one schema is how the two come to disagree. */
+    /* Rebuilt as JSON and passed to gen_sampling_parse, so container metadata and the original
+     * file share one set of range checks and one reading of `do_sample`. */
     nlohmann::json j = nlohmann::json::object();
     static const char* const kFields[] = { "do_sample", "temperature", "top_p", "min_p", "top_k" };
     for (const char* k : kFields) {

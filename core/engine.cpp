@@ -1,8 +1,6 @@
-/* engine.cpp -- the step loop and the server.
- *
- * The Engine's construction, the per-rank threads, the one loop that runs a step, and the server
- * it runs under; bring-up, the drafters and the buffer probe have files of their own. See
- * engine_priv.h for what the four share.
+/* engine.cpp -- the step loop and the server: Engine construction, the per-rank threads, the
+ * step loop and the server it runs under. Bring-up, the drafters and the buffer probe live in
+ * their own files (engine_priv.h).
  */
 #include "engine_priv.h"
 #include "gen/driver.h"
@@ -21,6 +19,7 @@
 #include "server/sink.h"
 #include "server/liveview.h"
 #include "text/tokenizer.h"
+#include "util/stallwatch.h"
 
 #include <atomic>
 #include <chrono>
@@ -39,10 +38,7 @@
 
 namespace rad {
 
-
-
-/* The RADIANCE_* names are taken here, before start(): bring-up sets one of its own
- * (RADIANCE_GDN_ANCHOR, Engine::configure_kv), and the report lists what the operator set. */
+/* The operator's RADIANCE_* names, captured at construction for the diagnostics report. */
 Engine::Engine(Config cfg)
     : cfg_(std::move(cfg)), env_set_(diag::env_names(environ, "RADIANCE_")) {}
 
@@ -59,19 +55,15 @@ Engine::Readback::~Readback() {
 }
 
 Engine::~Engine() {
-    /* WHERE --profile-ops LEAVES ITS FINAL TABLE. Here, because this is the last moment the
-     * program still holds the op table the rows name -- and it has to be printed somewhere: a
-     * flag that pays for the synchronisations, warns that the run is not comparable, and then
-     * says nothing is worse than no flag at all. */
+    /* --profile-ops prints its final table here, the last point where the program still holds
+     * the op table the rows name. */
     if (cfg_.profile_ops) for (auto& r : ranks_) r->ctx.dump_profile();
     for (float* p : kld_host_) if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
     if (pooled_host_) rad_dev_free(pooled_host_, RAD_MEM_HOST_PINNED);
     for (auto& r : ranks_) if (r->score_host) rad_dev_free(r->score_host, RAD_MEM_HOST_PINNED);
-    /* WHAT THE TIERING ACTUALLY DID, and it is printed here for the same reason: this is the last
-     * moment the plan the rows name is still alive. Only when the plan was dynamic -- a static
-     * one has nothing to say and a banner saying nothing is a banner people learn to skip. The
-     * per-layer residency histogram at the end of it is the number that says whether the global
-     * ranking starved a layer, which is the failure this engine has and a hit rate cannot show. */
+    /* The tiering summary, here for the same reason, and only for a dynamic plan. Its per-layer
+     * residency histogram shows whether the global ranking starved a layer, which a hit rate
+     * cannot. */
     for (auto& r : ranks_) {
         if (!r->heat.enabled()) continue;
         LogRank lr(r->index);
@@ -82,11 +74,10 @@ Engine::~Engine() {
                  (unsigned long long)r->ctx.route_dropped());
         RAD_INFO("%s", r->mover.report().c_str());
     }
-    /* THE TRANSFER STREAM BEFORE THE CONTEXTS. Ctx::shutdown drains the compute streams and then
-     * frees the arena, but the mover's stream copies into the arena too -- the prefill stager's
-     * ring is its top, and an idle arena lends its slots to the expert slab -- and is drained only
-     * when the mover goes, after it. A fill still landing in a lent arena slot at that moment is
-     * a GPU memory fault on the way out. */
+    /* Drain the transfer streams before the contexts. Ctx::shutdown drains the compute streams
+     * and frees the arena, but the mover's stream also copies into the arena (the prefill
+     * stager's ring, lent slab slots) and would otherwise drain only later, with the mover. A fill
+     * landing in a freed arena is a GPU memory fault. */
     for (auto& r : ranks_)
         if (RadStream s = r->mover.transfer_stream()) (void)rad_stream_sync(s);
     for (auto& r : ranks_) r->ctx.shutdown();
@@ -99,25 +90,20 @@ Engine::~Engine() {
     rad_tools_registry().close();
 }
 
-
 /* ================================================================== 7. serve */
-/* The step loop, which is the one place every component meets. Threading is spec §1's exactly:
- * HTTP threads feed a request queue, ONE scheduler thread produces ONE step, one thread per
- * tensor-parallel rank each owning one device.
+/* The step loop, where every component meets. Threading per spec §1: HTTP threads feed a request
+ * queue, one scheduler thread produces one step, and one thread per tensor-parallel rank owns one
+ * device.
  *
- * The ranks share an address space, so the batch is shared BY POINTER and the whole of the
- * handoff is a barrier -- no serialisation, no pipe, no pickling, which is most of what a Python
- * engine's multiprocessing budget actually buys (rank_barrier.h). The barrier is entered TWICE
- * per step: once to release the ranks against the batch, once to join them before the sampler's
- * answer is read. The scheduler thread is a participant on both sides, which is why the barrier's
- * width is tp + 1 and not tp.
+ * The batch is shared by pointer and the handoff is a barrier (rank_barrier.h), entered twice per
+ * step: to release the ranks against the batch, and to join them before the sampler's answer is
+ * read. The scheduler thread takes part, so the width is tp + 1.
  */
 
 int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool sizing) {
     Rank& r = *ranks_[(size_t)rank];
-    /* A SIZING DECLARE DECLARES INTO A SAMPLER OF ITS OWN. The chain has to be in the Program for
-     * the buffer list to match the real one, but the rank's sampler keeps the handles the real
-     * declare gave it -- the ones every step issues. */
+    /* A sizing declare uses a throwaway sampler: the chain must be in the Program so the buffer
+     * list matches, but the rank's sampler keeps the real declare's handles. */
     Sampler scratch;
     Sampler& smp = sizing ? scratch : r.sampler;
     rad_buf scratch_tok = 0;
@@ -125,24 +111,18 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
 
     SamplerConfig sc{};
     sc.n_vocab       = meta_.n_vocab;
-    /* WHAT THIS RANK ACTUALLY PRODUCES, taken from the logits buffer the plugin declared rather
-     * than re-derived from n_vocab and world_size. `program.meta` is the CONTAINER's metadata and
-     * carries the whole model's n_vocab on every rank, so reading it here would be wrong the
-     * moment a vocabulary is split; and computing the split a second time here would be wrong
-     * again the moment a plugin decides not to split it, which is where rad_arch.h stands
-     * and says why. Either mistake is a sampler reading past the end of every logits row. */
+    /* This rank's vocabulary width, from the declared logits buffer (see rad_tools_declare).
+     * meta_.n_vocab is the whole model's on every rank. */
     sc.n_vocab_local = logits_width > 0 ? logits_width : meta_.n_vocab;
-    /* THIS RANK'S FIRST VOCABULARY ROW, and it is the one thing the declared width cannot say:
-     * a width tells you how many rows a rank owns, not which. The rule is arch/common/rad_arch.h's
-     * shard_begin -- ceil(total/world) per rank, rounded up to a 128-row block, the last one short -- and it is restated here
-     * rather than carried through the ABI, so the restatement is CHECKED against what the plugin
-     * actually declared. A plugin that shards some other way gets a named refusal at startup
-     * instead of a sampler that names rank 0's tokens with rank 1's ids. */
+    /* This rank's first vocabulary row, which the width cannot tell. The rule restates
+     * arch/common/rad_arch.h's shard_begin rather than passing through the ABI, and is checked
+     * against the declared width, so a plugin that shards differently is refused at startup
+     * instead of sampling with the wrong ids. */
     sc.vocab_off = 0;
     if (sc.n_vocab_local < sc.n_vocab) {
-        /* rad_arch.h vocab_per_rank, restated: the even share when the world divides the vocabulary;
-         * otherwise ceil(n / tp) rounded up to a whole 128-row block so a block-scaled head can be
-         * cut there. */
+        /* rad_arch.h vocab_per_rank: the even share when tp divides the vocabulary, otherwise
+         * ceil(n / tp) rounded up to a 128-row block so a block-scaled head can be cut there; the
+         * last rank is short. */
         const int64_t ceil_per = (sc.n_vocab + cfg_.tp - 1) / cfg_.tp;
         const int64_t per = (sc.n_vocab % cfg_.tp == 0) ? sc.n_vocab / cfg_.tp
                                                         : (ceil_per + 127) / 128 * 128;
@@ -163,10 +143,9 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
     sc.world_size    = cfg_.tp;
     RAD_TRY(smp.declare(b, sc));
 
-    /* Where the chain writes the sampled ids. The sampler takes it as an argument rather than
-     * declaring it, because rad-kbench drives the same chain against a buffer it owns -- so the
-     * engine is the one that has to provide one. PERSIST, not transient: the step loop copies it
-     * back after the step, by which time a transient's storage may belong to another buffer. */
+    /* Where the chain writes the sampled ids. The engine declares it because rad-kbench drives the
+     * same chain against its own buffer. PERSIST, since the step loop copies it back after the
+     * step, when a transient's storage may belong to another buffer. */
     RadBufDecl d{};
     d.dtype    = RAD_I32;
     d.rank     = 1;
@@ -176,47 +155,32 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
     return tok ? RAD_OK : RAD_E_STATE;
 }
 
-
 /* ------------------------------------------------------------------ the tiering seam
  *
- * WHERE THE HEAT ENGINE RUNS, AND WHY IT IS A STEP AND NOT A LAYER. mover.h writes its run-phase
- * contract as "the order a layer dispatch calls it", and ctx.cpp states the invariant that
- * decides the unit: THE MOVER RELOCATES BETWEEN STEPS, NEVER DURING ONE -- `weights_dirty_` is
- * honoured once at the top of run_step, so a table edit made mid-step would be seen by some
- * issues and not others. A step is therefore the dispatch, and this pair brackets it.
+ * The heat engine dispatches per step, not per layer: the mover relocates only between steps
+ * (Ctx::run_step syncs the residency table once at its top), so a mid-step table edit would be
+ * seen by some issues and not others.
  *
- * IT RUNS ONCE A STEP, AFTER THE STEP'S FORWARD PASS IS ON THE QUEUE:
+ * It runs once per step, after the step's forward pass is queued:
  *
- *   - AFTER, because nothing in it is work the pass waits for. Ahead of a draft pass the device
- *     is idle -- the previous pass was drained to read its proposal -- so whatever the rank thread
- *     does before its first dispatch is time the device sits out; behind the issue it runs under
- *     the pass instead. Nothing it changes can reach the pass just issued: table edits are
- *     honoured at the top of the NEXT run_step, and a slot it frees is quarantined behind an event
- *     on the compute stream recorded after this pass.
- *   - ONCE A STEP, on the trunk pass and not the draft passes, because a swap almost never
- *     clears the hysteresis between two passes of one step and every call ranks the whole
- *     movable set. The draft head's histograms are not lost by it: they accumulate in the step's
- *     bank and are credited at the next step, weighted by the passes they stand for.
- *   - `begin_dispatch` only RETIRES. It never starts anything, so a loop that retires without
- *     issuing is not a slower engine but a stuck one (mover.h says so at length). The issue call
- *     below is the other half and they are written together for that reason.
- *   - The histograms this credits are the PREVIOUS step's -- a copy is asynchronous and lands
- *     while the step that produced it is still running (spec §5.5) -- and `histogram_ready` says
- *     which have landed.
+ *   - After, so it runs under the pass instead of in front of it (ahead of a draft pass the
+ *     device is idle). Its changes cannot reach the pass just issued: table edits apply at the
+ *     next run_step, and a freed slot is quarantined behind an event recorded after this pass.
+ *   - On the trunk pass only, since a swap rarely clears the hysteresis between passes of one
+ *     step and each call ranks the whole movable set. Draft-pass histograms accumulate in the
+ *     step's bank and are credited next step, weighted by pass count.
+ *   - `begin_dispatch` only retires; the issue call below is the other half. Retiring without
+ *     issuing stalls the mover (mover.h).
+ *   - It credits the previous step's histograms, whose copies land asynchronously while that step
+ *     runs (spec §5.5); `histogram_ready` says which have landed.
  *
- * ON A LONG PREFILL CHUNK ALMOST NONE OF THIS LANDS, and the counters below say so rather than
- * leaving it to be inferred from a placement that will not settle. This runs BEFORE run_step and
- * every issue path is enqueue-and-return, so on a chunk worth most of a second of device time the
- * host is many steps ahead of the card: the freshest bank holds a copy the device has not reached,
- * `histogram_ready` is 0, and the layer is skipped. Through a prefill of 2048-token chunks about 2%
- * of the layer-histograms are credited and the rest skipped as not yet landed, against effectively
- * all of them at a decode shape, where the step is short enough that the device keeps up. The same
- * shortfall is what the link panel's expert-streaming share is computed from, so it reads near zero
- * through a prefill that is in fact streaming.
+ * On long prefill chunks the host runs many steps ahead of the card, so most histograms have not
+ * landed and are skipped (about 2% credited with 2048-token chunks, nearly all at decode shapes).
+ * The counters report this, and the link panel's expert-streaming share reads near zero for the
+ * same reason.
  *
- * `heat_seen` is what stops a layer being credited twice. A bank holds its counts until the next
- * report overwrites them, so a step in which some layer did not route -- a drafter pass, or a
- * bisect running fewer layers -- would otherwise credit the stale plane again and again.
+ * `heat_seen` prevents crediting a bank twice: a bank keeps its counts until the next report, so a
+ * step where a layer did not route (a drafter pass) would re-credit the stale plane.
  */
 void Engine::tiering_dispatch(Rank& r, int step) {
     if (!r.heat.enabled()) return;
@@ -225,21 +189,17 @@ void Engine::tiering_dispatch(Rank& r, int step) {
 
     const int n_layer = r.ctx.n_route_layers();
     if ((int)r.heat_seen.size() != n_layer) r.heat_seen.assign((size_t)n_layer, -1);
-    /* THE SWEEP'S HISTOGRAMS ARE FOUND FIRST AND CREDITED SECOND, in the same order. A histogram
-     * is a row the card copied into host memory, so every line of it is a miss, and one layer's
-     * credit is too little work to hide the next row's fetch behind. With the rows known up front
-     * each is prefetched while an earlier one is credited: two rows ahead is 32 lines in flight,
-     * about what one core keeps outstanding to memory, so further ahead would only queue. */
+    /* Find all histograms first, then credit them in order. Each is a card-written row in host
+     * memory (every line a cache miss), and one credit is too little work to hide the next fetch.
+     * Prefetching two rows ahead keeps 32 lines in flight, about what one core sustains. */
     int8_t landed[kRouteBanks];
     std::memset(landed, -1, sizeof landed);
     std::vector<Rank::HeatRow>& rows = r.heat_rows;
     rows.clear();
     for (int l = 0; l < n_layer; ++l) {
-        /* DRAIN THE LAYER, do not take one and move on. The host reaches this once per step it
-         * ISSUES, and on a long chunk it issues far ahead of the card -- so between two visits the
-         * device can have produced many of this layer's histograms. Taking only the newest would
-         * throw the rest away and, worse, usually find the newest still in flight and take
-         * nothing. */
+        /* Drain every landed histogram for the layer. The host runs this once per issued step,
+         * possibly far ahead of the card, so several may have landed since the last visit, and the
+         * newest is often still in flight. */
         int seen = r.heat_seen[(size_t)l];
         bool any = false;
         for (;;) {
@@ -259,9 +219,8 @@ void Engine::tiering_dispatch(Rank& r, int step) {
     for (size_t i = 0; i < rows.size(); ++i) {
         if (i + kAhead < rows.size()) r.heat.prefetch(rows[i + kAhead].h, n_ex);
         const Rank::HeatRow& hr = rows[i];
-        /* One histogram can stand for more than one pass: a draft head reports once per draft
-         * pass and they all land in the same bank. Crediting such a bank once underprices that
-         * layer's experts by the number of passes, and the engine then drains the layer. */
+        /* A bank can hold several passes (a draft head reports once per pass into one bank), so
+         * weight it by the report count, or the layer's experts are underpriced and drained. */
         const int reps = r.ctx.last_histogram_reports(hr.layer, hr.bank);
         r.heat.observe(hr.layer, hr.h, n_ex, reps > 1 ? (float)reps : 1.0f);
         r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
@@ -269,36 +228,29 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         ++r.heat_credited;
     }
 
-    /* NO SWAPS BEHIND A PASS THE STAGER ARMED. Such a step is bound by its own copies -- every
-     * pooled expert of every routed layer crosses the link on the transfer stream a swap would
-     * share -- and the turnover slots a swap would land in are filled for it (below). The
-     * histograms are credited all the same, and the next step that stages nothing swaps on what
-     * they said. */
+    /* No swaps behind a pass the stager armed: that step is bound by its own copies on the same
+     * transfer stream, and the turnover slots are filled for it (below). Histograms are still
+     * credited; the next unstaged step swaps on them. */
     std::vector<Swap> swaps;
     if (!r.stager.staged() && r.heat.step(&swaps) < 0) return;
     for (const Swap& s : swaps) {
-        /* CONTRACT: every unit the engine named is BUSY on the way out, and a proposal that is
-         * silently dropped leaves the pair busy forever. `issue` clears it; `abandon` is what
-         * this owes the engine when the mover cannot take it. */
+        /* Contract: every proposed unit is busy until `issue` takes it or `abandon` returns it;
+         * a dropped proposal stays busy forever. */
         if (r.mover.issue(s, &r.heat) < 0) r.heat.abandon(s);
     }
 
-    /* AFTER the swaps, because a swap is what the policy asked for and a fill is what the memory
-     * allows: spending a move record on a fill that the next swap then needs would let a
-     * boundary the arbiter happens to be moving reorder the engine's own decisions.
+    /* Fill after the swaps: swaps are the policy's decisions, fills only use spare memory, and a
+     * fill must not take a move record the next swap needs.
      *
-     * Behind a staged pass the turnover slots are filled too: that step swaps nothing, and kept
-     * free they are residents its stager copies instead -- at TP2 a 160K-token prompt staged
-     * 9.6% more and ran 3-5% slower.
+     * Behind a staged pass the turnover slots are filled too, since that step swaps nothing; left
+     * free, the stager would copy those residents instead (at TP2 a 160K-token prompt staged 9.6%
+     * more and ran 3-5% slower).
      *
-     * AND THEY STAY FILLED UNTIL kTurnoverAfter STEPS IN A ROW HAVE STAGED NOTHING, idle ticks
-     * included. A prompt answered in a token or two -- or a pause before the next one -- would
-     * otherwise drop them and copy them straight back at the next prompt's first chunk, across the
-     * link the chunk stages over, and each round trip scatters the lent residents through the
-     * pool runs the stager coalesces its copies on: at TP2, 26K-token prompts back to back ran
-     * 33 copies a staged layer that way against 16 held, and the first prompt after a pause up to
-     * 0.4% slower. A decode run reaches the count in a few steps, and its swaps land in the working
-     * slots until it does. */
+     * They stay filled until kTurnoverAfter consecutive unstaged steps (idle ticks included).
+     * Otherwise a short answer or a pause drops them and the next prompt's first chunk copies them
+     * back, scattering the lent residents through the pool runs the stager coalesces on (at TP2,
+     * back-to-back 26K-token prompts: 33 copies per staged layer instead of 16). Decode reaches the
+     * count in a few steps. */
     constexpr int kTurnoverAfter = 4;
     r.unstaged_steps = r.stager.staged() ? 0 : r.unstaged_steps + 1;
     const bool hold = r.unstaged_steps < kTurnoverAfter;
@@ -319,9 +271,8 @@ void Engine::rank_loop(int index) {
 
         const RadBatch* b = step_batch_.load(std::memory_order_acquire);
         if (b) {
-            /* This rank's view of the step: the same numbers, pointed at this card's staging.
-             * The upload that filled it was issued on THIS stream, so the ordering is an
-             * ordinary same-stream dependency and no cross-rank fence is needed. */
+            /* This rank's view of the step, pointing at this card's staging. Its upload was issued
+             * on this rank's stream, so no cross-rank fence is needed. */
             const RadBatch* mine = gen_ ? gen_->batch_for(index) : sched_.batch_for(index);
             if (!mine) {
                 RAD_ERR("rank %d: the builder has no batch for this rank", index);
@@ -336,19 +287,16 @@ void Engine::rank_loop(int index) {
                 RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());
                 step_status_.store(s, std::memory_order_release);
             } else if (b->n_out > 0 && what != kIssueModel) {
-                /* WAIT FOR THE STAGING, WHICH THE SCHEDULER IS DOING RIGHT NOW UNDER THE MODEL
-                 * THIS THREAD JUST ENQUEUED. Everything above is enqueue-and-return, so arriving
-                 * here means the device has a forward pass in front of it and this wait costs
-                 * nothing it was not going to spend in collect_step anyway. */
+                /* Wait for the scheduler's sampler staging, which runs while the device executes
+                 * the forward pass enqueued above, so the wait is hidden behind device work. */
                 int bst = RAD_OK;
                 {
                     std::unique_lock<std::mutex> lk(build_mu_);
                     build_cv_.wait(lk, [this] { return build_ready_; });
                     bst = build_status_;
                 }
-                /* The sampler chain is issued on the SAME stream, right behind the model, with no
-                 * host synchronisation between them: it is more ops on the compute stream and not
-                 * a second phase (spec §13). */
+                /* The sampler chain goes on the same stream behind the model with no host sync
+                 * (spec §13). */
                 if (bst >= 0) {
                     /* The scored rows first: the sampler may rewrite a row in place. */
                     if (b->draft_pass == 0 && !score_rows_.empty()) s = issue_scored_rows(r);
@@ -369,14 +317,13 @@ void Engine::rank_loop(int index) {
 
 /* ------------------------------------------------------------------ the scheduler thread */
 int Engine::prepare_release(const RadBatch* b) {
-    /* THE ARENA LEVEL, AND THE ARENA'S MEMORY BACK FROM THE SLAB IF THIS STEP NEEDS IT. Every
-     * rank thread is parked, so a level can change and a recall can drain both streams. */
+    /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
+     * parked, so the level can change and a recall can drain both streams. */
     if (const int as = arena_step(b); as < 0) return as;
-    /* THE FOLLOWERS' POOLS, BEFORE THE TABLE THAT INDEXES THEM. Admission grew rank 0's cache for
-     * this step and the ids are already in the block table; a follower still at the old mark
-     * would read pages it never mapped. Here rather than on the arbiter's tick because the tick
-     * is 100 ms away and this step is about to run, and safe here because every rank thread is
-     * parked at the release. */
+    /* Grow the followers' pools to match rank 0's before the step's block table is used:
+     * admission grew rank 0's cache and the new ids are already in the table. Done here, not on
+     * the 100 ms arbiter tick, because the step is about to run; safe because every rank thread is
+     * parked. */
     for (size_t i = 1; i < ranks_.size(); ++i) {
         if (rad_dev_set(ranks_[i]->device) < 0) continue;
         if (ranks_[i]->kv.follow(ranks_[0]->kv) < 0)
@@ -393,8 +340,8 @@ int Engine::issue_ahead(const RadBatch** out) {
         sched_.expect_draft(serial_row_[(size_t)i].seq, serial_done_);
     const RadBatch* nb = sched_.step_next();
     if (!nb) return RAD_OK;
-    /* Its rows' tokens, positions and slots, from where this step's acceptance and drafts leave
-     * them -- in stream order behind all of it. */
+    /* Its rows' tokens, positions and slots, advanced on the card behind this step's acceptance
+     * and drafts. */
     RAD_TRY(advance_all(ADV_TRUNK, 0, false));
     RAD_TRY(prepare_release(nb));
     issue_what_.store(kIssueModel, std::memory_order_release);
@@ -417,14 +364,13 @@ void Engine::phase_mark(int p) {
     phase_t_ = now;
 }
 
-/* EVERY WAY OUT OF THE STEP LOOP ON AN ERROR GOES THROUGH HERE, because leaving it is three
- * obligations and forgetting one is a server that looks alive and serves nothing:
+/* Every error exit from the step loop goes through here, which does three things:
  *
- *   - the rank threads are parked on the barrier, and only an abort lets them see `stopping_`;
- *   - every request queued or running is waiting on a step that will never come, so it is failed
- *     now and its connection answered, and the scheduler refuses anything submitted after;
- *   - run_server watches `loop_status_` and takes the HTTP side down, so the process exits with
- *     the error rather than accepting requests into a queue nothing drains (spec §17). */
+ *   - aborts the barrier, so the parked rank threads see `stopping_`;
+ *   - fails every queued or running request and answers its connection; the scheduler then
+ *     refuses new submissions;
+ *   - sets `loop_status_`, which run_server watches to stop HTTP, so the process exits with the
+ *     error instead of queueing requests nothing will drain (spec §17). */
 int Engine::fail_loop(int st) {
     stopping_.store(true, std::memory_order_release);
     if (barrier_) barrier_->abort();
@@ -434,45 +380,25 @@ int Engine::fail_loop(int st) {
 }
 
 int Engine::step_loop() {
-    /* The batch is built on rank 0's stream into rank 0's memory and shared by pointer, so
-     * this thread lives on rank 0's device. The backend's current device is thread-local:
-     * a fresh thread starts on device 0, which is right only by accident. */
+    /* The batch is built on rank 0's stream into rank 0's memory, so this thread binds rank 0's
+     * device; the backend's current device is thread-local and starts at device 0. */
     if (rad_dev_set(ranks_[0]->device) < 0)
         RAD_ERR("step loop: could not bind rank 0's device");
     StepOut so;
     int idle = 0;
     std::vector<uint64_t> cancel;
-    /* Not in the KL mode: its scored rows are copied out of the logits buffer after the step is
-     * collected, and a pass issued ahead would have overwritten them by then. */
+    /* Not in KL mode: its scored rows are copied out of the logits buffer after collection, and a
+     * pass issued ahead would overwrite them. */
     pipelining_ = !cfg_.kld() && !embedding_ && drafter_.kind != RAD_DRAFT_BLOCK &&
                   (serial_drafting() || cfg_.n_spec <= 0);
     const bool t_on = (int)log_level() >= (int)Log::Debug;
-    /* Read once. See the block in the idle branch below for what it is for. */
-    /* "kv" | "arena" | "all" | "kv:<name>,<name>" -- the last narrows the KV scrub to named groups,
-     * which is the level below "it is the pool" and the one that names the defect. */
-    const char* const scrub_s_ = std::getenv("RADIANCE_DEBUG_IDLE_SCRUB");
-    std::string scrub_groups_;
-    int scrub_ = 0;
-    if (scrub_s_ && *scrub_s_) {
-        if (!std::strncmp(scrub_s_, "kv:", 3)) { scrub_ = 1; scrub_groups_ = std::string(",") + (scrub_s_ + 3) + ","; }
-        else if (!std::strcmp(scrub_s_, "kv"))    scrub_ = 1;
-        else if (!std::strcmp(scrub_s_, "arena")) scrub_ = 2;
-        else                                      scrub_ = 3;
-    }
-    if (scrub_)
-        RAD_WARN("RADIANCE_DEBUG_IDLE_SCRUB=%d: the %s%s%s will be ZEROED every time the engine "
-                 "goes idle. This is a determinism diagnostic and it is not free.", scrub_,
-                 (scrub_ & 1) ? "KV pool" : "", scrub_ == 3 ? " and the " : "",
-                 (scrub_ & 2) ? "activation arena" : "");
-
-    /* THE NEXT STEP'S FORWARD PASS, when it is already on the card: issued behind the step before
-     * it, before that step was read back (Scheduler::step_next). */
+    /* The next step's forward pass when already issued behind the previous step, before its
+     * readback (Scheduler::step_next). */
     const RadBatch* ahead = nullptr;
     while (!stopping_.load(std::memory_order_acquire)) {
         phase_t_ = std::chrono::steady_clock::now();
-        /* MEDIA A WAITING REQUEST NEEDS, encoded while nothing is in flight: the last step has been
-         * collected and none was issued ahead of it -- the scheduler issues none while a request
-         * is waiting, and one whose media is not encoded waits. */
+        /* Encode media for waiting requests while nothing is in flight. The scheduler issues no
+         * step ahead while a request waits, and a request with unencoded media waits. */
         if (!ahead && sched_.encodes_pending()) {
             if (const int es = run_encodes(); es < 0) return fail_loop(es);
         }
@@ -482,20 +408,18 @@ int Engine::step_loop() {
         if (issued) sched_.promote_next();
         else        b = sched_.step();
         if (!b) {
-            /* Nothing to run is not an error. Back off in small steps rather than spinning a core
-             * at idle; the first wait is short, because a request arriving into an empty engine
-             * should not pay for the queue having been empty. */
+            /* Idle: back off in small steps instead of spinning; the first wait is short so a new
+             * request into an empty engine is not delayed. */
             step_batch_.store(nullptr, std::memory_order_release);
             drain_completed();
             sched_.publish(/*idle=*/true);
-            /* Nothing could run because what can run is waiting on the encoder: go round now. */
+            /* Work is waiting only on the encoder: loop immediately. */
             if (sched_.encodes_pending()) { idle = 0; continue; }
-            /* A RELEASE THE LAST STEP DEFERRED AND NO COMMIT WILL NOW MAKE. A request cancelled
-             * while a drafter pass was being built keeps its blocks until the passes that name
-             * them have run (Scheduler::cancel), and commit() is where that normally lands -- an
-             * idle engine runs none, and blocks held by a cancelled request can be exactly what
-             * keep the next one from being admitted. The streams are drained first so no pass
-             * still in flight can be reading those blocks when they are handed on. */
+            /* Release deferred by the last step. A request cancelled while a drafter pass was being
+             * built keeps its blocks until the passes naming them run (Scheduler::cancel), and
+             * commit() normally releases them; an idle engine makes no commit, and those blocks
+             * may be what blocks the next admission. Drain the streams first so no in-flight pass
+             * still reads them. */
             if (sched_.has_deferred()) {
                 for (auto& rk : ranks_) (void)rad_stream_sync(rk->ctx.stream());
                 sched_.release_deferred();
@@ -503,63 +427,6 @@ int Engine::step_loop() {
             tier_tick();
             expire_tick(rad_mono_ns());
             loan_tick(/*idle=*/true);
-            /* RADIANCE_DEBUG_IDLE_SCRUB -- a DIAGNOSTIC, not a fix, and the one question it
-             * answers is whether request N+1 differs from request N because of bytes request N
-             * left behind. The engine is idle here: no sequence is live, so nothing in either the
-             * KV pool or the activation arena is owned by anybody and zeroing all of it is safe.
-             *
-             * `kv` zeroes every KV group's pool -- paged blocks included, which are NOT cleared on
-             * grab (see StateClear in mem/kv.h). `arena` zeroes the buffer plan, which is where
-             * every RAD_BUF_PERSIST buffer lives -- `qsa_tail` and `mtp_qsa_tail` among them, and
-             * those are indexed by SEQUENCE SLOT and are cleared for a new sequence by nothing at
-             * all. `all` does both.
-             *
-             * If the difference survives the scrub, bytes left behind are not its cause. */
-            if (scrub_ && idle == 0) {
-                for (auto& rk : ranks_) {
-                    if (scrub_ & 1)
-                        for (const KVGroupPlan& p : rk->kv.plans()) {
-                            if (!p.base || p.pool_bytes <= 0) continue;
-                            /* `name`, or `name@L`, or `name@LO-HI` -- a LAYER RANGE, because the
-                             * groups are bundles and the layers in one bundle are not one thing.
-                             * kv_attn carries the twelve trunk QSA layers AND the MTP draft head's
-                             * at index 12, and "which of those" is the question the group level
-                             * cannot answer. The pool is layer-major, so a layer is a contiguous
-                             * `layer_stride()` at `base + L * layer_stride()`. */
-                            int64_t lo = 0, hi = p.n_layers - 1;
-                            if (!scrub_groups_.empty()) {
-                                const size_t at = scrub_groups_.find("," + p.name + "@");
-                                const size_t plain = scrub_groups_.find("," + p.name + ",");
-                                if (at == std::string::npos && plain == std::string::npos) continue;
-                                if (at != std::string::npos) {
-                                    const char* q = scrub_groups_.c_str() + at + p.name.size() + 2;
-                                    lo = hi = std::strtoll(q, nullptr, 10);
-                                    if (const char* d = std::strchr(q, '-'))
-                                        if (d < std::strchr(q, ',')) hi = std::strtoll(d + 1, nullptr, 10);
-                                }
-                            }
-                            if (lo < 0) lo = 0;
-                            if (hi > p.n_layers - 1) hi = p.n_layers - 1;
-                            const int64_t stride = p.layer_stride();
-                            for (int64_t L = lo; L <= hi && stride > 0; ++L)
-                                rad_memset_async((char*)p.base + L * stride, 0, stride,
-                                                 rk->ctx.stream());
-                        }
-                    /* The arena's lent top holds expert weights, so it comes back first. */
-                    if ((scrub_ & 2) && !rk->arena_lent.empty()) {
-                        (void)rad_dev_set(rk->device);
-                        (void)rk->mover.reclaim(Mover::kLendArena, 0, &rk->heat);
-                        (void)rk->ctx.set_level(0);
-                        arena_floor_ = cfg_.max_tok;
-                        arena_floor_ns_ = rad_mono_ns();
-                    }
-                    if (scrub_ & 2)
-                        if (void* ab = rk->ctx.arena_base())
-                            if (const int64_t n = rk->ctx.arena_bytes(); n > 0)
-                                rad_memset_async(ab, 0, n, rk->ctx.stream());
-                    rad_stream_sync(rk->ctx.stream());
-                }
-            }
             if (idle < 200) ++idle;
             std::this_thread::sleep_for(std::chrono::microseconds(idle * 5));
             continue;
@@ -567,15 +434,11 @@ int Engine::step_loop() {
         idle = 0;
         if (t_on) phase_mark(PH_PLAN);
 
-        /* A FRESHLY ASSIGNED RECURRENT SLOT IS ZEROED BEFORE THE STEP THAT READS IT. The manager
-         * recorded the grab and cannot do the write itself (StateClear in core/mem/kv.h); this is
-         * the first moment a stream exists and the last before the ranks are released, and it is
-         * off the hot path -- the list is empty on every step but a sequence's first. Every rank
-         * clears its own pool BY ITS OWN PLAN: the slot number is the scheduler's, the memory and
-         * its size are the rank's. A state is as large as the heads this rank holds of the group,
-         * and the ranks' shares need not be equal (rad_arch.h remainder_place): a rank clearing
-         * rank 0's byte count of a larger state leaves its tail as the last sequence left it, and
-         * the recurrence reads it from the first token. */
+        /* Zero freshly assigned recurrent slots before the step that reads them. The manager
+         * records the grab but cannot write (StateClear in core/mem/kv.h); the list is empty except
+         * on a sequence's first step. Each rank clears by its own plan: the slot number is the
+         * scheduler's, but the state size depends on the heads this rank holds, which can differ
+         * per rank (rad_arch.h remainder_place). */
         for (const StateClear& c : ranks_[0]->kv.state_clears()) {
             for (auto& rk : ranks_) {
                 const KVGroupPlan* gp = rk->kv.plan(c.group);
@@ -588,16 +451,13 @@ int Engine::step_loop() {
         }
         ranks_[0]->kv.clear_state_clears();
 
-        /* Which entries want a logits row, in the order BatchBuilder wrote out_ids: entries with
-         * produces_token, 1 + n_spec rows each. Everything downstream indexes off this, because
-         * row index and sequence index are NOT the same -- a prefill chunk in the middle of a long
-         * prompt produces no row at all. */
+        /* Entries that want logits rows, in BatchBuilder's out_ids order: those with
+         * produces_token, 1 + n_spec rows each. Row and sequence indices differ (a mid-prompt
+         * chunk produces no row). */
         const StepPlan& plan = sched_.plan();
-        /* ONE ENTRY PER REQUEST, and the row counter is separate. Sampler::build_step expands
-         * each request into 1 + n_draft rows of its own -- that is where the per-position RNG
-         * coordinate comes from -- so pushing the request once per row here would stage (1+n)^2
-         * rows and overrun the arena whenever a drafter sets Request::n_draft. `first_row` is what
-         * indexes the sampled tokens, so it counts rows and not requests. */
+        /* One entry per request; Sampler::build_step expands each into 1 + n_draft rows itself
+         * (giving each position its RNG coordinate), so one push per row would stage (1+n)^2 rows.
+         * `first_row` indexes sampled tokens, so it counts rows. */
         so.reqs.clear();
         so.first_row.assign(plan.e.size(), -1);
         int32_t logit_row = 0;
@@ -611,31 +471,21 @@ int Engine::step_loop() {
         so.n_rows = logit_row;
         if (const int ss = stage_scored_rows(plan, so); ss < 0) return fail_loop(ss);
 
-        /* THE SAMPLER'S HOST WORK, staged by this lambda either in front of the ranks or -- by
-         * default, see build_mu_ in engine.h -- underneath them. It touches request state and the
-         * host grammar automata, which no rank thread reaches: every upload in the sampler chain
-         * is issued by Sampler::run, after the gate this fills.
+        /* The sampler's host work, run while the ranks enqueue (see build_mu_ in engine.h). It
+         * touches only request state and host grammar automata; Sampler::run issues the uploads
+         * after the gate opens.
          *
-         * CANCELLATIONS ARE COLLECTED, NOT APPLIED. A cancel touches scheduler state that the
-         * rank threads are reading through batch_for() while this runs; they are applied after the
-         * join, ahead of collect_step. */
+         * Cancellations are collected, not applied: the rank threads read scheduler state through
+         * batch_for() meanwhile. They are applied after the join, before collect_step. */
         auto stage_sampler = [&]() -> int {
         if (!so.reqs.empty() && !embedding_) {
-            /* PER-REQUEST SAMPLER STATE IS BUILT HERE, ON FIRST SIGHT. A grammar arrives compiled
-             * from admission and is only positioned here; a DRY sequence-breaker set is resolved
-             * against the vocabulary once. Both belong off the step path, and this is the first
-             * point on the scheduler thread where a request is known to be about to sample.
-             * Without it `seqs_` stays permanently empty, and `grammar` and
-             * `dry_sequence_breakers` are accepted by the API, carried through the request, and
-             * then quietly do nothing -- the one outcome core/server/oai.h's header forbids.
+            /* Per-request sampler state is built on first sight: the grammar (compiled at
+             * admission) is positioned and DRY sequence breakers are resolved against the
+             * vocabulary. Without this, `grammar` and `dry_sequence_breakers` would silently do
+             * nothing. Every rank does it, since each masks its own vocabulary shard.
              *
-             * EVERY RANK, because every rank masks its own vocabulary shard from its own automaton.
-             *
-             * A FAILURE HERE FAILS THE REQUEST, NOT THE ENGINE. A grammar this machine cannot run
-             * (left recursion, say) is a bad request, and taking the server down with it would let
-             * one caller end every other caller's generation. The server compiles at admission so
-             * this should already be unreachable; if it is reached, the request is cancelled with
-             * the reason in the log and the rest of the step goes on. */
+             * A failure (e.g. a left-recursive grammar) cancels the request, not the engine. The
+             * server compiles at admission, so this should be unreachable. */
             for (Request* rq : so.reqs) {
                 if (!rq) continue;
                 bool failed = false;
@@ -660,8 +510,7 @@ int Engine::step_loop() {
             for (auto& rk : ranks_) {
                 const int s = rk->sampler.build_step(so.reqs);
                 if (s < 0) { RAD_ERR("sampler build_step: %s", rad_strerror(s)); return s; }
-                /* A request the sampler could not serve is cancelled, not returned: the step goes
-                 * on for everyone else in the batch. */
+                /* A request the sampler could not serve is cancelled; the step goes on. */
                 for (uint64_t id : rk->sampler.take_failed()) cancel.push_back(id);
             }
             if (t_on) phase_mark(PH_BUILD);
@@ -672,12 +521,10 @@ int Engine::step_loop() {
         cancel.clear();
         int bst = RAD_OK;
 
-        /* ONE LINE PER STEP, on request. The shape of a step -- its phase, how many sequences,
-         * how many tokens each, and what context each is continuing from -- is the first thing
-         * anyone debugging a wrong answer needs, and no other log line carries it: -v prints the
-         * tokenizer and the loader and nothing about the steps that follow. Off by
-         * default because it is a line per step and decode steps are thousands of them. */
-        if (std::getenv("RADIANCE_LOG_STEPS")) {
+        /* RADIANCE_LOG_STEPS: one line per step with its phase and each sequence's slot, query
+         * length and context. Off by default (one line per decode step). */
+        static const bool log_steps = std::getenv("RADIANCE_LOG_STEPS") != nullptr;
+        if (log_steps) {
             std::string s = fmt("step %d %s n_seq=%lld n_tok=%lld", b->step,
                                 b->phase == RAD_PHASE_PREFILL ? "prefill" :
                                 b->phase == RAD_PHASE_DECODE  ? "decode"  : "MIXED",
@@ -688,14 +535,12 @@ int Engine::step_loop() {
             RAD_INFO("%s", s.c_str());
         }
 
-        /* THE RECURRENT HALF OF A PREFIX HIT, restored BEFORE the step that reads it. The adopted
-         * blocks carry the attention layers; this carries the recurrent ones, copied out of the
-         * snapshot's slot in host memory. Enqueued on each rank's own stream ahead of the
-         * release, so it is ordered before the kernels without a synchronisation -- the same way
-         * collect_step's readback is ordered after them.
+        /* Restore the recurrent half of a prefix hit before the step that reads it (the adopted
+         * blocks carry the attention layers), copying from the snapshot's host slot. Enqueued on
+         * each rank's stream before the release, so no synchronisation is needed.
          *
-         * UNDER THE SCHEDULER'S LOCK, because it reads the sequence table, which an HTTP thread's
-         * cancel mutates under that lock. Taken only on a step that has a restore in it. */
+         * Under the scheduler's lock, because an HTTP thread's cancel mutates the sequence table.
+         * Taken only when the step has a restore. */
         bool any_restore = false;
         for (const StepEntry& e : plan.e) if (e.ckpt_restore >= 0) { any_restore = true; break; }
         if (any_restore) {
@@ -703,7 +548,7 @@ int Engine::step_loop() {
                 for (const StepEntry& e : plan.e) {
                     if (e.ckpt_restore < 0) continue;
                     if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
-                    /* The window behind the hit, in the blocks admit_one seeded at its floor. */
+                    /* The window behind the hit, in the blocks admit_one seeded. */
                     if (ranks_[0]->kv.has_window_snapshot() &&
                         !ranks_[0]->kv.window_rows(e.seq, e.ctx_len, &ckpt_win_)) {
                         RAD_ERR("sequence %llu: no window rows at %d to restore into",
@@ -712,7 +557,6 @@ int Engine::step_loop() {
                     }
                     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
                         auto& rk = ranks_[ri];
-                        /* This rank's device, for its own stream and its own state slots. */
                         if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
                         const int s = rk->kv.checkpoint_restore(ckpt_slots_.data(),
                                                                 (int)ckpt_slots_.size(),
@@ -733,16 +577,12 @@ int Engine::step_loop() {
             if (rs < 0) return fail_loop(rs);
         }
 
-        /* WHICH SIDE OF THE BARRIER THE TIME IS ON. Everything above this point is scheduler-thread
-         * work the device is idle for -- build_step, the grammar, the plan; everything between the
-         * two arrivals is the ranks ENQUEUEING, not running. A step that is slow for a host reason
-         * and one that is slow for a device reason look identical in total step time; this split
-         * is the only thing that tells them apart. */
+        /* Host time before the release, with the device idle; time between the two arrivals is
+         * the ranks enqueueing. The split separates host-bound from device-bound steps. */
         if (t_on) phase_mark(PH_PRE);
 
         if (!issued) {
-            /* The gate is reset while every rank is still parked at the release, so there is no
-             * window in which one can read a stale ready flag from the step before. */
+            /* Reset the gate while every rank is parked, so none sees a stale ready flag. */
             {
                 std::lock_guard<std::mutex> lk(build_mu_);
                 build_ready_  = false;
@@ -754,9 +594,7 @@ int Engine::step_loop() {
             step_batch_.store(b, std::memory_order_release);
             barrier_->arrive_and_wait();      /* release the ranks */
             {
-                /* HERE IS THE POINT OF ALL OF IT: the ranks are enqueueing the forward pass and
-                 * the device is running it while this thread stages the sampler and walks the
-                 * grammar. */
+                /* Stage the sampler while the ranks enqueue and the device runs the pass. */
                 bst = stage_sampler();
                 {
                     std::lock_guard<std::mutex> lk(build_mu_);
@@ -767,9 +605,9 @@ int Engine::step_loop() {
             }
             barrier_->arrive_and_wait();      /* wait for them */
         } else {
-            /* THE FORWARD PASS IS ALREADY ON THE CARD, issued behind the last step, and that step
-             * has now committed -- so the sampler is staged from exactly the state it would have
-             * been, and the ranks put the chain behind the pass while the card is still in it. */
+            /* The forward pass was issued ahead and the previous step has now committed, so the
+             * sampler is staged from the correct state and its chain queued behind the running
+             * pass. */
             bst = stage_sampler();
             {
                 std::lock_guard<std::mutex> lk(build_mu_);
@@ -787,27 +625,21 @@ int Engine::step_loop() {
         for (uint64_t id : cancel) sched_.cancel(id);
         cancel.clear();
 
-        /* A staging failure is discovered with the ranks already released, so they have to be
-         * let go before this thread leaves -- the gate above carries the failure, so they have
-         * skipped the sampler and arrived at the join. */
+        /* A staging failure is known only after the ranks were released; the gate passed it to
+         * them, so they skipped the sampler and reached the join. */
         if (bst < 0) return fail_loop(bst);
 
         int st = step_status_.load(std::memory_order_acquire);
         if (st < 0) {
-            /* A device fault is not recoverable in process, and we do not serve from a wedged
-             * queue (spec §17): stop, release anyone parked on the barrier, and return. */
+            /* A device fault is not recoverable in-process (spec §17). */
             RAD_ERR("step %d failed: %s -- the engine cannot continue", b->step, rad_strerror(st));
             return fail_loop(st);
         }
 
-        /* AND THE SNAPSHOT, taken AFTER the step that produced the state. The chunker split this
-         * chunk so its last token IS the checkpoint position, so what copy 0 holds now is exactly
-         * the state at that position. It is a copy across the link into the snapshot's slot in host
-         * memory, issued before collect_step's readback synchronises and ahead of any step issued
-         * behind this one, which is what orders the next write of the state after it.
-         *
-         * Under the scheduler's lock for the reason the restore above is, and only on a step that
-         * writes a checkpoint. */
+        /* Snapshot after the step that produced the state: the chunker ended this chunk at the
+         * checkpoint position, so copy 0 holds exactly that state. The copy to the host slot is
+         * issued before collect_step's readback and before any step issued ahead, which orders the
+         * next write of the state after it. Under the scheduler's lock, as the restore. */
         bool any_save = false;
         for (const StepEntry& e : plan.e)
             if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0) { any_save = true; break; }
@@ -816,10 +648,9 @@ int Engine::step_loop() {
                 for (const StepEntry& e : plan.e) {
                     if (e.ckpt_slot < 0 || e.ckpt_tok < 0) continue;
                     if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
-                    /* The window behind the checkpoint position. The chunk that ends there
-                     * still holds it (its ensure kept the window behind the chunk's first
-                     * query), so a miss is a broken invariant -- and skipping would leave the
-                     * cache a slot it commits as valid with somebody else's pages in it. */
+                    /* The window behind the checkpoint position. The chunk ending there still
+                     * holds it, so a miss is a broken invariant; skipping would commit a slot
+                     * holding another sequence's pages. */
                     if (ranks_[0]->kv.has_window_snapshot() &&
                         !ranks_[0]->kv.window_rows(e.seq, e.ctx_len + e.ckpt_tok + 1,
                                                    &ckpt_win_)) {
@@ -849,19 +680,16 @@ int Engine::step_loop() {
         }
 
         if (t_on) phase_mark(PH_SAVE);
-        /* A SERIAL DRAFTER'S PASSES GO IN BEHIND THE STEP BEFORE ANYTHING WAITS FOR IT. The card
-         * works out the acceptance itself and every pass reads it from there (sched/advance.h),
-         * so the host has nothing to wait for until the step's last pass -- and the one wait below
-         * then covers the whole step. */
-        st = issue_serial_drafter(b->step, b, so);
+        /* Queue the serial drafter's passes behind the step before waiting: the card computes
+         * acceptance itself and every pass reads it there (sched/advance.h), so one wait covers
+         * the whole step. */
+        st = issue_serial_drafter(b->step, so);
         if (st < 0) return fail_loop(st);
         st = mark_step_end(b, so);
         if (st < 0) return fail_loop(st);
-        /* AND THE NEXT STEP'S FORWARD PASS, BEHIND ALL OF IT, before this step is read back. Its
-         * rows continue where the card's acceptance leaves them and verify what the drafter just
-         * proposed; its sampler waits for this step's commit, which it is staged from. So the card
-         * goes from this step's last pass straight into the next step's first, and the host's
-         * wait, commit and staging all happen while it runs. */
+        /* Then the next step's forward pass, before this step is read back. Its rows continue from
+         * the card's acceptance and verify the new drafts; its sampler waits for this step's
+         * commit. The card runs straight on while the host waits, commits and stages. */
         st = issue_ahead(&ahead);
         if (st < 0) return fail_loop(st);
         st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
@@ -872,21 +700,13 @@ int Engine::step_loop() {
             if (st < 0) return fail_loop(st);
         }
 
-        /* The buffer probe, after the trunk step: RADIANCE_DUMP_BUF names the buffers to print
-         * and trace level gates it, because dumping reads device memory back to the host and no
-         * serving run should pay for that. The drafters dump their own buffers after their own
-         * passes, for the reason engine_priv.h gives. */
-        if ((int)log_level() >= (int)Log::Trace)
-            dump_buffers(ranks_[0]->ctx, b->step, std::getenv("RADIANCE_DUMP_BUF"));
+        /* Buffer probe after the trunk step; drafters dump after their own passes. */
+        dump_buffers(ranks_[0]->ctx, b->step);
 
-        /* --profile-ops PRINTS WHILE THE SERVER IS STILL RUNNING rather than once at the end.
-         * The counters are cumulative, so each dump is the run so far and the us/call column is
-         * an average over it; a reader wants the table during the run it is diagnosing.
-         *
-         * Every 32 steps by default, and RADIANCE_PROFILE_EVERY moves it. Per-op timing restores
-         * a synchronisation around every launch -- over a thousand of them a step on a large
-         * model -- so a profiled step is several times slower and 32 of them is minutes. Often
-         * enough to read, rare enough not to bury the log. */
+        /* --profile-ops also prints during the run. Counters are cumulative, so each dump covers
+         * the run so far. Every 32 steps by default (RADIANCE_PROFILE_EVERY): per-op timing
+         * synchronises around every launch (over a thousand per step on a large model), so a
+         * profiled step is several times slower. */
         static const int prof_every = [] {
             const char* v = std::getenv("RADIANCE_PROFILE_EVERY");
             const int n = (v && *v) ? (int)std::strtol(v, nullptr, 10) : 32;
@@ -895,17 +715,13 @@ int Engine::step_loop() {
         if (cfg_.profile_ops && b->step > 0 && (b->step % prof_every) == 0)
             for (auto& rk : ranks_) rk->ctx.dump_profile();
 
-        /* One line a step at -vv. It is the only view of the loop there is: everything else the
-         * engine prints happens at startup, so a request that goes in and never comes out looks
-         * exactly like a request that never arrived. */
+        /* One line per step at -vv, the only log view of the loop itself. */
         RAD_TRACE("step %d: %lld tok / %lld seq, %lld logit row(s) -> tokens %s", b->step,
                   (long long)b->n_tok, (long long)b->n_seq, (long long)b->n_out,
                   so.token.empty() ? "(none)" : fmt("%d%s", so.token[0],
                                                     so.token.size() > 1 ? " ..." : "").c_str());
-        /* AND WHAT WENT IN. Every op in the forward pass can agree with the reference and the
-         * answer still be wrong if the ids are not the ids the model was trained on; the two look
-         * identical from the logits, which is why this is printed beside them rather than left to
-         * be inferred. Bounded at 32 because a 2048-token prefill's ids are not a log line. */
+        /* And the input ids (first 32): wrong ids look like a wrong forward pass from the logits
+         * alone. */
         if ((int)log_level() >= (int)Log::Trace && b->n_tok > 0 && b->token_ids) {
             std::string ids;
             const int64_t n = std::min<int64_t>(b->n_tok, 32);
@@ -931,19 +747,15 @@ int Engine::step_loop() {
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
 
-        /* THE DRAFTER FOR THE NEXT STEP. A block drafter runs here, because its passes are staged
-         * from the committed sequence; a serial one already ran on the card behind the step, and
-         * what is left is to check its acceptance against the host's and publish its proposals.
-         *
-         * ONE SWITCH ON A DECLARED SHAPE, not on a model. Both drivers return RAD_OK immediately
-         * when the declared kind is not theirs, so a program with no drafter costs a compare. */
+        /* The drafter for the next step. A block drafter runs here, since its passes are staged
+         * from the committed sequence. A serial one already ran on the card; what remains is to
+         * check its acceptance against the host's and publish its proposals. Both drivers return
+         * immediately for a kind that is not theirs. */
         st = drafter_.kind == RAD_DRAFT_BLOCK ? run_block_drafter(b->step)
                                               : finish_serial_drafter(so);
         if (st < 0) return fail_loop(st);
-        /* AND NOW THE STEP IS OVER. The draft rounds above are forward passes and they belong to
-         * the step that paid for them; charging the step at commit would leave them in the gap
-         * between one iteration and the next, which nothing measures. Scheduler::step_finished
-         * says what that costs. */
+        /* The step ends here, after its draft rounds, so step timing includes them
+         * (Scheduler::step_finished). */
         sched_.step_finished();
         tier_tick();
         loan_tick(/*idle=*/false);
@@ -953,10 +765,8 @@ int Engine::step_loop() {
         drain_completed();
         sched_.publish(/*idle=*/false);
 
-        /* ONE LINE EVERY 128 STEPS, and it adds up to the step. `ranks` is the enqueue, not the
-         * execution: the device work is waited for in `collect`, which is the only host
-         * synchronisation a step has, so `collect` is where device time shows up and any host
-         * cost the ranks could have been running under is time `collect` did not get to hide. */
+        /* One line every 128 steps; the phases sum to the step. `ranks` is the enqueue; device time
+         * shows up in `collect`, the step's only host synchronisation. */
         if (t_on) {
             phase_mark(PH_DRAFT);
             if (++phase_n_ == 128) {
@@ -978,10 +788,10 @@ int Engine::step_loop() {
     return RAD_OK;
 }
 
-/* THE SAMPLED IDS ON THEIR WAY TO THE HOST: a copy into pinned memory behind the sampler, and
- * nothing waited for. Issued by the serial drafter before its passes -- a head that samples
- * through the sampler's own buffer overwrites the ids -- and otherwise right before the wait. */
-int Engine::collect_issue(const RadBatch* b, StepOut& so) {
+/* Issue the copy of the sampled ids into pinned memory behind the sampler, without waiting.
+ * Issued by the serial drafter before its passes (a head sampling through the sampler's buffer
+ * overwrites the ids), otherwise just before the wait. */
+int Engine::collect_issue(StepOut& so) {
     so.rb = nullptr;
     so.lg.clear();
     if (so.n_rows <= 0) return RAD_OK;
@@ -995,11 +805,8 @@ int Engine::collect_issue(const RadBatch* b, StepOut& so) {
     if (!so.rb) return RAD_E_NOMEM;
     RAD_TRY(rad_memcpy_async(so.rb, src, (int64_t)so.n_rows * 4, r0.ctx.stream()));
 
-    /* THE FIRST FEW LOGITS, at -vv. There is no other window into the forward pass: rad-kbench can
-     * falsify one op against the oracle but nothing compares a whole layer, so when every op agrees
-     * and the model still answers the same token to every prompt, the question "are the logits even
-     * a function of the input" has no cheaper answer than looking. One copy on a path that already
-     * synchronises, and only when the operator asked for trace. */
+    /* The first logits row at -vv, the only direct view of the forward pass's output (rad-kbench
+     * checks single ops, not whole layers). */
     const int64_t nv = meta_.n_vocab;
     if ((int)log_level() >= (int)Log::Trace && nv > 0) {
         void* lp = r0.ctx.buf_ptr(r0.program.logits_buf);
@@ -1013,13 +820,12 @@ int Engine::collect_issue(const RadBatch* b, StepOut& so) {
 
 int Engine::mark_step_end(const RadBatch* b, StepOut& so) {
     if (embedding_) RAD_TRY(collect_pooled_issue(b, so));
-    else if (so.n_rows > 0 && !so.rb) RAD_TRY(collect_issue(b, so));
+    else if (so.n_rows > 0 && !so.rb) RAD_TRY(collect_issue(so));
     return rad_event_record(step_end_, ranks_[0]->ctx.stream());
 }
 
-/* AN EMBEDDING STEP'S ANSWER, ON ITS WAY TO THE HOST: the pooled buffer's first n_seq rows, copied
- * into pinned memory behind the pass on rank 0's stream -- every rank holds the same vectors, so
- * one copy is the answer. Nothing waits here; collect_pooled does, once. */
+/* Issue the copy of an embedding step's pooled rows (the first n_seq) into pinned memory on rank
+ * 0's stream; every rank holds the same vectors. collect_pooled waits. */
 int Engine::collect_pooled_issue(const RadBatch* b, StepOut& /*so*/) {
     if (b->n_seq <= 0) return RAD_OK;
     Rank& r0 = *ranks_[0];
@@ -1033,9 +839,8 @@ int Engine::collect_pooled_issue(const RadBatch* b, StepOut& /*so*/) {
                             r0.ctx.stream());
 }
 
-/* Each sequence's vector to its request's sink, and the step's three per-sequence arrays set so
- * the commit FINISHES every request it carried: an embedding request is one step long. The token
- * is never emitted (Request::embed), so its value is irrelevant; eos is what ends the request. */
+/* Hand each sequence's vector to its sink, and set eos for every sequence so the commit finishes
+ * it: an embedding request is one step long. The token is never emitted (Request::embed). */
 int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
     const StepPlan& plan = sched_.plan();
     so.token.assign(plan.e.size(), 0);
@@ -1062,13 +867,11 @@ int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
     return RAD_OK;
 }
 
-/* THE SCORED ROWS (Request::token_scores): the logits row at a scored prompt's last position, on
- * its way to the host before the sampler can rewrite it in place. Three parts, on three threads'
- * turns: which rows, decided with the rows themselves and while every rank is parked
- * (stage_scored_rows); one copy a row on each rank's own stream, right ahead of its sampler
- * (issue_scored_rows); and each request's ids read out of the staging after the step's one wait
- * (collect_scored_rows), which is ahead of the commit that finishes the request. A whole row
- * crosses, not the ids: one copy of 512 KB at a 128K vocabulary is cheaper than a copy an id. */
+/* Scored rows (Request::token_scores): the logits row at a scored prompt's last position, copied
+ * to the host before the sampler can rewrite it in place. stage_scored_rows picks the rows while
+ * every rank is parked; issue_scored_rows copies one row per rank stream ahead of its sampler;
+ * collect_scored_rows reads each request's ids after the step's wait, before the commit. A whole
+ * row is copied (512 KB at a 128K vocabulary), which is cheaper than one copy per id. */
 int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so) {
     score_rows_.clear();
     if (embedding_) return RAD_OK;
@@ -1132,11 +935,9 @@ int Engine::collect_scored_rows() {
     return RAD_OK;
 }
 
-/* One sampled row's logprobs into the step's table, which is sized on the first row that asks.
- * A ROW WHOSE LOGPROBS CANNOT BE COMPUTED FAILS ITS REQUEST, NOT THE STEP: its numbers are not
- * finite (RAD_E_INVAL), so its entry is left at token -1 (TokenLogprobs), which the scheduler
- * answers by failing that request with the reason, and every other sequence in the batch goes on.
- * A row outside the step, or one that was never staged for logprobs, is the engine's own fault. */
+/* One sampled row's logprobs into the step's table, sized on first use. A non-finite row
+ * (RAD_E_INVAL) is left at token -1, and the scheduler fails only that request. A row outside the
+ * step, or never staged for logprobs, is an engine error. */
 int Engine::row_logprobs(StepOut& so, int32_t row, int32_t token) {
     if (so.lp.empty()) so.lp.resize((size_t)so.n_rows);
     if (row < 0 || row >= so.n_rows) return RAD_E_STATE;
@@ -1146,9 +947,8 @@ int Engine::row_logprobs(StepOut& so, int32_t row, int32_t token) {
     return s;
 }
 
-/* Wait for the sampled ids and turn them into the three per-sequence arrays the scheduler wants.
- * This is the ONE host synchronisation on the step path: the host needs the tokens to commit them
- * and to stream them. Everything else in a step is enqueued and never waited on (spec §5.4). */
+/* Wait for the sampled ids and build the scheduler's per-sequence arrays. The step path's only
+ * host synchronisation: the host needs the tokens to commit and stream them (spec §5.4). */
 int Engine::collect_step(const RadBatch* b, StepOut& so) {
     const StepPlan& plan = sched_.plan();
     so.token.assign(plan.e.size(), 0);
@@ -1158,8 +958,7 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
     if (so.n_rows <= 0) return RAD_OK;
 
     so.rows.resize((size_t)so.n_rows);
-    /* The step's one wait. For the step's end and not for the stream: a step issued ahead is
-     * behind it, and the host's commit and staging are what that step runs over. */
+    /* Wait on the step-end event, not the stream: a step issued ahead is queued behind it. */
     RAD_TRY(rad_event_sync(step_end_));
     std::memcpy(so.rows.data(), so.rb, (size_t)so.n_rows * sizeof(int32_t));
     so.rb = nullptr;
@@ -1167,9 +966,8 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
     const std::vector<float>& lg = so.lg;
     const int64_t nv = meta_.n_vocab;
     if (!lg.empty()) {
-        /* The top three of the first sampled row. A sampler that answers the same token to every
-         * prompt is either reading a distribution with a fixed spike in it or not reading the
-         * distribution at all, and the two look identical from outside. */
+        /* Top three of the first sampled row, to tell a fixed spike in the distribution from a
+         * sampler that ignores it. */
         int64_t i0 = 0, i1 = 0, i2 = 0;
         for (int64_t i = 1; i < nv; ++i) {
             if (lg[(size_t)i] > lg[(size_t)i0])      { i2 = i1; i1 = i0; i0 = i; }
@@ -1189,76 +987,47 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
         const StepEntry& e = plan.e[i];
 
         if (e.n_spec > 0) {
-            /* THE COMPARISON IS AGAINST THE TARGET'S OWN SAMPLED TOKEN, AND THAT IS EXACT AT ANY
-             * TEMPERATURE. It looks as though everything but temperature 0 has to be refused: a
-             * positive temperature needs rejection sampling, and rejection sampling needs the
-             * target's probability planes, which this path does not bring back. Both halves are
-             * true and the conclusion does not follow, because there is a third rule that needs
-             * no planes at all:
+            /* Accept draft[k] when it equals the token the target itself drew at position k. This
+             * is exact at any temperature without rejection sampling or probability planes,
+             * because the sampler gives every verified position its own RNG coordinate
+             * (`p.pos = n_out + k`, sampler.cpp): y_k is the target's own draw at that output
+             * position, and each later token is conditioned on a prefix accepted only because it
+             * matched. The output is a draw from the target.
              *
-             *   accept draft[k] when it equals the token the target ITSELF drew at position k.
+             * It is not byte-identical to non-speculative decoding above temperature 0: a verify
+             * step computes 1 + n_spec rows and split-K depends on M, so logits differ slightly
+             * and a pick near a CDF boundary can flip. Greedy output matches exactly; both are
+             * deterministic.
              *
-             * That is exact because the sampler gives every verified position its own RNG
-             * coordinate -- `p.pos = n_out + k`, "its randomness is the same whether it arrived
-             * through speculation or one token at a time" (sampler.cpp). So y_k is the draw the
-             * target's own distribution specifies at that output position. The first emitted token
-             * is y_0 whether or not the draft agreed; every later one is conditioned on a prefix
-             * that was accepted only because it matched, so the conditioning is the one the target
-             * asked for. The emitted sequence is a draw from the target, not an approximation of
-             * one.
-             *
-             * IT IS NOT, HOWEVER, BYTE-IDENTICAL TO A NON-SPECULATIVE RUN ABOVE TEMPERATURE 0, and
-             * that is worth stating because the paragraph above sounds like it should be. The rule
-             * is exact given the same logits; the logits themselves are shape-dependent, because a
-             * verify step computes 1 + n_spec rows where a decode step computes one and split-K
-             * picks its count from M. At temperature 0 that survives the argmax and the text
-             * matches exactly. Above it a sampled pick near a CDF boundary can land the other way,
-             * so spec and non-spec agree on most prompts and not all -- deterministic and
-             * reproducible either way, and a property of the GEMMs rather than of acceptance.
-             *
-             * It accepts less often than optimal rejection sampling -- P(y == x) rather than
-             * min(1, p/q) -- and that is the whole price. Refusing instead would cost the request
-             * every drafted token AND take the step down with it, failing every other request
-             * batched alongside, for the common case of a client that left temperature at 1.
-             *
-             * `so.rows` is the sampler's OUTPUT, which is the sampled token -- at temperature 0
-             * that is the argmax, which is why the greedy-acceptance name still fits. */
+             * The cost is a lower acceptance rate than rejection sampling (P(y == x) instead of
+             * min(1, p/q)). `so.rows` holds the sampled tokens (the argmax at temperature 0). */
             if (!e.req) continue;
             int32_t out[RAD_SCHED_MAX_SPEC + 1] = { 0 };
             int32_t acc = 0;
             RAD_TRY(accept_greedy(e.draft, e.n_spec, &so.rows[(size_t)so.first_row[i]], out, &acc));
 
-            /* THE TURN CAN END IN THE MIDDLE OF AN ACCEPTED RUN, and stopping only on the last
-             * token of it is how the engine generates past the end of a turn. accept_greedy stops
-             * at the first DISAGREEMENT, not at the first end-of-generation token -- and a drafter
-             * that correctly predicts the model is about to stop AGREES about the stop token, so
-             * the run continues past it. Everything after it is the model writing the next turn:
-             * `<|im_end|><|im_start|>user ...` decoded, with the control tokens rendering as
-             * nothing, which reads as a model that rambles rather than as a bug in the accept
-             * path. Truncating here rather than in the scheduler keeps one definition of "how far
-             * did this step get" -- `accepted` and `token` are what the KV rollback, the conv
-             * cursor and the emitted text are all derived from. */
-            for (int32_t j = 0; j <= acc; ++j) {
-                if (vocab_ && vocab_->is_eog(out[j])) { acc = j; break; }
-            }
+            /* Truncated at the first end-of-generation token, so `accepted` and `token` (which
+             * drive the KV rollback, the conv cursor and the emitted text) say how far the step
+             * really got. */
+            acc = accept_cut_at_eog(out, acc,
+                                    [&](int32_t t) { return vocab_ && vocab_->is_eog(t); });
 
             so.accepted[i] = acc;
             so.token[i]    = out[acc];
             so.eos[i]      = vocab_ && vocab_->is_eog(so.token[i]) ? 1 : 0;
-            /* Each emitted token's logprobs from its own row: an accepted draft is the token the
-             * target drew at its position, so its row is the distribution it came from. */
+            /* Each emitted token's logprobs come from its own row, the distribution it was drawn
+             * from. */
             if (e.req && e.req->sp.n_probs >= 0)
                 for (int32_t j = 0; j <= acc; ++j)
                     RAD_TRY(row_logprobs(so, so.first_row[i] + j, out[j]));
-            /* EVERY token that leaves, in order: the grammar's state has to advance over the
-             * accepted drafts too, or the next step's mask is built n_accepted tokens behind.
-             * Bounded by the truncated `acc`, so it sees exactly the tokens the client does. */
+            /* Advance the grammar over every emitted token, accepted drafts included, up to the
+             * truncated `acc`, so it sees exactly what the client sees. */
             if (e.req)
                 for (auto& rk : ranks_)
                     for (int32_t j = 0; j <= acc; ++j) {
                         const int as = rk->sampler.accept_token(e.req->id, out[j]);
-                        /* A parse that outgrew the grammar's bounds is the request's, not a
-                         * defect: the backend is dead and the request fails at its next mask. */
+                        /* A parse that outgrew the grammar's bounds fails the request at its next
+                         * mask; not an engine defect. */
                         if (as == RAD_E_FULL || as == RAD_E_NOMEM)
                             RAD_WARN("engine: req %llu: its grammar's parse outgrew the bounds a "
                                      "grammar may use at token %d; the request fails at its next "
@@ -1277,19 +1046,14 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
         so.eos[i]   = vocab_ && vocab_->is_eog(so.token[i]) ? 1 : 0;
         if (e.req && e.req->sp.n_probs >= 0)
             RAD_TRY(row_logprobs(so, so.first_row[i], so.token[i]));
-        /* The grammar must see the token it just emitted, or the next step's mask is built from a
-         * state one token behind the sequence. EVERY rank, not just rank 0: each rank builds the
-         * mask for its own vocabulary shard from its own automaton, so a rank whose grammar did
-         * not advance masks the next step against the previous token's state. */
+        /* Advance the grammar on every rank: each builds the mask for its own vocabulary shard from
+         * its own automaton. */
         if (e.req)
             for (auto& rk : ranks_) rk->sampler.accept_token(e.req->id, so.token[i]);
     }
 
-    /* WHETHER EACH REQUEST MAY BE SPECULATED ON NEXT STEP, decided HERE and not in the block that
-     * starts requests, because the answer changes exactly where this loop just changed it: a lazy
-     * grammar becomes constraining inside accept_token, above. Deciding it any later means the
-     * scheduler sizes the next step from a stale answer and hands a constrained request a draft
-     * the sampler will then refuse. */
+    /* Update may_speculate here, because a lazy grammar becomes constraining inside accept_token
+     * above; a stale value would give a constrained request a draft the sampler refuses. */
     for (size_t i = 0; i < plan.e.size(); ++i) {
         const StepEntry& e = plan.e[i];
         if (!e.req) continue;
@@ -1299,59 +1063,37 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
     return RAD_OK;
 }
 
-/* Requests that reached a terminal state. The server drains the text through the sink and calls
- * reap(), which is what finally lets the Request go -- only the HTTP thread knows when it has
- * stopped writing into it. All this does is drop the sampler's per-request host state. */
-/* ------------------------------------------------------------------ the idle-tier tick */
-/* EVERY ITERATION, ON BOTH PATHS. A copy to host memory is asynchronous and reported when its
- * event has signalled, so the tick that collects it is simply the first one after it landed; the
- * next copy is handed out on the same tick. Tying either to a slower clock would only delay the
- * moment a finished conversation's VRAM can be given up. Room in a full arena is made at once
- * when the host tier has refused a copy for want of it, since that copy is waiting on it.
+/* ------------------------------------------------------------------ the KV loan */
+/* The only place the boundary between the KV cache and the expert slab moves.
  *
- * THE SCHEDULER'S LOCK IS HELD FOR THE BOOKKEEPING ONLY. Planning a batch and reporting one touch
- * rank 0's manager, the prefix cache and -- through the tiers' drop sinks -- the index an HTTP
- * thread's cancel also changes; issuing the transfers and polling them touch none of that, and a
- * transfer's records are pending the whole time it is out, which is what keeps everything else off
- * them without a lock. */
-/* THE ONE PLACE THE BOUNDARY BETWEEN THE KV CACHE AND THE EXPERT SLAB MOVES.
+ * The budget divides the card once at startup, so an unused KV block is VRAM no expert can use.
+ * The cache therefore lends what it does not hold at addresses it already owns: no allocation,
+ * mapping or driver call. There is exactly one lender, so the same memory is never in two pools.
  *
- * The budget divides the card once, at startup: a KV block nothing holds is VRAM no expert can
- * use, and an expert that does not fit is read across the link on the critical path of every step
- * that routes to it. The cache therefore LENDS what it is not holding, at the addresses it already
- * owns -- nothing is allocated, mapped or released, so the loan moves with no driver call and the
- * card's free VRAM is the same before and after. There is exactly one lender: two owners with two
- * opinions about how much is spare is the same memory in two pools.
+ * The order is the safety argument:
  *
- * THE ORDER IS THE WHOLE SAFETY ARGUMENT:
- *
- *   1. the cache says what it can spare -- above the highest block it holds, less its buffer;
- *   2. the cache's mark is set from the larger of that and what every rank's slab ACTUALLY
- *      HOLDS -- a shrink is met as units leave the slots, and reading the offer instead would put
- *      the same blocks in both pools;
+ *   1. the cache reports what it can spare (above its highest held block, less its buffer);
+ *   2. the cache's mark is set to the larger of that and what any rank's slab actually holds, so
+ *      a shrink completes only as units leave the slots;
  *   3. only then are the slabs told the offer, which they fill into or drain out of.
  *
- * A request that cannot wait for a shrink does not wait for one: the cache calls back into every
- * slab and has the blocks at once (KVManager::set_reclaim, installed in start()). */
+ * A request that cannot wait for a shrink takes the blocks at once through a callback into every
+ * slab (KVManager::set_reclaim, installed in start()). */
 void Engine::loan_tick(bool idle) {
     if (!lending_) return;
     const uint64_t now = rad_mono_ns();
     if (now - loan_last_ns_ < 100000000ull) return;    /* 100 ms */
     loan_last_ns_ = now;
 
-    /* UNDER THE SCHEDULER'S LOCK: the loan moves rank 0's live mark and free count, which an HTTP
-     * thread's cancel changes under that lock when it frees a sequence, and /metrics reads them
-     * under it. */
+    /* Under the scheduler's lock: the loan moves rank 0's live mark and free count, which an HTTP
+     * thread's cancel changes and /metrics reads under that lock. */
     const auto lk = sched_.hold();
     Rank& lead = *ranks_[0];
 
-    /* A FINISHED CONVERSATION'S VRAM IS ALREADY FREE by the time this runs: tier_tick gives up
-     * every entry whose host copy has landed, so what the cache can spare below counts it. */
-    /* WHAT THE CACHE CAN DO WITHOUT, AND WHAT THE SLABS STILL OCCUPY. A loan grows as soon as the
-     * cache can spare it -- the slots are filled on the next dispatch or the next idle tick -- but
-     * only by at least a prefill chunk, so a cache breathing by a few blocks does not have its
-     * boundary chase it. It shrinks at once, and the cache gets the blocks back as the slabs
-     * leave them: the cache's mark is never above the deepest slot any rank's slab still holds. */
+    /* tier_tick has already released every entry whose host copy landed, so `spare` counts
+     * finished conversations. The loan grows only in steps of at least a prefill chunk, so small
+     * fluctuations do not move the boundary; it shrinks at once, the cache regaining blocks as the
+     * slabs vacate them. */
     const int64_t cur   = lead.kv.loan_tokens();
     const int64_t spare = lead.kv.spare_tokens();
     const int64_t chunk = std::max<int64_t>(cfg_.max_tok, 1);
@@ -1360,10 +1102,8 @@ void Engine::loan_tick(bool idle) {
     int64_t held = 0;
     for (auto& r : ranks_) held = std::max(held, r->mover.loan_held(Mover::kLendKV));
 
-    /* THE CACHE FIRST WHEN THE LOAN GROWS, THE SLABS FIRST WHEN IT SHRINKS. Either way no block is
-     * both handed out by the cache and a slot in a slab: a growing loan is lent only once the
-     * cache has stopped handing those blocks out, and a shrinking one is returned to the cache
-     * only as the slabs leave it. */
+    /* The cache moves first when the loan grows, the slabs first when it shrinks, so no block is
+     * ever both a cache block and a slab slot. */
     if (lead.kv.set_loan(std::max(offer, held)) < 0) {
         RAD_ERR("kv loan: the cache refused a loan of %lld tokens it said it could spare; lending "
                 "stops", (long long)std::max(offer, held));
@@ -1384,34 +1124,27 @@ void Engine::loan_tick(bool idle) {
 }
 
 /* ------------------------------------------------------------------ the arena's level */
-/* WHICH LEVEL THE STEP RUNS AT, AND WHAT THE SLAB MAY KEEP OF THE ARENA WHILE IT DOES.
+/* Pick the step's arena level and how much of the arena the slab may keep. A step's rows are its
+ * tokens or, for the drafter's passes, one per drafted position per sequence; the smallest level
+ * serving that many is used, else the full plan, which lends nothing.
  *
- * The rows a step puts through the arena are its tokens and, after it, the drafter's passes --
- * at most one row per drafted position of every sequence. The smallest level serving that many is
- * the one the step runs at; a step larger than every level runs at the full plan, which lends
- * nothing.
- *
- * A LEVEL THAT NEEDS MORE THAN THE SLAB LEFT IT TAKES IT BACK BEFORE THE STEP, synchronously: the
- * units in the slots it needs go back to their host copies, which is a change of address and not
- * a copy, and both streams that can read a slot are drained before this returns. The first chunk
- * of a prefill pays that once; the chunks after it find the memory already theirs, because the
- * loan does not grow again until the steps have been small for a while (arena_tick). */
+ * If the level needs memory the slab holds, it is reclaimed synchronously before the step: units
+ * in those slots revert to their host copies (an address change, not a copy) and both streams
+ * that can read a slot are drained. A prefill pays this on its first chunk only, since the loan
+ * does not regrow until steps have been small for a while (arena_tick). */
 int Engine::arena_step(const RadBatch* b) {
     if (arena_rows_.size() <= 1 || !b) return RAD_OK;
-    /* AN ENCODER PASS TAKES THE FULL PLAN: its activations are sized by the pass, not by a step's
-     * rows, and only the full plan holds them (a plugin declares them small under shape_probe). */
+    /* An encoder pass needs the full plan: its activations are sized by the pass, and a plugin
+     * declares them small under shape_probe. */
     const int64_t need = b->enc ? INT64_MAX : std::max<int64_t>(
         b->n_tok, (int64_t)b->n_seq * (1 + std::max(cfg_.n_spec, 0)));
-    int level = 0;
-    for (size_t k = 1; k < arena_rows_.size(); ++k)
-        if (arena_rows_[k] >= need && (level == 0 || arena_rows_[k] < arena_rows_[(size_t)level]))
-            level = (int)k;
+    const int level = arena_level(need);
     const uint64_t now = rad_mono_ns();
     arena_last_ = arena_rows_[(size_t)level];
     if (arena_last_ >= arena_floor_) { arena_floor_ = arena_last_; arena_floor_ns_ = now; }
-    /* Whether the step after this one goes on with a prompt, for the stager to stage that step's
-     * first layers at this one's end. A step issued ahead is a decode step and the plan the
-     * scheduler holds is not its own, so it never says so. */
+    /* Whether the next step continues a prompt, so the stager stages its first layers at this
+     * step's end. Never for a step issued ahead (a decode step whose plan the scheduler does not
+     * hold). */
     const bool more = b->phase != RAD_PHASE_DECODE && sched_.prefill_continues();
     for (auto& r : ranks_) {
         const int64_t allow = r->arena_lent[(size_t)level];
@@ -1426,29 +1159,36 @@ int Engine::arena_step(const RadBatch* b) {
             }
         }
         RAD_TRY(r->ctx.set_level(level));
-        /* The full plan lends nothing, so its top -- the staging region -- is the step's. */
-        r->stager.set_full_arena(level == 0);
+        /* The full plan lends nothing, so its top (the staging region) is the step's ring; the
+         * span's shared level keeps a place of its own for it (stager.h); every other level
+         * lends both. */
+        char* const ring = level == 0 ? r->stager.ring_full()
+                         : arena_last_ == arena_span_rows_ && r->arena_low_off >= 0
+                               ? r->stager.ring_low() : nullptr;
+        r->stager.set_ring(ring);
+        /* The next step's first layers go ahead only from the full plan, into the region at the
+         * top that no level's buffers use. At the shared level the ring is memory the full plan
+         * computes in, and a copy still going there when such a step starts would race it; a
+         * pass's own copies are behind its own ops, which wait for them. */
         r->stager.set_next_prefill(more && level == 0);
     }
     if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
     return RAD_OK;
 }
 
-/* THE LOAN GROWS ONLY ONCE THE LARGE STEPS HAVE STOPPED. A prefill is a run of chunks with decode
- * steps between them, and lending the arena out after every chunk would refill the slab across
- * the link and recall it at the next one. So the floor -- the largest step seen -- holds for two
- * seconds after it was last reached, and only then falls to the size of the latest step. */
+int Engine::arena_level(int64_t rows) const { return arena_level_for(arena_rows_, rows); }
+
+/* The arena loan grows only after large steps stop. A prefill is chunks with decode steps between,
+ * and lending after every chunk would refill and recall the slab each time. So the floor (the
+ * largest step seen) holds for two seconds after it was last reached, then falls to the latest
+ * step's size. */
 void Engine::arena_tick(uint64_t now_ns) {
     if (arena_rows_.size() <= 1) return;
     if (arena_last_ < arena_floor_ && now_ns - arena_floor_ns_ > 2000000000ull) {
         arena_floor_ = arena_last_;
         arena_floor_ns_ = now_ns;
     }
-    int level = 0;
-    for (size_t k = 1; k < arena_rows_.size(); ++k)
-        if (arena_rows_[k] >= arena_floor_ &&
-            (level == 0 || arena_rows_[k] < arena_rows_[(size_t)level]))
-            level = (int)k;
+    const int level = arena_level(arena_floor_);
     for (auto& r : ranks_) {
         const int64_t want = r->arena_lent[(size_t)level];
         if (want <= r->mover.loan(Mover::kLendArena)) continue;
@@ -1458,6 +1198,15 @@ void Engine::arena_tick(uint64_t now_ns) {
     if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
 }
 
+/* ------------------------------------------------------------------ the idle-tier tick */
+/* Runs every iteration, busy or idle. A host copy is reported once its event signals, so the
+ * first tick after it lands collects it and hands out the next; a slower clock would only delay
+ * releasing a finished conversation's VRAM. When the host tier has refused a copy for lack of
+ * arena room, room is made at once.
+ *
+ * The scheduler's lock covers only the bookkeeping (planning and reporting touch rank 0's
+ * manager, the prefix cache and the index an HTTP cancel changes). Issuing and polling touch none
+ * of that, and a transfer's records stay pending while it is out. */
 void Engine::tier_tick() {
     Rank& lead = *ranks_[0];
     if (!pump_ || !lead.tierx.enabled()) return;
@@ -1474,9 +1223,8 @@ void Engine::tier_tick() {
         }
         if (ranks_.size() > 1) (void)rad_dev_set(lead.device);
         if (all) {
-            /* A COPY IS GOOD ONLY IF EVERY RANK'S SHARD LANDED. One that did not leaves an entry
-             * whose host copy is part this card's bytes and part stale, which is not restorable
-             * anywhere, so the whole batch is a failure and every slot goes back. */
+            /* A copy is good only if every rank's shard landed; otherwise the host copy is
+             * partly stale, so the whole batch fails and every slot goes back. */
             const std::vector<char> ok(P.copy.size(), good ? 1 : 0);
             {
                 const auto lk = sched_.hold();
@@ -1503,14 +1251,10 @@ void Engine::tier_tick() {
     }
 
     /* ---- what is not live leaves VRAM -------------------------------------------------------- */
-    /* AS SOON AS ITS COPY HAS LANDED, WHILE THE EXPERT SLAB HAS A USE FOR THE BLOCKS. An entry no
-     * running sequence reads and whose host copy is in place costs nothing to give up -- a later
-     * turn restores it in a copy -- and its blocks are lent to the slab. With no lender, or a slab
-     * whose loan already covers every slot it has, the blocks would sit empty in the pool, so the
-     * entry stays where the next turn finds it for free; a request that needs the room takes it
-     * through trim, which drops the same entries on demand.
-     *
-     * NOT THE SNAPSHOTS: they are in host memory already and hold no VRAM. */
+    /* Release an entry once its host copy has landed, if the expert slab can use the blocks; a
+     * later turn restores it with a copy. Otherwise (no lending, or the loan already covers every
+     * slab slot) it stays in VRAM, and a request needing room takes it through trim. Snapshots
+     * are already in host memory. */
     if (lending_) {
         int64_t ceiling = 0;
         for (auto& r : ranks_) ceiling = std::max(ceiling, r->mover.loan_ceiling(Mover::kLendKV));
@@ -1519,8 +1263,8 @@ void Engine::tier_tick() {
     }
 
     /* ---- capacity ---------------------------------------------------------------------------- */
-    /* WHEN THE ARENA HAS REFUSED A COPY: the oldest host-only entries make room for it. The drops
-     * move no bytes, so the plan is reported as soon as it is made. */
+    /* When the host arena refused copies, drop host-only entries worth less than them to make
+     * room (IdleTiers::plan). Drops move no bytes, so the plan is reported at once. */
     if (lead.tiers.starved()) {
         std::vector<TierJob> jobs;
         lead.tiers.plan(P.slow_budget, &jobs);
@@ -1547,14 +1291,13 @@ bool Engine::flush_copies() {
     Rank& lead = *ranks_[0];
     bool landed = false;
     const uint64_t t0 = rad_mono_ns();
-    /* Counted only when something was in flight or waiting: a call that found nothing to land
-     * stalled nobody. */
+    /* Counted only when something was in flight or waiting. */
     struct Note {
         IdleTiers& t; uint64_t t0; bool worked = false;
         ~Note() { if (worked) t.note_flush((int64_t)(rad_mono_ns() - t0)); }
     } note{lead.tiers, t0};
-    /* BOUNDED: each round lands one batch of P.max_copy entries, and a pool short of more than
-     * that many rounds' worth is a pool the tiers cannot relieve in one step. */
+    /* Bounded: each round lands one batch of P.max_copy entries; a larger shortfall cannot be
+     * relieved in one step. */
     for (int round = 0; round < 64; ++round) {
         if (!P.copy.empty()) {
             note.worked = true;
@@ -1582,16 +1325,18 @@ bool Engine::flush_copies() {
     return landed;
 }
 
+/* Drop the sampler's per-request state for requests that reached a terminal state. The server
+ * drains their text through the sink and calls reap(), which releases the Request; only the HTTP
+ * thread knows when it has stopped writing. */
 void Engine::drain_completed() {
-    /* TAKEN, NOT READ. The list is appended to by HTTP threads' cancels, so walking it by
-     * reference would race them; and nothing else consumes it -- the server learns of a terminal
-     * request through its sink and reaps it on its own -- so each id is seen here exactly once and
-     * the cost stays proportional to what finished rather than to everything that ever has. */
+    /* Taken, not read: HTTP cancels append to the list, and nothing else consumes it, so each id
+     * is seen exactly once. */
     sched_.take_completed(&done_);
     for (uint64_t id : done_) for (auto& rk : ranks_) rk->sampler.end_request(id);
 }
 
-int Engine::serve() {
+int Engine::serve(std::unique_ptr<StallWatch> watch) {
+    startup_watch_ = std::move(watch);
     if (ranks_.empty() || !ranks_[0]->ctx.program()) {
         RAD_ERR("serve: start() has not run, or stopped at --debug-graph");
         return RAD_E_STATE;
@@ -1645,8 +1390,8 @@ int Engine::serve() {
                     (long long)cfg_.max_seqs, (long long)pooled_dim_);
             return RAD_E_NOMEM;
         }
-        /* NO PREFIX CACHE: an encoder keeps no KV to reuse, and attending both ways means a
-         * shared prefix does not even compute to the same rows. */
+        /* No prefix cache: an encoder keeps no KV, and with bidirectional attention a shared
+         * prefix does not compute to the same rows. */
         cfg_.prefix_cache = false;
         prefix_off_why_ = "an embedding model: an encoder keeps no KV to reuse, and attending both "
                           "ways means a shared prefix does not compute to the same rows";
@@ -1655,13 +1400,11 @@ int Engine::serve() {
                  "tokens an input", (long long)pooled_dim_, (long long)cfg_.max_tok);
     }
 
-    /* The scheduler drives ONE block manager. Block ids are pure bookkeeping and identical on
-     * every rank: every rank carves the same block count (Engine::configure_kv caps each at the
-     * least rank's), so its free list evolves identically even where the ranks' shares of a
-     * group differ in bytes, or are zero (rad_kv_group_zero). What differs per rank is the pool
-     * BASE, and that lives in KVPoolBinding. So rank 0's manager owns the bookkeeping and the
-     * others exist to own their own card's allocation. If the counts ever disagree the block
-     * tables mean different things on different cards, so it is checked rather than assumed. */
+    /* The scheduler drives one block manager, rank 0's. Block ids are identical on every rank:
+     * all carve the same block count (Engine::configure_kv caps each at the smallest rank's), even
+     * where a group's share differs in bytes or is zero (rad_kv_group_zero). Only the pool base
+     * differs per rank (KVPoolBinding). Check the counts, since a mismatch would make one block
+     * table mean different things on different cards. */
     for (size_t i = 1; i < ranks_.size(); ++i) {
         const auto& a = ranks_[0]->kv.plans();
         const auto& c = ranks_[i]->kv.plans();
@@ -1679,28 +1422,24 @@ int Engine::serve() {
         }
     }
 
-    /* BACK TO RANK 0 BEFORE THE SCHEDULER IS BUILT. The per-rank loops above left this
-     * thread on the LAST rank's device, and the scheduler is given ranks_[0]->ctx.stream()
-     * -- so its staging buffers and its staging EVENT would be created on one card and
-     * recorded on another card's stream, which fails every step with "could not record
-     * the staging event". One batch serves every rank (spec §1), and rank 0 owns it. */
+    /* Back to rank 0's device before building the scheduler: the loops above left this thread on
+     * the last rank's device, and the scheduler's staging buffers and event must live on rank 0,
+     * whose stream it is given (spec §1). */
     RAD_TRY(rad_dev_set(ranks_[0]->device));
 
     kv_iface_ = std::make_unique<KVBinding<KVManager>>(&ranks_[0]->kv);
     pc_iface_ = std::make_unique<PCBinding<PrefixCache>>(&ranks_[0]->prefix);
-    /* THE RESTORE PATH, installed only when the tiers are on. The scheduler calls this before the
-     * admission lookup and must not know what a tier is; the engine does, so the knowledge lives
-     * here as a callable rather than as an include in core/sched.
+    /* The restore path, installed only when the tiers are on. The scheduler calls it before the
+     * admission lookup without knowing about tiers, so it is a callable rather than an include in
+     * core/sched.
      *
-     * EVERY RANK RESTORES ITS OWN SHARD, and rank 0 goes first because its TierExec is the one
-     * holding the policy -- it allocates the blocks and reports the job, and the others follow
-     * into the same block ids. A rank that fails leaves the prefix shorter and nothing worse,
-     * which is why none of this returns an error upward: a miss is always safe. */
+     * Every rank restores its own shard. Rank 0's TierExec holds the policy: it allocates the
+     * blocks and reports the job, and the others follow into the same block ids. A failure only
+     * shortens the prefix, so no error is returned. */
     if (ranks_[0]->tierx.enabled()) {
         auto* b = static_cast<PCBinding<PrefixCache>*>(pc_iface_.get());
-        /* CALLED FROM INSIDE Scheduler::step(), UNDER ITS LOCK -- which is what makes it safe to
-         * touch the cache and rank 0's manager here, and why nothing below may call back into the
-         * scheduler. */
+        /* Called inside Scheduler::step() under its lock, which makes touching the cache and rank
+         * 0's manager safe; nothing here may call back into the scheduler. */
         b->restore_fn = [this](const Request& req) {
             const uint64_t t0 = rad_mono_ns();
             PrefixCache& pc = ranks_[0]->prefix;
@@ -1708,10 +1447,9 @@ int Engine::serve() {
             media_keys(req, &mk);
             const std::vector<BlockHash> want = pc.restorable_from(req.prompt, mk);
             if (want.empty()) return;
-            /* THE WHOLE CHAIN IN ONE RESTORE. A 4-token block makes a long conversation tens of
-             * thousands of entries, and one transfer an entry is tens of thousands of host round
-             * trips before the turn can start; as one restore it is a launch per (group, layer)
-             * per staging batch and a copy per run of arena slots. */
+            /* The whole chain in one restore. With 4-token blocks a long conversation is tens of
+             * thousands of entries; batched, it is one launch per (group, layer) per staging batch
+             * and one copy per run of arena slots instead of a round trip per entry. */
             std::vector<TierJob> jobs;
             jobs.reserve(want.size());
             for (const BlockHash& h : want) {
@@ -1726,24 +1464,19 @@ int Engine::serve() {
                 (void)r->tierx.issue_restore(jobs, r->ctx.stream(), &mine);
                 for (size_t i = 0; i < ok.size(); ++i) ok[i] = ok[i] && i < mine.size() && mine[i];
             }
-            /* Back to rank 0's card before anything else runs on this thread: the admission this
-             * restore is part of grows rank 0's pool next. */
+            /* Back to rank 0's device: the admission continues by growing rank 0's pool. */
             if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
             ranks_[0]->tierx.report_pass(jobs, ok, rad_mono_ns());
-            /* EVERY ENTRY THAT CAME BACK IS REBOUND, not only the leading run: the tiers have
-             * already marked each one resident at its new blocks, and an entry the cache did not
-             * take would name blocks nothing references. */
+            /* Rebind every entry that came back, not only the leading run: the tiers already
+             * marked each resident at its new blocks. */
             const std::vector<int32_t>& cg = pc.cached_groups();
             for (size_t i = 0; i < jobs.size(); ++i) {
                 TierJob& j = jobs[i];
                 if (!ok[i]) continue;
                 const int rb = pc.rebind(j.key, j.blocks);
                 if (rb != RAD_OK) {
-                    /* A PROMOTION WITH NO ENTRY TO LAND IN. The blocks were reserved for the entry
-                     * and nothing else holds them; the record the tiers just marked resident names
-                     * them too, and would be released later from under whoever the pool gives them
-                     * to. Both are let go, so the blocks return to the pool and the key is simply
-                     * unknown. */
+                    /* No entry to land in: release the reserved blocks and forget the tier record,
+                     * which would otherwise release them later from under their next owner. */
                     ranks_[0]->tierx.quiesce();
                     for (size_t k = 0; k < cg.size() && k < j.blocks.size(); ++k)
                         if (j.blocks[k] >= 0) ranks_[0]->kv.release_block(cg[k], j.blocks[k]);
@@ -1752,40 +1485,45 @@ int Engine::serve() {
             }
             ranks_[0]->tiers.note_restore((int64_t)(rad_mono_ns() - t0));
         };
-        /* AN EVICTION THAT WOULD LOSE AN ENTRY WAITS FOR ITS COPY INSTEAD. Called by the
-         * prefix cache binding under the scheduler's lock, on this thread, when dropping the
-         * entries that already have a host copy did not free enough: every copy waiting is
-         * planned, issued and landed now, so the entries it covers can leave VRAM and be kept. */
+        /* An eviction that would lose an entry waits for its copy instead. Called by the prefix
+         * cache binding under the scheduler's lock when dropping already-copied entries did not
+         * free enough: all waiting copies are landed now, so those entries can leave VRAM. */
         b->flush_fn = [this]() -> bool { return flush_copies(); };
     }
-    /* EVERY RANK'S CARD, STREAM AND ARENA. The batch is one build shared by pointer (spec §1) and
-     * that is right for the host side; the DEVICE side is staged per rank, because a rank reading
-     * another card's staging is both a PCIe read on the step path and, worse, unordered against
-     * the copies that fill it -- see the Set comment in batch.h. */
+    /* Per-rank card, stream and program. The batch is built once and shared by pointer on the
+     * host (spec §1), but its device side is staged per rank: reading another card's staging is a
+     * PCIe read and unordered against the copies that fill it (see Set in batch.h). */
     std::vector<BatchBuilder::RankIO> rio;
     rio.reserve(ranks_.size());
     for (auto& rk : ranks_)
         rio.push_back({ rk->device, rk->ctx.stream(), &rk->program });
     if (generator) {
-        /* THE GENERATOR'S DRIVER IN PLACE OF THE SCHEDULER: the scheduler is never initialised,
-         * so its step staging -- sized for token steps the generator never runs -- is never
-         * allocated, and nothing calls it. */
+        /* The generator's driver replaces the scheduler, which is never initialised, so its
+         * token-step staging is never allocated. */
         std::vector<gen::Driver::RankIO> gio;
         for (auto& rk : ranks_) gio.push_back({ rk->device, rk->ctx.stream() });
         gen_ = std::make_unique<gen::Driver>();
-        RAD_TRY(gen_->init(ranks_[0]->program, cfg_, kv_iface_.get(), gio));
+        RAD_TRY(gen_->init(ranks_[0]->program, kv_iface_.get(), gio));
         RAD_TRY(rad_dev_set(ranks_[0]->device));
     } else
     RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
-    /* THE SMALLEST STEP THE PREFILL STAGER OVERLAPS. A prefill chunk the scheduler holds back for
-     * other work in the step (--busy-prefill-chunk) is kept at or above it: under it every routed
-     * layer reads its pooled experts synchronously, which costs a long prefill far more than the
-     * step it shares saves. The largest over the ranks, since the step waits for the slowest. */
+    /* The smallest step the prefill stager overlaps. A chunk held back for other work
+     * (--busy-prefill-chunk) stays at or above it; below it every routed layer reads its pooled
+     * experts synchronously, which costs far more than sharing the step saves. The maximum over
+     * ranks, since the step waits for the slowest. */
     {
         int64_t stage_rows = 0;
         for (auto& rk : ranks_)
             if (rk->stager.enabled()) stage_rows = std::max(stage_rows, rk->stager.min_rows());
         sched_.set_stage_rows(stage_rows);
+        /* The shortest prompt a span pays for where routed experts are read from host memory: a
+         * spanned step runs at the full plan, which lends the expert slab nothing, while every
+         * other step runs at the span's shared level and lends it the span's extra rows. On
+         * Qwen3.8-Flash-Next at TP2 (two R9700, 12 GiB host pool) the span loses to one-interval
+         * steps up to 12K tokens and wins from 18K, hence eight intervals. With every expert on
+         * the card there is no such cost and every lone prefill spans. */
+        sched_.set_span_min(stage_rows > 0 && arena_span_rows_ > 0
+                                ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0) : 0);
     }
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
@@ -1800,31 +1538,28 @@ int Engine::serve() {
     for (int i = 0; i < cfg_.tp; ++i) rank_threads_.emplace_back([this, i] { rank_loop(i); });
     std::thread stepper([this] { if (gen_) gen_loop(); else step_loop(); });
 
-    if (cfg_.kld()) print_startup_report(RAD_OK);
+    if (cfg_.kld()) {
+        print_startup_report(RAD_OK);
+        startup_watch_.reset();
+    }
     int s = cfg_.kld() ? run_kld() : run_server();
+    startup_watch_.reset();
 
-    /* Stop the step loop before anything the server owns is destroyed: Request::sink is a raw
-     * pointer into the server's storage, and a request the scheduler has not finished is a request
-     * still writing into it (server.h). */
+    /* Stop the step loop before the server's storage is destroyed: Request::sink points into it,
+     * and an unfinished request still writes there (server.h). */
     stopping_.store(true, std::memory_order_release);
     barrier_->abort();
     if (stepper.joinable()) stepper.join();
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
-    /* A step loop that died is the answer, whatever the transport said on the way down: the
-     * process should exit with the engine's error, not report a clean shutdown of a server that
-     * stopped serving. */
+    /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);
     return ls < 0 ? ls : s;
 }
 
-/* THE STATE SLOTS A SEQUENCE OWNS, one per KV group, -1 where the group is not stateful.
- *
- * Read from RANK 0 and applied to every rank, which is correct for the same reason the batch hands
- * one `state_index` row to all of them: only rank 0's KVManager tracks sequences (kv_iface_ is
- * bound to it), while every rank's pool has identical geometry, so a slot index means the same
- * offset everywhere and only the base pointer differs. Looking the sequence up in any other rank's
- * manager returns "not found". */
+/* The state slots a sequence owns, one per KV group, -1 where the group is not stateful. Read from
+ * rank 0 and applied to every rank: only rank 0's KVManager tracks sequences (kv_iface_), and
+ * every rank's pool has identical geometry, so a slot index means the same offset everywhere. */
 bool Engine::state_slots_of(uint64_t seq, std::vector<int32_t>* out) const {
     const KVManager& kv = ranks_[0]->kv;
     out->assign((size_t)kv.n_groups(), -1);
@@ -1842,28 +1577,9 @@ bool Engine::state_slots_of(uint64_t seq, std::vector<int32_t>* out) const {
 }
 
 /* ------------------------------------------------------------------ the HTTP frontend */
-/* WHAT IS WIRED AND WHAT IS NOT, stated rather than discovered at runtime. `/v1/completions`,
- * `/v1/chat/completions`, `/v1/models`, `/metrics` and `/health` are live. `/v1/embeddings` is
- * 501 (no embedding head in the container), and so are image, video and audio content parts
- * unless the program declared an encoder that accepts them (MEDIA, below).
- *
- * THE CHAT ENDPOINT IS 501 ONLY WHEN THE MODEL HAS NO TEMPLATE, and that distinction is the whole
- * reason `chat_bridge` is conditional below. A container that carries a chat template gets the
- * full path: the template's grammar and lazy triggers reach the sampler, and the reply parser the
- * auto-parser derives from that same template comes back out through IChatTemplate::apply bound
- * to the request that asked for it. A container without one gets an endpoint that says so,
- * because a chat template guessed is a prompt format guessed, and the failure mode of guessing is
- * fluent text in the wrong shape. */
-/* WHAT /server_info SAYS ABOUT THE ENGINE.
- *
- * The server cannot derive any of this: it holds interfaces and knows nothing about devices,
- * containers or placement. Rather than growing ServerOptions a field per fact, the engine renders
- * the object it owns and the server splices it in verbatim.
- *
- * IT IS THE OPERATOR'S FIRST QUESTION, asked of a process that is already running: which model,
- * on how many cards, with how much KV, drafting how deeply, over which wire. All of it is printed
- * at startup too -- and a startup log is on a machine, in a file, from a process that may have
- * been restarted since. */
+/* The engine's part of /server_info: model, cards, KV, drafting and wire, for a running process.
+ * The server holds only interfaces, so the engine renders this object and the server splices it in
+ * verbatim. */
 std::string Engine::engine_info() const {
     nlohmann::ordered_json e;
     e["arch"]        = meta_.arch_id ? meta_.arch_id : "";
@@ -1879,8 +1595,7 @@ std::string Engine::engine_info() const {
     e["tp_wire_min_kb"]         = cfg_.tp_wire_exact ? 0 : cfg_.tp_wire_min_kb;
     e["max_num_batched_tokens"] = cfg_.max_tok;
     e["placement"]              = cfg_.placement;
-    /* What each lookup table was asked for and where it went: auto's answer is the one a
-     * dashboard reading this needs, and the request is the one the command line shows. */
+    /* Each lookup table's requested and resolved placement. */
     e["embedding_placement"]    = { { "asked", table_placement_name(cfg_.embedding_placement) },
                                     { "resolved", table_placement_name(cfg_.embedding_resolved) } };
     e["ngram_placement"]        = { { "asked", table_placement_name(cfg_.ngram_placement) },
@@ -1906,8 +1621,8 @@ std::string Engine::engine_info() const {
     }
     e["devices"] = std::move(devs);
 
-    /* Rank 0's, and every rank declares the same graph -- see the miss report in
-     * engine_bringup.cpp for why that is relied on rather than assumed. */
+    /* Rank 0's; every rank declares the same graph (see the miss report in
+     * engine_bringup.cpp). */
     const Program& p0 = ranks_[0]->program;
     e["ops"]     = (int64_t)p0.ops.size() - 1;
     e["weights"] = (int64_t)p0.weights.size() - 1;
@@ -1916,16 +1631,11 @@ std::string Engine::engine_info() const {
     const KVManager& kv = ranks_[0]->kv;
     for (int32_t g = 0; g < kv.n_groups(); ++g) {
         const KVGroupPlan* pl = kv.plan(g);
-        /* Group 0 is the "no KV group" sentinel every program carries so that a handle of zero is
-         * absent rather than valid. It has no layers and no pool, and reporting it would be
-         * reporting the absence of a thing. */
+        /* Skip group 0, the sentinel that makes handle 0 mean "none". */
         if (!pl || pl->name.empty() || pl->n_layers <= 0) continue;
         nlohmann::ordered_json k;
         k["name"]     = pl->name;
-        k["kind"]     = pl->kind == RAD_KV_FULL   ? "full"
-                      : pl->kind == RAD_KV_WINDOW ? "window"
-                      : pl->kind == RAD_KV_LINEAR ? "linear"
-                      : pl->kind == RAD_KV_CONV   ? "conv" : "none";
+        k["kind"]     = bld_kv_kind_name(pl->kind);
         k["n_layers"] = pl->n_layers;
         k["bytes"]    = pl->pool_bytes;
         if (pl->paged()) {
@@ -1952,30 +1662,22 @@ std::string Engine::engine_info() const {
     return e.dump();
 }
 
-
 /* ------------------------------------------------------------------ a clean stop
  *
- * SIGINT AND SIGTERM ARE HANDLED, so a serving process has a way to end other than being killed
- * where it stands. Unhandled, `~Engine` never runs: `--profile-ops` collects a table nobody
- * prints, the placement banner is unreachable by construction, and an in-flight request is cut
- * rather than drained.
+ * SIGINT and SIGTERM are handled so `~Engine` runs: --profile-ops prints its table, the placement
+ * summary prints, and in-flight requests drain instead of being cut.
  *
- * A WATCHER THREAD AND NOT THE HANDLER ITSELF. `Server::stop` takes locks, joins threads and
- * drains a graveyard; none of that is async-signal-safe, and calling it from a handler is the
- * deadlock that only shows up under load. The handler does the one thing it may -- store to a
- * lock-free atomic -- and this thread does the work. A second signal is left to the default
- * disposition, so an operator who has decided not to wait still gets an immediate kill.
+ * The handler only stores to a lock-free atomic; a watcher thread does the work, because
+ * `Server::stop` takes locks and joins threads, which is not async-signal-safe. A second signal
+ * gets the default disposition, so the operator can still force an immediate kill.
  */
 namespace {
 std::atomic<bool> g_signalled{false};
 void on_signal(int) { g_signalled.store(true, std::memory_order_relaxed); }
 
 /* ================================================================== sampling defaults */
-/* WHAT A REQUEST THAT SENDS NO SAMPLER SETTINGS IS SERVED WITH.
- *
- * The reading and the range checks belong to core/gen_config.h, which carries the argument for
- * why any of this exists. What is here is the ORDER, and the container lookup, which is the one
- * part that reads the model's metadata:
+/* The sampler for a request that sends no sampler settings. Parsing and range checks live in
+ * core/gen_config.h; this is the precedence order and the container lookup:
  *
  *   --temp / --top-k / --top-p / --min-p    an operator overriding, field by field, and last
  *   --generation-config PATH                a generation_config.json named outright
@@ -1984,11 +1686,11 @@ void on_signal(int) { g_signalled.store(true, std::memory_order_relaxed); }
  *                                          checkpoint carries it
  *   SamplingParams' own defaults            the untruncated floor
  *
- * Each source is consulted only if the one above it said nothing at all, so a deployment that
- * names a file gets that file's sampler and not a blend of it with the container's.
+ * The flags override field by field. Of the file sources, the first that states anything is used
+ * whole, never blended with a lower one.
  *
  * `stated` and `source`, when given, receive what the source in force read and its name ("" for
- * none): gen_sampling_sources turns the two into the reason for each field. */
+ * none), which gen_sampling_sources turns into a reason per field. */
 SamplingParams resolve_sampling_defaults(const RadModelMeta& meta, bool container,
                                          const Config& cfg, GenSampling* stated = nullptr,
                                          std::string* source = nullptr) {
@@ -2018,9 +1720,8 @@ SamplingParams resolve_sampling_defaults(const RadModelMeta& meta, bool containe
     if (cfg.sample_min_p >= 0.0f) { sp.min_p = cfg.sample_min_p; over += " --min-p"; }
     if (cfg.sample_top_k >= 0)    { sp.top_k = cfg.sample_top_k; over += " --top-k"; }
 
-    /* THE REST OF THE SAMPLER HAS NO FILE SOURCE: a generation_config.json is read for the four
-     * fields above and no others, so these are SamplingParams' own values unless a flag sets
-     * them, and request_overrides() logs the ones that did. */
+    /* The remaining fields have no file source (generation_config.json supplies only the four
+     * above): SamplingParams' defaults unless a flag sets them; request_overrides() logs those. */
     if (cfg.sample_typical_p)          sp.typical_p          = *cfg.sample_typical_p;
     if (cfg.sample_rep_penalty)        sp.rep_penalty        = *cfg.sample_rep_penalty;
     if (cfg.sample_pres_penalty)       sp.pres_penalty       = *cfg.sample_pres_penalty;
@@ -2050,9 +1751,9 @@ SamplingParams resolve_sampling_defaults(const RadModelMeta& meta, bool containe
     return sp;
 }
 
-/* "presence_penalty 1.5, max_tokens auto, ..." -- every request default and bound the command line
- * moved, under the request's spelling of the field, or "" when it moved none. The four fields
- * resolve_sampling_defaults describes are not repeated. */
+/* "presence_penalty 1.5, max_tokens auto, ...": every request default or bound the command line
+ * changed, in the request's field names; "" if none. Excludes the four fields
+ * resolve_sampling_defaults reports. */
 std::string request_overrides(const Config& c) {
     std::string out;
     auto add = [&out](const std::string& s) { out += (out.empty() ? "" : ", ") + s; };
@@ -2091,30 +1792,31 @@ std::string request_overrides(const Config& c) {
     return out;
 }
 }  /* namespace */
+/* The HTTP server over the engine. `/v1/completions`, `/v1/chat/completions`, `/v1/models`,
+ * `/metrics` and `/health` are live. `/v1/embeddings` answers 501 unless the program is an
+ * embedding program, and so do image, video and audio content parts unless the program declared an
+ * encoder that accepts them (MEDIA, below). The chat endpoint answers 501 only when the model has
+ * no chat template: a guessed template is a guessed prompt format. With one, the template's
+ * grammar and lazy triggers reach the sampler and its derived reply parser comes back through
+ * IChatTemplate::apply. */
 int Engine::run_server() {
-    /* The rank-0 sampler comes along so admission can refuse a request whose sampling stage this
-     * build has no kernel for, by name and at the door (IScheduler::admit). The tiers come along
-     * because they are where a stored conversation is RECORDED, and that is passed whether or not
-     * any tier can move anything: with the caps at zero the object still holds the session table,
-     * and withholding it on that ground would leave the sessions view reporting an empty server. */
+    /* The rank-0 sampler lets admission refuse, by name, a request whose sampling stage has no
+     * kernel (IScheduler::admit). The tiers are passed even when they move nothing, because they
+     * hold the session table the sessions view reads. */
     server::SchedulerBridge sched_bridge(&sched_, ranks_.empty() ? nullptr : &ranks_[0]->sampler,
                                         ranks_.empty() ? nullptr : &ranks_[0]->tiers);
     server::TokenizerBridge tok_bridge(vocab_);
     server::ChatTemplateBridge chat_bridge;
     server::GrammarBridge grammar_bridge(vocab_view_.get());
 
-    /* THE SNAPSHOT OF WHAT ONLY THE ENGINE CAN SEE, and there is ONE of it. The live view
-     * (spec §16) and the web dashboard are two renderers of the same numbers, so they are given
-     * the same function rather than each reaching into the engine on its own -- two readers is
-     * two chances to disagree about what the engine was doing.
+    /* One snapshot function feeds both the live view (spec §16) and the web dashboard, so they
+     * cannot disagree. It runs on the drawing thread and must not slow the engine: it reads the
+     * scheduler's published copy (Scheduler::publish), the driver's VRAM counter, and rank 0's
+     * plan, immutable after start().
      *
-     * Called from whichever thread is drawing, and it must not be able to slow the engine: it
-     * reads the scheduler's published copy (Scheduler::publish), the driver's VRAM counter
-     * through a descriptor opened here, and rank 0's plan, which is immutable after start().
-     *
-     * THE CARDS' FIXED FACTS ARE READ ONCE, HERE, on the engine thread before serving. The props
-     * call enters the device runtime -- device properties, a device switch, a free-memory query,
-     * a peer walk -- and is meant for startup; it also opens the counter dev_vram_used reads. */
+     * The cards' fixed facts are read once here, before serving: rad_dev_props enters the device
+     * runtime (properties, device switch, free-memory query, peer walk) and also opens the counter
+     * dev_vram_used reads. */
     std::vector<server::CardStat> card_facts;
     for (const auto& r : ranks_) {
         RadDeviceProps pr{};
@@ -2131,11 +1833,9 @@ int Engine::run_server() {
 
         s.cards.clear();
         for (const server::CardStat& f : card_facts) {
-            /* vram_used is sampled per call rather than cached: it is the number that moves, and
-             * it is the one an operator watching for a leak is watching. A card whose counter
-             * cannot be read is left out rather than drawn empty. Utilisation, power and
-             * temperature stay 0 -- "not sampled" -- because the device layer does not expose
-             * them and a plausible invented number is worse than a blank. */
+            /* vram_used is sampled per call. A card whose counter cannot be read is left out.
+             * Utilisation, power and temperature stay 0 ("not sampled"): the device layer does
+             * not expose them. */
             int64_t used = 0;
             if (dev_vram_used(f.index, &used) != RAD_OK) continue;
             server::CardStat c = f;
@@ -2143,16 +1843,12 @@ int Engine::run_server() {
             s.cards.push_back(std::move(c));
         }
 
-        /* THE EXPERT PLANE, from rank 0's placement plan. A dense model has no expert units, so
-         * this stays empty and both renderers omit the panel -- which is why it is filled
-         * unconditionally rather than behind a "is this MoE" test the engine would have to
-         * invent. When there are experts, this is the picture the heat engine is judged by. */
+        /* The expert plane from rank 0's placement plan; empty for a dense model, and the
+         * renderers then omit the panel. */
         s.experts = server::ExpertPlane{};
         if (!ranks_.empty()) {
             const Plan& p = ranks_[0]->plan;
-            /* Read ONCE for both halves of this panel: the same struct answers "what did the
-             * mover do to the experts" and "what did it put on the link", and two reads is two
-             * chances for the two halves of one picture to disagree. */
+            /* Read once for both the expert and link halves of the panel, so they agree. */
             const MoverStats ms = ranks_[0]->mover.stats();
             int32_t n_layer = 0, n_expert = 0;
             for (const MoveUnit& mu : p.units)
@@ -2164,12 +1860,9 @@ int Engine::run_server() {
                 s.experts.n_layers  = n_layer;
                 s.experts.n_experts = n_expert;
                 s.experts.tier.assign((size_t)n_layer * (size_t)n_expert, (uint8_t)Tier::VRAM);
-                /* THE LIVE TIER WHERE THERE IS ONE, and the plan's otherwise. The plan is where a
-                 * unit STARTED; once the heat engine runs, the picture this panel exists to show
-                 * is the one that moves, and reading the plan would draw a frozen plane under an
-                 * engine doing nothing but change it. HeatEngine::tier is a plain vector
-                 * read and the writes are made by the dispatch thread at a step boundary, so a
-                 * draw racing one gets the value from either side of a single store. */
+                /* The live tier when the heat engine runs, else the plan's (where a unit started).
+                 * HeatEngine::tier is a plain vector written by the dispatch thread at step
+                 * boundaries, so a racing read sees either side of a single store. */
                 const HeatEngine& heat = ranks_[0]->heat;
                 const bool live_tier = heat.enabled();
                 s.experts.heat_enabled = live_tier;
@@ -2181,11 +1874,9 @@ int Engine::run_server() {
                     const Tier t = live_tier ? heat.tier((int32_t)u) : mu.tier;
                     s.experts.tier[(size_t)mu.layer * (size_t)n_expert + (size_t)mu.expert]
                         = (uint8_t)t;
-                    /* RESIDENCY IS COUNTED OVER THE UNITS, NOT OVER THE PLANE. The plane is a
-                     * rectangle and a model need not fill it -- a draft head's expert count can
-                     * differ from the trunk's -- so tallying cells would count
-                     * (layer, expert) pairs that were never placed as VRAM-resident, which is the
-                     * one direction the number must not be wrong in. */
+                    /* Count residency over units, not plane cells: the plane is a rectangle a
+                     * model need not fill (a draft head's expert count can differ), and empty
+                     * cells default to VRAM. */
                     const int ti = (int)t >= 0 && (int)t < kTierCount ? (int)t : (int)Tier::SSD;
                     s.experts.units[ti]++;
                     s.experts.bytes[ti] += mu.bytes;
@@ -2208,39 +1899,25 @@ int Engine::run_server() {
                 s.experts.stage_copies   = (int64_t)ms.stage_copies;
                 s.experts.flex_bytes    = ranks_[0]->mover.flex_used_bytes();
                 s.experts.flex_capacity = ranks_[0]->mover.flex_offered_bytes();
-                /* THE HEAT ENGINE'S OWN TALLY, which answers a different question from the
-                 * mover's. The mover counts bytes that went; these count decisions -- how many
-                 * dispatches proposed nothing and why, and whether a promotion was of a unit
-                 * never promoted before (investment) or one just demoted (pure loss). */
+                /* The heat engine's decision counts (the mover counts bytes): dispatches that
+                 * proposed nothing and why, and whether a promotion was a first (investment) or a
+                 * readmit of a just-demoted unit (pure loss). */
                 const HeatStats hs = heat.stats();
                 s.experts.dispatches        = (int64_t)hs.dispatches;
                 s.experts.refused           = (int64_t)hs.refused;
                 s.experts.no_candidate      = (int64_t)hs.no_candidate;
                 s.experts.distinct_promoted = (int64_t)hs.distinct_promoted;
                 s.experts.readmits          = (int64_t)hs.readmits;
-                /* AND WHETHER THE PLACEMENT IS ACTUALLY PAYING. Residency is a property of the
-                 * plan; the hit rate is a property of the TRAFFIC, and a plan holding 80% of the
-                 * units can still miss on most tokens if the hot ones are the ones outside. */
+                /* The routed hit rate: residency describes the plan, this describes the traffic. */
                 s.experts.routed            = (int64_t)hs.routed;
                 s.experts.routed_resident   = (int64_t)hs.routed_resident;
 
             }
 
-            /* THE LINK, and the two things that share it.
-             *
-             * THE COLLECTIVE IS ONE RANK'S AND THE MOVES ARE EVERY RANK'S, which is why the two
-             * halves of this panel are summed differently. The ranks are symmetric in the
-             * all-reduce -- each pushes the same message -- so rank 0's count IS the machine's and
-             * summing it would double it. A promotion, a demotion and a streamed expert are the
-             * opposite: each rank holds its own shard of the plane and pulls its own bytes over
-             * its own link, so the machine's traffic is the sum and rank 0 alone is a half of it
-             * at --tp 2. Reading one rank for all of them would put the move and stream rows at
-             * 1/world of the truth while the all-reduce beside them stayed right, which is the
-             * worse of the two errors: the SHARES would be wrong, and the shares are the whole
-             * point of the panel.
-             *
-             * `world` is published so the reader can still recover a per-card figure, which is the
-             * one to hold against a single link's ceiling. */
+            /* The link panel. All-reduce counts come from rank 0 only: the ranks are symmetric,
+             * so summing would double them. Moves and streamed experts are summed over ranks:
+             * each rank moves its own shard over its own link. `world` lets a reader recover the
+             * per-card figure to compare against one link's ceiling. */
             s.passes.present = true;
             for (const auto& rk : ranks_) {
                 const Ctx::PassCounts pc = rk->ctx.pass_counts();
@@ -2281,13 +1958,9 @@ int Engine::run_server() {
     d.grammar = &grammar_bridge;
     d.live  = snap;
 
-    /* load_from_vocab warns on its own when the template is missing or will not compile; all we
-     * decide here is whether the endpoint exists. The reply format is the architecture plugin's
-     * when it declares one, and the template's otherwise. */
-    /* WHAT AN EMBEDDING MODEL SERVES: /v1/embeddings, and no chat. */
-    /* Its named prompts are the checkpoint's sentence-transformers configuration
-     * (`sentence_transformers.prompts.*`), and a `messages` input renders through its chat
-     * template. */
+    /* An embedding model serves /v1/embeddings and no chat. Its named prompts are the checkpoint's
+     * sentence-transformers configuration (`sentence_transformers.prompts.*`); a `messages` input
+     * renders through its chat template. */
     struct EmbedInfo final : server::IEmbedder {
         int64_t d = 0, n = 0;
         const RadModelMeta* meta = nullptr;
@@ -2312,20 +1985,20 @@ int Engine::run_server() {
     embed_info.meta = &meta_;
     if (embedding_) d.embed = &embed_info;
 
+    /* The template loader warns on its own about a missing or broken template; this only decides
+     * whether the chat endpoint exists. The reply format is the architecture plugin's when it
+     * declares one, else derived from the template. */
     const RadChatFormat* declared_format = rad_tools_chat_format(plugins_, meta_);
+    /* An image model's template is its conditioning network's; nothing is served as chat. */
+    const bool have_tpl = !gen_ && vocab_ && !vocab_->chat_template().empty() &&
+                          chat_bridge.init(*vocab_, declared_format, plugins_.arch_plugin) >= 0 &&
+                          chat_bridge.ready();
     if (embedding_) {
         /* No chat endpoint: the model's template, when it has one, renders a `messages` input. */
-        if (vocab_ && !vocab_->chat_template().empty() &&
-            chat_bridge.init(*vocab_, declared_format, plugins_.arch_plugin) >= 0 &&
-            chat_bridge.ready())
-            embed_info.tpl = &chat_bridge;
-    } else if (gen_) {
-        /* An image model's template is its conditioning network's; nothing is served as chat. */
-    } else if (vocab_ && !vocab_->chat_template().empty() &&
-        chat_bridge.init(*vocab_, declared_format, plugins_.arch_plugin) >= 0 &&
-        chat_bridge.ready()) {
+        if (have_tpl) embed_info.tpl = &chat_bridge;
+    } else if (have_tpl) {
         d.chat = &chat_bridge;
-    } else {
+    } else if (!gen_) {
         RAD_WARN("no chat template in this container; /v1/chat/completions will answer 501 and "
                  "/v1/completions is the endpoint to use");
     }
@@ -2340,8 +2013,8 @@ int Engine::run_server() {
     o.port     = cfg_.port;
     o.api_key  = cfg_.api_key;
     o.max_seqs = cfg_.max_seqs;
-    /* `n` fans one request out over the batch, so a server that runs more sequences a step takes
-     * more choices a request; the floor keeps a small batch from refusing what it would queue. */
+    /* `n` fans one request out over the batch, so the default scales with --max-num-seqs; the
+     * floor of 8 keeps a small batch from refusing what it would queue. */
     o.max_n    = cfg_.max_n > 0 ? (int)cfg_.max_n : (int)std::max<int64_t>(o.max_n, cfg_.max_seqs);
     if (cfg_.max_n <= 0)
         decide("--max-n", std::to_string(o.max_n), "the larger of 8 and --max-num-seqs");
@@ -2351,8 +2024,8 @@ int Engine::run_server() {
     o.reasoning_effort_map = cfg_.reasoning_effort_map;
     o.default_thinking_budget = cfg_.thinking_token_budget;
     {
-        /* THE FOUR SAMPLER DEFAULTS A FILE CAN STATE, where no flag set them: the value served and,
-         * field by field, the file or metadata it came from. */
+        /* The four sampler defaults a file can state: the served value and, per field, its
+         * source. */
         GenSampling stated;
         std::string src;
         o.default_sampling =
@@ -2367,8 +2040,8 @@ int Engine::run_server() {
     o.default_dry_breakers_set = cfg_.sample_dry_seq_breakers.has_value();
     /* An embedding model samples nothing, so it has no logprobs to give. */
     o.supports_logprobs = !embedding_ && ranks_[0]->sampler.has_logprobs();
-    /* -1 leaves ServerOptions' own default, which is `auto` (0). That is resolved per request
-     * against the context, so it needs one to resolve against. */
+    /* -1 keeps ServerOptions' default, `auto` (0), resolved per request against the context, so
+     * it needs a known context. */
     if (cfg_.default_max_tokens >= 0) o.default_max_tokens = cfg_.default_max_tokens;
     if (o.default_max_tokens == 0 && o.max_ctx <= 0) {
         RAD_ERR("a request that names no max_tokens gets what the context leaves after its prompt "
@@ -2398,18 +2071,19 @@ int Engine::run_server() {
                                      moved.c_str());
     }
     o.engine_info = engine_info();
-    /* Per request, not once: the dump carries OpInfo::issued, which only becomes true once the
-     * run phase has run. See ServerOptions::graph_json. */
+    /* Per request, since OpInfo::issued changes once the run phase runs
+     * (ServerOptions::graph_json). */
     o.graph_json  = [this] { return dump_graph_json(ranks_[0]->program); };
-    /* Read again for a request, from a reading at most a second old (Engine::diagnostics_json):
-     * the links and clocks it reports are only telling under load. */
+    /* Per request, from a reading at most a second old (Engine::diagnostics_json). */
     o.diagnostics_json = [this] { return diagnostics_json(); };
 
-    /* MEDIA, WHEN THE PROGRAM DECLARED AN ENCODER. The processor reads its geometry from the
-     * container and the encoder states the one it was built for; the two meet at the patch width
-     * and the merge, and a disagreement is refused here rather than discovered as garbage rows. */
+    /* Media, when the program declared an encoder. The processor's geometry comes from the
+     * container and the encoder states its own; patch width and merge must agree, checked here
+     * rather than found as garbage rows. */
     std::unique_ptr<mm::Processor> mm_proc;
     std::unique_ptr<server::MultimodalBridge> mm_bridge;
+    /* How the model hears, for the speech routes: the plugin's RadAudioFormat copied out. */
+    server::SpeechFormat speech_fmt;
     const RadEncoderDecl& encd = ranks_[0]->program.encoder;
     if (encd.modalities != 0) {
         mm::VisionConfig vc;
@@ -2420,13 +2094,11 @@ int Engine::run_server() {
             return RAD_E_INVAL;
         }
         vc.max_patches = encd.max_patches;
-        /* THE COMMAND LINE OVER THE CONTAINER, field by field, and the result checked as a whole:
-         * a minimum stated alone can land above the maximum the container states.
-         *
-         * A TOKEN-BUDGET PROCESSOR (Gemma 4's) sizes images and frames by soft tokens, not pixel
-         * bands: the band flags would do nothing on it, so they are refused by name, and the
-         * budgets come from --image-tokens and --video-max-frame-tokens. */
-        /* LFM2-VL's processor takes pictures only, so the video flags would do nothing on it. */
+        /* Flags override the container field by field, and the result is checked as a whole (a
+         * minimum given alone can exceed the container's maximum). Flags a processor would ignore
+         * are refused by name: LFM2-VL takes pictures only, and a token-budget processor (Gemma
+         * 4's) sizes by soft tokens (--image-tokens, --video-max-frame-tokens), not pixel
+         * bands. */
         if (vc.family == mm::Family::Lfm2 &&
             (cfg_.video_min_pixels || cfg_.video_max_pixels || cfg_.video_min_frames ||
              cfg_.video_max_frames || cfg_.video_fps || cfg_.video_max_frame_tokens)) {
@@ -2466,8 +2138,7 @@ int Engine::run_server() {
                     why.c_str());
             return RAD_E_INVAL;
         }
-        /* The processor lowers the image band to one encoder pass; an operator who asked for
-         * more is told, rather than finding the cap in the startup line below. */
+        /* The processor caps the image band at one encoder pass; warn if more was asked for. */
         const int64_t pass_px = encd.max_patches * vc.patch * vc.patch;
         if (cfg_.image_max_pixels && *cfg_.image_max_pixels > pass_px)
             RAD_WARN("media: --image-max-pixels %lld is above what one encoder pass takes (%lld "
@@ -2533,8 +2204,8 @@ int Engine::run_server() {
                      (long long)mm_proc->config().image_max_pixels, (long long)encd.max_patches,
                      (long long)mm_proc->config().video_max_pixels);
     }
-    /* AUDIO, WHEN THE PROGRAM DECLARED AN AUDIO ENCODER: the feature extractor reads its framing
-     * from the container, and the encoder states the frame width and the frames an output row. */
+    /* Audio, when the program declared an audio encoder: framing comes from the container; the
+     * encoder states the frame width and frames per output row. */
     const RadEncoderDecl& aend = ranks_[0]->program.audio_encoder;
     if (aend.modalities != 0) {
         mm::AudioConfig ac;
@@ -2550,26 +2221,70 @@ int Engine::run_server() {
                     (long long)aend.patch_dim);
             return RAD_E_INVAL;
         }
+        /* The tokens around a clip: the config's ids where it names them (Gemma 4's boa/eoa),
+         * else the spellings the architecture plugin states (RadAudioFormat). Each must be one
+         * token of this vocabulary, or the prompt would carry text where the model was trained on
+         * a marker. */
+        const RadAudioFormat* afmt = rad_tools_audio_format(plugins_, meta_);
+        auto one_token = [&](const char* spell, int32_t* id) -> int {
+            if (*id >= 0 || !spell || !*spell) return RAD_OK;
+            const std::vector<int32_t> t = tok_bridge.encode(spell, /*add_special=*/false,
+                                                             /*parse_special=*/true);
+            if (t.size() != 1) {
+                RAD_ERR("the architecture plugin spells a clip's marker '%s', which this "
+                        "vocabulary reads as %zu tokens rather than one", spell, t.size());
+                return RAD_E_INVAL;
+            }
+            *id = t[0];
+            return RAD_OK;
+        };
+        if (afmt) {
+            RAD_TRY(one_token(afmt->audio_open, &ac.tok_start));
+            RAD_TRY(one_token(afmt->audio_close, &ac.tok_end));
+            auto str = [](const char* p) { return std::string(p ? p : ""); };
+            speech_fmt.transcribe_prompt = str(afmt->transcribe_prompt);
+            speech_fmt.language_prompt   = str(afmt->language_prompt);
+            speech_fmt.transcript_open   = str(afmt->transcript_open);
+            speech_fmt.language_lead     = str(afmt->language_lead);
+            for (uint32_t i = 0; afmt->languages && i < afmt->n_languages; ++i)
+                speech_fmt.languages.emplace_back(str(afmt->languages[2 * i]),
+                                                  str(afmt->languages[2 * i + 1]));
+        }
+        if (ac.tok_start < 0 || ac.tok_end < 0) {
+            RAD_ERR("the '%s' encoder's clips have no opening or closing token: the container "
+                    "names none and the architecture plugin states none (rad_arch_audio_format)",
+                    ranks_[0]->program.audio_encoder_name.c_str());
+            return RAD_E_INVAL;
+        }
         ac.merge = (int32_t)aend.merge;
         ac.max_frames = aend.max_patches;
         if (!mm_proc) mm_proc = std::make_unique<mm::Processor>();
-        RAD_TRY(mm_proc->init_audio(ac));
+        if (const int rc = mm_proc->init_audio(ac, &why); rc < 0) {
+            RAD_ERR("the '%s' encoder's audio front end cannot be built: %s",
+                    ranks_[0]->program.audio_encoder_name.c_str(), why.c_str());
+            return rc;
+        }
         o.allow_audio = true;
         if (mm::decoder_available())
             RAD_INFO("media: audio through '%s'; a clip is cut at %.3g s, %d mel bins a %d ms frame, "
                      "%d frames a token; %lld frames a pass",
                      ranks_[0]->program.audio_encoder_name.c_str(),
-                     (double)ac.max_samples / (double)ac.rate, ac.n_mels,
+                     (double)mm_proc->audio_config().max_samples / (double)ac.rate, ac.n_mels,
                      ac.hop * 1000 / ac.rate, ac.merge, (long long)aend.max_patches);
     }
     if (mm_proc) {
         mm_bridge = std::make_unique<server::MultimodalBridge>(
             mm_proc.get(), encd.modalities | aend.modalities);
         d.mm = mm_bridge.get();
+        if (speech_fmt.transcribes() && o.allow_audio) {
+            d.speech = &speech_fmt;
+            RAD_INFO("speech: /v1/audio/transcriptions through '%s', %zu languages",
+                     ranks_[0]->program.audio_encoder_name.c_str(), speech_fmt.languages.size());
+        }
     }
 
-    /* AN IMAGE GENERATOR'S ENDPOINTS: the driver's queue, the model's declared prompts and sizes,
-     * and the processor for the conditioning network's view of a reference picture. */
+    /* An image generator's endpoints: the driver's queue, the declared prompts and sizes, and the
+     * processor that prepares a reference picture for the conditioning network. */
     struct ImageBridge final : server::IImageGen {
         gen::Driver*         drv = nullptr;
         const mm::Processor* proc = nullptr;
@@ -2617,8 +2332,8 @@ int Engine::run_server() {
         image_bridge.drv = gen_.get();
         image_bridge.proc = mm_proc.get();
         d.images = &image_bridge;
-        /* The model a client lists and names is the generator's own (qwen-image-2.1), not the
-         * architecture a diffusers pipeline's container is named after. */
+        /* The served model id is the generator's own name (qwen-image-2.1), not the container's
+         * architecture name. */
         if (cfg_.served_model_name.empty() && !in.name.empty()) {
             o.model_id = in.name;
             decide("--served-model-name", o.model_id, "an image generator: its own name");
@@ -2639,10 +2354,9 @@ int Engine::run_server() {
     if (cfg_.max_queued_requests <= 0)
         decide("--max-queued-requests", std::to_string(srv.queue_cap()), "8 x --max-num-seqs");
 
-    /* A TEMPLATE DEFAULT THE TEMPLATE REFUSES is a 400 on every chat request that leaves it to
-     * the default, found by the first caller rather than the operator. --chat-template-kwargs
-     * stops startup; --reasoning-effort only warns, because a deployment whose clients all send
-     * their own effort serves correctly with one the template would refuse. */
+    /* A default the template refuses would 400 every chat request that relies on it. Bad
+     * --chat-template-kwargs stop startup; --reasoning-effort only warns, since clients that send
+     * their own effort are unaffected. */
     if (d.chat && (!cfg_.chat_template_kwargs.empty() || !cfg_.reasoning_effort.empty())) {
         std::string kw_why, eff_why;
         srv.check_template_defaults(&kw_why, &eff_why);
@@ -2656,9 +2370,8 @@ int Engine::run_server() {
                      "that sends no reasoning effort of its own will be answered 400: %s",
                      cfg_.reasoning_effort.c_str(), eff_why.c_str());
     }
-    /* THE EFFORTS THE TEMPLATE TAKES, said once: a client sending another gets this set back in
-     * its 400 and can read it off /server_info beforehand. A map whose target the template
-     * refuses would refuse every request it maps, so it stops startup. */
+    /* Log the efforts the template accepts (a client sending another gets this set in its 400,
+     * and /server_info shows it). A map target the template refuses stops startup. */
     if (d.chat) {
         const std::vector<std::string> efforts = srv.probe_reasoning_efforts();
         std::string mapped;
@@ -2678,41 +2391,31 @@ int Engine::run_server() {
             return RAD_E_INVAL;
         }
     }
-    /* A BUDGET THE MODEL CANNOT HOLD STOPS STARTUP, as --chat-template-kwargs does: the default
-     * would apply to no request at all, and the operator who set it would not find out. */
+    /* A thinking budget the model cannot hold stops startup; it would silently apply to no
+     * request. */
     if (const std::string why = srv.check_thinking_budget(); !why.empty()) {
         RAD_ERR("--thinking-token-budget %lld: %s", (long long)cfg_.thinking_token_budget,
                 why.c_str());
         return RAD_E_INVAL;
     }
     print_startup_report(RAD_OK);
+    const char* const keyed = o.api_key.empty() ? "" : "; a bearer key is required";
     if (embedding_)
-        RAD_INFO("serving on http://%s:%d  (/v1/embeddings; completions and chat are 501)%s",
-                 o.host.c_str(), o.port, o.api_key.empty() ? "" : "  -- a bearer key is required");
+        RAD_INFO("serving on http://%s:%d  (/v1/embeddings; completions and chat are 501%s)",
+                 o.host.c_str(), o.port, keyed);
     else if (gen_)
         RAD_INFO("serving on http://%s:%d  (/v1/images/generations%s; completions and chat are "
-                 "501)%s", o.host.c_str(), o.port,
-                 d.images && d.images->info().max_refs > 0 ? " and /v1/images/edits" : "",
-                 o.api_key.empty() ? "" : "  -- a bearer key is required");
+                 "501%s)", o.host.c_str(), o.port,
+                 d.images && d.images->info().max_refs > 0 ? " and /v1/images/edits" : "", keyed);
     else
-        RAD_INFO("serving on http://%s:%d  (/v1/completions%s)%s", o.host.c_str(), o.port,
+        RAD_INFO("serving on http://%s:%d  (/v1/completions%s%s)", o.host.c_str(), o.port,
                  d.chat ? "; /v1/chat/completions with tools and reasoning" : "; chat is 501",
-                 o.api_key.empty() ? "" : "  -- a bearer key is required");
+                 keyed);
 
-    /* THE LIVE VIEW (spec §16), constructed here and nowhere else.
-     *
-     * `core/server/liveview.{h,cpp}` is the console's view of a running engine, and the
-     * throughput heartbeat the server otherwise has no form of: nothing here logs a request,
-     * and everything else the engine prints happens at startup, so a loop that stalls looks
-     * exactly like a loop with nothing to do.
-     *
-     * Off by default, because §16 opens with "everything below is off by default". Redirected, it
-     * prints one greppable key=value line per interval and no escape sequences at all -- which is
-     * the property that makes it usable under nohup, and the reason the renderer is chosen once by
-     * isatty() rather than per draw.
-     *
-     * The snapshot function is the only part the engine owns: LiveView holds no data and reads no
-     * device. Held by value in this scope so its thread is joined before Deps goes out of it. */
+    /* The live view (spec §16, off by default): the console's throughput heartbeat
+     * (core/server/liveview.h). Redirected, it prints one key=value line per interval with no
+     * escape sequences; the renderer is chosen once by isatty(). LiveView holds no data and only
+     * calls `snap`. Scoped here so its thread is joined before Deps goes out of scope. */
     std::unique_ptr<server::LiveView> live;
     if (cfg_.live_view) {
         live = std::make_unique<server::LiveView>(snap);
@@ -2734,10 +2437,8 @@ int Engine::run_server() {
                 srv.stop();
                 return;
             }
-            /* THE STEP LOOP HAS DIED, so nothing will ever run another step. Every request it
-             * held has already been failed and answered (Engine::fail_loop); what is left is to
-             * stop taking new ones, which a transport left up would accept into a queue nobody
-             * drains. */
+            /* The step loop died and its requests were already failed (Engine::fail_loop); stop
+             * the transport so no new request is queued. */
             if (loop_status_.load(std::memory_order_acquire) < 0) {
                 RAD_ERR("stopping: the step loop failed with %s",
                         rad_strerror(loop_status_.load(std::memory_order_acquire)));
@@ -2748,10 +2449,11 @@ int Engine::run_server() {
         }
     });
 
+    /* Startup ends here; a quiet server from now on is an idle one. */
+    startup_watch_.reset();
     const int rc = srv.run();
-    /* The loop tests `watching` FIRST, so clearing it ends the watcher WITHOUT a second stop: a
-     * normal return from run() has already torn the transport down. It costs one sleep interval
-     * to join, which is the price of not polling a condition variable nobody else waits on. */
+    /* The watcher tests `watching` first, so clearing it ends the thread without a second stop;
+     * run() has already torn the transport down. Joining costs up to one sleep interval. */
     watching.store(false, std::memory_order_relaxed);
     watcher.join();
     if (live) live->stop();

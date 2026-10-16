@@ -1,17 +1,14 @@
-// DOES A LAUNCH COST MORE WHEN THE MODULE REGISTERS MORE KERNELS, and does crossing into a shared
-// object cost anything at all?
+// Does a launch cost more when the module registers more kernels, and does crossing into a shared
+// object cost anything?
 //
-// The engine issues a launch for roughly twice what the same shape costs in a self-contained
-// binary, and the excess is roughly CONSTANT across kernels of very different shapes -- the
-// signature of a fixed per-issue tax rather than of anything a particular shim does. The error
-// check after every launch, a full command ring and the argument count together do not account for
-// it.
+// An engine launch costs roughly twice what the same shape costs in a self-contained binary, and
+// the excess is roughly constant across kernel shapes: a fixed per-issue tax. The per-launch error
+// check, a full command ring and the argument count do not account for it.
 //
-// The structural difference this isolates is the MODULE. libr4d is a .so holding every template
-// instantiation of every kernel, entered through a function pointer; a self-contained harness has
-// a handful of kernels compiled into the binary that launches them. HIP resolves a launch by
-// looking the host stub up in the table __hipRegisterFunction fills, so a bigger table is a
-// plausible tax -- and if it is the tax, the lever is fewer instantiations, not tidier shims.
+// This isolates the module. libr4d is a .so holding every kernel instantiation, entered through a
+// function pointer; a self-contained harness compiles a handful of kernels into the binary. HIP
+// resolves a launch by looking the host stub up in the table __hipRegisterFunction fills, so a
+// bigger table is a plausible tax, and then the lever is fewer instantiations.
 //
 //   see build_launchreg.sh
 #include <hip/hip_runtime.h>
@@ -65,13 +62,13 @@ int main(int argc, char** argv) {
         L->fn  = (LaunchFn)dlsym(L->h, "lr_launch");
         L->dfn = (DistinctFn)dlsym(L->h, "lr_launch_distinct");
         CountFn c = (CountFn)dlsym(L->h, "lr_registered");
-        if (!L->fn || !c) { std::printf("dlsym %s\n", L->path); return 1; }
+        if (!L->fn || !L->dfn || !c) { std::printf("dlsym %s\n", L->path); return 1; }
         L->nreg = c();
     }
     std::printf("%d launches a sequence, %d iterations, medians\n", N, iters);
     std::printf("  few  = %d instantiations, many = %d\n", few.nreg, many.nreg);
 
-    /* Warm every path: clocks, lazy module load for BOTH objects, and the code itself. */
+    /* Warm every path: clocks, lazy module load for both objects, and the code itself. */
     for (int w = 0; w < 400; ++w) {
         for (int i = 0; i < N; ++i) hipLaunchKernelGGL(local_k, dim3(1), dim3(64), 0, s, d);
         for (int i = 0; i < N; ++i) few.fn(d, s);
@@ -107,12 +104,10 @@ int main(int argc, char** argv) {
         a_dist.push_back(us_since(t0, t1));
     }
 
-    /* ---- A SECOND SUBMITTING THREAD. The last structural difference between this harness and the
-     * engine: --tp 2 runs two rank threads, each issuing onto its own stream, and every arm above
-     * is single-threaded. If HIP takes a process-wide lock on the submit path then a launch costs
-     * what it costs plus whatever the other rank is holding -- which would be a fixed tax, present
-     * on every kernel however small, which is exactly the shape the excess has. The second
-     * thread runs the identical loop on its OWN stream and is not measured; only rank 0 is. */
+    /* ---- A second submitting thread. --tp 2 runs two rank threads, each issuing onto its own
+     * stream. A process-wide lock on HIP's submit path would add a fixed tax to every launch,
+     * the same shape as the excess. The second thread runs the same loop on its own stream and
+     * is not measured; only rank 0 is. */
     hipStream_t s2;
     if (hipStreamCreate(&s2) != hipSuccess) { std::printf("second stream\n"); return 1; }
     std::atomic<bool> run{true};

@@ -1,5 +1,3 @@
-# The plugin layer's own sources (registry.h, loader.cpp, schema.cpp, select.cpp, bands.cpp) are
-# picked up by core/CMakeLists.txt's per-directory glob and compiled into rad_core. This file
-# exists only for the test plugins below it, which must be .so files rather than part of the
-# engine -- the plugin loader cannot be tested by anything it does not dlopen.
+# The plugin layer's sources are compiled into rad_core by core/CMakeLists.txt's glob. This file
+# only adds the test plugins, which must be separate .so files so the loader can dlopen them.
 add_subdirectory(testplugin)

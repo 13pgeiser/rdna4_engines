@@ -1,14 +1,17 @@
-/* lq_quant.h -- what every libquant quantiser shares: the grid's options as a recipe spells them,
- * reading a grid off a rule, and the table each algorithm file exports its quantiser through.
+/* lq_quant.h -- shared by every libquant quantiser: the grid options a recipe spells, reading a
+ * grid off a rule, and the table each algorithm file exports its quantiser through.
  *
- * lq_registry.cpp holds the plugin's exports and the quantisers that are a few lines each (rtn,
- * gptq, cast); an algorithm with a loop of its own (AWQ, AutoRound, ParoQuant) is a file, and its
- * RadQuantizerInfo comes back from the function named for it below.
+ * lq_registry.cpp holds the plugin's exports and the short quantisers (rtn, gptq, cast). An
+ * algorithm with its own loop (AWQ, AutoRound, ParoQuant) has its own file and returns its
+ * RadQuantizerInfo from the function named for it below.
  */
 #pragma once
 #include "lq_grid.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <vector>
 
 /* The grid options, shared by every quantiser over a grid. */
 #define LQ_GRID_OPTIONS                                                                          \
@@ -48,8 +51,8 @@ namespace lq {
  * weight's name, when it is refused. */
 int grid_of(const RadParam* o, int n_o, const RadQuantWeight* w, Grid* g);
 
-/* A rank-1 weight -- a norm, a bias -- is declined rather than quantised: nothing in a recipe
- * should have to spell out every vector a pattern happens to match. */
+/* Rank-1 weights (norms, biases) are declined rather than quantised, so a recipe pattern need not
+ * exclude every vector it happens to match. */
 inline bool declines(const RadQuantWeight* w) { return !w || w->rank < 2; }
 
 /* Say why a rule is refused, with the weight's name, and return RAD_E_INVAL. */
@@ -57,6 +60,22 @@ int refuse(const RadQuantWeight* w, const char* why);
 
 /* A 64-bit hash of a string, for a seed that is the same on every machine and every run. */
 uint64_t name_seed(const char* s);
+
+/* The rows of `w` [N, K] in the listed row units of `unit` rows each (the last unit may be short),
+ * packed in list order into `out`. Returns the row count. */
+inline int64_t gather_units(const float* w, int64_t N, int64_t K, int64_t unit,
+                            const std::vector<int64_t>& units, std::vector<float>* out) {
+    int64_t rows = 0;
+    for (int64_t u : units) rows += std::min(unit, N - u * unit);
+    out->resize((size_t)(rows * K));
+    int64_t at = 0;
+    for (int64_t u : units) {
+        const int64_t n = std::min(unit, N - u * unit);
+        std::memcpy(out->data() + at * K, w + u * unit * K, (size_t)(n * K) * sizeof(float));
+        at += n;
+    }
+    return rows;
+}
 
 /* The algorithm files' quantisers. */
 const RadQuantizerInfo& awq_info();

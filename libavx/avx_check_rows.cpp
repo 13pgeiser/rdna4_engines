@@ -1,31 +1,32 @@
-/* avx_check_rows.cpp -- embed_lookup_q over a FILE-BACKED table, the form a model serves it in.
+/* avx_check_rows.cpp -- embed_lookup_q over a file-backed table, as a model serves it.
  *
- * The geometry table checks the op against libref over a heap buffer, which the gather reads as
- * memory. A table in a container is not read that way: its rows come through a row cache every
- * thread shares, with direct reads of the file for the cache's misses and a reader thread a call
- * ahead (avx_ngram.cpp). What can go wrong there is WHICH bytes arrive -- a slot claimed twice, a
- * row decoded from a slot that was taken over, a wait on a claim that was given up -- and libref
- * has no such path to compare against, so the answer here is the file's own bytes.
+ * The geometry table checks the op against libref over a heap buffer. A table in a container is
+ * read differently: through a shared row cache, direct file reads for misses and a reader thread
+ * one call ahead (avx_ngram.cpp). The failures there are about which bytes arrive (a slot claimed
+ * twice, a row decoded from a slot taken over, a wait on an abandoned claim), and libref has no
+ * such path, so the reference is the file's own bytes.
  *
- * Two threads play the ranks of one call, as the engine's rank threads do: the same ids, rank 0
- * and 1 of 2, released together, so a thread claims rows, waits on rows the other has claimed, and
- * meets its own claim again when an id repeats within a call. Half the ids come from a small hot
- * set the cache keeps; the rest from a table four times the cache's 2^19 rows, so sets fill and
- * rows are evicted while the other thread may be reading them. Every call also hands over the NEXT
- * call's ids as `ahead`, as the engine's prefill does, so the reader thread claims and reads those
- * rows while this call's threads are still decoding theirs: a third thread in every race above.
+ * Two threads act as ranks 0 and 1 of 2 over the same ids, released together, so each claims rows,
+ * waits on the other's claims and meets its own claim again when an id repeats. Half the ids come
+ * from a small hot set; the rest from a table four times the cache's 2^19 rows, so sets fill and
+ * rows are evicted while the other thread may be reading them. Each call also passes the next
+ * call's ids as `ahead`, so the reader thread races both ranks.
  *
- * Every output row is compared bit for bit with that id's bytes in the file through the call's
- * scale, and a padding id must come back as a zero row. The row is 40 codes, so the AVX-512 decode
- * takes one full 32-code step and a masked tail. The table is a file in `dir`, and the filesystem
- * there decides how the gather aligns its direct reads: by the alignment the filesystem reports
- * (ext4, XFS), or by its block size where it reports none (btrfs, and a tmpfs since Linux 6.6). The
- * case says which it ran. */
-#include "avx_harness.h"
+ * Each output row is compared bit for bit with the file's bytes through the call's scale; a padding
+ * id must give a zero row. Rows are 40 codes, so the AVX-512 decode runs one 32-code step plus a
+ * masked tail. Direct reads align to the filesystem's reported DIO alignment (ext4, XFS) or to its
+ * block size where none is reported (btrfs, tmpfs since Linux 6.6); the case reports which.
+ *
+ * Each table is written once per process under a name of its own (mkostemp), stays mapped for the
+ * rest of the process and is unlinked once the gather has opened it: the ISA levels share the file
+ * reads and differ only in the decode. */
+#include "avx_check.h"
 
 #include <barrier>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <thread>
 
 #include <cstddef>
@@ -41,16 +42,30 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-/* EMBED_LOOKUP_Q'S INIT REFUSES A PROCESS THAT MAY NOT MAKE AN io_uring RING, and says why: Docker's
- * default seccomp profile answers EPERM to io_uring_setup, and a server started that way used to
- * load the whole model and then fail every request as "unsupported". A child process installs the
- * same refusal as a seccomp filter and asks the kernel's init, which must refuse a gather into
- * bf16 -- the one that reads through the ring -- name the Docker option on stderr, and accept a
- * gather into f32, which reads the table as memory. Then this process asks: it must accept where a
- * ring can be made and refuse where it cannot, as in a build sandbox. */
-bool ngram_init_case(const Lib& avx) {
+/* The errno of creating a ring as the gather does (avx_ngram.cpp: ReadRing::init), or 0. */
+static int ring_probe() {
+    io_uring_params p{};
+    p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+    const long ring = syscall(__NR_io_uring_setup, 4096, &p);
+    if (ring < 0) return errno;
+    ::close((int)ring);
+    return 0;
+}
+
+/* Ring memory can count against the locked-memory limit, which every process of the user shares,
+ * so a run beside other io_uring users can be refused one (ENOMEM) for a while. That is the
+ * machine, not the gather: the cases name it and skip. */
+static const char* const kRingMemory = "io_uring ring memory refused (ENOMEM); the locked-memory "
+                                       "limit is shared with this user's other processes";
+
+/* embed_lookup_q's init must refuse a process that cannot create an io_uring ring, and say why
+ * (Docker's default seccomp profile returns EPERM for io_uring_setup). A child installs that
+ * refusal as a seccomp filter; init must then refuse a bf16 gather (read through the ring), name
+ * the Docker option on stderr, and accept an f32 gather (read as memory). This process must then be
+ * accepted where a ring can be created and refused where it cannot, as in a build sandbox. */
+bool ngram_init_case(const Lib& lib) {
     const char* what = "embed_lookup_q's init";
-    const RadKernelInfo* r = avx.row("embed_lookup_q");
+    const RadKernelInfo* r = lib.row("embed_lookup_q");
     if (!r || !r->init) {
         std::printf("  %s: the row has no init\n", what);
         return false;
@@ -114,53 +129,43 @@ bool ngram_init_case(const Lib& avx) {
         std::printf("  %s, where io_uring is refused: refused, naming the Docker option\n", what);
     }
 
-    io_uring_params p{};
-    const long ring = syscall(__NR_io_uring_setup, 1, &p);
-    const bool here = ring >= 0;
-    if (here) ::close((int)ring);
+    /* The init tests the ring once per process, so the probes bracket it. */
+    const int before = ring_probe();
     void* inst = nullptr;
     const int st = r->init(bf16, 2, 0, 1, &inst);
+    const int after = ring_probe();
+    if (st == RAD_E_UNSUPPORTED && (before == ENOMEM || after == ENOMEM)) {
+        std::printf("  %s, in this process: SKIPPED -- %s\n", what, kRingMemory);
+        return ok;
+    }
+    const bool here = before == 0;
     const bool right = here ? st == RAD_OK : st == RAD_E_UNSUPPORTED;
     std::printf("  %s, in this process (io_uring %s): %s\n", what, here ? "available" : "refused",
                 right ? (here ? "accepted" : "refused") : "FAIL");
     return ok && right;
 }
 
-bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool verbose,
-                     bool bf16) {
-    const RadKernelInfo* r = avx.row("embed_lookup_q");
-    const char* what = bf16 ? "embed_lookup_q from a file, bf16 table" : "embed_lookup_q from a file";
-    if (!r || !r->launch) {
-        std::printf("  %s: no row\n", what);
-        return false;
-    }
-    /* A bf16 table is twice the bytes a row and is read with no scale: its rows are their output,
-     * so what this checks there is the cache and the reads at a row size the E4M3 table never
-     * has. */
-    /* The gather's misses are io_uring reads, and a sandbox can forbid io_uring outright -- Docker's
-     * default seccomp profile does. There the gather refuses every call by design, so the case
-     * says why it cannot run rather than counting a refusal per call. */
-    {
-        io_uring_params p{};
-        const long ring = syscall(__NR_io_uring_setup, 1, &p);
-        if (ring < 0) {
-            std::printf("  %s: SKIPPED -- io_uring is unavailable here (%s)\n", what,
-                        std::strerror(errno));
-            return true;
-        }
-        ::close((int)ring);
-    }
-    const int64_t n = 40, V = int64_t(1) << 21, M = 512, hot = 4096;
-    const int64_t rb = bf16 ? 2 * n : n;
-    const float scale = 0.375f;
+/* A table file, written and mapped once per process. */
+struct RowTable {
+    enum { OK, SKIP, FAIL } state = FAIL;
+    std::string path, note;       /* note: the skip or failure reason, or the read granule */
+    const uint8_t* tab = nullptr;
+    bool unlinked = false;
+};
 
-    const std::string path = dir + "/rad-avx-check-rows.bin";
+static RowTable* row_table(const std::string& dir, bool bf16, int64_t V, int64_t rb) {
+    static std::map<std::pair<std::string, bool>, RowTable> tables;
+    const auto key = std::make_pair(dir, bf16);
+    if (auto it = tables.find(key); it != tables.end()) return &it->second;
+    RowTable& t = tables[key];
+
+    /* A name of its own, so a concurrent run cannot truncate the file under this one's mapping. */
+    std::string path = dir + "/rad-avx-check-rows.XXXXXX";
     uint64_t x = 0x9e3779b97f4a7c15ull;
     auto rnd = [&x]() { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; };
     {
-        const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-        if (fd < 0) { std::printf("  %s: cannot create %s\n", what, path.c_str());
-                      return false; }
+        const int fd = ::mkostemp(path.data(), O_CLOEXEC);
+        if (fd < 0) { t.note = "cannot create " + path; return &t; }
         std::vector<uint64_t> chunk(1 << 16);
         bool wrote = true;
         for (int64_t done = 0; done < V * rb && wrote; done += (int64_t)(chunk.size() * 8)) {
@@ -170,13 +175,11 @@ bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool
         }
         wrote = wrote && ::fsync(fd) == 0;
         ::close(fd);
-        if (!wrote) { ::unlink(path.c_str()); std::printf("  %s: short write\n", what);
-                      return false; }
+        if (!wrote) { ::unlink(path.c_str()); t.note = "short write"; return &t; }
     }
-    /* A filesystem without direct I/O -- one that refuses the open, as a tmpfs did before Linux
-     * 6.6, or one that reports the file has none -- is one the gather refuses by design, so the
-     * case cannot run there; it says so rather than counting a refusal per call. Every other
-     * filesystem the gather has to read, with or without a reported alignment. */
+    /* The gather refuses a filesystem without direct I/O (the O_DIRECT open fails, as on tmpfs
+     * before Linux 6.6, or it reports a zero DIO alignment), so the case is skipped there. Every
+     * other filesystem must work, with or without a reported alignment. */
     bool reported = false;
     {
         const int dfd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
@@ -188,18 +191,62 @@ bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool
         if (dfd >= 0) ::close(dfd);
         if (!dio) {
             ::unlink(path.c_str());
-            std::printf("  %s: SKIPPED -- %s cannot do direct I/O\n", what, dir.c_str());
-            return true;
+            t.state = RowTable::SKIP;
+            t.note = dir + " cannot do direct I/O";
+            return &t;
         }
     }
-    const char* granule = reported ? "the alignment the filesystem reports"
-                                   : "no alignment reported, read by the block size";
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     void* map = fd < 0 ? MAP_FAILED : mmap(nullptr, (size_t)(V * rb), PROT_READ, MAP_SHARED, fd, 0);
     if (fd >= 0) ::close(fd);
-    if (map == MAP_FAILED) { ::unlink(path.c_str()); std::printf("  %s: mmap\n", what);
-                             return false; }
-    const uint8_t* tab = static_cast<const uint8_t*>(map);
+    if (map == MAP_FAILED) { ::unlink(path.c_str()); t.note = "mmap"; return &t; }
+    /* The mapping stays for the life of the process. libavx resolves a table to its file once, by
+     * the mapping's address range (avx_ngram.cpp: table_file), so no other file may be mapped at
+     * these addresses while the process runs. */
+    t.tab = static_cast<const uint8_t*>(map);
+    t.path = path;
+    t.note = reported ? "the alignment the filesystem reports"
+                      : "no alignment reported, read by the block size";
+    t.state = RowTable::OK;
+    return &t;
+}
+
+bool row_gather_case(const Lib& lib, const std::string& dir, int64_t calls, uint64_t seed,
+                     bool verbose, bool bf16) {
+    const RadKernelInfo* r = lib.row("embed_lookup_q");
+    const char* what = bf16 ? "embed_lookup_q from a file, bf16 table" : "embed_lookup_q from a file";
+    if (!r || !r->launch) {
+        std::printf("  %s: no row\n", what);
+        return false;
+    }
+    /* A bf16 table has twice the row bytes and no scale, so it exercises the cache and the reads
+     * at a row size the E4M3 table never has. */
+    /* Misses are io_uring reads. Where a sandbox forbids io_uring the gather refuses every call by
+     * design, so the case is skipped with the reason. */
+    if (const int e = ring_probe()) {
+        std::printf("  %s: SKIPPED -- %s\n", what,
+                    e == ENOMEM ? kRingMemory
+                                : (std::string("io_uring is unavailable here (") +
+                                   std::strerror(e) + ")").c_str());
+        return true;
+    }
+    const int64_t n = 40, V = int64_t(1) << 21, M = 512, hot = 4096;
+    const int64_t rb = bf16 ? 2 * n : n;
+    const float scale = 0.375f;
+
+    RowTable* rt = row_table(dir, bf16, V, rb);
+    if (rt->state == RowTable::SKIP) {
+        std::printf("  %s: SKIPPED -- %s\n", what, rt->note.c_str());
+        return true;
+    }
+    if (rt->state != RowTable::OK) {
+        std::printf("  %s: %s\n", what, rt->note.c_str());
+        return false;
+    }
+    const char* granule = rt->note.c_str();
+    const uint8_t* tab = rt->tab;
+    uint64_t x = seed ? seed : 1;
+    auto rnd = [&x]() { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; };
 
     std::vector<int32_t> hotset((size_t)hot);
     for (auto& h : hotset) h = (int32_t)(rnd() % (uint64_t)V);
@@ -229,7 +276,8 @@ bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool
     };
 
     std::barrier<> go(2);
-    int64_t bad[2] = {0, 0}, refused[2] = {0, 0};
+    int64_t bad[2] = {0, 0}, refused[2] = {0, 0}, failed[2] = {0, 0};
+    /* Each rank thread makes its own ring on its first call. */
     auto rank = [&](int rk) {
         uint16_t sc = rad_f32_to_bf16(scale);
         std::vector<uint16_t> out((size_t)(M * n));
@@ -248,11 +296,15 @@ bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool
         a.rank = rk; a.world_size = 2;
         for (int64_t c = 0; c < calls; ++c) {
             ts[0].data = &ids[(size_t)(c * M)];
-            /* The last call has nothing ahead of it, and says so with an absent operand. */
+            /* The last call passes no `ahead` (absent operand). */
             ts[4].data = c + 1 < calls ? &ids[(size_t)((c + 1) * M)] : nullptr;
             std::fill(out.begin(), out.end(), (uint16_t)0xdead);
             go.arrive_and_wait();
-            if (r->launch(&a, nullptr) != RAD_OK) { ++refused[rk]; continue; }
+            if (const int rc = r->launch(&a, nullptr); rc != RAD_OK) {
+                ++refused[rk];
+                if (rc != RAD_E_UNSUPPORTED) ++failed[rk];
+                continue;
+            }
             for (int64_t m = 0; m < M; ++m) {
                 const int32_t id = ids[(size_t)(c * M + m)];
                 for (int64_t i = 0; i < n; ++i) {
@@ -264,19 +316,33 @@ bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool
             }
         }
     };
-    std::thread t0(rank, 0), t1(rank, 1);
-    t0.join();
-    t1.join();
-    /* THE ADDRESS RANGE STAYS RESERVED. libavx resolves a table to its file once, by the address
-     * range of its mapping, for the life of the process (avx_ngram.cpp, table_file) -- the
-     * engine's container mapping is one. A case that unmapped here could have the next case's file
-     * mapped at the same addresses, and the gather would read this file through the fd it kept:
-     * every row of the next case wrong, on whichever run the kernel happens to reuse the range.
-     * An inaccessible anonymous mapping over the same range frees the file and keeps the range. */
-    if (mmap(map, (size_t)(V * rb), PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS |
-             MAP_NORESERVE, -1, 0) == MAP_FAILED)
-        munmap(map, (size_t)(V * rb));
-    ::unlink(path.c_str());
+    auto race = [&] {
+        bad[0] = bad[1] = refused[0] = refused[1] = failed[0] = failed[1] = 0;
+        std::thread t0(rank, 0), t1(rank, 1);
+        t0.join();
+        t1.join();
+    };
+    /* Calls refused as unsupported with every delivered row right mean a ring the kernel would
+     * not make. Under contention for ring memory the case runs again on fresh threads, which make
+     * fresh rings, up to three times; it is skipped by name only if a probe saw ENOMEM meanwhile.
+     * Refusals without that evidence fail. */
+    bool pressure = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        race();
+        const bool ring_refused = refused[0] + refused[1] && bad[0] + bad[1] == 0 &&
+                                  failed[0] + failed[1] == 0;
+        if (!ring_refused) break;
+        if (ring_probe() == ENOMEM) pressure = true;
+    }
+    /* The gather holds its own descriptor from the first call on, so the name can go. */
+    if (!rt->unlinked) {
+        ::unlink(rt->path.c_str());
+        rt->unlinked = true;
+    }
+    if (pressure && refused[0] + refused[1] && bad[0] + bad[1] + failed[0] + failed[1] == 0) {
+        std::printf("  %s: SKIPPED -- %s\n", what, kRingMemory);
+        return true;
+    }
 
     const bool pass = bad[0] + bad[1] + refused[0] + refused[1] == 0;
     if (verbose || !pass)

@@ -192,7 +192,7 @@ int main(int argc, char** argv) {
         {"h256 gqa8 causal q-pitch slice", 256, 8, 1, false, true, false, false, 0, {5}, {21}, -1, 0, 0, 512},
         /* no scratch where a split was wanted: falls back to the unsplit kernel */
         {"h256 gqa2 decode, split wanted, no scratch", 256, 2, 1, false, true, false, false, 0, {1}, {500}},
-        /* PREFILL-SHAPED: the WMMA kernel (a 64-row query, or longer) */
+        /* Prefill-shaped: the WMMA kernel (a 64-row query, or longer) */
         {"wmma h512 gqa4 prefill 200 of 900", 512, 4, 1, false, true, false, false, 0, {200}, {900}, -1, 262144, s512, 0, 1},
         {"wmma h512 gqa8 prefill fp8+descale", 512, 8, 1, true, true, false, true, 0, {130}, {130}, -1, 0, 0, 0, 1},
         {"wmma h512 gqa2 kvh2 ragged + decode rows", 512, 2, 2, false, true, true, false, 0, {150, 1, 70}, {300, 50, 70}, -1, 0, 0, 0, 1},
@@ -240,9 +240,26 @@ int main(int argc, char** argv) {
                     wmmas, fails);
         return fails ? 1 : 0;
     }
+    /* [--shard k/n] [name filter]: --shard runs every n-th case from the k-th, so ctest can split
+     * the run into parallel entries. */
+    int shard = 0, shards = 1;
+    const char* filter = nullptr;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--shard" && i + 1 < argc) {
+            if (std::sscanf(argv[++i], "%d/%d", &shard, &shards) != 2 || shards < 1 || shard < 0 ||
+                shard >= shards) {
+                std::fprintf(stderr, "--shard takes k/n with 0 <= k < n\n");
+                return 2;
+            }
+        } else {
+            filter = argv[i];
+        }
+    }
     int fails = 0;
-    for (auto& c : cases) {
-        if (argc > 1 && c.name.find(argv[1]) == std::string::npos) continue;
+    for (size_t i = 0; i < cases.size(); ++i) {
+        const Case& c = cases[i];
+        if ((int)(i % (size_t)shards) != shard) continue;
+        if (filter && c.name.find(filter) == std::string::npos) continue;
         fails += run(c);
     }
     std::printf("%d failure(s)\n", fails);

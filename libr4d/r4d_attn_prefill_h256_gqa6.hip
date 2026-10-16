@@ -2,33 +2,27 @@
 // 128-VGPR accumulator. The query is bf16 and the KV cache is fp8 or bf16; the 16-bit operand
 // format for both matmuls is f16 (see r4d_dt16.h for why).
 //
-// Two families are compiled: all-16-bit (bf16 KV) and 16/8 mixed (bf16 query, fp8 KV). A variant
-// far off the optimum is not kept behind a flag, so there is no fp8-P variant here.
+// Two families: all-16-bit (bf16 KV) and 16/8 mixed (bf16 query, fp8 KV). No fp8-P variant.
 //
-// The options below each stay separable, so any one of them can be turned off on its own after a
-// geometry change:
+// Each option below can be turned off on its own after a geometry change:
 //
-//   LAZY  (always on, and the reason this file exists)
-//         The obvious form rescales all 128 accumulator VGPRs by alpha on EVERY m-tile. Here the
-//         softmax runs against a REFERENCE max instead of a running one: p = 2^(s - m_ref + SHIFT)
-//         with m_ref updated -- and the accumulator rescaled -- only when some row's max exceeds
-//         m_ref by more than the P format can absorb (DT16::GROW octaves). Accuracy is unchanged:
-//         eager rescaling by alpha and lazy accumulation at a shifted scale produce the SAME
-//         relative weighting in an f32 accumulator.
-//   F16   f16 rather than bf16 as the 16-bit operand format. gfx1201 has NO bf16 convert, so an
-//         f32->bf16 is ~6 VALU of software RTNE; v_cvt_pkrtz_f16_f32 does two f32->f16 in ONE.
-//         Both are exact for these operands (fp8 has 3 mantissa bits, bf16 has 7, f16 has 10).
-//   MSKIP Causal masking applied only on m-tiles that straddle the limit. Interior tiles pay
-//         nothing.
-//   FOLDQ scale * k_descale * log2(e) folded into the query ONCE at load.
-//   CONTIG The k axis of a WMMA is only ever CONTRACTED, so relabelling it on BOTH operands is
-//         free; reading eight contiguous elements at 8*h gives one aligned ds_read_b128 per
-//         fragment, deletes 16 address adds, and makes the P fragment lane-local.
-//   PF/SGB Prefetch PF fragments before the matching PF WMMAs, with a hard scheduling barrier
-//         between the two groups. Without the barrier PF is INERT.
-//   DOT2  v_dot2_f32_f16 row sum off the packed f16 P: 4 instructions for 8, and the denominator
-//         becomes the p values the PV matmul actually used.
-//   BTS/KWIDE/GPREV  the tile-staging set -- see the comments on each define.
+//   LAZY  (always on) Softmax against a reference max instead of a running one:
+//         p = 2^(s - m_ref + SHIFT), with m_ref updated and the 128-VGPR accumulator rescaled only
+//         when a row max exceeds m_ref by more than the P format absorbs (DT16::GROW octaves),
+//         instead of on every m-tile. Same relative weighting in an f32 accumulator.
+//   F16   f16 as the 16-bit operand format. gfx1201 has no bf16 convert (software RTNE is ~6 VALU);
+//         v_cvt_pkrtz_f16_f32 converts two values in one. Exact for these operands (fp8 has 3
+//         mantissa bits, bf16 7, f16 10).
+//   MSKIP Causal masking only on m-tiles that straddle the limit.
+//   FOLDQ scale * k_descale * log2(e) folded into the query once at load.
+//   CONTIG The WMMA k axis is only contracted, so relabelling it on both operands is free. Reading
+//         eight contiguous elements at 8*h gives one aligned ds_read_b128 per fragment, removes 16
+//         address adds and makes the P fragment lane-local.
+//   PF/SGB Load PF fragments before the matching PF WMMAs, with a scheduling barrier between the
+//         groups. Without the barrier PF has no effect.
+//   DOT2  v_dot2_f32_f16 row sum from the packed f16 P: 4 instructions instead of 8, and the
+//         denominator uses the p values the PV matmul used.
+//   BTS/KWIDE/GPREV  tile staging; see each define.
 #include "r4d.h"
 #include "r4d_common.h"
 #include "r4d_dt16.h"
@@ -42,30 +36,22 @@
 #define O_PF8    3072
 #define O_SGB    4096
 #define O_DOT2  16384
-// BTS: the block table entries for a tile are TILE/BS values at a WAVE-UNIFORM index, so they
-// belong in SGPRs. Without this, every staging pass is `global_load_b32` (block table),
-// `s_wait_loadcnt 0x0`, fourteen instructions of address arithmetic, `global_load_b64` (the KV),
-// `s_wait_loadcnt 0x0` -- TWO serialised memory round trips, inside a barrier-bounded phase with
-// nothing else to run. A scalar load hoisted to the top of the tile collapses that to one.
+// BTS: a tile's TILE/BS block-table entries are at a wave-uniform index, so load them into SGPRs
+// once per tile. Otherwise each staging pass does two serialised memory round trips (block table,
+// then KV) inside a barrier-bounded phase with nothing else to run.
 #define O_BTS   262144
 // KWIDE: one 16-byte K fetch per thread instead of two 8-byte ones. 768 threads x 16 B is exactly
-// a 48-key tile, so the staging loop becomes straight-line: half the global loads, half the block
-// table lookups, half the dependency chains.
-// The naive assignment (key = tid/16) makes a warp write ONE row at a 32-byte stride, which is a
-// 4-way LDS bank conflict: bank = 8*ch mod 32 takes only four values. Interleaving two keys across
-// the warp instead -- key = 2*warp + (lane&1), ch = (lane&31)>>1 -- gives eight distinct 4-bank
-// groups covering all 32 banks, i.e. the conflict-free minimum, and the global side still reads two
-// contiguous 256-byte runs.
+// a 48-key fp8 tile, so staging is straight-line with half the loads and block-table lookups.
+// key = tid/16 would make a warp write one row at a 32-byte stride (4-way LDS bank conflict, since
+// 8*ch mod 32 takes four values). key = 2*warp + (lane&1), ch = (lane&31)>>1 interleaves two keys
+// so the writes cover all 32 banks, while global reads stay two contiguous 256-byte runs.
 #define O_KWIDE 524288
-// GPREV: fetch tile ti+1's V into REGISTERS immediately after the second barrier, so its memory
-// latency is covered by tile ti's 96 WMMAs and only the LDS stores stay between the barriers.
-// V ONLY. A second prefetch, for K, does not pay at any issue point: this kernel already sits at
-// 240 VGPRs, so the allocator spills it, and a spilled prefetch is waited on immediately, which is
-// not a prefetch at all.
+// GPREV: fetch tile ti+1's V into registers right after the second barrier, so its latency is
+// hidden by tile ti's 96 WMMAs and only the LDS stores remain between barriers. V only: at
+// 240 VGPRs a K prefetch would be spilled, and a spilled prefetch is waited on immediately.
 #define O_GPREV 1048576
-// LDSB: an LDS-scoped barrier instead of __syncthreads(). See lds_barrier() in r4d_common.h --
-// the default fence invalidates the vector cache twice per tile for a synchronisation that only
-// ever orders LDS.
+// LDSB: an LDS-scoped barrier instead of __syncthreads() (lds_barrier() in r4d_common.h). The
+// default fence invalidates the vector cache twice per tile, though only LDS needs ordering.
 #define O_LDSB  2097152
 
 // bf16 dword -> 16-bit dword in the target format, optionally scaled. Used once per kernel on Q.
@@ -76,11 +62,9 @@ __device__ __forceinline__ uint32_t r4d_qcvt(uint32_t w, float s) {
                  __builtin_bit_cast(float, w & 0xffff0000u) * s);
 }
 
-// WIN turns on a sliding window (a.window positions, ending at each row's causal limit), the way
-// the decode kernel's WIN does. The window's lower bound masks the keys before it, and the KV walk
-// starts at the tile holding the window's first token (taken at query row 0, whose window reaches
-// furthest back) so the tiles no row can reach are never walked. window <= 0 (or WIN off) is the
-// full-attention form, unchanged.
+// WIN enables a sliding window (a.window positions ending at each row's causal limit), as in the
+// decode kernel. Keys below the window are masked, and the KV walk starts at the tile holding the
+// workgroup's earliest window token. window <= 0 (or WIN off) is full attention.
 template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT, int WIN = 0>
 __global__ __launch_bounds__(NWARPS * 32)
 void r4d_attn_prefill_kernel(const R4DArgs a)
@@ -127,9 +111,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     const int ctx = a.seqused_k[seq];
     if (ctx <= 0) return;
 
-    // Ragged batches: this sequence owns rows [qoff, qoff+qlen) of the dense q and out blocks.
-    // grid.x is sized from the batch MAXIMUM q_len, so a shorter sequence has blocks past its own
-    // end -- they exit here rather than run a full KV walk to write nothing.
+    // Ragged batches: this sequence owns rows [qoff, qoff+qlen) of q and out. grid.x is sized from
+    // the batch maximum q_len, so blocks past a shorter sequence's end exit here.
     const int qoff = r4d_q_off(a.cu_q, seq, a.q_len);
     const int qlen = r4d_q_len(a.cu_q, seq, a.q_len);
     if (qb * BLOCK_Q >= qlen) return;
@@ -153,7 +136,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                            + ((size_t)(qoff + qrow) * a.q_heads + qhead) * HEAD_DIM;
         #pragma unroll
         for (int t = 0; t < NKS; ++t) {
-            // CONTIG reads the same 8 d as ONE run; the split map takes them 4+4.
+            // CONTIG reads the 8 dims as one run; the split map takes them 4+4.
             const uint2 l0 = *(const uint2*)(qp + 16 * t + (CTG ? 8 * h : 4 * h));
             const uint2 h0 = *(const uint2*)(qp + 16 * t + (CTG ? 8 * h + 4 : 8 + 4 * h));
             qf[t] = D::mk(make_uint2(r4d_qcvt<D, FOLDQ, F16>(l0.x, mul),
@@ -164,9 +147,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     }
 
     const int klimit = ctx - qlen + qpos;
-    // The window's first key this row may attend to: the causal limit back by the window, floored
-    // at zero. The decode kernel's r4d_attn_wlo is the same formula, inlined here because the
-    // prefill header is compiled before the decode one that defines it.
+    // First key in this row's window, floored at zero. Same formula as r4d_attn_wlo, which is
+    // defined in the decode unit, included after this one.
     int wlo = (WIN && a.window > 0) ? (ctx - qlen + qpos - a.window + 1) : 0;
     if (WIN && a.window > 0 && wlo < 0) wlo = 0;
 
@@ -180,17 +162,14 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     const int qmax_cta   = min(qb * BLOCK_Q + BLOCK_Q - 1, qlen - 1);
     const int klimit_cta = ctx - qlen + qmax_cta;
     const int ntiles = (min(klimit_cta + 1, ctx) + TILE - 1) / TILE;
-    // The window's first tile, taken at THIS CTA's first query row (whose window reaches furthest
-    // back among the rows it holds); the walk starts there, so no tile below every row's window is
-    // fetched. Taken at the CHUNK's row 0 instead, the last CTA of an 8192-token chunk walked eight
-    // thousand keys none of its rows can see -- fully masked tiles, so skipping them changes no
-    // value. WIN off (or window <= 0) starts at 0.
+    // First window tile, taken at this workgroup's first query row (the one reaching furthest
+    // back), not the chunk's row 0, so fully masked tiles are never walked. Starts at 0 without a
+    // window.
     const int wlo0 = (WIN && a.window > 0) ? (ctx - qlen + qb * BLOCK_Q - a.window + 1) : 0;
     const int tstart = (WIN && a.window > 0 && wlo0 > 0) ? (wlo0 / TILE) : 0;
 
-    // ---- staging, split into a global FETCH (registers) and an LDS STORE ------------------------
-    // Splitting them is what lets GPREV move the fetch out from between the barriers; without
-    // GPREV the two simply run back to back.
+    // ---- staging, split into a global fetch (registers) and an LDS store ------------------------
+    // The split lets GPREV move the fetch out from between the barriers.
     const int vg = lane >> 3, vj = lane & 7;
     uint4 kreg[KREGS], vreg[VREGS];
 
@@ -282,8 +261,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                     *(uint2*)(dst)     = make_uint2(D::from_bf16w(v.x), D::from_bf16w(v.y));
                     *(uint2*)(dst + 4) = make_uint2(D::from_bf16w(v.z), D::from_bf16w(v.w));
                 } else {
-                    // tr_b128 transposes 16-BIT lanes, so each transposed short is two fp8 from
-                    // ADJACENT d; v_perm_b32 splits them back into two d rows.
+                    // tr_b128 transposes 16-bit lanes, so each short holds two fp8 from adjacent
+                    // dims; v_perm_b32 splits them into two dim rows.
                     const uint32_t lo0 = byte_gather(v.x, v.y, 0), lo1 = byte_gather(v.z, v.w, 0);
                     const uint32_t hi0 = byte_gather(v.x, v.y, 1), hi1 = byte_gather(v.z, v.w, 1);
                     uint32_t wl[4], wh[4];
@@ -300,14 +279,10 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
         }
     };
 
-    // The block table for tile ti is fetched during tile ti-1, so the scalar load has an entire
-    // store phase and two barriers to complete instead of stalling the KV address chain.
-    // A tile's NB entries are read whole, and when a tile spans several blocks the last one can run
-    // past the sequence's last block -- past the end of its row, and on the last row past the end
-    // of the table. Every key is clamped to ctx - 1 before it picks an entry, so no entry past
-    // `lastb` is ever used and clamping the index there changes no value that is. Only a window
-    // that reaches past `lastb` takes the clamped form, so every other tile keeps its one wide
-    // scalar load; at one block a tile no window can reach past it and the test folds away.
+    // Tile ti's block-table entries are loaded during tile ti-1, off the KV address chain.
+    // A multi-block tile can run past the sequence's last block (on the last row, past the end of
+    // the table). Keys are clamped to ctx - 1, so entries past lastb are never used; only tiles
+    // reaching past lastb take the clamped load. With NB == 1 the test folds away.
     const int lastb = (ctx - 1) / BS;
     auto load_bt = [&](int t0, int* out) {
         if (NB > 1 && t0 + NB - 1 > lastb) {
@@ -331,11 +306,11 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
         if (LDSB) lds_barrier(); else __syncthreads();
         fetchK(k0, blk);
         if (!GPREV) fetchV(k0, blk);
-        storeV();              // V first: its data is already in registers, so it covers K's wait
+        storeV();              // V first: already in registers, so it covers K's load latency
         storeK();
         if (LDSB) lds_barrier(); else __syncthreads();
-        // The next tile's global loads are issued HERE, before the 96 WMMAs below, and the wait
-        // that consumes them does not appear until after the next barrier.
+        // Issue the next tile's V loads before the WMMAs below; they are consumed after the next
+        // barrier.
         if (GPREV && ti + 1 < ntiles) fetchV(k0 + TILE, blkn);
 
         #pragma unroll 1
@@ -343,8 +318,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
             v8f s = (v8f){0,0,0,0,0,0,0,0};
             {
                 const uint16_t* krow = &sK[(mt * 16 + c) * KSTR] + (CTG ? 8 * h : 0);
-                // PF fragments are LOADED before the matching PF WMMAs are ISSUED, so the wait in
-                // front of each WMMA becomes `s_wait_dscnt PF-1` instead of a full drain.
+                // Load PF fragments before issuing their WMMAs, so each WMMA waits on
+                // s_wait_dscnt PF-1 instead of a full drain.
                 #pragma unroll
                 for (int g = 0; g < NKS; g += PF) {
                     frag16 kb[PF];
@@ -369,8 +344,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
             for (int e = 0; e < 8; ++e) sc[e] = FOLDQ ? s[e] : s[e] * mul;
 
             const int kbase = k0 + mt * 16 + 8 * h;
-            // The causal bound masks the keys past klimit; the window bound (WIN) also masks the
-            // keys before wlo. MSKIP skips both when an m-tile straddles neither limit.
+            // Mask keys past klimit and, with WIN, before wlo. MSKIP skips tiles straddling neither.
             if (!MSKIP || wave_any(kbase + 7 > klimit) || (WIN && wave_any(kbase < wlo))) {
                 #pragma unroll
                 for (int e = 0; e < 8; ++e) sc[e] = ((kbase + e <= klimit) && (!WIN || kbase + e >= wlo))
@@ -414,8 +388,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                 }
                 const uint2 lo  = make_uint2(pw[0], pw[1]);
                 const uint2 hi2 = make_uint2(pw[2], pw[3]);
-                // QK leaves lane (c,h) holding keys 8h+e. Under CONTIG that IS the B fragment, so
-                // the cross-half exchange the two-runs-of-four map needed is simply not there.
+                // QK leaves lane (c,h) holding keys 8h+e. Under CONTIG that is already the B
+                // fragment; the split map needs a cross-half exchange.
                 frag16 p16;
                 if (CTG) {
                     p16 = D::mk(lo, hi2);

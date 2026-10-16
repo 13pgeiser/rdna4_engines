@@ -1,9 +1,9 @@
 /* systemone_test.cpp -- /v1/systemone's adapter (core/server/systemone.h) and its handler.
  *
- * What d1 reads is exact text: a reworded instruction or a different option code is a different
- * question to a model trained on its own prompts. So the rendering is checked as text, against
- * strings written out from d1's prompt.py, and the readout against hand-computed softmaxes. The
- * end-to-end parity with d1 itself is a serve against the model (docs/SYSTEMONE.md).
+ * d1 reads exact text: a reworded instruction or a different option code is a different question
+ * to a model trained on its own prompts. So rendering is checked as text against strings copied
+ * from d1's prompt.py, and the readout against hand-computed softmaxes. End-to-end parity with d1
+ * itself needs a serve against the model (docs/SYSTEMONE.md).
  */
 #include "rad_test.h"
 
@@ -13,6 +13,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <map>
 #include <mutex>
@@ -23,10 +24,10 @@ using namespace rad::server;
 
 namespace {
 
-/* A vocabulary in which d1's answer spellings are single tokens -- yes/no in three cases, the
- * letters, " A".." Z", the digits -- and everything else is one id a byte, 1000 up, so a prompt
- * decodes back to its exact text. "Q" and "07" are NOT single tokens, which drives the fallback
- * codebook. Every string handed to encode is logged, which is how the tokenisation split is seen. */
+/* A vocabulary in which d1's answer spellings are single tokens (yes/no in three cases, the
+ * letters, " A".." Z", the digits) and every other byte is one id from 1000 up, so a prompt
+ * decodes back to its exact text. "Q" and "07" are not single tokens, which exercises the
+ * fallback codebook. Every string passed to encode is logged, to observe the tokenisation split. */
 struct DictTokenizer : ITokenizer {
     std::map<std::string, int32_t> whole;
     mutable std::vector<std::string> log;
@@ -158,7 +159,7 @@ TEST(choice_codes_follow_d1s_codebook) {
         CHECK_EQ(q.candidates[q.groups[1][1]], tok.id(" B"));
     }
     {   /* Letters are their own codes, except one that is not a token: Q takes the first free
-         * fallback, which is A -- not yet used, because the codes are taken in option order. */
+         * fallback, A, which is still unused because codes are assigned in option order. */
         DecisionRequest r;
         ApiError e;
         CHECK_OK(parse(tok, R"({"state": "s", "questions": {"q": {"type": "choice",
@@ -245,21 +246,45 @@ TEST(requests_d1_cannot_answer_are_refused_by_field) {
 /* ------------------------------------------------------------------ the handler */
 namespace {
 
-/* Answers every scored request with logits that make the first spelling of the first answer
- * win by ln 3 -- P = 0.75 at two answers -- and records what it was handed. */
+/* Answers every scored request with logits that make the first spelling of the first answer win
+ * by ln 3 (P = 0.75 with two answers), and records each request and each batch it was handed.
+ * `fail_first` fails the first request with an engine error; `refuse` answers as SchedulerBridge
+ * refuses (id 0, the sink failed). Reaps are checked as FakeScheduler checks them. */
 struct ScoringScheduler : IScheduler {
     std::mutex mu;
     std::vector<Request> seen;
+    std::vector<size_t> batches;
     std::vector<std::thread> workers;
+    std::map<uint64_t, Sink*> sinks;
+    std::vector<uint64_t> reaped;
+    int errors = 0;
+    bool fail_first = false, refuse = false;
     std::atomic<uint64_t> next{ 1 };
-    ~ScoringScheduler() override { for (auto& t : workers) if (t.joinable()) t.join(); }
+    ~ScoringScheduler() override { join(); }
+    void join() { for (auto& t : workers) if (t.joinable()) t.join(); }
+    void submit_all(std::vector<Request>& rs, std::vector<uint64_t>* ids) override {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            batches.push_back(rs.size());
+        }
+        ids->clear();
+        for (Request& r : rs) ids->push_back(submit(std::move(r)));
+    }
     uint64_t submit(Request&& r) override {
         std::lock_guard<std::mutex> lk(mu);
         auto ts = r.token_scores;
         void* sink = r.sink;
+        const bool fail = fail_first && seen.empty();
         seen.push_back(std::move(r));
-        workers.emplace_back([ts, sink] {
+        if (refuse) {
+            sink_fail(sink, RAD_E_INVAL, "refused");
+            return 0;
+        }
+        const uint64_t id = next++;
+        sinks[id] = static_cast<Sink*>(sink);
+        workers.emplace_back([ts, sink, fail] {
             sink_admitted(sink);
+            if (fail) { sink_fail(sink, RAD_E_IO, "the step failed"); return; }
             if (ts) {
                 ts->logits.assign(ts->tokens.size(), 0.0f);
                 ts->logits[0] = std::log(3.0f);
@@ -267,9 +292,17 @@ struct ScoringScheduler : IScheduler {
             sink_push(sink, 'x', nullptr);
             sink_finish(sink, Finish::Length);
         });
-        return next++;
+        return id;
     }
     void cancel(uint64_t) override {}
+    void reap(uint64_t id) override {
+        std::lock_guard<std::mutex> lk(mu);
+        auto it = sinks.find(id);
+        if (it == sinks.end() || !it->second->done() ||
+            std::find(reaped.begin(), reaped.end(), id) != reaped.end())
+            ++errors;
+        reaped.push_back(id);
+    }
     SchedMetrics metrics() const override { return {}; }
 };
 
@@ -304,6 +337,84 @@ TEST(the_endpoint_answers_only_for_a_declared_d1) {
             CHECK_EQ(rq.max_tokens, 1);
             CHECK_EQ(rq.sp.temp, 0.0f);
         }
+    }
+}
+
+namespace {
+
+const char* const kThreeQuestions = R"({"state": "s", "questions": {
+    "a": {"type": "noul", "instructions": "x"},
+    "b": {"type": "noul", "instructions": "y"},
+    "c": {"type": "noul", "instructions": "z"}}})";
+
+ServerOptions d1_options() {
+    ServerOptions o;
+    o.model_id = "d1";
+    o.decision_type = "d1";
+    return o;
+}
+
+}  /* namespace */
+
+/* The questions share the state they ask about, and it is computed once: the first question runs
+ * alone with a checkpoint at the end of the shared head, so the head stays in the prefix cache,
+ * and the rest follow as one batch that reads it. Submitting them together would answer the same
+ * and compute the head once per question. A single question has no head to share. */
+TEST(the_first_question_runs_alone_and_leaves_the_shared_head_cached) {
+    DictTokenizer tok;
+    DecisionRequest want;
+    ApiError e;
+    CHECK_OK(parse(tok, kThreeQuestions, &want, &e));
+    REQUIRE(want.trunk > 0);
+
+    ScoringScheduler sched;
+    Deps d;
+    d.sched = &sched;
+    d.tok = &tok;
+    {
+        Server srv(d, d1_options());
+        CHECK_EQ(srv.router().call("POST", "/v1/systemone", kThreeQuestions).status, 200);
+        CHECK_EQ(srv.in_flight(), (int64_t)0);
+        CHECK_EQ(srv.router().call("POST", "/v1/systemone",
+                                   R"({"state": "s", "questions": {"a": {"type": "noul", "instructions": "x"}}})")
+                     .status, 200);
+        sched.join();
+    }
+    std::lock_guard<std::mutex> lk(sched.mu);
+    CHECK(sched.batches == std::vector<size_t>({ 1, 2, 1 }));
+    REQUIRE(sched.seen.size() == 4);
+    CHECK_EQ(sched.seen[0].checkpoint_at, (int64_t)want.trunk);
+    CHECK_EQ(sched.seen[1].checkpoint_at, (int64_t)0);
+    CHECK_EQ(sched.seen[2].checkpoint_at, (int64_t)0);
+    CHECK_EQ(sched.seen[3].checkpoint_at, (int64_t)0);
+    CHECK_EQ(sched.errors, 0);
+    CHECK_EQ(sched.reaped.size(), (size_t)4);
+}
+
+/* A first question the engine fails, or the scheduler refuses, fails the call with a 500: the
+ * rest would only repeat it, so nothing else is submitted, and the admission places come back.
+ * What was submitted is reaped once; a refused question, never issued, is not. */
+TEST(a_failed_first_question_fails_the_call_and_submits_nothing_more) {
+    for (bool refuse : { false, true }) {
+        DictTokenizer tok;
+        ScoringScheduler sched;
+        sched.fail_first = !refuse;
+        sched.refuse = refuse;
+        Deps d;
+        d.sched = &sched;
+        d.tok = &tok;
+        {
+            Server srv(d, d1_options());
+            HttpResponse r = srv.router().call("POST", "/v1/systemone", kThreeQuestions);
+            CHECK_EQ(r.status, 500);
+            CHECK(has(r.body, refuse ? "refused question a" : "the step failed"));
+            CHECK_EQ(srv.in_flight(), (int64_t)0);
+            sched.join();
+        }
+        std::lock_guard<std::mutex> lk(sched.mu);
+        CHECK(sched.batches == std::vector<size_t>({ 1 }));
+        CHECK_EQ(sched.errors, 0);
+        CHECK_EQ(sched.reaped.size(), (size_t)(refuse ? 0 : 1));
     }
 }
 

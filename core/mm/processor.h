@@ -1,26 +1,26 @@
-/* processor.h -- what an image or a video becomes before an encoder sees it (spec §11).
+/* processor.h -- what an image, video or audio clip becomes before an encoder sees it (spec §11).
  *
- * THIS IS THE QWEN-VL PROCESSOR FAMILY (Qwen2-VL through Qwen3.x), and what is family-specific is
- * the arithmetic, not the numbers: every size, rate and token id comes from the container, which
- * carries the checkpoint's config.json and its two preprocessor configs (rad-convert writes them
- * under `vision_config.*`, `preprocessor.*` and `video_preprocessor.*`). What the family fixes:
+ * The family fixes the arithmetic, not the numbers: every size, rate and token id comes from the
+ * container, which carries the checkpoint's config.json and its two preprocessor configs
+ * (rad-convert writes them under `vision_config.*`, `preprocessor.*` and `video_preprocessor.*`).
+ * The Qwen-VL family (Qwen2-VL through Qwen3.x), the reference shape the others follow:
  *
  *   - A picture is resized so both sides are multiples of patch * merge and its area falls in the
  *     configured band, keeping the aspect ratio (smart_resize), with PIL's antialiased bicubic.
- *   - It is cut into patch x patch squares, `temporal` frames deep -- an image is repeated to fill
- *     the depth -- in MERGE-BLOCK ORDER: the merge x merge patches that become one output row are
+ *   - It is cut into patch x patch squares, `temporal` frames deep (an image is repeated to fill
+ *     the depth), in merge-block order: the merge x merge patches that become one output row are
  *     consecutive. Each patch row is (channel, frame, y, x), normalised by the configured mean and
  *     deviation, in bf16.
  *   - The prompt gets `<vision_start> pad*N <vision_end>` where the template put the media, N
- *     being the encoder's output rows. A video gets one such run per temporal group, each after
- *     the text `<T seconds>` giving the group's time -- which is how the model knows when a frame
- *     is, since the groups share one temporal rotary component.
- *   - Rotary positions are three components (temporal, height, width): text counts up in all
+ *     being the encoder's output rows. A video gets one run per temporal group, each after the
+ *     text `<T seconds>`; the groups share one temporal rotary component, so the text is how the
+ *     model knows when a frame is.
+ *   - Rotary positions have three components (temporal, height, width). Text counts up in all
  *     three; a media run holds its start in the first and adds its row and column to the other
- *     two; the text after it continues from start + max(rows, cols). (RopeLayout below.)
+ *     two; the text after it continues from start + max(rows, cols). See RopeLayout.
  *
  * The encoder's input is patches plus each patch's (row, col) in its segment and the segment's
- * size, which is all a learned position table and a 2-D rotary embedding need; the processor
+ * size, which is all a learned position table or a 2-D rotary embedding needs. The processor
  * produces those too, so the core stages them without knowing what they are for.
  */
 #pragma once
@@ -39,7 +39,7 @@ namespace mm {
 
 enum class Kind { Image, Video, Audio };
 
-/* THE PROCESSOR FAMILY, from the container's vision_config.model_type. The two differ in how a
+/* The processor family, from the container's vision_config.model_type. Families differ in how a
  * picture is sized, what a patch value is, and how a video is sampled and spelled in the prompt;
  * the Item they produce and everything after it is shared.
  *
@@ -61,16 +61,16 @@ enum class Family { QwenVL, Gemma4, Lfm2 };
 struct VisionConfig {
     Family  family = Family::QwenVL;
     int32_t patch = 0, temporal = 0, merge = 0;
-    /* Gemma4: soft tokens (output rows) an image, and a video frame, may take. One of 70, 140,
-     * 280, 560, 1120 -- the budgets the model was trained at. */
+    /* Gemma4: soft tokens (output rows) an image and a video frame may take. One of 70, 140,
+     * 280, 560, 1120, the budgets the model was trained at. */
     int32_t image_soft_tokens = 0, video_soft_tokens = 0;
     int64_t image_min_pixels = 0, image_max_pixels = 0;
     int64_t video_min_pixels = 0, video_max_pixels = 0;
     double  fps = 2.0;
     int32_t min_frames = 4, max_frames = 768;
-    /* The per-frame ceiling on a video's resolution, in output rows: a clip that samples few
-     * frames does not spend the whole video budget on near-native frames, so the cost of a video
-     * grows with its length (the reference processor's per-frame cap). 0 turns the cap off. */
+    /* Per-frame ceiling on a video's resolution, in output rows (the reference processor's
+     * per-frame cap). A clip with few frames does not spend the whole video budget on
+     * near-native frames, so a video's cost grows with its length. 0 turns the cap off. */
     int32_t max_frame_rows = 768;
     float   mean[3] = { 0.5f, 0.5f, 0.5f };
     float   stdv[3] = { 0.5f, 0.5f, 0.5f };
@@ -81,62 +81,97 @@ struct VisionConfig {
     double  max_pixels_tolerance = 0.0;
     int64_t max_segment_patches = 0;
 
-    /* THE DEPLOYMENT'S BOUNDS, not the checkpoint's. `max_patches` is the encoder's pass size: an
-     * image is one segment and a segment is never split, so no image may resize past it, and the
-     * image band's ceiling is lowered to fit. `max_source_pixels` bounds what the decoder is asked
-     * to hold before any resize. */
+    /* Deployment bounds, not the checkpoint's. `max_patches` is the encoder's pass size: an image
+     * is one segment and a segment is never split, so the image band's ceiling is lowered to fit
+     * it. `max_source_pixels` bounds what the decoder may hold before any resize. */
     int64_t max_patches = 0;
     int64_t max_source_pixels = (int64_t)1 << 26;
     /* A whole video's patch budget, across all its passes. */
     int64_t max_video_patches = 0;
 
-    /* The pixel bands are non-empty and the frame counts and rate positive. RAD_OK, or
-     * RAD_E_INVAL with the first one that is not in `why`. from_meta runs it on what the
-     * container states, and the engine again after the command line has replaced some of it. */
+    /* Checks the pixel bands are non-empty and the frame counts and rate positive; RAD_E_INVAL
+     * names the first violation in `why`. from_meta runs it on the container's values, and the
+     * engine again after command-line overrides. */
     int check(std::string* why) const;
 
     int64_t patch_dim() const { return 3LL * temporal * patch * patch; }
     int32_t factor() const { return patch * merge; }
 
-    /* Read from the container. Refuses a container that states no vision tower; the defaults for
-     * the processor-only keys are the family's, used only when the container omits them. */
+    /* Read from the container; refuses one with no vision tower. Processor-only keys the
+     * container omits take the family's defaults. */
     int from_meta(const RadModelMeta& m, std::string* why);
 };
 
-/* WHAT AN AUDIO CLIP BECOMES: Gemma 4's feature extractor (Gemma4AudioFeatureExtractor), read
- * from the container's `preprocessor.*` (the checkpoint's preprocessor_config.json) and its
- * audio_config. The samples are mono at `rate`, cut at `max_samples`; `frame_length / 2` zeros go
- * in front; frame i is samples [i * hop, i * hop + frame_length) of that, pre-emphasised when the
- * config says so, times a periodic Hann window, through a `fft`-point real FFT; its magnitudes go
- * through an HTK mel bank (no area normalisation) and log(x + mel_floor), optionally standardised
- * per bin. A frame is real when its last sample is a real one -- the reference's mask -- so a clip
- * of n samples has floor((n - frame_length / 2 - 1) / hop) + 1 real frames and the reference's
- * output keeps ceil(real / merge) rows of it: that many placeholders, between <boa> and <eoa>.
- * The staged patches are the real frames then zero frames to a whole number of rows -- equal, for
- * every row the reference keeps, to the frames past the end the reference zeroes. */
+/* The audio feature extractor family, from the container's audio_config.model_type. The
+ * families differ in the spectrogram and in how a clip's frames are laid out for the encoder;
+ * the Item they produce is shared.
+ *
+ *   Gemma4    Gemma4AudioFeatureExtractor: a frame_length / 2 zero lead, a periodic Hann window
+ *             through an fft-point FFT, magnitudes through an HTK mel bank, log(x + mel_floor).
+ *             The clip's real frames, then zero frames to whole output rows.
+ *
+ *   Qwen3ASR  Qwen3ASRFeatureExtractor (Whisper's): a clip shorter than `min_samples` is
+ *             zero-padded to it; frames are torch.stft's, centred with a reflected n_fft / 2 at
+ *             each end, a periodic Hann window and power spectra, the last frame dropped, so n
+ *             samples are n / hop frames; a Slaney mel bank with Slaney area normalisation;
+ *             log10(max(x, 1e-10)), floored at the clip's maximum less 8, then (x + 4) / 4.
+ *             The encoder convolves each `chunk` frames (one second) on its own, zero-padded to a
+ *             whole chunk, and keeps `chunk_rows(L)` rows of a chunk of L real frames. A chunk is
+ *             staged as merge * chunk_rows(L) frames: its real frames, the reference's zero
+ *             padding, and, where that exceeds a whole chunk, frames past it that the encoder
+ *             reads as zero. Plane 1 of the coordinates marks those (RadBatch::enc_coord), which
+ *             keeps one chunk's convolution from seeing the next. */
+enum class AudioFamily { Gemma4, Qwen3ASR };
+
+/* Audio features, configured from the container: Gemma 4's framing from `preprocessor.*` (the
+ * checkpoint's preprocessor_config.json), Qwen3-ASR's from `processor.feature_extractor.*`
+ * (processor_config.json), and the encoder's own from audio_config.
+ *
+ * Gemma 4: samples are mono at `rate`, cut at `max_samples`, with `frame_length / 2` zeros in
+ * front. Frame i is samples [i * hop, i * hop + frame_length), pre-emphasised when configured,
+ * times a periodic Hann window, through an `fft`-point real FFT; magnitudes go through an HTK mel
+ * bank (no area normalisation) and log(x + mel_floor), optionally standardised per bin.
+ *
+ * A frame is real when its last sample is (the reference's mask), so an n-sample clip has
+ * floor((n - frame_length / 2 - 1) / hop) + 1 real frames and keeps ceil(real / merge) output
+ * rows: that many placeholders between <boa> and <eoa>. The staged patches are the real frames
+ * then zero frames up to a whole row, which matches the reference's zeroed frames past the end
+ * for every row it keeps. */
 struct AudioConfig {
+    AudioFamily family = AudioFamily::Gemma4;
     int32_t rate = 0, frame_length = 0, hop = 0, fft = 0, n_mels = 0;
     double  min_freq = 0.0, max_freq = 0.0, mel_floor = 0.0;
     double  preemphasis = 0.0, input_scale = 1.0;
     bool    preemphasis_htk = true;
     std::vector<double> bin_mean, bin_std;      /* empty: no per-bin standardisation */
-    /* The longest clip in samples: Gemma 4's extractor truncates at 480000 (30 s at 16 kHz). */
+    /* The longest clip in samples: Gemma 4's extractor truncates at 480000 (30 s at 16 kHz).
+     * Qwen3-ASR's does not truncate, and its longest clip is what one encoder pass holds. */
     int64_t max_samples = 0;
+    /* Qwen3ASR: a shorter clip is zero-padded to this many samples first (the reference's
+     * min_length); the frames the encoder convolves on their own (2 * n_window). */
+    int64_t min_samples = 0;
+    int32_t chunk = 0;
     int32_t tok_audio = -1, tok_start = -1, tok_end = -1;
 
-    /* THE ENCODER'S: frames an output row, and the most frames a pass carries. */
+    /* The encoder's: frames per output row, and the most frames a pass carries. */
     int32_t merge = 0;
     int64_t max_frames = 0;
 
-    /* Read from the container; refuses one that states no Gemma 4 audio tower. */
+    /* Read from the container; refuses one that states no audio tower this processor knows.
+     * Qwen3-ASR's config names no token around its placeholders, so tok_start and tok_end stay
+     * -1 for the caller to resolve (the architecture plugin spells them; see
+     * RadAudioFormat::audio_open). */
     int from_meta(const RadModelMeta& m, std::string* why);
     /* The real frames of an n-sample clip. */
     int64_t real_frames(int64_t n_samples) const;
+    /* Qwen3ASR: the encoder rows a chunk of `frames` real frames keeps -- three convolutions of
+     * kernel 3, stride 2 and padding 1, so a whole chunk of 100 is 13. */
+    static int64_t chunk_rows(int64_t frames);
 };
 
-/* One media part after processing: its patches, its place in the prompt's token stream, and --
- * once the encoder has run -- its rows. Shared between the request that owns it and the engine
- * thread that encodes it; the engine writes `embd` once and nothing reads it before then. */
+/* One media part after processing: its patches, its place in the prompt's token stream and, once
+ * the encoder has run, its rows. Shared between the owning request and the engine thread that
+ * encodes it; the engine writes `embd` once and nothing reads it before then. */
 struct Item {
     Kind    kind = Kind::Image;
     int32_t grid_t = 0, grid_h = 0, grid_w = 0;   /* in patches; grid_t temporal groups */
@@ -147,14 +182,18 @@ struct Item {
     /* The encoder's output: n_seg segments of seg_rows rows, one segment per temporal group.
      * `rows_w` is a segment's width in output rows, which is where its rotary grid wraps. */
     int32_t n_seg = 0, seg_rows = 0, rows_w = 0, rows_h = 0;
-    /* An audio clip's REAL feature frames; the rest of its `grid_h` are the zero frames that make
-     * it whole output rows. 0 for a picture or a video. */
+    /* An audio clip's real feature frames; the rest of `grid_h` are zero frames padding it to
+     * whole output rows. 0 for a picture or a video. */
     int32_t valid = 0;
+    /* An audio clip staged in chunks (AudioFamily::Qwen3ASR): each chunk but the last is
+     * `chunk_staged` frames, of which the first `chunk_read` take part in the convolution and the
+     * rest read as zero. 0 for a clip staged whole. */
+    int32_t chunk_staged = 0, chunk_read = 0;
 
-    /* SEGMENTS OF THEIR OWN SIZE, when an item's segments differ -- an LFM2-VL picture is its
-     * tiles and a thumbnail -- each `h` x `w` patches from patch `patch0` on. Empty, every segment
-     * is grid_h x grid_w (a picture, a video's temporal groups, an audio clip). The accessors
-     * below are the only way the rest of the engine reads a segment, so both forms look alike. */
+    /* Per-segment sizes, when an item's segments differ (an LFM2-VL picture is its tiles plus a
+     * thumbnail): each is `h` x `w` patches starting at patch `patch0`. Empty means every segment
+     * is grid_h x grid_w. The rest of the engine reads segments only through the accessors below,
+     * so both forms look alike. */
     struct Segment { int32_t h = 0, w = 0; int64_t patch0 = 0; };
     std::vector<Segment> segments;
     /* The model rotates this item's tokens at their token positions (LFM2-VL's 1-D rotary), not
@@ -175,21 +214,21 @@ struct Item {
     }
     int64_t n_rows() const { return row_at(n_seg); }
 
-    /* THE TOKENS THAT REPLACE THE MEDIA MARKER, and where in them each segment's run of
-     * placeholders starts. Placeholders are the checkpoint's own pad ids, not an arbitrary one:
-     * an n-gram embedding hashes them like any other id. */
+    /* The tokens that replace the media marker, and where in them each segment's placeholder run
+     * starts. Placeholders are the checkpoint's own pad ids, because an n-gram embedding hashes
+     * them like any other id. */
     std::vector<int32_t> expand;
     std::vector<int32_t> seg_at;
 
-    /* A CONTENT KEY over the patches and the grid. It is taken BEFORE the encoder runs, so a
-     * prefix-cache hit over this item skips the encoder as well as the prefill: the patches are
-     * what the encoder is a function of, and they already reflect every preprocessing choice. */
+    /* Content key over the patches and the grid, taken before the encoder runs, so a prefix-cache
+     * hit over this item skips the encoder as well as the prefill. The patches already reflect
+     * every preprocessing choice, and the encoder is a function of them alone. */
     uint64_t key_hi = 0, key_lo = 0;
 
     /* [n_rows, n_embd] bf16, written by the engine after the encoder pass. */
     std::vector<uint16_t> embd;
     bool encoded = false;
-    /* Handed to the engine's encoder queue and not yet encoded -- the scheduler's thread only. */
+    /* Handed to the engine's encoder queue and not yet encoded. Scheduler thread only. */
     bool queued = false;
 
     /* The (row, col, rows, cols) of each patch in its segment, for the encoder: component-major,
@@ -197,16 +236,16 @@ struct Item {
     void coords(int64_t first, int64_t count, int32_t* planes) const;
 };
 
-/* THE ROTARY LAYOUT OF ONE PROMPT: which tokens are media and where each run's grid sits. Built
- * once when the prompt is tokenised; `at` is what the batch builder asks for every row of every
- * pass, so it is a binary search over runs rather than an array the length of the prompt. */
+/* The rotary layout of one prompt: which tokens are media and where each run's grid sits. Built
+ * once when the prompt is tokenised. The batch builder calls `at` for every row of every pass,
+ * so it is a binary search over runs rather than an array the length of the prompt. */
 struct RopeLayout {
     struct Run {
         int32_t tok = 0;        /* first placeholder token of the run */
         int32_t n = 0;          /* its length: rows_h * rows_w */
         int32_t w = 0;          /* its width in rows */
         int32_t base = 0;       /* the rotary position of its first token */
-        int32_t shift = 0;      /* rotary minus token index for the text AFTER the run */
+        int32_t shift = 0;      /* rotary minus token index for the text after the run */
         int32_t item = 0;       /* which of PromptMedia::items the run belongs to */
         int32_t row0 = 0;       /* the item's encoder row that its first token takes */
         bool    flat = false;   /* Item::rope_1d: the run's tokens rotate at their positions */
@@ -215,8 +254,8 @@ struct RopeLayout {
 
     bool empty() const { return runs.empty(); }
 
-    /* The last run starting at or before token i, or null. Inline and dependency-free, because
-     * the batch builder asks it for every row of every pass. */
+    /* The last run starting at or before token i, or null. Inline because the batch builder
+     * calls it for every row of every pass. */
     const Run* last_at(int64_t i) const {
         size_t lo = 0, hi = runs.size();
         while (lo < hi) {
@@ -238,11 +277,6 @@ struct RopeLayout {
         }
         out[0] = out[1] = out[2] = (int32_t)(i + r->shift);
     }
-    /* Rotary minus index for text at or after token i -- the one number a decode row needs. */
-    int32_t shift_at(int64_t i) const {
-        const Run* r = last_at(i);
-        return r ? r->shift : 0;
-    }
     /* The run holding token i, or null when i is text. */
     const Run* run_at(int64_t i) const {
         const Run* r = last_at(i);
@@ -250,7 +284,7 @@ struct RopeLayout {
     }
 };
 
-/* THE MEDIA A PROMPT CARRIES, in prompt order, with where each item's expansion begins. */
+/* One media item of a prompt and where its expansion begins. */
 struct Placed {
     std::shared_ptr<Item> item;
     int32_t               tok = 0;   /* index of item->expand[0] in the prompt */
@@ -266,30 +300,31 @@ struct PromptMedia {
 class Processor {
 public:
     /* `encode_text` tokenises the timestamp text between a video's groups: plain text, no
-     * special tokens added and none parsed. `token_id` is the id of the vocabulary entry spelled
-     * exactly so, or -1: how a family whose markers the config does not number (LFM2-VL's tile
-     * and thumbnail markers) finds them. */
+     * special tokens added or parsed. `token_id` returns the id of the vocabulary entry spelled
+     * exactly so, or -1; it finds markers the config does not number (LFM2-VL's tile and
+     * thumbnail markers). */
     int init(const VisionConfig& cfg, std::function<std::vector<int32_t>(const std::string&)> encode_text,
              std::function<int32_t(const std::string&)> token_id = {});
     const VisionConfig& config() const { return cfg_; }
 
     /* `image_tokens` is a Gemma 4 soft-token budget for this image (0: the configured one); a
      * processor that sizes images by pixels refuses a non-zero one. `max_pixels`, when set, first
-     * scales a larger picture down to that area (PIL's bicubic), as a caller's own pipeline may. */
+     * scales a larger picture down to that area with PIL's bicubic. */
     int image(const uint8_t* bytes, size_t n, int32_t image_tokens, std::shared_ptr<Item>* out,
               std::string* why, int64_t max_pixels = 0) const;
     int video(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out, std::string* why) const;
 
-    /* The pieces, exposed for the test suite: an already-decoded picture or frame list. */
+    /* From an already-decoded picture or frame list; for tests. */
     int image_from(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
     int video_from(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
 
-    /* AUDIO, when the program declared an audio encoder: `merge` and `max_frames` are its. */
-    int  init_audio(const AudioConfig& cfg);
+    /* Audio, when the program declares an audio encoder; `merge` and `max_frames` are the
+     * encoder's. */
+    int  init_audio(const AudioConfig& cfg, std::string* why = nullptr);
     bool has_audio() const { return audio_on_; }
     const AudioConfig& audio_config() const { return acfg_; }
     int audio(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out, std::string* why) const;
-    /* ...and from samples already decoded (mono at the configured rate), for the test suite. */
+    /* From samples already decoded (mono at the configured rate); for tests. */
     int audio_from(const std::vector<float>& samples, std::shared_ptr<Item>* out,
                    std::string* why) const;
 
@@ -305,11 +340,15 @@ private:
     VisionConfig cfg_{};
     AudioConfig  acfg_{};
     bool         audio_on_ = false;
+    int audio_qwen3asr(const std::vector<float>& samples, std::shared_ptr<Item>* out,
+                       std::string* why) const;
+
     std::vector<float>  hann_;          /* the window, float32 as the reference stores it */
     std::vector<double> mel_;           /* [n_mels, fft/2 + 1]: filter b's weight on bin k */
     std::vector<int32_t> mel_lo_, mel_hi_;  /* filter b's nonzero bins, [lo, hi) */
     std::vector<double> tw_re_, tw_im_;     /* exp(-2 pi i k / fft), k < fft/2 */
     std::vector<int32_t> brev_;             /* the FFT's bit-reversal permutation */
+    std::vector<int32_t> radix_;            /* a non-power-of-two FFT's factors, smallest first */
     std::function<std::vector<int32_t>(const std::string&)> encode_text_;
 };
 

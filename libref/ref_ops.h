@@ -1,58 +1,51 @@
 /* ref_ops.h -- the entry points ref_registry.cpp puts in the kernel table, and the layout
  * conventions they share.
  *
- * ============================== SHAPES ARE READ OFF THE OPERANDS ==============================
+ * ============================== Shapes are read off the operands ==============================
  *
- * Every extent this plugin loops over comes from a RadTensor's shape, never from the op's
- * parameters. That is a deliberate rule and not laziness:
+ * Every extent this plugin loops over comes from a RadTensor's shape, never from the parameters:
  *
- *   * A RANGED parameter is collapsed to a BAND when the instance is resolved (spec §2.2), and
- *     `rad_issue` carries the actual value as an integer rather than by rewriting the param list.
- *     A loop bounded by `M` would therefore run to the band's upper bound -- 8192 rows of a
- *     single-row decode -- and read off the end of the arena. Ref takes M from the tensor.
- *   * Everything else the parameters name is either derivable from a shape (head_dim, N, K, n)
- *     or is genuinely not a shape at all (causal, window, block_size, eps, group, top_k). Ref
- *     uses the parameter for the second kind and cross-checks it against the shape for the
- *     first, refusing with RAD_E_SHAPE where a disagreement would mean an out-of-bounds read.
+ *   * A ranged parameter is collapsed to a band when the instance is resolved (spec §2.2), and
+ *     `rad_issue` carries the actual value separately. A loop bounded by `M` would run to the
+ *     band's upper bound (8192 rows for a one-row decode) and read past the arena. Ref takes M
+ *     from the tensor.
+ *   * Other parameters are either derivable from a shape (head_dim, N, K, n) or not shapes at all
+ *     (causal, window, block_size, eps, group, top_k). Ref uses the latter directly and
+ *     cross-checks the former against the shape, refusing with RAD_E_SHAPE where a disagreement
+ *     would read out of bounds.
  *
- * ============================== THE PAGED KV LAYOUT ==============================
+ * ============================== The paged KV layout ==============================
  *
- * This is libr4d's and every kernel in the project has to match it, so it is written here once:
+ * libr4d's layout, which every kernel must match:
  *
  *     kv_cache[num_blocks, kv_heads, block_size, 2 * head_dim]
  *
- * K first and V second inside a slot: element d of the key is at [..., d] and element d of the
- * value at [..., head_dim + d]. A flat slot index s decomposes as block = s / block_size and
- * offset = s % block_size, which is what `slot_mapping` carries and what `block_table` indexes
- * into. Nothing else in the file is allowed to invent a different one.
+ * K then V within a slot: key element d at [..., d], value element d at [..., head_dim + d]. A
+ * flat slot index s is block = s / block_size, offset = s % block_size; `slot_mapping` carries such
+ * indices and `block_table` maps to blocks.
  *
- * ============================== THE SPECULATIVE ROLLBACK CONTRACT ==============================
+ * ============================== The speculative rollback contract ==============================
  *
- * The linear-attention pair (gdn_conv_update, gdn_recurrent_update) must support rejection
- * without recompute (spec §10), and the contract is part of the schema rather than an assumption:
+ * The linear-attention pair (gdn_conv_update, gdn_recurrent_update) supports rejection without
+ * recompute (spec §10); the contract is part of the schema:
  *
  *   conv state   [n_slots, conv_dim, state_len], state_len >= conv_width - 2 + q_len.
- *                A step READS its window at offset num_accepted[s] - 1 -- the slot the last
- *                accepted token left -- and REWRITES the buffer shifted down by one: slots
- *                0 .. conv_width-3 take the tail of the old history, and this step's token t
- *                lands at slot t + conv_width - 2. The invariant that makes it work is that the
- *                last accepted token of a step always sits at the slot its own index implies, so
- *                the next step's read offset is the only thing that changes.
+ *                A step reads its window at offset num_accepted[s] - 1 (the slot the last
+ *                accepted token left) and rewrites the buffer shifted down by one: slots
+ *                0 .. conv_width-3 take the tail of the old history, and this step's token t lands
+ *                at slot t + conv_width - 2. Invariant: a step's last accepted token always sits at
+ *                the slot its index implies, so only the next step's read offset changes.
  *   linear state [n_slots, n_head_v, head_v, head_k], addressed through state_idx[s, 0..q_len).
- *                The initial state is read from state_idx[s, num_accepted[s] - 1] and EVERY
- *                candidate token t writes its own state to state_idx[s, t], because which of them
- *                survives verification is not known until after this layer has run.
+ *                The initial state is read from state_idx[s, num_accepted[s] - 1], and every
+ *                candidate token t writes its own state to state_idx[s, t], since which survives
+ *                verification is unknown until after this layer.
  *
- * num_accepted counts the accepted tokens of the PREVIOUS step and is 1-based: 1 means "none of
- * the drafts survived, only the token that was already committed". It is a REQUIRED operand on
- * both ops -- an op that lets the caller omit it is an op whose rollback contract is optional --
- * and a non-speculative decode passes all ones. Ref still reads a null as 1 rather than faulting,
- * because a tool calling the launch directly has no declare in front of it to enforce the schema.
+ * num_accepted counts the previous step's accepted tokens, 1-based: 1 means no draft survived, only
+ * the committed token. It is a required operand on both ops; a non-speculative decode passes all
+ * ones. Ref still reads a null as 1, for direct callers with no declare to enforce the schema.
  *
- * BOTH OPS ALSO TAKE `cu`, and it is required. The two decode kernels run off the one cumulative-
- * lengths tensor on the one step; the number of sequences is cu's length minus one and nothing
- * else in either argument list carries it. The fast kernels read `cu[n]` before any null test, so
- * a schema that omitted it would not make it optional -- it would make the launch fault.
+ * Both ops also require `cu`: the number of sequences is cu's length minus one and nothing else
+ * carries it. The fast kernels read `cu[n]` before any null test, so omitting it would fault.
  */
 #ifndef RAD_REF_OPS_H
 #define RAD_REF_OPS_H
@@ -83,8 +76,10 @@ int ref_pool_rows          (const RadArgs*, RadStream);
 int ref_relu               (const RadArgs*, RadStream);
 int ref_clamp              (const RadArgs*, RadStream);
 int ref_conv2d             (const RadArgs*, RadStream);
+int ref_conv2d_unfold      (const RadArgs*, RadStream);
 int ref_conv1d_dw          (const RadArgs*, RadStream);
 int ref_rel_sinusoid       (const RadArgs*, RadStream);
+int ref_seg_sinusoid       (const RadArgs*, RadStream);
 int ref_attn_local_rel     (const RadArgs*, RadStream);
 int ref_gelu               (const RadArgs*, RadStream);
 int ref_silu               (const RadArgs*, RadStream);
@@ -103,6 +98,7 @@ int ref_softmax            (const RadArgs*, RadStream);
 
 /* ---- quantisation and rotation */
 int ref_quant_act_i8       (const RadArgs*, RadStream);
+int ref_quant_act_i8g      (const RadArgs*, RadStream);
 int ref_had_quant_act_i8   (const RadArgs*, RadStream);
 int ref_quant_act_fp8      (const RadArgs*, RadStream);
 int ref_had_quant_act_fp8  (const RadArgs*, RadStream);
@@ -153,6 +149,12 @@ int ref_gelu_tanh(const RadArgs*, RadStream);
 int ref_scatter_add_rows(const RadArgs*, RadStream);
 int ref_attn_prefix_self(const RadArgs*, RadStream);
 int ref_qsa_block_key      (const RadArgs*, RadStream);
+/* the QSA indexer and DFlash2's convolution (ref_qsa.cpp) */
+int ref_qsa_score          (const RadArgs*, RadStream);
+int ref_qsa_select         (const RadArgs*, RadStream);
+int ref_qsa_tail_store     (const RadArgs*, RadStream);
+int ref_qsa_work           (const RadArgs*, RadStream);
+int ref_dflash_conv        (const RadArgs*, RadStream);
 
 /* ---- mixture of experts */
 int ref_router_topk        (const RadArgs*, RadStream);
@@ -160,6 +162,14 @@ int ref_moe_scatter        (const RadArgs*, RadStream);
 int ref_moe_gemm           (const RadArgs*, RadStream);
 int ref_moe_gemm_q         (const RadArgs*, RadStream);
 int ref_moe_gemm_q_mod4    (const RadArgs*, RadStream);
+/* The layout hooks of moe_gemm_q and moe_gemm_q_mod4: a codebook expert's views of several planes
+ * in the joined form of abi/rad_planes.h, checked against `dtype` (ref_moe.cpp). */
+int ref_moe_cb_layout      (const RadParam*, int, int, const RadEncoding*, const int*,
+                            const RadTensor*, int, RadLayout*);
+int ref_moe_cb_relayout    (const RadParam*, int, int, const RadEncoding*, const int*,
+                            const RadTensor*, int, void*, int64_t);
+int ref_moe_cb_unrelayout  (const RadParam*, int, int, const RadEncoding*, const int*,
+                            const void*, int64_t, const RadTensor*, int);
 int ref_scale_rows         (const RadArgs*, RadStream);
 int ref_moe_gather         (const RadArgs*, RadStream);
 int ref_row_topk           (const RadArgs*, RadStream);
@@ -198,24 +208,17 @@ int ref_sample_pick        (const RadArgs*, RadStream);
 int ref_sample_argmax      (const RadArgs*, RadStream);
 int ref_sample_logprobs    (const RadArgs*, RadStream);
 
-/* ============================== OPERAND DESCRIPTION ==============================
+/* ============================== Operand description ==============================
  *
- * `RadKernelInfo::opd_shape` (rad_abi.h): how big is operand i of this op at this geometry, and
- * what may legally be in it. libref/ref_shapes.cpp implements one for every entry point above,
- * and the NAMING IS PART OF THE MECHANISM rather than a convention: the hook does not receive the
- * op name, so a single shared function would have to recover it from a parameter and no op in this
- * vocabulary carries its own name as one. Instead ref_registry.cpp's ROW() macro pastes the shape
- * hook out of the launch it was already given -- `fn ## _shape` -- so every row gets its
- * description without a row being edited, and an op added later that forgets to describe itself
- * does not link.
+ * `RadKernelInfo::opd_shape` (rad_abi.h): the size of operand i at this geometry and what it may
+ * legally hold. libref/ref_shapes.cpp implements one per entry point above. The naming is
+ * load-bearing: the hook does not receive the op name, so ref_registry.cpp's ROW() macro pastes
+ * `fn ## _shape` from the launch function, and an op added without a description fails to link.
  *
- * The signature is spelled once here because it is the same for every entry point above, and the
- * parameter names are what document it: `p`/`n_p` is the resolved parameter list exactly as
- * `launch` would receive it, `operand` is the positional index into the op's schema, and the
- * answer lands in `out`. RAD_OK, or RAD_E_UNSUPPORTED when the geometry
- * does not carry what the description needs -- which a caller SKIPS AND COUNTS rather than
- * guessing, because a tool that invents an extent tests the kernel's bounds handling and calls the
- * result correctness. */
+ * `p`/`n_p` is the resolved parameter list as `launch` receives it, `operand` the positional index
+ * into the op's schema, and the result goes to `out`. Returns RAD_OK, or RAD_E_UNSUPPORTED when the
+ * geometry lacks what the description needs; callers skip and count those rather than guess, since
+ * an invented extent tests bounds handling, not correctness. */
 #define REF_SHAPE_FN(fn) \
     int fn##_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
 
@@ -240,8 +243,10 @@ REF_SHAPE_FN(ref_pool_rows);
 REF_SHAPE_FN(ref_relu);
 REF_SHAPE_FN(ref_clamp);
 REF_SHAPE_FN(ref_conv2d);
+REF_SHAPE_FN(ref_conv2d_unfold);
 REF_SHAPE_FN(ref_conv1d_dw);
 REF_SHAPE_FN(ref_rel_sinusoid);
+REF_SHAPE_FN(ref_seg_sinusoid);
 REF_SHAPE_FN(ref_attn_local_rel);
 REF_SHAPE_FN(ref_gelu);
 REF_SHAPE_FN(ref_silu);
@@ -259,6 +264,7 @@ REF_SHAPE_FN(ref_cast);
 REF_SHAPE_FN(ref_softmax);
 
 REF_SHAPE_FN(ref_quant_act_i8);
+REF_SHAPE_FN(ref_quant_act_i8g);
 REF_SHAPE_FN(ref_had_quant_act_i8);
 REF_SHAPE_FN(ref_quant_act_fp8);
 REF_SHAPE_FN(ref_had_quant_act_fp8);
@@ -306,6 +312,11 @@ REF_SHAPE_FN(ref_gelu_tanh);
 REF_SHAPE_FN(ref_scatter_add_rows);
 REF_SHAPE_FN(ref_attn_prefix_self);
 REF_SHAPE_FN(ref_qsa_block_key);
+REF_SHAPE_FN(ref_qsa_score);
+REF_SHAPE_FN(ref_qsa_select);
+REF_SHAPE_FN(ref_qsa_tail_store);
+REF_SHAPE_FN(ref_qsa_work);
+REF_SHAPE_FN(ref_dflash_conv);
 
 REF_SHAPE_FN(ref_router_topk);
 REF_SHAPE_FN(ref_moe_scatter);

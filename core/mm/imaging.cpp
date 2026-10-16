@@ -82,6 +82,12 @@ inline unsigned muldiv255(unsigned a, unsigned b) {
 
 void resize_lanczos_rgba(const FrameRGBA& src, int32_t w, int32_t h, FrameRGBA* out) {
     const int iw = src.w, ih = src.h;
+    /* Image.resize returns a copy at the same size. The premultiplied round trip below is not
+     * lossless where alpha is below 255. */
+    if (w == iw && h == ih) {
+        *out = src;
+        return;
+    }
     /* RGBA -> RGBa: the colour premultiplied by the alpha */
     std::vector<uint8_t> pre((size_t)iw * ih * 4);
     for (size_t i = 0; i < (size_t)iw * ih; ++i) {

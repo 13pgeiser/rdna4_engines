@@ -9,16 +9,14 @@ int Arena::init(int64_t plan_bytes, int64_t scratch_bytes, int kind, int regions
     release();
     if (plan_bytes < 0 || scratch_bytes < 0 || regions < 1) return RAD_E_INVAL;
 
-    /* The scratch region starts on a page boundary. Kernels that want 4 KiB alignment for a
-     * workspace get it for free, and the ones that do not are not charged for it -- the padding is
-     * one page against an arena measured in hundreds of megabytes. */
+    /* Scratch starts on a page boundary, so a workspace gets 4 KiB alignment for at most one
+     * page of padding. */
     const int64_t off   = align_up(plan_bytes, RAD_ALIGN_UNIT);
     const int64_t pitch = align_up(scratch_bytes, RAD_ALIGN_UNIT);
     const int64_t tail  = pitch * regions;
     int64_t       total = off + tail;
 
-    /* A zero-byte arena would hand every buffer a null base and turn a plan bug into a segfault
-     * with no name on it. One page instead, so a stray offset lands somewhere reportable. */
+    /* Never zero bytes: a null base would turn a plan bug into an anonymous segfault. */
     if (total == 0) total = RAD_ALIGN_UNIT;
 
     void* p = rad_dev_alloc(total, kind);
@@ -50,13 +48,25 @@ void Arena::release() {
 }
 
 
-/* See arena.h. The walk is Ctx::bind_arena's, lifted here whole so the budget resolver and the
- * allocation cannot disagree.
- *
- * THIS ASSUMES the plan gives host-domain buffers their own offset space. If it interleaves them
- * with device buffers instead, both arenas come out sparse: correct, but paying VRAM for host
- * activations. BufferInfo carries one arena_offset and one total, so the contract has to be stated
- * somewhere and this is it. */
+int64_t arena_host_bytes(const Program& P) {
+    int64_t host_hw = 0;
+    for (size_t i = 1; i < P.buffers.size(); ++i) {
+        const BufferInfo& bi = P.buffers[i];
+        if (bi.arena_offset < 0 || bi.decl.domain != RAD_DOMAIN_HOST) continue;
+        int64_t bytes = bi.bytes;
+        if (bytes <= 0) {
+            int64_t n = 1;
+            for (uint32_t d = 0; d < bi.decl.rank; ++d) n *= bi.decl.shape[d];
+            bytes = rad_dtype_bytes(bi.decl.dtype, n);
+        }
+        host_hw = std::max(host_hw, bi.arena_offset + bytes);
+    }
+    return host_hw;
+}
+
+/* Assumes the plan gives host-domain buffers their own offset space (BufferInfo carries one
+ * arena_offset). If it interleaved them with device buffers, both arenas would come out sparse:
+ * correct, but paying VRAM for host activations. */
 int64_t arena_plan_bytes(const Program& P, int64_t* dev_out, int64_t* total_out) {
     int64_t dev_hw = 0, host_hw = 0;
     for (size_t i = 1; i < P.buffers.size(); ++i) {
@@ -74,8 +84,7 @@ int64_t arena_plan_bytes(const Program& P, int64_t* dev_out, int64_t* total_out)
     /* With no host-domain buffers the plan's own total is authoritative: it may carry alignment
      * slack the high-water mark does not see. */
     int64_t dev_bytes = host_hw > 0 ? dev_hw : std::max(dev_hw, P.arena_bytes);
-    /* The staging region sits above every buffer, so it is its own term, whichever of the two
-     * above set the high-water mark. */
+    /* The staging region sits above every buffer, so it is a separate term. */
     if (P.arena_stage_bytes > 0 && P.arena_stage_off >= 0)
         dev_bytes = std::max(dev_bytes, P.arena_stage_off + P.arena_stage_bytes);
     int64_t total = align_up(dev_bytes, RAD_ALIGN_UNIT) +
@@ -84,5 +93,12 @@ int64_t arena_plan_bytes(const Program& P, int64_t* dev_out, int64_t* total_out)
     if (dev_out)   *dev_out = dev_bytes;
     if (total_out) *total_out = total;
     return total;
+}
+int arena_level_for(const std::vector<int64_t>& level_rows, int64_t rows) {
+    int level = 0;
+    for (size_t k = 1; k < level_rows.size(); ++k)
+        if (level_rows[k] >= rows && (level == 0 || level_rows[k] < level_rows[(size_t)level]))
+            level = (int)k;
+    return level;
 }
 }  /* namespace rad */

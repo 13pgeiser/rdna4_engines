@@ -3,7 +3,7 @@
 
     pad_verify.py SRC PADDED
 
-Re-derives the head/row maps from PADDED/config.json `_tp_padding`, then for EVERY tensor in the
+Re-derives the head/row maps from PADDED/config.json `_tp_padding`, then for every tensor in the
 padded index checks, streaming one tensor at a time:
   untouched tensors  byte-identical to the source
   padded tensors     every real row/column block equals the source block it came from, and every

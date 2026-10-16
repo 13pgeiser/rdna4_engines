@@ -1,17 +1,11 @@
-/* geometry.h -- the chunk geometry, COMPUTED from the resolved kernels rather than documented as
- * a minimum an operator has to know.
+/* geometry.h -- the prefill chunk geometry, computed from the resolved kernels.
  *
- * vLLM makes a hybrid model's operator pass a minimum `--max-num-batched-tokens` by hand, because
- * it inflates the attention block size until it matches the mamba page and then asserts the batch
- * budget covers it. The constraint is real; the fact that a human has to carry the number is not.
- * Here declare has already resolved every kernel, so the constraints that produce it are in hand:
- * the attention block size comes off the resolved attention kernel (§7.2) and the linear-state
- * chunk length off whichever resolved kernels mark a parameter RAD_PROLE_SEQ_CHUNK, and the
- * reconciliation is arithmetic.
- *
- * If the resolved geometry needs more tokens than the operator budgeted, that is said at startup
- * with the number and the engine refuses -- rather than running something subtly wrong, which here
- * means chunks that never land on a checkpoint boundary and a linear prefix hit rate of zero.
+ * The attention block size comes from the resolved attention kernel (§7.2) and the linear-state
+ * chunk length from every resolved kernel that marks a parameter RAD_PROLE_SEQ_CHUNK, so the
+ * operator never has to supply a minimum --max-num-batched-tokens by hand (as vLLM requires for
+ * hybrid models). If the budget is below what the geometry needs, startup prints the number and
+ * refuses: a smaller budget means chunks never land on a checkpoint boundary and the linear
+ * prefix hit rate is zero.
  */
 #pragma once
 #include "rad_core.h"
@@ -19,50 +13,64 @@
 namespace rad {
 
 struct ChunkGeometry {
-    /* The attention block size, reconciled across every paged KV group. Taken from the resolved
-     * kernel; libr4d's paged attention is compiled for 16 and rejects anything else. */
+    /* Attention block size, the lcm across every paged KV group. libr4d's paged attention is
+     * compiled for 16 only. */
     int64_t attn_block = 1;
 
-    /* The length a linear-state scan tiles at -- libr4d's gated delta net is the one that has
-     * one, at 64. Scanned off the constraints of every op whose schema marks a parameter
-     * RAD_PROLE_SEQ_CHUNK, and off the geometry the architecture plugin declared them with. */
+    /* Tile length of a linear-state scan (64 for libr4d's gated delta net). Taken from the
+     * declared geometry and kernel constraints of every op whose schema marks a parameter
+     * RAD_PROLE_SEQ_CHUNK. */
     int64_t state_chunk = 1;
 
-    /* What a NON-FINAL prefill chunk must be a multiple of: lcm(attn_block, state_chunk). A chunk
-     * that ends here ends on an attention block boundary and on a linear chunk boundary at once,
-     * so neither kernel is handed a partial tile it has to special-case. */
+    /* lcm(attn_block, state_chunk); every non-final prefill chunk is a multiple of it, so no
+     * kernel is handed a partial tile. */
     int64_t quantum = 1;
 
-    /* The linear-state checkpoint interval (§7.3), rounded UP from the operator's request to a
-     * multiple of `quantum`, so splitting at an interval is automatically a legal chunk split.
-     * Zero when the model has no linear state and checkpointing means nothing. */
+    /* Linear-state checkpoint interval (§7.3): the operator's request rounded up to a multiple
+     * of `quantum`, so a split at the interval is a legal chunk split. Zero without linear state
+     * (see window_ckpt for the exception). */
     int64_t checkpoint_interval = 0;
+
+    /* How many intervals one prefill chunk may carry from an interval boundary past the first
+     * (Config::prefill_span); 1 without an interval grid. plan_chunk is where it acts. */
+    int64_t span = 1;
+
+    /* The budget of every step a span does not take (prefill_shared_tok). A span is for a prefill
+     * alone in its step (Scheduler::step); a step carrying anything else is planned at this
+     * budget as a deployment without a span plans it, so the span's extra rows never lengthen a
+     * step other requests wait on. */
+    int64_t shared_tok = 0;
 
     /* The smallest --max-num-batched-tokens this geometry can be served with. */
     int64_t min_max_tok = 1;
 
-    /* An upper bound some kernel placed on the chunk length, or 0. Used only to detect a
-     * contradiction, which is a kernel-set bug worth naming rather than clamping around. */
+    /* Smallest upper bound a kernel places on the chunk length, or 0. Used only to report a
+     * contradiction with `quantum`, never to clamp. */
     int64_t max_chunk = 0;
 
-    /* Every contributor by name, for the startup line and for the refusal. Built once. */
+    /* Every contributor by name, for the startup line and the refusal. */
     std::string why;
 
-    /* NO LINEAR STATE, A SLIDING WINDOW: the checkpoint snapshots the window behind a prompt's
-     * tail (KVManager::has_window_snapshot) and nothing else. Chunks are not split at the
-     * interval -- a window snapshot in the middle of a prompt buys a later hit nothing its tail
-     * does not -- and the interval is only the shortest prompt worth a snapshot. */
+    /* No linear state but a sliding window: the checkpoint snapshots only the window behind a
+     * prompt's tail (KVManager::has_window_snapshot). Chunks are not split at the interval, since
+     * a mid-prompt window snapshot gains nothing; the interval is only the shortest prompt worth
+     * a snapshot. */
     bool window_ckpt = false;
 
     bool checkpoints() const { return checkpoint_interval > 0; }
 };
 
+/* The budget of a step a span does not take (ChunkGeometry::shared_tok), from the configuration
+ * alone: --max-num-batched-tokens less the span's extra intervals, at least one interval, and the
+ * whole budget without a span. The engine states it to the plugin before declare
+ * (RadBuildCtx::max_mixed_tok) and the scheduler plans by it, so the two agree. */
+int64_t prefill_shared_tok(const Config& cfg);
+
 /* Resolve the geometry from the declared program and the operator's budgets.
  *
- * Returns RAD_OK, or RAD_E_INVAL when cfg.max_tok cannot serve the geometry -- in which case the
- * required number is in out->min_max_tok and the reason in out->why, and the caller is expected to
- * print both and stop. Returns RAD_E_SHAPE when two kernels' constraints cannot be satisfied at
- * once, which is a kernel-set bug and not an operator one. */
+ * Returns RAD_E_INVAL when cfg.max_tok is too small (the required number is in
+ * out->min_max_tok, the reason in out->why; the caller stops), and RAD_E_SHAPE when two kernels'
+ * constraints contradict each other, which is a kernel-set bug. */
 int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry* out);
 
 }  /* namespace rad */

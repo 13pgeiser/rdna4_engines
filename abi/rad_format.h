@@ -1,6 +1,6 @@
 /* rad_format.h -- the .rad container (spec.md §4.2).
  *
- *   canonical, not kernel-shaped    -- an entry is a LOGICAL weight holding the planes of its
+ *   canonical, not kernel-shaped    -- an entry is a logical weight holding the planes of its
  *                                      encoding (rad_encoding.h), row-major; no kernel library
  *                                      is named anywhere in the file, and the kernel that reads a
  *                                      weight rearranges it at load (spec §4.3)
@@ -13,8 +13,8 @@
  * Little-endian only. Every offset is from the start of the file. Every string is an offset into
  * the string blob, so the directory is fixed-stride and mmap-walkable without a parse.
  *
- * THERE IS ONE VERSION. A file in any other is refused with the instruction to convert again: the
- * product has no installed base, and a second reader would be a second set of invariants. */
+ * There is one format version. A file in any other is refused with an instruction to convert
+ * again, so there is a single reader with a single set of invariants. */
 #ifndef RAD_FORMAT_H
 #define RAD_FORMAT_H
 
@@ -74,7 +74,7 @@ typedef struct RadFileKV {
 enum { RAD_KV_F64 = 100 };
 
 /* ------------------------------------------------------------------ weight directory */
-/* One LOGICAL weight: what a declaration's `source` names (RadWeightDecl). Fixed stride, so an
+/* One logical weight: what a declaration's `source` names (RadWeightDecl). Fixed stride, so an
  * expert's address inside a layer is base + id*stride and no table is walked on the critical
  * path. */
 typedef struct RadFileEntry {
@@ -84,7 +84,7 @@ typedef struct RadFileEntry {
 
     uint32_t   enc;           /* index into the encoding table */
     uint32_t   rank;
-    int64_t    shape[RAD_MAX_RANK];   /* the LOGICAL shape */
+    int64_t    shape[RAD_MAX_RANK];   /* the logical shape */
 
     int32_t    layer;         /* RadWeightGroup, flattened: the movement unit */
     int32_t    expert;
@@ -105,9 +105,9 @@ typedef struct RadFilePlane {
 } RadFilePlane;
 
 /* ------------------------------------------------------------------ expert profile */
-/* Derived from the imatrix's activation counts. A WARM START, not a policy (spec §5.3): what a
- * calibration set routes to is not what decoding routes to, so this is worth a small improvement
- * in residency hit rate over starting cold and no more. */
+/* Derived from the imatrix's activation counts. A warm start, not a policy (spec §5.3): a
+ * calibration set routes differently from decoding, so this gives only a small residency hit-rate
+ * gain over starting cold. */
 typedef struct RadFileProfile {
     int32_t layer;
     int32_t expert;
@@ -116,8 +116,8 @@ typedef struct RadFileProfile {
 } RadFileProfile;
 
 /* ------------------------------------------------------------------ vocab */
-/* rad-convert interprets tokenizer.json properly and bakes the result here, rather than hashing
- * the file against a hardcoded enum the way llama.cpp does (spec §12). */
+/* rad-convert interprets tokenizer.json and bakes the result here, rather than hashing the file
+ * against a hardcoded enum as llama.cpp does (spec §12). */
 enum { RAD_TOK_BPE = 1, RAD_TOK_UNIGRAM = 2, RAD_TOK_WORDPIECE = 3, RAD_TOK_RWKV = 4 };
 
 /* Normaliser / pre-tokeniser / decoder steps, in declared order. */

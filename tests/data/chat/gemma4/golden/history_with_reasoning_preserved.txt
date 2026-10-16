@@ -1,0 +1,10 @@
+<bos><|turn>system
+<|think|>
+<turn|>
+<|turn>user
+First question.<turn|>
+<|turn>model
+First answer.<turn|>
+<|turn>user
+Second question.<turn|>
+<|turn>model

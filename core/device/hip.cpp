@@ -1,16 +1,14 @@
 /* hip.cpp -- the HIP half of the device backend: devices, memory and elastic memory.
  *
- * Streams, events, copies and fills are not here. They are AQL packets the engine writes into
- * queues it owns (aql.cpp), which starts from this table and fills in the rest -- pinned host
- * memory included, because the copies have to recognise it.
+ * Streams, events, copies and fills are AQL packets on engine-owned queues (aql.cpp), which
+ * starts from this table and fills in the rest, pinned host memory included because the copies
+ * must recognise it.
  *
- * Thin by design. Every entry point is one hip* call plus an error capture, because anything
- * cleverer than that is a place where the host backend and this one can disagree, and the host
- * backend is where all of it is tested (docs/IMPLEMENTATION.md). If a call here grows a policy,
- * the policy belongs in the component that wanted it, not in the device layer.
+ * Thin by design: each entry point is one hip* call plus error capture, so it cannot diverge from
+ * the host backend, where the logic is tested (docs/IMPLEMENTATION.md). Policy belongs in the
+ * component that wants it.
  *
- * The whole file compiles to nothing without RAD_HAVE_HIP, so a no-ROCm configure builds it and
- * gets an empty object rather than needing the source list to know about the backend split.
+ * Compiles to nothing without RAD_HAVE_HIP, so the source list needs no backend split.
  */
 #include "device.h"
 
@@ -36,9 +34,7 @@
 namespace rad {
 namespace {
 
-/* One place that turns a hipError_t into a RAD_E_*. The mapping is coarse on purpose: the string
- * carries the detail, the code carries the class, and a caller that wants to know exactly what the
- * driver said reads rad_dev_last_error(). */
+/* Maps a hipError_t to a coarse RAD_E_* class; the detail goes to rad_dev_last_error(). */
 int hip_fail(hipError_t e, const char* who) {
     device_set_error("%s: %s (%s)", who, hipGetErrorString(e), hipGetErrorName(e));
     switch (e) {
@@ -55,9 +51,8 @@ int hip_fail(hipError_t e, const char* who) {
     do { hipError_t _e = (call);                                                 \
          if (_e != hipSuccess) return hip_fail(_e, #call); } while (0)
 
-/* For the calls whose caller returns void -- the frees and the destroys. A failing teardown is
- * still worth naming: hipFree returning anything but success means the pointer was not what the
- * caller thought it was, and the next allocation of that class is the one that will look wrong. */
+/* For void callers (frees, destroys): a failing teardown is still logged, since it means the
+ * pointer was not what the caller thought. */
 void hip_note(hipError_t e, const char* who) {
     if (e != hipSuccess) RAD_WARN("device: %s: %s", who, hipGetErrorString(e));
 }
@@ -79,24 +74,14 @@ int d_set(int device) {
 
 /* ------------------------------------------------------------------ how much VRAM is really free
  *
- * hipMemGetInfo IS NOT THE ANSWER ON THIS DRIVER, and the error is large enough to pay for.
+ * On a card that also drives a display, hipMemGetInfo's "free" sits up to 0.7 GiB below the
+ * amdgpu driver's own per-card accounting, and that gap is allocatable. So read the driver's
+ * counters (bytes, per card, all processes) from the drm node matched by PCI slot. The node's
+ * total must equal HIP's total, so both describe the same memory; any failure returns -1 and the
+ * caller keeps hipMemGetInfo. -1 on every non-amdgpu platform.
  *
- * On a card that also drives a display, hipMemGetInfo's "free" sits up to 0.7 GiB below what the
- * amdgpu driver's own per-card accounting reports as unused -- while two otherwise identical cards
- * differ by only tens of MiB in the driver's numbers. That gap is not memory anything holds: a run
- * budgeted past hipMemGetInfo's figure allocates all of it and serves, with sysfs still reporting
- * hundreds of MiB unused afterwards. Believing HIP's number costs that 0.7 GiB, which on a model
- * whose experts do not fit is most of a millisecond a decode step.
- *
- * amdgpu publishes its own accounting, in bytes, per card, counting every process on it. Match the
- * HIP device to a drm node by PCI slot and read it. Two guards: the node's total must equal the
- * total HIP reports, so the two accountings are known to be the same accounting, and any failure
- * at any step falls back to hipMemGetInfo rather than inventing a number.
- *
- * Returns -1 when sysfs cannot answer, which is every non-amdgpu platform.
- *
- * The node's `mem_info_vram_used` is also kept open, per device, for d_vram_used: an observer
- * reads the card through that one descriptor and never through the runtime. */
+ * The node's `mem_info_vram_used` is also kept open per device for d_vram_used, so an observer
+ * reads the card through that descriptor and never through the runtime. */
 constexpr int kMaxVramNodes = 64;
 std::atomic<int> g_vram_used_fd[kMaxVramNodes] = {};   /* 0: not opened; else the fd plus one */
 
@@ -144,8 +129,7 @@ static int64_t sysfs_vram_free(int device, int64_t total) {
     }
     return -1;
 }
-/* A sysfs attribute is regenerated by a read at offset 0, so the descriptor is read with pread and
- * never moved. */
+/* A sysfs attribute is regenerated by a read at offset 0, so read with pread at 0. */
 int d_vram_used(int device, int64_t* out) {
     if (!out || device < 0 || device >= kMaxVramNodes) return RAD_E_INVAL;
     const int fd = g_vram_used_fd[device].load(std::memory_order_acquire) - 1;
@@ -166,8 +150,7 @@ int d_integrated(int device) {
     return hipDeviceGetAttribute(&v, hipDeviceAttributeIntegrated, device) == hipSuccess ? v : 0;
 }
 
-/* /proc/meminfo's MemAvailable: what the host could still hand out without swapping, -1 when it
- * cannot be read. */
+/* /proc/meminfo's MemAvailable in bytes, or -1. */
 static int64_t host_mem_available() {
     FILE* f = std::fopen("/proc/meminfo", "r");
     if (!f) return -1;
@@ -185,17 +168,12 @@ int d_props(int device, RadDeviceProps* out) {
     HIP_TRY(hipGetDeviceProperties(&p, device));
     std::memset(out, 0, sizeof *out);
 
-    /* TRUNCATION IS INTENDED AND IS SAID SO. HIP's name and gcnArchName are 256 bytes each and
-     * these fields are 128 and 32; snprintf would cut them safely anyway, but silently enough that
-     * gcc warns about it, and a build that carries a warning nobody intends to act on is a build
-     * whose warnings stop being read. The explicit precision is the same cut, declared. Real
-     * values are far inside both -- a product name and a gcnArchName run to a couple of dozen
-     * characters -- so this is about the bound, not about the data. */
+    /* Intended truncation: HIP's fields are 256 bytes, ours 128 and 32. The explicit precision
+     * silences gcc's truncation warning; real values are a few dozen characters. */
     snprintf(out->name, sizeof out->name, "%.*s", (int)(sizeof out->name) - 1, p.name);
     snprintf(out->arch, sizeof out->arch, "%.*s", (int)(sizeof out->arch) - 1, p.gcnArchName);
-    /* gcnArchName carries the feature suffixes -- "gfx1201:sramecc-:xnack-". The arch a kernel
-     * plugin's constraints match on is the bare target, so cut at the colon here rather than
-     * making every consumer do it. */
+    /* Strip feature suffixes ("gfx1201:sramecc-:xnack-"): plugin constraints match the bare
+     * target. */
     if (char* c = std::strchr(out->arch, ':')) *c = '\0';
 
     out->device_id  = device;
@@ -205,10 +183,8 @@ int d_props(int device, RadDeviceProps* out) {
     out->lds_bytes  = (int64_t)p.sharedMemPerBlock;
     out->is_host_backend = 0;
 
-    /* hipMemGetInfo reports the CURRENT device, so ask about `device` by visiting it. That costs
-     * two context switches on a call nobody makes per step -- props is read at startup and by
-     * rad-info -- and the alternative is a vram_free that silently describes the wrong card under
-     * tensor parallel. */
+    /* hipMemGetInfo reports the current device, so switch to `device` and back. props is not
+     * called per step. */
     int prev = 0;
     bool moved = false;
     if (hipGetDevice(&prev) == hipSuccess && prev != device &&
@@ -219,30 +195,24 @@ int d_props(int device, RadDeviceProps* out) {
         out->vram_free = (int64_t)freeb;
         if (totalb) out->vram_bytes = (int64_t)totalb;
     }
-    /* And then prefer the driver's own counter where it can be read -- see sysfs_vram_free. The
-     * fallback above is what every non-amdgpu platform gets; it is conservative by up to a GiB on
-     * a card that drives a display. */
+    /* Prefer the driver's counter where readable (see sysfs_vram_free). */
     {
         const int64_t sf = sysfs_vram_free(device, out->vram_bytes);
         if (sf >= 0) {
             out->vram_free = sf;
         } else if (d_integrated(device)) {
-            /* INTEGRATED GRAPHICS WHOSE "DEVICE MEMORY" IS THE HOST'S. When the runtime reports
-             * more than the carve-out the driver counts as VRAM, the rest is system RAM mapped for
-             * the GPU, and the runtime's free figure knows nothing of the other processes using
-             * it: a budget derived from it claims memory the machine is already running on. What
-             * the host can still give is the bound. A carve-out the runtime reports as it is --
-             * the case sysfs answers above -- is dedicated memory and is left alone. */
+            /* Integrated GPU whose reported memory exceeds the driver's carve-out: the rest is
+             * system RAM, and the runtime's free figure ignores other processes using it. Bound
+             * it by MemAvailable. (A carve-out reported as-is is answered by sysfs above.) */
             const int64_t avail = host_mem_available();
             if (avail >= 0 && avail < out->vram_free) out->vram_free = avail;
         }
     }
-    /* A failed restore leaves this thread pointed at the wrong card, which under tensor parallel
-     * is a rank quietly working on its neighbour's memory. Say so. */
+    /* A failed restore leaves this thread on the wrong card; under TP that is a rank working on
+     * its neighbour's memory, so it is logged. */
     if (moved) HIP_NOTE(hipSetDevice(prev));
 
-    /* Whether any peer is reachable at all. The engine asks for a specific pair through
-     * rad_dev_enable_peer; this flag is for the report. */
+    /* Whether any peer is reachable, for the report; pairs go through rad_dev_enable_peer. */
     int n = d_count();
     for (int i = 0; i < n && !out->supports_p2p; ++i) {
         if (i == device) continue;
@@ -258,8 +228,8 @@ int d_peer_access(int self, int peer) {
     return can ? 1 : 0;
 }
 
-/* The runtime's bus id, rewritten in the kernel's spelling (lower case, four-digit domain) so it
- * names the same directory under /sys/bus/pci/devices. */
+/* The runtime's bus id in the kernel's spelling (lower case, four-digit domain), matching
+ * /sys/bus/pci/devices. */
 int d_pci_address(int device, char* out, int cap) {
     if (!out || cap <= 0) return RAD_E_INVAL;
     char bus[64] = { 0 };
@@ -297,8 +267,8 @@ int d_enable_peer(int self, int peer) {
     HIP_TRY(hipSetDevice(self));
     hipError_t e = hipDeviceEnablePeerAccess(peer, 0);
     HIP_NOTE(hipSetDevice(prev));
-    /* Already enabled is success. The kernel plugin's init() hook runs per resolved instance
-     * (spec §2.1) and several instances legitimately want the same pair. */
+    /* Already enabled is success: init() runs per resolved instance (spec §2.1) and several may
+     * want the same pair. */
     if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled)
         return hip_fail(e, "hipDeviceEnablePeerAccess");
     return RAD_OK;
@@ -319,12 +289,11 @@ void* d_alloc(int64_t bytes, int kind) {
             break;
         case RAD_MEM_HOST_PINNED:
         case RAD_MEM_HOST_MAPPED:
-            /* The AQL backend's, which pins host memory through ROCr in pieces the IOMMU can map
-             * (aql.cpp, "pinned host memory, in pieces"). */
+            /* Pinned by the AQL backend through ROCr (aql.cpp, "pinned host memory, in pieces"). */
             device_set_error("rad_dev_alloc: pinned host memory is the AQL backend's");
             return nullptr;
         case RAD_MEM_HOST:
-            /* Pageable. Aligned to a page anyway so the same buffer can be an O_DIRECT target. */
+            /* Pageable, page-aligned so it can be an O_DIRECT target. */
             if (posix_memalign(&p, 4096, (size_t)((bytes + 4095) / 4096 * 4096)) != 0) p = nullptr;
             if (!p) e = hipErrorOutOfMemory;
             break;
@@ -367,7 +336,7 @@ void* d_device_ptr(void* p) {
     hipPointerAttribute_t a{};
     if (hipPointerGetAttributes(&a, p) != hipSuccess) return nullptr;
     if (a.devicePointer) return a.devicePointer;
-    /* A mapped host allocation that the attribute query did not resolve: ask the explicit way. */
+    /* Mapped host allocation not resolved by the attribute query. */
     void* d = nullptr;
     if (hipHostGetDevicePointer(&d, p, 0) == hipSuccess) return d;
     return nullptr;
@@ -378,22 +347,20 @@ const DeviceBackend g_hip = {
     "hip",
     d_count, d_set, d_props, d_enable_peer,
     d_alloc, d_free, d_host_ptr, d_device_ptr,
-    /* Streams, events, copies and fills: the AQL backend's (aql.cpp), which starts from this
-     * table and fills these in. */
+    /* Streams, events, copies and fills: filled in by the AQL backend (aql.cpp). */
     nullptr, nullptr, nullptr,
     nullptr, nullptr, nullptr, nullptr,
     nullptr, nullptr, nullptr,
     nullptr,
     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-    /* Recorded passes: likewise the AQL backend's. */
+    /* Recorded passes: AQL backend. */
     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
 
-    /* Elastic memory: likewise the AQL backend's, which reserves and backs ranges through HSA
-     * (aql.cpp, "elastic memory, through HSA"). */
+    /* Elastic memory: AQL backend, through HSA (aql.cpp, "elastic memory, through HSA"). */
     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
 
     d_vram_used,
-    /* Plugin device code: the AQL backend's, which owns the fat-binary registrations. */
+    /* Plugin device code: AQL backend, which owns the fat-binary registrations. */
     nullptr, nullptr,
     d_integrated,
     d_peer_access,
@@ -409,8 +376,7 @@ const DeviceBackend* hip_backend_if_present(void) {
     int n = 0;
     hipError_t e = hipGetDeviceCount(&n);
     if (e != hipSuccess || n <= 0) {
-        /* Not an error and not a warning: a HIP build on a machine with no visible card is a
-         * supported configuration, it is just the host one. dispatch.cpp says so at Info. */
+        /* Supported configuration (host backend); dispatch.cpp logs it at Info. */
         RAD_DEBUG("device: hipGetDeviceCount -> %s, %d device(s)", hipGetErrorName(e), n);
         return nullptr;
     }

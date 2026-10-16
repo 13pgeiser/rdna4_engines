@@ -1,10 +1,9 @@
 /* tokenizer_ucd.h -- the Unicode properties a pre-tokeniser pattern can name.
  *
- * The tables are generated (tools/gen_tokenizer_ucd.cpp) by asking Oniguruma, the engine
- * HuggingFace tokenizers matches Split patterns with, what each property contains. A pattern in a
- * tokenizer.json means whatever it means THERE, so that is the one definition this compiler has:
- * the general categories at Oniguruma's Unicode version, its `\s`, `\d` and `\w`, its scripts, and
- * its case-folding orbits for `(?i)`.
+ * The tables are generated (tools/gen_tokenizer_ucd.cpp) by querying Oniguruma, the engine
+ * HuggingFace tokenizers matches Split patterns with. A tokenizer.json pattern means what it means
+ * there, so Oniguruma is the only definition used: its general categories at its Unicode version,
+ * its `\s`, `\d` and `\w`, its scripts, and its case-folding orbits for `(?i)`.
  */
 #pragma once
 #include <cstddef>

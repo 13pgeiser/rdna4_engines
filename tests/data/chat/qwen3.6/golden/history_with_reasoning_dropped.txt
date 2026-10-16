@@ -1,0 +1,8 @@
+<|im_start|>user
+First question.<|im_end|>
+<|im_start|>assistant
+First answer.<|im_end|>
+<|im_start|>user
+Second question.<|im_end|>
+<|im_start|>assistant
+<think>

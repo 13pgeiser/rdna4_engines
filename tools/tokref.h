@@ -1,15 +1,12 @@
-/* tokref.h -- a reference encoder for checking core/text's.
+/* tokref.h -- an independent reference encoder for checking core/text's.
  *
  * `encode` runs the declared chain the way llama.cpp does: its structural splitters for the
  * patterns it recognises, std::regex over a category-collapsed copy of the text for the rest, and
  * a string-keyed bigram queue for the merge. It shares no code with core/text/tokenizer_regex.cpp
- * or tokenizer_bpe.cpp, which is the point: tokenizer_test and rad-tokcheck hold core/text's
- * encoder to it id for id.
+ * or tokenizer_bpe.cpp; tokenizer_test and rad-tokcheck compare the two id for id.
  *
- * WHERE IT IS KNOWN TO DIFFER FROM HUGGINGFACE TOKENIZERS, which is the reference both are
- * ultimately judged by. core/text's encoder follows HuggingFace in each case, so these are the only
- * places the two encoders may disagree, and the tests that compare them name the case rather
- * than avoiding the input:
+ * Known differences from HuggingFace tokenizers, which core/text follows. These are the only
+ * places the two encoders may disagree, and the comparing tests name each case:
  *   - `(?i:'s|'t|'re|'ve|'m|'ll|'d)` is rewritten to `'[sS]|...` before matching, which drops
  *     Oniguruma's case orbit of 's': U+017F LATIN SMALL LETTER LONG S. "'ſ" is a contraction to
  *     HuggingFace and not here.
@@ -20,7 +17,9 @@
  *     upper/lower-case letter classes and uses its own Han ranges.
  *   - `\d{1,3}(?=(?:\d{3})*\b)` is split by llama.cpp's AFMoE digit rule, which also splits digit
  *     runs followed by letters; the pattern does not.
- *   - Split behaviours other than Isolated are applied as Isolated.
+ *   - Split behaviours other than Isolated are applied as Isolated. (Punctuation and Digits
+ *     apply theirs: they are written here from HuggingFace's character predicates, over the
+ *     category and \s tables of core/text/tokenizer_ucd.h, rather than as patterns.)
  *   - A regex Replace normaliser runs std::regex (ECMAScript, bytes) and expands `$` in its
  *     replacement; HuggingFace inserts the replacement verbatim.
  */

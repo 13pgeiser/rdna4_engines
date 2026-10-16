@@ -102,9 +102,8 @@ Rd plane(const EncodedView& v, int idx) {
     return r;
 }
 
-/* The tables of one row part of a "givens" weight, read once: the cosine and sine of every angle
- * and the pairs as indices, so undoing a row is arithmetic and not a table walk. A decode asks for
- * the part its row falls in, and rows of one part follow each other. */
+/* One row part's "givens" tables, read once (pairs as indices, cos and sin of every angle) and
+ * reused while consecutive rows stay in the same part. */
 struct GivensPart {
     int64_t              part = -1;
     int64_t              S = 0;
@@ -199,9 +198,8 @@ int enc_decode_rows(const EncodedView& v, int64_t row0, int64_t n, float* out, s
     const bool plain  = rad_enc_is(&e, "plain");
     const bool affine = rad_enc_is(&e, "affine");
     if (!plain && !affine) {
-        /* A QUANTISER'S OWN SCHEME, read by the quantiser that wrote it -- whichever loaded one
-         * answers for it (abi/rad_quant.h). The weight is described as far as the caller knows it:
-         * a [rows, cols] view and the planes from their starts. */
+        /* A quantiser's own scheme, decoded by whichever loaded quantiser accepts it
+         * (abi/rad_quant.h), given a [rows, cols] view and the plane starts. */
         std::vector<RadQuantDecodeFn> fns;
         {
             std::lock_guard<std::mutex> lk(g_dec_mu);
@@ -266,12 +264,9 @@ int enc_decode_rows(const EncodedView& v, int64_t row0, int64_t n, float* out, s
     }
     std::vector<float> tmp(perm ? (size_t)v.cols : 0);
     GivensPart gv;
-    /* THE COMMON FORM, A ROW AT A TIME: codes with no codebook, sign, zero or minimum and at most
-     * one scale level -- int4 experts, fp8 rows, a fixed-scale table. The element walk below
-     * resolves every element's dtype and its scale's index through a switch and two divisions,
-     * and on a Flash-Next conversion that walk is a third of the convert; here the codes' dtype is
-     * resolved once a row and the scale read once a group. The same products, so the same
-     * floats. */
+    /* Fast path for the common form (no codebook, sign, zero or minimum; at most one scale level,
+     * e.g. int4 experts, fp8 rows): dtype resolved once per row and the scale read once per group,
+     * instead of per element (a third of a Flash-Next conversion). Same products, same floats. */
     const bool direct = V <= 1 && !table && !signs && !zero && mins.empty() && scales.size() <= 1;
 
     for (int64_t i = 0; i < n; ++i) {
@@ -368,10 +363,8 @@ int enc_selection_logical(const RadEncoding& e, const int* sel, int n_sel, const
                 rad_store_f32(out, dt, i * c + j, rad_load_f32(src + i * rb, p.dtype, j));
         return RAD_OK;
     }
-    /* CODES AND THE SCALAR CODEBOOK THEY INDEX, without the scale: each code as its table entry.
-     * It is what a kernel that folds the scale itself reads -- the codes view of a w4nla8h expert
-     * -- and the entries are the values the reference multiplies, where the raw indices would be
-     * other numbers. */
+    /* Codes with the scalar codebook they index, without the scale: each code as its table entry,
+     * as read by a kernel that applies the scale itself (a w4nla8h expert's codes view). */
     if (n_sel == 2 && !std::strcmp(e.plane[sel[0]].role, "codes") &&
         !std::strcmp(e.plane[sel[1]].role, "table") && e.plane[sel[0]].kind == RAD_PLANE_TILED &&
         e.plane[sel[0]].block[0] == 1 && e.plane[sel[0]].block[1] == 1 &&
@@ -394,14 +387,11 @@ int enc_selection_logical(const RadEncoding& e, const int* sel, int n_sel, const
             }
         return RAD_OK;
     }
-    /* A SCALE AND THE LEVELS ABOVE IT, without the codes: each first-level scale times every level
-     * that covers it. It is what a kernel that takes its scales as an operand of their own reads
-     * where the encoding states them in two levels -- the scale view of a w4nl64a8h expert, an
-     * E4M3 scale a (row, 64 of K) under one fixed f32 -- and the product is the scale the
-     * reference multiplies, where the first level on its own is that scale off by the second. One
-     * element a first-level scale, in that plane's extents. A level has to cover whole
-     * first-level blocks -- the whole weight, or a block a multiple of the first's -- or a scale
-     * would straddle two of its elements and have no one product. */
+    /* A scale with the levels above it, without codes: each first-level scale times every level
+     * covering it, one element per first-level scale. Read by a kernel taking scales as their own
+     * operand when the encoding has two levels (a w4nl64a8h expert: an E4M3 scale per (row, 64 of
+     * K) under one f32). Each level must cover whole first-level blocks, or a product would be
+     * ambiguous. */
     if (n_sel >= 2 && !std::strcmp(e.plane[sel[0]].role, "scale")) {
         bool chain = true;
         for (int k = 0; k < n_sel && chain; ++k) {
@@ -447,8 +437,8 @@ int enc_selection_logical(const RadEncoding& e, const int* sel, int n_sel, const
     if (n_sel != e.n_planes)
         return refuse("it takes " + std::to_string(n_sel) + " of its encoding's " +
                       std::to_string(e.n_planes) + " planes, which decode to nothing on their own");
-    /* The logical rows from the first selected plane and its block height; the columns are what
-     * is left of `n`, since a codes plane of vector codes does not carry them. */
+    /* Logical rows from the first plane and its block height; columns are what remains of `n`,
+     * since a vector-code plane does not carry them. */
     const RadEncPlane& p0 = e.plane[sel[0]];
     const int64_t r = rows[0] * (p0.kind == RAD_PLANE_TILED && p0.block[0] > 0 ? p0.block[0] : 1);
     if (r <= 0 || n % r)
@@ -481,7 +471,7 @@ int enc_plane_rect(const RadEncPlane& p, int64_t rows, int64_t cols, int64_t r0,
                                                     lo, hi, extent);
             return false;
         }
-        if (b <= 0) {                 /* one element covers the whole extent: every slice has it */
+        if (b <= 0) {                 /* one element covers the whole extent; every slice has it */
             *e0 = 0;
             *en = pext;
             return true;
@@ -498,7 +488,7 @@ int enc_plane_rect(const RadEncPlane& p, int64_t rows, int64_t cols, int64_t r0,
     PlaneRect r;
     if (!cut(r0, r1, rows, p.block[0], pr, &r.row0, &r.rows, "rows")) return RAD_E_SHAPE;
     if (!cut(c0, c1, cols, p.block[1], pc, &r.col0, &r.cols, "columns")) return RAD_E_SHAPE;
-    /* A slice is copied as bytes, so a packed plane's cut has to land on a byte. */
+    /* Slices are copied as bytes, so a packed plane's cut must fall on a byte. */
     const int bits = rad_dtype_bits(p.dtype);
     if (bits > 0 && (r.col0 * bits) % 8 != 0) {
         if (why) *why = fmt("column %lld of the ", r.col0) + rad_dtype_name(p.dtype) + " '" +

@@ -1,25 +1,18 @@
 // r4d_ar_gather_2rank.hip: r4d_ar_gather_2rank -- multi-block one-shot P2P all-GATHER, exactly two
 // ranks, for dual R9700 (gfx1201/RDNA4, PCIe).
 //
-// WHY IT EXISTS AS A KERNEL AND NOT AS A COPY. r4d_ar_oneshot_2rank_exact.hip says of
-// r4d_p2p_copy2d that a strided device-to-device copy "is what an ALL-GATHER between two ranks is
-// once the peer's buffer is IPC-mapped", and that is true of the DATA MOVEMENT and false of the
-// whole operation: a copy carries no handshake, so the reader has no way to know the writer's
-// bytes have landed. Ordering that with a separate fence plus a barrier collective is three
-// launches and a second rendezvous to keep aligned with this one. This is the same kernel as the
-// one-shot all-reduce with the reduction removed -- same push, same per-block flag protocol, same
-// double-buffered slot -- and it is a separate file rather than a template variant because the
-// all-reduce's shape (out is numel) and this one's (out is world_size * numel) differ.
+// A kernel rather than r4d_p2p_copy2d: a copy moves the data but carries no handshake, so the
+// reader cannot know the writer's bytes have landed, and ordering it with a fence plus a barrier
+// collective costs three launches and a second rendezvous. This is the one-shot all-reduce minus
+// the reduction (same push, per-block flag protocol and double-buffered slot); it is a separate
+// file because the output shapes differ (numel vs world_size * numel).
 //
-// WHAT IT IS FOR. The vocab-parallel sampler. lm_head is row-sharded, so each rank reduces its own
-// slice of the vocabulary to k candidates and only the CANDIDATE SETS are combined: at 4 rows and
-// 1024 candidates the message is 32 KiB, against the ~1 GiB a full-logits gather would move. The
-// payload is (u32 global token id, f32 logit) pairs, which is why this MOVES bytes and does not
-// sum them -- adding two f32 lanes would work on the logit and destroy the id, whose bit pattern
-// at any real vocabulary size is an f32 denormal.
+// Used by the vocab-parallel sampler. lm_head is row-sharded, so each rank reduces its vocabulary
+// slice to k candidates and only the candidate sets are combined (32 KiB at 4 rows x 1024
+// candidates, against ~1 GiB for full logits). The payload is (u32 token id, f32 logit) pairs,
+// so the bytes are moved, never summed.
 //
-// The element type is therefore irrelevant beyond its size: `dtype` is taken for symmetry with the
-// rest of the family and used only to turn n_elem into bytes.
+// `dtype` only converts n_elem to bytes.
 #include "r4d.h"
 #include "r4d_ar_seq.h"
 #include <cstdint>
@@ -36,19 +29,16 @@ __device__ __forceinline__ unsigned int r4d_g_load_acq(const unsigned int* p) {
   return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-// WHERE A RANK'S WORDS LAND. `row16` is one ROW of this rank's contribution, in 16-byte words.
+// Where a rank's words land. `row16` is one row of this rank's contribution, in 16-byte words.
 //
-//   row16 <= 0 or row16 == n16  -- one row: rank r's whole slice at r * n16, the plain
-//                                 concatenation an all-gather is usually taken to mean.
-//   otherwise                   -- ROW-INTERLEAVED: the input is [rows][row16] and the output is
-//                                 [rows][world][row16], so row m carries every rank's words for
+//   row16 <= 0 or row16 == n16  -- one row: rank r's whole slice at r * n16 (plain concatenation).
+//   otherwise                   -- row-interleaved: input [rows][row16], output
+//                                 [rows][world][row16], so row m holds every rank's words for
 //                                 that row side by side.
 //
-// The second form is the one the vocab-parallel sampler needs and it is not a convenience. The
-// merge that consumes this reads ONE ROW of gathered candidates per sampled position, at a single
-// row stride; the concatenated form puts rank 1's row m a whole message away from rank 0's, which
-// no row stride can express. Interleaving here costs one division per word in a kernel that moves
-// 32 KiB and saves a transpose launch on the step path.
+// The vocab-parallel sampler's merge reads one row of gathered candidates per position at a single
+// row stride, which the concatenated form cannot express. Interleaving costs one division per word
+// and saves a transpose launch.
 __device__ __forceinline__ int r4d_g_dst(int k, int row16, int n16, int who) {
   if (row16 <= 0 || row16 >= n16) return who * n16 + k;
   const int m = k / row16, c = k - m * row16;
@@ -56,7 +46,7 @@ __device__ __forceinline__ int r4d_g_dst(int k, int row16, int n16, int who) {
 }
 
 // Block b owns words [start,end) of the 16B-word space and drives its own flag handshake; no
-// cross-block sync, exactly as in the all-reduce.
+// cross-block sync, as in the all-reduce.
 __global__ void r4d_ar_gather_2rank_kernel(
     const int4* __restrict__ in4, int4* peer_base, const int4* my_base, int4* __restrict__ out4,
     unsigned int* peer_flags, unsigned int* my_flags, unsigned int* seq_ctrs,
@@ -73,8 +63,8 @@ __global__ void r4d_ar_gather_2rank_kernel(
   const int start = b * w;
   int end = start + w; if (end > n16) end = n16;
 
-  // push chunk -> peer slot, and place this rank's own slice while the push is in flight: it is a
-  // local store that needs no handshake, so it costs nothing to hide here.
+  // Push the chunk to the peer slot and place this rank's own slice (a local store, no handshake)
+  // while the push is in flight.
   {
     int k = start + tid;
     for (; k + 3 * nt < end; k += 4 * nt) {
@@ -87,8 +77,8 @@ __global__ void r4d_ar_gather_2rank_kernel(
     }
     for (; k < end; k += nt) { int4 v = in4[k]; ps[k] = v; out4[r4d_g_dst(k, row16, n16, rank)] = v; }
   }
-  // Drain modes, identical to the all-reduce's: they order the pushes against the release flag so
-  // the peer cannot see the flag before the data.
+  // Drain modes, as in the all-reduce: order the pushes before the release flag so the peer cannot
+  // see the flag before the data.
   if (drain == 1) __threadfence_system();
   else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
   __syncthreads();
@@ -96,8 +86,8 @@ __global__ void r4d_ar_gather_2rank_kernel(
     if (drain == 2) __threadfence_system();
     r4d_g_store_rel(&peer_flags[b], s);
     unsigned long long z = 0;
-    // A handshake that cannot complete is a lockstep violation, and placing a slot the peer never
-    // filled would pass stale bytes on as the peer's, so it traps instead.
+    // A handshake that cannot complete is a lockstep violation; trap rather than pass on stale
+    // bytes as the peer's.
     while (r4d_ar_seq_behind(r4d_g_load_acq(&my_flags[b]), s)) {
       if (++z > R4D_AR_GATHER_SPIN_MAX) __builtin_trap();
     }
@@ -105,7 +95,7 @@ __global__ void r4d_ar_gather_2rank_kernel(
   __syncthreads();
   if (acq) __threadfence_system();
 
-  // The peer's slice, now staged in this rank's scratch, into the places that name it.
+  // Place the peer's slice, now staged in this rank's scratch.
   {
     const int who = 1 - rank;
     int k = start + tid;
@@ -128,9 +118,10 @@ void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, lo
   const long nbytes = (long)n_elem * esize;
   if (nbytes % 16 != 0) throw std::runtime_error("all_gather: n_elem*esize not 16B-aligned");
   if (rank != 0 && rank != 1) throw std::runtime_error("all_gather: rank must be 0 or 1");
+  if (nbytes / 16 > slot_stride16) throw std::runtime_error("all_gather: message larger than a slot");
   const int n16 = (int)(nbytes / 16);
-  // One row of this rank's contribution, in 16-byte words. Zero means "one row", which is the
-  // plain concatenation; anything else has to divide evenly or a row would straddle a word.
+  // One row of this rank's contribution, in 16-byte words. Zero means one row (plain
+  // concatenation); otherwise rows must be whole 16-byte words and divide the message.
   long rowb = (long)row_elems * esize;
   if (row_elems > 0 && (rowb % 16 != 0 || nbytes % rowb != 0))
     throw std::runtime_error("all_gather: row is not a whole number of 16B words");
@@ -139,8 +130,7 @@ void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, lo
   if (nb < 1) nb = 1;
   if (nb > n16) nb = n16;
   if (nb > R4D_AR_GATHER_MAX_BLOCKS) nb = R4D_AR_GATHER_MAX_BLOCKS;
-  // The counter allocation's block capacity, shared with the all-reduce this rides beside
-  // (r4d_ar_seq.h).
+  // Block capacity of the counter allocation shared with the all-reduce (r4d_ar_seq.h).
   const unsigned nbw = (unsigned)r4d_ar_max_blocks();
   if ((unsigned)nb > nbw) nb = (int)nbw;
   int nt = (int)nthreads;

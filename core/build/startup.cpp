@@ -1,9 +1,6 @@
 /* startup.cpp -- the tools' seam onto core/plugin and core/build, and the shared CLI plumbing.
- *
- * rad-convert, rad-check and rad-tune are the engine's startup with a different last step, so they
- * do not get their own loader: they call the same Registry and the same Builder the engine will,
- * through the two functions below. A tool that resolved kernels differently from the engine would
- * be a tool whose answers are about a different program.
+ * The tools use the same Registry and Builder as the engine (see startup.h), so they resolve the
+ * same program.
  */
 #include "build/startup.h"
 #include "build/rad_build.h"
@@ -14,22 +11,17 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 
 namespace rad {
 
-/* One Registry for the life of the process. A Resolved, a Band and a KernelRow all point into a
- * plugin's static tables, and the Program outlives the call that built it, so the registry cannot
- * be a local. registry.h says the same thing about the engine.
+/* One Registry for the life of the process: Resolved, Band and KernelRow point into plugin
+ * static tables, and the Program outlives the call that built it.
  *
- * NEVER DESTROYED, because exit destroys in the wrong order for it. A function-local static is
- * constructed before the first plugin is loaded, so its destructor runs AFTER every plugin's own
- * static destructors -- and closing from there calls each instance's fini into plugin state that
- * no longer exists. libr4d's router keeps its per-device counter blocks in a global map; fini
- * looked up and erased a node of the destroyed map, a double free that glibc reported as
- * "corrupted size vs. prev_size" or "free(): invalid pointer" on whichever exit the heap layout
- * exposed it. A caller that needs the finis to run closes the registry itself while the plugins
- * are alive, as Engine's shutdown does; at exit the process is ending and what the instances
- * hold goes with it. */
+ * Never destroyed. A function-local static would be destroyed after the plugins' own static
+ * destructors, and its close would call each instance's fini into destroyed plugin state (e.g.
+ * libr4d's router erasing from its destroyed global map: a double free). A caller that needs the
+ * finis closes the registry while plugins are alive, as Engine's shutdown does. */
 Registry& rad_tools_registry() {
     static Registry* r = new Registry();
     return *r;
@@ -37,16 +29,10 @@ Registry& rad_tools_registry() {
 
 /* ------------------------------------------------------------------ the reference-kernel gate */
 
-/* An op counts as "on the reference" when NO domain and NO band offers a kernel from a library that
- * is not a reference implementation (RadPluginReferenceFn).
- *
- * The narrower reading matters. A reference library is usually a HOST plugin, so every op's host
- * band resolves to it -- that is what makes the host domain work at all, and flagging it would
- * flag the entire vocabulary of every model. What is a hazard is an op a reference is the ONLY
- * implementation of: wherever the planner puts it, it runs naive generic code.
- *
- * The op is still counted once per declared instance, because "rmsnorm resolves to ref" reads very
- * differently at one layer and at sixty-four. */
+/* An op is "on the reference" when no band in any domain offers a non-reference kernel
+ * (RadPluginReferenceFn). A reference library usually serves the host domain for every op, so
+ * only an op with no other implementation is flagged: wherever it is placed, it runs naive code.
+ * Counted once per declared instance; `out` lists distinct op names. */
 int rad_reference_ops(const Program& p, std::vector<std::string>* out) {
     int n = 0;
     for (size_t i = 1; i < p.ops.size(); ++i) {
@@ -58,8 +44,7 @@ int rad_reference_ops(const Program& p, std::vector<std::string>* out) {
                     real = true;
         if (real) continue;
         ++n;
-        /* By op NAME and deduplicated: a 64-layer model declares sixty-four identical rmsnorms and
-         * the useful sentence is "rmsnorm has no kernel", not sixty-four copies of it. */
+        /* Deduplicated by op name. */
         if (out && std::find(out->begin(), out->end(), oi.op) == out->end())
             out->push_back(oi.op);
     }
@@ -71,9 +56,8 @@ int rad_gate_reference_kernels(const Program& p, bool allow, const char* what) {
     const int n = rad_reference_ops(p, &ops);
     if (n == 0) return RAD_OK;
 
-    std::string list;
-    for (size_t i = 0; i < ops.size(); ++i) { if (i) list += ", "; list += ops[i]; }
-    /* Which reference libraries those are, by the name each one gave itself. */
+    const std::string list = join(ops);
+    /* The reference libraries involved, by plugin name. */
     std::vector<std::string> refs;
     for (size_t i = 1; i < p.ops.size(); ++i)
         for (const Band& b : p.ops[i].bands)
@@ -81,8 +65,7 @@ int rad_gate_reference_kernels(const Program& p, bool allow, const char* what) {
                 if (b.dom[d] && b.dom[d].row && b.dom[d].row->reference &&
                     std::find(refs.begin(), refs.end(), b.dom[d].row->plugin) == refs.end())
                     refs.push_back(b.dom[d].row->plugin);
-    std::string libs;
-    for (size_t i = 0; i < refs.size(); ++i) { if (i) libs += ", "; libs += refs[i]; }
+    const std::string libs = join(refs);
 
     if (allow) {
         RAD_WARN("%d declared op(s) resolve to a reference implementation (%s) and "
@@ -92,15 +75,12 @@ int rad_gate_reference_kernels(const Program& p, bool allow, const char* what) {
         return RAD_OK;
     }
 
-    RAD_ERR("%d declared op(s) resolve only to a reference implementation (%s).\n"
+    RAD_ERR("%d declared op(s) resolve only to a reference implementation (%s), which runs "
+            "orders of magnitude slower; %s refuses them (spec §17).\n"
             "    %zu distinct op(s): %s\n"
-            "  A reference library exists to be an ORACLE and a last resort, not a deployment. "
-            "Falling back to it silently is a model running orders of magnitude below the machine "
-            "with nothing in the output to say so, which is the failure spec §17 exists to prevent "
-            "-- so %s refuses rather than serving it.\n"
-            "  Either supply a kernel plugin that covers these ops, or pass "
-            "--debug-accept-reference-kernels to accept the cost deliberately.",
-            n, libs.c_str(), ops.size(), list.c_str(), what);
+            "  Supply a kernel plugin that covers these ops, or pass "
+            "--debug-accept-reference-kernels to accept the cost.",
+            n, libs.c_str(), what, ops.size(), list.c_str());
     return RAD_E_NOKERNEL;
 }
 
@@ -145,13 +125,9 @@ int rad_tools_load_plugins(const std::string& home, const std::vector<std::strin
 
     Registry& r = rad_tools_registry();
 
-    /* Kernels first and in hierarchy order, then architectures. The order matters for kernels and
-     * not for architectures: no two architecture plugins may claim the same id, so there is
-     * nothing for a hierarchy to break a tie between.
-     *
-     * A home on the path need not have every directory -- one holding a single kernel library is
-     * the ordinary shape of a home of one's own -- but kernels/ and architectures/ must each be
-     * somewhere on it, or the scan names the first home's as missing. */
+    /* Kernels first, in hierarchy order, then architectures (unordered: no two may claim the same
+     * id). A home need not have every directory, but kernels/ and architectures/ must each exist
+     * somewhere on the path, or the scan reports the first home's as missing. */
     const std::string first = rad_home_dirs(home).front();
     std::vector<std::string> kdirs = home_subdirs(home, "kernels");
     if (kdirs.empty()) kdirs.push_back(first + "/kernels");
@@ -163,9 +139,8 @@ int rad_tools_load_plugins(const std::string& home, const std::vector<std::strin
     s = r.load_dirs(adirs, {});
     if (s < 0) return s;
 
-    /* The quantisers, which rad-convert drives and the oracle decodes through for a scheme the
-     * core does not define. A home without the directory has none, which is not an error for an
-     * engine serving a container whose encodings the core decodes itself. */
+    /* Quantisers: rad-convert drives them, and the oracle decodes through them for schemes the
+     * core does not define. Optional. */
     const std::vector<std::string> qdirs = home_subdirs(home, "quantizers");
     if (!qdirs.empty()) {
         s = r.load_dirs(qdirs, {});
@@ -174,18 +149,16 @@ int rad_tools_load_plugins(const std::string& home, const std::vector<std::strin
 
     RAD_TRY(r.check_complete());
 
-    /* The tuning cache, once the kernel set is known. A missing file is not an error and leaves
-     * every shape on its plugin's first variant; a present one moves the shapes rad-tune measured.
-     * Reported when it has rows, because "which variant am I running" is otherwise a question with
-     * no visible answer -- --debug-graph prints the per-shape source beside each kernel. */
+    /* The tuning cache, once the kernel set is known. A missing file leaves every shape on its
+     * plugin's first variant. Logged when it has rows; --debug-graph shows the per-shape
+     * source. */
     const std::string tune = rad_home_file(home, TuneCache::rel_path(rad_machine_key()));
     const std::string tune_home = tune.substr(0, tune.size() - TuneCache::rel_path(rad_machine_key()).size() - 1);
     const int n_tuned = r.load_tune(tune_home);
     if (n_tuned > 0) RAD_INFO("tune cache: %d row(s) from %s", n_tuned, tune.c_str());
 
-    /* The selection key is the PAIR (spec §2.4). An exact match on both halves, with no fallback:
-     * a quantised container handed to a plugin that declares dense weights fails later, at the
-     * name map, with a worse message than the one below. */
+    /* The selection key is the (arch_id, quant) pair (spec §2.4), matched exactly with no
+     * fallback; a mismatched plugin would only fail later at the name map with a worse message. */
     for (const Plugin& p : r.plugins()) {
         if (p.kind == RAD_PLUGIN_KERNEL) {
             out->kernels.push_back({ p.name, p.version });
@@ -198,7 +171,7 @@ int rad_tools_load_plugins(const std::string& home, const std::vector<std::strin
         }
     }
 
-    /* AN IMPORTED QUANTISATION is served by the family's quantised plugin (startup.h). */
+    /* An imported quantisation is served by the family's quantised plugin (startup.h). */
     if (imported && !arch_id.empty() && out->arch_plugin.empty()) {
         std::vector<const Plugin*> fam, quantised;
         for (const Plugin& p : r.plugins())
@@ -234,10 +207,8 @@ int rad_tools_load_plugins(const std::string& home, const std::vector<std::strin
         return RAD_E_NOKERNEL;
     }
     if (!arch_id.empty() && out->arch_plugin.empty()) {
-        /* No match, no model (spec §1). Name what IS installed AND at which quantisation, because
-         * the two causes look identical otherwise: an architecture nobody has written a plugin for,
-         * and one that is written but only for another weight format. The second is the common one
-         * for a family with more than one member. */
+        /* No match, no model (spec §1). List what is installed with its quantisation, to tell an
+         * unsupported architecture from one supported only at another weight format. */
         std::string have, same;
         for (const Plugin& p : r.plugins()) {
             if (p.kind != RAD_PLUGIN_ARCH) continue;
@@ -261,13 +232,9 @@ int rad_tools_load_plugins(const std::string& home, const std::vector<std::strin
     return RAD_OK;
 }
 
-/* WHAT THE ARCHITECTURE PLUGIN SAYS BEFORE IT DECLARES. Optional export: a plugin without one
- * leaves every field zero, which the caller reads as "no opinion" and answers from its own
- * defaults.
- *
- * Not an error path. A probe that fails is a plugin declining to answer, not a model that cannot
- * be served -- the caller falls back to its own default and the plugin gets to refuse properly in
- * declare, where it has the whole configuration in front of it and can say why. */
+/* Optional export. Without it, or on failure, every field is zero and the caller uses its own
+ * defaults. A failed probe is not an error: the plugin can still refuse in declare, where it has
+ * the whole configuration and can say why. */
 int rad_tools_probe(const LoadedPlugins& lp, const RadModelMeta& meta, RadArchProbe* out) {
     if (!out) return RAD_E_INVAL;
     *out = RadArchProbe{};
@@ -287,6 +254,21 @@ const RadChatFormat* rad_tools_chat_format(const LoadedPlugins& lp, const RadMod
     const Plugin* ap = rad_tools_registry().plugin(lp.arch_plugin);
     if (!ap || !ap->arch_chat_format) return nullptr;
     return ap->arch_chat_format(&meta);
+}
+
+const RadAudioFormat* rad_tools_audio_format(const LoadedPlugins& lp, const RadModelMeta& meta) {
+    const Plugin* ap = rad_tools_registry().plugin(lp.arch_plugin);
+    if (!ap || !ap->arch_audio_format) return nullptr;
+    const RadAudioFormat* f = ap->arch_audio_format(&meta);
+    if (!f) return nullptr;
+    /* The plugin's struct may be older than ours: it is copied into a zeroed one up to the size
+     * it states, so a field it predates reads as null (rad_builder.h). */
+    static thread_local RadAudioFormat copy;
+    copy = RadAudioFormat{};
+    const size_t n = f->struct_size < sizeof copy ? f->struct_size : sizeof copy;
+    std::memcpy(&copy, f, n);
+    copy.struct_size = (uint32_t)sizeof copy;
+    return &copy;
 }
 
 WeightSourceFn rad_container_sources(const RadFile& f) {
@@ -313,8 +295,8 @@ int CheckpointSources::answer(const std::string& name, const Program& prog, Weig
         CkptWeight w;
         std::string why;
         const int st = ckpt_resolve(ck_, prog, name, false, &w, &why);
-        /* Not found is not remembered as an answer -- declare may map the name later -- but
-         * its reason is, for the loader to give if it never is. */
+        /* Not-found is not cached, since declare may map the name later, but its reason is kept
+         * for the loader to report. */
         if (st == RAD_E_NOTFOUND) {
             missing_[name] = why;
             return st;
@@ -369,7 +351,6 @@ int rad_tools_declare(const LoadedPlugins& lp, const RadModelMeta& meta, const R
         return RAD_E_NOTFOUND;
     }
 
-    /* The Builder takes the Registry directly: there is no selector adapter between the two. */
     Builder b(r, meta, ctx);
     if (ref) b.set_reference(ref);
     if (sources) b.set_sources(sources);
@@ -382,20 +363,15 @@ int rad_tools_declare(const LoadedPlugins& lp, const RadModelMeta& meta, const R
         return s;
     }
 
-    /* The sampler declares here, into the same builder and before finish(), so its ops go through
-     * the same resolution as the plugin's. A sampler op that does not resolve is deliberately NOT
-     * a declare failure -- a deployment that never sends `typical_p` does not need a typical
-     * kernel -- so this returning negative means something structural, not a miss. */
-    /* NOT FOR AN EMBEDDING PROGRAM (rad_declare_pooled) OR AN IMAGE GENERATOR: neither samples a
-     * token, so a sampler chain in it would be ops and buffers no step ever issues. */
+    /* The sampler declares into the same builder before finish(). An unresolved sampler op is not
+     * a declare failure (a deployment that never sends `typical_p` needs no typical kernel), so a
+     * negative return here is structural. Skipped for embedding programs and image generators,
+     * which sample no token. */
     if (also && b.program().pooled_buf == RAD_NULL_HANDLE && !b.program().is_generator()) {
-        /* THE WIDTH THE PLUGIN ACTUALLY DECLARED, handed over rather than re-derived. The sampler
-         * needs to know how much vocabulary THIS RANK produces, and the one place that is a fact
-         * is the logits buffer the plugin just named. Computing it a second time from n_vocab and
-         * world_size puts the sharding rule in two files, and the two disagree the moment a plugin
-         * stops splitting the vocabulary -- which arch/common/rad_arch.h currently does, on
-         * purpose. A sampler reading 248320 logits out of a 124160-wide row is not a crash; it is
-         * fluent text with the wrong tokens. */
+        /* This rank's vocabulary width, taken from the declared logits buffer rather than
+         * re-derived from n_vocab and world_size, which would break when a plugin does not split
+         * the vocabulary (arch/common/rad_arch.h does not). A wrong width does not crash; it
+         * samples the wrong tokens. */
         int64_t lw = 0;
         if (b.program().logits_buf != RAD_NULL_HANDLE &&
             (size_t)b.program().logits_buf < b.program().buffers.size()) {
@@ -410,8 +386,7 @@ int rad_tools_declare(const LoadedPlugins& lp, const RadModelMeta& meta, const R
     }
 
     s = b.finish();
-    /* Declare ALWAYS completes: a structural error is reported whole, not first-failure-at-the-top
-     * (spec §3.1). */
+    /* Declare always completes; every structural error is reported (spec §3.1). */
     for (const auto& e : b.errors()) RAD_ERR("    %s", e.c_str());
     if (s < 0) return s;
     if (b.status() < 0) return b.status();

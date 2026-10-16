@@ -1,7 +1,6 @@
 #!/bin/sh
-# What speculation is worth on the AGENT's OWN WORKLOAD: /v1/chat/completions with tools, which
-# is a constrained decode. Arms alternate across server restarts because n_spec is a server-level
-# setting and cannot be varied inside one process.
+# What speculation is worth on an agent workload: /v1/chat/completions with tools, a constrained
+# decode. Arms alternate across server restarts because n_spec is a server-level setting.
 T='[{"type":"function","function":{"name":"write","description":"write a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},{"type":"function","function":{"name":"bash","description":"run a shell command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}}},{"type":"function","function":{"name":"read","description":"read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]'
 Q="Write a long, heavily commented C implementation of a chess board representation with FEN parsing, then explain every design decision in detail."
 U="http://127.0.0.1:8111"

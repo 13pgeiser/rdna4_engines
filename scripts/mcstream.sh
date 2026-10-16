@@ -1,10 +1,8 @@
 #!/bin/sh
-# Tool-call replies STREAMED, which is how an agent client talks to this server: content is sent
-# as it grows and cannot be retracted, so a tool call repaired only at the end would leave the
-# client showing the raw XML AND the call. Asserts on the RAW SSE bytes, not on the assembled
-# message.
-# The port is an override (P=, default 8100): this harness attaches to a server that is already
-# up rather than starting one.
+# Streamed tool-call replies, as agent clients use them. Streamed content cannot be retracted, so a
+# tool call repaired only at the end would leave the client showing both the raw XML and the call.
+# Asserts on the raw SSE bytes, not the assembled message.
+# Attaches to a running server on P= (default 8100).
 P=${P:-8100}
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/mcstream.XXXXXX"); trap 'rm -rf "$WORK"' EXIT INT TERM
 T='[{"type":"function","function":{"name":"bash","description":"run a shell command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}}},{"type":"function","function":{"name":"write","description":"write a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]'

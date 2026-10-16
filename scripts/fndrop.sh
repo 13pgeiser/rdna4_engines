@@ -1,31 +1,22 @@
 #!/bin/sh
-# What happens when a client goes away mid-request, against a server that is ALREADY RUNNING.
+# Client disconnects mid-request, against a running server.
 #
-# WHY THIS EXISTS. A disconnect calls the scheduler's reap at an arbitrary point in the step loop,
-# so anything that holds a raw Request* across that point -- the step plan's entry, a drafter's
-# snapshot -- is a use-after-free that takes the whole server down. Every other harness in this
-# tree waits for its requests, so none of them can see that.
+# A disconnect runs the scheduler's reap at an arbitrary point in the step loop, so anything holding
+# a raw Request* across that point (a step plan entry, a drafter snapshot) is a use-after-free.
+# Other harnesses wait for their requests and never exercise this.
 #
-# SURVIVING IS NOT THE TEST. A server that stays up and then answers differently has a freed slot
-# feeding a live sequence, which is the same defect wearing a quieter shirt. So a reference answer
-# is taken first, the drops happen, and the same question is asked again: the hashes have to match.
+# Staying up is not enough: a freed slot feeding a live sequence shows as a changed answer. A
+# reference answer is taken first and the same question is asked after each drop; the hashes must
+# match. Every observation counts toward the verdict, since a transient divergence right after a
+# burst is the interesting case and a final re-check would hide it.
 #
-# THE DROP POINTS ARE DERIVED, NOT WRITTEN DOWN. One full request is timed first and the drops are
-# placed at fractions of it, because a drop point past the end of the request is not a drop at all
-# -- it is curl waiting for a response that already arrived, and it reports PASS having exercised
-# nothing.
+# Drop points are fractions of a timed full request; a drop past the end of the request exercises
+# nothing. `--max-time` is the disconnect (curl closes the socket); `running` returning to zero
+# well before the request would have finished confirms it.
 #
-# `--max-time` is the disconnect: curl closes the socket where it lands. A drop is confirmed by
-# `running` falling back to zero well before the request would have finished on its own.
-#
-# EVERY OBSERVATION COUNTS, NOT THE LAST ONE. A transient divergence right after a burst is the
-# interesting case and a final re-check hides it: ask again and the answer is right, so the run
-# reports clean. The verdict below is over all of them.
-#
-# AND ONE DIVERGENCE IS NOT A FINDING HERE. A single completion hash can diverge on an unchanged
-# binary -- concurrency decides batch composition and greedy decoding differs at a tie -- so a
-# diverged row means RUN IT AGAIN, several times, before believing it. The reference question
-# itself is stable against an idle server; it is the contended path that can tie-flip.
+# One divergence is not a finding: concurrency changes batch composition, and greedy decoding can
+# flip at a tie even on an unchanged binary. Rerun several times before believing a diverged row.
+# The reference question is stable against an idle server; only the contended path can tie-flip.
 #
 #   P=8100 scripts/fndrop.sh
 P="${P:-8100}"

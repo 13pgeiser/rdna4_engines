@@ -1,31 +1,28 @@
-/* xprefetch.h -- the next-layer expert prefetch at decode: what the host half (xprefetch.cpp) and the
+/* xprefetch.h -- next-layer expert prefetch at decode: what the host half (xprefetch.cpp) and the
  * kernels (xprefetch.hip) share.
  *
- * WHAT IT DOES. Under expert-tiered placement a routed layer's GEMMs read the experts that are not on
- * the card from the pinned host pool, across the link, while they run. A layer's router input predicts
- * the NEXT routed layer's choice well: that layer's router applied to it ranks the experts the next
- * layer will route. So at each routed layer the prefetch applies the next layer's router to this
- * layer's router input, takes the likeliest experts that sit in the pinned pool, copies them onto the
- * card with the DMA engine while the rest of this layer runs, and points the next layer's weight tables
- * at the copies just before its GEMMs. The GEMMs then read those experts from the card.
+ * Under expert-tiered placement, a routed layer's GEMMs read off-card experts from the pinned host
+ * pool across the link. A layer's router input predicts the next routed layer's choice well, so at
+ * each routed layer the prefetch applies the next layer's router to this layer's router input,
+ * copies the likeliest pinned-pool experts onto the card with the DMA engine, and points the next
+ * layer's weight tables at the copies just before its GEMMs.
  *
- * NOTHING IT DOES CHANGES A RESULT. A copy holds the bytes of the pool slot it was made from, and an
- * entry is pointed at it only where it still names that slot (a compare-and-swap: a heat-engine move
- * since then wins) and only once the copy has landed. Late copies are not used; nothing waits for them.
+ * Results never change: a copy holds the bytes of the pool slot it came from, and an entry is
+ * redirected only where it still names that slot (compare-and-swap; a heat-engine move wins) and
+ * only once the copy has landed. Late copies go unused; nothing waits for them.
  *
- * THE PIECES, per routed layer l predicting layer l+1:
- *   - at l's router input (Ctx::xp_predict): on a stream of its own, behind the compute stream's
- *     dispatch that reads the input (a ride), xp_logits applies l+1's router to the input rows and
- *     xp_plan picks the copies and writes them to a mailbox in pinned host memory;
- *   - after l's routed down GEMM (Ctx::xp_mark): a ride on the compute stream that the DMA list polls,
- *     so the copies cross the link under l+1's attention rather than under l's own streamed experts;
- *   - a host thread hands each mailbox to the card's prefetch DMA queue: wait for the mark, copy, then
- *     write the request's number to the group's done word;
- *   - ahead of l+1's routed GEMMs (Ctx::xp_step, on the compute stream): xp_step puts the previous
- *     layer's entries back (its GEMMs are behind it in the stream) and points l+1's at the copies if
- *     the done word says they have landed.
- * The ring holds kXpGroups layers' copies, kXpSlots each; a group is copied into again three layers
- * later, after the step that put its entries back. */
+ * Pieces, per routed layer l predicting l+1:
+ *   - at l's router input (Ctx::xp_predict): on its own stream, riding behind the compute dispatch
+ *     that reads the input, xp_logits applies l+1's router and xp_plan writes the chosen copies to
+ *     a mailbox in pinned host memory;
+ *   - after l's routed down GEMM (Ctx::xp_mark): a ride on the compute stream that the DMA list
+ *     polls, so the copies cross the link under l+1's attention, not under l's streamed experts;
+ *   - a host thread hands each mailbox to the prefetch DMA queue: wait for the mark, copy, then
+ *     write the request number to the group's done word;
+ *   - before l+1's routed GEMMs (Ctx::xp_step, compute stream): restore the previous layer's
+ *     entries (its GEMMs are earlier in the stream) and redirect l+1's if the done word matches.
+ * The ring holds kXpGroups layers of kXpSlots copies; a group is reused three layers later, after
+ * the step that restored its entries. */
 #pragma once
 #include <cstdint>
 
@@ -67,9 +64,9 @@ struct XpStats {
     unsigned int copied, routed, planned, pad;
 };
 
-/* What the prefetch takes on the card for a model of `layers` routed layers whose largest expert unit
- * is `unit` bytes: the ring and the buffers beside it (Ctx::xp_open allocates exactly these), in the
- * 2 MiB grains the card's allocations come in -- the ring its own, the small buffers sharing theirs. */
+/* Device bytes the prefetch takes for `layers` routed layers with largest expert unit `unit` bytes:
+ * the ring and its side buffers (exactly what Ctx::xp_open allocates), each rounded to the card's
+ * 2 MiB allocation grain. */
 inline int64_t xp_device_bytes(int64_t unit, int64_t layers) {
     constexpr int64_t kGrain = (int64_t)2 << 20;
     auto grains = [](int64_t b) { return (b + kGrain - 1) / kGrain * kGrain; };

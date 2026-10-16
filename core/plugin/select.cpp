@@ -1,11 +1,9 @@
 /* select.cpp -- the constraint selector, the selection table, and the per-instance init/fini.
  * spec.md §2.1 and §16.
  *
- * The selector answers one question: is there a kernel compiled for this geometry, in this domain,
- * in the highest plugin that has one. It is a NECESSARY condition and not a sufficient one --
- * strides, contiguity, alignment and buffer sizes are properties of a call rather than of a model
- * and stay in the entry point, which still rejects what it cannot run. libr4d's registry makes the
- * same point at length.
+ * The selector finds a kernel compiled for this geometry and domain in the highest plugin that has
+ * one. A match is necessary, not sufficient: strides, contiguity, alignment and buffer sizes are
+ * properties of a call, and the entry point still rejects what it cannot run.
  */
 #include "registry.h"
 
@@ -20,17 +18,16 @@ namespace rad {
 
 namespace {
 
-/* True when every constraint holds. Otherwise `why` names the FIRST one that did not and what it
- * wanted: "no kernel" on its own is not an answer anyone can act on, and the first failure is the
- * one a reader can fix -- listing all four of a row's unmet constraints buries it. */
+/* True when every constraint holds. Otherwise `why` names the first one that failed and what it
+ * wanted. */
 bool row_matches(const KernelRow& r, const Geometry& g, const Geometry& facts,
                  const std::vector<std::string>& skip, std::string* why) {
     static const size_t kFact = std::strlen(RAD_DEVICE_FACT_PREFIX);
     for (int i = 0; i < r.info->n_constraints; ++i) {
         const RadConstraint& c = r.info->constraints[i];
-        /* A constraint on a RAD_DERIVED parameter the caller did not name is not a predicate on
-         * the question -- it IS the answer, read back afterwards. Matching on it would make the
-         * kernel unreachable by the only query anyone can ask (rad_abi.h, spec §7.2). */
+        /* A constraint on a RAD_DERIVED parameter the caller did not name is the answer, read back
+         * afterwards, not a predicate; matching on it would make the kernel unreachable
+         * (rad_abi.h, spec §7.2). */
         if (c.key && std::find(skip.begin(), skip.end(), c.key) != skip.end()) continue;
         /* A "device." key is a fact about the machine, read from what the engine measured. */
         if (c.key && std::strncmp(c.key, RAD_DEVICE_FACT_PREFIX, kFact) == 0) {
@@ -50,9 +47,30 @@ bool row_matches(const KernelRow& r, const Geometry& g, const Geometry& facts,
     return true;
 }
 
-/* The question, normalised so two spellings of the same one fold together in the table. The
- * geometry is displayed as asked, because a plugin author writes the parameters in the order that
- * reads best; only the fold key is sorted. */
+/* The op's RAD_DERIVED keys (from its schema) that the caller did not supply. A supplied one is
+ * pinned and matches like any other parameter. */
+std::vector<std::string> unsupplied_derived(const RadOpSchema* sch, const Geometry& g) {
+    std::vector<std::string> keys;
+    if (!sch) return keys;
+    for (int i = 0; i < sch->n_params; ++i) {
+        if (sch->params[i].required != RAD_DERIVED || !sch->params[i].key) continue;
+        if (!g.has(sch->params[i].key)) keys.emplace_back(sch->params[i].key);
+    }
+    return keys;
+}
+
+/* The scan select() and select_in() share: the first plugin in hierarchy order with a match
+ * supplies the row, the highest priority within it wins, ties to the row declared first. With
+ * `only` set, rows of every other plugin are passed over. Every row considered goes into
+ * `t.candidates` and each distinct refusal into `misses`. */
+const KernelRow* scan_rows(const std::vector<const KernelRow*>* rows, const Geometry& g,
+                           int domain, const Geometry& facts,
+                           const std::vector<std::string>& derived_keys,
+                           const Registry::RowFilter* accept, std::string_view only,
+                           SelectionTrace& t, std::vector<std::string>* misses);
+
+/* The question, normalised so two spellings of it fold together in the table. Only the fold key
+ * is sorted; the geometry is displayed as asked. */
 std::string fold_key(std::string_view op, int domain, const Geometry& g) {
     const std::string q = g.str();     /* named: split_ws returns views into it */
     std::vector<std::string> kv;
@@ -86,67 +104,18 @@ const KernelRow* Registry::select(std::string_view op, const Geometry& g, int do
     t.query  = g.str();
     t.domain = domain;
 
-    /* The derived keys of this op that the caller did NOT supply. Derivedness is a property of the
-     * op's schema, so it is known here and nowhere else; a caller that supplied one anyway has
-     * pinned it, and it drops out of this list and matches like any other parameter. */
-    std::vector<std::string> derived_keys;
-    if (const RadOpSchema* sch = schema(op)) {
-        for (int i = 0; i < sch->n_params; ++i) {
-            if (sch->params[i].required != RAD_DERIVED || !sch->params[i].key) continue;
-            if (!g.has(sch->params[i].key)) derived_keys.emplace_back(sch->params[i].key);
-        }
-    }
-
+    const std::vector<std::string> derived_keys = unsupplied_derived(schema(op), g);
     const std::vector<const KernelRow*>* rows = rows_for(op);
-    const KernelRow* best = nullptr;
     std::vector<std::string> misses;
-
-    if (rows) {
-        bool in_group = false;
-        int  cur_order = 0;
-        for (const KernelRow* r : *rows) {
-            /* A kernel in the other domain answers a different question. It is not a candidate and
-             * not a refusal -- but the fact that it exists is worth carrying, because "there is a
-             * device kernel and no host one" is the sentence the placement planner needs (§5.1). */
-            if (r->info->domain != domain) { t.other_domain_has_rows = true; continue; }
-
-            if (!in_group || r->plugin_order != cur_order) {
-                /* THE HIERARCHY IS ABSOLUTE. The first plugin with any matching kernel supplies
-                 * it; the moment we would step down to the next plugin with a winner in hand, we
-                 * stop. A lower-priority plugin never outbids a higher one no matter how
-                 * specialised its kernel -- that is what makes a user override an override. */
-                if (best) break;
-                cur_order = r->plugin_order;
-                in_group  = true;
-            }
-
-            std::string whynot;
-            bool ok = row_matches(*r, g, device_facts_, derived_keys, &whynot);
-            if (ok && accept && *accept) {
-                whynot = (*accept)(*r, g);
-                ok = whynot.empty();
-            }
-            if (ok) {
-                t.candidates.push_back({ r->plugin, r->info->name, r->info->priority, true, "ok" });
-                /* SPECIFICITY IS DECLARED, NOT DERIVED: the highest priority wins, and a tie goes
-                 * to the row declared first. Counting matched constraints would get it backwards. */
-                if (!best || r->info->priority > best->info->priority) best = r;
-            } else {
-                t.candidates.push_back({ r->plugin, r->info->name, r->info->priority, false, whynot });
-                if (std::find(misses.begin(), misses.end(), whynot) == misses.end())
-                    misses.push_back(whynot);
-            }
-        }
-    }
+    const KernelRow* best = scan_rows(rows, g, domain, device_facts_, derived_keys, accept, {},
+                                      t, &misses);
 
     if (best) {
         t.kernel   = best->info->name;
         t.plugin   = best->plugin;
         t.priority = best->info->priority;
-        /* The answer to the question that could not be asked: whatever the winner's RAD_C_EQ says
-         * about each skipped derived key. A kernel with no EQ on one -- ref's `block_size >= 1`,
-         * which admits every value -- leaves it UNKNOWN rather than zero, because "any" is not a
-         * number and the caller has to decide rather than be handed a plausible one. */
+        /* Each skipped derived key takes the winner's RAD_C_EQ value. A kernel with no EQ on it
+         * (e.g. ref's `block_size >= 1`) leaves it unknown rather than zero; the caller decides. */
         for (const std::string& key : derived_keys) {
             SelectionTrace::DerivedParam d;
             d.key   = key;
@@ -167,9 +136,111 @@ const KernelRow* Registry::select(std::string_view op, const Geometry& g, int do
     return best;
 }
 
+const KernelRow* Registry::select_in(std::string_view plugin, std::string_view op,
+                                     const Geometry& g, int domain, const RowFilter* accept,
+                                     SelectionTrace* why) const {
+    SelectionTrace local;
+    SelectionTrace& t = why ? *why : local;
+    t = SelectionTrace{};
+    t.op     = std::string(op);
+    t.query  = g.str();
+    t.domain = domain;
+    if (plugin.empty()) {
+        t.reason = "no plugin named";
+        return nullptr;
+    }
+    const std::vector<std::string> derived_keys = unsupplied_derived(schema(op), g);
+    std::vector<std::string> misses;
+    const KernelRow* best = scan_rows(rows_for(op), g, domain, device_facts_, derived_keys,
+                                      accept, plugin, t, &misses);
+    if (best) {
+        t.kernel   = best->info->name;
+        t.plugin   = best->plugin;
+        t.priority = best->info->priority;
+        for (const std::string& key : derived_keys) {
+            SelectionTrace::DerivedParam d;
+            d.key   = key;
+            d.known = kernel_constraint(*best, key, RAD_C_EQ, &d.value);
+            t.derived.push_back(std::move(d));
+        }
+    } else {
+        for (size_t i = 0; i < misses.size(); ++i) t.reason += (i ? "; " : "") + misses[i];
+        if (t.reason.empty())
+            t.reason = fmt("no %s kernel for op '%s' in %.*s", domain_name(domain), t.op.c_str(),
+                           (int)plugin.size(), plugin.data());
+    }
+    return best;
+}
+
+namespace {
+
+const KernelRow* scan_rows(const std::vector<const KernelRow*>* rows, const Geometry& g,
+                           int domain, const Geometry& facts,
+                           const std::vector<std::string>& derived_keys,
+                           const Registry::RowFilter* accept, std::string_view only,
+                           SelectionTrace& t, std::vector<std::string>* misses) {
+    const KernelRow* best = nullptr;
+    if (!rows) return best;
+    bool in_group = false;
+    int  cur_order = 0;
+    for (const KernelRow* r : *rows) {
+        if (!only.empty() && r->plugin != only) continue;
+        /* Rows of the other domain are neither candidates nor refusals, but their existence is
+         * recorded for the placement planner (§5.1). */
+        if (r->info->domain != domain) { t.other_domain_has_rows = true; continue; }
+
+        if (!in_group || r->plugin_order != cur_order) {
+            /* The hierarchy is absolute: stop at the first plugin with a match, before a lower
+             * plugin can outbid it. */
+            if (best) break;
+            cur_order = r->plugin_order;
+            in_group  = true;
+        }
+
+        std::string whynot;
+        bool ok = row_matches(*r, g, facts, derived_keys, &whynot);
+        if (ok && accept && *accept) {
+            whynot = (*accept)(*r, g);
+            ok = whynot.empty();
+        }
+        if (ok) {
+            t.candidates.push_back({ r->plugin, r->info->name, r->info->priority, true, "ok" });
+            /* Highest declared priority wins; a tie goes to the row declared first. */
+            if (!best || r->info->priority > best->info->priority) best = r;
+        } else {
+            t.candidates.push_back({ r->plugin, r->info->name, r->info->priority, false, whynot });
+            if (std::find(misses->begin(), misses->end(), whynot) == misses->end())
+                misses->push_back(whynot);
+        }
+    }
+    return best;
+}
+
+}  /* namespace */
+
+std::string weight_refusal(const RadKernelInfo* ki, const Geometry& g, int operand,
+                           const RadEncoding& enc, const int* sel, const RadTensor* planes,
+                           int n_sel, std::string_view name) {
+    char es[256];
+    if (!ki->layout) {
+        if (ki->domain == RAD_DOMAIN_DEVICE && n_sel > 1) {
+            rad_enc_format(&enc, es, sizeof es);
+            return fmt("reads '%.*s' as stored, and it is %d planes of %s", (int)name.size(),
+                       name.data(), n_sel, es);
+        }
+        return std::string();
+    }
+    RadLayout L{};
+    if (ki->layout(g.params(), g.n_params(), operand, &enc, sel, planes, n_sel, &L) ==
+        RAD_E_DTYPE) {
+        rad_enc_format(&enc, es, sizeof es);
+        return fmt("does not read '%.*s' encoded %s", (int)name.size(), name.data(), es);
+    }
+    return std::string();
+}
+
 /* "gemm_nt:sk=8,mb=1;all_reduce:drain=3" -> the axes asked for `op`, or empty. Parsed on every
- * resolve rather than once: resolve runs a few thousand times at startup and never again, and a
- * parsed-once cache would need a mutex for a string that does not change. */
+ * resolve: resolve runs only at startup, and a parsed-once cache would need a mutex. */
 static std::string tune_pin_for(const char* spec, std::string_view op) {
     for (const char* p = spec; *p;) {
         const char* semi = std::strchr(p, ';');
@@ -183,7 +254,7 @@ static std::string tune_pin_for(const char* spec, std::string_view op) {
     return {};
 }
 
-/* For an error message, which is the whole value of refusing a bad pin rather than defaulting. */
+/* Every axis and its legal values, for the bad-pin error message. */
 static std::string tunable_names(const RadKernelInfo* k) {
     std::string s;
     for (int i = 0; i < k->n_tunables; ++i) {
@@ -198,15 +269,14 @@ static std::string tunable_names(const RadKernelInfo* k) {
     return s.empty() ? "(nothing tunable)" : s;
 }
 
-/* Is `v` one of the values this axis declares? A cached or pinned value outside the list is not
- * applied: the axis list is the kernel's statement of what it can run, and honouring a number it
- * never offered is how a stale cache launches a shape the kernel cannot serve. */
+/* Whether `v` is one of the axis's declared values. A cached or pinned value outside the list is
+ * never applied, so a stale cache cannot launch a shape the kernel cannot serve. */
 static bool axis_allows(const RadTunable& t, int64_t v) {
     for (int i = 0; i < t.n_values; ++i) if (t.values[i] == v) return true;
     return false;
 }
 
-/* Does this combination survive the kernel's own cross-axis test? Null means yes. */
+/* Whether the combination passes the kernel's cross-axis test; no test means yes. */
 static bool choice_valid(const RadKernelInfo* k, const Geometry& g,
                          const std::vector<std::pair<std::string, int64_t>>& c) {
     if (!k->tune_valid) return true;
@@ -231,28 +301,22 @@ Resolved Registry::resolve(std::string_view op, const Geometry& g, int domain, S
     r.row = select(op, g, domain, &t, true, accept);
     if (!r.row) return r;
 
-    /* The frozen geometry is the query PLUS what the kernel supplied for it. Writing the derived
-     * value here rather than leaving it to the caller is what makes rad_kv_block_size() and
-     * RadArgs.p agree: the kernel is launched with the block size it was compiled for, and the
+    /* The frozen geometry is the query plus the kernel's derived values, so rad_kv_block_size()
+     * and RadArgs.p agree: the kernel launches with the block size it was compiled for, and the
      * block manager sizes itself from the same number. */
     r.geom = g;
     for (const SelectionTrace::DerivedParam& d : t.derived)
         if (d.known) r.geom.set_i(d.key, d.value);
-    /* THE TUNED AXES. A kernel declares a SPACE (RadTunable) and this is where a point in it is
-     * chosen: the cache when this shape has been measured on this machine, each axis's own
-     * `deflt` otherwise -- so an untuned install is fast rather than broken (spec §15). The core
-     * owns the cache and the policy, so no plugin has to.
+    /* Tuned axes. A kernel declares a space (RadTunable); the point chosen is the cached one when
+     * this shape was measured on this machine, else each axis's `deflt` (spec §15).
      *
-     * THE KEY IS THE FROZEN GEOMETRY BEFORE THE CHOICES GO IN, which is why `geom_key` is captured
-     * here and the choices are folded into `geom` afterwards. rad-tune keys its rows on the
-     * geometry the builder recorded; a key that included its own answer could never match. It also
-     * has to sit after the derived parameters are written in, or the two spellings of one shape
-     * would never meet.
+     * The cache key is the frozen geometry after the derived parameters and before the choices
+     * go in: rad-tune keys rows on the geometry the builder recorded, so a key that included its
+     * own answer could never match.
      *
-     * An axis the cached row does not mention keeps its default, and a key the row carries that
-     * this kernel no longer declares is ignored. That is exactly what tunecache.h promises: a
-     * library may add or widen an axis between builds without throwing away the measurements that
-     * still apply, and a cache is an optimisation that must never stop a server. */
+     * An axis the cached row does not mention keeps its default, and a row key the kernel no
+     * longer declares is ignored (tunecache.h), so a library may add or widen axes between builds
+     * and keep the measurements that still apply. */
     r.geom_key = TuneCache::canon_geometry(r.geom);
 
     const RadKernelInfo* ki = r.row->info;
@@ -278,17 +342,14 @@ Resolved Registry::resolve(std::string_view op, const Geometry& g, int domain, S
         }
 
         /* RADIANCE_TUNE=op:key=value[,key=value][;op:...] pins axes for every kernel serving that
-         * op. It is the debug half of the cache, and it exists because an axis is where a kernel's
-         * fences and launch geometry live: the all-reduce's drain depth and acquire ordering are
-         * axes, so questions like "is the missing acquire fence why this deployment is not
-         * reproducible" are answerable without a rebuild.
+         * op, for debugging without a rebuild (e.g. the all-reduce's drain depth and acquire
+         * ordering are axes).
          *
-         * An unknown key, or a value the axis does not offer, is a HARD ERROR rather than a silent
-         * default: a pin that did not take is worse than no pin, because the run looks like it
-         * tested something. A kernel with nothing tunable is not a failed pin, though -- the same
-         * op is served by libr4d on the device and by libref on the host, and libref declares no
-         * axes for anything, so refusing here would take the host band out over a device pin. */
-        if (const char* pin = std::getenv("RADIANCE_TUNE")) {
+         * An unknown key or a value the axis does not offer is a hard error: a pin that silently
+         * did not take is worse than none. A kernel with no axes is not a failed pin (libref
+         * declares none), so a device pin does not remove the host band. */
+        static const char* const pin = std::getenv("RADIANCE_TUNE");
+        if (pin) {
             const std::string want = tune_pin_for(pin, op);
             for (const auto& kv : TuneCache::parse_choice(want)) {
                 int idx = -1;
@@ -306,11 +367,9 @@ Resolved Registry::resolve(std::string_view op, const Geometry& g, int domain, S
             }
         }
 
-        /* A combination the kernel's own cross-axis test refuses is not launched. Falling back to
-         * every axis's default is the one answer that cannot be wrong here: the defaults are what
-         * an untuned install runs, so they are the kernel's own statement of what it can always
-         * do. A cache written for a different build, or a pin that is individually legal on each
-         * axis but not together, lands here. */
+        /* A combination the kernel's cross-axis test refuses (a cache from another build, or a
+         * pin legal per axis but not together) falls back to all defaults, which the kernel must
+         * always be able to run. */
         if (!choice_valid(ki, r.geom, chosen)) {
             std::vector<std::pair<std::string, int64_t>> dflt;
             for (int i = 0; i < ki->n_tunables; ++i)
@@ -326,8 +385,8 @@ Resolved Registry::resolve(std::string_view op, const Geometry& g, int domain, S
         r.choice = TuneCache::canon_choice(chosen);
     }
 
-    /* scratch_bytes stays 0: the scratch hook takes a RadArgs, which needs the operand tensors,
-     * and those belong to the builder. It sizes the arena; this layer only says which kernel. */
+    /* scratch_bytes stays 0: the scratch hook needs a RadArgs with the operand tensors, which the
+     * builder owns and sizes the arena with. */
     return r;
 }
 
@@ -336,9 +395,9 @@ void Registry::record_(const std::string& op, int domain, const Geometry& g,
                        const SelectionTrace& t) {
     const std::string key = fold_key(op, domain, g);
     std::lock_guard<std::mutex> lk(mu_);
-    for (SelectionRecord& s : log_) {
-        if (s.key == key) { ++s.count; return; }   /* same question, therefore the same answer */
-    }
+    /* The same question, therefore the same answer. */
+    const auto at = log_at_.try_emplace(key, log_.size());
+    if (!at.second) { ++log_[at.first->second].count; return; }
     SelectionRecord s;
     s.op       = op;
     s.domain   = domain;
@@ -348,10 +407,8 @@ void Registry::record_(const std::string& op, int domain, const Geometry& g,
     s.plugin   = t.plugin;
     s.priority = t.priority;
     s.reason   = t.reason;
-    /* Kept apart from the query. A derived key was not part of the question -- printing it inside
-     * the geometry would read as something the caller asked for, and the next reader would go
-     * looking for the code that passed it. ":=" is the kernel answering, "?" is a winner with no
-     * EQ on the key, which is a hole the caller has to fill and not a value. */
+    /* Derived keys are kept apart from the query because the caller did not ask for them. ":="
+     * is the kernel's answer; "?" is a winner with no EQ on the key, which the caller must fill. */
     for (const SelectionTrace::DerivedParam& d : t.derived) {
         if (!s.derived.empty()) s.derived += ' ';
         s.derived += d.known ? fmt("%s:=%lld", d.key.c_str(), d.value)
@@ -368,6 +425,7 @@ size_t Registry::n_selections() const {
 void Registry::clear_selections() {
     std::lock_guard<std::mutex> lk(mu_);
     log_.clear();
+    log_at_.clear();
 }
 
 std::string Registry::selection_table() const {
@@ -400,11 +458,7 @@ std::string Registry::selection_table() const {
 }
 
 /* ------------------------------------------------------------------ instances */
-/* init() once per resolved instance -- one op, one band, one domain -- with the frozen geometry,
- * the rank and the world size. Some kernels have per-instance state that must be established once
- * and not per launch: libr4d's all-reduce needs its peer signal buffers and IPC handles set up
- * across ranks before the first call, and a kernel that JITs or loads a config table wants
- * somewhere to do it that is not the hot path. */
+/* See registry.h: init_instance. */
 int Registry::init_instance(Resolved& r, int rank, int world_size) {
     if (!r.row || !r.row->info) return RAD_E_INVAL;
     const RadKernelInfo* k = r.row->info;
@@ -413,16 +467,13 @@ int Registry::init_instance(Resolved& r, int rank, int world_size) {
     void* inst = nullptr;
     const int st = k->init(r.geom.params(), r.geom.n_params(), rank, world_size, &inst);
     if (st < 0) {
-        /* A negative init aborts startup, and the caller names the kernel -- which it can, because
-         * the message below already did. Continuing would mean launching a kernel whose one-time
-         * setup failed, and that is a fault three frames later instead of here. */
+        /* A negative init aborts startup rather than launching a kernel whose setup failed. */
         RAD_ERR("kernel '%s' (%s) failed to initialise for %s: %s", k->name, r.row->plugin.c_str(),
                 r.geom.str().c_str(), rad_strerror(st));
         return st;
     }
     r.instance = inst;
-    /* Registered even when the kernel returned null: fini pairs 1:1 with a successful init, and a
-     * kernel with global setup and no handle still needs its fini call. */
+    /* Registered even when the instance is null: fini pairs 1:1 with every successful init. */
     std::lock_guard<std::mutex> lk(mu_);
     instances_.emplace_back(k, inst);
     return RAD_OK;

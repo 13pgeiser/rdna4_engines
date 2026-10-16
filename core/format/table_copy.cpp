@@ -19,9 +19,9 @@ int table_copy_fill(const RadFile& file, const uint8_t* src, int64_t n, int64_t 
     if (!why || !src || !buf || n <= 0) return RAD_E_INVAL;
     const int64_t huge = (int64_t)2 << 20;
 
-    /* A reader per hardware thread up to sixteen, each reading its own contiguous span in pieces of
-     * 64 MiB: a drive serves sixteen queued reads at full rate, and the span keeps each reader's
-     * reads sequential on the file. */
+    /* One reader per hardware thread up to 16, each reading its own contiguous span in 64 MiB
+     * pieces: a drive serves 16 queued reads at full rate, and spans keep each reader
+     * sequential. */
     const int nt = (int)std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
     const int64_t piece = (int64_t)64 << 20;
     const int64_t span = ((n + nt - 1) / nt + huge - 1) & ~(huge - 1);

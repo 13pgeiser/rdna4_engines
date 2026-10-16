@@ -1,7 +1,7 @@
-/* advance.hip -- the advance kernel: one thread a row of the batch it patches. See advance.h.
+/* advance.hip -- the advance kernel: one thread per row of the batch it patches. See advance.h.
  *
- * Launched through hipLaunchKernel like any kernel library's, which the AQL backend intercepts, so
- * it is one dispatch on the rank's own queue in stream order with the pass it belongs to.
+ * Launched through hipLaunchKernel, which the AQL backend intercepts, so it is one dispatch on the
+ * rank's own queue, in stream order with its pass.
  */
 #include <hip/hip_runtime.h>
 

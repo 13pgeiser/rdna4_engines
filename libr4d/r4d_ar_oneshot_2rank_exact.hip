@@ -1,28 +1,23 @@
 // r4d_ar_oneshot_2rank_exact.hip: r4d_ar_oneshot_2rank_exact -- multi-block one-shot P2P-BAR
-// all-reduce, exactly two ranks, for dual R9700 (gfx1201/RDNA4, PCIe). "One-shot" is the
-// algorithm class: each rank pushes its whole input, so the scratch is sized by the full message
-// and there is no ring or reduce-scatter stage. "2rank" is a hard constraint, not a tuning
-// choice -- the handshake is one peer flag per block, not a tree. Pure HIP behind the C ABI in
-// r4d.h (wheel-ROCm ships no rocThrust, which torch/extension.h needs); the caller passes raw
-// data_ptr / numel / dtype / stream.
+// all-reduce, exactly two ranks, for dual R9700 (gfx1201/RDNA4, PCIe). One-shot: each rank pushes
+// its whole input, so scratch is sized by the full message and there is no ring or reduce-scatter
+// stage. Two ranks is a hard constraint: the handshake is one peer flag per block. Pure HIP behind
+// the C ABI in r4d.h; the caller passes raw pointers, element count, dtype and stream.
 //
 // Design:
-//  * PUSH model: each rank writes ITS input into the PEER's IPC scratch, then reduces
-//    (local input + peer's data now in MY scratch) -> out. Only scratch+flags are
-//    IPC-shared; input/output stay local -> no cudagraph buffer registration needed.
-//  * MULTI-BLOCK, per-chunk independent flags (NO grid barrier): block b owns a
-//    contiguous chunk of 16B words -> pushes it to peer, sets peer_flags[b], spins on
-//    my_flags[b], reduces its chunk. Spreads the push across CUs (PCIe saturation) and
-//    the reduce across CUs (HBM saturation): the single-block bandwidth fix.
-//  * cudagraph-safe: seq is a DEVICE-resident PER-BLOCK counter the kernel increments.
-//    Both ranks execute the identical graph sequence (SPMD) so seq_ctr[b] stays in
-//    lockstep across ranks regardless of which batch-size graphs ran.
-//  * race-free reuse: scratch DOUBLE-BUFFERED by a per-LAUNCH parity (r4d_ar_seq.h says why it
-//    is not seq&1); same-stream serialization + the per-block flag handshake guarantee a slot
-//    is drained before reuse.
-//  * FINE-GRAINED memory (hipDeviceMallocFinegrained) => uncached => posted straight to
-//    the fabric => SCOPE_SYS release/acquire skip the L2 writeback. drain/acq explicit
-//    fences are tunable (all-thread system fences; default drain=1/acq=0 on fine-grained).
+//  * Push: each rank writes its input into the peer's IPC scratch, then reduces local input +
+//    peer data (now in its own scratch) into out. Only scratch and flags are IPC-shared; input and
+//    output stay local, so graph capture needs no buffer registration.
+//  * Multi-block with per-chunk flags and no grid barrier: block b owns a contiguous chunk of 16B
+//    words, pushes it, sets peer_flags[b], spins on my_flags[b] and reduces its chunk. This
+//    spreads the push (PCIe) and the reduce (memory) across CUs.
+//  * Graph-safe: seq is a device-resident per-block counter the kernel increments. Both ranks run
+//    the same launch sequence (SPMD), so seq_ctr[b] stays in lockstep across ranks.
+//  * Reuse: scratch is double-buffered by a per-launch parity (r4d_ar_seq.h explains why not
+//    seq&1); same-stream serialisation plus the handshake drain a slot before reuse.
+//  * Fine-grained memory (hipDeviceMallocFinegrained) is uncached and posted straight to the
+//    fabric, so system-scope release/acquire skip the L2 writeback. The drain/acq fences are
+//    selectable (default drain=1/acq=0 on fine-grained).
 #include "r4d.h"
 #include "r4d_ar_seq.h"
 #include "r4d_ar_hc.h"      // the gather word and the hc write word, shared with the rotated wire
@@ -51,7 +46,7 @@ __device__ __forceinline__ void rd_from_f(float v, float& o) { o = v; }
 __device__ __forceinline__ void rd_from_f(float v, __half& o) { o = __float2half(v); }
 __device__ __forceinline__ void rd_from_f(float v, __hip_bfloat16& o) { o = (__hip_bfloat16)v; }
 
-// vectorized 128-bit add: an int4 packs LANES elements of T; fp32-accumulate reduce.
+// Vectorised 128-bit add: an int4 packs LANES elements of T, summed in fp32.
 template <typename T, int LANES>
 __device__ __forceinline__ int4 vadd(const int4& a, const int4& b) {
   int4 r;
@@ -63,8 +58,8 @@ __device__ __forceinline__ int4 vadd(const int4& a, const int4& b) {
   return r;
 }
 
-// Multi-block one-shot all-reduce. Each block owns words [start,end) of the 16B-word
-// space and drives its own flag handshake; fully independent, no cross-block sync.
+// Multi-block one-shot all-reduce. Each block owns words [start,end) of the 16B-word space and
+// drives its own flag handshake; no cross-block sync.
 template <typename T, int LANES>
 __global__ void r4d_ar_oneshot_2rank_exact_kernel(
     const int4* __restrict__ in4, int4* peer_base, const int4* my_base, int4* __restrict__ out4,
@@ -82,7 +77,7 @@ __global__ void r4d_ar_oneshot_2rank_exact_kernel(
   const int start = b * w;
   int end = start + w; if (end > n16) end = n16;
 
-  // push chunk -> peer slot, 4x-unrolled for memory-level parallelism (PCIe saturation)
+  // Push the chunk to the peer slot, 4x unrolled for memory-level parallelism.
   {
     int k = start + tid;
     for (; k + 3 * nt < end; k += 4 * nt) {
@@ -91,15 +86,14 @@ __global__ void r4d_ar_oneshot_2rank_exact_kernel(
     }
     for (; k < end; k += nt) ps[k] = in4[k];
   }
-  // drain modes (ordering of the pushes vs the release flag, so the peer sees data first):
-  //  0 = none (relies purely on PCIe posted-write ordering + the release flag)
-  //  1 = all-thread __threadfence_system  (safe but emits an L2 wb-invalidate per
-  //      wavefront (WASTED on fine-grained/uncached memory; floods at high nt*nb)
-  //  2 = single-thread __threadfence_system (cheap but only drains wavefront 0's stores)
-  //  3 = all-thread store-completion wait (s_wait_storecnt 0): every wavefront drains
-  //      its posted writes into the fabric with NO L2 wb-invalidate; PCIe keeps posted
-  //      writes to the same peer ordered, so the later release flag lands after the data.
-  //      Correct for FINE-GRAINED memory (uncached; coarse would leave data in L2).
+  // Drain modes, ordering the pushes before the release flag so the peer sees data first:
+  //  0 = none (relies on PCIe posted-write ordering and the release flag)
+  //  1 = all-thread __threadfence_system: safe, but an L2 writeback-invalidate per wave, wasted
+  //      on fine-grained memory and costly at high nt*nb
+  //  2 = single-thread __threadfence_system: cheap, but drains only wave 0's stores
+  //  3 = all-thread s_wait_storecnt 0: every wave drains its posted writes with no L2
+  //      writeback-invalidate; PCIe keeps posted writes to one peer ordered, so the release flag
+  //      lands after the data. Correct only for fine-grained memory (coarse leaves data in L2).
   if (drain == 1) __threadfence_system();
   else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
   __syncthreads();
@@ -107,15 +101,14 @@ __global__ void r4d_ar_oneshot_2rank_exact_kernel(
     if (drain == 2) __threadfence_system();
     store_sys_rel(&peer_flags[b], s);
     unsigned long long z = 0;
-    // A handshake that cannot complete is a lockstep violation: reducing a slot the peer never
-    // filled would hand stale bytes on as a sum, so it traps instead.
+    // A handshake that cannot complete is a lockstep violation; trap rather than sum stale bytes.
     while (r4d_ar_seq_behind(load_sys_acq(&my_flags[b]), s)) {
       if (++z > R4D_AR_SPIN_MAX) __builtin_trap();
     }
   }
   __syncthreads();
   if (acq) __threadfence_system();
-  // reduce chunk (vectorized, 4x-unrolled): out = local input + peer input (staged in local scratch)
+  // Reduce the chunk, 4x unrolled: out = local input + peer input (staged in local scratch).
   {
     int k = start + tid;
     for (; k + 3 * nt < end; k += 4 * nt) {
@@ -128,16 +121,14 @@ __global__ void r4d_ar_oneshot_2rank_exact_kernel(
   }
 }
 
-// THE SAME ALL-REDUCE WITH THE GATED RESIDUAL'S WRITE AS ITS EPILOGUE. `y` is the message: every
-// word is reduced exactly as the kernel above reduces it and stored back, and then the hc streams
-// behind it take the write, h[r][c*n + i] += inj[r][c] * y[r][i], in hc_write's arithmetic
-// (r4d_hc_bf16.hip) -- its bf16 helpers, its expression, and the reduced value read as the bf16
-// the reduction stored, which is what hc_write reads back from memory. So the pair's output is
-// reproduced to the byte with no second launch: on this part a dependent launch is a gap of about
-// three microseconds, around a write that costs one or two.
+// The same all-reduce with the gated residual write as its epilogue. `y` is the message: each word
+// is reduced as above and stored back, then the hc streams take
+// h[r][c*n + i] += inj[r][c] * y[r][i] in hc_write's arithmetic (r4d_hc_bf16.hip) over the stored
+// bf16 value. The output matches the two-kernel pair byte for byte without the second launch (a
+// dependent launch gap is about 3 us on this part, against a 1-2 us write).
 //
-// A word is eight elements and a row is `n` of them with n a multiple of eight, so a word never
-// straddles a row and the block that reduces it owns every stream element behind it.
+// n is a multiple of eight, so a word never straddles a row and the block that reduces it owns
+// every stream element behind it.
 __global__ void r4d_ar_hc_write_kernel(
     int4* __restrict__ y4, int4* peer_base, const int4* my_base, unsigned int* peer_flags,
     unsigned int* my_flags, unsigned int* seq_ctrs, const unsigned short* __restrict__ inj,
@@ -190,28 +181,24 @@ __global__ void r4d_ar_hc_write_kernel(
   }
 }
 
-// THE SAME WRITE WITH THE MoE GATHER AS ITS PROLOGUE. The routed experts' rows go back to token
-// order -- y[t][i] = sum over t's slots, ascending, of w[t][j] * y_expert[slot][i], rounded to
-// bf16 -- with the shared arm folded as moe_gather folds it, and the word is pushed to the peer
-// and kept as this rank's message exactly as if moe_gather had written it and this kernel had read
-// it back. The arithmetic is moe_gather's, rounding helpers included: its narrows are
-// round-to-nearest-even (r4d_common.h), where the hc write below keeps hc_write's own. So the
-// three kernels' bytes are reproduced with two fewer dependent launches.
+// The same write with the MoE gather as its prologue. The routed experts' rows go back to token
+// order, y[t][i] = sum over t's slots, ascending, of w[t][j] * y_expert[slot][i] rounded to bf16,
+// with the shared arm folded in as moe_gather does; the word is pushed to the peer and kept as this
+// rank's message. The gather uses moe_gather's round-to-nearest-even narrows (r4d_common.h), the hc
+// write keeps hc_write's, so the bytes match the three separate kernels with two fewer launches.
 //
-// A block's words sit in at most R4D_ARG_ROWS rows (the launcher sizes the grid so), and the
-// slots of those rows are found once, in LDS, by one pass over the sorted list -- the scan
-// moe_gather makes a token at a time.
+// A block's words sit in at most R4D_ARG_ROWS rows (the launcher sizes the grid for it), and their
+// slots are found once, in LDS, in one pass over the sorted list.
 //
-// AT A PREFILL CHUNK THAT TABLE IS THE WRONG SHAPE. Eight rows a block is what makes it fit in
-// LDS, and at 2048 rows it takes hundreds of blocks -- each scanning the whole sorted list, and
-// each paying its own flag round trip over a fabric the all-reduce saturates with a few dozen. So
-// with INV the slots come from an inverse table instead -- inv[token * top_k + slot] = the sorted
-// row holding it, or -1 -- built by one launch in front (r4d_ar_gather_inv_kernel), and a block
-// owns as many rows as the all-reduce's own block count gives it. The gather's reads of the
-// routed rows then run beside the push of the words already summed, where the pair of kernels runs
-// them one after the other. The arithmetic is the table form's, value for value.
-/* inv[f] = i for every sorted row i holding slot f, and -1 for a slot no row holds: one block, so
- * the clear and the scatter are two phases with a barrier between them. */
+// That table does not suit a prefill chunk: eight rows per block means hundreds of blocks at 2048
+// rows, each scanning the whole sorted list and paying its own flag round trip, where a few dozen
+// already saturate the fabric. With INV the slots come from an inverse table instead
+// (inv[token * top_k + slot] = sorted row holding it, or -1), built by r4d_ar_gather_inv_kernel
+// beforehand, and the block count stays the all-reduce's. The gather's reads then overlap the push
+// of words already summed. The arithmetic is identical to the table form.
+
+/* inv[f] = i for every sorted row i holding slot f, -1 for a slot no row holds. One block, so the
+ * clear and the scatter are separated by a barrier. */
 __global__ void r4d_ar_gather_inv_kernel(int* __restrict__ inv, const int* __restrict__ sorted,
                                          int T) {
   for (int x = threadIdx.x; x < T; x += blockDim.x) inv[x] = -1;
@@ -249,8 +236,8 @@ __global__ void r4d_ar_gather_hc_write_kernel(
   const int nrow = end > start ? (end - 1) / wpr - row_lo + 1 : 0;
   const int K = G.top_k;
 
-  /* The slot table. A slot no sorted row claims reads -1, so the clear and the scan are two
-   * phases with a barrier between them, as in moe_gather. */
+  /* Slot table. A slot no sorted row claims reads -1, so clear and scan are separated by a
+   * barrier, as in moe_gather. */
   if (!INV) {
     for (int x = tid; x < nrow * K; x += nt) s_i[x] = -1;
     __syncthreads();
@@ -271,7 +258,7 @@ __global__ void r4d_ar_gather_hc_write_kernel(
     __syncthreads();
   }
 
-  /* The gather, one word a thread a pass, pushed and kept. */
+  /* Gather one word per thread per pass; push it and keep it. */
   for (int k = start + tid; k < end; k += nt) {
     const int row = k / wpr, i0 = (k - row * wpr) * 8;
     const int4 out = r4d_ar_gather_word<INV>(G, inv, s_i, s_w, s_g, row, row - row_lo, i0);
@@ -302,8 +289,7 @@ __global__ void r4d_ar_gather_hc_write_kernel(
   }
 }
 
-// The IPC handle is returned through a caller-owned buffer rather than a std::string so this
-// stays a C ABI; R4D_AR_HANDLE_BYTES is the fixed size the header promises.
+// The IPC handle goes into a caller-owned buffer of R4D_AR_HANDLE_BYTES so this stays a C ABI.
 static_assert(sizeof(hipIpcMemHandle_t) <= R4D_AR_HANDLE_BYTES, "ipc handle larger than the ABI buffer");
 
 long r4d_ar_ipc_alloc(long size, int finegrained, char* out_handle, int* out_len) {
@@ -311,8 +297,8 @@ long r4d_ar_ipc_alloc(long size, int finegrained, char* out_handle, int* out_len
   if (finegrained) HIPOK(hipExtMallocWithFlags(&p, size, hipDeviceMallocFinegrained));
   else HIPOK(hipMalloc(&p, size));
   HIPOK(hipMemset(p, 0, size));
-  // The zeroes must be in memory before the pointer is handed to a peer, whose first push or flag
-  // store would otherwise race a memset still queued behind it.
+  // The zeroes must land before the pointer reaches a peer, or its first push or flag store could
+  // race the queued memset.
   HIPOK(hipStreamSynchronize(nullptr));
   hipIpcMemHandle_t h;
   HIPOK(hipIpcGetMemHandle(&h, p));
@@ -320,34 +306,18 @@ long r4d_ar_ipc_alloc(long size, int finegrained, char* out_handle, int* out_len
   *out_len = (int)sizeof(h);
   return (long)p;
 }
-long r4d_ar_ipc_open(const char* handle, int len) {
-  hipIpcMemHandle_t h;
-  if (len != (int)sizeof(h)) throw std::runtime_error("bad ipc handle size");
-  std::memcpy(&h, handle, sizeof(h));
-  void* p = nullptr;
-  HIPOK(hipIpcOpenMemHandle(&p, h, hipIpcMemLazyEnablePeerAccess));
-  return (long)p;
-}
-// A strided device-to-device copy, which is what an ALL-GATHER between two ranks is once the
-// peer's buffer is IPC-mapped: no reduction, no codec, nothing to schedule. The runtime's copy
-// path is the fast one for peer traffic on this part -- 13.52 GB/s per direction with both
-// directions running, against 9.30 for a kernel doing b128 peer loads and 10.1 for RCCL.
-// `dpitch`, `spitch` and `width` are BYTES; `height` is rows.
-// THE SAME COPY AS A KERNEL, WITH A BOUNDED WORKGROUP COUNT.
+// r4d_p2p_copy2d as a kernel with a bounded workgroup count.
 //
-// `hipMemcpy2DAsync` is not a DMA engine on this part -- it runs as
-// `__amd_rocclr_copyBufferRectAligned` -- and it launches ONE 16-thread workgroup per 16 bytes of
-// a row: a 64 x 248 KB rectangle is 62080 workgroups.  Alone that is fine and reaches the link
-// rate.  Sharing the part with a GEMM it is meant to hide under, it fills every scheduling slot,
-// costs that GEMM around 60% of its runtime again, and gains almost nothing itself.
+// hipMemcpy2DAsync is not a DMA engine on this part: it runs as
+// `__amd_rocclr_copyBufferRectAligned`, one 16-thread workgroup per 16 bytes of a row (62080
+// workgroups for 64 x 248 KB). Alone it reaches link rate, but beside the GEMM it should hide
+// under, it fills every scheduling slot and slows that GEMM by about 60%.
 //
-// A peer copy needs a very small grid: across access width x workgroup size x workgroup count x
-// loads-in-flight (swept by `dev/prrun.py`), 32 workgroups of 64 threads is within 0.1% of the
-// best point at every size.  So this takes the grid as an argument and defaults to 64 workgroups,
-// which is a 0.1% footprint against the blit's 62080.
+// A peer copy needs only a small grid: 32 workgroups of 64 threads is within 0.1% of the best
+// configuration at every size. The grid is an argument and defaults to at most 64 workgroups.
 //
-// 16-byte accesses, so every pitch, the width and both base addresses must be 16-byte aligned; the
-// caller checks and falls back to `r4d_p2p_copy2d` when they are not.
+// 16-byte accesses: every pitch, the width and both base addresses must be 16-byte aligned; the
+// caller checks and falls back to r4d_p2p_copy2d otherwise.
 typedef unsigned r4d_u4v __attribute__((ext_vector_type(4)));
 
 __global__ __launch_bounds__(256) void r4d_p2p_copy2d_k(const r4d_u4v* __restrict__ src,
@@ -378,12 +348,10 @@ int r4d_p2p_copy2d_kernel(long dst, long src, long dpitch, long spitch, long wid
   return e == hipSuccess ? 0 : -100 - (int)e;
 }
 
-// A SYSTEM-SCOPE RELEASE on `stream`, for the case where this device has written into the PEER's
-// memory and something other than this device is about to read it.  A peer write issued by a copy
-// or a kernel is a posted write: it retires from the wave long before it lands, and the only thing
-// that orders it against a later handshake on a different path is a system-scope release.  One
-// thread is enough -- the fence is a memory-system operation, not a per-lane one -- and it costs a
-// dispatch.
+// A system-scope release on `stream`, for when this device has written into peer memory that
+// another agent will read. A peer write from a copy or kernel is posted and retires long before it
+// lands; only a system-scope release orders it against a later handshake on a different path. One
+// thread suffices, since the fence is a memory-system operation.
 __global__ void r4d_p2p_fence_kernel() { __threadfence_system(); }
 
 int r4d_p2p_fence(long stream) {
@@ -392,6 +360,10 @@ int r4d_p2p_fence(long stream) {
   return e == hipSuccess ? 0 : -100 - (int)e;
 }
 
+// A strided device-to-device copy: a two-rank all-gather once the peer's buffer is IPC-mapped.
+// The runtime's copy path is the fast one for peer traffic on this part (13.52 GB/s per direction
+// with both directions busy, against 9.30 for a b128-load kernel and 10.1 for RCCL).
+// `dpitch`, `spitch` and `width` are bytes; `height` is rows.
 int r4d_p2p_copy2d(long dst, long src, long dpitch, long spitch, long width, long height,
                    long stream) {
   hipError_t e = hipMemcpy2DAsync((void*)dst, (size_t)dpitch, (const void*)src, (size_t)spitch,
@@ -407,6 +379,7 @@ void r4d_ar_hc_write(long peer_scratch, long my_scratch, long peer_flags, long m
   hipStream_t st = (hipStream_t)stream_i;
   if (n <= 0 || M <= 0 || n % 8) throw std::runtime_error("ar_hc_write: n must be a positive multiple of 8");
   if (hc < 1 || hrow % 8) throw std::runtime_error("ar_hc_write: the streams must be whole 16B words");
+  if (M * n * 2 / 16 > slot_stride16) throw std::runtime_error("ar_hc_write: message larger than a slot");
   const int n16 = (int)(M * n * 2 / 16);
   int nb = (int)nblocks;
   if (nb < 1) nb = 1;
@@ -434,20 +407,20 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
   if (n <= 0 || M <= 0 || n % 8 || hc < 1 || hrow % 8) return -1;
   if (top_k < 1 || top_k > R4D_ARG_SLOTS) return -2;
   if (ye_ld % 8 || (sh && sh_ld < n)) return -3;
+  if (M * n * 2 / 16 > slot_stride16) return -5;      /* larger than a slot */
   const int n16 = (int)(M * n * 2 / 16);
   const int wpr = (int)(n / 8);
   const unsigned nbw = (unsigned)r4d_ar_max_blocks();
   int nb = (int)nblocks;
   if (nb < 1) nb = 1;
-  /* THE GRID IS AT LEAST WIDE ENOUGH THAT NO BLOCK SPANS MORE THAN R4D_ARG_ROWS ROWS: a block of
-   * w words starting anywhere touches at most (w - 1) / wpr + 2 rows. Both ranks compute the same
-   * count from the same M and n, which the per-block handshake requires. */
+  /* Enough blocks that none spans more than R4D_ARG_ROWS rows: a block of w words touches at most
+   * (w - 1) / wpr + 2 rows. Both ranks compute the same count from the same M and n, as the
+   * per-block handshake requires. */
   const int wmax = (R4D_ARG_ROWS - 2) * wpr + 1;
   const int nb_min = (n16 + wmax - 1) / wmax;
-  /* THE INVERSE TABLE WHEN THE LDS ONE WOULD NEED MORE BLOCKS THAN THE REDUCTION WANTS, which is
-   * a prefill chunk and never a decode step. Both ranks decide it from the same M and n. The
-   * block count stays the reduction's: at a 2048-row chunk 48 and 96 blocks measure within half
-   * a percent of its 24, and 192 no better. */
+  /* Use the inverse table when the LDS table would need more blocks than requested (a prefill
+   * chunk, never a decode step); both ranks decide from the same M and n. The block count stays
+   * the requested one: at a 2048-row chunk, 48, 96 and 192 blocks are no faster than 24. */
   const bool by_inv = inv != 0 && nb_min > nb;
   if (!by_inv && nb < nb_min) nb = nb_min;
   if (nb > n16) nb = n16;
@@ -455,8 +428,8 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
   int nt = (int)nthreads;
   if (nt < 64) nt = 64;
   if (nt > 1024) nt = 1024;
-  /* Zeroed whole, padding included: the struct is passed by value, so its tail padding is
-   * kernel-argument bytes too, and a recorded pass's audit compares those bytes. */
+  /* Zeroed including padding: the struct is passed by value, so its tail padding is part of the
+   * kernel-argument bytes a recorded pass's audit compares. */
   R4dArGather G;
   std::memset(&G, 0, sizeof G);
   G.ye = (const unsigned short*)ye;
@@ -483,8 +456,8 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
   return (int)hipGetLastError();
 }
 
-/* The inverse slot table alone, on `stream`, for the wide fused gather (r4d_ar_oneshot_Nrank_exact.hip):
- * the same kernel and the same launch as above, so both widths read one table. */
+/* The inverse slot table alone, for the wide fused gather (r4d_ar_oneshot_Nrank_exact.hip); same
+ * kernel and launch as above. */
 int r4d_ar_gather_inv(long inv, long sorted, long T, long stream_i) {
   if (!inv || !sorted || T < 1) return -1;
   r4d_ar_gather_inv_kernel<<<1, 1024, 0, (hipStream_t)stream_i>>>((int*)inv, (const int*)sorted,
@@ -493,14 +466,11 @@ int r4d_ar_gather_inv(long inv, long sorted, long T, long stream_i) {
 }
 
 void r4d_ar_ipc_free(long p) { if (p) (void)hipFree((void*)p); }
-void r4d_ar_ipc_memzero(long p, long size) { if (p) HIPOK(hipMemset((void*)p, 0, size)); }
 
-// THE HOST MAILBOX. Coherent so a peer's stores are not held in a CPU cache line this card reads
-// around, mapped so the cards address it, portable so every card does and not only the one
-// current at allocation. A card reaches it through the same fine-grained path a peer's VRAM
-// scratch is reached by, so the kernels' fences mean what they mean there. The address a card
-// uses must be the CPU's own, because one pointer is published to every rank: a mapping that put
-// the pages elsewhere on some card would have each rank write where no other rank reads.
+// Host mailbox. Coherent so a peer's stores are not held in a CPU cache line, mapped so cards can
+// address it, portable so every card can (not only the current one). Cards reach it over the same
+// fine-grained path as a peer's VRAM scratch, so the kernels' fences apply unchanged. The card
+// address must equal the CPU address, because one pointer is published to every rank.
 long r4d_ar_host_alloc(long size) {
   void* p = nullptr;
   HIPOK(hipHostMalloc(&p, size, hipHostMallocCoherent | hipHostMallocMapped |
@@ -518,9 +488,8 @@ long r4d_ar_host_alloc(long size) {
 }
 void r4d_ar_host_free(long p) { if (p) (void)hipHostFree((void*)p); }
 
-// Enable direct peer access. radiance runs one process with a thread per rank sharing an address
-// space, so a peer pointer is valid here once this has run and no IPC handle exchange is needed;
-// see the header of r4d_ar_entry.hip.
+// Enable direct peer access. Ranks are threads of one process sharing an address space, so a peer
+// pointer is valid once this has run and no IPC handle exchange is needed (see r4d_ar_entry.hip).
 void r4d_ar_ipc_enable_peer(long peer) {
   hipError_t e = hipDeviceEnablePeerAccess((int)peer, 0);
   if (e == hipErrorPeerAccessAlreadyEnabled) { (void)hipGetLastError(); return; }
@@ -537,13 +506,14 @@ void r4d_ar_oneshot_2rank_exact(long peer_scratch, long my_scratch, long peer_fl
   const int esize = (dtype == 2) ? 4 : 2;
   const long nbytes = (long)n_elem * esize;
   if (nbytes % 16 != 0) throw std::runtime_error("all_reduce: n_elem*esize not 16B-aligned");
+  if (nbytes / 16 > slot_stride16) throw std::runtime_error("all_reduce: message larger than a slot");
   const int n16 = (int)(nbytes / 16);
   int nb = (int)nblocks;
   if (nb < 1) nb = 1;
   if (nb > n16) nb = n16;
   if (nb > R4D_AR_MAX_BLOCKS) nb = R4D_AR_MAX_BLOCKS;
-  // The counter allocation's block capacity, which every 2-rank kernel on an instance must agree
-  // on because the parity counters sit that many words in (r4d_ar_seq.h).
+  // Block capacity of the counter allocation. Every 2-rank kernel on an instance must agree on it,
+  // because the parity counters start that many words in (r4d_ar_seq.h).
   const unsigned nbw = (unsigned)r4d_ar_max_blocks();
   if ((unsigned)nb > nbw) nb = (int)nbw;
   int nt = (int)nthreads;

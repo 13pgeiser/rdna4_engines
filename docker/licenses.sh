@@ -1,15 +1,14 @@
 #!/bin/sh
-# docker/licenses.sh ROOT FILE... -- the licenses of everything in the runtime image that radiance
-# did not write.
+# docker/licenses.sh ROOT FILE... -- record the licenses of all third-party software in the
+# runtime image.
 #
-# FILE... are the paths, in the build image, of every file copied into ROOT from outside the
-# radiance install: the shared libraries, comgr, busybox, curl, jq and the CA bundle's directory.
-# Each is traced to the package that installed it, or to the FFmpeg stage's /opt/ffmpeg. Every package's license files
-# are copied to ROOT/usr/share/doc/<package>/, the license texts Debian's copyright files refer to
-# go to ROOT/usr/share/common-licenses/, and ROOT/usr/share/doc/THIRD-PARTY lists each component
-# with its version, its license files and where its source is. A file that no package owns, or a
-# package that ships no license file, stops the build: the image would hold software whose license
-# is not recorded.
+# FILE... are the build-image paths of every file copied into ROOT from outside the radiance
+# install: the shared libraries, comgr, busybox, curl, jq and the CA bundle's directory. Each is
+# traced to its installing package, or to the FFmpeg stage's /opt/ffmpeg. Package license files go
+# to ROOT/usr/share/doc/<package>/, the texts Debian's copyright files refer to go to
+# ROOT/usr/share/common-licenses/, and ROOT/usr/share/doc/THIRD-PARTY lists each component with its
+# version, license files and source. A file no package owns, or a package with no license file,
+# fails the build, so no software ships with an unrecorded license.
 set -eu
 R=$1; shift
 D=$R/usr/share/doc

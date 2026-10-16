@@ -1,14 +1,12 @@
-/* rad_core.h -- the data model shared BETWEEN core components. Each component owns its own
- * header for its own methods; this file owns the structs that cross a component boundary, so
- * two components cannot disagree about what a weight or a band or a request is.
+/* rad_core.h -- the data model shared between core components. Each component owns a header for
+ * its own methods; this file owns the structs that cross a component boundary (weights, bands,
+ * requests, config), so components cannot disagree about them.
  *
- * If you need to add a field here, add it. If you need to CHANGE one, say so loudly -- somebody
- * else is reading it.
+ * Adding a field is fine. Changing one affects other readers; flag it in review.
  */
 #pragma once
 #include "rad_internal.h"
 
-#include <atomic>
 #include <map>
 #include <memory>
 #include <optional>
@@ -41,21 +39,19 @@ class Engine;
 
 /* ================================================================== plugin layer */
 
-/* One kernel row plus where it came from. The hierarchy is absolute: the first plugin with any
- * matching kernel supplies it, and a lower-priority plugin never outbids a higher one no matter
- * how specialised its kernel (spec §2.1). `plugin_order` is that hierarchy position. */
+/* One kernel row plus its origin. The hierarchy is absolute: the first plugin with any matching
+ * kernel supplies it, and a lower-priority plugin never outbids a higher one, however specialised
+ * (spec §2.1). `plugin_order` is the hierarchy position. */
 struct KernelRow {
     const RadKernelInfo* info = nullptr;
     std::string          plugin;
     int                  plugin_order = 0;   /* 0 is highest priority */
     int                  index = 0;          /* declaration order within the plugin */
-    /* The plugin's rad_kernel_concurrent answer for this row: its launches touch nothing but
-     * their operands and their scratch, so one may run beside another that shares none of those
-     * bytes. False when the plugin does not say. */
+    /* rad_kernel_concurrent: launches touch only their operands and scratch, so one may run beside
+     * another that shares none of those bytes. False when the plugin does not say. */
     bool                 concurrent = false;
-    /* The plugin's rad_kernel_collective answer for this row: its launches exchange data with
-     * the other ranks' cards, and -- `releases_link` -- end the engine's hold on the link
-     * themselves, through `link_gate`. False when the plugin does not say. */
+    /* rad_kernel_collective: launches exchange data with other ranks' cards; `releases_link` means
+     * they end the engine's hold on the link themselves, through `link_gate`. False when unsaid. */
     bool                 collective = false;
     bool                 releases_link = false;
     /* The row's plugin declared itself a reference implementation (RadPluginReferenceFn). */
@@ -66,91 +62,86 @@ struct KernelRow {
 struct Resolved {
     const KernelRow* row = nullptr;
     void*            instance = nullptr;
-    /* The frozen geometry, INCLUDING the tuned axes: once selection has picked a point in the
-     * kernel's RadTunable space it is set here, so RadArgs.p carries it and the kernel reads `sk`
-     * with the same rad_args_geti() it reads `M` with. There is no variant index anywhere. */
+    /* The frozen geometry, including the tuned axes, so RadArgs.p carries them and the kernel
+     * reads `sk` with rad_args_geti() like `M`. There is no variant index. */
     Geometry         geom;
     int64_t          scratch_bytes = 0;
-    /* The geometry WITHOUT the tuned axes, in tunecache.h's canonical spelling. The cache keys on
-     * it, so it has to be captured BEFORE the choices are folded into `geom` -- otherwise the key
-     * would depend on the answer it is used to look up. */
+    /* The geometry without the tuned axes, in tunecache.h's canonical spelling. It is the cache
+     * key, so it is captured before the choices are folded into `geom`. */
     std::string      geom_key;
-    /* The chosen axes, `key=value` comma separated and sorted -- the cache's `choice` column --
-     * and where they came from: "axis defaults", "tuned <timestamp>" or "RADIANCE_TUNE" (spec §15).
-     * Both empty for a kernel with nothing to tune. */
+    /* The chosen axes as sorted `key=value,...` (the cache's `choice` column), and their source:
+     * "axis defaults", "tuned <timestamp>" or "RADIANCE_TUNE" (spec §15). Both empty for a kernel
+     * with nothing to tune. */
     std::string      choice;
     std::string      tune_source;
+    /* The row's DIV on the op's ranged parameter (the least common multiple of several), 0 when
+     * it has none. Selection checked it at the band's upper bound only, so the issue path refuses
+     * a value in the band it does not divide (Registry::build_bands). */
+    int64_t          ranged_div = 0;
 
     explicit operator bool() const { return row != nullptr; }
 };
 
-/* One row of a bucket table: a band of the ranged parameter, resolved per domain.
- * The bucket boundaries are the constraint values themselves -- take the union of the LE, GE and
- * EQ values that candidate kernels place on the ranged parameter, and those are the bands. No
- * policy was chosen by anyone (spec §2.2). */
+/* One row of a bucket table: a band of the ranged parameter, resolved per domain. The band
+ * boundaries are the union of the LE, GE and EQ values candidate kernels place on the ranged
+ * parameter; there is no chosen policy (spec §2.2). */
 struct Band {
     int64_t  hi = 0;                          /* inclusive upper bound */
     Resolved dom[RAD_N_DOMAINS];              /* [RAD_DOMAIN_DEVICE], [RAD_DOMAIN_HOST] */
     std::string miss[RAD_N_DOMAINS];          /* why nothing resolved, for the report */
 
-    /* The band as a reader sees it -- "M <= 64", "M in (64, 512]", "any shape". Carried on
-     * the band rather than recomputed at each reporting site, because the exclusive lower
-     * bound is the previous band's hi and only the table's builder has that. */
+    /* Display form: "M <= 64", "M in (64, 512]", "any shape". Stored here because the exclusive
+     * lower bound is the previous band's hi, which only the table's builder has. */
     std::string span;
 };
 
 /* ================================================================== the declared program */
 
-/* MAPPED IS NOT "HOST MEMORY", IT IS THE CONTAINER'S OWN MAPPING, and that is the whole of the
- * difference. The other three off-device tiers all COPY: pinned and pageable allocate an arena and
- * memcpy the weight into it at load, and SSD preads it a slot at a time. A mapped weight is never
- * copied and occupies no pool -- the loader publishes a pointer into the mmap that
- * core/format/radfile.cpp already holds, and the OS page cache decides what is resident.
+/* Weight tiers. HostPinned and HostPageable copy the weight into an arena at load, and SSD preads
+ * it a slot at a time. Mapped is not host memory but the container's own mmap
+ * (core/format/radfile.cpp): never copied, in no pool, and the OS page cache decides residency.
  *
- * It exists for a weight that is tens of gigabytes and read A HANDFUL OF ROWS A TOKEN -- an
- * n-gram embedding table is the shape. Every copying tier is wrong for that: staging the unit
- * moves the whole table to use a few kilobytes of it, pinning it forces all of it resident on a
- * host whose RAM is the same order as the table, and an arena copy wants a second copy of it
- * beside the mapping that already holds one. A sparse Zipfian gather of a dozen rows out of
- * hundreds of millions is exactly what a page cache is good at.
+ * Mapped is for tables of tens of gigabytes read a few rows a token, such as an n-gram embedding.
+ * A copying tier would stage the whole table for a few kilobytes, pin it on a host with RAM of
+ * the same order, or keep a second copy beside the mapping; a sparse Zipfian gather suits a page
+ * cache.
  *
- * Only a HOST kernel can read the mapping -- the bytes are pageable and at no device address -- so
- * the planner assigns this tier where no device kernel for the op exists at all, and where
- * --ngram-placement keeps an n-gram table off the card (embed_lookup_q, libavx/avx_ngram.cpp).
- * Under `ram` the load phase publishes a copy in place of the mapping: locked memory for the host
- * gather, or pinned memory a device kernel reads over the link (the zero-copy site). */
+ * Only a host kernel can read the mapping (pageable, no device address), so the planner assigns
+ * it where no device kernel exists for the op, and where --ngram-placement keeps an n-gram table
+ * off the card (embed_lookup_q, libavx/avx_ngram.cpp). Under `ram` the load phase publishes a
+ * copy instead: locked memory for the host gather, or pinned memory a device kernel reads over
+ * the link (the zero-copy site). */
 enum class Tier { VRAM = 0, HostPinned = 1, HostPageable = 2, SSD = 3, Mapped = 4 };
 
-/* WHERE A LOOKUP TABLE LIVES: the token embedding (--embedding-placement) and an n-gram embedding
- * (--ngram-placement), each a model-level weight that only a row lookup reads, so a step touches M
- * of its rows and never the whole table. That is what makes every tier below the card usable for
- * it, and why the operator gets to choose.
+/* Where a lookup table lives: the token embedding (--embedding-placement) or an n-gram embedding
+ * (--ngram-placement). Only a row lookup reads them, so a step touches M rows, never the whole
+ * table, which makes every tier below the card usable.
  *
- *   Vram   resident on the card, a weight like any other.
- *   Ram    in host memory the card or a host kernel reads in place: the embedding pinned beside
- *          the host pool, read over the link; an n-gram table as a copy made at load.
- *   Disk   read from the container on demand; the n-gram table's only.
- *   Auto   the fastest of the three that has room once every other weight is placed; the n-gram
- *          table's only. Engine::plan decides it and writes the answer into Config, so every rank
- *          plans from one choice. The embedding takes Ram or Vram. */
+ *   Vram   resident on the card, like any other weight.
+ *   Ram    host memory the card or a host kernel reads in place: the embedding pinned beside the
+ *          host pool and read over the link; an n-gram table as a copy made at load.
+ *   Disk   read from the container on demand; n-gram table only.
+ *   Auto   the fastest of the three with room once every other weight is placed; n-gram table
+ *          only. Engine::plan resolves it into Config so every rank plans from one choice. The
+ *          embedding takes Ram or Vram. */
 enum class TablePlacement { Auto = 0, Vram = 1, Ram = 2, Disk = 3 };
 const char* table_placement_name(TablePlacement p);
-/* --draft-window: how many drafts a step verifies for each sequence (core/sched/draft.h).
+/* --draft-window: how many drafts a step verifies per sequence (core/sched/draft.h).
  *   Fixed     every sequence drafts --num-speculative-tokens.
- *   Adaptive  that is the ceiling; each step's head depth and each sequence's stop follow the
- *             measured acceptance and the measured step cost. A serial drafter's policy only.
- * The default is kDraftWindowDefault, and the help text and the startup line read it from there.
+ *   Adaptive  that is the ceiling; head depth per step and each sequence's stop follow measured
+ *             acceptance and step cost. Serial drafters only.
+ * The default is kDraftWindowDefault; the help text and startup line read it from there.
  *
- * FIXED IS THE DEFAULT BECAUSE ADAPTIVE LOSES WHERE A SERVER IS BUSY. Qwen3.8-Flash-Next at TP2 on
- * two R9700, distinct prompts a sequence, tokens a second over a steady window against fixed depth 3:
+ * Fixed is the default because adaptive loses on a busy server. Qwen3.8-Flash-Next, TP2 on two
+ * R9700, distinct prompts, throughput against fixed depth 3:
  *
  *      concurrent sequences        1        2        4        8
  *      adaptive, ceiling 3       +0.4%    -0.1%    +1.7%    -0.3%
  *      adaptive, ceiling 5       +7.1%    -2.3%    +7.4%   -11.9%
  *
- * At eight the head runs five rounds for little more text: 43.0 against 36.3 ms a step (1.18x) for
- * 23.3 against 22.3 tokens. The cost model's prior puts depth 5 over depth 3 at 1.10x, and a depth
- * not yet timed at a load is priced on the prior. */
+ * At eight sequences depth 5 costs 1.18x the step time (43.0 vs 36.3 ms) for 1.04x the tokens
+ * (23.3 vs 22.3). The cost model's prior puts depth 5 at 1.10x depth 3, and a depth not yet timed
+ * at a load is priced on the prior. */
 enum class DraftWindow { Fixed = 0, Adaptive = 1 };
 constexpr DraftWindow kDraftWindowDefault = DraftWindow::Fixed;
 inline const char* draft_window_name(DraftWindow w) {
@@ -158,9 +149,8 @@ inline const char* draft_window_name(DraftWindow w) {
 }
 enum class Site { Device = 0, DeviceStaged = 1, DeviceZeroCopy = 2, Host = 3 };
 
-/* Tier-indexed arrays are sized by this rather than by a literal: the report, the live view and
- * the planner's totals all index by (int)Tier and a fifth tier that fits in four of them is an
- * out-of-bounds write that costs nothing until it costs everything. */
+/* Size of every Tier-indexed array (report, live view, planner totals). Use it rather than a
+ * literal, so a new tier cannot silently write out of bounds. */
 constexpr int kTierCount = 5;
 
 const char* tier_name(Tier t);
@@ -179,10 +169,10 @@ struct WeightInfo {
     int64_t        part_lo[RAD_MAX_ROW_PARTS] = {0}, part_hi[RAD_MAX_ROW_PARTS] = {0};
     int64_t        part_total[RAD_MAX_ROW_PARTS] = {0};
 
-    /* WHAT IT IS A VIEW OF (RadWeightDecl::source and ::planes, spec §4.3). `enc` is the source's
-     * encoding as the model holds it -- or, with nothing behind the builder, plain in the declared
-     * dtype -- and `sel` the planes this declaration takes, in its order. `sel_rows`/`sel_cols`
-     * are each plane's extents for THIS RANK, which is what a layout hook is shown. */
+    /* The view's source (RadWeightDecl::source and ::planes, spec §4.3). `enc` is the source's
+     * encoding as the model holds it, or plain in the declared dtype when nothing is behind the
+     * builder; `sel` lists the planes this declaration takes, in order. `sel_rows`/`sel_cols` are
+     * each plane's extents for this rank, which is what a layout hook is shown. */
     std::string    source;
     RadEncoding    enc{};
     bool           enc_known = false;
@@ -191,21 +181,20 @@ struct WeightInfo {
     int64_t        sel_rows[RAD_ENC_MAX_PLANES] = {0};
     int64_t        sel_cols[RAD_ENC_MAX_PLANES] = {0};
 
-    /* Filled by the layout pass: what the resolved kernel stores for it. `identity` is the
-     * selected plane's bytes unchanged -- the only form the file and mapped tiers can serve,
-     * since they read the container where it lies; `widen` is identity but for an exact widening
-     * (a bf16 norm read as f32) the loader performs. Otherwise the kernel at (lay_op, lay_band,
-     * lay_dom) relayouts it at load, as operand `lay_operand`. */
+    /* Filled by the layout pass: what the resolved kernel stores. `identity` is the selected
+     * plane's bytes unchanged, the only form the file and mapped tiers can serve since they read
+     * the container in place; `widen` is identity plus an exact widening (a bf16 norm read as
+     * f32) done by the loader. Otherwise the kernel at (lay_op, lay_band, lay_dom) relayouts it at
+     * load, as operand `lay_operand`. */
     std::string    layout_tag;
     bool           identity = true;
     bool           widen = false;
     int32_t        lay_op = -1, lay_band = -1, lay_dom = -1, lay_operand = -1;
     uint32_t       stored_dtype = RAD_DT_INVALID;
     uint32_t       stored_rank = 0;
-    int64_t        stored_shape[RAD_MAX_RANK] = {0};   /* what the kernel will receive. A layout
-                                       * hook may reshape -- WMMA fragment order is not the
-                                       * declared shape -- and the kernel has to be handed the
-                                       * shape it actually gets, not the logical one. */
+    int64_t        stored_shape[RAD_MAX_RANK] = {0};   /* the shape the kernel receives, which a
+                                       * layout hook may change (WMMA fragment order is not the
+                                       * declared shape) */
     int64_t        stored_bytes = 0;
     int64_t        align = RAD_ALIGN_UNIT;
 
@@ -214,51 +203,20 @@ struct WeightInfo {
     Site           site = Site::Device;
     int32_t        slab_slot = -1;      /* -1 = not slab-resident */
 
-    /* Filled at load. Under TP this is THIS RANK's shard, not the whole weight. */
+    /* Filled at load. Under TP this is this rank's shard, not the whole weight. */
     void*          ptr = nullptr;
     void*          host_ptr = nullptr;
     uint64_t       file_offset = 0;
-    std::atomic<uint32_t> generation{0}; /* bumped when the mover relocates it */
 
-    /* Ordering, so layer offload is a scheduling problem and not a prediction one: this is the
-     * first op index that reads the weight, and prefetch runs off it (spec §5). */
+    /* First and last op index that read the weight. Prefetch runs off these, so layer offload is
+     * scheduling rather than prediction (spec §5). */
     int32_t        first_use_op = -1;
     int32_t        last_use_op  = -1;
-
-    /* The atomic makes the copy hand-written, so a field added above has to be added here too.
-     * The weight list reallocates through this copy as the plugin declares, so a field left out
-     * is reset to its default on every weight declared before the last growth. */
-    WeightInfo() = default;
-    WeightInfo(const WeightInfo& o) { *this = o; }
-    WeightInfo& operator=(const WeightInfo& o) {
-        name = o.name; decl = o.decl; logical_bytes = o.logical_bytes;
-        shard_lo = o.shard_lo; shard_hi = o.shard_hi;
-        n_part_spans = o.n_part_spans;
-        for (int i = 0; i < RAD_MAX_ROW_PARTS; ++i) {
-            part_lo[i] = o.part_lo[i]; part_hi[i] = o.part_hi[i]; part_total[i] = o.part_total[i];
-        }
-        source = o.source; enc = o.enc; enc_known = o.enc_known; n_sel = o.n_sel;
-        for (int i = 0; i < RAD_ENC_MAX_PLANES; ++i) {
-            sel[i] = o.sel[i]; sel_rows[i] = o.sel_rows[i]; sel_cols[i] = o.sel_cols[i];
-        }
-        layout_tag = o.layout_tag; identity = o.identity; widen = o.widen;
-        lay_op = o.lay_op; lay_band = o.lay_band; lay_dom = o.lay_dom; lay_operand = o.lay_operand;
-        stored_dtype = o.stored_dtype;
-        stored_bytes = o.stored_bytes; align = o.align;
-        stored_rank = o.stored_rank;
-        for (int i = 0; i < RAD_MAX_RANK; ++i) stored_shape[i] = o.stored_shape[i];
-        tier = o.tier; site = o.site; slab_slot = o.slab_slot;
-        ptr = o.ptr; host_ptr = o.host_ptr; file_offset = o.file_offset;
-        generation.store(o.generation.load());
-        first_use_op = o.first_use_op; last_use_op = o.last_use_op;
-        return *this;
-    }
 };
 
-/* THIS RANK'S SELECTED PLANES AS A LAYOUT HOOK SEES THEM: dense rank-2 geometry, `data` null
- * unless the caller fills it. One definition, because the builder asks the hook with it at
- * declare and the runtime asks again before moving an op to another domain, and the two
- * questions have to be the same question. */
+/* This rank's selected planes as a layout hook sees them: dense rank-2 geometry, `data` null
+ * unless the caller fills it. Shared by the builder at declare and the runtime before moving an
+ * op to another domain, so both ask the hook the same question. */
 inline void weight_planes(const WeightInfo& w, RadTensor* t) {
     for (int k = 0; k < w.n_sel; ++k) {
         t[k] = RadTensor{};
@@ -271,10 +229,9 @@ inline void weight_planes(const WeightInfo& w, RadTensor* t) {
     }
 }
 
-/* CAN THE BYTES BE READ WHERE THEY LIE IN THE CONTAINER -- the file tier's O_DIRECT stage, the
- * mapped tier's pointer? Only when they are the selected plane's bytes unchanged and this rank
- * holds all of it: a relayout has no place in the file that already looks the way the kernel
- * reads it, and a column shard is not one range of it. */
+/* Whether the bytes can be read where they lie in the container (the file tier's O_DIRECT stage,
+ * the mapped tier's pointer): only when they are the selected plane unchanged and this rank holds
+ * all of it. A relayout is not in the file, and a column shard is not one contiguous range. */
 inline bool weight_file_direct(const WeightInfo& w, int world_size) {
     return w.identity && !w.widen && (w.decl.shard == RAD_SHARD_NONE || world_size <= 1);
 }
@@ -284,8 +241,8 @@ struct BufferInfo {
     RadBufDecl  decl{};
     int64_t     bytes = 0;
 
-    /* From the buffer plan: liveness over the declared op list, and the arena offset the plan
-     * assigned. Two transients whose lives do not overlap share storage (spec §3.1). */
+    /* From the buffer plan: liveness over the declared op list, and the assigned arena offset.
+     * Two transients whose lives do not overlap share storage (spec §3.1). */
     int32_t     first_def = -1;
     int32_t     last_use  = -1;
     int64_t     arena_offset = -1;
@@ -299,13 +256,10 @@ struct OpInfo {
     int64_t               range_lo = 0, range_hi = 0;
     std::vector<Band>     bands;
     std::vector<rad_weight> weights;
-    /* Which SCHEMA OPERAND POSITION each declared weight belongs to, parallel to `weights`.
-     *
-     * It is NOT the index. The n-th declared weight is not the n-th operand whose role is
-     * RAD_OPD_WEIGHT, because RAD_OPD_WTAB lets one operand position consume a whole RUN of
-     * declared weights (a MoE layer's experts), so the mapping is many-to-one. Recorded once at
-     * declare rather than recomputed at each site that needs it: the recomputation is easy to get
-     * wrong, and one recorded answer is one the sites cannot disagree about. */
+    /* The schema operand position each declared weight belongs to, parallel to `weights`. Not the
+     * index: RAD_OPD_WTAB lets one operand consume a run of declared weights (a MoE layer's
+     * experts), so the mapping is many-to-one. Recorded once at declare so call sites cannot
+     * disagree. */
     std::vector<int32_t>  weight_opd;
     const RadOpSchema*    schema = nullptr;
     int32_t               index = 0;    /* position in the declared order */
@@ -325,14 +279,12 @@ struct KVGroupInfo {
     bool            drafter = false;
 };
 
-/* A RAD_KV_CONV GROUP'S WINDOW, IN ENTRIES: conv_width - 1 of history and one more for every
- * speculative position. It is the last extent of the state tensor the kernels index, and the
- * kernels take the layout from that extent -- a slot is `entries` consecutive entries a channel,
- * and libr4d's conv update derives the verify step's query length from it as
- * entries - (conv_width - 2). So the allocation's slot, the KV manager's view of a slot (its clear
- * when one is handed out, a checkpoint's save and restore) and the cursor conv_state_index derives
- * all take this one number. A slot sized larger on the manager's side than in the tensor puts
- * each of those views across the start of the next sequence's window. */
+/* A RAD_KV_CONV group's window in entries: conv_width - 1 of history plus one per speculative
+ * position. It is the last extent of the state tensor, and kernels derive the layout from it: a
+ * slot is `entries` consecutive entries per channel, and libr4d's conv update derives the verify
+ * query length as entries - (conv_width - 2). The allocation, the KV manager's slot view (clear on
+ * hand-out, checkpoint save and restore) and conv_state_index's cursor must all use this number;
+ * a larger manager-side slot overlaps the next sequence's window. */
 inline int64_t conv_window_entries(const RadKVGroupDecl& d, int64_t n_spec) {
     return (d.conv_width > 0 ? d.conv_width - 1 : 0) + (n_spec > 0 ? n_spec : 0);
 }
@@ -350,39 +302,37 @@ public:
     RadBuildCtx  ctx{};
     RadModelMeta meta{};
 
-    /* The buffer the plugin named as this step's logits (rad_declare_logits). Zero when the
-     * plugin declared none, which is what an encoder-only or embedding-only plugin does on
-     * purpose -- the engine refuses to SERVE such a program and says so at startup, rather
-     * than discovering at the first step that there is nothing to sample. */
+    /* The step's logits buffer (rad_declare_logits). Zero when the plugin declared none, as an
+     * encoder-only or embedding-only plugin does; the engine refuses to serve such a program at
+     * startup. */
     rad_buf logits_buf = 0;
-    /* The buffer the plugin named as this step's pooled vectors (rad_declare_pooled): set only by
-     * an EMBEDDING program, which then has no logits buffer. */
+    /* The step's pooled vectors (rad_declare_pooled): set only by an embedding program, which has
+     * no logits buffer. */
     rad_buf pooled_buf = 0;
 
-    /* THE DRAFT HEAD THIS PLUGIN DECLARED (rad_declare_drafter). `kind == RAD_DRAFT_NONE` when
-     * it declared none, which is the normal case -- the engine then speculates with the
-     * scheduler's prompt-lookup drafter or not at all. `name` is kept beside the decl because
-     * RadDrafterDecl::name points into the plugin's own storage. */
+    /* The declared draft head (rad_declare_drafter). `kind == RAD_DRAFT_NONE` when none, the
+     * normal case: the engine then speculates with the scheduler's prompt-lookup drafter or not at
+     * all. `drafter_name` is a copy because RadDrafterDecl::name points into plugin storage. */
     RadDrafterDecl drafter{};
     std::string    drafter_name;
-    /* A SERIAL HEAD WITH NO CACHE OF ITS OWN (rad_drafter_shared_kv): it reads the trunk's K and V
+    /* A serial head with no cache of its own (rad_drafter_shared_kv): it reads the trunk's K and V
      * and writes none, so the driver owes it no history and runs every round at the committed
-     * position. `drafter_pos_offset` is where those rows sit for the rotary, 0 or 1 past it. Both
-     * are false and 0 for every drafter that did not ask, which is every one that predates it. */
+     * position. `drafter_pos_offset` (0 or 1) is where those rows sit for the rotary. False and 0
+     * for drafters that did not ask. */
     bool           drafter_shared_kv = false;
     int32_t        drafter_pos_offset = 0;
 
-    /* THE MEDIA ENCODER THIS PLUGIN DECLARED (rad_declare_encoder). `modalities == 0` when it
-     * declared none, which is every text-only program and every deployment that asked for no
-     * media (RadBuildCtx::max_enc_patches 0). `encoder_name` for the reason `drafter_name` is. */
+    /* The declared media encoder (rad_declare_encoder). `modalities == 0` when none: every
+     * text-only program, and every deployment with RadBuildCtx::max_enc_patches 0.
+     * `encoder_name` is a copy, as `drafter_name` is. */
     RadEncoderDecl encoder{};
     std::string    encoder_name;
-    /* ...and the audio encoder, the second a program may declare (RAD_MM_AUDIO). */
+    /* The audio encoder, the second a program may declare (RAD_MM_AUDIO). */
     RadEncoderDecl audio_encoder{};
     std::string    audio_encoder_name;
-    /* THE IMAGE GENERATOR THIS PLUGIN DECLARED (rad_declare_generator); `layout` 0 when it declared
-     * none. The strings and the fixed schedule it points at are the copies below, not the plugin's
-     * storage. A generator program has no logits and no pooled vectors. */
+    /* The declared image generator (rad_declare_generator); `layout` 0 when none. Its strings and
+     * fixed schedule point at the copies in `gen_str`, not plugin storage. A generator program has
+     * no logits and no pooled vectors. */
     RadGeneratorDecl generator{};
     struct GenStrings {
         std::string name, tmpl_text, tmpl_edit, tmpl_image, tmpl_image_sep, drop_prefix,
@@ -392,38 +342,33 @@ public:
     bool is_generator() const { return generator.layout != 0; }
 
     /* Two arenas, because a host-site activation cannot index device memory. The buffer plan
-     * colours the domains SEPARATELY -- a transient may share storage only with a transient in the
-     * same domain -- so each of these is a high-water mark in its own offset space and
-     * BufferInfo::arena_offset is relative to the arena of that buffer's declared domain. Both are
-     * sized for max_tok, which is the worst step (spec §3.1). */
+     * colours each domain separately (transients share storage only within a domain), so each is
+     * a high-water mark in its own offset space and BufferInfo::arena_offset is relative to the
+     * arena of the buffer's declared domain. Both are sized for max_tok, the worst step (spec
+     * §3.1). */
     int64_t arena_bytes = 0;         /* RAD_DOMAIN_DEVICE */
-    /* Where the device arena's TRANSIENTS start: everything below is PERSIST and DERIVED, at the
-     * same offset at every size a step can be, and everything above is the part a smaller step
-     * packs smaller (core/build/rad_bufplan.cpp, plan_level). */
+    /* Start of the device arena's transients. PERSIST and DERIVED buffers sit below, at the same
+     * offset at every step size; above is what a smaller step packs smaller
+     * (core/build/rad_bufplan.cpp, plan_level). */
     int64_t arena_fixed_bytes = 0;
-    /* THE PREFILL STAGING REGION, above every buffer the plan placed: where a step at the full
-     * plan copies a routed layer's non-resident experts ahead of the layer (core/place/stager.h).
-     * Sized by the VRAM budget, appended by the engine after it, and part of the top of the arena
-     * that the smaller levels lend to the expert slab. -1 / 0 where there is none. */
+    /* The prefill staging region, above every planned buffer: where a full-size step copies a
+     * routed layer's non-resident experts ahead of the layer (core/place/stager.h). Sized by the
+     * VRAM budget and appended by the engine; part of the arena top that smaller levels lend to
+     * the expert slab. -1 / 0 when absent. */
     int64_t arena_stage_off = -1;
     int64_t arena_stage_bytes = 0;
     int64_t host_arena_bytes = 0;    /* RAD_DOMAIN_HOST */
     int64_t scratch_bytes = 0;       /* the largest single kernel scratch requirement */
-    /* How many scratch regions of that size the arena holds: one per lane the program runs.
-     * Every kernel on a stream is handed the same region, which its in-order launches make safe;
-     * a second lane is a second stream, and a region both lanes wrote would take two kernels'
-     * partials at once. Two when the architecture declared a buffer rad_buf_concurrent. */
+    /* Scratch regions of that size in the arena, one per lane. Kernels on one stream share a
+     * region safely through in-order launch; a second lane is a second stream and needs its own.
+     * Two when the architecture declared a buffer rad_buf_concurrent. */
     int32_t scratch_regions = 1;
 
-    /* Everything that resolved to nothing, reported whole rather than the first failure at the
-     * top (spec §3.1).
-     *
-     * STRUCTURED, not a pre-formatted sentence, because the two domains want two different
-     * reports and one flat list of strings cannot give them. A DEVICE miss is a hole a request
-     * will fall into and deserves its own line; a HOST miss removes one placement option for one
-     * op and deserves a line per OP, not per band. A flat list of strings leaves the reporting
-     * site able only to print all of them, and a deep model at tp2 then opens with thousands of
-     * lines of `E` -- every one of them expected, and a real device hole invisible among them. */
+    /* Everything that resolved to nothing, reported whole rather than stopping at the first
+     * failure (spec §3.1). Structured because the domains are reported differently: a device miss
+     * is a hole a request can hit and gets its own line; a host miss only removes a placement
+     * option and gets one line per op, not per band. Otherwise a deep model at tp2 prints
+     * thousands of expected lines that hide a real device hole. */
     struct Miss {
         std::string op;
         std::string geom;         /* the band's display geometry */
@@ -434,26 +379,20 @@ public:
         std::string line() const; /* "op  geometry  [domain] -> why", the full-detail rendering */
     };
     std::vector<Miss> misses;
-    /* THE DEVICE MISSES A REQUEST CAN FALL INTO, in `misses` order: the device bands no kernel
-     * serves and no host kernel stands in for. A host kernel for the same band stands in on the
-     * host backend, where every op without a device row runs on the host (Ctx::bind_ops); on a
-     * card it stands in only for an op that has weights, because the planner moves an op to the
-     * host by placing its weights there and has nothing to place for an op without them --
-     * attention over a cache that lives in VRAM is the case that matters. One rule for the engine
-     * that refuses to start on a hole and for the tools that count them. */
+    /* The device misses a request can hit, in `misses` order: device bands no kernel serves and no
+     * host kernel stands in for. On the host backend a host kernel for the band stands in, since
+     * every op without a device row runs on the host (Ctx::bind_ops). On a card it stands in only
+     * for an op with weights, because the planner moves an op to the host by placing its weights
+     * there; attention over a VRAM cache is the case that matters. Shared by the engine's startup
+     * refusal and the tools that count holes. */
     std::vector<const Miss*> device_holes(bool host_backend) const;
 
-    /* Every (kernel, shape) pair rad-tune would need to benchmark (spec §15). */
-    /* `info` is the kernel's own row, so rad-tune can read its RadTunable axes and expand the
-     * cross product itself. A count would not do: the tuner has to know the KEYS and their legal
-     * values to build a candidate, and the validity predicate to discard the ones this geometry
-     * cannot run. Plugins outlive the Program, so the pointer is good for the process. */
-    /* ONE PER KERNEL INSTANTIATION: the kernel, the plugin it came from, and the input parameters
-     * it was resolved at. `geom` is what a launch is handed and therefore CARRIES the axis
-     * defaults the selector folded in -- a tuner overrides them per candidate with set_i.
-     * `geom_key` is the instantiation WITHOUT them, in tunecache.h's canonical spelling, and it is
-     * the cache key: the selector looks an instantiation up before it knows what to choose, so a
-     * key that included the choice could never be found. */
+    /* One per kernel instantiation that rad-tune would benchmark (spec §15). `info` is the
+     * kernel's row, so the tuner can read the RadTunable axes, their legal values and the validity
+     * predicate; plugins outlive the Program, so the pointer stays valid. `geom` is what a launch
+     * receives and carries the selector's axis defaults, which the tuner overrides per candidate
+     * with set_i. `geom_key` is the instantiation without them (tunecache.h's spelling) and is the
+     * cache key, because the selector looks up before it knows the choice. */
     struct TuneRequest {
         std::string          kernel, plugin;
         Geometry             geom;
@@ -472,17 +411,15 @@ public:
 
 enum class ReqState { Waiting, Running, Preempted, Finished, Failed, Cancelled };
 
-/* A CHAT REPLY'S REASONING BLOCK, AS TOKENS. The reply parser reads the block in text
- * (core/text/chatparse.h); this is the same block named by token id, so the engine can count it
- * and close it without detokenising. It exists only where both markers the reply needs are
- * single tokens -- `<think>` and `</think>` are, on every model this engine serves -- and
- * `close < 0` says it does not: such a reply's reasoning is still split out as text, but it is
- * not counted and no budget can be held on it.
+/* A chat reply's reasoning block by token id, so the engine can count and close it without
+ * detokenising; the reply parser reads the same block as text (core/text/chatparse.h). It exists
+ * only when both markers are single tokens (`<think>`/`</think>` are on every served model).
+ * `close < 0` means no countable block: the reasoning is still split out as text, but is not
+ * counted and cannot carry a budget.
  *
- * The block is read where the parser reads it: at the start of the reply. It is open from the
- * first token when the generation prompt opened it (`starts_open`), or opens on `open` as the
- * reply's first token, and the first `close` ends it. A reply that starts any other way has no
- * block. */
+ * The block starts the reply: open from the first token when the generation prompt opened it
+ * (`starts_open`), or opened by `open` as the first token; the first `close` ends it. A reply that
+ * starts any other way has no block. */
 struct ReasoningSpan {
     int32_t open = -1;            /* the token a reply opens its own block with; -1 for none */
     int32_t close = -1;           /* the token that ends the block; -1: no countable block */
@@ -490,9 +427,8 @@ struct ReasoningSpan {
     bool known() const { return close >= 0; }
 };
 
-/* A reply's position relative to its ReasoningSpan, advanced one emitted token at a time. The
- * server counts with it and the sampler enforces a budget with it, and both must agree on where
- * the block ends, so there is one definition. */
+/* A reply's position relative to its ReasoningSpan, advanced one emitted token at a time. Shared
+ * by the server's count and the sampler's budget so both agree where the block ends. */
 struct ReasoningCount {
     enum State : uint8_t { Lead, Think, Done };
     State   st = Lead;
@@ -516,16 +452,15 @@ struct ReasoningCount {
     bool inside() const { return st == Think; }
 };
 
-/* THE MOST ALTERNATIVES ONE TOKEN'S LOGPROBS MAY CARRY: OpenAI's bound on top_logprobs. A request
- * above it is refused. The sampler declares `sample_logprobs` one wider (Sampler::kLpK), for the
- * width of the row the split-vocabulary gather moves; the extra pair is never reported. */
+/* Most alternatives one token's logprobs may carry: OpenAI's top_logprobs bound; larger requests
+ * are refused. The sampler's `sample_logprobs` is one wider (Sampler::kLpK) for the
+ * split-vocabulary gather; the extra pair is never reported. */
 static constexpr int RAD_MAX_LOGPROBS = 20;
 
-/* One emitted token's log-probability under the model's RAW distribution -- the logits before any
- * penalty, temperature, mask or cut -- and its `n_top` most likely alternatives in descending
- * order, ties to the lower id. What OpenAI's `logprobs` and llama-server's `n_probs` report.
- * `token` -1 is a token whose logprobs could not be computed (a row with no finite logit): the
- * scheduler fails its request rather than report a number for it. */
+/* One emitted token's log-probability under the raw distribution (logits before any penalty,
+ * temperature, mask or cut), and its `n_top` most likely alternatives in descending order, ties to
+ * the lower id. This is OpenAI's `logprobs` and llama-server's `n_probs`. `token` -1 means the
+ * logprobs could not be computed (no finite logit in the row); the scheduler fails the request. */
 struct TokenLogprobs {
     int32_t token = -1;
     float   logprob = 0.0f;
@@ -536,7 +471,7 @@ struct TokenLogprobs {
 
 struct SamplingParams {
     float  temp = 1.0f;
-    int    top_k = 0;                /* 0 = off */
+    int    top_k = 0;                /* 0 = the 1024-candidate width */
     float  top_p = 1.0f;
     float  min_p = 0.0f;
     float  typical_p = 1.0f;
@@ -550,35 +485,31 @@ struct SamplingParams {
     int    dry_penalty_last_n = -1;
     float  xtc_probability = 0.0f;
     float  xtc_threshold = 0.1f;
-    /* TEMPERATURE AFTER THE CUTS rather than before them: top-p, min-p, typical and XTC read the
-     * distribution at temperature 1 and the pick draws at `temp`. llama.cpp's default order; the
-     * default here is vLLM's, temperature first. A request names the order with `samplers`. */
+    /* Temperature after the cuts: top-p, min-p, typical and XTC read the distribution at
+     * temperature 1 and the pick draws at `temp`. This is llama.cpp's order; the default is
+     * vLLM's (temperature first). A request selects it with `samplers`. */
     bool   temp_last = false;
-    /* LOGPROBS: -1 is none; 0..RAD_MAX_LOGPROBS returns every emitted token's logprob and that
-     * many alternatives. Speculation is unaffected: every verified position is a row of its own,
-     * and an accepted draft is the token the target drew there. */
+    /* Logprobs: -1 is none; 0..RAD_MAX_LOGPROBS returns every emitted token's logprob and that
+     * many alternatives. Works under speculation: each verified position is its own row, and an
+     * accepted draft is the token the target drew there. */
     int    n_probs = -1;
     uint64_t seed = 0;
     bool   greedy() const { return top_k == 1 || temp <= 0.0f; }
     std::string grammar;             /* GBNF, or "" */
     std::vector<std::string> dry_seq_breakers;
 
-    /* THE REPLY'S REASONING BLOCK, and how many tokens its body may run to. -1 is no limit. At
-     * the limit the sampler masks every position still inside the block to `reasoning.close`, so
-     * the block ends there and the answer follows -- vLLM's `thinking_token_budget`. A budget
-     * needs a known span; the server refuses one it cannot hold. */
+    /* The reasoning block and its body's token limit (-1 = none). At the limit the sampler masks
+     * every position still inside the block to `reasoning.close`, so the answer follows (vLLM's
+     * `thinking_token_budget`). A budget needs a known span; the server refuses one otherwise. */
     ReasoningSpan reasoning;
     int32_t       thinking_budget = -1;
 
-    /* A LAZY GRAMMAR CONSTRAINS NOTHING UNTIL A TRIGGER FIRES, and that is the only shape in
-     * which a tool-calling chat template can be enforced: the reply is free prose until the
-     * model starts writing a call, and grammar-shaped from there. Without this a request that
-     * carries `tools` would be constrained to emit a tool call and nothing else, so a lazy
-     * grammar arriving as a non-lazy one is not a small difference -- it is a model that can no
-     * longer answer in words. The trigger types are common_grammar_trigger_type's, kept as ints
-     * because rad_core.h does not include the lift: 0 token, 1 word, 2 pattern, 3 pattern-full.
-     * Resolving a word or a token to vocabulary ids happens in the sampler, which is the layer
-     * that has the vocabulary. */
+    /* A lazy grammar constrains nothing until a trigger fires. That is the only way to enforce a
+     * tool-calling template: free prose until the model starts a call, grammar-shaped after. Treat
+     * a lazy grammar as non-lazy and a request with `tools` can only emit a tool call. Trigger
+     * types are common_grammar_trigger_type's, as ints because this header does not include the
+     * lift: 0 token, 1 word, 2 pattern, 3 pattern-full. The sampler resolves words and tokens to
+     * vocabulary ids. */
     struct GrammarTrigger { int type = 0; std::string value; };
     bool                        grammar_lazy = false;
     std::vector<GrammarTrigger> grammar_triggers;
@@ -588,21 +519,18 @@ struct SamplingParams {
      * about to be sampled. See GrammarSpec::prefix in core/sample/grammar.h. */
     std::string                 grammar_prefix;
 
-    /* `grammar` COMPILED, by the thread that admitted the request (core/sample/gbnf.h,
-     * gbnf_compile). Compiling a grammar builds its mask plan, which is host work in the tens to
-     * hundreds of milliseconds, and the sampler starts a request on the scheduler thread with
-     * every other request's step waiting on it. Holding the program here keeps it findable by
-     * the sampler for as long as the request lives, so starting the request there is a lookup.
-     * Null for a request that was not admitted through the server; the sampler then compiles. */
+    /* `grammar` compiled by the admitting thread (core/sample/gbnf.h, gbnf_compile). Building the
+     * mask plan takes tens to hundreds of milliseconds, and the sampler starts requests on the
+     * scheduler thread where every other request's step waits; held here, starting is a lookup.
+     * Null for a request not admitted through the server; the sampler then compiles. */
     std::shared_ptr<const GbnfProgram> grammar_program;
 };
 
-/* THE RAW LOGITS AT CHOSEN VOCABULARY IDS, read at the prompt's last position: what a caller
- * that answers from a distribution over a handful of tokens needs (/v1/systemone), and nothing
- * more of the vocabulary. The caller fills `tokens` before submission; the engine writes `logits`
- * in the same order, from the logits row BEFORE the sampler touches it, and before the request's
- * sink finishes. Read them only after a successful finish. Shared, so the result outlives a
- * caller that left mid-step. */
+/* Raw logits at chosen vocabulary ids at the prompt's last position, for a caller that answers
+ * from a distribution over a few tokens (/v1/systemone). The caller fills `tokens` before
+ * submission; the engine writes `logits` in the same order, from the row before the sampler
+ * touches it, before the sink finishes. Read only after a successful finish. Shared so the result
+ * outlives a caller that left mid-step. */
 struct TokenScores {
     std::vector<int32_t> tokens;
     std::vector<float>   logits;
@@ -615,14 +543,9 @@ struct Request {
     SamplingParams       sp;
     int32_t              max_tokens = 0;
     std::vector<std::string> stop;
-    /* GENERATE PAST THE END-OF-TEXT TOKEN, to max_tokens. It exists so a caller can ask for a
-     * request whose LENGTH IS THE ONE IT ASKED FOR. Without it the length is the model's opinion
-     * and varies from run to run on the same prompt, so a steady-state decode measurement over
-     * such a request may be measuring a mostly idle engine, and its variance reads as a
-     * difference between whatever was being compared.
-     *
-     * It ignores the EOS TOKEN and nothing else: `stop` strings and max_tokens still end a
-     * request, which is vLLM's meaning of the field and the one a client already expects. */
+    /* Generate past the end-of-text token, up to max_tokens, so the output length is fixed (for
+     * example in a steady-state decode measurement). Only the EOS token is ignored: `stop` strings
+     * and max_tokens still end the request, as in vLLM. */
     bool                 ignore_eos = false;
     int                  priority = 0;
     bool                 stream = false;
@@ -633,70 +556,61 @@ struct Request {
     std::vector<int32_t> blocks;              /* per KV group, flattened by group offset */
     int32_t              state_slot = -1;     /* linear/conv state slot */
 
-    /* THE MEDIA THIS PROMPT CARRIES, null for a text prompt: each item's patches, where its
-     * token run sits in `prompt`, the rotary layout those runs give the prompt, and -- once the
-     * encoder has run -- the rows that replace the placeholders' embeddings (core/mm). */
+    /* The prompt's media, null for text (core/mm): each item's patches, where its token run sits
+     * in `prompt`, the rotary layout those runs give, and after the encoder runs, the rows that
+     * replace the placeholders' embeddings. */
     std::shared_ptr<mm::PromptMedia> media;
 
     int32_t              n_draft = 0;         /* speculative window this step */
-    /* AND THE PROPOSAL ITSELF, because masking a speculative window needs the tokens and not
-     * just the count: Sampler::build_step walks a constraining grammar over these to mask the
-     * position behind each one, then rewinds. Points into the scheduler's own array for this
-     * request -- SchedReq owns this Request, so it outlives it -- and is written beside n_draft,
-     * in the same two places, for the reason the comment there gives. Null when n_draft is 0. */
+    /* The proposal itself: Sampler::build_step walks a constraining grammar over these tokens to
+     * mask each draft position, then rewinds. Points into the scheduler's array for this request
+     * (SchedReq owns this Request, so it outlives it) and is written alongside n_draft. Null when
+     * n_draft is 0. */
     const int32_t*       draft = nullptr;
     int32_t              n_accepted = 0;      /* from the previous verify */
 
-    /* MAY THIS REQUEST BE SPECULATED ON AT ALL. Written by the engine after every step, read by
-     * the scheduler when it sizes the next one. One thing clears it, and it is a property the
-     * scheduler cannot see for itself: its grammar is constraining right now. The mask for draft
-     * position i depends on which of 0..i-1 were accepted, and the host automaton cannot know
-     * that before the verify runs. A LAZY grammar clears this only once its trigger fires, so a
-     * tool-calling request speculates through its prose and stops the moment it starts writing
-     * the call.
+    /* Whether this request may be speculated on. Written by the engine after every step, read by
+     * the scheduler when sizing the next. Only a currently constraining grammar clears it: the
+     * mask at draft position i depends on which of 0..i-1 were accepted, which the host automaton
+     * cannot know before the verify. A lazy grammar clears it only once its trigger fires.
      *
-     * TEMPERATURE DOES NOT CLEAR IT. A sampled target does not need rejection sampling to stay
-     * exact: acceptance compares against the token the target itself drew, and the sampler gives
-     * every verified position its own RNG coordinate. See Engine::collect_step.
+     * Temperature does not clear it: acceptance compares against the token the target itself
+     * drew, and each verified position has its own RNG coordinate (Engine::collect_step).
      *
-     * It is a flag rather than a call because there are two drafters and an n-gram fallback inside
-     * step() itself, and every one of them has to obey: the fallback fills any proposal the others
-     * left empty, so guarding only the drafters guards nothing. */
+     * A flag rather than a call because two drafters and an n-gram fallback inside step() must all
+     * obey it; the fallback fills any proposal the others left empty. */
     bool                 may_speculate = true;
-    /* AND WHETHER THAT ANSWER CAN CHANGE AT A COMMIT, which only a grammar that cannot rewind
-     * makes it do. A step issued ahead is sized before the commit in front of it, so the scheduler
-     * issues ahead for a request only when this is set. Written by the engine when the sampler
-     * starts the request (Sampler::speculation_fixed); false until then. */
+    /* Whether may_speculate can change at a commit, which only a non-rewindable grammar causes. A
+     * step issued ahead is sized before the preceding commit, so the scheduler issues ahead only
+     * when this is set. Written when the sampler starts the request
+     * (Sampler::speculation_fixed); false until then. */
     bool                 speculation_fixed = false;
 
-    /* A LOGITS ROW AT EVERY PROMPT POSITION, not only at the last: each trunk step that carries
-     * this request's prompt names all of its tokens in `out_ids`, after the rows the sampler
-     * reads, and the engine hands them to the KL scorer (core/kld.h). Only the --kld mode sets
-     * it; the logits buffer is sized for it there and nowhere else. */
+    /* A logits row at every prompt position, not only the last: each trunk step carrying this
+     * prompt names all its tokens in `out_ids` after the sampler's rows, and the engine hands them
+     * to the KL scorer (core/kld.h). Set only in --kld mode, which sizes the logits buffer for
+     * it. */
     bool                 score = false;
 
-    /* THE END OF A PREFIX OTHER REQUESTS WILL START FROM, in prompt tokens; 0 for none. On a
-     * model with linear state (convolutions, a recurrence) a prefix hit resumes from a state
-     * checkpoint, and those are written only on the checkpoint interval and at a long prompt's
-     * tail -- neither is where a shared head of a few hundred tokens ends. The scheduler ends a
-     * prefill chunk here, rounded down to its quantum, and writes a checkpoint as it does on the
-     * interval (Scheduler::plan_chunk), so the requests that follow reuse the whole head.
-     * /v1/systemone sets it on the first question of several over one state. */
+    /* End of a prefix other requests will start from, in prompt tokens; 0 for none. With linear
+     * state, a prefix hit resumes from a state checkpoint, written only on the checkpoint interval
+     * and at a long prompt's tail. The scheduler ends a prefill chunk here (rounded down to its
+     * quantum) and writes a checkpoint (Scheduler::plan_chunk), so following requests reuse the
+     * whole head. /v1/systemone sets it on the first of several questions over one state. */
     int64_t              checkpoint_at = 0;
 
-    /* NON-NULL: read the raw logits at these ids at the prompt's last position (TokenScores).
+    /* Non-null: read the raw logits at these ids at the prompt's last position (TokenScores).
      * The request still samples the one token max_tokens allows; the caller discards it. */
     std::shared_ptr<TokenScores> token_scores;
 
-    /* AN EMBEDDING REQUEST: the whole prompt in ONE step, never split -- an encoder that attends
-     * both ways cannot be fed half its input -- and finished at that step with its pooled vector
-     * in the sink (Sink::embedding). Nothing is generated and nothing is emitted. Only an
-     * embedding program (rad_declare_pooled) serves these, and it serves nothing else. */
+    /* An embedding request: the whole prompt in one step, never split (a bidirectional encoder
+     * cannot take half its input), finished at that step with its pooled vector in the sink
+     * (Sink::embedding). Nothing is generated. Only an embedding program (rad_declare_pooled)
+     * serves these, and it serves nothing else. */
     bool                 embed = false;
 
-    /* THE CONVERSATION AS THE CLIENT NAMES IT (OpenRouter's `session_id`), "" when it names
-     * none: carried to the session the prefix cache records for it, as a label on /sessions and
-     * the dashboard. It changes nothing about how the request is served. */
+    /* The client's conversation id (OpenRouter's `session_id`), "" when absent. A label for the
+     * prefix cache's session on /sessions and the dashboard; it does not affect serving. */
     std::string          session_label;
 
     std::string          finish_reason;
@@ -715,42 +629,31 @@ struct Config {
     std::vector<std::string> kernel_hierarchy;   /* ordered; first wins */
 
     int   tp = 1;
-    /* THE TENSOR-PARALLEL WIRE, and it is a deployment choice rather than a tuning one. 1 is the
-     * exact bf16 all-reduce. 0 accepts a LOSSY wire: at two ranks libr4d serves a
-     * Walsh-Hadamard-rotated 6-bit payload -- 6 bits an element plus a bf16 scale per group of
-     * 64, against 16 bits an element -- so the message a prefill chunk pushes across PCIe drops
-     * by 2.4x. The sum a rank receives is then not the sum it would have received and no check
-     * downstream can tell, which is why it is a named flag and not a heuristic. */
+    /* The tensor-parallel wire, a deployment choice. 1 is the exact bf16 all-reduce. 0 accepts a
+     * lossy wire: at two ranks libr4d sends a Walsh-Hadamard-rotated 6-bit payload (6 bits per
+     * element plus a bf16 scale per 64) instead of 16 bits per element, 2.4x fewer bytes over
+     * PCIe. The received sum then differs undetectably, hence a named flag, not a heuristic. */
     int   tp_wire_exact = 1;          /* --tp-wire exact|wht6 */
-    /* WHERE THE LOSSY WIRE STARTS PAYING, in KiB of one all-reduce message. Compression only wins
-     * once the transfer is bandwidth-bound: a decode step all-reduces a handful of residual rows
-     * and the exact kernel already moves that at most of what the link delivers, so rotating it
-     * costs more than the bytes it saves. A prefill chunk's message is orders of magnitude larger
-     * and is squarely on the wire. Below this floor `--tp-wire wht6` therefore serves the message
-     * EXACTLY -- which also means a decode-only serve sees no quality change from the flag at all.
-     *
-     * 128 KiB IS THE KNEE. A decode step's message scales with the number of sequences in the
-     * batch, so concurrency decides which side of the floor a step lands on. Compressing pays for
-     * every message above the floor and costs on the smallest ones, and 128 KiB is the smallest
-     * floor that compresses everything which benefits while leaving single-sequence decode
-     * exact. */
+    /* Smallest all-reduce message, in KiB, that the lossy wire compresses; smaller ones are sent
+     * exact. Compression pays only when the transfer is bandwidth-bound: a decode step's handful
+     * of residual rows costs more to rotate than it saves, while a prefill chunk is far larger.
+     * Decode message size scales with batch size; 128 KiB is the smallest floor that compresses
+     * every message that benefits while keeping single-sequence decode exact. */
     int64_t tp_wire_min_kb = 128;     /* --tp-wire-min-kb */
-    /* HOW THE COLLECTIVES REACH THE OTHER CARDS. Auto asks the driver, for every ordered pair of
-     * the ranks' cards, whether one can address the other's memory, and takes the P2P kernels only
-     * if every pair can. A driver can answer yes on a board where peer traffic is broken or slower
-     * than going through host memory, and that is what `off` is for: it takes the host-mailbox
-     * collectives whatever the driver says. `on` takes the P2P kernels and stops startup naming
-     * the pairs the driver refuses, rather than falling back -- a deployment that was measured on
-     * P2P should not quietly serve on something else. */
+    /* How the collectives reach the other cards. Auto takes the P2P kernels only if the driver
+     * reports peer access for every ordered pair of the ranks' cards. `off` forces the
+     * host-mailbox collectives, for boards where the driver says yes but peer traffic is broken or
+     * slower. `on` forces P2P and stops startup naming the refused pairs instead of falling
+     * back. */
     int   p2p = RAD_P2P_AUTO;         /* --p2p auto|on|off */
     int64_t max_tok = 8192;            /* --max-num-batched-tokens */
     /* --busy-prefill-chunk: how much of a step a prefill chunk may take when other work is
-     * pending in it (decode rows behind it, another prefill, a request waiting to be admitted).
-     * -1 = auto: the chunk leaves those their rows and a share for admission, and keeps at least
-     * the smallest pass the prefill stager arms for. 0 = off: the chunk takes every token the
-     * step has left, as 1.3.0 did. N > 0: the chunk is held to N tokens on such a step.
-     * Scheduler::step, docs/GUIDE.md. */
+     * pending in it (decode rows, another prefill, a request waiting for admission). -1 = auto:
+     * leave those their rows plus a share for admission, but keep at least the smallest pass the
+     * prefill stager arms for. 0 = off: the chunk takes every token the step has left. N > 0: cap
+     * the chunk at N tokens on such a step. See Scheduler::step, docs/GUIDE.md. */
     int64_t busy_prefill_chunk = -1;
+    int64_t prefill_interleave = 0;    /* --prefill-interleave: decode-only steps between chunks */
     int64_t max_seqs = 256;
     int64_t max_ctx = 0;               /* 0 = the model's training context */
     /* --rope-scaling: "yarn:FACTOR[:ORIG]" writes YaRN over the checkpoint's own rotary keys (the
@@ -758,64 +661,50 @@ struct Config {
      * YaRN off; empty serves what the checkpoint says. Engine::apply_rope_scaling. */
     std::string rope_scaling;
 
-    /* THE ENGINE DERIVES THE BUDGET FROM THE CARD, AND IT IS STATED IN FULL BEFORE ANYTHING IS
-     * ALLOCATED.
+    /* VRAM budget, derived from the card and printed in full before anything is allocated.
+     * Spec §6 forbids a budget derived from free VRAM at startup, which moves with other
+     * processes. This one is arithmetic on known numbers: the fixed card total, every non-pool
+     * allocation computed from the program beforehand, and what the driver already holds,
+     * measured. core/mem/vram_budget.cpp writes the result into the two fields below, so the
+     * planner, KV manager and pool report read one number. Engine::plan derives each rank's copy
+     * (rank_cfg_, docs/TP3.md §1), which that rank's pools and planner both read.
      *
-     * Spec §6 forbids a derived budget because a budget derived from the FREE VRAM at startup is
-     * a benchmark that moves when a desktop opens a window. What it does not forbid is arithmetic
-     * on numbers that are all known and all printed: the card total is a fixed property, every
-     * non-pool allocation this engine makes is computed from the program before it is made, and
-     * what the driver already holds is measured rather than assumed. core/mem/vram_budget.cpp does
-     * that sum and writes the answer back into the two fields below, so every consumer downstream
-     * -- the planner, the KV manager, the pool report -- reads one resolved number and there is no
-     * second place for them to disagree. Engine::plan derives each rank's own copy from it
-     * (rank_cfg_, see docs/TP3.md §1), and the rank's pools and planner both read that copy --
-     * still one number per card, and the same number on every card whose cache costs as much per
-     * token as the dearest rank's.
-     *
-     * NO FLAG SETS THEM: zero until the resolver has run. */
+     * No flag sets them; zero until the resolver runs. */
     int64_t vram_weights_mib = 0;
     int64_t vram_kv_mib = 0;
-    int64_t gpu_headroom_mib = 96;     /* --gpu-headroom, left unclaimed on every card */
-    /* --kv-cache-dtype bf16|fp8. fp8 is an E4M3 cache with per-(sequence, head) descales, and it
-     * halves what a token of context costs -- which at a production context is most of the KV
-     * pool. It is a real quantisation and the model computes a slightly different function with
-     * it, so it is stated rather than inferred, and bf16 is the default.
-     *
-     * TWO VALUES AND NOT THREE. An "auto" that resolved to bf16 everywhere in this tree would be
-     * a third name for the second one, and a flag whose values are not all distinct is a flag
-     * whose log line cannot be read back. */
+    int64_t gpu_headroom_mib = 96;     /* --gpu-headroom-mib, left unclaimed on every card */
+    /* --kv-cache-dtype bf16|fp8. fp8 is an E4M3 cache with per-(sequence, head) descales; it
+     * halves the per-token cost, most of the KV pool at production context. It changes the
+     * model's output slightly, so it is explicit and bf16 is the default. No "auto": it would
+     * always resolve to bf16 and only add a third name. */
     std::string kv_cache_dtype = "bf16";
     int64_t host_pool_mib = 0;
-    /* THE FILE TIER FOR WEIGHTS: what fits neither the VRAM slab nor the pinned host pool is read
-     * from the container itself, with O_DIRECT, ahead of the ops that read it -- a scheduled unit by
-     * the exact prefetch, a routed expert a routed layer at a time. Off unless asked for, because a
-     * weight served from disk is a step paced by the drive: a budget that spills there by accident
-     * is a server that is correct and several orders of magnitude slow. The tier needs no directory
-     * of its own; the container is the file. */
+    /* File tier for weights: what fits in neither the VRAM slab nor the pinned host pool is read
+     * from the container with O_DIRECT ahead of the ops that read it (a scheduled unit by the
+     * exact prefetch, a routed expert a routed layer at a time). Off by default because disk
+     * paces the step, so an accidental spill makes the server orders of magnitude slower. */
     bool    weights_disk_tier = false;
 
     std::string placement = "auto";    /* all_vram | layer_offload | expert_tiered | auto */
-    /* --embedding-placement and --ngram-placement, as asked (TablePlacement says what each tier
-     * is), and what Engine::plan resolved them to before any rank planned: never Auto. The
-     * embedding's default is Ram; `embedding_placement_given` says whether the operator named it,
-     * because a named tier that cannot be honoured stops the server where the default gives way
-     * to the card with the reason. */
+    /* --embedding-placement and --ngram-placement as given (see TablePlacement), and their
+     * resolved values from Engine::plan before any rank plans (never Auto). The embedding defaults
+     * to Ram; `embedding_placement_given` records whether the operator named it, because a named
+     * tier that cannot be honoured stops the server, while the default falls back to the card with
+     * the reason. */
     TablePlacement embedding_placement = TablePlacement::Ram;
     bool           embedding_placement_given = false;
     TablePlacement ngram_placement     = TablePlacement::Auto;
     TablePlacement embedding_resolved  = TablePlacement::Vram;
     TablePlacement ngram_resolved      = TablePlacement::Disk;
-    /* SET BY THE RESOLVER: the pinned host room the token embedding takes when it resolves to Ram,
-     * a rank, ON TOP OF host_pool_mib -- so the table never takes the experts' share of the pool,
-     * and a dense model that has no pool still has a place for it. */
+    /* Set by the resolver: pinned host MiB per rank for the token embedding when it resolves to
+     * Ram, on top of host_pool_mib, so it never takes the experts' share and a dense model with no
+     * pool still has room for it. */
     int64_t embedding_host_mib = 0;
-    /* --vision-tower-placement: where a model's encoder towers live. A tower is every weight its
-     * architecture declared read once per request (RAD_ACCESS_PER_REQUEST) -- the vision tower,
-     * and the audio encoder where a model has one -- and Vram, the default, keeps it on the card
-     * with the rest. Ram pins it in host memory of its own, `tower_host_mib` a rank on top of
-     * host_pool_mib as the embedding's is, and the encoder's kernels read it over the link in
-     * place, once an image: what it held on the card goes to the KV cache. */
+    /* --vision-tower-placement: where encoder towers live. A tower is every weight declared
+     * RAD_ACCESS_PER_REQUEST (the vision tower, and an audio encoder where present). Vram, the
+     * default, keeps it on the card. Ram pins it in its own host memory, `tower_host_mib` per rank
+     * on top of host_pool_mib like the embedding; the encoder reads it over the link once per
+     * image, and its VRAM goes to the KV cache. */
     TablePlacement tower_placement = TablePlacement::Vram;
     TablePlacement tower_resolved  = TablePlacement::Vram;
     int64_t        tower_host_mib  = 0;
@@ -823,71 +712,65 @@ struct Config {
     int64_t host_pool_total_mib() const { return host_pool_mib + embedding_host_mib + tower_host_mib; }
     bool    deterministic = false;
     int64_t checkpoint_interval = 2048;   /* linear-state checkpoints (spec §7.3) */
-    /* HOW MANY LINEAR-STATE SNAPSHOTS THE SERVER MAY HOLD AT ONCE -- a CAP and not a charge.
-     * The slots are address space in the KV pool and are backed as they are handed out, so a
-     * run that writes no snapshot pays nothing for them and one holding two pays for two. What
-     * it still bounds is the ADDRESS SPACE: a slot is a sizeable fraction of a gigabyte on a
-     * linear-attention model, and the range it reserves is range the paged groups do not get,
-     * so raising this trades addressable context rather than VRAM (spec 7.3, 19.1). */
+    /* Checkpoint intervals one step may carry of a prefill alone in its step, from an interval
+     * boundary past the first (--prefill-span; 1 splits at every interval). The step's rows stay
+     * on the interval-sized pieces a span of 1 cuts, so an architecture that runs row-local work a
+     * piece at a time computes them identically and can overlap one piece's collectives with the
+     * next piece's work. Every other step is planned at ChunkGeometry::shared_tok. Checkpoints
+     * inside a span are not written; those at its end and at a prompt's tail are, where a span of
+     * 1 writes them. */
+    int64_t prefill_span = 1;
+    /* Cap on linear-state (or sliding-window) snapshots held at once, for the whole server. The
+     * slots are pinned host memory, all allocated at startup and never on the card (spec §7.3).
+     * A slot is a sizeable fraction of a gigabyte on a linear-attention model, so raising the cap
+     * trades host RAM for retained checkpoints. */
     int64_t checkpoint_slots = 8;
     bool    prefix_cache = true;
-    /* geometric-backoff | tip-only | keep-all. §19.1 records the default as a GUESS until there is
-     * a workload to measure, and core/mem/prefix.h ships the two ends of the trade beside it for
-     * exactly that measurement -- which needs a way to select them. */
+    /* geometric-backoff | tip-only | keep-all. §19.1 records the default as unmeasured;
+     * core/mem/prefix.h ships the two extremes so they can be compared. */
     std::string checkpoint_policy = "geometric-backoff";
 
     /* ---------------- IDLE SESSION TIERS (spec §7.3) ----------------
      *
-     * A finished turn leaves its prefix in the cache holding KV blocks, which is what makes the
-     * next turn cheap. Those blocks are the most valuable thing in the pool while a session is
-     * live and the least valuable thing in it once the session stops. With a host tier, a
-     * finished conversation is COPIED to host memory at once and its VRAM given up the moment
-     * something wants it -- the expert slab's loan, or a request -- so no threshold decides when
-     * it leaves the card: the copy makes leaving free. A full host tier drops its least recently
-     * used entries. Nothing is written to a drive.
+     * A finished turn's prefix holds KV blocks in the cache, making the next turn cheap. With a
+     * host tier, a finished conversation is copied to host memory at once and its VRAM released
+     * as soon as something needs it (the expert slab's loan, or a request), so no threshold
+     * decides eviction. A full host tier drops its least recently used entries. Nothing is
+     * written to disk. Restoring a 200K-token turn costs a PCIe copy; recomputing it takes
+     * minutes.
      *
-     * Moving is worth it because the alternative is a re-prefill. Recovering a 200K-token turn
-     * costs a copy over PCIe; recomputing it costs minutes. The two are not the same order.
-     *
-     * CAPACITY IS WHAT TURNS THEM ON. Nothing is copied until the host tier has a size: a tier of
-     * zero bytes holds nothing, so the feature is off until an operator says how much memory it
-     * may have. */
+     * The tier is off until it has a size. */
     int64_t prefix_cache_mib = 0;             /* the host tier's size. 0 is off */
-    /* HOW LONG AN UNUSED CONVERSATION IS KEPT, in seconds, whichever tier holds it: VRAM, host
-     * memory, and its snapshots. 0 keeps everything until the memory is wanted. */
+    /* Seconds an unused conversation is kept in any tier (VRAM, host memory, its snapshots). 0
+     * keeps everything until the memory is needed. */
     int64_t prefix_cache_ttl = 3600;
 
-    /* THE CACHE ALWAYS LENDS AND THERE IS NO FLAG FOR IT. It keeps the blocks it is using plus a
-     * buffer it derives, and lends the rest to the expert plane at the addresses it already owns;
-     * see core/mem/kv.h. The buffer's right size is a property of the workload (a prefill chunk,
-     * or the largest recent shortfall) that nobody can state in advance, which is why it is
-     * derived rather than a number to set.
+    /* The cache always lends; there is no flag. It keeps the blocks in use plus a derived buffer
+     * and lends the rest to the expert plane at addresses it already owns (core/mem/kv.h). The
+     * buffer's size depends on the workload (a prefill chunk, the largest recent shortfall), so it
+     * is derived.
      *
-     * The loan allocates nothing, so it does not touch --gpu-headroom-mib: that reserve stays what
-     * a card keeps for the things this engine does not allocate -- chief among them a kernel's
-     * code object, which HIP loads on the kernel's FIRST LAUNCH and not at startup, and which
-     * faults inside the HIP runtime rather than returning an error when there is no room. */
+     * The loan allocates nothing, so --gpu-headroom-mib is unaffected. That reserve covers what
+     * this engine does not allocate, mainly kernel code objects: HIP loads one on the kernel's
+     * first launch, not at startup, and faults inside the runtime rather than returning an error
+     * when there is no room. */
 
-    /* The speculative window: the depth, or under --draft-window adaptive its ceiling. See
-     * core/sched/draft.h. */
-    /* -1 is `auto`: engine_bringup asks rad_arch_probe for the depth THIS container's drafter was
-     * trained at, and a container with no draft head resolves to 0 with a line saying so.
-     *
-     * IT DEFAULTS TO AUTO BECAUSE MERGING A DRAFTER IS THE STATEMENT OF INTENT. rad-kbench and
-     * rad-tune read the container's own operating point; a serving engine that defaulted to off
-     * would leave a deployment that forgot the flag paying for a draft head at convert time,
-     * paying for it again in VRAM, and then running at one token a step -- a small fraction of
-     * the throughput the same container gives at its declared depth. */
+    /* The speculative window: the depth, or under --draft-window adaptive its ceiling
+     * (core/sched/draft.h). -1 is auto: engine_bringup asks rad_arch_probe for the depth this
+     * container's drafter was trained at; a container without a draft head resolves to 0 with a
+     * log line. Auto is the default because a merged drafter states the intent, and rad-kbench
+     * and rad-tune read the same operating point; defaulting to off would pay for the head in
+     * VRAM and still decode one token a step. */
     int     n_spec = -1;                /* --num-speculative-tokens; -1 = auto, 0 = off */
     DraftWindow draft_window = kDraftWindowDefault;   /* --draft-window */
 
     /* ---------------- KL DIVERGENCE AGAINST A REFERENCE (core/kld.h) ----------------
      *
-     * A MODE, LIKE --debug-graph: the engine starts as it would to serve, then runs a fixed
-     * corpus through prefill instead of listening, with a full-vocabulary logits row at every
-     * scored position. `--kld-record DIR` makes THIS model the yardstick and writes its
-     * log-probabilities to DIR once; `--kld-ref DIR` scores this model against what is there, and
-     * only the candidate's own logits are computed. Exactly one of the two. */
+     * A mode, like --debug-graph: the engine starts as for serving, then runs a fixed corpus
+     * through prefill with a full-vocabulary logits row at every scored position instead of
+     * listening. `--kld-record DIR` writes this model's log-probabilities to DIR as the reference;
+     * `--kld-ref DIR` scores this model against them, computing only its own logits. Exactly one
+     * of the two. */
     std::string kld_record;             /* --kld-record DIR */
     std::string kld_ref;                /* --kld-ref DIR */
     std::string kld_corpus;             /* --kld-corpus FILE, read by --kld-record only */
@@ -905,7 +788,7 @@ struct Config {
 
     std::string host = "0.0.0.0";
     /* The chat endpoint's default `reasoning_effort`, empty for the template's own default.
-     * Passed through verbatim: the legal set belongs to the template, not to us. */
+     * Passed through verbatim: the legal set belongs to the template. */
     std::string reasoning_effort;
     /* --reasoning-effort-map FROM=TO,...: an effort a request sends, replaced before the template
      * sees it. */
@@ -921,26 +804,18 @@ struct Config {
      * model: one model is loaded and every request is served by it. */
     std::string served_model_name;
 
-    /* WHAT A REQUEST THAT SENDS NO SAMPLER SETTINGS IS SERVED WITH.
-     *
-     * A checkpoint states the sampling it was tuned for, and serving it at anything else is a
-     * different model. Left alone these are resolved from the container and from the
-     * `generation_config.json` beside it (resolve_sampling_defaults in engine.cpp); set, they win over
-     * both, which is what makes a deployment able to pin a sampler a container gets wrong.
-     *
-     * -1 IS "NOT SET HERE" RATHER THAN A VALUE, because every one of these has a legal setting
-     * that would otherwise be indistinguishable from silence: 0 is a real temperature (greedy),
-     * 0 is a real top_k (off) and 0 is a real min_p. A flag that cannot say "unset" cannot have
-     * anything resolved underneath it. */
+    /* Sampler defaults for a request that sends none. Unset, they resolve from the container and
+     * the `generation_config.json` beside it (resolve_sampling_defaults in engine.cpp), since a
+     * checkpoint is tuned for its stated sampling; set, they override both. -1 means unset,
+     * because 0 is a legal value for each (greedy temperature, top_k at the candidate width, min_p
+     * off). */
     float   sample_temp  = -1.0f;
     int     sample_top_k = -1;
     float   sample_top_p = -1.0f;
     float   sample_min_p = -1.0f;
-    /* THE REST OF THE SAMPLER, each one the default for a request that does not name the field.
-     * Optional rather than negative-for-unset: a presence penalty of -1 and a DRY multiplier of
-     * -1 are settings a request can send, so no value of the field itself can mean "not set".
-     * Unset, a request that sends nothing gets SamplingParams' own value, exactly as before the
-     * flags existed. */
+    /* The remaining sampler defaults for requests that omit the field. Optional, because -1 is a
+     * legal value for some (presence penalty, DRY multiplier). Unset, SamplingParams' own value
+     * applies. */
     std::optional<float> sample_typical_p, sample_rep_penalty, sample_pres_penalty,
                          sample_freq_penalty, sample_dry_multiplier, sample_dry_base,
                          sample_xtc_probability, sample_xtc_threshold;
@@ -960,9 +835,8 @@ struct Config {
     /* --max-queued-requests: requests admitted and unfinished at once, beyond which the answer is
      * 429. 0 is 8 x --max-num-seqs. */
     int64_t max_queued_requests = 0;
-    /* --max-stop-strings / --max-stop-bytes: how many stop strings a request may send, and how
-     * long each may be. Every stop string is searched for in every stretch of generated text, so
-     * these bound what one request can make that scan cost. */
+    /* --max-stop-strings / --max-stop-bytes: count and length limits on a request's stop strings.
+     * Every stop string is searched in all generated text, so these bound that scan's cost. */
     int64_t max_stop_strings = 64;
     int64_t max_stop_bytes = 4096;
 
@@ -975,7 +849,7 @@ struct Config {
     std::string reasoning_format = "auto";
 
     /* ---------------- THE HTTP TRANSPORT ----------------
-     * The values the transport has always used, settable. See TransportOptions (server/http.h). */
+     * See TransportOptions (server/http.h). */
     int     http_threads = 0;                /* 0: one per core, at least 4 */
     int     http_read_timeout_s = 30;
     int     http_write_timeout_s = 600;
@@ -1001,10 +875,9 @@ struct Config {
 
     /* An operator-supplied generation_config.json, overriding the search described above. */
     std::string generation_config;
-    /* --override-chat-template: a Jinja file whose text replaces the chat template the container
-     * (or the checkpoint directory) carries. Everything that reads the template reads this one:
-     * the chat endpoint's rendering, and the reply format derived from it -- reasoning markers and
-     * tool calls. Empty serves the container's. */
+    /* --override-chat-template: a Jinja file replacing the template the container (or checkpoint
+     * directory) carries, for chat rendering and for the reply format derived from it (reasoning
+     * markers, tool calls). Empty serves the container's. */
     std::string override_chat_template;
 
     bool    debug_graph = false;
@@ -1014,23 +887,21 @@ struct Config {
     /* --live: the live view (spec §16). Off by default like everything else in that section. */
     bool    live_view = false;
 
-    /* libref is the ORACLE and the last resort, not a deployment. An op silently falling
-     * back to it is a model running orders of magnitude below the machine with nothing in the
-     * output to say so, so it is refused unless this says otherwise -- deliberately, and by a
-     * flag with `debug` in its name (startup.h, rad_gate_reference_kernels). */
+    /* libref is the oracle and last resort, not a deployment: an op falling back to it runs orders
+     * of magnitude slower with no visible sign. It is refused unless this debug flag is set
+     * (startup.h, rad_gate_reference_kernels). */
     bool    accept_reference_kernels = false;
 
-    /* WHERE EACH OPTION THE OPERATOR SET CAME FROM, keyed by the option table's spelling:
-     * "command line", or the environment variable that supplied it. An option absent here took
-     * its default or was resolved at startup -- the distinction the startup report
-     * (core/diag/diag.h) prints beside every value. */
+    /* Where each operator-set option came from, keyed by the option table's spelling: "command
+     * line" or the supplying environment variable. Absent means default or resolved at startup;
+     * the startup report (core/diag/diag.h) prints this beside every value. */
     std::map<std::string, std::string> given;
 };
 
 }  /* namespace rad */
 
-/* Declared here because config.cpp is owned by the engine, and every tool parses the same flags
- * so that `rad-info --model X` and `radiance --model X` cannot disagree about what a flag means. */
+/* Declared here because config.cpp is owned by the engine, and every tool parses the same flags,
+ * so `rad-info --model X` and `radiance --model X` agree on what a flag means. */
 namespace rad {
 int  config_parse(int argc, char** argv, Config* c);
 void config_usage(const char* argv0);

@@ -1,0 +1,6 @@
+<bos><|turn>system
+<|think|>
+You are a coding agent.<|tool>declaration:read{description:<|"|>Read a file.<|"|>,parameters:{properties:{limit:{type:<|"|>INTEGER<|"|>},path:{description:<|"|>Absolute path<|"|>,type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:edit{description:<|"|>Apply edits — exact text, «quoted» & <tagged>, 日本語.<|"|>,parameters:{properties:{dry_run:{type:<|"|>BOOLEAN<|"|>},edits:{items:{properties:{newText:{type:<|"|>STRING<|"|>},oldText:{type:<|"|>STRING<|"|>}},required:[<|"|>oldText<|"|>,<|"|>newText<|"|>],type:<|"|>OBJECT<|"|>},type:<|"|>ARRAY<|"|>},mode:{enum:[<|"|>fast<|"|>,<|"|>safe<|"|>],type:<|"|>STRING<|"|>},path:{type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>,<|"|>edits<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:ping{description:<|"|>Takes no arguments.<|"|>,parameters:{type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+Read /work/a.py.<turn|>
+<|turn>model

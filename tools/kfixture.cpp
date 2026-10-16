@@ -1,28 +1,25 @@
-/* kfixture.cpp -- reading and writing the recorded reference. See kfixture.h for why it exists.
+/* kfixture.cpp -- reading and writing the recorded reference (see kfixture.h).
  *
- * The format is binary and little-endian, because the payload is float samples and a text format
- * for those is either lossy or three times the size. It is versioned in the header and a reader
- * refuses a version it does not know rather than reading a struct that has moved -- the failure
- * mode of getting that wrong is a report full of confident wrong numbers.
+ * Binary and little-endian, since the payload is float samples and text would be lossy or about
+ * 3x larger. Versioned; a reader refuses any version it does not know.
  */
 #include "kfixture.h"
 #include "opshapes.h"
 #include "format/encoding.h"
 #include "rad_plugin.h"
+#include "rad_sample.h"
 
 #include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
-#include <thread>
 
 namespace rad {
 namespace {
 
 const char KF_MAGIC[4] = { 'R', 'K', 'B', '1' };
 
-/* Every write goes through one of these and every read through its mirror, so a field added to
- * one side and not the other is a compile error rather than a silent misparse. */
+/* Primitive writer and its mirrored reader; save() and load() must stay field-for-field in step. */
 struct W {
     FILE* f;
     bool  ok = true;
@@ -52,8 +49,7 @@ struct R {
     double   f64() { double v = 0;   raw(&v, 8); return v; }
     std::string str() {
         const uint32_t n = u32();
-        /* A length out of a corrupt file must not become an allocation. Nothing here is longer
-         * than an op name or a geometry key. */
+        /* Bound lengths read from a possibly corrupt file before allocating. */
         if (!ok || n > (1u << 20)) { ok = false; return {}; }
         std::string s(n, '\0');
         raw(s.data(), n);
@@ -75,6 +71,40 @@ struct R {
     }
 };
 
+/* The largest element count an operand may describe: past every real tensor (the largest is a
+ * 51.2 GB n-gram table, ~2^35 bf16 elements), well short of an overflow in any size product. */
+constexpr int64_t KF_MAX_NUMEL = (int64_t)1 << 40;
+
+/* Whether a loaded operand can describe a case (Kfixture::load). Absent operands carry nothing to
+ * check. */
+bool operand_valid(const KfOperand& o) {
+    if (o.role < RAD_OPD_IN || o.role > RAD_OPD_WTAB) return false;
+    if (o.absent) return true;
+    if (rad_dtype_bits(o.dtype) <= 0) return false;
+    if (o.shape.empty() || o.shape.size() > (size_t)RAD_MAX_RANK) return false;
+    int64_t n = 1;
+    for (int64_t x : o.shape) {
+        if (x <= 0 || x > KF_MAX_NUMEL || n > KF_MAX_NUMEL / x) return false;
+        n *= x;
+    }
+    if (o.fill < KF_FILL_NORMAL || o.fill > KF_FILL_SAMPLE_PARAMS) return false;
+    if (o.idx_max < 0 || o.fill_chunk < 0 || o.idx_const < -1) return false;
+    if (o.has_enc) {
+        if (o.sel.empty() || o.sel.size() != o.sel_rows.size() ||
+            o.sel.size() != o.sel_cols.size())
+            return false;
+        for (size_t k = 0; k < o.sel.size(); ++k)
+            if (o.sel_rows[k] <= 0 || o.sel_cols[k] <= 0 || o.sel_rows[k] > KF_MAX_NUMEL ||
+                o.sel_cols[k] > KF_MAX_NUMEL / o.sel_rows[k])
+                return false;
+    }
+    if (o.have_ref) {
+        if (o.ref_n != n || o.ref_nonfinite < 0 || o.ref_nonfinite > n) return false;
+        if ((int64_t)o.sample.size() != std::min<int64_t>(n, KF_SAMPLES)) return false;
+    }
+    return true;
+}
+
 }  /* namespace */
 
 uint64_t kf_operand_seed(uint64_t case_seed, int k) {
@@ -85,9 +115,7 @@ uint64_t kf_operand_seed(uint64_t case_seed, int k) {
 void kf_sample_positions(uint64_t seed, int64_t n, std::vector<int64_t>* out) {
     out->clear();
     if (n <= 0) return;
-    /* Small operands are sampled ENTIRELY rather than approximately: below the sample count there
-     * is nothing to gain by drawing, and an exhaustive check of a 256-element scale plane is
-     * strictly better than 1024 draws with repeats. */
+    /* Operands no larger than the sample count are sampled exhaustively. */
     if (n <= KF_SAMPLES) {
         out->reserve((size_t)n);
         for (int64_t i = 0; i < n; ++i) out->push_back(i);
@@ -104,7 +132,7 @@ int Kfixture::save(const std::string& path) const {
     if (!f) return RAD_E_IO;
     W w{ f };
     w.raw(KF_MAGIC, 4);
-    w.u32(version);
+    w.u32(KF_VERSION);
     w.u32((uint32_t)KF_SAMPLES);
     w.str(source);
     w.str(oracle);
@@ -115,7 +143,6 @@ int Kfixture::save(const std::string& path) const {
         w.u64(c.seed);
         w.i64(c.m);
         w.str(c.band);
-        w.u8(c.speed_only ? 1 : 0);
         w.u32((uint32_t)c.params.size());
         for (const KfParam& p : c.params) {
             w.str(p.key);
@@ -131,7 +158,8 @@ int Kfixture::save(const std::string& path) const {
             w.i64v(o.shape);
             w.u8(o.absent ? 1 : 0);
             w.u32((uint32_t)o.fill);
-            w.u8((uint8_t)((o.is_index ? 1 : 0) | (o.idx_unique ? 2 : 0) | (o.idx_cu ? 4 : 0)));
+            w.u8((uint8_t)((o.is_index ? 1 : 0) | (o.idx_unique ? 2 : 0) | (o.idx_cu ? 4 : 0) |
+                           (o.idx_prefix ? 8 : 0) | (o.idx_history ? 16 : 0)));
             w.i64(o.idx_max);
             w.i64(o.idx_const);
             w.i64(o.fill_chunk);
@@ -151,6 +179,8 @@ int Kfixture::save(const std::string& path) const {
                 w.f64(o.ref_sumsq);
                 w.i64(o.ref_nonfinite);
                 w.f32v(o.sample);
+                w.u32((uint32_t)o.sketch.size());
+                w.raw(o.sketch.data(), o.sketch.size() * sizeof(double));
             }
         }
     }
@@ -168,13 +198,15 @@ int Kfixture::load(const std::string& path) {
     if (!r.ok || std::memcmp(magic, KF_MAGIC, 4) != 0) { std::fclose(f); return RAD_E_FORMAT; }
     version = r.u32();
     const uint32_t samples = r.u32();
-    /* A file recorded with a different sample count is not readable as this one: the positions
-     * are DERIVED from the count, so every sample would be compared against the wrong element and
-     * the report would be a page of confident failures. */
-    if (version != 4 || samples != (uint32_t)KF_SAMPLES) {
+    /* Sample positions are derived from the count, so a file with a different count cannot be
+     * read. */
+    if (version < 4 || version > KF_VERSION || samples != (uint32_t)KF_SAMPLES) {
         std::fclose(f);
         return RAD_E_FORMAT;
     }
+    const bool v4 = version == 4;
+    /* The sampler laws are version 6's; an older file naming one is corrupt. */
+    const bool sampler_laws = version >= 6;
     source   = r.str();
     oracle   = r.str();
     recorded = r.str();
@@ -188,7 +220,7 @@ int Kfixture::load(const std::string& path) {
         c.seed = r.u64();
         c.m    = r.i64();
         c.band = r.str();
-        c.speed_only = r.u8() != 0;
+        if (v4) (void)r.u8();     /* a flag no recording set */
         const uint32_t np = r.u32();
         if (!r.ok || np > 256) { r.ok = false; break; }
         for (uint32_t i = 0; i < np && r.ok; ++i) {
@@ -210,9 +242,14 @@ int Kfixture::load(const std::string& path) {
             o.absent = r.u8() != 0;
             o.fill   = (int)r.u32();
             const uint8_t flags = r.u8();
-            o.is_index   = (flags & 1) != 0;
-            o.idx_unique = (flags & 2) != 0;
-            o.idx_cu     = (flags & 4) != 0;
+            o.is_index    = (flags & 1) != 0;
+            o.idx_unique  = (flags & 2) != 0;
+            o.idx_cu      = (flags & 4) != 0;
+            o.idx_prefix  = (flags & 8) != 0;
+            o.idx_history = (flags & 16) != 0;
+            /* A flag this reader does not know is a law it would draw as another. */
+            if ((flags & ~0x1Fu) != 0) r.ok = false;
+            if (!sampler_laws && (o.idx_history || o.fill == KF_FILL_SAMPLE_PARAMS)) r.ok = false;
             o.idx_max    = r.i64();
             o.idx_const  = r.i64();
             o.fill_chunk = r.i64();
@@ -238,7 +275,16 @@ int Kfixture::load(const std::string& path) {
                 o.ref_sumsq     = r.f64();
                 o.ref_nonfinite = r.i64();
                 o.sample        = r.f32v();
+                if (!v4) {
+                    const uint32_t nk = r.u32();
+                    if (!r.ok || (nk != 0 && nk != (uint32_t)KF_SKETCH)) { r.ok = false; break; }
+                    o.sketch.resize(nk);
+                    r.raw(o.sketch.data(), (size_t)nk * sizeof(double));
+                }
             }
+            /* Version 4 drew no weight table: its references were computed on zeros. */
+            if (v4 && o.role == RAD_OPD_WTAB) o.undrawn = true;
+            if (r.ok && !operand_valid(o)) r.ok = false;
             c.opd.push_back(std::move(o));
         }
         cases.push_back(std::move(c));
@@ -248,20 +294,11 @@ int Kfixture::load(const std::string& path) {
     return ok ? RAD_OK : RAD_E_FORMAT;
 }
 
-}  /* namespace rad */
-
-namespace rad {
-
 void kf_reduce(const float* v, int64_t n, uint64_t seed, double* sumsq, int64_t* nonfinite,
                std::vector<float>* sample) {
-    /* THREADED, AND SUMMED IN BLOCK ORDER SO IT IS STILL DETERMINISTIC.
-     *
-     * This walks every element of every output of every case, which at a 248K-vocabulary
-     * logits_gemm is sixteen million elements and at gdn_recurrent_update rather more -- single
-     * threaded it dominates the CPU time of a replay that does almost no GPU work. Partial sums
-     * are accumulated per block and added back in block index order, so the answer does not depend
-     * on how many threads ran: a recorded sum of squares that moved with the core count would make
-     * every recorded reference machine-specific. */
+    /* Threaded (outputs reach tens of millions of elements, which would dominate a replay's CPU
+     * time). Per-block partial sums are added in block order, so the result does not depend on the
+     * thread count and recorded references are machine-independent. */
     const int64_t nb = (n + KF_REDUCE_BLOCK - 1) / KF_REDUCE_BLOCK;
     std::vector<double> part((size_t)std::max<int64_t>(nb, 1), 0.0);
     std::vector<int64_t> partnf((size_t)std::max<int64_t>(nb, 1), 0);
@@ -277,18 +314,7 @@ void kf_reduce(const float* v, int64_t n, uint64_t seed, double* sumsq, int64_t*
         part[(size_t)b] = ss;
         partnf[(size_t)b] = nf;
     };
-    if (nb <= 2) {
-        for (int64_t b = 0; b < nb; ++b) do_block(b);
-    } else {
-        unsigned hw = std::thread::hardware_concurrency();
-        if (hw == 0) hw = 1;
-        const int64_t nt = std::min<int64_t>(nb, (int64_t)hw);
-        std::vector<std::thread> th;
-        th.reserve((size_t)nt);
-        for (int64_t t = 0; t < nt; ++t)
-            th.emplace_back([&, t]() { for (int64_t b = t; b < nb; b += nt) do_block(b); });
-        for (auto& x : th) x.join();
-    }
+    rad_for_blocks(nb, do_block);
     double ss = 0;
     int64_t nf = 0;
     for (int64_t b = 0; b < nb; ++b) { ss += part[(size_t)b]; nf += partnf[(size_t)b]; }
@@ -302,89 +328,267 @@ void kf_reduce(const float* v, int64_t n, uint64_t seed, double* sumsq, int64_t*
     for (int64_t p : pos) sample->push_back(v[p]);
 }
 
+void kf_sketch(const float* v, int64_t n, uint64_t seed, std::vector<double>* out) {
+    out->assign(KF_SKETCH, 0.0);
+    if (n <= 0) return;
+    const int64_t nb = (n + KF_REDUCE_BLOCK - 1) / KF_REDUCE_BLOCK;
+    std::vector<double> part((size_t)nb * KF_SKETCH, 0.0);
+    const uint64_t key = seed ^ 0xD6E8FEB86659FD93ull;
+    rad_for_blocks(nb, [&](int64_t b) {
+        const int64_t lo = b * KF_REDUCE_BLOCK;
+        const int64_t hi = std::min<int64_t>(lo + KF_REDUCE_BLOCK, n);
+        double acc[KF_SKETCH] = {};
+        for (int64_t i = lo; i < hi; ++i) {
+            if (!std::isfinite(v[i])) continue;
+            /* Element i's signs: the low KF_SKETCH bits of a hash of (seed, i). Stateless, so a
+             * block needs nothing from the blocks before it. */
+            uint64_t z = key + (uint64_t)(i + 1) * 0x9E3779B97F4A7C15ull;
+            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+            z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+            z ^= z >> 31;
+            const double x = (double)v[i];
+            for (int j = 0; j < KF_SKETCH; ++j) acc[j] += ((z >> j) & 1u) ? -x : x;
+        }
+        for (int j = 0; j < KF_SKETCH; ++j) part[(size_t)b * KF_SKETCH + (size_t)j] = acc[j];
+    });
+    for (int64_t b = 0; b < nb; ++b)
+        for (int j = 0; j < KF_SKETCH; ++j)
+            (*out)[(size_t)j] += part[(size_t)b * KF_SKETCH + (size_t)j];
+}
+
+namespace {
+
+/* A uniform in [0, 1) from 24 bits, as rad_sample_uniform01 forms one, and an integer in [0, n).
+ * Arithmetic only: a libm call could round differently on the machine that replays. */
+float unit24(uint64_t& s) { return (float)(rad_splitmix(s) >> 40) * (1.0f / 16777216.0f); }
+int64_t below(uint64_t& s, int64_t n) {
+    return n > 0 ? (int64_t)(rad_splitmix(s) % (uint64_t)n) : 0;
+}
+
+/* Row r's own stream, so a row's draw depends on neither the rows before it nor the row count. */
+uint64_t row_stream(uint64_t seed, int64_t r) {
+    return seed ^ (0xD1B54A32D192ED03ull * (uint64_t)(r + 1));
+}
+
+/* RAD_FILL_SAMPLE_PARAMS: `rows` RadSampleParams, each what a request stages (core/sample/
+ * sampler.cpp), flags agreeing with fields. Row 0 switches every stage on, so a one-row case does
+ * work in each; on the others each stage is on in seven rows of eight and otherwise at its
+ * identity, so both paths of every stage run in a batch. One row in eight is greedy and one in
+ * sixteen a greedy request asking for logprobs, which the engine stages at top_k 1 without the
+ * flag.
+ *
+ * Every value is in the range a request uses, except XTC's threshold: candidates are drawn as
+ * normals, a flat distribution whose largest probability among 1024 is about 0.015, so llama.cpp's
+ * 0.1 would never find the two candidates above it that the stage needs. It is drawn in
+ * [1e-4, 1e-2), and below 1e-3 on row 0, where it must fire. The window lies inside the history
+ * plane (`fill_chunk` wide) and covers at least half of what follows its start; `mask_row` names a
+ * row of the bitmask plane (`idx_max` rows). DRY's penalty is its multiplier times
+ * base^(L - allowed) for a repeat of L tokens; the base stays below 2, so over the repeats the
+ * history law draws a penalty is a logit or two at the median and rarely past 10^3, and an error
+ * elsewhere in the plane is not lost in the norm of one huge value. */
+void draw_sample_params(const KfOperand& d, uint64_t seed, int64_t rows, uint8_t* out) {
+    const int64_t hw = d.fill_chunk > 0 ? d.fill_chunk : 0;
+    const int64_t mask_rows = d.idx_max > 0 ? d.idx_max : 0;
+    /* What a positive last-n counts in when the op has no history plane: the engine's default. */
+    const int64_t span = hw > 0 ? hw : 64;
+    for (int64_t r = 0; r < rows; ++r) {
+        uint64_t s = row_stream(seed, r);
+        const bool all = r == 0;
+        auto u = [&] { return unit24(s); };
+        auto pick = [&](int64_t n) { return below(s, n); };
+        auto on = [&] { return all || pick(8) != 0; };
+
+        RadSampleParams p;
+        std::memset(&p, 0, sizeof p);
+        p.seed = rad_splitmix(s);
+        p.pos = (uint64_t)pick(4096);
+        const int64_t kind = all ? 15 : pick(16);
+        const bool greedy = kind < 2, top1 = kind == 2;
+
+        /* [0.5, 1) or (1, 1.5]: 1 is the identity, drawn on its own. */
+        const float t = u();
+        p.temp      = greedy || top1 ? 0.0f : on() ? (t < 0.5f ? 0.5f + t : 2.0f - t) : 1.0f;
+        p.top_k     = top1 ? 1 : on() ? (int32_t)(20 + pick(81)) : 0;
+        p.top_p     = on() ? 0.8f + 0.19f * u() : 1.0f;
+        p.min_p     = on() ? 0.01f + 0.09f * u() : 0.0f;
+        p.typical_p = on() ? 0.7f + 0.29f * u() : 1.0f;
+
+        /* Penalties: each of the three at its identity in one row of four, never all three. */
+        const bool pen = on();
+        p.rep_penalty = 1.0f;
+        p.penalty_last_n = 64;
+        if (pen) {
+            if (all || pick(4)) p.rep_penalty  = 1.0f + 0.3f * (1.0f - u());
+            if (all || pick(4)) p.freq_penalty = 0.5f * (1.0f - u());
+            if (all || pick(4)) p.pres_penalty = 0.5f * (1.0f - u());
+            if (p.rep_penalty == 1.0f && p.freq_penalty == 0.0f && p.pres_penalty == 0.0f)
+                p.rep_penalty = 1.1f;
+            const int64_t w = all ? 0 : pick(3);
+            p.penalty_last_n = w == 0 ? -1 : w == 1 ? 64 : (int32_t)(1 + pick(span));
+            p.flags |= RAD_SP_PENALTY;
+        } else if (pick(2)) {
+            p.penalty_last_n = 0;
+        }
+
+        /* DRY. On one row in four a breaker in the window caps the repeat, at no less than the
+         * allowed length (the host turns DRY off below it). */
+        const bool dry = on();
+        p.dry_base = 1.75f;
+        p.dry_allowed_length = 2;
+        p.dry_penalty_last_n = -1;
+        if (dry) {
+            p.dry_multiplier = 0.25f + 0.75f * u();
+            p.dry_base = 1.5f + 0.5f * u();
+            if (!all && pick(4) == 0) p.dry_allowed_length = (int32_t)(1 + pick(3));
+            if (!all && pick(2))
+                p.dry_penalty_last_n = (int32_t)(8 + pick(span > 8 ? span - 7 : 1));
+            if (!all && pick(4) == 0) p.dry_rep_limit = p.dry_allowed_length + (int32_t)pick(7);
+            p.flags |= RAD_SP_DRY;
+        }
+
+        /* XTC's coin comes up in about seven rows of eight that set it. */
+        p.xtc_threshold = 0.1f;
+        if (on()) {
+            p.xtc_probability = all ? 1.0f : 0.75f + 0.25f * u();
+            p.xtc_threshold = (all || pick(2) ? 1e-4f : 1e-3f) * (1.0f + 9.0f * u());
+            p.flags |= RAD_SP_XTC;
+        }
+
+        /* The engine's window runs to the newest token at the plane's end; half the windows do,
+         * the rest end earlier. */
+        if (hw > 0 && (pen || dry)) {
+            const int64_t off = all || pick(2) ? 0 : pick(hw / 2 + 1);
+            const int64_t rem = hw - off;
+            p.hist_off = (int32_t)off;
+            p.hist_len = (int32_t)(all || pick(2) ? rem : (rem + 1) / 2 + pick(rem / 2 + 1));
+        }
+
+        p.mask_row = -1;
+        if (mask_rows > 0 && on()) {
+            p.mask_row = (int32_t)pick(mask_rows);
+            p.flags |= RAD_SP_MASK;
+        }
+
+        if (greedy) p.flags |= RAD_SP_GREEDY;
+        if (top1 || (!greedy && on())) p.flags |= RAD_SP_LOGPROBS;
+        std::memcpy(out + (size_t)r * sizeof p, &p, sizeof p);
+    }
+}
+
+/* RAD_OPD_F_IDX_HISTORY: `rows` rows of `w` ids in [0, range), each text that repeats itself. A row
+ * draws on 16 ids spread over the range, in runs of one to three, and four times in five copies 3
+ * to 12 of its own earlier tokens. A fresh id follows every copy, so a repeat is rarely much longer
+ * than the copy that made it, which keeps DRY's exponent small; a window ending inside a 64-token
+ * row ends inside a repeat about three times in four. The row closes in a loop, its last 2 to 4
+ * tokens repeated three more times, so a window reaching its end always ends in a repeat, and one
+ * that DRY finds at three earlier positions. */
+void draw_history(int64_t rows, int64_t w, int64_t range, uint64_t seed, float* v) {
+    for (int64_t r = 0; r < rows; ++r) {
+        uint64_t s = row_stream(seed, r);
+        int64_t ids[16];
+        for (int64_t& x : ids) x = below(s, range);
+        float* row = v + r * w;
+        int64_t i = 0;
+        while (i < w) {
+            if (i >= 4 && below(s, 5) < 4) {
+                const int64_t src = below(s, i - 2), len = 3 + below(s, 10);
+                for (int64_t t = 0; t < len && i < w; ++t, ++i) row[i] = row[src + t];
+                if (i < w) row[i++] = (float)ids[below(s, 16)];
+            } else {
+                const int64_t len = 1 + below(s, 3);
+                for (int64_t t = 0; t < len && i < w; ++t, ++i) row[i] = (float)ids[below(s, 16)];
+            }
+        }
+        const int64_t p = 2 + below(s, 3);
+        if (w >= 8 * p)
+            for (int64_t j = w - 3 * p; j < w; ++j) row[j] = row[j - p];
+    }
+}
+
+}  /* namespace */
+
 void kf_draw(const std::vector<KfOperand>& opd, size_t k, int64_t M, int64_t vocab_rows,
              uint64_t seed, std::vector<uint8_t>* out) {
     const KfOperand& d = opd[k];
     int64_t n = 1;
     for (int64_t x : d.shape) n *= x;
     out->assign((size_t)rad_dtype_bytes(d.dtype, n), 0);
-    if (n <= 0 || d.absent) return;
-    if (d.role != RAD_OPD_IN && d.role != RAD_OPD_INOUT && d.role != RAD_OPD_WEIGHT) return;
+    if (n <= 0 || d.absent || out->empty()) return;   /* empty: a dtype the core cannot size */
+    if (d.role != RAD_OPD_IN && d.role != RAD_OPD_INOUT && d.role != RAD_OPD_WEIGHT &&
+        d.role != RAD_OPD_WTAB)
+        return;
+    if (d.undrawn) return;
+    const bool weightish = d.role == RAD_OPD_WEIGHT || d.role == RAD_OPD_WTAB;
+    if (d.role == RAD_OPD_WTAB && d.has_enc) {
+        std::string why;
+        if (kf_draw_table(d, k, out, &why) != RAD_OK) out->assign(out->size(), 0);
+        return;
+    }
 
-    /* A WEIGHT'S CONTENT DOES NOT DEPEND ON THE BATCH SIZE, so its seed must not either.
-     *
-     * The M sweep runs the same GEMM at eight or ten query lengths. Under a per-case seed each of
-     * those points would re-draw the same 178-million-element weight from scratch -- ten
-     * Box-Muller passes over 178M elements for one (N, K), which dominates a replay's wall clock.
-     * Deriving the seed from the operand's own identity instead -- its position, dtype and extents
-     * -- makes every point of the sweep ask for the SAME bytes, which a caller can then draw once
-     * and keep. kf_weight_seed is public for exactly that: it is the cache key.
-     *
-     * It costs nothing in coverage. Which pseudorandom weight a kernel is checked against was
-     * never the point; that two implementations agree about it is. */
-    if (d.role == RAD_OPD_WEIGHT) seed = kf_weight_seed(d, k);
+    /* A weight's seed comes from its own identity (position, dtype, extents), not the case, so
+     * every point of an M sweep uses the same bytes and the caller can draw them once
+     * (kf_weight_seed is the cache key). */
+    if (weightish) seed = kf_weight_seed(d, k);
+
+    /* Sampler rows are structs, written whole; a row that does not fit is left zero. */
+    if (!weightish && !d.is_index && d.fill == KF_FILL_SAMPLE_PARAMS) {
+        draw_sample_params(d, seed, (int64_t)(out->size() / sizeof(RadSampleParams)), out->data());
+        return;
+    }
 
     std::vector<float> tmp;
-    /* A BIG OPERAND IS DRAWN IN BLOCKS AND NEVER MATERIALISES AS FLOATS.
+    /* Large plain-normal operands (every weight and ordinary activation) are drawn block by block,
+     * each block on its own thread and narrowed into its own byte range, avoiding a full-size
+     * float intermediate (713 MB for one fp8 GEMM weight). The bytes do not depend on the thread
+     * count: the stream is seeded per RAD_FILL_BLOCK block, and every dtype the draw narrows to
+     * packs whole elements into a byte. The shaped fills below read across the whole tensor and
+     * are small, so they are not blocked.
      *
-     * The plain-normal path -- which is every weight and every ordinary activation, so almost all
-     * of the bytes here -- would otherwise allocate one float vector the size of the whole tensor
-     * and narrow it in one pass. At an fp8 GEMM weight that is 713 MB of scratch to produce 178 MB
-     * of fp8, touched twice, for one case. In blocks it is a few hundred kilobytes that stays in
-     * cache, and the result is identical because rad_fill_normal is block-seeded at exactly this
-     * width.
-     *
-     * Only this path blocks. The shaped fills below (a triangular inverse, a chunk-local cumulative
-     * sum) read across the whole tensor by construction and are small by construction, so blocking
-     * them would buy nothing and get the shapes wrong. */
-    /* A WEIGHT CAN BE AN INDEX, so `role == WEIGHT` is not the whole answer here. An operand whose
-     * VALUES are sizes or offsets -- a weight by role, an index by content -- must not be drawn as
-     * standard normals cast to its integer dtype, which is zeros and negatives. ngram_ids is the
-     * case: it refuses `vocab_size <= 0` and `offset < 0` by name, so drawing it as a plain weight
-     * makes the ORACLE refuse every geometry and the op is never checked on any plugin. That
-     * refusal reads exactly like a shape the reference does not serve, so it is easy to miss.
-     *
-     * The index path runs values through the float `tmp` below, so an index constant past 2^24
-     * does not survive the round trip -- fine for a vocabulary and not for a token id at a 250k
-     * vocab, which is why the constant here is the vocabulary and not the id. */
-    const bool plain = (d.role == RAD_OPD_WEIGHT && !d.is_index) ||
-                       (!d.is_index && d.fill == KF_FILL_NORMAL);
-    if (plain && n > RAD_FILL_BLOCK && rad_dtype_bytes(d.dtype, 1) >= 1) {
-        const float sigma = d.role == RAD_OPD_WEIGHT ? 0.02f : 1.0f;
-        tmp.resize((size_t)RAD_FILL_BLOCK);
-        for (int64_t lo = 0; lo < n; lo += RAD_FILL_BLOCK) {
+     * A weight-role operand may hold indices (e.g. ngram_ids sizes and offsets, which the oracle
+     * refuses when <= 0 or negative), so it is drawn as an index, not as normals. Index values
+     * pass through the float `tmp`, exact only up to 2^24. */
+    const bool plain = (weightish && !d.is_index) || (!d.is_index && d.fill == KF_FILL_NORMAL);
+    if (plain) {
+        /* Sigma 0.02 matches real checkpoint weights; unit variance would put an fp8 quantiser's
+         * amax far from where it sits on real data. */
+        const float sigma = weightish ? 0.02f : 1.0f;
+        const int64_t nb = (n + RAD_FILL_BLOCK - 1) / RAD_FILL_BLOCK;
+        uint8_t* dst = out->data();
+        rad_for_blocks(nb, [&](int64_t b) {
+            thread_local std::vector<float> blk;
+            const int64_t lo = b * RAD_FILL_BLOCK;
             const int64_t len = std::min<int64_t>(RAD_FILL_BLOCK, n - lo);
-            rad_fill_normal_block(tmp.data(), len, seed, lo / RAD_FILL_BLOCK, sigma);
-            rad_narrow(tmp.data(), d.dtype, len,
-                       out->data() + rad_dtype_bytes(d.dtype, lo));
-        }
+            blk.resize((size_t)len);
+            rad_fill_normal_block(blk.data(), len, seed, b, sigma);
+            rad_narrow(blk.data(), d.dtype, len, dst + rad_dtype_bytes(d.dtype, lo));
+        });
         return;
     }
     tmp.assign((size_t)n, 0.0f);
-    if (d.role == RAD_OPD_WEIGHT && !d.is_index) {
-        /* A WEIGHT IS A SMALL DRAW, and the 0.02 sigma is not cosmetic: a checkpoint's weights
-         * are that size, and drawing them at unit variance puts an fp8 quantiser's amax three
-         * orders of magnitude off where a real one sits, so the case would measure the
-         * quantiser's behaviour on data no model produces. */
-        rad_fill_normal(tmp.data(), n, seed, 0.02f);
-        rad_narrow(tmp.data(), d.dtype, n, out->data());
-        return;
-    }
-    if (d.is_index && d.idx_cu) {
-        /* Cumulative sequence lengths, [0 .. T]: the batch's shape, not a draw. Every GDN kernel
-         * opens by reading cu[n] before any null test, so a wrong one is a fault and not a wrong
-         * answer. */
+    if (d.is_index && d.idx_prefix) {
+        /* A routing histogram's offsets [0, ..., T]: non-decreasing, first 0 and last T, so each
+         * of the n - 1 buckets holds a valid run. T is idx_max - 1 (idx_max bounds a value
+         * exclusively). The runs come from T uniform choices of a bucket. */
+        const int64_t buckets = n > 1 ? n - 1 : 1;
+        const int64_t T = d.idx_max > 0 ? d.idx_max - 1 : 0;
+        std::vector<int64_t> cnt((size_t)buckets, 0);
+        uint64_t s2 = seed;
+        for (int64_t t = 0; t < T; ++t) ++cnt[(size_t)(rad_splitmix(s2) % (uint64_t)buckets)];
+        int64_t acc = 0;
+        for (int64_t i = 1; i < n; ++i) {
+            acc += cnt[(size_t)(i - 1)];
+            tmp[(size_t)i] = (float)acc;
+        }
+    } else if (d.is_index && d.idx_cu) {
+        /* Cumulative sequence lengths [0 .. T]. GDN kernels read cu[n] before any null test, so
+         * a wrong one faults. */
         const int64_t S = n > 1 ? n - 1 : 1;
         for (int64_t i = 0; i < n; ++i) tmp[(size_t)i] = (float)((i * M) / S);
     } else if (d.is_index && d.idx_const >= 0) {
-        /* A length, not a choice. `seqused` is the case: a random context shorter than the query
-         * makes causal attention read a prefix that does not exist, and both implementations
-         * agree about the garbage. */
+        /* A fixed length (see OpdShape::idx_const). */
         for (int64_t i = 0; i < n; ++i) tmp[(size_t)i] = (float)d.idx_const;
     } else if (d.is_index && d.idx_unique) {
-        /* A scatter's destinations, distinct: a partial Fisher-Yates over the range. Two tokens
-         * on one slot is a race the two implementations resolve differently, so the comparison
-         * would measure the scheduler. */
+        /* Distinct scatter destinations (see OpdShape::idx_unique): partial Fisher-Yates. */
         uint64_t s2 = seed;
         const int64_t range = d.idx_max > 0 ? d.idx_max : n;
         std::vector<int32_t> pool((size_t)range);
@@ -396,38 +600,33 @@ void kf_draw(const std::vector<KfOperand>& opd, size_t k, int64_t M, int64_t voc
         }
         for (int64_t i = range; i < n; ++i) tmp[(size_t)i] = -1.0f;
     } else if (d.is_index) {
-        /* An index operand indexes the operand before it, whose leading extent is the only legal
-         * range -- unless the recipe named the range itself, which the paged pair has to: a KV
-         * slot indexes n_blocks * block_size and a block-table entry indexes n_blocks, and neither
-         * is any operand's dim 0. */
-        uint64_t s2 = seed;
+        /* Range: idx_max if the recipe set it, else the previous operand's leading extent, else
+         * vocab_rows. */
         int64_t rows = vocab_rows > 0 ? vocab_rows : 32000;
         if (k > 0 && !opd[k - 1].shape.empty()) rows = opd[k - 1].shape[0];
         if (d.idx_max > 0) rows = d.idx_max;
         if (rows <= 0) rows = 1;
-        for (int64_t i = 0; i < n; ++i)
-            tmp[(size_t)i] = (float)(rad_splitmix(s2) % (uint64_t)rows);
+        if (d.idx_history) {
+            const int64_t w = d.shape.empty() ? n : d.shape.back();
+            draw_history(n / w, w, rows, seed, tmp.data());
+        } else {
+            uint64_t s2 = seed;
+            for (int64_t i = 0; i < n; ++i)
+                tmp[(size_t)i] = (float)(rad_splitmix(s2) % (uint64_t)rows);
+        }
     } else {
         rad_fill_normal(tmp.data(), n, seed, 1.0f);
-        /* INTO THE OPERAND'S DOMAIN, where a normal draw is outside it. */
+        /* Map into the operand's domain where normals fall outside it. The maps run in double and
+         * round once, as the normals do: glibc's float routines differ between releases, and a
+         * fixture recorded on one host is replayed on another against its exact answers. */
         if (d.fill == KF_FILL_SIGMOID) {
-            for (int64_t i = 0; i < n; ++i) tmp[(size_t)i] = 1.0f / (1.0f + std::exp(-tmp[(size_t)i]));
+            for (int64_t i = 0; i < n; ++i)
+                tmp[(size_t)i] = (float)(1.0 / (1.0 + std::exp(-(double)tmp[(size_t)i])));
         } else if (d.fill == KF_FILL_TRI_LOWER) {
-            /* UNIT DIAGONAL, SMALL OFF-DIAGONAL, and the diagonal is the whole point.
-             *
-             * `A` is the chunked delta rule's intra-chunk matrix -- I + tril(diag(beta) K K^T, -1)
-             * -- so it is UNIT lower triangular by construction and its inverse is bounded. Drawn
-             * with a normal on the diagonal it is not: a diagonal element near zero makes the
-             * inverse enormous, and `gdn_kkt_solve` then returns values of order 1e20 with a
-             * rel_l2 that grows with the chunk count. Two implementations summing an
-             * ill-conditioned product in different orders disagree by however ill-conditioned it
-             * is, so that number is the CONDITION NUMBER OF THE TEST, not an error in the kernel.
-             *
-             * This is the same correction FillSigmoid and FillGateCumsum already are: put the
-             * operand inside the domain the op is only ever handed, or the comparison measures
-             * the harness. The strictly-upper part stays zeroed -- whether it is read at all is a
-             * convention the two implementations never disagree about on a real matrix, because
-             * the same library's kkt_solve produced it. */
+            /* Unit diagonal, small off-diagonal, upper part zero. `A` is the chunked delta rule's
+             * I + tril(diag(beta) K K^T, -1), unit lower triangular with a bounded inverse. A
+             * normal diagonal would make it ill-conditioned (gdn_kkt_solve outputs ~1e20), and the
+             * comparison would measure the condition number, not the kernel. */
             const int64_t ch = d.fill_chunk > 0 ? d.fill_chunk : 1;
             const int64_t heads = d.shape.size() >= 3 ? d.shape[1] : 1;
             const int64_t rows = (heads * ch) != 0 ? n / (heads * ch) : n;
@@ -441,9 +640,8 @@ void kf_draw(const std::vector<KfOperand>& opd, size_t k, int64_t M, int64_t voc
                         else                tmp[i] *= 0.25f;
                     }
         } else if (d.fill == KF_FILL_GATE_CUMSUM) {
-            /* Rows are [tokens, heads] and the cumsum runs down TOKENS within a chunk, resetting
-             * at each boundary -- which is what chunk_local_cumsum produces and what the scan
-             * assumes. */
+            /* Rows are [tokens, heads]; the cumsum runs down tokens and resets at each chunk
+             * boundary, as chunk_local_cumsum produces. */
             const int64_t heads = d.shape.size() >= 2 ? d.shape.back() : 1;
             const int64_t rows = heads > 0 ? n / heads : n;
             const int64_t ch = d.fill_chunk > 0 ? d.fill_chunk : rows;
@@ -451,17 +649,14 @@ void kf_draw(const std::vector<KfOperand>& opd, size_t k, int64_t M, int64_t voc
                 float acc = 0.0f;
                 for (int64_t t = 0; t < rows; ++t) {
                     if (t % ch == 0) acc = 0.0f;
-                    acc -= std::log1p(std::exp(tmp[(size_t)(t * heads + h)]));
+                    acc -= (float)std::log1p(std::exp((double)tmp[(size_t)(t * heads + h)]));
                     tmp[(size_t)(t * heads + h)] = acc;
                 }
             }
         } else if (d.fill == KF_FILL_UNIT_ROW) {
-            /* UNIT L2 NORM ALONG THE LAST DIMENSION, which is what the model's own qk_norm hands
-             * the gated-delta-net path. Drawn as plain normals over a 128-wide head the key has
-             * norm ~11, the solve's matrix I + tril(beta k k^T, -1) then has off-diagonals two
-             * orders of magnitude too large, and its inverse is astronomical -- gdn_kkt_solve
-             * returns values of order 1e18 and a rel_l2 that moves with the draw. That is not a
-             * defect in the kernel; it is an input outside the domain the op is ever handed. */
+            /* Unit L2 norm along the last dimension, as the model's qk_norm provides. Plain normals
+             * over a 128-wide head have norm ~11, making the solve ill-conditioned (outputs
+             * ~1e18). */
             const int64_t w = d.shape.empty() ? n : d.shape.back();
             if (w > 0) {
                 for (int64_t r = 0; r + w <= n; r += w) {
@@ -477,20 +672,47 @@ void kf_draw(const std::vector<KfOperand>& opd, size_t k, int64_t M, int64_t voc
     rad_narrow(tmp.data(), d.dtype, n, out->data());
 }
 
-}  /* namespace rad */
-
-namespace rad {
-
-
 uint64_t kf_weight_seed(const KfOperand& d, size_t k) {
     uint64_t s = 0x9E3779B97F4A7C15ull ^ (uint64_t)(k + 1) ^ ((uint64_t)d.dtype << 17);
     for (int64_t x : d.shape) { s ^= (uint64_t)x; s = rad_splitmix(s); }
     return rad_splitmix(s);
 }
 
-}  /* namespace rad */
-
-namespace rad {
+int kf_draw_table(const KfOperand& d, size_t k, std::vector<uint8_t>* out, std::string* why) {
+    out->clear();
+    if (!d.has_enc || d.shape.size() < 2 || d.shape[0] <= 0) {
+        if (why) *why = "a weight table needs an encoding and a leading expert dimension";
+        return RAD_E_SHAPE;
+    }
+    const int64_t ne = d.shape[0];
+    /* One expert: the table's selection over its shape without the leading dimension. */
+    KfOperand one = d;
+    one.role = RAD_OPD_WEIGHT;
+    one.shape.assign(d.shape.begin() + 1, d.shape.end());
+    const int64_t per = rad_dtype_bytes(d.dtype, rad_numel(one.shape));
+    if (per <= 0) {
+        if (why) *why = "a dtype the core cannot size";
+        return RAD_E_DTYPE;
+    }
+    out->assign((size_t)(per * ne), 0);
+    const uint64_t base = kf_weight_seed(d, k);
+    std::vector<std::vector<uint8_t>> pl;
+    std::vector<uint8_t> logical;
+    for (int64_t e = 0; e < ne; ++e) {
+        uint64_t es = base ^ (0xC2B2AE3D27D4EB4Full * (uint64_t)(e + 1));
+        kf_draw_planes(one, rad_splitmix(es), &pl);
+        std::string w;
+        const int rc = kf_planes_logical(one, pl, &logical, &w);
+        if (rc != RAD_OK || (int64_t)logical.size() != per) {
+            if (why) *why = rc != RAD_OK ? w : "an expert decodes to a different size than the "
+                                               "table holds";
+            out->assign((size_t)(per * ne), 0);
+            return rc != RAD_OK ? rc : RAD_E_SHAPE;
+        }
+        std::memcpy(out->data() + per * e, logical.data(), (size_t)per);
+    }
+    return RAD_OK;
+}
 
 void kf_operand_enc(const WeightInfo& w, KfOperand* d) {
     d->has_enc = true;
@@ -515,7 +737,7 @@ void draw_plane(const RadEncoding& e, const RadEncPlane& p, int64_t rows, int64_
     const int64_t n = rows * cols;
     uint64_t s = seed;
     if (!std::strcmp(p.role, "t.perm")) {
-        /* a permutation of the columns, each row its own: Fisher-Yates over the identity */
+        /* a per-row permutation of the columns: Fisher-Yates over the identity */
         for (int64_t r = 0; r < rows; ++r) {
             std::vector<int64_t> v((size_t)cols);
             for (int64_t j = 0; j < cols; ++j) v[(size_t)j] = j;
@@ -531,10 +753,13 @@ void draw_plane(const RadEncoding& e, const RadEncPlane& p, int64_t rows, int64_
     const bool ints = pb || p.dtype == RAD_I8 || p.dtype == RAD_U8 || p.dtype == RAD_I16 ||
                       p.dtype == RAD_U16 || p.dtype == RAD_I32 || p.dtype == RAD_U32;
     const bool codes = !std::strcmp(p.role, "codes");
-    if (ints || p.dtype == RAD_FP4E2M1 || p.dtype == RAD_FP6E2M3 || p.dtype == RAD_FP6E3M2) {
-        /* EVERY BIT PATTERN OF THESE IS A VALUE, so a uniform draw over the patterns is the
-         * widest test -- except a code into a codebook, which is held inside it, and a wide
-         * integer, which a reference would sum past f32's exact range. */
+    const bool minifloat = p.dtype == RAD_FP4E2M1 || p.dtype == RAD_FP6E2M3 ||
+                           p.dtype == RAD_FP6E3M2;
+    if (ints || minifloat) {
+        /* Every bit pattern is a value, so draw uniformly over patterns, except codebook codes
+         * (kept inside the codebook) and wide integers (capped at 12 bits so a reference's sums
+         * stay exact in f32). The sub-byte floats have no infinity or NaN, so their patterns are
+         * stored as drawn: rad_store_f32 does not encode them. */
         const int bits = rad_dtype_bits(p.dtype);
         uint64_t range = bits >= 16 ? 1u << 12 : 1ull << bits;
         const int64_t entries = codes ? codebook_entries(e) : 0;
@@ -542,7 +767,7 @@ void draw_plane(const RadEncoding& e, const RadEncPlane& p, int64_t rows, int64_
         for (int64_t r = 0; r < rows; ++r)
             for (int64_t j = 0; j < cols; ++j) {
                 uint32_t c = (uint32_t)(rad_splitmix(s) % range);
-                if (pb) { rad_store_bits(out + r * rb, pb, j, c); continue; }
+                if (pb || minifloat) { rad_store_bits(out + r * rb, bits, j, c); continue; }
                 const bool neg = (p.dtype == RAD_I8 || p.dtype == RAD_I16 || p.dtype == RAD_I32);
                 const float v = neg ? (float)((int64_t)c - (int64_t)(range / 2)) : (float)c;
                 rad_store_f32(out + r * rb, p.dtype, j, v);
@@ -550,23 +775,27 @@ void draw_plane(const RadEncoding& e, const RadEncPlane& p, int64_t rows, int64_
         return;
     }
     if (p.dtype == RAD_E8M0) {
-        /* 2^-4 .. 2^4: a block scale, which a draw over every exponent would make an overflow */
+        /* 2^-4 .. 2^4; a draw over every exponent would overflow */
         for (int64_t r = 0; r < rows; ++r)
             for (int64_t j = 0; j < cols; ++j)
                 out[r * rb + j] = (uint8_t)(123 + rad_splitmix(s) % 9);
         return;
     }
-    /* A float plane: a normal draw, and a magnitude for what scales (a scale or a minimum is
-     * read as one, and a negative one is a sign flip no quantiser writes). */
+    /* Float plane: normal draw; scale planes get a positive magnitude, since no quantiser writes a
+     * negative scale. Rows are stored independently, so they go to threads in chunks. */
     std::vector<float> f((size_t)n);
     rad_fill_normal(f.data(), n, seed, 1.0f);
     const bool mag = rad_enc_role_in_chain(p.role, "scale") || !std::strcmp(p.role, "t.scale");
-    for (int64_t r = 0; r < rows; ++r)
-        for (int64_t j = 0; j < cols; ++j) {
-            float v = f[(size_t)(r * cols + j)];
-            if (mag) v = 0.25f + std::fabs(v);
-            rad_store_f32(out + r * rb, p.dtype, j, v);
-        }
+    const int64_t chunk = std::max<int64_t>(1, RAD_FILL_BLOCK / std::max<int64_t>(cols, 1));
+    rad_for_blocks((rows + chunk - 1) / chunk, [&](int64_t b) {
+        const int64_t r1 = std::min<int64_t>(rows, (b + 1) * chunk);
+        for (int64_t r = b * chunk; r < r1; ++r)
+            for (int64_t j = 0; j < cols; ++j) {
+                float v = f[(size_t)(r * cols + j)];
+                if (mag) v = 0.25f + std::fabs(v);
+                rad_store_f32(out + r * rb, p.dtype, j, v);
+            }
+    });
 }
 
 }  /* namespace */
@@ -613,16 +842,12 @@ int kf_lay_weight(const RadKernelInfo* info, const RadParam* p, int n_p, int ope
     *lay = RadLayout{};
     const int rc = info->layout(p, n_p, operand, &d.enc, d.sel.data(), pt, n, lay);
     if (rc != RAD_OK) return rc;
-    /* A layout with no relayout behind it is a row that would fail at load; said so here rather
-     * than handed on as bytes nobody wrote. */
+    /* A layout without a relayout would fail at load; report it rather than return unwritten
+     * bytes. */
     if (lay->bytes <= 0 || !info->relayout) return RAD_E_STATE;
     out->assign((size_t)lay->bytes, 0);
     return info->relayout(p, n_p, operand, &d.enc, d.sel.data(), pt, n, out->data(), lay->bytes);
 }
-
-}  /* namespace rad */
-
-namespace rad {
 
 int64_t kf_vocab_rows(const std::vector<KfOperand>& opd) {
     int64_t v = 0;
@@ -631,19 +856,10 @@ int64_t kf_vocab_rows(const std::vector<KfOperand>& opd) {
     return v;
 }
 
-}  /* namespace rad */
-
-namespace rad {
-/* HOW THE ENGINE DESCRIBES A RE-LAID WEIGHT, AND THEREFORE HOW THIS TOOL MUST.
- *
- * STORED DTYPE, DECLARED SHAPE -- which is what Ctx::refresh_weights does, and not what the
- * RadLayout says. The two differ for any layout that changes the width: libr4d's fp8 lm_head
- * appends each row's 128-block scales to its own row, so the stored plane is [N, K + 2*sk] while
- * the operand the kernel is handed is still [N, K] of E4M3 and the kernel finds the scales past
- * the end of its own row. Described by the stored shape instead, the kernel reads K = K + 2*sk,
- * finds it is not the K it was compiled for, and refuses the geometry it was selected for.
- *
- * Describing the operand any other way here would be testing a call the engine never makes. */
+/* Describe a re-laid weight as Ctx::refresh_weights does: stored dtype, declared shape, not the
+ * RadLayout's shape. They differ when a layout changes the width: libr4d's fp8 lm_head appends each
+ * row's 128-block scales, storing [N, K + 2*sk], while the kernel is still handed [N, K] of E4M3
+ * and finds the scales past the end of the row. */
 void kf_describe_laid(const KfOperand& d, const RadLayout& lay, void* data, RadTensor* out) {
     *out = RadTensor{};
     out->data  = data;

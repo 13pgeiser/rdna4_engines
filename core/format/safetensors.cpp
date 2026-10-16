@@ -1,9 +1,6 @@
-/* safetensors.cpp -- the reader, and the small JSON scanner it needs.
- *
- * The scanner is not a general JSON parser and does not try to be. safetensors headers are one
- * flat object of objects with three known keys, so a scanner that understands strings, arrays of
- * integers and nested braces is sufficient and is auditable in one sitting. Anything it does not
- * understand is an error naming the byte offset, never a guess.
+/* safetensors.cpp -- the reader and its small JSON scanner. Not a general JSON parser: the header
+ * is one flat object of objects with three known keys, so strings, integer arrays and nested braces
+ * suffice. Anything else is an error naming the byte offset.
  */
 #include "safetensors.h"
 
@@ -33,8 +30,8 @@ struct Scan {
         return false;
     }
 
-    /* A JSON string with the escapes that actually occur in these files. \u is decoded to UTF-8
-     * because a tensor name is a key we will compare against. */
+    /* A JSON string with the escapes that occur in these files; \u is decoded to UTF-8 because
+     * tensor names are compared. */
     bool str(std::string* out, const char* base) {
         ws();
         if (p >= end || *p != '"') return fail("expected a string", base);
@@ -57,14 +54,10 @@ struct Scan {
                     char hex[5] = { p[0], p[1], p[2], p[3], 0 };
                     unsigned cp = (unsigned)std::strtoul(hex, nullptr, 16);
                     p += 4;
-                    /* A SURROGATE PAIR IS ONE CODEPOINT, AND ENCODING THE HALVES SEPARATELY IS
-                     * NOT UTF-8. JSON has no way to write a codepoint above U+FFFF except as a
-                     * \uD800-\uDBFF \uDC00-\uDFFF pair, and emitting three bytes for each half
-                     * produces CESU-8: it round-trips through this reader but compares unequal to
-                     * the same name written directly, which is what a tensor name is compared for.
-                     * The halves are joined here; an unpaired surrogate is left to the default
-                     * three-byte path rather than rejected, because a name is data to be matched
-                     * and not text to be validated. */
+                    /* Join a surrogate pair (\uD800-\uDBFF \uDC00-\uDFFF) into one codepoint;
+                     * encoding the halves separately is CESU-8, which compares unequal to the same
+                     * name in UTF-8. An unpaired surrogate takes the three-byte path rather than
+                     * being rejected: names are matched, not validated. */
                     if (cp >= 0xD800 && cp < 0xDC00 && end - p >= 6 && p[0] == '\\' &&
                         p[1] == 'u') {
                         char lo_hex[5] = { p[2], p[3], p[4], p[5], 0 };
@@ -108,7 +101,7 @@ struct Scan {
         return true;
     }
 
-    /* Skip one value of any type, so an unknown key inside a tensor object is survivable. */
+    /* Skip one value of any type, so unknown keys in a tensor object are tolerated. */
     bool skip(const char* base) {
         ws();
         if (p >= end) return fail("truncated", base);
@@ -129,7 +122,7 @@ struct Scan {
     }
 };
 
-/* safetensors names its dtypes; we name ours. The table is the only place the two meet. */
+/* safetensors dtype names to RAD dtypes. */
 uint32_t st_dtype(const std::string& s) {
     if (s == "BF16") return RAD_BF16;
     if (s == "F16")  return RAD_F16;
@@ -143,8 +136,7 @@ uint32_t st_dtype(const std::string& s) {
     if (s == "BOOL") return RAD_BOOL;
     if (s == "F8_E4M3") return RAD_F8E4M3;
     if (s == "F8_E5M2") return RAD_F8E5M2;
-    /* F64 and F8_E8M0 have no RAD_ equivalent. Reported by name at use rather than mapped to
-     * something close, because "close" here is a silently wrong number. */
+    /* F64 and F8_E8M0 have no RAD_ equivalent; refused by name at use rather than approximated. */
     return RAD_DT_INVALID;
 }
 
@@ -274,13 +266,10 @@ int SafeTensorsFile::open(const std::string& path) {
         t.bytes  = (uint64_t)(off_end - off_begin);
         t.data   = data_base + t.offset;
 
-        /* THE SHAPE HAS TO DESCRIBE THE SPAN. Every reader of a tensor walks it by shape and
-         * dtype -- numel() elements from `data` -- and not by data_offsets, so a shape that
-         * claims more than the span reads the next tensor's bytes, or past the mapping into a
-         * SIGBUS. The extents are bounded before each multiply because they are numbers from
-         * the file, and a product that wraps can come out equal to the span. An empty shape is a
-         * scalar, one element. A dtype this reader does not know is not sized here; every
-         * consumer refuses it by name. */
+        /* The shape must match the span: readers walk numel() elements from `data`, not
+         * data_offsets, so an oversized shape reads the next tensor or past the mapping. Extents
+         * are untrusted, so bound each multiply against wrap. An empty shape is a scalar. Unknown
+         * dtypes are not sized here; consumers refuse them by name. */
         int64_t elems = 1;
         bool    shape_ok = true;
         for (int64_t d : t.shape) if (d < 0) shape_ok = false; else if (d == 0) elems = 0;

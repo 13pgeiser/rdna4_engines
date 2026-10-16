@@ -1,8 +1,8 @@
 /* share_test.cpp -- which bytes of a container entry one rank takes (core/format/share.h).
  *
- * The loader reads exactly the rectangles weight_share names, so a wrong one is a rank serving
- * another rank's rows -- a model that loads, runs and is wrong in the way spec §17 exists to
- * prevent. Each case is a shape tensor parallelism actually produces, worked by hand.
+ * The loader reads exactly the rectangles weight_share names, so a wrong one makes a rank serve
+ * another rank's rows: a model that loads, runs and is silently wrong (spec §17). Each case is a
+ * shape tensor parallelism produces, worked by hand.
  */
 #include "rad_test.h"
 #include "format/share.h"
@@ -95,8 +95,8 @@ TEST(a_row_shard_takes_rows_of_the_codes_and_their_scale_blocks) {
     CHECK_EQ(s[0].rects[0].rows, (int64_t)2);
 }
 
-/* A STACKED [gate|up] IS CUT IN EACH PART: rank 1 of 2 takes the second half of gate AND the second
- * half of up, never "all of up". */
+/* A stacked [gate|up] is cut in each part: rank 1 of 2 takes the second half of gate and the
+ * second half of up, never "all of up". */
 TEST(a_stacked_weight_is_cut_in_every_part) {
     const RadEncoding e = rad_enc_plain(RAD_BF16);
     /* entry [2 * 512, 64]: gate rows 0..511, up rows 512..1023; a rank's parts are 256 rows each */
@@ -145,7 +145,7 @@ TEST(a_shard_that_splits_a_block_is_refused) {
     CHECK_EQ(share(w, 384, 256, 2, 0, s, &why), RAD_E_SHAPE);
 }
 
-/* AN UNEVEN SPAN: the plugin names this rank's rows of each part, and the scale plane takes the
+/* An uneven span: the plugin names this rank's rows of each part, and the scale plane takes the
  * same slice in its own blocks. */
 TEST(an_uneven_span_is_the_rows_the_plugin_names) {
     const RadEncoding e = fp8_block();
@@ -163,9 +163,9 @@ TEST(an_uneven_span_is_the_rows_the_plugin_names) {
     CHECK_EQ(s[1].rows, (int64_t)3);
 }
 
-/* PER-PART SPANS: a stacked weight whose parts are not the same width -- the delta net's
- * [q|k|v|z] -- takes a span per part, each in its own part's rows. Three ranks over 16 K heads of
- * 128: rank 1 takes K heads [6, 11) of q and of k, and V heads [18, 33) of 48 in v. */
+/* Per-part spans: a stacked weight whose parts differ in width (the delta net's [q|k|v|z]) takes
+ * a span per part, each in its own part's rows. Three ranks over 16 K heads of 128: rank 1 takes
+ * K heads [6, 11) of q and of k, and V heads [18, 33) of 48 in v. */
 TEST(per_part_spans_cut_each_stacked_part_by_its_own_rows) {
     const RadEncoding e = rad_enc_plain(RAD_BF16);
     /* entry: q 2048 | k 2048 | v 6144 rows; rank 1 of 3 declares 640 + 640 + 1920 */
@@ -228,9 +228,9 @@ TEST(a_sharded_vector_is_a_slice_of_it) {
     CHECK_EQ(s[0].rects[0].bytes, (int64_t)(16 * 4));
 }
 
-/* A RESHAPE: a conv kernel [O, C, T, H, W] declared as the [O, C*T*H*W] matrix it is. The bytes
- * do not move, so the share is the whole plane in the declared view -- and a shard of a reshape
- * is a different cut, so it is refused. */
+/* A reshape: a conv kernel [O, C, T, H, W] declared as the [O, C*T*H*W] matrix it is. The bytes
+ * do not move, so the share is the whole plane in the declared view; a shard of a reshape would
+ * be a different cut, so it is refused. */
 TEST(a_whole_plane_may_be_declared_under_another_shape) {
     const RadEncoding e = rad_enc_plain(RAD_BF16);
     WeightInfo w = decl(e, { 0 }, 1152, 1536, RAD_SHARD_NONE, 2);
@@ -246,9 +246,9 @@ TEST(a_whole_plane_may_be_declared_under_another_shape) {
     CHECK_EQ(weight_share(r, e, 5, conv, 2, 0, s, &why), RAD_E_SHAPE);
 }
 
-/* A depthwise conv kernel [C, 1, K] is the [C, K] matrix its inner 1 leaves, so a row shard of
- * it is rows of that matrix -- contiguous, K elements each. An inner dimension that is not 1 is
- * still a rank-3 weight, and which of its dimensions a rank owns is not the loader's to guess. */
+/* A depthwise conv kernel [C, 1, K] is the [C, K] matrix its inner 1 leaves, so a row shard is
+ * contiguous rows of K elements. An inner dimension other than 1 is still a rank-3 weight, and
+ * which dimension a rank owns is not the loader's to guess. */
 TEST(a_unit_inner_dimension_is_sharded_as_the_matrix_it_leaves) {
     const RadEncoding e = rad_enc_plain(RAD_BF16);
     WeightInfo w = decl(e, { 0 }, 10240, 4, RAD_SHARD_ROW, 2);

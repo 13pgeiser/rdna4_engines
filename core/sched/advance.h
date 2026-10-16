@@ -1,27 +1,23 @@
 /* advance.h -- the card's own bookkeeping between passes: which drafts a verify step accepted, and
  * the inputs of every pass that follows from it.
  *
- * WHY THE CARD DOES THIS AND NOT THE HOST. A speculative step is a verify pass and the draft passes
- * behind it, and every pass after the verify depends on how many drafts it accepted: the draft
- * head continues from the accepted position, and the next verify starts after it. Deciding that on
- * the host means reading the sampled tokens back, waiting for them, and only then staging the next
- * pass -- a synchronisation per step during which the card has nothing queued. Deciding it here
- * lets the host stage and issue every pass of a step, and the next step, before any of them has
- * run: the rule is a compare of a few integers a sequence, and the card already holds all of them.
+ * Why on the card: every pass after a verify depends on how many drafts it accepted (the draft
+ * head continues from the accepted position, the next verify starts after it). Deciding that on
+ * the host costs a readback and a sync per step with the card idle. On the card it is a compare
+ * of a few integers per sequence, so the host can stage and issue every pass of a step, and the
+ * next step, before any of them runs.
  *
- * THE STATE IS PER SEQUENCE SLOT (StepSlot), in device memory on every rank, and it carries exactly
- * what a pass needs that the host cannot know in advance: where the next verify starts, what it
- * rolls back, which tokens it verifies, and where the draft head continues from. Every rank keeps
- * its own copy and computes the same numbers from the same sampled tokens, so no rank ever reads
- * another's memory.
+ * State: one StepSlot per sequence slot, in device memory on every rank. It holds what the host
+ * cannot know in advance: where the next verify starts, what it rolls back, which tokens it
+ * verifies and where the draft head continues. Each rank computes the same numbers from the same
+ * sampled tokens, so no rank reads another's memory.
  *
- * A PASS NAMES ITS DEVICE ROWS. A batch can mix rows whose inputs the host staged -- a prefill
- * chunk, a history row for positions the host already knows -- with rows whose positions come from
- * the card; `rows[0][i]` says which, and the advance leaves a host row exactly as it was uploaded.
+ * Device rows: a batch can mix host-staged rows (a prefill chunk, a history row at known
+ * positions) with rows whose positions come from the card. `rows[0][i]` says which; the advance
+ * leaves a host row as uploaded.
  *
- * The same code runs on the host backend, where device memory is host memory: the rows run on the
- * issuing thread once the stream has drained, which is their place in stream order
- * (advance_impl.h is shared by both builds).
+ * On the host backend, device memory is host memory and the rows run on the issuing thread once
+ * the stream has drained (advance_impl.h is shared by both builds).
  */
 #pragma once
 #include <cstdint>
@@ -87,18 +83,17 @@ struct AdvanceArgs {
     int64_t src_pitch = 1;
     const int32_t* eog = nullptr;   /* end-of-generation ids, sorted */
     int32_t n_eog = 0;
-    /* THE ROTARY PLANES (RadBatch::rope_pos), [3][rope_pitch] at rope_off, or rope_off -1 when the
-     * build carries none. A row whose position the card moves carries its rotary position along
-     * by the offset the host staged for it: the rows the card owns are decode and draft rows, all
-     * text, and text rotates at its index plus one per-sequence shift. A row the card leaves at
-     * the host's position keeps the host's three components, which is what a media token needs. */
+    /* Rotary planes (RadBatch::rope_pos), [3][rope_pitch] at rope_off; rope_off -1 when the build
+     * has none. A row the card moves keeps the host-staged offset between its position and its
+     * rotary position: card-owned rows are decode and draft rows, all text, which rotate at their
+     * index plus a per-sequence shift. A row left at the host's position keeps the host's three
+     * components, as a media token needs. */
     int64_t rope_off = -1;
     int32_t rope_pitch = 0;
-    /* A SERIAL HEAD WITH NO CACHE OF ITS OWN (rad_drafter_shared_kv), read by ADV_HIST and
-     * ADV_ROUND alone: its history pass is one row a sequence at the committed position, and every
-     * round sits there too, its context ending at that position. `rot_shift` is where those rows
-     * sit for the rotary, 0 or 1 past the committed position. Zero for every other head, whose
-     * passes advance exactly as they always did. */
+    /* A serial head with no cache of its own (rad_drafter_shared_kv), read by ADV_HIST and
+     * ADV_ROUND only: its history pass is one row per sequence at the committed position, and
+     * every round sits there too, with context ending at that position. `rot_shift` is the rotary
+     * position of those rows, 0 or 1 past the committed position. Zero for every other head. */
     int32_t shared_kv = 0;
     int32_t rot_shift = 0;
 };

@@ -1,0 +1,11 @@
+<bos><|turn>system
+<|think|>
+<|tool>declaration:read{description:<|"|>Read a file.<|"|>,parameters:{properties:{limit:{type:<|"|>INTEGER<|"|>},path:{description:<|"|>Absolute path<|"|>,type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:edit{description:<|"|>Apply edits — exact text, «quoted» & <tagged>, 日本語.<|"|>,parameters:{properties:{dry_run:{type:<|"|>BOOLEAN<|"|>},edits:{items:{properties:{newText:{type:<|"|>STRING<|"|>},oldText:{type:<|"|>STRING<|"|>}},required:[<|"|>oldText<|"|>,<|"|>newText<|"|>],type:<|"|>OBJECT<|"|>},type:<|"|>ARRAY<|"|>},mode:{enum:[<|"|>fast<|"|>,<|"|>safe<|"|>],type:<|"|>STRING<|"|>},path:{type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>,<|"|>edits<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:ping{description:<|"|>Takes no arguments.<|"|>,parameters:{type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+Edit both files, then ping.<turn|>
+<|turn>model
+<|tool_call>call:edit{dry_run:false,edits:[{newText:<|"|>    return a < b & c  # it's
+<|"|>,oldText:<|"|>    return a
+<|"|>},{newText:<|"|>\"<|"|>,oldText:<|"|>x	y<|"|>}],mode:<|"|>safe<|"|>,path:<|"|>/work/a.py<|"|>}<tool_call|><|tool_call>call:read{limit:3,path:<|"|>/work/über.py<|"|>}<tool_call|><|tool_call>call:ping{}<tool_call|><|tool_response>response:edit{value:<|"|>{"ok": true}<|"|>}<tool_response|><|tool_response>response:read{value:<|"|>x = 1
+<|"|>}<tool_response|><|tool_response>response:ping{value:<|"|>pong<|"|>}<tool_response|>Doing all three.<turn|>
+<|channel>thought

@@ -1,64 +1,47 @@
-/* avx_check.cpp -- rad-avx-check: libavx against libref, every op, every ISA level, no engine.
+/* avx_check.cpp -- rad-avx-check: a host kernel library against libref, every op, every ISA level,
+ * no engine.
  *
- * ============================== WHAT THIS IS AND WHY IT IS NOT rad-kbench ==============================
+ * rad-kbench needs rad_core, a Geometry, the plugin loader and sometimes a recorded fixture, i.e.
+ * building the engine. This is the same comparison with only two dlopen calls, a geometry table and
+ * libref's operand descriptions. Neither plugin is linked, so the .so under test is the one the
+ * engine would load.
  *
- * rad-kbench is the tree's kernel checker and it is the right tool for a DEVICE plugin: it needs
- * rad_core, a Geometry, a plugin loader and (for the fixture path) a recorded artifact. Building
- * it means building the engine, which on a machine with no device toolchain means building the
- * engine's host half to test a host plugin. This is the same comparison with nothing under it: two dlopen calls, a
- * table of geometries, and libref's own operand descriptions to size the buffers.
+ * Checks, in order:
  *
- * It links NEITHER plugin. That is not laziness -- the claim being made is about the .so the
- * engine would load, and a checker that statically linked the kernels would be exercising a
- * different binary with different inlining and different flags.
+ *   1. Schema agreement. The loader refuses a whole plugin on any schema disagreement, which would
+ *      make every row unreachable. libavx's schema table is a hand-kept copy of libref's
+ *      (avx_registry.cpp), checked here with the loader's rule: parameter key/type/requiredness
+ *      and operand role/optionality, by position; names are not compared.
  *
- * ============================== THE FOUR THINGS IT CHECKS, IN ORDER ==============================
+ *   2. Coverage. libavx must implement every op libref implements. An absent row and a row that
+ *      returns RAD_E_UNSUPPORTED are reported separately and neither passes; this catches kernels
+ *      built but never wired.
  *
- *   1. SCHEMA AGREEMENT, before any arithmetic. The loader refuses two plugins whose schemas for
- *      one op disagree, and it refuses the WHOLE plugin -- so a single drifted parameter makes
- *      every row libavx carries unreachable, and the message an operator sees names one op and
- *      leaves them to find the rest. libavx's schema table is a hand-kept copy of libref's
- *      (avx_registry.cpp says so at length); this is what keeps the copy honest, running the
- *      loader's own rule: parameter key/type/requiredness positionally, operand role/optionality
- *      positionally, names deliberately NOT compared.
+ *   3. The numbers. Both plugins get byte-identical inputs and every OUT and INOUT operand is
+ *      compared. The finiteness pattern is compared first (a NaN on one side only is a failure;
+ *      `rel > tol` is false for NaN), and ids exactly. Every buffer carries guard bytes on both
+ *      sides, and every input must be unchanged after the launch. A case libref cannot describe
+ *      or run fails: the table is then wrong. Hand-built cases cover operand shapes a description
+ *      cannot draw (avx_check_hand.cpp).
  *
- *   2. COVERAGE. Every op libref implements, libavx must implement. A row that is ABSENT and a row
- *      that RETURNS RAD_E_UNSUPPORTED are reported differently and neither is reported as a pass.
- *      This is the check that catches a kernel that was built and never wired, because a kernel
- *      that declines is indistinguishable from a kernel that works to anything that only looks for
- *      the return codes it expects.
+ *   4. Threads. No check geometry reaches the kernels' parallel thresholds, so every case runs a
+ *      second time with each parallel region forced to several threads (avx_par_force) and must
+ *      reproduce the serial run byte for byte.
  *
- *   3. THE NUMBERS. Both plugins are handed BYTE-IDENTICAL inputs and every OUT and INOUT operand
- *      is compared. The FINITENESS PATTERN is compared first and separately: a NaN on one side and
- *      a number on the other is a failure, not a tolerance question, and the obvious spelling
- *      (`rel > tol || rel < 0`) is FALSE for NaN -- which is how a NaN passes a comparison
- *      silently. After the geometry table, a set of HAND-BUILT cases covers the operand shapes a
- *      description cannot draw -- strided column slices, several sequences, rolling windows read
- *      past offset zero, a band above the operand's rows (see hand_cases below).
+ *   5. Every ISA level, each forced in turn through avx_isa_force (an exported symbol, not an env
+ *      variable). A level the CPU cannot execute is reported as not executable and not counted.
  *
- *   4. EVERY ISA LEVEL. The scalar, AVX, AVX2 and AVX-512 paths are four instruction streams
- *      compiled from one source, and only the level the machine under it happens to execute gets
- *      exercised by accident. Each is forced in turn through avx_isa_force -- an exported
- *      symbol rather than an environment variable, because an env switch that changes what a
- *      kernel computes is exactly what this project refuses to have. A level the CPU cannot
- *      execute is reported as NOT EXECUTABLE and counted nowhere: claiming a pass for a path that
- *      never ran is the one result worse than a failure.
+ * Another host library is checked the same way at the one level it selects for itself, with the
+ * row the selector would resolve each geometry to; the ops it does not implement are listed rather
+ * than failed (libavx/README.md, "Checking another host library").
  */
-#include "avx_harness.h"
+#include "avx_check.h"
 #include "avx_isa.h"
 
-#include <deque>
-#include <functional>
+#include <cinttypes>
 
-/* ================================================================== error metric
- * rad-kbench's, including the thing its header says it got wrong once: the finiteness pattern is
- * compared BEFORE any norm. */
-struct Err {
-    double max_abs = 0, max_rel = 0, rel_l2 = 0;
-    int64_t nonfinite_gap = 0, n = 0;
-};
-
-static Err compare(const float* got, const float* ref, int64_t n) {
+/* ================================================================== comparison */
+Err compare(const float* got, const float* ref, int64_t n) {
     Err e;
     e.n = n;
     double num = 0, den = 0;
@@ -77,10 +60,67 @@ static Err compare(const float* got, const float* ref, int64_t n) {
     return e;
 }
 
-/* rad-kbench's tolerance table, and it means the same thing here: what a DIFFERENT SUMMATION ORDER
- * of the same arithmetic costs, not what a wrong kernel costs. A vectorised reduction IS that
- * different order, so these are the right numbers for this comparison rather than a loosened
- * version of them. A kernel with a transposed operand lands nowhere near any of these. */
+bool same_values(uint32_t dt, const void* ref, const void* got, int64_t n, double tol,
+                 double* rel, std::string* why) {
+    char buf[256];
+    if (dt == RAD_I32 || dt == RAD_U32 || dt == RAD_I64) {
+        int64_t bad = 0, first = -1;
+        for (int64_t i = 0; i < n; ++i)
+            if (avx::ld_int_dt(dt, ref, i) != avx::ld_int_dt(dt, got, i)) {
+                if (first < 0) first = i;
+                ++bad;
+            }
+        *rel = bad ? 1.0 : 0.0;
+        if (!bad) return true;
+        std::snprintf(buf, sizeof buf, "%lld of %lld ids differ, first at %lld: %lld where libref "
+                      "has %lld", (long long)bad, (long long)n, (long long)first,
+                      (long long)avx::ld_int_dt(dt, got, first),
+                      (long long)avx::ld_int_dt(dt, ref, first));
+        *why = buf;
+        return false;
+    }
+    std::vector<float> fr((size_t)n), fa((size_t)n);
+    h_widen(ref, dt, n, fr.data());
+    h_widen(got, dt, n, fa.data());
+    const Err e = compare(fa.data(), fr.data(), n);
+    *rel = e.rel_l2;
+    if (e.nonfinite_gap == 0 && e.rel_l2 <= tol) return true;
+    std::snprintf(buf, sizeof buf, "rel_l2=%.3e max_abs=%.3e nonfinite_gap=%lld tol=%.1e",
+                  e.rel_l2, e.max_abs, (long long)e.nonfinite_gap, tol);
+    *why = buf;
+    return false;
+}
+
+bool parallel_rerun(const Lib& lib, int threads, const std::vector<uint8_t*>& outs,
+                    const std::vector<size_t>& bytes, const std::function<void()>& reset,
+                    const std::function<int()>& launch, std::string* why) {
+    std::vector<std::vector<uint8_t>> serial(outs.size());
+    for (size_t i = 0; i < outs.size(); ++i) serial[i].assign(outs[i], outs[i] + bytes[i]);
+    reset();
+    lib.par_force(threads);
+    const int rc = launch();
+    lib.par_force(0);
+    char buf[160];
+    if (rc < 0) {
+        std::snprintf(buf, sizeof buf, "on %d threads it returned %d", threads, rc);
+        *why = buf;
+        return false;
+    }
+    for (size_t i = 0; i < outs.size(); ++i) {
+        if (std::memcmp(outs[i], serial[i].data(), bytes[i]) == 0) continue;
+        size_t at = 0;
+        while (at < bytes[i] && outs[i][at] == serial[i][at]) ++at;
+        std::snprintf(buf, sizeof buf, "on %d threads output buffer %zu differs from the serial "
+                      "run from byte %zu of %zu", threads, i, at, bytes[i]);
+        *why = buf;
+        return false;
+    }
+    return true;
+}
+
+/* rad-kbench's tolerance table: rel_l2 bounds for the same arithmetic in a different summation
+ * order, which is what a vectorised reduction is. A wrong kernel (e.g. a transposed operand) lands
+ * far outside these. First match wins. */
 struct Tol { const char* op; const char* dtype; double rel_l2; };
 static const Tol kTol[] = {
     { "gemm_nt",      "bf16",     8e-3 },
@@ -89,6 +129,9 @@ static const Tol kTol[] = {
     { "gemm_nt",      "*",        3e-2 },
     { "logits_gemm",  "bf16",     8e-3 },
     { "logits_gemm",  "f32",      2e-5 },
+    /* The plain grouped GEMM is gemm_nt's arithmetic per expert, held to its bounds. */
+    { "moe_gemm",     "f32",      2e-5 },
+    { "moe_gemm",     "bf16",     8e-3 },
     { "moe_gemm",     "*",        3e-2 },
     { "attn_",        "bf16",     2e-2 },
     { "attn_",        "f32",      1e-4 },
@@ -100,6 +143,8 @@ static const Tol kTol[] = {
     { "quant_act",    "*",        1e-6 },
     { "dequant",      "*",        1e-6 },
     { "cast",         "*",        1e-6 },
+    /* An fp8 cache stores x / scale narrowed once; both libraries narrow the same quotient. */
+    { "kv_store",     "fp8_e4m3", 1e-6 },
     { "all_reduce",   "f32",      1e-6 },
     { "all_reduce",   "*",        4e-3 },
     { "all_gather",   "*",        0.0  },
@@ -121,119 +166,348 @@ static double tolerance_for(const std::string& op, const char* dtype) {
 
 struct Stats {
     int checked = 0, passed = 0, failed = 0, skipped = 0, declined = 0, missing = 0;
+    int unselected = 0, rerun = 0;
     double worst = 0;
     std::string worst_where;
 };
 
-static void run_case(const Lib& ref, const Lib& avx, const Case& c, bool verbose,
-                     double tol_override, Stats* st) {
-    const RadKernelInfo* kr = ref.row(c.op);
-    const RadKernelInfo* ka = avx.row(c.op);
-    if (!kr) { ++st->skipped; return; }
-    if (!ka) { ++st->missing; return; }
+/* After a launch on one side: both guards of every operand and of the scratch intact, and every
+ * input operand as drawn. Prints each violation and returns false. */
+static bool intact(const Prepared& pr, bool side_a, const char* who, const Case& c) {
+    bool ok = true;
+    auto name = [&](size_t i) {
+        return pr.schema->operands[i].name ? pr.schema->operands[i].name : "?";
+    };
+    for (size_t i = 0; i < pr.opd.size(); ++i) {
+        const Opd& o = pr.opd[i];
+        if (o.absent) continue;
+        const GBuf& g = side_a ? o.a : o.b;
+        if (const int hit = g.guard_hit()) {
+            std::printf("  FAIL %-20s %s\n       %s wrote %s operand %d (%s)\n", c.op,
+                        case_str(c).c_str(), who, hit < 0 ? "before the start of" : "past the end of",
+                        (int)i, name(i));
+            ok = false;
+        }
+        const bool input = o.role == RAD_OPD_IN || o.role == RAD_OPD_WEIGHT ||
+                           o.role == RAD_OPD_WTAB;
+        if (input && g.size() && std::memcmp(g.data(), o.master.data(), g.size()) != 0) {
+            std::printf("  FAIL %-20s %s\n       %s changed its input operand %d (%s)\n", c.op,
+                        case_str(c).c_str(), who, (int)i, name(i));
+            ok = false;
+        }
+    }
+    if ((side_a ? pr.sa : pr.sb).guard_hit()) {
+        std::printf("  FAIL %-20s %s\n       %s wrote outside its scratch\n", c.op,
+                    case_str(c).c_str(), who);
+        ok = false;
+    }
+    return ok;
+}
 
-    /* Side A is libref, side B is libavx. The description comes from the ORACLE: the two have to
-     * be handed the same bytes for the comparison to mean anything, and where they could disagree
-     * about an extent the reference semantics are the ones that define the op. */
-    /* A SKIP IS REPORTED WITH ITS REASON, and that is not a nicety. A silent skip is how a checker
-     * reports coverage it does not have, and the two reasons here mean completely
-     * different things. "the oracle cannot describe this geometry" is a limit of libref's shape
-     * hook and the case should be rewritten or dropped; "the oracle declined the launch" means the
-     * case is asking for something the op does not define. Either way it is the CASE TABLE that is
-     * wrong, and a count with no name does not say which line. */
-    Prepared pr = h_prepare(ref, kr, c, kr, ka);
-    if (pr.skipped || !pr.ok) {
+static void run_case(const Check& ck, const Case& c, Stats* st) {
+    const Lib& ref = *ck.ref;
+    const Lib& lib = *ck.lib;
+    const char* who = lib.info->name;
+    auto skip = [&](const char* why) {
         ++st->skipped;
-        if (verbose)
-            std::printf("  %-22s %-46s SKIP: libref's opd_shape declines this geometry\n",
-                        c.op, case_str(c).c_str());
+        std::printf("  SKIP %-20s %s\n       %s\n", c.op, case_str(c).c_str(), why);
+    };
+    const RadKernelInfo* kr = ref.row(c.op);
+    if (!kr) { skip("libref has no row for the op"); return; }
+    std::vector<RadParam> params;
+    for (const P& p : c.p) params.push_back(h_mk(p));
+    const RadKernelInfo* ka = lib.select(c.op, params.data(), (int)params.size());
+    if (!ka) {
+        if (lib.host_row(c.op)) {
+            ++st->unselected;
+            if (ck.verbose)
+                std::printf("  %-22s %-46s no row's constraints admit it\n", c.op,
+                            case_str(c).c_str());
+        } else {
+            ++st->missing;
+        }
         return;
     }
+
+    /* Side A is libref, side B the library under test; operands are sized by the oracle's
+     * description. A case libref cannot describe or run fails as a skip: the table is wrong. */
+    Prepared pr = h_prepare(ref, kr, c, kr, ka);
+    if (pr.skipped || !pr.ok) { skip("libref's opd_shape declines this geometry"); return; }
 
     const int rr = kr->launch(&pr.aa, nullptr);
     const int ra = ka->launch(&pr.ab, nullptr);
 
-    /* THE ORACLE IS ASKED FIRST, and getting this order wrong cost a false report. If libref
-     * declines the geometry there is nothing to compare against, so the case is SKIPPED -- even
-     * when libavx declined it too, which is the correct and identical behaviour rather than a gap.
-     * Reporting libavx's decline before looking at the oracle's blamed the plugin for a case the
-     * op does not define (it was a case table asking for an `a_order` spelling neither
-     * implementation accepts). A DECLINE only means something when the oracle produced an answer. */
+    /* Check the oracle first: if libref declines, there is nothing to compare, even if the library
+     * declined too. A decline only counts when libref answered. */
     if (rr < 0) {
-        ++st->skipped;
-        if (verbose)
-            std::printf("  %-22s %-46s SKIP: libref's launch returned %d\n", c.op,
-                        case_str(c).c_str(), rr);
+        char why[64];
+        std::snprintf(why, sizeof why, "libref's launch returned %d", rr);
+        skip(why);
         return;
     }
     if (ra == RAD_E_UNSUPPORTED) {
         ++st->declined;
-        if (verbose) std::printf("  %-22s %-46s DECLINED\n", c.op, case_str(c).c_str());
+        std::printf("  %-22s %-46s DECLINED\n", c.op, case_str(c).c_str());
         return;
     }
+    ++st->checked;
     if (ra < 0) {
-        std::printf("  FAIL %-20s %s\n       libavx returned %d where libref returned %d\n",
-                    c.op, case_str(c).c_str(), ra, rr);
+        std::printf("  FAIL %-20s %s\n       %s returned %d where libref returned %d\n", c.op,
+                    case_str(c).c_str(), who, ra, rr);
         ++st->failed;
-        ++st->checked;
         return;
     }
 
-    bool ok = true;
+    bool ok = intact(pr, true, "libref", c);
+    ok = intact(pr, false, who, c) && ok;
     double worst = 0;
-    const double tol = tol_override >= 0 ? tol_override : tolerance_for(c.op, case_dtype(c));
+    const double tol = ck.tol_override >= 0 ? ck.tol_override : tolerance_for(c.op, case_dtype(c));
     for (size_t i = 0; i < pr.opd.size(); ++i) {
         const Opd& o = pr.opd[i];
         if (o.absent || o.n <= 0) continue;
         if (o.role != RAD_OPD_OUT && o.role != RAD_OPD_INOUT) continue;
-        std::vector<float> fr((size_t)o.n), fa((size_t)o.n);
-        h_widen(o.a.data(), o.d.dtype, o.n, fr.data());
-        h_widen(o.b.data(), o.d.dtype, o.n, fa.data());
-        const Err e = compare(fa.data(), fr.data(), o.n);
-        worst = std::max(worst, e.rel_l2);
-        if (e.nonfinite_gap != 0 || !(e.rel_l2 <= tol)) {
+        double rel = 0;
+        std::string why;
+        if (!same_values(o.d.dtype, o.a.data(), o.b.data(), o.n, tol, &rel, &why)) {
             ok = false;
-            std::printf("  FAIL %-20s %s\n       operand %d (%s) rel_l2=%.3e max_abs=%.3e "
-                        "nonfinite_gap=%lld tol=%.1e\n",
-                        c.op, case_str(c).c_str(), (int)i,
-                        pr.schema->operands[i].name ? pr.schema->operands[i].name : "?",
-                        e.rel_l2, e.max_abs, (long long)e.nonfinite_gap, tol);
+            std::printf("  FAIL %-20s %s\n       operand %d (%s): %s\n", c.op, case_str(c).c_str(),
+                        (int)i, pr.schema->operands[i].name ? pr.schema->operands[i].name : "?",
+                        why.c_str());
         }
+        worst = std::max(worst, rel);
     }
-    ++st->checked;
+    /* A launch that left every output's values as drawn compares the draw with itself: the case
+     * proves nothing about the arithmetic (all-zero weights, or a stage its parameters switch
+     * off). -0 counts as 0, so a product of zeros does not pass for work. */
+    bool wrote = false;
+    for (const Opd& o : pr.opd) {
+        if (o.absent || o.n <= 0 || (o.role != RAD_OPD_OUT && o.role != RAD_OPD_INOUT)) continue;
+        std::vector<float> now((size_t)o.n), was((size_t)o.n);
+        h_widen(o.a.data(), o.d.dtype, o.n, now.data());
+        h_widen(o.master.data(), o.d.dtype, o.n, was.data());
+        for (int64_t i = 0; i < o.n && !wrote; ++i)
+            wrote = !(now[(size_t)i] == was[(size_t)i]);
+    }
+    if (!wrote) {
+        ok = false;
+        std::printf("  FAIL %-20s %s\n       libref's launch changed no output byte, so the "
+                    "comparison is vacuous\n", c.op, case_str(c).c_str());
+    }
+
+    /* The same launch with every parallel region on several threads, against the serial bytes. */
+    if (ok && ck.threads > 0 && lib.par_force) {
+        std::vector<uint8_t*> outs;
+        std::vector<size_t> bytes;
+        for (Opd& o : pr.opd)
+            if (!o.absent && o.n > 0 && (o.role == RAD_OPD_OUT || o.role == RAD_OPD_INOUT)) {
+                outs.push_back(o.b.data());
+                bytes.push_back(o.b.size());
+            }
+        auto reset = [&] {
+            for (Opd& o : pr.opd)
+                if (!o.absent && o.n > 0 && (o.role == RAD_OPD_OUT || o.role == RAD_OPD_INOUT))
+                    std::memcpy(o.b.data(), o.master.data(), o.master.size());
+            if (!pr.sb.empty()) std::memset(pr.sb.data(), 0, pr.sb.size());
+        };
+        std::string why;
+        if (!parallel_rerun(lib, ck.threads, outs, bytes, reset,
+                            [&] { return ka->launch(&pr.ab, nullptr); }, &why)) {
+            ok = false;
+            std::printf("  FAIL %-20s %s\n       %s\n", c.op, case_str(c).c_str(), why.c_str());
+        }
+        ok = intact(pr, false, who, c) && ok;
+        ++st->rerun;
+    }
+
     if (ok) ++st->passed; else ++st->failed;
     if (worst > st->worst) {
         st->worst = worst;
         st->worst_where = std::string(c.op) + " " + case_str(c);
     }
-    if (verbose)
+    if (ck.verbose)
         std::printf("  %-22s %-46s rel_l2=%.3e tol=%.1e %s\n", c.op, case_str(c).c_str(), worst,
                     tol, ok ? "ok" : "FAIL");
 }
 
+/* ================================================================== zero rows
+ *
+ * docs/OPS.md: an op issued over zero rows returns RAD_E_SHAPE and writes nothing. Each op's first
+ * case is described at its row count and at twice it; every extent that changes is a row extent
+ * and is set to zero, and both plugins are launched with the row parameter at 0 (a cumulative
+ * length draws as all zeros, every sequence empty). libref answering anything else means the
+ * construction does not fit the op, which is reported and not counted. */
+static bool zero_row_cases(const Check& ck, const std::vector<Case>& cases) {
+    const Lib& ref = *ck.ref;
+    const Lib& lib = *ck.lib;
+    std::vector<std::string> seen;
+    int checked = 0, failed = 0, unfit = 0;
+    for (const Case& c : cases) {
+        if (c.speed_only || (!ck.only_op.empty() && ck.only_op != c.op)) continue;
+        if (std::find(seen.begin(), seen.end(), c.op) != seen.end()) continue;
+        seen.push_back(c.op);
+        const char* key = nullptr;
+        for (const char* k : { "M", "q_len", "numel" })
+            for (const P& p : c.p)
+                if (!key && p.kind == RAD_P_INT && !std::strcmp(p.k, k)) key = k;
+        const RadKernelInfo* kr = ref.row(c.op);
+        if (!key || !kr || !kr->opd_shape) continue;
+        auto with = [&](long long r) {
+            std::vector<RadParam> v;
+            for (const P& p : c.p) {
+                v.push_back(h_mk(p));
+                if (!std::strcmp(p.k, key)) v.back().ival = r == 2 ? 2 * p.i : 0;
+            }
+            return v;
+        };
+        long long r1 = 0;
+        for (const P& p : c.p) if (!std::strcmp(p.k, key)) r1 = p.i;
+        std::vector<RadParam> p1, p2 = with(2), p0 = with(0);
+        for (const P& p : c.p) p1.push_back(h_mk(p));
+        const RadKernelInfo* ka = lib.select(c.op, p0.data(), (int)p0.size());
+        const RadOpSchema* sch = ref.schema(c.op);
+        if (!ka || !sch || r1 <= 0) continue;
+
+        Prepared pr;
+        pr.schema = sch;
+        pr.opd.assign((size_t)sch->n_operands, Opd{});
+        bool described = true;
+        for (int i = 0; i < sch->n_operands && described; ++i) {
+            RadOpdDesc d1{}, d2{};
+            d1.idx_const = d2.idx_const = -1;
+            described = kr->opd_shape(p1.data(), (int)p1.size(), i, &d1) >= 0 &&
+                        kr->opd_shape(p2.data(), (int)p2.size(), i, &d2) >= 0;
+            Opd& o = pr.opd[(size_t)i];
+            o.d = d1;
+            for (uint32_t k = 0; k < d1.rank; ++k)
+                if (d1.shape[k] != d2.shape[k]) o.d.shape[k] = 0;
+            o.absent = (d1.flags & RAD_OPD_F_ABSENT) != 0;
+            o.role = sch->operands[i].role;
+            o.n = o.absent ? 0 : desc_numel(o.d);
+        }
+        if (!described) continue;
+        for (size_t k = 0; k < pr.opd.size(); ++k) h_draw(pr.opd, k, 0, 0x2e70u + k);
+        for (Opd& o : pr.opd) {
+            o.a.assign(o.master);
+            o.b.assign(o.master);
+        }
+        pr.params = p0;
+        h_build_tensors(pr.opd, true, &pr.ta);
+        h_build_tensors(pr.opd, false, &pr.tb);
+        pr.aa.t = pr.ta.data(); pr.aa.n_t = (int)pr.ta.size();
+        pr.aa.p = pr.params.data(); pr.aa.n_p = (int)pr.params.size();
+        pr.aa.world_size = 1;
+        pr.ab = pr.aa;
+        pr.ab.t = pr.tb.data();
+
+        const int rr = kr->launch(&pr.aa, nullptr);
+        if (rr != RAD_E_SHAPE) {
+            ++unfit;
+            if (ck.verbose)
+                std::printf("  %-22s zero rows: libref returned %d; not counted\n", c.op, rr);
+            continue;
+        }
+        const int ra = ka->launch(&pr.ab, nullptr);
+        bool untouched = true;
+        for (const Opd& o : pr.opd)
+            untouched = untouched && o.b.guard_hit() == 0 &&
+                        std::memcmp(o.b.data(), o.master.data(), o.master.size()) == 0;
+        ++checked;
+        if (ra != RAD_E_SHAPE || !untouched) {
+            ++failed;
+            std::printf("  FAIL %-20s zero rows (%s = 0)\n       %s returned %d%s; libref "
+                        "refuses with RAD_E_SHAPE and writes nothing\n", c.op, key,
+                        lib.info->name, ra, untouched ? "" : " and wrote");
+        } else if (ck.verbose) {
+            std::printf("  %-22s zero rows refused, nothing written\n", c.op);
+        }
+    }
+    if (checked || unfit)
+        std::printf("  zero rows: %d ops checked, %d failed%s\n", checked, failed,
+                    unfit ? (", " + std::to_string(unfit) + " not reducible to zero rows").c_str()
+                          : "");
+    return failed == 0;
+}
+
 /* ================================================================== exhaustive conversion
  *
- * THE ONE CHECK A DRAW CANNOT MAKE. Every geometry in the case table fills its operands with
- * standard normals, which is the right domain for an activation and reaches almost none of the
- * interesting bit patterns of a narrow float: no NaN, no infinity, no subnormal, no negative zero.
- * A conversion is exactly where those live -- `cvt_fp8e4m3_to_f32` has a separate branch for the
- * subnormal range and another for the format's single NaN encoding, and a draw of normals exercises
- * neither.
- *
- * So the 8-bit and 16-bit formats are checked EXHAUSTIVELY: every one of the 256 or 65536 bit
- * patterns, through the plugin's own `cast`, against libref's. For an 8-bit source that is the
- * complete input space and the result is a proof rather than evidence; for a 16-bit one it is the
- * complete space too. The narrowing direction (f32 -> narrow) cannot be exhaustive over 2^32, so it
- * is fed the widened patterns back plus the boundary values of each format -- which is where a
- * narrowing rounds differently if it is going to.
- *
- * It is worth the forty lines because this is the class of bug that survives everything else: the
- * fp8 encode's lower bound was wrong by seven octaves and every geometry in the table still passed
- * until `cast` was run at a tolerance of 1e-6. */
-static bool exhaustive_cast(const Lib& ref, const Lib& avx, bool verbose) {
+ * Drawn normals reach almost none of a narrow float's special patterns (NaN, infinity,
+ * subnormals, negative zero), yet conversions branch on exactly those (e.g. cvt_fp8e4m3_to_f32's
+ * subnormal and NaN handling). So every bit pattern of each 8- and 16-bit format is widened to f32
+ * through both plugins' `cast` and compared bit for bit, NaNs as NaNs. The narrowing direction
+ * cannot cover 2^32 inputs. It is fed every representable value (the widened patterns), then
+ * every midpoint between two adjacent values with 1 and 2 f32 ulps to either side, where
+ * round-to-nearest-even decides and a rounding error lands, then the overflow edges and every
+ * class of NaN. */
+static bool exhaustive_cast(const Check& ck) {
+    const Lib& ref = *ck.ref;
+    const Lib& lib = *ck.lib;
     const RadKernelInfo* kr = ref.row("cast");
-    const RadKernelInfo* ka = avx.row("cast");
-    if (!kr || !ka) return true;
+    if (!kr || !lib.host_row("cast")) {
+        std::printf("EXACT   cast: no row in %s\n", kr ? lib.info->name : "libref");
+        return kr && !ck.own;
+    }
+
+    /* One cast of `n` elements through both plugins; the outputs compared byte for byte, element
+     * by element. Returns false having printed the first difference. */
+    auto both = [&](const char* label, uint32_t from, const char* fname, uint32_t to,
+                    const char* tname, const void* src, int64_t n, std::vector<uint8_t>* out_a) {
+        const size_t ob = dt_bytes(to, n), eb = (size_t)rad_dtype_bits(to) / 8;
+        std::vector<uint8_t> ya(ob, 0), yb(ob, 0);
+        RadParam p[4];
+        p[0] = RadParam{ "M", RAD_P_INT, 1, 0, nullptr, 0 };
+        p[1] = RadParam{ "n", RAD_P_INT, (long long)n, 0, nullptr, 0 };
+        p[2] = RadParam{ "from", RAD_P_STR, 0, 0, fname, 0 };
+        p[3] = RadParam{ "to", RAD_P_STR, 0, 0, tname, 0 };
+        const RadKernelInfo* kb = lib.select("cast", p, 4);
+        if (!kb) {
+            std::printf("EXACT   cast %-16s %-10s no row of %s admits it\n", label, fname,
+                        lib.info->name);
+            return !ck.own;
+        }
+        auto mk_t = [&](const void* data, uint32_t dt) {
+            RadTensor t{};
+            t.data = const_cast<void*>(data); t.dtype = dt; t.rank = 2;
+            t.shape[0] = 1; t.shape[1] = n;
+            t.stride[0] = n; t.stride[1] = 1;
+            return t;
+        };
+        RadTensor ta[2] = { mk_t(src, from), mk_t(ya.data(), to) };
+        RadTensor tb[2] = { mk_t(src, from), mk_t(yb.data(), to) };
+        RadArgs aa{}, ab{};
+        aa.t = ta; aa.n_t = 2; aa.p = p; aa.n_p = 4; aa.world_size = 1;
+        ab = aa; ab.t = tb;
+        const int rr = kr->launch(&aa, nullptr), ra = kb->launch(&ab, nullptr);
+        if (rr < 0 || ra < 0) {
+            std::printf("EXACT   cast %-16s refused: libref %d, %s %d\n", label, rr,
+                        lib.info->name, ra);
+            return false;
+        }
+        /* Widened NaNs need only be NaNs: F16C quiets a signalling one, libref keeps it. */
+        int64_t bad = 0, first = -1;
+        for (int64_t i = 0; i < n; ++i) {
+            if (std::memcmp(ya.data() + i * eb, yb.data() + i * eb, eb) == 0) continue;
+            if (to == RAD_F32 && std::isnan(((const float*)ya.data())[i]) &&
+                std::isnan(((const float*)yb.data())[i]))
+                continue;
+            if (first < 0) first = i;
+            ++bad;
+        }
+        if (out_a) *out_a = ya;
+        if (!bad) {
+            if (ck.verbose)
+                std::printf("  cast %-16s all %lld inputs identical\n", label, (long long)n);
+            return true;
+        }
+        uint32_t in_bits = 0, got = 0, want = 0;
+        std::memcpy(&in_bits, (const uint8_t*)src + first * (rad_dtype_bits(from) / 8),
+                    (size_t)rad_dtype_bits(from) / 8);
+        std::memcpy(&want, ya.data() + first * eb, eb);
+        std::memcpy(&got, yb.data() + first * eb, eb);
+        std::printf("EXACT   cast %-16s %lld of %lld inputs differ, first input 0x%x: libref "
+                    "0x%x, %s 0x%x\n", label, (long long)bad, (long long)n, in_bits, want,
+                    lib.info->name, got);
+        return false;
+    };
 
     struct Fmt { const char* name; uint32_t dt; int bits; };
     static const Fmt kFmt[] = {
@@ -247,592 +521,59 @@ static bool exhaustive_cast(const Lib& ref, const Lib& avx, bool verbose) {
         std::vector<uint8_t> src((size_t)((n * f.bits) / 8));
         if (f.bits == 8) for (int64_t i = 0; i < n; ++i) src[(size_t)i] = (uint8_t)i;
         else for (int64_t i = 0; i < n; ++i) ((uint16_t*)src.data())[i] = (uint16_t)i;
+        const std::string wide = std::string(f.name) + " -> f32";
+        const std::string narrow = std::string("f32 -> ") + f.name;
 
-        /* ---- widening: every pattern of the narrow format into f32. */
-        std::vector<float> ya((size_t)n, 0), yb((size_t)n, 0);
-        for (int pass = 0; pass < 2; ++pass) {
-            const bool narrowing = pass == 1;
-            /* ---- narrowing: the widened values back down, which covers every value the format can
-             * represent plus, through the round trip, the ties at each of its steps. */
-            std::vector<uint8_t> na((size_t)((n * f.bits) / 8), 0);
-            std::vector<uint8_t> nb((size_t)((n * f.bits) / 8), 0);
+        /* Every pattern widened; then every value narrowed back. */
+        std::vector<uint8_t> wbytes;
+        if (!both(wide.c_str(), f.dt, f.name, RAD_F32, "f32", src.data(), n, &wbytes)) {
+            ok = false;
+            continue;
+        }
+        std::vector<float> vals((size_t)n);
+        std::memcpy(vals.data(), wbytes.data(), (size_t)n * sizeof(float));
+        if (!both(narrow.c_str(), RAD_F32, "f32", f.dt, f.name, vals.data(), n, nullptr))
+            ok = false;
 
-            RadParam p[4];
-            p[0] = RadParam{ "M", RAD_P_INT, 1, 0, nullptr, 0 };
-            p[1] = RadParam{ "n", RAD_P_INT, (long long)n, 0, nullptr, 0 };
-            p[2] = RadParam{ "from", RAD_P_STR, 0, 0, narrowing ? "f32" : f.name, 0 };
-            p[3] = RadParam{ "to", RAD_P_STR, 0, 0, narrowing ? f.name : "f32", 0 };
-
-            auto mk_t = [&](void* data, uint32_t dt) {
-                RadTensor t{};
-                t.data = data; t.dtype = dt; t.rank = 2;
-                t.shape[0] = 1; t.shape[1] = n;
-                t.stride[0] = n; t.stride[1] = 1;
-                return t;
-            };
-            RadTensor ta[2], tb[2];
-            if (!narrowing) {
-                ta[0] = mk_t(src.data(), f.dt);  ta[1] = mk_t(ya.data(), RAD_F32);
-                tb[0] = mk_t(src.data(), f.dt);  tb[1] = mk_t(yb.data(), RAD_F32);
-            } else {
-                ta[0] = mk_t(ya.data(), RAD_F32); ta[1] = mk_t(na.data(), f.dt);
-                tb[0] = mk_t(ya.data(), RAD_F32); tb[1] = mk_t(nb.data(), f.dt);
-            }
-            RadArgs aa{}, ab{};
-            aa.t = ta; aa.n_t = 2; aa.p = p; aa.n_p = 4; aa.world_size = 1;
-            ab = aa; ab.t = tb;
-            if (kr->launch(&aa, nullptr) < 0 || ka->launch(&ab, nullptr) < 0) continue;
-
-            int64_t bad = 0;
-            int64_t first = -1;
-            if (!narrowing) {
-                for (int64_t i = 0; i < n; ++i) {
-                    const bool na_ = std::isnan(ya[(size_t)i]), nb_ = std::isnan(yb[(size_t)i]);
-                    if (na_ != nb_ || (!na_ && ya[(size_t)i] != yb[(size_t)i])) {
-                        if (first < 0) first = i;
-                        ++bad;
-                    }
-                }
-            } else {
-                for (size_t i = 0; i < na.size(); ++i)
-                    if (na[i] != nb[i]) { if (first < 0) first = (int64_t)i; ++bad; }
-            }
-            if (bad) {
-                ok = false;
-                std::printf("EXACT   cast %-10s %-10s %lld of %lld patterns differ, first at %lld\n",
-                            narrowing ? "f32 ->" : "-> f32", f.name, (long long)bad,
-                            (long long)n, (long long)first);
-            } else if (verbose) {
-                std::printf("  cast %-6s %-9s all %lld bit patterns identical\n",
-                            narrowing ? "f32 ->" : "-> f32", f.name, (long long)n);
+        /* The midpoints, their neighbours, the overflow edges and the NaNs. */
+        std::vector<float> fin;
+        for (float v : vals) if (std::isfinite(v)) fin.push_back(v);
+        std::sort(fin.begin(), fin.end());
+        fin.erase(std::unique(fin.begin(), fin.end()), fin.end());
+        std::vector<float> in;
+        for (size_t i = 0; i + 1 < fin.size(); ++i) {
+            const float m = (float)(((double)fin[i] + (double)fin[i + 1]) / 2.0);
+            float lo = m, hi = m;
+            in.push_back(m);
+            for (int u = 0; u < 2; ++u) {
+                lo = std::nextafter(lo, -INFINITY);
+                hi = std::nextafter(hi, INFINITY);
+                in.push_back(lo);
+                in.push_back(hi);
             }
         }
-    }
-    return ok;
-}
-
-/* ================================================================== operands no description draws
- *
- * libref's opd_shape describes every op the one way a cold harness can use it: one sequence where
- * the op allows it, every operand dense at its declared rank, integer operands at their plainest
- * value. The engine hands kernels more than that, and each case below is one of those shapes, with
- * its operands built by hand:
- *
- *   several sequences through a path chosen for uniform queries;
- *   a rank-2 COLUMN SLICE of a fused projection, whose row stride is the projection's width;
- *   a speculative step whose `num_accepted` reads a rolling window past offset zero;
- *   a ranged parameter at its band's upper bound over an operand of fewer rows;
- *   head widths that do not divide a kernel's channel panel;
- *   packed weight codes at odd element offsets, which fall off the row converter;
- *   integer stores of values past the target's range, and exponents of -inf and NaN.
- *
- * Both plugins get byte-identical copies, and every OUT or INOUT buffer is compared WHOLE -- not
- * just the view the op was handed -- so a write outside the view is a difference too. */
-struct Hand {
-    struct Buf {
-        uint32_t dt = RAD_F32;
-        int64_t elems = 0;
-        std::vector<uint8_t> a, b;
-        bool out = false;
-    };
-    std::string name, op;
-    std::deque<Buf> bufs;
-    std::vector<int> buf_of;                  /* per operand, the backing buffer or -1 */
-    std::vector<RadTensor> ta, tb;
-    std::vector<RadParam> p;
-    std::deque<std::string> strs;
-    double tol = 1e-5;
-
-    Hand(const char* n, const char* o, double t) : name(n), op(o), tol(t) {}
-
-    /* An operand over a fresh buffer of `span` elements, viewed with `shape` and `stride`. The
-     * whole buffer is filled -- the bytes outside the view are another projection's columns, and
-     * a kernel that reads them must read the same thing on both sides. */
-    Hand& view(uint32_t dt, std::vector<int64_t> shape, std::vector<int64_t> stride, int64_t span,
-               const std::function<float(int64_t)>& fill, bool out = false) {
-        Buf bf;
-        bf.dt = dt; bf.elems = span; bf.out = out;
-        std::vector<float> v((size_t)span);
-        for (int64_t i = 0; i < span; ++i) v[(size_t)i] = fill(i);
-        bf.a.assign(dt_bytes(dt, span) + 8, 0);
-        h_narrow(v.data(), dt, span, bf.a.data());
-        bf.b = bf.a;
-        bufs.push_back(std::move(bf));
-        RadTensor t{};
-        t.dtype = dt;
-        t.rank = (uint32_t)shape.size();
-        for (size_t i = 0; i < shape.size(); ++i) {
-            t.shape[i] = shape[i];
-            t.stride[i] = stride[i];
+        static const float kEdges[] = { 127.5f, 128.0f, 300.0f, 448.0f, 464.0f, 480.0f, 57344.0f,
+                                        61440.0f, 65504.0f, 65520.0f, 1e10f, 3.4028235e38f,
+                                        INFINITY };
+        for (float e : kEdges) { in.push_back(e); in.push_back(-e); }
+        static const uint32_t kNaN[] = { 0x7fc00000u, 0xffc00000u, 0x7fffffffu, 0xffffffffu,
+                                         0x7ff00000u, 0x7f800001u, 0xff800001u, 0x7fc00001u };
+        for (uint32_t b : kNaN) {
+            float v;
+            std::memcpy(&v, &b, 4);
+            in.push_back(v);
         }
-        ta.push_back(t); tb.push_back(t);
-        buf_of.push_back((int)bufs.size() - 1);
-        return *this;
+        const std::string mid = narrow + " mid";
+        if (!both(mid.c_str(), RAD_F32, "f32", f.dt, f.name, in.data(), (int64_t)in.size(),
+                  nullptr))
+            ok = false;
     }
-    /* A dense operand of `shape`. */
-    Hand& dense(uint32_t dt, std::vector<int64_t> shape, const std::function<float(int64_t)>& fill,
-                bool out = false) {
-        std::vector<int64_t> st(shape.size());
-        int64_t acc = 1;
-        for (int i = (int)shape.size() - 1; i >= 0; --i) {
-            st[(size_t)i] = acc;
-            acc *= shape[(size_t)i];
-        }
-        return view(dt, shape, st, acc, fill, out);
-    }
-    Hand& idx(std::vector<int64_t> v, bool out = false) {
-        return dense(RAD_I32, { (int64_t)v.size() }, [v](int64_t i) { return (float)v[(size_t)i]; },
-                     out);
-    }
-    Hand& none() {
-        ta.push_back(RadTensor{});
-        tb.push_back(RadTensor{});
-        buf_of.push_back(-1);
-        return *this;
-    }
-    Hand& pi(const char* k, long long v) {
-        p.push_back(RadParam{ k, RAD_P_INT, v, 0, nullptr, 0 });
-        return *this;
-    }
-    Hand& pf(const char* k, double v) {
-        p.push_back(RadParam{ k, RAD_P_F64, 0, 0, nullptr, v });
-        return *this;
-    }
-    Hand& ps(const char* k, const char* v) {
-        strs.emplace_back(v);
-        p.push_back(RadParam{ k, RAD_P_STR, 0, 0, strs.back().c_str(), 0 });
-        return *this;
-    }
-
-    /* Returns false on a failure, having printed it. */
-    bool run(const Lib& ref, const Lib& avx, bool verbose) {
-        const RadKernelInfo* kr = ref.row(op.c_str());
-        const RadKernelInfo* ka = avx.row(op.c_str());
-        if (!kr || !ka) {
-            std::printf("  FAIL %-20s %s\n       no row for the op in %s\n", op.c_str(),
-                        name.c_str(), kr ? "libavx" : "libref");
-            return false;
-        }
-        for (size_t i = 0; i < ta.size(); ++i) {
-            if (buf_of[i] < 0) continue;
-            ta[i].data = bufs[(size_t)buf_of[i]].a.data();
-            tb[i].data = bufs[(size_t)buf_of[i]].b.data();
-        }
-        RadArgs aa{}, ab{};
-        aa.t = ta.data(); aa.n_t = (int)ta.size();
-        aa.p = p.data();  aa.n_p = (int)p.size();
-        aa.world_size = 1;
-        ab = aa; ab.t = tb.data();
-        const int rr = kr->launch(&aa, nullptr);
-        const int ra = ka->launch(&ab, nullptr);
-        if (rr < 0) {
-            std::printf("  FAIL %-20s %s\n       libref refused the case (%d); the case is wrong\n",
-                        op.c_str(), name.c_str(), rr);
-            return false;
-        }
-        if (ra < 0) {
-            std::printf("  FAIL %-20s %s\n       libavx returned %d where libref returned %d\n",
-                        op.c_str(), name.c_str(), ra, rr);
-            return false;
-        }
-        bool ok = true;
-        double worst = 0;
-        for (const Buf& bf : bufs) {
-            if (!bf.out) continue;
-            std::vector<float> fr((size_t)bf.elems), fa((size_t)bf.elems);
-            h_widen(bf.a.data(), bf.dt, bf.elems, fr.data());
-            h_widen(bf.b.data(), bf.dt, bf.elems, fa.data());
-            const Err e = compare(fa.data(), fr.data(), bf.elems);
-            worst = std::max(worst, e.rel_l2);
-            if (e.nonfinite_gap != 0 || !(e.rel_l2 <= tol)) {
-                ok = false;
-                std::printf("  FAIL %-20s %s\n       rel_l2=%.3e max_abs=%.3e nonfinite_gap=%lld "
-                            "tol=%.1e\n", op.c_str(), name.c_str(), e.rel_l2, e.max_abs,
-                            (long long)e.nonfinite_gap, tol);
-            }
-        }
-        if (verbose)
-            std::printf("  %-22s %-46s rel_l2=%.3e tol=%.1e %s\n", op.c_str(), name.c_str(), worst,
-                        tol, ok ? "ok" : "FAIL");
-        return ok;
-    }
-};
-
-/* A deterministic fill that is not a constant: the value of element i under seed s. */
-static std::function<float(int64_t)> hfill(uint64_t s, float sigma = 1.0f) {
-    return [s, sigma](int64_t i) {
-        uint64_t x = s * 0x9E3779B97F4A7C15ull + (uint64_t)i;
-        x ^= x >> 31; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 29;
-        return ((float)(x % 2001) / 1000.0f - 1.0f) * sigma;
-    };
-}
-
-static bool hand_cases(const Lib& ref, const Lib& avx, bool verbose, int* n_checked) {
-    std::vector<Hand> hs;
-
-    /* ---- attention: two sequences through the uniform long-query form, no cu_seqlens ------- */
-    {
-        const int64_t S = 2, QL = 32, KVH = 1, G = 2, HD = 16, BS = 16, NB = 6;
-        Hand h("n_seq=2 q_len=32 no cu_seqlens", "attn_paged", 1e-4);
-        h.dense(RAD_F32, { S * QL, KVH * G, HD }, hfill(1))
-         .dense(RAD_F32, { NB, KVH, BS, 2 * HD }, hfill(2))
-         .dense(RAD_I32, { S, 3 }, [](int64_t i) { return (float)((i * 5) % 6); })
-         .idx({ 40, 36 })
-         .none().none().none()
-         .dense(RAD_F32, { S * QL, KVH * G, HD }, hfill(3), true)
-         .pi("q_len", QL).pi("head_dim", HD).pi("gqa", G).pi("block_size", BS).pi("causal", 1)
-         .pi("window", 0).ps("q_dtype", "f32").ps("kv_dtype", "f32");
-        hs.push_back(std::move(h));
-    }
-    /* ---- attention and the KV write over column slices of a fused [q|k|v] projection ------- */
-    {
-        const int64_t T = 5, NH = 2, KVH = 1, HD = 16, W = (NH + 2 * KVH) * HD, BS = 4, NB = 4;
-        Hand h("k, v are rank-2 column slices, row stride 64", "kv_store", 1e-6);
-        h.view(RAD_F32, { T, KVH * HD }, { W, 1 }, T * W, hfill(4))            /* k at column 0 */
-         .view(RAD_F32, { T, KVH * HD }, { W, 1 }, T * W, hfill(5))
-         .idx({ 3, 0, 9, 14, 6 })
-         .dense(RAD_F32, { NB, KVH, BS, 2 * HD }, hfill(6), true)
-         .pi("M", T).pi("head_dim", HD).pi("n_head_kv", KVH).pi("block_size", BS)
-         .ps("kv_dtype", "f32");
-        hs.push_back(std::move(h));
-
-        Hand g("q and out are rank-2 column slices", "attn_paged", 1e-4);
-        g.view(RAD_F32, { T, NH * HD }, { W, 1 }, T * W, hfill(7))
-         .dense(RAD_F32, { NB, KVH, BS, 2 * HD }, hfill(8))
-         .dense(RAD_I32, { T, 2 }, [](int64_t i) { return (float)(i % NB); })
-         .idx({ 3, 5, 7, 2, 8 })
-         .none().none().none()
-         .view(RAD_F32, { T, NH * HD }, { W, 1 }, T * W, hfill(9), true)
-         .pi("q_len", 1).pi("head_dim", HD).pi("gqa", NH / KVH).pi("block_size", BS)
-         .pi("causal", 1).pi("window", 0).ps("q_dtype", "f32").ps("kv_dtype", "f32");
-        hs.push_back(std::move(g));
-
-        Hand d("q, k, v, out are rank-2 column slices", "attn_dense", 1e-4);
-        d.view(RAD_F32, { T, HD }, { W, 1 }, T * W, hfill(10))
-         .view(RAD_F32, { T, HD }, { W, 1 }, T * W, hfill(11))
-         .view(RAD_F32, { T, HD }, { W, 1 }, T * W, hfill(12))
-         .idx({ 0, 2, 5 })
-         .view(RAD_F32, { T, HD }, { W, 1 }, T * W, hfill(13), true)
-         .pi("M", T).pi("head_dim", HD).pi("gqa", 1).pi("causal", 1).ps("dtype", "f32");
-        hs.push_back(std::move(d));
-    }
-    /* ---- the GDN decode convolution read past offset zero ---------------------------------- */
-    {
-        const int64_t S = 2, QL = 3, HG = 2, H = 2, K = 16, V = 16, WID = 4;
-        const int64_t CD = 2 * HG * K + H * V, SL = WID - 2 + QL;
-        Hand h("num_accepted 2 and 3", "gdn_conv_update", 2e-5);
-        h.dense(RAD_F32, { S * QL, CD }, hfill(14))
-         .dense(RAD_F32, { CD, WID }, hfill(15, 0.5f))
-         .none()
-         .dense(RAD_F32, { 3, CD, SL }, hfill(16), true)
-         .idx({ 2, 0 })
-         .idx({ 2, 3 })
-         .idx({ 0, QL, 2 * QL })
-         .dense(RAD_F32, { S * QL, HG, K }, hfill(17), true)
-         .dense(RAD_F32, { S * QL, HG, K }, hfill(18), true)
-         .dense(RAD_F32, { S * QL, H, V }, hfill(19), true)
-         .pi("q_len", QL).pi("head_k", K).pi("head_v", V).pi("conv_width", WID)
-         .pi("max_query_len", QL);
-        hs.push_back(std::move(h));
-
-        /* The same step over a CHANNEL-CONTIGUOUS state, [slot][t][c] viewed as [slot][c][t]:
-         * the layout that takes libavx's row-move path rather than its element loop. */
-        Hand m("num_accepted 2 and 3, channel-contiguous state", "gdn_conv_update", 2e-5);
-        m.dense(RAD_F32, { S * QL, CD }, hfill(14))
-         .dense(RAD_F32, { CD, WID }, hfill(15, 0.5f))
-         .none()
-         .view(RAD_F32, { 3, CD, SL }, { SL * CD, 1, CD }, 3 * SL * CD, hfill(16), true)
-         .idx({ 2, 0 })
-         .idx({ 2, 3 })
-         .idx({ 0, QL, 2 * QL })
-         .dense(RAD_F32, { S * QL, HG, K }, hfill(17), true)
-         .dense(RAD_F32, { S * QL, HG, K }, hfill(18), true)
-         .dense(RAD_F32, { S * QL, H, V }, hfill(19), true)
-         .pi("q_len", QL).pi("head_k", K).pi("head_v", V).pi("conv_width", WID)
-         .pi("max_query_len", QL);
-        hs.push_back(std::move(m));
-    }
-    /* ---- head widths that do not divide the 1024-channel panel ------------------------------- */
-    {
-        const int64_t S = 2, QL = 2, HG = 4, H = 8, K = 96, V = 96, WID = 4;
-        const int64_t CD = 2 * HG * K + H * V, SL = WID - 2 + QL;
-        Hand h("head_k = head_v = 96, conv_dim 1536", "gdn_conv_update", 2e-5);
-        h.dense(RAD_F32, { S * QL, CD }, hfill(20))
-         .dense(RAD_F32, { CD, WID }, hfill(21, 0.5f))
-         .none()
-         .dense(RAD_F32, { 2, CD, SL }, hfill(22), true)
-         .idx({ 1, 0 })
-         .idx({ 1, 2 })
-         .idx({ 0, QL, 2 * QL })
-         .dense(RAD_F32, { S * QL, HG, K }, hfill(23), true)
-         .dense(RAD_F32, { S * QL, HG, K }, hfill(24), true)
-         .dense(RAD_F32, { S * QL, H, V }, hfill(25), true)
-         .pi("q_len", QL).pi("head_k", K).pi("head_v", V).pi("conv_width", WID)
-         .pi("max_query_len", QL);
-        hs.push_back(std::move(h));
-
-        const int64_t M = 6;
-        Hand p("head_k = head_v = 96, conv_dim 1536", "gdn_conv_prep", 2e-5);
-        p.dense(RAD_F32, { M, CD + 2 * H }, hfill(26))
-         .dense(RAD_F32, { CD, WID }, hfill(27, 0.5f))
-         .none()
-         .dense(RAD_F32, { H }, hfill(28, 0.5f))
-         .dense(RAD_F32, { H }, hfill(29, 0.5f))
-         .dense(RAD_F32, { 2, CD, WID - 1 }, hfill(30), true)
-         .idx({ 0, 4, M })
-         .none().none()
-         .idx({ 1, 0 })
-         .idx({ 1, 0 })
-         .dense(RAD_F32, { M, HG, K }, hfill(31), true)
-         .dense(RAD_F32, { M, HG, K }, hfill(32), true)
-         .dense(RAD_F32, { M, H, V }, hfill(33), true)
-         .dense(RAD_F32, { M, H }, hfill(34), true)
-         .dense(RAD_F32, { M, H }, hfill(35), true)
-         .pi("M", M).pi("head_k", K).pi("head_v", V).pi("chunk", 4).pi("conv_width", WID)
-         .pf("l2_eps", 1e-6).pf("softplus_thr", 20.0);
-        hs.push_back(std::move(p));
-    }
-    /* ---- the PLE ops at their band's upper bound, and a verify over two sequences ------------ */
-    {
-        const int64_t T = 5, N = 32, HC = 2, BAND = 64;
-        Hand g("M = 64 over 5 rows", "ple_gate", 1e-5);
-        g.dense(RAD_F32, { T, HC * N }, hfill(36))
-         .dense(RAD_F32, { T, HC * N }, hfill(37))
-         .dense(RAD_F32, { T, N }, hfill(38))
-         .dense(RAD_F32, { HC * N }, hfill(39, 0.2f))
-         .dense(RAD_F32, { HC * N }, hfill(40, 0.2f))
-         .dense(RAD_F32, { HC * N }, hfill(41, 0.2f))
-         .dense(RAD_F32, { T, HC * N }, hfill(42), true)
-         .dense(RAD_F32, { T, HC * N }, hfill(43), true)
-         .pi("M", BAND).pi("n", N).pi("hc", HC).pf("eps", 1e-6).ps("dtype", "f32")
-         .pf("wadd", 1.0);
-        hs.push_back(std::move(g));
-
-        /* Two sequences, a verify of 3 and one of 2, reading at offsets 1 and 2 of a window deep
-         * enough for both: hist 6 at width 4 and dilation 2, plus a verify's n - 1. */
-        const int64_t WIDTH = 4, DIL = 2, HIST = (WIDTH - 1) * DIL, SL = HIST + 2;
-        Hand c("M = 64 over 5 rows, verifies of 3 and 2", "ple_conv", 1e-5);
-        c.dense(RAD_F32, { T, N }, hfill(44))
-         .dense(RAD_F32, { N, WIDTH }, hfill(45, 0.5f))
-         .dense(RAD_F32, { 2, N, SL }, hfill(46), true)
-         .idx({ 0, 3, 5 })
-         .dense(RAD_F32, { T, N }, hfill(47))
-         .idx({ 1, 0 })
-         .idx({ 7, 9 })
-         .idx({ 2, 3 })
-         .dense(RAD_F32, { T, N }, hfill(48), true)
-         .pi("M", BAND).pi("n", N).pi("width", WIDTH).pi("dilation", DIL).ps("dtype", "f32");
-        hs.push_back(std::move(c));
-
-        /* LFM2's form of the same window: width 3, undilated, no residual and no activation. */
-        const int64_t CW = 3, CHIST = CW - 1, CSL = CHIST + 2;
-        Hand k("M = 64 over 5 rows, verifies of 3 and 2", "causal_conv1d", 1e-5);
-        k.dense(RAD_F32, { T, N }, hfill(55))
-         .dense(RAD_F32, { N, CW }, hfill(56, 0.5f))
-         .dense(RAD_F32, { 2, N, CSL }, hfill(57), true)
-         .idx({ 0, 3, 5 })
-         .idx({ 1, 0 })
-         .idx({ 7, 9 })
-         .idx({ 2, 3 })
-         .dense(RAD_F32, { T, N }, hfill(58), true)
-         .pi("M", BAND).pi("n", N).pi("width", CW).ps("dtype", "f32");
-        hs.push_back(std::move(k));
-
-        /* The antialiased resample ENLARGING a 4 x 4 table (a drawn case's grid is never larger
-         * than the table), one row shrinking it, and a 1 x 1 grid. */
-        static const int32_t kAaCrd[4][6] = { { 0, 6, 3, 1, 0, 5 }, { 0, 8, 4, 2, 0, 1 },
-                                              { 7, 7, 7, 2, 1, 7 }, { 9, 9, 9, 3, 1, 9 } };
-        Hand ga("a 4 x 4 table onto 7 x 9, 2 x 3 and 1 x 1 grids", "grid_embed_aa", 1e-6);
-        ga.dense(RAD_F32, { 6, N }, hfill(59), true)
-          .dense(RAD_F32, { 16, N }, hfill(60))
-          .dense(RAD_I32, { 4, 6 }, [](int64_t i) { return (float)kAaCrd[i / 6][i % 6]; })
-          .pi("M", 6).pi("n", N).pi("side", 4).ps("dtype", "f32");
-        hs.push_back(std::move(ga));
-
-        Hand n("M = 64 over 5 rows, verifies of 3 and 2", "ngram_ids", 0.0);
-        n.idx({ 11, 12, 13, 21, 22 })
-         .dense(RAD_I32, { 2, 2 + 2 }, [](int64_t i) { return (float)(100 + i); }, true)
-         .idx({ 0, 3, 5 })
-         .dense(RAD_I64, { 3 }, [](int64_t i) { return (float)(1000003 + 7919 * i); })
-         .dense(RAD_I64, { 4 }, [](int64_t i) { return (float)(97 + 2 * i); })
-         .dense(RAD_I64, { 4 }, [](int64_t i) { return (float)(1000 * i); })
-         .idx({ 1, 0 })
-         .idx({ 7, 9 })
-         .idx({ 2, 3 })
-         .dense(RAD_I32, { T, 4 }, [](int64_t) { return -1.0f; }, true)
-         .pi("M", BAND).pi("heads", 4).pi("ngram", 3).pi("eos", 5);
-        hs.push_back(std::move(n));
-    }
-    /* ---- packed weight codes at odd element offsets ------------------------------------------ */
-    {
-        const int64_t M = 2, N = 4, K = 33;
-        Hand h("W4 weight, K = 33: odd rows start mid-byte", "gemm_nt_q", 1e-5);
-        h.dense(RAD_F32, { M, K }, hfill(49))
-         .none()
-         .dense(RAD_I4, { N, K }, hfill(50, 2.0f))
-         .dense(RAD_F32, { N, 1 }, [](int64_t i) { return 0.5f + 0.25f * (float)i; })
-         .dense(RAD_F32, { M, N }, hfill(51), true)
-         .pi("M", M).pi("N", N).pi("K", K).ps("dtype", "w4a16");
-        hs.push_back(std::move(h));
-
-        Hand w("W2 weight, K = 33", "gemm_nt_q", 1e-5);
-        w.dense(RAD_F32, { M, K }, hfill(52))
-         .none()
-         .dense(RAD_I2, { N, K }, hfill(53, 2.0f))
-         .dense(RAD_F32, { N, 1 }, [](int64_t i) { return 1.0f + (float)i; })
-         .dense(RAD_F32, { M, N }, hfill(54), true)
-         .pi("M", M).pi("N", N).pi("K", K).ps("dtype", "w2a16");
-        hs.push_back(std::move(w));
-    }
-    /* ---- integer stores past the range, and exponents of -inf and NaN ------------------------ */
-    {
-        const float big[] = { 1e10f, -1e10f, INFINITY, -INFINITY, 2.5f, -2.5f, 3.5f, 127.5f,
-                              -128.5f, 300.0f, -300.0f, 0.49f };
-        const int64_t n = (int64_t)(sizeof big / sizeof big[0]);
-        for (const char* to : { "i8", "u8", "i16" }) {
-            /* 51 elements: the vector body runs at every level and so does the scalar tail. */
-            const int64_t len = 4 * n + 3;
-            Hand h((std::string("f32 -> ") + to + " past the range").c_str(), "cast", 0.0);
-            const uint32_t dt = rad_dtype_parse(to);
-            h.dense(RAD_F32, { 1, len }, [&big, n](int64_t i) { return big[i % n]; })
-             .dense(dt, { 1, len }, [](int64_t) { return 0.0f; }, true)
-             .pi("M", 1).pi("n", len).ps("from", "f32").ps("to", to);
-            hs.push_back(std::move(h));
-        }
-        /* 48 wide, a whole number of vectors at every level: a scalar tail's own exp would turn
-         * the row's sum into a NaN by itself and hide what the vector exp did with one. */
-        Hand s("rows of -inf: one fully masked, one partly", "softmax", 1e-6);
-        const int64_t w = 48;
-        s.dense(RAD_F32, { 3, w }, [w](int64_t i) {
-                const int64_t r = i / w, c = i % w;
-                if (r == 0) return -INFINITY;
-                if (r == 1 && c % 3 == 0) return -INFINITY;
-                return (float)(c % 7) * 0.5f - 1.0f;
-            })
-         .dense(RAD_F32, { 3, w }, [](int64_t) { return 0.0f; }, true)
-         .pi("M", 3).pi("n", w).ps("dtype", "f32");
-        hs.push_back(std::move(s));
-    }
-
-    /* ---- the drafter's walk with the pairwise term in charge -------------------------------- *
-     * A cold description draws `pred` and `succ` as weights, at 0.02, where the pairwise term is a
-     * thousandth of `unary` and never moves a pick: the walk is checked and the form is not. Here
-     * the codebooks are unit-scale and `unary` half that, so every pick is the form's. Some
-     * candidates are outside the vocabulary (-1 and past it) and so is the second sequence's
-     * anchor, which is the "contributes nothing" branch. Once with `hp` and once without. */
-    for (int with_hp : { 1, 0 }) {
-        const int64_t M = 3, L = 4, K = 8, R = 40, NV = 50;
-        Hand h(with_hp ? "unit codebooks, hp present, ids outside the vocab"
-                       : "unit codebooks, hp absent (a plane of ones)", "dflash_select", 0.0);
-        h.dense(RAD_I32, { M * L, K }, [](int64_t i) { return (float)((i * 7 + 3) % 53 - 1); })
-         .dense(RAD_F32, { M * L, K }, hfill(31, 0.5f));
-        if (with_hp) h.dense(RAD_BF16, { M * L, R }, hfill(32));
-        else         h.none();
-        h.idx({ 5, 60, 17 })
-         .dense(RAD_BF16, { NV, R }, hfill(33))
-         .dense(RAD_BF16, { NV, R }, hfill(34))
-         .dense(RAD_I32, { M, L }, [](int64_t) { return 0.0f; }, true)
-         .pi("M", M).pi("steps", L).pi("top_k", K).pi("rank", R).pi("n_vocab", NV)
-         .pi("anchor_stride", 1).ps("dtype", "bf16");
-        hs.push_back(std::move(h));
-    }
-
-    /* ---- the fp8 fusions without their optional operands ------------------------------------ *
-     * The cold descriptions always carry `residual` and `out_bf16`; the plain norm and a caller
-     * that wants only the codes are the other forms. `mode` 1 is sigmoid in libr4d's spelling. */
-    {
-        const int64_t M = 4, n = 200;
-        Hand r("no residual, no out_bf16, ragged group", "rmsnorm_quant_fp8", 4e-3);
-        r.dense(RAD_BF16, { M, n }, hfill(41))
-         .none()
-         .dense(RAD_BF16, { n }, hfill(42, 0.1f))
-         .dense(RAD_F8E4M3, { M, n }, [](int64_t) { return 0.0f; }, true)
-         .dense(RAD_F32, { M, 4 }, [](int64_t) { return 0.0f; }, true)
-         .pi("M", M).pi("n", n).pf("eps", 1e-6).pi("group", 64).ps("dtype", "bf16")
-         .pf("wadd", 1.0);
-        hs.push_back(std::move(r));
-
-        Hand g("mode 1, no out_bf16", "gated_quant_fp8", 6e-3);
-        g.dense(RAD_BF16, { M, 2 * n }, hfill(43))
-         .dense(RAD_F8E4M3, { M, n }, [](int64_t) { return 0.0f; }, true)
-         .dense(RAD_F32, { M, 4 }, [](int64_t) { return 0.0f; }, true)
-         .pi("M", M).pi("n", n).pi("group", 64).ps("dtype", "bf16").pi("mode", 1);
-        hs.push_back(std::move(g));
-    }
-
-    /* ---- scatter_rows: a negative index writes nothing, and the rows nobody names stay ------- */
-    {
-        const int64_t n = 70;
-        Hand s("idx with -1 over a 12-row pool", "scatter_rows", 0.0);
-        s.dense(RAD_F32, { 4, n }, hfill(51))
-         .idx({ 5, -1, 0, 9 })
-         .dense(RAD_F32, { 12, n }, hfill(52), true)
-         .pi("M", 4).pi("n", n).ps("dtype", "f32");
-        hs.push_back(std::move(s));
-    }
-
-    /* ---- ParoQuant's rotation over real pairings: every stage of every group a permutation of
-     * its 128 columns read as pairs, two parts of three stages. The dense form over a drawn matrix
-     * a (part, group) -- the op takes whatever matrices the weight stores. --------------------- */
-    {
-        const int64_t M = 5, K = 256, S = 3, P = 2, G = 128;
-        std::vector<int32_t> pr((size_t)(P * S * K));
-        for (int64_t ps = 0; ps < P * S; ++ps)
-            for (int64_t g = 0; g < K / G; ++g) {
-                std::vector<int32_t> perm((size_t)G);
-                for (int64_t i = 0; i < G; ++i) perm[(size_t)i] = (int32_t)i;
-                uint64_t x = 0x9E3779B97F4A7C15ull * (uint64_t)(ps * 31 + g + 1);
-                for (int64_t i = G - 1; i > 0; --i) {
-                    x ^= x >> 31; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 29;
-                    std::swap(perm[(size_t)i], perm[(size_t)(x % (uint64_t)(i + 1))]);
-                }
-                for (int64_t i = 0; i < G; ++i)
-                    pr[(size_t)(ps * K + g * G + i)] = (int32_t)(g * G + perm[(size_t)i]);
-            }
-        const auto h63 = hfill(63);
-        const auto scl = [h63](int64_t i) { return 1.25f + 0.75f * h63(i); };   /* (0.5, 2) */
-        const auto zero = [](int64_t) { return 0.0f; };
-        for (uint32_t ydt : { (uint32_t)RAD_F16, (uint32_t)RAD_F32 }) {
-            Hand h(ydt == RAD_F16 ? "two parts of three stages, y f16" : "two parts of three stages, y f32",
-                   "givens_rotate", 1e-5);
-            h.dense(RAD_BF16, { M, K }, hfill(61))
-             .dense(RAD_I32, { P * S, K }, [pr](int64_t i) { return (float)pr[(size_t)i]; })
-             .dense(RAD_F32, { P * S, K / 2 }, hfill(62, 3.0f))
-             .dense(RAD_F32, { P, K }, scl)
-             .dense(ydt, { M, P * K }, zero, true)
-             .pi("M", M).pi("n", K).pi("group", G).ps("dtype", "bf16").pi("stages", S)
-             .pi("parts", P);
-            hs.push_back(std::move(h));
-        }
-        /* A code may sit on a rounding edge that libref's f64 sum and libavx's f32 sum land on
-         * either side of, one step of the grid: the tolerance is a few such codes in 2560. */
-        for (const char* outq : { "fp8", "i8" }) {
-            const bool i8 = outq[0] == 'i';
-            Hand h(i8 ? "two parts, i8" : "two parts, fp8", "givens_dense_quant", 5e-3);
-            h.dense(RAD_BF16, { M, K }, hfill(64))
-             .dense(RAD_F16, { P * K, G }, hfill(65, 0.1f))
-             .dense(RAD_F32, { P, K }, scl)
-             .dense(i8 ? RAD_I8 : RAD_F8E4M3, { M, P * K }, zero, true)
-             .dense(RAD_F32, { M, P * K / G }, zero, true)
-             .pi("M", M).pi("n", K).pi("group", G).ps("dtype", "bf16").pi("parts", P)
-             .ps("out", outq);
-            hs.push_back(std::move(h));
-        }
-    }
-
-    bool ok = true;
-    int fails = 0;
-    for (Hand& h : hs) {
-        ++*n_checked;
-        if (!h.run(ref, avx, verbose)) { ok = false; ++fails; }
-    }
-    std::printf("  hand-built: %d checked, %d failed\n", (int)hs.size(), fails);
     return ok;
 }
 
 /* ================================================================== schema agreement
- * core/plugin/loader.cpp:schema_same, reproduced so a drift is caught here rather than at an
- * engine start on a machine that has a model on it. */
+ * A copy of core/plugin/loader.cpp: schema_same, so drift is caught here rather than at engine
+ * start. */
 static bool schema_same(const RadOpSchema& a, const RadOpSchema& b, std::string* why) {
     char buf[256];
     if (a.n_params != b.n_params) {
@@ -873,54 +614,75 @@ static bool schema_same(const RadOpSchema& a, const RadOpSchema& b, std::string*
     return true;
 }
 
-/* embed_lookup_q over a file-backed table, two ranks and the reader racing (avx_check_rows.cpp). */
-bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool verbose,
-                     bool bf16);
-/* embed_lookup_q's init, where io_uring is refused and here (avx_check_rows.cpp). */
-bool ngram_init_case(const Lib& avx);
+/* The directory holding this binary, on the build's filesystem (which reports its direct-I/O
+ * alignment on ext4 or XFS). */
+static std::string self_dir(const char* argv0) {
+    const std::string self = argv0;
+    const size_t sl = self.rfind('/');
+    return sl == std::string::npos ? "." : self.substr(0, sl);
+}
 
 int main(int argc, char** argv) {
-    std::string ref_path = "libref.so", avx_path = "libavx.so", only_op;
+    std::string ref_path = "libref.so", avx_path = "libavx.so";
     int only_level = -1;
-    bool verbose = false;
-    double tol_override = -1;
+    Check ck;
+    ck.threads = 4;
 
     for (int i = 1; i < argc; ++i) {
         const std::string s = argv[i];
         auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
-        if      (s == "--ref")   ref_path = next();
-        else if (s == "--avx")   avx_path = next();
-        else if (s == "--op")    only_op = next();
-        else if (s == "--level") only_level = std::atoi(next());
-        else if (s == "--tol")   tol_override = std::atof(next());
-        else if (s == "-v" || s == "--verbose") verbose = true;
+        if      (s == "--ref")     ref_path = next();
+        else if (s == "--avx")     avx_path = next();
+        else if (s == "--op")      ck.only_op = next();
+        else if (s == "--level")   only_level = std::atoi(next());
+        else if (s == "--tol")     ck.tol_override = std::atof(next());
+        else if (s == "--threads") ck.threads = std::atoi(next());
+        else if (s == "-v" || s == "--verbose") ck.verbose = true;
         else if (s == "-h" || s == "--help") {
             std::printf(
-                "rad-avx-check -- libavx against libref, every op, every ISA level.\n\n"
+                "rad-avx-check -- a host kernel library against libref, every op, every ISA "
+                "level.\n\n"
                 "  --ref PATH     the oracle plugin      (default libref.so)\n"
-                "  --avx PATH     the plugin under test  (default libavx.so)\n"
+                "  --avx PATH     the plugin under test  (default libavx.so); any host library\n"
                 "  --op NAME      only this op\n"
                 "  --level N      only this ISA level (0 scalar 1 avx 2 avx2 3 avx512)\n"
+                "  --threads N    rerun every case with each parallel region on N threads and\n"
+                "                 require the same bytes (default 4, 0 to skip; libavx only)\n"
                 "  --tol X        override every tolerance (for bisecting, not for passing)\n"
-                "  -v             print every case, not only the failures\n");
+                "  -v             print every case, not only the failures\n\n"
+                "A library not named libavx is checked as a host library: the libref ops it\n"
+                "does not serve are listed rather than failed (libavx/README.md).\n");
             return 0;
         }
     }
 
-    Lib ref, avx;
-    if (!ref.open(ref_path.c_str()) || !avx.open(avx_path.c_str())) return 2;
+    Lib ref, lib;
+    if (!ref.open(ref_path.c_str()) || !lib.open(avx_path.c_str())) return 2;
+    ck.ref = &ref;
+    ck.lib = &lib;
+    ck.own = std::strcmp(lib.info->name, "libavx") == 0;
+    const char* who = lib.info->name;
     std::printf("oracle : %s %s  (%s)\n", ref.info->name, ref.info->version, ref_path.c_str());
-    std::printf("under  : %s %s  (%s)\n", avx.info->name, avx.info->version, avx_path.c_str());
+    std::printf("under  : %s %s  (%s)\n", who, lib.info->version, avx_path.c_str());
+    if (!ck.own)
+        std::printf("         checked as a host library: the ops it lacks are listed, not "
+                    "failed\n");
 
     /* ---- 1. schema agreement */
-    int sch_bad = 0;
-    for (int i = 0, n = avx.schema_count(); i < n; ++i) {
-        const RadOpSchema* sa = avx.schema_at(i);
+    int sch_bad = 0, sch_extra = 0;
+    for (int i = 0, n = lib.schema_count(); i < n; ++i) {
+        const RadOpSchema* sa = lib.schema_at(i);
         if (!sa || !sa->op) continue;
         const RadOpSchema* sr = ref.schema(sa->op);
         if (!sr) {
-            std::printf("SCHEMA  %-24s declared by libavx and not by libref\n", sa->op);
-            ++sch_bad;
+            if (ck.own) {
+                std::printf("SCHEMA  %-24s declared by %s and not by libref\n", sa->op, who);
+                ++sch_bad;
+            } else {
+                if (ck.verbose)
+                    std::printf("SCHEMA  %-24s not in libref: no oracle, not checked\n", sa->op);
+                ++sch_extra;
+            }
             continue;
         }
         std::string why;
@@ -929,131 +691,143 @@ int main(int argc, char** argv) {
             ++sch_bad;
         }
     }
-    std::printf("schemas: %d declared, %d disagree with libref\n", avx.schema_count(), sch_bad);
+    std::printf("schemas: %d declared, %d disagree with libref", lib.schema_count(), sch_bad);
+    if (sch_extra) std::printf(", %d not in libref (no oracle)", sch_extra);
+    std::printf("\n");
     if (sch_bad) {
-        std::printf("\nThe loader refuses a plugin on ANY schema disagreement, so this would make "
-                    "every row\nlibavx carries unreachable. Nothing below is worth reading until "
-                    "that is fixed.\n");
+        std::printf("\nThe loader refuses a plugin on any schema disagreement, so every row of %s "
+                    "would be\nunreachable. Fix the schemas first.\n", who);
         return 1;
     }
 
     /* ---- 2. coverage
      *
-     * OPS WITH NO CPU PATH BY DECISION, named one by one: the image generator's (arch/qwenimage21).
-     * A DiT step at 2048^2 is about 4e14 FLOP, minutes on a CPU, so the generator is a GPU program
-     * and libavx serves none of its ops. The list is what keeps the rule a rule -- an op missing
-     * from libavx and not named here is still a kernel built and never wired. */
-    static const char* const kNoCpuPath[] = {
-        "ln_mod", "gate_add", "timestep_embed", "gather_rows2", "lane_gather", "lane_store",
-        "randn_lanes", "flow_euler", "chan_affine", "conv2d_nhwc", "l2norm_chan", "d2s_add",
-        "s2d_avg_add", "to_rgba8", "gelu_tanh", "scatter_add_rows", "attn_prefix_self",
-        "ln_mod_quant_fp8",
-    };
-    auto no_cpu_path = [](const char* op) {
-        for (const char* o : kNoCpuPath)
-            if (!std::strcmp(o, op)) return true;
-        return false;
-    };
-    int missing = 0, exempt = 0;
+     * Any op libref implements and libavx lacks is a failure. For another library every gap is
+     * listed. */
+    int missing = 0, device_only = 0;
+    std::vector<std::string> gaps;
     for (int i = 0, n = ref.kernel_count(); i < n; ++i) {
         const RadKernelInfo* kr = ref.kernel_at(i);
         if (!kr || !kr->op) continue;
-        if (!avx.row(kr->op) && no_cpu_path(kr->op)) {
-            ++exempt;
-            continue;
-        }
-        if (!avx.row(kr->op)) {
-            std::printf("COVER   %-24s libref implements it, libavx does not\n", kr->op);
-            ++missing;
-        }
+        if (lib.host_row(kr->op)) continue;
+        if (lib.row(kr->op)) ++device_only;
+        if (ck.own) std::printf("COVER   %-24s libref implements it, %s does not\n", kr->op, who);
+        ++missing;
+        gaps.push_back(kr->op);
     }
-    std::printf("coverage: libref %d rows, libavx %d rows, %d op(s) missing, %d with no CPU path "
-                "(the image generator's)\n", ref.kernel_count(), avx.kernel_count(), missing, exempt);
-
-    /* ---- 3/4. the numbers, per ISA level */
-    const std::vector<Case> cases = build_cases();
-    if (!avx.isa_force) {
-        std::printf("\nNOTE: %s exports no avx_isa_force, so only the path it selects for itself "
-                    "is\nexercised. That is honest but it is not the four-level sweep.\n",
-                    avx_path.c_str());
+    if (ck.own) {
+        std::printf("coverage: libref %d rows, %s %d rows, %d op(s) missing\n",
+                    ref.kernel_count(), who, lib.kernel_count(), missing);
     } else {
-        std::printf("cpu    : highest executable level is %s\n", avx.isa_name(avx.isa_detect()));
+        std::printf("coverage: libref %d rows, %s %d rows; %d of libref's ops have no host row "
+                    "here (%d a device row only)", ref.kernel_count(), who, lib.kernel_count(),
+                    missing, device_only);
+        if (!gaps.empty()) {
+            std::printf(", not checked:\n ");
+            for (const std::string& g : gaps) std::printf(" %s", g.c_str());
+        }
+        std::printf("\n");
     }
 
-    int rc = missing ? 1 : 0;
-    /* Before anything runs a gather: the case forks, and a child is cleanest taken from a process
-     * that has started none of the gather's threads. */
-    if (only_op.empty() || only_op == "embed_lookup_q") {
-        std::printf("\n");
-        if (!ngram_init_case(avx)) rc = 1;
+    /* ---- 3/4/5. the numbers, per ISA level */
+    const std::vector<Case> cases = build_cases();
+    int lo = 0, hi = 0, top = 0;
+    if (!lib.isa_force) {
+        std::printf("\nNote: %s exports no avx_isa_force, so only the level it selects for itself "
+                    "is checked.\n", avx_path.c_str());
+    } else {
+        std::printf("cpu    : highest executable level is %s\n", lib.isa_name(lib.isa_detect()));
+        lo = only_level >= 0 ? only_level : 0;
+        hi = only_level >= 0 ? only_level : AVX_N_LEVELS - 1;
+        top = std::min(hi, lib.isa_detect());
     }
-    const int lo = only_level >= 0 ? only_level : 0;
-    const int hi = only_level >= 0 ? only_level : AVX_N_LEVELS - 1;
+    if (ck.threads > 0 && !lib.par_force) {
+        std::printf("Note: %s exports no avx_par_force, so its parallel regions are not forced.\n",
+                    avx_path.c_str());
+        ck.threads = 0;
+    } else if (ck.threads > 0) {
+        const int forced = lib.par_force(ck.threads);
+        lib.par_force(0);
+        if (!forced) {
+            std::printf("Note: %s was built without OpenMP: no parallel region to force.\n",
+                        avx_path.c_str());
+            ck.threads = 0;
+        }
+    }
+
+    int rc = ck.own && missing ? 1 : 0;
+    const bool gather = ck.own && (ck.only_op.empty() || ck.only_op == "embed_lookup_q");
+    /* Run before any gather: the case forks, best done before the gather's threads exist. */
+    if (gather) {
+        std::printf("\n");
+        if (!ngram_init_case(lib)) rc = 1;
+    }
     std::vector<std::string> declined_ops;
     for (int lvl = lo; lvl <= hi; ++lvl) {
-        int actual = lvl;
-        if (avx.isa_force) actual = avx.isa_force(lvl);
-        if (actual != lvl) {
-            /* CLAMPED, AND SAID SO. Reporting a pass for a level the machine cannot execute would
-             * be reporting that a path works on a machine that never ran it. */
-            std::printf("\n== level %d (%s): NOT EXECUTABLE on this CPU -- avx_isa_force clamped to"
-                        " %s.\n   This row proves nothing about level %d and is not counted.\n",
-                        lvl, avx.isa_name ? avx.isa_name(lvl) : "?",
-                        avx.isa_name ? avx.isa_name(actual) : "?", lvl);
-            continue;
+        if (lib.isa_force) {
+            const int actual = lib.isa_force(lvl);
+            if (actual != lvl) {
+                /* Clamped: the level cannot run here, so report it and count nothing. */
+                std::printf("\n== level %d (%s): not executable on this CPU (clamped to %s), not "
+                            "counted\n", lvl, lib.isa_name(lvl), lib.isa_name(actual));
+                continue;
+            }
+            std::printf("\n== level %d (%s) ==\n", lvl, lib.isa_name(lvl));
+        } else {
+            std::printf("\n== %s ==\n", who);
         }
-        std::printf("\n== level %d (%s) ==\n", lvl, avx.isa_name ? avx.isa_name(lvl) : "?");
-        /* Before the tolerances: the conversions have to be EXACT, and they are checked over their
-         * whole input space rather than over a draw. Run per level, because the vectorised bodies
-         * differ per level and a draw of normals reaches none of the patterns that separate them. */
-        if (!exhaustive_cast(ref, avx, verbose)) rc = 1;
+        /* Exhaustive conversion check first, per level (the vector bodies differ per level). */
+        if (ck.only_op.empty() || ck.only_op == "cast")
+            if (!exhaustive_cast(ck)) rc = 1;
         Stats st;
         for (const Case& c : cases) {
-            if (!only_op.empty() && only_op != c.op) continue;
-            /* A speed-only case has no correctness question to ask -- see avx_harness.h. */
+            if (!ck.only_op.empty() && ck.only_op != c.op) continue;
+            /* Speed-only cases are not checked (avx_harness.h). */
             if (c.speed_only) continue;
-            const size_t before = (size_t)st.declined;
-            run_case(ref, avx, c, verbose, tol_override, &st);
-            if ((size_t)st.declined != before && lvl == lo) {
-                bool seen = false;
-                for (const std::string& s : declined_ops) if (s == c.op) { seen = true; break; }
-                if (!seen) declined_ops.push_back(c.op);
-            }
+            const int before = st.declined;
+            run_case(ck, c, &st);
+            if (st.declined != before &&
+                std::find(declined_ops.begin(), declined_ops.end(), c.op) == declined_ops.end())
+                declined_ops.push_back(c.op);
         }
-        std::printf("  %d checked, %d passed, %d failed, %d declined, %d skipped, %d missing."
-                    "  worst rel_l2 = %.3e",
-                    st.checked, st.passed, st.failed, st.declined, st.skipped, st.missing,
-                    st.worst);
+        std::printf("  %d checked, %d passed, %d failed, %d declined, %d skipped, %d missing.",
+                    st.checked, st.passed, st.failed, st.declined, st.skipped, st.missing);
+        if (st.unselected) std::printf("  %d admitted by no row's constraints.", st.unselected);
+        std::printf("  worst rel_l2 = %.3e", st.worst);
         if (!st.worst_where.empty()) std::printf("\n  worst case: %s", st.worst_where.c_str());
+        if (st.rerun) std::printf("\n  %d rerun on %d threads, byte for byte", st.rerun, ck.threads);
         std::printf("\n");
-        if (st.failed || st.declined || st.missing) rc = 1;
-        if (only_op.empty()) {
-            int hand_checked = 0;
-            if (!hand_cases(ref, avx, verbose, &hand_checked)) rc = 1;
-        }
-        if (only_op.empty() || only_op == "embed_lookup_q") {
-            /* Beside the binary, on the build's filesystem, which reports its direct-I/O
-             * alignment wherever the build is on ext4 or XFS. */
-            const std::string self = argv[0];
-            const size_t sl = self.rfind('/');
-            const std::string at = sl == std::string::npos ? "." : self.substr(0, sl);
-            /* The E4M3 table the quantised containers carry, and the plain bf16 one a checkpoint
-             * served as it ships carries: one path, two row sizes. */
-            if (!row_gather_case(avx, at, 1000, verbose, false)) rc = 1;
-            if (!row_gather_case(avx, at, 1000, verbose, true)) rc = 1;
-            /* And in TMPDIR, which is a tmpfs on most machines: since Linux 6.6 a tmpfs does
-             * direct reads and reports no alignment for them, as btrfs does, so the gather finds
-             * its granule from the block size there. */
-            const char* tmp = std::getenv("TMPDIR");
-            if (!row_gather_case(avx, tmp && *tmp ? tmp : "/tmp", 1000, verbose, false)) rc = 1;
+        if (st.failed || st.declined || st.skipped || (ck.own && st.missing)) rc = 1;
+        if (!hand_cases(ck)) rc = 1;
+        if (!zero_row_cases(ck, cases)) rc = 1;
+        if (gather) {
+            /* The E4M3 table of quantised containers and the plain bf16 one of an unconverted
+             * checkpoint: one path, two row sizes. The reads, the cache and the reader thread are
+             * compiled once, at the baseline, so the two ranks race through 1000 calls only at the
+             * highest level; the others run 50, enough to check their decode. Ids differ per level,
+             * so each level also misses the cache. */
+            const std::string at = self_dir(argv[0]);
+            const int64_t calls = lvl == top ? 1000 : 50;
+            const uint64_t seed = 0x9e3779b97f4a7c15ull + (uint64_t)lvl;
+            if (!row_gather_case(lib, at, calls, seed, ck.verbose, false)) rc = 1;
+            if (!row_gather_case(lib, at, calls, seed, ck.verbose, true)) rc = 1;
+            /* And in TMPDIR, usually tmpfs: since Linux 6.6 tmpfs does direct reads but reports
+             * no alignment (like btrfs), so the gather uses the block size. Only the read differs
+             * there, so it runs once. */
+            if (lvl == top) {
+                const char* tmp = std::getenv("TMPDIR");
+                if (!row_gather_case(lib, tmp && *tmp ? tmp : "/tmp", calls, seed, ck.verbose,
+                                     false))
+                    rc = 1;
+            }
         }
     }
     if (!declined_ops.empty()) {
-        std::printf("\nDECLINED (RAD_E_UNSUPPORTED from a row that claims the op) -- %d op(s):\n ",
+        std::printf("\nDeclined (RAD_E_UNSUPPORTED from a row that claims the op), %d op(s):\n ",
                     (int)declined_ops.size());
         for (const std::string& s : declined_ops) std::printf(" %s", s.c_str());
-        std::printf("\nA row that declines is worse than no row: the selector resolves to it and "
-                    "the step\nfails at issue rather than at declare.\n");
+        std::printf("\nThe selector resolves to such a row, so the step fails at issue, not at "
+                    "declare.\n");
     }
     std::printf("\n%s\n", rc == 0 ? "PASS" : "FAIL");
     return rc;

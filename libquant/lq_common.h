@@ -1,11 +1,10 @@
-/* lq_common.h -- the number conversions every libquant quantiser shares, written out once.
+/* lq_common.h -- number conversions shared by every libquant quantiser.
  *
- * WHY THESE ARE NOT rad_plugin.h's. They are the rules the containers in service were quantised by,
- * and a converter that wants to reproduce those containers byte for byte has to round exactly as
- * they were rounded. Where a rule here and rad_plugin.h's agree on every finite input the
- * difference is only in what a NaN becomes; where they could disagree -- the integer round, which
- * is half AWAY from zero, and the fp4 encoder, which breaks a tie toward the even CODE -- the
- * comment says so. Each is a pure function of its input.
+ * These are kept apart from rad_plugin.h's because they are the rules the containers in service
+ * were quantised with, and reproducing those containers byte for byte needs the same rounding.
+ * Where a rule here agrees with rad_plugin.h on every finite input, only the NaN result differs;
+ * where they can disagree (the integer round is half away from zero, the fp4 encoder breaks ties
+ * toward the even code) the function's comment says so. Each is a pure function of its input.
  */
 #pragma once
 #include "rad_plugin.h"
@@ -58,9 +57,9 @@ inline uint16_t f32_to_f16(float f) {
 }
 inline float f16_to_f32(uint16_t h) { return rad_f16_to_f32(h); }
 
-/* E4M3-fn: clamp at 448, round to nearest even on the 3-bit mantissa, a real subnormal rung below
- * 2^-6, and a NaN encoded as a signed zero -- a weight is never NaN, and the one place a NaN could
- * come from is a scale of zero, which the scale rules below never produce. */
+/* E4M3-fn: clamp at 448, round to nearest even on the 3-bit mantissa, real subnormals below 2^-6.
+ * A NaN encodes as a signed zero: a weight is never NaN, and the only other source, a zero scale,
+ * is never produced by the scale rules. */
 inline uint8_t f32_to_e4m3(float f) {
     uint32_t bits;
     std::memcpy(&bits, &f, 4);
@@ -85,9 +84,9 @@ inline uint8_t f32_to_e4m3(float f) {
     return (uint8_t)(sign | m);
 }
 
-/* FP4 e2m1 by nearest magnitude, a tie going to the EVEN CODE -- which on this grid is the
- * smaller magnitude except at 2.5, where it is 2.0 (code 4) over 3.0 (code 5), the hardware's
- * own round-to-nearest-even. */
+/* FP4 e2m1 by nearest magnitude, ties to the even code. On this grid that is the smaller magnitude
+ * except at 2.5, which goes to 2.0 (code 4) over 3.0 (code 5), as hardware round-to-nearest-even
+ * does. */
 inline uint8_t f32_to_e2m1(float v) {
     static const float k[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
     const uint8_t sign = (v < 0.0f) ? 0x8u : 0x0u;
@@ -101,15 +100,25 @@ inline uint8_t f32_to_e2m1(float v) {
     return (uint8_t)(sign | (uint8_t)best);
 }
 
-/* Any small float grid by exhaustive nearest search over its codes, ties to the even code. For
- * fp6 and e5m2, which nothing here needs to be fast. */
+/* `v` as a bf16, f16 or E4M3 value holds it, widened back; other dtypes pass it through. */
+inline float round_to(uint32_t dt, float v) {
+    switch (dt) {
+        case RAD_BF16:   return bf16_to_f32(f32_to_bf16(v));
+        case RAD_F16:    return f16_to_f32(f32_to_f16(v));
+        case RAD_F8E4M3: return rad_fp8e4m3_to_f32(f32_to_e4m3(v));
+        default:         return v;
+    }
+}
+
+/* Any small float grid by exhaustive nearest search over its codes, ties to the even code. Used for
+ * fp6 and e5m2, where speed does not matter. */
 inline uint32_t f32_to_small_float(float v, uint32_t dt) {
     const int bits = rad_dtype_bits(dt);
     const uint32_t n = 1u << bits;
     uint32_t best = 0;
     float bd = -1.0f;
-    /* Eight bytes, not one: rad_load_f32 reads any dtype up to 64 bits, and the compiler cannot
-     * see that `dt` is a small one. */
+    /* Eight bytes: rad_load_f32 handles dtypes up to 64 bits, and the compiler cannot see that
+     * `dt` is small. */
     uint8_t buf[8] = {};
     for (uint32_t c = 0; c < n; ++c) {
         buf[0] = (uint8_t)c;
@@ -121,21 +130,21 @@ inline uint32_t f32_to_small_float(float v, uint32_t dt) {
     return best;
 }
 
-/* The integer round every integer grid here uses: HALF AWAY FROM ZERO, by truncation of v +- 0.5.
- * It is what the containers in service were packed with, and lround differs from it only at
- * values no representable f32 product reaches -- but "only" is a claim, and the byte-for-byte
- * reproduction of those containers is a fact. */
+/* The integer round of every integer grid: half away from zero, by truncating v +- 0.5. The
+ * containers in service were packed with it. lround should agree on every value an f32 product
+ * reaches, but this is what is known to reproduce those containers byte for byte. */
 inline int round_away(float v) { return (int)(v < 0.0f ? v - 0.5f : v + 0.5f); }
 
 inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
-/* The unnormalised Sylvester Walsh-Hadamard transform in place, the butterfly keeping a+b low and
- * a-b high: the transform an "fwhtN" encoding names and libr4d's r4d_fwht_wave computes. */
-inline void fwht_inplace(float* v, int64_t n) {
+/* Unnormalised Sylvester Walsh-Hadamard transform in place, butterfly a+b low and a-b high: the
+ * transform an "fwhtN" encoding names and libr4d's r4d_fwht_wave computes. */
+template <class T>
+inline void fwht_inplace(T* v, int64_t n) {
     for (int64_t h = 1; h < n; h <<= 1)
         for (int64_t i = 0; i < n; i += h << 1)
             for (int64_t j = i; j < i + h; ++j) {
-                const float a = v[j], b = v[j + h];
+                const T a = v[j], b = v[j + h];
                 v[j] = a + b;
                 v[j + h] = a - b;
             }

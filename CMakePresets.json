@@ -1,0 +1,81 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "RelWithDebInfo in build/, HIP when a card is found",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build"
+    },
+    {
+      "name": "asan",
+      "displayName": "AddressSanitizer + UBSan, host backend, in build-asan/",
+      "inherits": "default",
+      "binaryDir": "${sourceDir}/build-asan",
+      "cacheVariables": { "RAD_ASAN": "ON", "RAD_TSAN": "OFF", "RAD_WITH_HIP": "OFF" }
+    },
+    {
+      "name": "tsan",
+      "displayName": "ThreadSanitizer, host backend, in build-tsan/",
+      "inherits": "default",
+      "binaryDir": "${sourceDir}/build-tsan",
+      "cacheVariables": { "RAD_TSAN": "ON", "RAD_ASAN": "OFF", "RAD_WITH_HIP": "OFF" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "default", "configurePreset": "default" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "tsan", "configurePreset": "tsan" }
+  ],
+  "testPresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "configurePreset": "default",
+      "output": { "outputOnFailure": true },
+      "execution": { "jobs": 8, "noTestsAction": "error" }
+    },
+    {
+      "name": "fast",
+      "displayName": "The inner loop: no slow, gpu, oot or perf test",
+      "inherits": "base",
+      "filter": { "include": { "label": "^fast$" } }
+    },
+    {
+      "name": "host",
+      "displayName": "Everything that runs without a card, except the out-of-tree rebuild",
+      "inherits": "base",
+      "filter": { "exclude": { "label": "^(gpu|oot)$" } }
+    },
+    {
+      "name": "full",
+      "displayName": "Every test",
+      "inherits": "base"
+    },
+    {
+      "name": "gpu",
+      "displayName": "The tests that need a card, one at a time",
+      "inherits": "base",
+      "filter": { "include": { "label": "^gpu$" } }
+    },
+    {
+      "name": "perf",
+      "displayName": "The wall-clock checks, one at a time",
+      "inherits": "base",
+      "filter": { "include": { "label": "^perf$" } }
+    },
+    {
+      "name": "asan",
+      "displayName": "The fast tier under AddressSanitizer + UBSan",
+      "inherits": "fast",
+      "configurePreset": "asan"
+    },
+    {
+      "name": "tsan",
+      "displayName": "The fast tier under ThreadSanitizer",
+      "inherits": "fast",
+      "configurePreset": "tsan"
+    }
+  ]
+}

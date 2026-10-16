@@ -1,14 +1,12 @@
-/* engine_priv.h -- what the Engine's translation units share and nothing outside them sees.
+/* engine_priv.h -- shared by the Engine's translation units only.
  *
- * `Engine` is one class across four files because its phases have almost nothing to say to each
- * other: bring-up runs once and touches every subsystem; the step loop runs a thousand times a
- * second and touches four; the drafters are two shapes of extra pass; the probe is debug-only and
- * reads everything. Splitting them is not decomposition of the class -- the public surface in
- * engine.h is unchanged -- it is putting each phase where it can be read on its own.
+ * `Engine` is one class split across several files by phase, which share little: bring-up runs
+ * once and touches every subsystem, the step loop runs constantly and touches a few, the drafters
+ * are extra passes, and the probe is debug-only. The public surface in engine.h is unchanged.
  *
- * `Engine::Rank` lives here rather than in engine.h because it names every subsystem's concrete
- * type, and engine.h is included by main.cpp and the tools: a forward declaration there is what
- * keeps a caller that only wants to serve a model from compiling the pool allocator.
+ * `Engine::Rank` is defined here, not in engine.h, because it names every subsystem's concrete
+ * type; engine.h is included by main.cpp and the tools, which then need only a forward
+ * declaration.
  */
 #pragma once
 #include "engine.h"
@@ -30,43 +28,35 @@
 namespace rad {
 
 /* ================================================================== per-rank state */
-/* One thread per tensor-parallel rank, each owning one device. No IPC, no shared-memory
- * handshake, no serialisation between ranks -- which is most of what a Python engine spends its
- * multiprocessing budget on. Because the ranks share an address space, the step batch is shared
- * BY POINTER rather than broadcast (spec §1). */
+/* One tensor-parallel rank's state; see Engine::ranks_. */
 struct Engine::Rank {
     int       index = 0;
     int       device = 0;
-    Program   program;          /* declare runs once PER RANK: dimensions are already divided */
+    Program   program;          /* declare runs once per rank: dimensions are already divided */
     Plan      plan;
     Pools     pools;
     Mover     mover;
-    /* THE POLICY HALF OF TIERED PLACEMENT. Bound to the plan at bringup and off unless the plan
-     * is dynamic; `heat_seen[l]` is the last step whose histogram layer l has already been
-     * credited, because a histogram sits in its bank until the NEXT report overwrites it and
-     * crediting it twice would double every count. */
+    /* The policy half of tiered placement, bound to the plan at bring-up and off unless the plan
+     * is dynamic. `heat_seen[l]` is the last step whose layer-l histogram was credited: a
+     * histogram stays in its bank until the next report overwrites it, and must not be counted
+     * twice. */
     HeatEngine       heat;
     std::vector<int> heat_seen;
     /* One sweep's histograms, found before any is credited; kept so a sweep allocates nothing. */
     struct HeatRow { int layer; int bank; const int32_t* h; };
     std::vector<HeatRow> heat_rows;
-    /* WHY A LAYER'S HISTOGRAM WENT UNCREDITED, which the credited total cannot separate on its
-     * own. A histogram is skipped either because its copy has not landed yet or because the bank
-     * still holds a step already credited, and those are different faults: the first says the host
-     * ran ahead of the device and the sample was lost, the second says the layer did not route.
-     * Without the split, a placement engine starved of evidence reads exactly like a model whose
-     * layers are idle. */
+    /* Credited histograms, and layer sweeps that found nothing new. A histogram is skipped
+     * either because its copy has not landed (the host ran ahead and the sample was lost) or
+     * because its bank holds an already-credited step (the layer did not route). Counting these
+     * apart keeps a placement engine starved of evidence from looking like idle layers. */
     uint64_t heat_credited = 0, heat_idle = 0;
     /* Trunk steps in a row whose pass the prefill stager did not arm (Engine::tiering_dispatch). */
     int unstaged_steps = 0;
-    Residency residency;
     KVManager kv;
     PrefixCache prefix;
-    /* THE IDLE SESSION TIERS (spec 7.3). Rank 0 owns the policy and the session index,
-     * because they describe CONVERSATIONS and a conversation is not sharded -- but the
-     * transfer is per rank, since each rank holds its own shard of every KV block and
-     * has its own pool to gather out of. Both are inert unless --prefix-cache-mib gave the
-     * host tier a size. */
+    /* Idle session tiers (spec 7.3). Rank 0 owns the policy and session index, since a
+     * conversation is not sharded; the transfer is per rank, since each holds its own shard of
+     * every KV block. Both are inert unless --prefix-cache-mib sizes the host tier. */
     IdleTiers tiers;
     TierExec  tierx;
     /* The activation arena's smaller levels, smallest step first (Engine::probe_arena_levels). */
@@ -74,32 +64,35 @@ struct Engine::Rank {
     /* Per Ctx level (0 is the full plan): the bytes at the top of this rank's arena that level
      * leaves to the expert slab. */
     std::vector<int64_t>    arena_lent;
-    /* THE PREFILL STAGER (core/place/stager.h): the next routed layer's pooled experts, copied into
-     * the top of this rank's arena while a full-plan step runs the layer before. */
+    /* Where the prefill stager's ring is at the span's shared level, from the arena's base; -1
+     * without that level. */
+    int64_t                 arena_low_off = -1;
+    /* Prefill stager (core/place/stager.h): copies the next routed layer's pooled experts into the
+     * top of this rank's arena while a full-plan step runs the layer before. */
     PrefillStager stager;
-    /* THE FILE STAGER (core/place/stager.h): a routed layer's file-tier experts, read from the
+    /* File stager (core/place/stager.h): reads a routed layer's file-tier experts from the
      * container into one of the mover's two file buffers before the layer's first expert op, on
-     * every pass. With both stagers in use the chain hands each the passes it armed for. */
+     * every pass. With both stagers in use, the chain hands each the passes it armed for. */
     FileStager  fstager;
     StagerChain stagers;
     Ctx       ctx;
     Sampler   sampler;          /* one per rank: each samples its own vocab shard (spec §9) */
-    /* THE SCORED ROWS' LOGITS (Request::token_scores), this rank's vocabulary shard of each,
-     * copied into pinned memory ahead of the sampler. Grown to the most rows a step has scored. */
+    /* Scored rows' logits (Request::token_scores), this rank's vocabulary shard, copied into pinned
+     * memory ahead of the sampler. Grown to the most rows a step has scored. */
     float*    score_host = nullptr;
     int64_t   score_rows_cap = 0;
     rad_buf   tok_buf = 0;      /* where the chain writes the sampled ids */
-    /* THE CARD'S STEP STATE (sched/advance.h): one StepSlot a scheduler slot, and the
-     * end-of-generation ids acceptance stops at, sorted. Every rank keeps its own and computes the
-     * same values from the same sampled ids. */
+    /* The card's step state (sched/advance.h): one StepSlot per scheduler slot, and the sorted
+     * end-of-generation ids acceptance stops at. Every rank keeps its own and computes the same
+     * values from the same sampled ids. */
     StepSlot* step_slots = nullptr;
     int32_t*  eog = nullptr;
     int32_t   n_eog = 0;
 };
 
-/* THE TIERS' WORK IN FLIGHT (Engine::tier_tick). One copy batch out on every rank's transfer
- * stream at a time, with each rank's answer kept until all of them have one -- a rank that has
- * landed must not be asked again and forget it failed. */
+/* The tiers' work in flight (Engine::tier_tick): one copy batch per rank's transfer stream at a
+ * time. Each rank's result is kept until all ranks have one, so a landed rank is not polled again
+ * and a failure is not lost. */
 struct TierPump {
     std::vector<TierJob> copy;
     std::vector<int>     copy_st;    /* per rank: 0 in flight, 1 landed, negative failed */
@@ -107,10 +100,9 @@ struct TierPump {
     int                  slow_budget = 0;   /* capacity drops one plan may make */
 };
 
-/* THE BUFFER PROBE (engine_probe.cpp). Declared here because three files call it: the step
- * loop dumps after a trunk step, and each drafter dumps after its own passes -- a drafter that
- * runs as extra passes leaves every one of its buffers holding the PREVIOUS step's values at the
- * moment the step loop dumps. */
-void dump_buffers(Ctx& ctx, int step, const char* names, const char* phase = "");
+/* The buffer probe (engine_probe.cpp): the buffers RADIANCE_DUMP_BUF names, at -vv only. The step
+ * loop dumps after a trunk step, and each drafter after its own passes, since a drafter's buffers
+ * still hold the previous step's values when the step loop dumps. */
+void dump_buffers(Ctx& ctx, int step, const char* phase = "");
 
 }  /* namespace rad */

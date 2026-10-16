@@ -1,10 +1,8 @@
 /* report.cpp -- the startup report, as text for the log and as JSON for /diagnostics.
  *
- * ONE LAYOUT FOR A READER WHO DID NOT RUN THE SERVER: every option on its own line with the value
- * in force and where it came from, the reason under any value startup derived, the machine in a
- * few dense lines and a block a card, and the findings last with what to do about each. The text
- * and the JSON are rendered from the same structs, so neither can say something the other does
- * not.
+ * Text layout: one line per option with value and source (the reason below any derived value),
+ * the host in a few lines, a block per card, then findings with fixes. Text and JSON render from
+ * the same structs.
  */
 #include "diag/diag.h"
 #include "rad_internal.h"
@@ -57,15 +55,6 @@ std::string short_bdf(const std::string& b) {
     return b.rfind("0000:", 0) == 0 ? b.substr(5) : b;
 }
 
-std::string link(const std::string& speed, int width) {
-    std::string s = speed;
-    const size_t p = s.find(" PCIe");
-    if (p != std::string::npos) s.erase(p);
-    if (s.empty()) s = "?";
-    return width > 0 ? fmt("%s x%d", s.c_str(), width) : s;
-}
-
-std::string watts(int64_t uw) { return uw < 0 ? std::string("unknown") : fmt("%lld W", (long long)(uw / 1000000)); }
 
 std::string host_lines(const HostFacts& h, const RunFacts& r) {
     std::string o;
@@ -118,10 +107,12 @@ std::string card_lines(const CardFacts& c) {
     std::string chain;
     for (const PciHop& h : c.chain)
         chain += fmt("%s%s %s (max %s)", chain.empty() ? "" : " -> ", short_bdf(h.bdf).c_str(),
-                     link(h.cur_speed, h.cur_width).c_str(), link(h.max_speed, h.max_width).c_str());
+                     link_text(h.cur_speed, h.cur_width).c_str(),
+                     link_text(h.max_speed, h.max_width).c_str());
     o += fmt("      link   %s  [read at %s%% busy%s]\n", chain.empty() ? "unknown" : chain.c_str(),
              c.busy_percent < 0 ? "?" : std::to_string(c.busy_percent).c_str(),
-             c.busy_percent >= 0 && c.busy_percent < 30 ? ": a link at rest parks below its maximum" : "");
+             c.busy_percent >= 0 && c.busy_percent < kBusyPercent
+                 ? ": a link at rest parks below its maximum" : "");
     if (!c.dpm_pcie.empty()) {
         std::string t;
         for (size_t i = 0; i < c.dpm_pcie.size(); ++i)
@@ -131,8 +122,8 @@ std::string card_lines(const CardFacts& c) {
     if (!c.dma.empty()) o += "      dma    " + c.dma + "\n";
     o += fmt("      power  cap %s (default %s, max %s) | voltage offset %s | sclk %s | mclk %s | "
              "runtime pm %s (control %s) | iommu group %s\n",
-             watts(c.power_cap_uw).c_str(), watts(c.power_cap_default_uw).c_str(),
-             watts(c.power_cap_max_uw).c_str(), or_unknown(c.vddgfx_offset).c_str(),
+             watts_text(c.power_cap_uw).c_str(), watts_text(c.power_cap_default_uw).c_str(),
+             watts_text(c.power_cap_max_uw).c_str(), or_unknown(c.vddgfx_offset).c_str(),
              or_unknown(c.sclk).c_str(), or_unknown(c.mclk).c_str(),
              or_unknown(c.runtime_status).c_str(), or_unknown(c.runtime_control).c_str(),
              c.iommu_type.empty() ? "none" : c.iommu_type.c_str());
@@ -286,9 +277,8 @@ std::string to_json(const std::vector<ConfigRow>& config, const std::vector<Deci
         fs.push_back({ { "level", x.level == Finding::Warn ? "warn" : "note" }, { "id", x.id },
                        { "what", x.what }, { "why", x.why }, { "fix", x.fix } });
     o["findings"] = std::move(fs);
-    /* REPLACE, NOT THROW, on bytes that are not UTF-8. Values here come from the operator and the
-     * filesystem -- a --model path, a boot parameter, a product name -- and none of them is
-     * promised to be UTF-8; the strict default would make the whole answer an exception. */
+    /* Replace invalid UTF-8 instead of throwing: paths, boot parameters and product names are
+     * not guaranteed to be UTF-8. */
     return o.dump(-1, ' ', false, J::error_handler_t::replace);
 }
 

@@ -1,46 +1,35 @@
 /* r4d_selftest -- dump the libr4d row table, cross-check it, and prove every row links and runs.
  *
- * A transcription error in a constraint table is invisible until a model silently picks the wrong
- * kernel, which is exactly the failure this project exists to make impossible. So the table is
- * printed in full and then checked against itself:
+ * A transcription error in a constraint table stays invisible until a model silently picks the
+ * wrong kernel. So the table is printed in full and checked against itself:
  *
- *   - every row's `op` has a schema declared by this plugin, or nothing can ever select it;
- *   - every CONSTRAINT KEY is a declared parameter of that op. This is the check that earns its
- *     keep: libr4d's select() has its own parameter vocabulary and radiance's schemas are
- *     docs/OPS.md's, so a key that was renamed in one place and not the other produces a row that
- *     matches nothing and reports nothing;
+ *   - every row's `op` has a schema declared by this plugin, or nothing can select it;
+ *   - every constraint key is a declared parameter of that op. libr4d's select() and radiance's
+ *     schemas (docs/OPS.md) use different vocabularies, and a key renamed in only one place
+ *     yields a row that matches nothing;
  *   - names are unique, launches exist, an init has a fini, a declared variant list is non-empty.
  *
- * Then, on a device: every launch is called once with a minimal valid input, so a linkage error, a
- * missing libr4d symbol or an argument-order mistake surfaces here rather than in a serve. Two of
- * these are real numerical checks rather than smoke tests, because they are cheap and because they
- * cover the two things most likely to be silently wrong:
+ * Then, on a device, every launch is called with a minimal valid input, so a linkage error, a
+ * missing libr4d symbol or an argument-order mistake surfaces here rather than in a serve. Some
+ * cases are real numerical checks, e.g.:
  *
- *   - the W4 weight arrangement, checked against libr4d's own dequant (`dequant_w4_bf16` undoes
- *     the fragment order), so the host relayout and the device kernel have to agree;
- *   - the two-rank all-reduce, run across two real cards through the plugin's init/fini
- *     rendezvous, with a known sum. That exercises the peer handshake, which cannot be tested any
- *     other way.
+ *   - the W4 weight arrangement against libr4d's own dequant (`dequant_w4_bf16` undoes the
+ *     fragment order), so the host relayout and the device kernel must agree;
+ *   - the two-rank all-reduce across two real cards through the plugin's init/fini rendezvous,
+ *     with a known sum: the only test of the peer handshake.
  *
- * The plugin is dlopened rather than linked, because an undefined symbol in the .so is itself one
- * of the failures worth catching.
+ * The plugin is dlopened rather than linked, so an undefined symbol in the .so is caught too.
  *
- * ONE CHILD PROCESS PER ROW. A bad pointer handed to a kernel is a GPU page fault, and a GPU page
- * fault is not an error code -- the ROCr runtime prints one line to stderr and aborts the process
- * where it stands. In a single process that means the FIRST bad row ends the run and every row
- * after it reports nothing, which is the opposite of what a catalogue check is for; worse, stdout
- * is block-buffered down a pipe, so the abort interleaves the fault line into whatever was still
- * in the buffer and the row it lands next to is not the row that faulted -- a fault that reads as
- * `quant_act_i8`'s can belong to a row twenty earlier.
+ * One child process per row. A bad pointer handed to a kernel is a GPU page fault, which ROCr
+ * reports by printing a line and aborting the process. In one process the first bad row would end
+ * the run, and with stdout block-buffered down a pipe the fault line can land next to the wrong
+ * row. So the parent runs the static phase and then re-execs itself once per row with
+ * `--case <name>`; a child killed by a signal is a FAIL naming the signal, and the run continues.
+ * posix_spawn rather than fork, because the parent already has the HIP runtime's threads up and
+ * only exec resets them. The row list is the plugin's own table, so a row without a smoke case
+ * reports `no smoke case`.
  *
- * So the parent runs the static phase and then re-execs ITSELF once per row with `--case <name>`,
- * and reports the child's exit status: a signal is a FAIL naming the signal, and the run
- * continues. posix_spawn rather than a bare fork, because the parent has the HIP runtime and its
- * threads up by then and only exec resets them. The row list is the plugin's own row table, so a
- * row nobody wrote a smoke case for reports `no smoke case` rather than being silently absent --
- * the coverage check falls out of the isolation for free.
- *
- * `--case <name>` is also the reproducer: it runs exactly one row, alone, in the foreground.
+ * `--case <name>` is also the reproducer: it runs one row, alone, in the foreground.
  */
 
 #include "rad_abi.h"
@@ -69,7 +58,7 @@
 #include <thread>
 #include <vector>
 
-/* posix_spawn's environment. Declared here rather than relying on unistd.h's _GNU_SOURCE guard. */
+/* posix_spawn's environment; declared here rather than relying on unistd.h's _GNU_SOURCE guard. */
 extern char** environ;
 
 #ifdef RAD_HAVE_HIP
@@ -82,13 +71,7 @@ static int g_skip = 0;
 /* The row this process was asked to run, or null for the parent. Set from --case. */
 static const char* g_case = nullptr;
 
-/* This binary and the plugin it was given, so a case that needs a process of its own can ask for
- * one. A kernel that reads its configuration from the environment caches the answer, which makes
- * two settings of it two processes whatever else is true. */
-static const char* g_exe = nullptr;
-static const char* g_plugin = nullptr;
-/* Whether any case block claimed g_case. A row the sweep never mentions is a coverage hole and
- * says so, rather than exiting 0 having done nothing. */
+/* Whether any case block claimed g_case; a row no case mentions is reported as a coverage hole. */
 static bool g_matched = false;
 
 static bool sel(const char* name) {
@@ -98,8 +81,8 @@ static bool sel(const char* name) {
     return true;
 }
 
-/* Exit codes the child speaks: 0 clean, 1 at least one FAIL, 2 nothing but skips. Anything else,
- * or a signal, is the child dying where it stood and is a FAIL the parent attributes by name. */
+/* Child exit codes: 0 clean, 1 at least one FAIL, 2 only skips. Anything else, or a signal, is a
+ * crash, which the parent reports as a FAIL for that row. */
 enum { CH_OK = 0, CH_FAIL = 1, CH_SKIP = 2 };
 
 static void ok(const char* what, bool cond, const std::string& detail = std::string()) {
@@ -123,27 +106,6 @@ static std::string fmt(const char* f, ...) {
     return b;
 }
 
-/* Re-exec this binary on one case with the anchor state form selected, and hand back the exit
- * status the way the row driver does. The state form is read from the environment once per process
- * and cached, so the per-candidate smoke case and the anchor check cannot share one: the choice is
- * made before either of them can ask for it. */
-static int spawn_anchor_child(const char* case_name) {
-    std::vector<char*> env;
-    for (char** e = environ; *e; ++e)
-        if (std::strncmp(*e, "RADIANCE_GDN_ANCHOR=", 20) != 0) env.push_back(*e);
-    char on[] = "RADIANCE_GDN_ANCHOR=1";
-    env.push_back(on);
-    env.push_back(nullptr);
-    char* const argv[] = { const_cast<char*>(g_exe), const_cast<char*>(g_plugin),
-                           const_cast<char*>("--case"), const_cast<char*>(case_name), nullptr };
-    pid_t pid = 0;
-    if (posix_spawn(&pid, g_exe, nullptr, nullptr, argv, env.data()) != 0) return -1;
-    int st = 0;
-    if (waitpid(pid, &st, 0) < 0) return -1;
-    std::fflush(stdout);
-    if (WIFSIGNALED(st)) return 128 + WTERMSIG(st);
-    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
-}
 
 
 /* ------------------------------------------------------------------ the plugin surface */
@@ -156,8 +118,8 @@ struct Plugin {
     const RadOpSchema* (*schema_at)(int) = nullptr;
     int (*kernel_count)(void) = nullptr;
     const RadKernelInfo* (*kernel_at)(int) = nullptr;
-    /* A TEST HOOK and not part of the plugin ABI -- libr4d's own, resolved out of the same .so.
-     * r4d.h says why the wave count cannot be compared any other way. */
+    /* Test hooks, not part of the plugin ABI: libr4d's own, resolved from the same .so. r4d.h
+     * explains why the wave count cannot be compared any other way. */
     void (*pin_mw)(int) = nullptr;
     void (*pin_nt)(int) = nullptr;
     void (*pin_qsa)(int) = nullptr;
@@ -168,6 +130,7 @@ struct Plugin {
     void (*pin_ddec)(int) = nullptr;
     void (*pin_hc)(int) = nullptr;
     void (*pin_qsel)(int) = nullptr;
+    int (*record)(const void**, int) = nullptr;
 };
 
 /* Defined after the tiny-tensor helpers it needs; called from the static checks above them. */
@@ -202,6 +165,7 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_moe_gemm_pin_down_dec", &pl->pin_ddec);
     okall &= sym(pl->h, "r4d_hc_read_pin_prefill", &pl->pin_hc);
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
+    okall &= sym(pl->h, "r4d_record_dispatches", &pl->record);
     return okall;
 }
 
@@ -301,17 +265,14 @@ static void cross_check(const Plugin& pl) {
         const RadKernelInfo* r = pl.kernel_at(k);
         if (!r->launch) { ++no_launch; continue; }
         if (r->init && !r->fini) ++init_no_fini;
-        /* EVERY ROW IS DEVICE DOMAIN. This library is a device kernel library and a stray host
-         * row would be a step that silently leaves the card -- which is why the check exists.
+        /* Every row is device domain; a stray host row would silently move a step off the card.
          * Host kernels are libavx's. */
         if (r->domain != RAD_DOMAIN_DEVICE) {
             ++bad_domain;
             keydetail += std::string(r->name) + " is not RAD_DOMAIN_DEVICE; ";
         }
-        /* EVERY AXIS CARRIES A DEFAULT AND THE DEFAULT IS ONE OF ITS OWN VALUES. The loader
-         * refuses a plugin that breaks this, by name, so a deployment can never run an axis with
-         * no legal fallback -- but the loader's refusal is a startup failure, and this is the
-         * check that tells the author which row and which key at the moment they add it. */
+        /* Every axis's default is one of its own values. The loader also refuses a plugin that
+         * breaks this, but at startup; this names the row and key at authoring time. */
         for (int v = 0; v < r->n_tunables; ++v) {
             const RadTunable& t = r->tunables[v];
             if (!t.key || !t.key[0] || !t.values || t.n_values < 1) {
@@ -344,9 +305,9 @@ static void cross_check(const Plugin& pl) {
             keydetail += std::string(r->name) + " has no schema for op '" + r->op + "'; ";
             continue;
         }
-        /* THE CHECK THAT EARNS ITS KEEP. A constraint on a key the op does not declare can never
-         * be satisfied, so the row is unreachable and nothing says so. A "device." key is not a
-         * parameter at all: it is matched against the machine (rad_types.h). */
+        /* A constraint on a key the op does not declare can never be satisfied, so the row is
+         * silently unreachable. A "device." key is not a parameter: it is matched against the
+         * machine (rad_types.h). */
         static const size_t kFact = std::strlen(RAD_DEVICE_FACT_PREFIX);
         for (int c = 0; c < r->n_constraints; ++c) {
             if (!std::strncmp(r->constraints[c].key, RAD_DEVICE_FACT_PREFIX, kFact)) continue;
@@ -359,12 +320,10 @@ static void cross_check(const Plugin& pl) {
                              "' which op '" + r->op + "' does not declare; ";
             }
         }
-        /* EVERY MULTI-CARD ROW STATES THE TRANSPORT IT NEEDS. A kernel in this library that runs
-         * only at two or more ranks either reads and writes the other cards' memory directly and
-         * requires device.p2p == 1, or is a host twin whose mailbox is pinned host memory and
-         * requires device.p2p == 0. Without the key, a machine whose cards cannot reach each other
-         * resolves a P2P kernel and the launch faults or hangs instead of being refused by name at
-         * selection; and a host twin without it would compete with its original where P2P works. */
+        /* Every multi-card row states its transport: device.p2p == 1 for a kernel that accesses
+         * peer memory directly, device.p2p == 0 for a host twin with a pinned host mailbox.
+         * Without it, a machine without P2P would resolve a P2P kernel that faults or hangs, and
+         * a host twin would compete with its original where P2P works. */
         bool multi = false, p2p = false;
         for (int c = 0; c < r->n_constraints; ++c) {
             const RadConstraint& rc = r->constraints[c];
@@ -423,24 +382,14 @@ static int64_t g_cold = 0;
 
 #ifdef RAD_HAVE_HIP
 
-/* EVERY hipError_t IN THIS FILE IS CHECKED, and that is not pedantry about a `nodiscard`. A
- * dropped device-to-host hipMemcpy is exactly how a correctness harness reports PASS on memory the
- * device never wrote: a kernel that faults leaves its error sticky on the next HIP call, so the
- * copy meant to bring the answer back fails and the comparison runs on whatever the host buffer
- * already held. Fresh, that is zeros and the case fails loudly. REUSED -- one allocation and a
- * loop over geometries, which is the normal shape in this file -- it still holds the PREVIOUS
- * geometry's correct answer, and the case passes.
+/* Every hipError_t in this file is checked. A kernel fault leaves a sticky error, so the
+ * device-to-host copy of the answer fails; unchecked, the comparison then runs on stale host
+ * memory, which in a loop over geometries holds the previous geometry's correct answer and passes.
  *
- * Forwarding macros rather than a wrapper function, so every call site stays an ordinary call and
- * __LINE__ comes for free. The failure goes through `g_fail`, which every one of main()'s four
- * exit paths already returns, so nothing downstream needs to know about this.
- *
- * AND IT RETURNS int, NOT hipError_t. ROCm puts the `nodiscard` on the TYPE -- `typedef enum
- * __HIP_NODISCARD hipError_t` -- not on the individual functions, so ANY expression of that type
- * whose value is dropped warns, this wrapper's own return included; returning hipError_t here
- * would move every one of those warnings onto the ten #define lines below instead of removing
- * them. `hipSuccess` is 0 and an enum promotes, so the handful of sites that do test the result
- * read unchanged. */
+ * Forwarding macros keep call sites ordinary and supply __LINE__; failures count in `g_fail`,
+ * which main() returns. The wrapper returns int, not hipError_t: ROCm puts `nodiscard` on the type
+ * itself, so a hipError_t return would warn at every macro. hipSuccess is 0, so sites that test the
+ * result read unchanged. */
 static int hip_ck(hipError_t e, const char* what, int line) {
     if (e != hipSuccess) {
         std::printf("  FAIL  %s at r4d_selftest.cpp:%d: %s\n", what, line, hipGetErrorString(e));
@@ -474,19 +423,16 @@ static void* dalloc(size_t bytes) {
     return p;
 }
 
-/* ---- THE TIMED WINDOW, WARM OR COLD (--cold MIB).
+/* ---- the timed window, warm or cold (--cold MIB).
  *
  * Warm, a perf mode launches `iters` times back to back on one set of operands, so a weight that
- * fits in L2 (8 MiB here) or the last-level cache (64 MiB) is read from cache after the first
- * launch: --perfmoe's whole expert set times at ten thousand GB/s "of weight", sixteen times what
- * the part's DRAM delivers. The engine streams its weights cold every step, and a change in how a
- * kernel waits on memory can look free warm and cost microseconds there.
+ * fits in L2 (8 MiB) or the last-level cache (64 MiB) is read from cache after the first launch,
+ * unlike in the engine, which streams weights cold every step.
  *
- * Cold, every launch is preceded by a read of g_cold bytes through the hierarchy and timed alone
- * between two events, and the median launch is the figure. The read is device copies into one
- * kColdChunk destination: copied in full, the span would leave that many dirty lines for the
- * timed launch to write back, which inflates exactly the bandwidth-bound kernels this mode is for.
- * The flush buffers are allocated outside dalloc because dfree_all runs between shapes. */
+ * Cold, each launch follows a read of g_cold bytes through the hierarchy and is timed alone between
+ * two events; the median is reported. The read copies into one kColdChunk destination, since
+ * copying the full span would leave dirty lines for the timed launch to write back. The flush
+ * buffers live outside dalloc because dfree_all runs between shapes. */
 constexpr int64_t kColdChunk = 4ll << 20;
 
 template <class F>
@@ -548,10 +494,10 @@ static RadTensor T(void* d, uint32_t dt, std::vector<int64_t> shape) {
     return t;
 }
 
-/* moe_gemm_q TAKES ITS EXPERTS AS TWO TABLES BY PARITY (operands 2/3 even, 6/7 odd). A stacked
- * plane holding every expert in order is both at once: the even entries at twice its leading
- * stride, and the odd ones the same from one plane in. `wbits`/`sbits` are the two planes'
- * element widths, which a plugin-private dtype cannot be asked for. */
+/* moe_gemm_q takes its experts as two tables by parity (operands 2/3 even, 6/7 odd). A stacked
+ * plane of every expert is both: the even entries at twice its leading stride, the odd ones the
+ * same from one entry in. `wbits`/`sbits` are the planes' element widths, which a plugin-private
+ * dtype cannot report. */
 static void moe_parity_tables(std::vector<RadTensor>& ts, int64_t ne, int wbits, int sbits) {
     const RadTensor w = ts[2], s = ts[3];
     RadTensor wo = w, so = s;
@@ -568,16 +514,12 @@ static void moe_parity_tables(std::vector<RadTensor>& ts, int64_t ne, int wbits,
     ts.insert(ts.end() - 1, so);
 }
 
-/* An ABSENT optional operand is a null `data`, not a zero rank -- r4d_opt() keys on the pointer
- * (rad_abi.h) and a shim reading a rank-0 tensor whose data still points at the last allocation
- * takes the present branch on an operand the test meant to withhold. Clearing rank alone leaves
- * quant_act_i8's plain form re-running the asum form. */
+/* An absent optional operand is a null `data`, not a zero rank: r4d_opt() keys on the pointer
+ * (rad_abi.h), so clearing only the rank would still take the present branch. */
 static void absent(RadTensor& t) { t.data = nullptr; t.rank = 0; }
 
-/* Cumulative sequence lengths, on the device. Every gdn kernel opens with `bos = cu[n]` and
- * `T = cu[n+1] - bos`, so a cu of zeros -- which is what dalloc hands back -- means T == 0 for
- * every sequence and the whole grid returns before it touches an operand. That is a launch that
- * proves nothing, so the smoke tests fill it. */
+/* Fills an i32 device buffer, e.g. cumulative sequence lengths. A zeroed cu (as dalloc returns)
+ * means T == 0 for every sequence and the gdn kernels exit immediately, so smoke tests fill it. */
 static void fill_i32(void* d, const std::vector<int32_t>& v) {
     st_memcpy(d, v.data(), v.size() * sizeof(int32_t), hipMemcpyHostToDevice);
 }
@@ -596,17 +538,16 @@ static RadParam PS(const char* k, const char* v) {
     RadParam p; std::memset(&p, 0, sizeof(p));
     p.key = k; p.kind = RAD_P_STR; p.sval = v; return p;
 }
-/* A real-valued parameter. These are RAD_P_F64 in the schemas (docs/OPS.md), and the point of
- * spelling them that way here is that this file feeds the launches DIRECTLY -- there is no declare
- * in front of it to catch a kind mismatch, so a case that passed them as strings would silently
- * take the shim's default instead of the value it names. */
+/* A real-valued parameter, RAD_P_F64 as in the schemas (docs/OPS.md). This file calls launches
+ * directly with no declare to catch a kind mismatch, so a string would silently fall back to the
+ * shim's default. */
 static RadParam PF(const char* k, double v) {
     RadParam p; std::memset(&p, 0, sizeof(p));
     p.key = k; p.kind = RAD_P_F64; p.dval = v; return p;
 }
 
-/* Bytes per element for the dtypes this file allocates. Deliberately local: the core's
- * rad_dtype_bytes is not linkable from here (see the note in r4d_plugin.h). */
+/* Bytes per element for the dtypes this file allocates. Local because the core's rad_dtype_bytes
+ * is not linkable from here (r4d_plugin.h). */
 static size_t esz(uint32_t dt) {
     switch (dt) {
         case RAD_F32: case RAD_I32: case RAD_U32: return 4;
@@ -629,11 +570,9 @@ static void* alloc_for(const RadTensor& t) {
     return dalloc((size_t)n * esz(t.dtype));
 }
 
-/* An i32 operand whose CONTENTS matter -- cu, state_idx, num_accepted. run_case allocates what is
- * still null and dalloc zeroes it, and a zero is a wrong answer for all three: a zero cu means
- * every sequence has no tokens and the grid exits before touching an operand, and a zero
- * num_accepted makes the recurrent update read column `nacc - 1` == -1 of its state-index row.
- * So these are built and filled here, before run_case sees them. */
+/* An i32 operand whose contents matter (cu, state_idx, num_accepted), built and filled before
+ * run_case, which would otherwise zero it. A zero cu means no tokens, and a zero num_accepted
+ * makes the recurrent update read column -1 of its state-index row. */
 static RadTensor TI32(const std::vector<int64_t>& shape, const std::vector<int32_t>& v) {
     RadTensor t = T(nullptr, RAD_I32, shape);
     t.data = alloc_for(t);
@@ -646,9 +585,8 @@ static std::vector<int32_t> rep_i32(int64_t n, int32_t v) {
     return std::vector<int32_t>((size_t)n, v);
 }
 
-/* An f32 operand filled with one value. The attention descales are the case: dalloc zeroes, a zero
- * descale scales every score to zero, and a uniform softmax over a zeroed cache is a launch that
- * would pass with the dequantise multiply deleted. */
+/* An f32 operand filled with one value, e.g. attention descales: a zero descale would zero every
+ * score, and a uniform softmax would pass even with the dequantise multiply deleted. */
 static RadTensor TF32(const std::vector<int64_t>& shape, float v) {
     RadTensor t = T(nullptr, RAD_F32, shape);
     t.data = alloc_for(t);
@@ -668,18 +606,12 @@ static std::vector<int32_t> iota_i32(int64_t n) {
 
 /* ------------------------------------------------------------------ the tuning space
  *
- * A row declares AXES and one point in their cross product is one instantiation of the kernel.
- * This enumerates that product the way the core does at tune time -- all-defaults first, so a
- * sweep's first line is what an untuned install runs, then every other legal point -- and asks
- * the row's own tune_valid to prune the combinations no geometry can serve.
- *
- * THE SELFTEST ENUMERATES RATHER THAN LISTING, for the same reason rows declare their space rather
- * than naming a table of points: a hand-kept list in a harness drifts from the plugin it is
- * testing, and drifts silently, because a missing point looks exactly like a point that was never
- * fast. */
-/* How many points an INTERACTIVE sweep walks. rad-tune walks the whole space; a --perfbf16 that
- * printed four hundred lines at 400 iterations each would be a different tool. Raise it with
- * R4D_PERF_POINTS when a specific axis needs the whole ladder. */
+ * A row declares axes; one point in their cross product is one instantiation of the kernel. This
+ * enumerates the product as the core does at tune time (all-defaults first, so a sweep's first
+ * line is what an untuned install runs) and prunes points with the row's own tune_valid.
+ * Enumerating rather than listing points keeps the harness from drifting from the plugin. */
+/* How many points an interactive sweep walks (rad-tune walks the whole space). Raise it with
+ * R4D_PERF_POINTS when an axis needs the whole ladder. */
 static const size_t kPerfCap = [] {
     const char* e = std::getenv("R4D_PERF_POINTS");
     const long v = (e && *e) ? std::strtol(e, nullptr, 10) : 0;
@@ -714,8 +646,7 @@ static std::vector<TunePoint> tune_points(const RadKernelInfo* r, const std::vec
                           r->tune_valid(geom.data(), (int)geom.size(),
                                         tp.choice.data(), (int)tp.choice.size());
         if (legal) {
-            /* The all-defaults point goes FIRST wherever it lands in the odometer: a sweep is read
-             * top-down and the baseline has to be the first line or every delta is eyeballed. */
+            /* The all-defaults point goes first, so a sweep's baseline is its first line. */
             int is_deflt = 1;
             for (int i = 0; i < n; ++i)
                 if (tp.choice[(size_t)i].ival != r->tunables[i].deflt) { is_deflt = 0; break; }
@@ -731,9 +662,7 @@ static std::vector<TunePoint> tune_points(const RadKernelInfo* r, const std::vec
     return out;
 }
 
-/* Append a point's choices to a case's parameters. This is exactly what the core does at issue:
- * the chosen values arrive as ordinary parameters and the launch reads `sk` with the same
- * rad_args_geti() it reads `M` with. */
+/* Appends a point's choices to a case's parameters, as the core does at issue. */
 static std::vector<RadParam> with_point(const std::vector<RadParam>& ps, const TunePoint& tp) {
     std::vector<RadParam> out = ps;
     out.insert(out.end(), tp.choice.begin(), tp.choice.end());
@@ -784,11 +713,9 @@ static void attn_case(const Plugin& pl, const char* name, int64_t head_dim, int6
     const int64_t seqs = 2, kv_heads = 2, blocks = 8, bs = 16;
     const int64_t q_heads = kv_heads * gqa, total_q = seqs * q_len;
     const uint32_t kvdt = std::strcmp(kv_dtype, "bf16") == 0 ? RAD_BF16 : RAD_F8E4M3;
-    /* One disjoint run of blocks per sequence, and a context that fills them. Both operands are
-     * i32 and dalloc zeroes: a zeroed block table points every sequence at block 0, so the two
-     * race on one slot, and a zeroed seqused is no context at all -- the decode grid's `live` and
-     * the prefill grid's `qb * BLOCK_Q >= qlen` both exit on the first comparison, which is a
-     * launch that proves the kernel starts and nothing else. */
+    /* One disjoint run of blocks per sequence, and a context that fills them. Zeroed (as dalloc
+     * returns), the block table would point every sequence at block 0, and seqused would mean no
+     * context, so both grids would exit at once. */
     const int64_t max_blocks = blocks / seqs, ctx = max_blocks * bs;
 
     std::vector<RadTensor> ts = {
@@ -798,10 +725,8 @@ static void attn_case(const Plugin& pl, const char* name, int64_t head_dim, int6
         TI32({ seqs }, rep_i32(seqs, (int32_t)ctx)),
         TF32({ seqs, kv_heads }, 1.0f),
         TF32({ seqs, kv_heads }, 1.0f),
-        /* cu_seqlens. THE OPERAND LIST IS oAttnPaged's AND IT HAS EIGHT SLOTS: leaving this one
-         * out shifts `out` into it, puts AP_OUT past n_t, and makes fill_paged refuse every row
-         * with RAD_E_INVAL -- which reads as kernels that do not work. Absent is the uniform
-         * batch, which is what this case is. */
+        /* cu_seqlens. oAttnPaged has eight slots; omitting this one would shift `out` into it
+         * and every row would fail with RAD_E_INVAL. Absent means a uniform batch, as here. */
         T(nullptr, RAD_I32,  { seqs + 1 }),
         T(nullptr, RAD_BF16, { total_q, q_heads, head_dim }),
     };
@@ -841,10 +766,9 @@ static void gemm_case(const Plugin& pl, const char* name, const char* dtype, int
 
 /* ================================================================== the block-scaled fp8 family
  *
- * The gemm_case helper above hands `b` and `b_scale` as flat U8 buffers, which the fp8 shim
- * refuses: it checks the scale plane's own extents, because that is the operand a converter is most
- * likely to hand over at the wrong grid and a wrong grid reads a plausible number. So the fp8 rows
- * get their own builder, with the [N][K] and [ceil(N/128)][ceil(K/128)] shapes spelled out. */
+ * The gemm_case helper hands `b` and `b_scale` as flat U8 buffers, which the fp8 shim refuses: it
+ * checks the scale plane's extents, since a scale at the wrong grid reads plausible numbers. So the
+ * fp8 rows get their own builder with [N][K] and [ceil(N/128)][ceil(K/128)] shapes. */
 static void fp8_gemm_case(const Plugin& pl, const char* name, const char* dtype,
                           int64_t M, int64_t N, int64_t K, int need_ascale,
                           const TunePoint* tp = nullptr) {
@@ -881,8 +805,8 @@ static uint16_t h_to_bf16(float f) {
     uint32_t u; std::memcpy(&u, &f, 4);
     return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
-/* E4M3 -> f32, the software form. Exponent 0 is subnormal (no implicit leading one). This is the
- * ORACLE for the device's v_cvt_f32_fp8, so it is written from the format and not from the kernel. */
+/* E4M3 -> f32 in software; exponent 0 is subnormal (no implicit leading one). The oracle for the
+ * device's v_cvt_f32_fp8, so it is written from the format, not from the kernel. */
 static float h_e4m3(uint8_t b) {
     const float sign = (b & 0x80u) ? -1.0f : 1.0f;
     const uint32_t ex = (uint32_t)(b >> 3) & 0x0Fu, mn = (uint32_t)b & 0x07u;
@@ -899,11 +823,9 @@ static uint16_t st_rand_bf16(uint32_t i) {
 }
 static uint8_t st_rand_e4m3(uint32_t i) {
     const uint32_t x = st_mix32(i + 0x9e3779b9u);
-    /* Bounded to [-1, 1] (the positive magnitudes below), mirroring st_rand_bf16. The full e4m3
-     * range (up to 448) makes the attention scores reach ~448*head_dim/sqrt(head_dim), so the
-     * softmax dominates by e^score and a 1-ulp difference between the device's v_cvt_f32_fp8 and
-     * this software h_e4m3 flips the max into a large output error; bounded, the scores stay ~22
-     * (the passing bf16 path) and the comparison is stable. */
+    /* Bounded to [-1, 1] like st_rand_bf16. With the full e4m3 range (up to 448) the attention
+     * scores grow so large that a 1-ulp difference between v_cvt_f32_fp8 and h_e4m3 flips the
+     * softmax max into a large output error; bounded, the scores stay near 22. */
     static const uint8_t mag[] = {
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,   /* subnormal, 0 .. 7/64 */
         0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,   /* exp 4, 0.125 .. 0.234375 */
@@ -915,11 +837,10 @@ static uint8_t st_rand_e4m3(uint32_t i) {
     return (uint8_t)(m | (((x >> 8) & 1u) << 7));
 }
 
-/* The inline paged-attention oracle: a port of ref_attn_paged (libref/ref_attn.cpp) for the
- * uniform batch, bf16 q, fp8-e4m3 or bf16 k/v, f32 descales. The selftest does not link libref,
- * so the reference the kbench byte-equality uses is carried here; the mask, the two-pass softmax
- * and the k/v dequant are the same, so a wrong kernel fails the comparison. One (row, head) at a
- * time: `i` is the query's position within its sequence's query, and `pos = ctx - qlen + i`. */
+/* Inline paged-attention oracle: a port of ref_attn_paged (libref/ref_attn.cpp) for the uniform
+ * batch, bf16 q, fp8-e4m3 or bf16 k/v, f32 descales, with the same mask, two-pass softmax and k/v
+ * dequant (the selftest does not link libref). One (row, head) at a time: `i` is the query's index
+ * within its sequence's query, and `pos = ctx - qlen + i`. */
 static void attn_oracle_one(const uint16_t* qh, const uint8_t* kv, int kv_is_fp8,
                             int64_t head_dim, int64_t kv_heads, int64_t block_size, int64_t kh,
                             const int* block_table, int64_t max_blocks, int ctx,
@@ -973,10 +894,9 @@ static void attn_oracle_one(const uint16_t* qh, const uint8_t* kv, int kv_is_fp8
     for (int64_t d = 0; d < head_dim; ++d) out[d] *= inv;
 }
 
-/* The numeric attention check: fill q and the paged k/v with avalanche-random data, run the row,
- * and compare the bf16 output against the inline oracle above. The launch smoke (attn_case) proves
- * the kernel starts; this proves it computes. A negative control corrupts a share of the reference
- * and requires the comparison to FAIL -- the proof the check has teeth. */
+/* Numeric attention check: fill q and the paged k/v with avalanche-random data, run the row, and
+ * compare the bf16 output against the oracle above. A negative control corrupts part of the
+ * reference and requires the comparison to fail. */
 static void attn_numeric_case(const Plugin& pl, const char* name, int64_t head_dim, int64_t gqa,
                               int64_t q_len, const char* kv_dtype, int window, int64_t ctx = 64) {
     if (!sel(name)) return;
@@ -1053,8 +973,7 @@ static void attn_numeric_case(const Plugin& pl, const char* name, int64_t head_d
     ok(nm, nbad == 0,
        fmt("max_err=%.5g bad=%d/%d", max_err, nbad, (int)oref.size()));
 
-    /* Negative control: corrupt a share of the reference and require the comparison to FAIL -- the
-     * proof the check has teeth, since a broken (always-passing) comparison would flag nothing. */
+    /* Negative control: corrupt part of the reference and require the comparison to fail. */
     for (size_t idx = 0; idx < oref.size(); ++idx)
         if ((idx & 7) == 0) oref[idx] += 0.5f;
     float nmax = 0.0f; int nbadc = 0;
@@ -1073,14 +992,12 @@ static void attn_numeric_case(const Plugin& pl, const char* name, int64_t head_d
 /* ================================================================== a weight's canonical planes
  *
  * A container holds a weight as the planes of its encoding, row-major (spec §4.1), and a kernel's
- * own layout hooks arrange those into what it reads, at load. The cases below that need a weight
- * build its planes here, get the bytes the kernel reads from the ROW'S OWN HOOKS (`stored`), and
- * compute their reference from the PLANES -- so the reference is what the weight means, and the
- * arrangement is checked by the one reader that matters, the kernel. A reference computed from the
- * stored bytes would only repeat the arrangement back to itself.
+ * layout hooks arrange them at load. Cases build the planes here, get the kernel's bytes from the
+ * row's own hooks (`stored`), and compute the reference from the planes, so the arrangement is
+ * checked by the kernel rather than against itself.
  *
- * The quantisation here is the plainest there is (absmax over each scale block) and is not under
- * test: what is checked is that the kernel reads the numbers the planes hold. */
+ * The quantisation (absmax per scale block) is not under test; what is checked is that the kernel
+ * reads the numbers the planes hold. */
 struct Planes {
     RadEncoding enc{};
     std::vector<std::vector<uint8_t>> data;   /* one per plane of `enc` */
@@ -1111,9 +1028,9 @@ struct Planes {
     }
 };
 
-/* gemm_nt_q's `pb1`/`pb2` over N rows (ParoQuant): rows [0, e1), [e1, e2), [e2, N) meet copies 0, 1,
- * 2 of the activation, side by side in a row; `parts` is how many copies there are. 0 leaves a
- * bound out, as the kernels read it. */
+/* gemm_nt_q's `pb1`/`pb2` over N rows (ParoQuant): rows [0, e1), [e1, e2), [e2, N) meet
+ * activation copies 0, 1, 2, side by side in a row; `parts` counts the copies. 0 leaves a bound
+ * out, as the kernels read it. */
 struct PartCut {
     int64_t e1, e2;
     int     parts;
@@ -1124,8 +1041,9 @@ struct PartCut {
     int part_of(int64_t n) const { return (int)(n >= e1) + (int)(n >= e2); }
 };
 
-/* An ASYMMETRIC grid's planes for a [N, K] weight: `bits`-bit codes (a bit stream along K), an f16
- * scale and a u8 zero point 0 .. 2^bits - 1 a 128 of K, drawn through st_mix32 of their coordinates. */
+/* An asymmetric grid's planes for a [N, K] weight: `bits`-bit codes (a bit stream along K), an f16
+ * scale and a u8 zero point 0 .. 2^bits - 1 per 128 of K, drawn from st_mix32 of the
+ * coordinates. */
 static Planes asym_planes(int bits, int64_t N, int64_t K) {
     Planes p;
     p.enc = rad_enc_affine(bits == 4 ? RAD_U4 : RAD_U5, RAD_F16, 1, 128);
@@ -1159,9 +1077,9 @@ static void h_fwht(float* v, int64_t n) {
             }
 }
 
-/* Block fp8 over [N, K]: E4M3 codes, and a bf16 scale a 128x128 block that is the block's absmax
- * over 448 -- the format the checkpoints ship. Codes are taken against the ROUNDED scale, so code
- * times stored scale is the weight the planes describe. */
+/* Block fp8 over [N, K], the checkpoint format: E4M3 codes and a bf16 scale per 128x128 block
+ * (absmax / 448). Codes are taken against the rounded scale, so code times stored scale is the
+ * weight the planes describe. */
 static Planes fp8_block_planes(const std::vector<float>& w, int64_t N, int64_t K) {
     Planes p;
     rad_enc_clear(&p.enc);
@@ -1185,11 +1103,11 @@ static Planes fp8_block_planes(const std::vector<float>& w, int64_t N, int64_t K
     return p;
 }
 
-/* A symmetric 4-bit grid over [N, K]: i4 codes -8..7 and a scale of dtype `sdt` a row per `group`
- * columns, absmax over 7. ROTATED, each group of a row is multiplied by the `group`-wide Hadamard
- * first and the stored scale carries the 1/group the rotation leaves -- <H w, H a> = group <w, a>,
- * so a kernel that multiplies codes by stored scales against a rotated activation computes the
- * unrotated product. The encoding names the rotation, which is what a kernel's hook checks. */
+/* A symmetric 4-bit grid over [N, K]: i4 codes -8..7 and a scale of dtype `sdt` per row per
+ * `group` columns (absmax / 7). With `rot`, each group is multiplied by the `group`-wide Hadamard
+ * first and the stored scale carries the residual 1/group (<H w, H a> = group <w, a>), so codes
+ * times scales against a rotated activation give the unrotated product. The encoding names the
+ * rotation, which the kernel's hook checks. */
 static Planes int4_planes(const std::vector<float>& w, int64_t N, int64_t K, int64_t group,
                           uint32_t sdt, bool rot) {
     Planes p;
@@ -1224,9 +1142,9 @@ static Planes int4_planes(const std::vector<float>& w, int64_t N, int64_t K, int
     return p;
 }
 
-/* The same rotated grid with libquant's w4nl CODEBOOK: u4 codes indexing a sixteen-entry f32
- * `table` plane holding r4d_args.h's kW4nlTable, a scale of amax over the largest entry (22), the
- * nearest entry chosen, and the residual 1/group folded into the stored scale as above. */
+/* The same rotated grid with libquant's w4nl codebook: u4 codes indexing a sixteen-entry f32
+ * `table` plane (r4d_args.h's kW4nlTable), scale = amax / largest entry (22), nearest entry chosen,
+ * residual 1/group folded into the stored scale. */
 static Planes nl_planes(const std::vector<float>& w, int64_t N, int64_t K, int64_t group,
                         uint32_t sdt) {
     Planes p;
@@ -1263,12 +1181,11 @@ static Planes nl_planes(const std::vector<float>& w, int64_t N, int64_t K, int64
     return p;
 }
 
-/* The same codebook at w4nl64a8h's scales (`gs` 64) or w4nl32a8h's (32): the weight rotated by 128
- * as above, and each `gs`-column part of a rotated group scaled on its own -- amax over the largest
- * entry, residual 1/128 folded in, stored as an E4M3 code under r4d_args.h's fixed kW4G64Scale --
- * with the nearest entry chosen against the scale as stored. Planes: codes, scale (E4M3
- * [1 x gs]), scale.1 (f32, the constant), table. With `w5`, w5nl64a8h's: u5 codes into
- * kW5nlTable, whose largest entry is 30. */
+/* The same codebook at w4nl64a8h's scales (`gs` 64) or w4nl32a8h's (32): the weight rotated by 128,
+ * each `gs`-column part of a rotated group scaled on its own (amax / largest entry, residual 1/128
+ * folded in, stored as E4M3 under r4d_args.h's fixed kW4G64Scale), nearest entry chosen against
+ * the stored scale. Planes: codes, scale (E4M3 [1 x gs]), scale.1 (f32 constant), table. With
+ * `w5`, w5nl64a8h's: u5 codes into kW5nlTable, whose largest entry is 30. */
 static Planes nl64_planes(const std::vector<float>& w, int64_t N, int64_t K, int64_t gs = 64,
                           bool w5 = false) {
     const float* tab = w5 ? kW5nlTable : kW4nlTable;
@@ -1312,9 +1229,9 @@ static Planes nl64_planes(const std::vector<float>& w, int64_t N, int64_t K, int
     return p;
 }
 
-/* A symmetric 8-bit grid over [N, K]: i8 codes -127..127 and an f16 scale of amax / 127 a row per
- * 128 columns -- what libquant writes for `codes=i8 group=128 scale=f16 clamp=sym`, and the
- * encoding the w8a16 layout hook takes. */
+/* A symmetric 8-bit grid over [N, K]: i8 codes -127..127 and an f16 scale of amax / 127 per row per
+ * 128 columns, as libquant writes for `codes=i8 group=128 scale=f16 clamp=sym` and the w8a16
+ * layout hook takes. */
 static Planes int8_planes(const std::vector<float>& w, int64_t N, int64_t K) {
     Planes p;
     p.enc = rad_enc_affine(RAD_I8, RAD_F16, 1, 128);
@@ -1340,9 +1257,8 @@ static int code_at(const Planes& p, int64_t n, int64_t k) {
     return (int)rad_load_f32(p.data[0].data() + n * p.row_bytes(0), p.enc.plane[0].dtype, k);
 }
 
-/* The rectangle [r0, r1) x [c0, c1) of a LOGICAL weight, as the planes covering it -- each plane
- * cut on its own blocks, the way the loader takes a tensor-parallel rank's share. Byte-wide planes
- * only, which is every plane the shards below are taken of. */
+/* The rectangle [r0, r1) x [c0, c1) of a logical weight as the planes covering it, each cut on its
+ * own blocks as the loader takes a tensor-parallel rank's share. Byte-wide planes only. */
 static Planes share(const Planes& p, int64_t r0, int64_t r1, int64_t c0, int64_t c1) {
     Planes q;
     q.enc = p.enc;
@@ -1365,9 +1281,9 @@ static Planes share(const Planes& p, int64_t r0, int64_t r1, int64_t c0, int64_t
     return q;
 }
 
-/* WHAT ROW `r` READS for `operand`, from the planes named `roles`: RAD_OK with its own arrangement
- * in `out` (relayout), or RAD_E_UNSUPPORTED with the one selected plane as it is -- a hook's
- * "stored as it is", and what a row with no hook gets. Anything else is the hook's refusal. */
+/* What row `r` reads for `operand` from the planes named `roles`: RAD_OK with its arrangement in
+ * `out` (relayout), or RAD_E_UNSUPPORTED with the one selected plane unchanged (a hook's "stored as
+ * is", or a row with no hook). Anything else is the hook's refusal. */
 static int stored(const RadKernelInfo* r, const std::vector<RadParam>& lp, int operand,
                   const Planes& p, std::initializer_list<const char*> roles,
                   std::vector<uint8_t>* out, RadLayout* lay = nullptr) {
@@ -1398,8 +1314,8 @@ static int stored(const RadKernelInfo* r, const std::vector<RadParam>& lp, int o
                        L.bytes);
 }
 
-/* AND BACK: the row's inverse of `stored`, which must give exactly the planes it was handed. True
- * when it does; `why` says what differed, or that the row has no inverse. */
+/* The row's inverse of `stored`, which must give back exactly the planes it was handed. `why`
+ * says what differed, or that the row has no inverse. */
 static bool restores(const RadKernelInfo* r, const std::vector<RadParam>& lp, int operand,
                      const Planes& p, std::initializer_list<const char*> roles,
                      const std::vector<uint8_t>& bytes, std::string* why) {
@@ -1430,56 +1346,16 @@ static bool restores(const RadKernelInfo* r, const std::vector<RadParam>& lp, in
     return true;
 }
 
-/* kv_store, both widths, AGAINST AN EXACTLY-REPRESENTABLE SET so the check is equality and not a
- * tolerance. E4M3 has three mantissa bits, so every value below -- the halves and integers up to 8
- * -- survives a round trip unchanged, and the bf16 path stores them unchanged too. That makes ONE
- * expectation serve both rows: `h_e4m3` or `h_bf16` of what landed must equal what went in,
- * exactly. A tolerance would pass the two failures this is actually for.
- *
- * WHAT IT IS FOR. The op scatters into kv_cache[n_blocks, kv_heads, block_size, 2*head_dim] with K
- * at [.., d] and V at [.., head_dim + d], addressed by a slot that decomposes as
- * (slot / block_size, slot % block_size). That is four indices deep and every one of them is a
- * place to be off by a head, a block or a half-row -- and a k/v swap or a head transposition is
- * invisible to any test whose values do not distinguish (token, head, dim). These do: the value is
- * built from all three, and K and V are given disjoint sign.
- *
- * THE NEGATIVE AND OUT-OF-RANGE SLOTS ARE THE OTHER HALF OF THE CONTRACT. A pad row must store
- * NOTHING -- the scheduler hands them for rows with no request -- so the cache is prefilled with a
- * sentinel and those slots are checked to still hold it. `libref` and libr4d agree that zero
- * is a REAL slot (r4d_gdn_conv_w4_h128_bf16.hip follows the same rule), so slot 0 is used
- * deliberately here rather than avoided. */
-
-/* ------------------------------------------------------- the vocab-parallel top-R, end to end
- *
- * THE PROPERTY IS AN EQUALITY, not a tolerance: a top-R taken over one plane must equal the merge
- * of the two half-plane top-Rs, index for index and value for value. That one check covers all
- * three pieces at once -- the `vocab_off` shift, the `pairs` plane row_topk writes, and the
- * merge -- and it is the property the engine depends on, since a sharded draft head is only
- * allowed to be silent if it proposes exactly what the replicated one did.
- *
- * THE VALUES ARE DELIBERATELY FULL OF TIES, because ties are where a merge stops agreeing. A
- * dense top-R breaks them on the lower column, so a merge that broke them on rank order would
- * disagree exactly when the same logit appears in both shards -- which, on a 23-value alphabet
- * over 2048 columns, is every row. Distinct values would pass either way.
- *
- * The gathered plane is assembled here the way `all_gather` with `row = R*2` assembles it: rank
- * r's R pairs at [r*R, (r+1)*R) of each row. If that interleave is ever spelled differently in
- * the graph, this case is what says so. */
-
 /* ------------------------------------------------- static YaRN, in double
  *
  * cos and sin of one rotary pair at one position: the inverse frequency theta^(-2i/rot), blended
- * toward inv/factor over the linear ramp [low, high] -- vLLM's YaRNScalingRotaryEmbedding, whose
- * correction bounds tests/yarn_test.cpp holds yarn_from to -- and both scaled by the magnitude.
- * Computed here, so the YaRN cases need nothing beside this binary.
+ * toward inv/factor over the linear ramp [low, high] (vLLM's YaRNScalingRotaryEmbedding; its
+ * correction bounds are held to yarn_from by tests/yarn_test.cpp), both scaled by the magnitude.
  *
- * `tol` IS WHAT AN f32 EVALUATION OF THE SAME FORMULA MAY DIFFER BY. powf, the reciprocal, the
- * blend and the product with the position each cost an ulp or so of the ANGLE, so the bound is 8
- * ulp of the angle plus the rounding of the result. Where the ramp sits it is a few 1e-5 even at
- * position 524287, so a wrong factor, bound or blend order is far outside it; it is loose only in
- * the fastest pairs at long positions, which YaRN leaves unscaled and which no f32 rotary places
- * better than its own angle's ulp. A double reference cannot reproduce the device's powf rounding
- * there, and a tolerance that pretended to would be a table of this card's answers. */
+ * `tol` is how far an f32 evaluation of the same formula may differ: 8 ulp of the angle plus the
+ * rounding of the result. Where the ramp sits it is a few 1e-5 even at position 524287, so a wrong
+ * factor, bound or blend order falls far outside it; it is loose only in the fastest pairs at long
+ * positions, which YaRN leaves unscaled and where f32 cannot do better than the angle's ulp. */
 struct YarnRef { double c, s, tol; };
 static YarnRef yarn_ref(double pos, int i, int rot, double theta, double factor, double low,
                         double high, double magnitude) {
@@ -1498,27 +1374,19 @@ static double yarn_high(int64_t rot) { return rot == 64 ? 22 : rot == 128 ? 43 :
 
 /* ------------------------------------------------- the fused attention prologue, against its pair
  *
- * THE QUESTION IS BIT EQUALITY AND NOTHING ELSE. `qk_norm_rope_gate` replaces rmsnorm(q) +
- * rmsnorm(k) + rope(q) + rope(k) -- four launches a layer, sixteen layers -- and it is only worth
- * having if the model that comes out is the SAME model. Its own header says it rounds the norm
- * output to bf16 before rotating for exactly this reason ("skipping that round trip is more
- * accurate and would be wrong: it is a different function"), and this is the check that the claim
- * holds against the kernels it replaces rather than against an argument.
+ * Bit equality: `qk_norm_rope_gate` replaces rmsnorm(q) + rmsnorm(k) + rope(q) + rope(k), and
+ * rounds the norm output to bf16 before rotating so that it computes the same function.
  *
- * THE TABLE IS PART OF THE CLAIM. The fused kernel takes cos/sin instead of theta, so a table
- * built with different angles is a different rope -- fluent text with subtly wrong positions,
- * which nothing downstream would flag. `rope_table` is therefore run here as the fused path's
- * first stage rather than filled by this file, so what is compared is the pair the engine issues.
+ * The table is part of the claim: the fused kernel takes cos/sin, and a table with different
+ * angles is a different rope. So `rope_table` runs here as the fused path's first stage, and the
+ * comparison is of what the engine issues.
  *
- * The q side reads a STRIDED view in the engine (the [q|gate] projection is interleaved per head)
- * and the unfused norm cannot, so the reference is fed a contiguous copy of the same numbers. The
- * arithmetic does not depend on the stride; the values are what is being compared. */
+ * In the engine the q side is a strided view (the [q|gate] projection is interleaved per head);
+ * see the reference block below. */
 static void qk_prologue_case(const Plugin& pl, uint32_t gain_dt, bool yarn = false, int64_t rot = 64) {
     if (!sel("qk_norm_rope_gate") && !sel("rope_table_f32")) return;
-    /* THE GAIN'S WIDTH IS RUN BOTH WAYS, because the two callers differ: every architecture plugin
-     * here declares an f32 norm gain and vLLM's declares bf16, and one flag inside the kernel picks
-     * between them. Checking only bf16 -- which is what the shape smoke test above passes -- would
-     * leave the width the ENGINE uses unexercised. */
+    /* Both gain widths run: architecture plugins here declare f32 norm gains, vLLM's bf16, and one
+     * kernel flag picks between them. The smoke test only passes bf16. */
     const bool gf32 = gain_dt == RAD_F32;
     const RadKernelInfo* rf = find(pl, "qk_norm_rope_gate");
     const RadKernelInfo* rt = find(pl, "rope_table_f32");
@@ -1526,11 +1394,8 @@ static void qk_prologue_case(const Plugin& pl, uint32_t gain_dt, bool yarn = fal
     const RadKernelInfo* rr = find(pl, "rope_bf16");
     if (!rf || !rt || !rn || !rr) { ok("qk_norm_rope_gate vs its pair", false, "row absent"); return; }
 
-    /* THE ENGINE'S HEAD COUNTS, and k rotated IN PLACE the way the block issues it -- the two ways
-     * this case could pass while the model still moved. A separate k_out is not what a caller with
-     * one k buffer does, and 4 query heads is not 12: the wave count the launcher picks is a
-     * function of nq + nkv, so a head count the model does not have exercises a launch it does not
-     * make. */
+    /* The engine's head counts, and k rotated in place as the block issues it: the launcher's
+     * wave count depends on nq + nkv, so other head counts would exercise a different launch. */
     const int64_t M = 512, nq = 12, nkv = 2, hd = 256, ctx = yarn ? 524288 : 4096;
     auto add_yarn = [&](std::vector<RadParam>& ps) {
         if (!yarn) return;
@@ -1538,11 +1403,9 @@ static void qk_prologue_case(const Plugin& pl, uint32_t gain_dt, bool yarn = fal
         ps.push_back(PF("yarn_high", yarn_high(rot))); ps.push_back(PF("yarn_magnitude", kYarnMag));
     };
     const double  theta = 1e7, eps = 1e-6, wadd = 1.0;
-    /* MANY ROWS, because the difference this case is hunting is one bf16 in tens of thousands: two
-     * summation orders for the same mean-square agree to a ULP in f32 and that ULP almost never
-     * crosses a bf16 boundary. A handful of rows settles nothing; 512 rows x 14 heads x 256 lanes
-     * is 1.8M elements a side. The positions still span the interesting range -- 0, small, and
-     * near the top. */
+    /* Many rows: two summation orders of one mean square differ by an f32 ULP that rarely crosses
+     * a bf16 boundary, so a mismatch shows in about one element in tens of thousands. 512 rows x
+     * 14 heads x 256 lanes is 1.8M elements a side; positions span 0, small and near the top. */
     std::vector<int32_t> pos((size_t)M);
     for (int64_t i = 0; i < M; ++i) pos[(size_t)i] = (int32_t)((i * 7 + i * i) % ctx);
     if (yarn) std::copy(std::begin(kYarnPos), std::end(kYarnPos), pos.begin());
@@ -1564,8 +1427,7 @@ static void qk_prologue_case(const Plugin& pl, uint32_t gain_dt, bool yarn = fal
                 hgate[(size_t)((t * nq + h) * hd + d)]  = g;
             }
     for (size_t i = 0; i < hk.size(); ++i) hk[i] = h_to_bf16(rnd(2000000 + (int64_t)i));
-    /* The gain is built in bf16 either way and WIDENED for the f32 run, so the two runs put the
-     * same numbers through both widths -- a difference between them is the flag, not the data. */
+    /* The gain is built in bf16 and widened for the f32 run, so both runs use the same values. */
     std::vector<uint16_t> hwq((size_t)hd), hwk((size_t)hd);
     std::vector<float> fwq((size_t)hd), fwk((size_t)hd);
     for (int64_t d = 0; d < hd; ++d) {
@@ -1585,15 +1447,13 @@ static void qk_prologue_case(const Plugin& pl, uint32_t gain_dt, bool yarn = fal
     void* d_cs = dalloc((size_t)ctx * rot * 4);
     void* d_qr = dalloc(qb);            /* the reference q and k, normed then rotated in place */
     void* d_kr = dalloc(kb);
-    void* d_qs = dalloc(qb);            /* the contiguous q source the unfused norm reads */
     void* d_qo = dalloc(qb);
     void* d_ko = dalloc(kb);
     void* d_go = dalloc(qb);
-    if (!d_qg || !d_k || !d_wq || !d_wk || !d_p || !d_cs || !d_qr || !d_kr || !d_qs ||
+    if (!d_qg || !d_k || !d_wq || !d_wk || !d_p || !d_cs || !d_qr || !d_kr ||
         !d_qo || !d_ko || !d_go) { ok("qk_norm_rope_gate vs its pair", false, "hipMalloc failed"); return; }
     st_memcpy(d_qg, hqg.data(), hqg.size() * 2, hipMemcpyHostToDevice);
     st_memcpy(d_k,  hk.data(),  kb, hipMemcpyHostToDevice);
-    st_memcpy(d_qs, hq_src.data(), qb, hipMemcpyHostToDevice);
     if (gf32) {
         st_memcpy(d_wq, fwq.data(), (size_t)hd * 4, hipMemcpyHostToDevice);
         st_memcpy(d_wk, fwk.data(), (size_t)hd * 4, hipMemcpyHostToDevice);
@@ -1606,11 +1466,9 @@ static void qk_prologue_case(const Plugin& pl, uint32_t gain_dt, bool yarn = fal
 
     /* ---- the pair the fusion replaces ---- */
     {
-        /* THE ENGINE FEEDS THIS NORM A STRIDED VIEW, not a contiguous copy: the q half of each
-         * head inside the interleaved [q|gate] projection, so its rows are 2*head_dim apart. If
-         * the norm answers differently on a strided row than on a dense one, the fused kernel can
-         * be exact against the dense form and the MODEL still move -- so the reference here is the
-         * operand the block actually issues. */
+        /* The engine feeds this norm a strided view: the q half of each head inside the
+         * interleaved [q|gate] projection, rows 2*head_dim apart. The reference uses the same
+         * operand, in case the norm differs on strided and dense rows. */
         RadTensor qsrc = T(d_qg, RAD_BF16, { M * nq, hd });
         qsrc.stride[0] = 2 * hd; qsrc.stride[1] = 1;
         std::vector<RadTensor> ts = { qsrc,
@@ -1690,22 +1548,13 @@ static void qk_prologue_case(const Plugin& pl, uint32_t gain_dt, bool yarn = fal
     st_memcpy(wq_.data(), d_qr, qb, hipMemcpyDeviceToHost);
     st_memcpy(wk_.data(), d_kr, kb, hipMemcpyDeviceToHost);
 
-    /* BIT EQUALITY, and it holds only because the two FOLD THE SUM OF SQUARES THE SAME WAY.
-     * `r4d_rmsnorm_bf16` picks its thread width from `r4d_act_threads(M, n)` and states the rule
-     * itself: "the width decides which columns a thread folds into the sum of squares. Two
-     * kernels that disagree about it disagree in the last bits of the norm, and the fused one is
-     * required to be byte-identical to this kernel followed by the quantiser." The fused prologue
-     * reproduces that fold, so the comparison below is an equality and not a tolerance.
+    /* Bit equality holds because both fold the sum of squares the same way: `r4d_rmsnorm_bf16`
+     * takes its thread width from `r4d_act_threads(M, n)`, which decides the columns each thread
+     * folds, and the fused prologue reproduces that fold.
      *
-     * THE FAILURE MESSAGE STILL REPORTS A RELATIVE WORST CASE rather than a bf16 step count,
-     * because a ULP in the mean square is a ULP in the normed value -- and a ROTATED element is a
-     * difference of two products, so where they nearly cancel that ULP comes out as a few percent
-     * of a small number while a wrong angle or a wrong pairing is O(1). The two read very
-     * differently.
-     *
-     * 512 rows is not decoration: where the folds do differ they differ on a handful of elements
-     * in a million, so a few rows agree exactly and say nothing -- which is also why a model's
-     * transcript moves after a few dozen steps and not at the first one. */
+     * The failure message reports a relative worst case: a rotated element is a difference of two
+     * products, so a ULP can be a few percent of a small number, while a wrong angle or pairing is
+     * O(1). */
     auto cmp = [&](const char* what, const std::vector<uint16_t>& got,
                    const std::vector<uint16_t>& want, int64_t width) {
         int64_t n_off = 0;
@@ -1732,11 +1581,8 @@ static void qk_prologue_case(const Plugin& pl, uint32_t gain_dt, bool yarn = fal
         char rate[128];
         std::snprintf(rate, sizeof rate, "%lld of %zu differ, worst %.2e of full scale",
                       (long long)n_off, got.size(), worst);
-        /* BYTE EQUALITY, NOT A TOLERANCE. The kernel reproduces `rmsnorm_bf16`'s fold, so the
-         * only honest assertion is that not one of 1.8M elements differs -- a relative bound here
-         * would let the engine's transcript move while this row still said "ok". `worst` stays in
-         * the message because a failure that is a rounding and a failure that is a wrong angle
-         * read very differently. */
+        /* Byte equality: no element may differ. `worst` in the message separates a rounding
+         * from a wrong angle. */
         ok(("qk_norm_rope_gate " + tag + " is byte-identical to the unfused pair").c_str(),
            n_off == 0, std::string(rate) + (n_off == 0 ? "" : " -- " + where));
     };
@@ -1746,16 +1592,14 @@ static void qk_prologue_case(const Plugin& pl, uint32_t gain_dt, bool yarn = fal
 }
 /* ------------------------------------ the prologue with the cache store folded on, against the pair
  *
- * `qk_norm_rope_gate_kv_store` is `qk_norm_rope_gate` followed by `kv_store` into the E4M3 or the
- * bf16 cache, and the claim is byte equality with that pair -- the q and rotated k it leaves, and
- * every byte of the cache, including the ones it must not touch. The same inputs go down both paths
- * on separate buffers (k is rotated in place, so each path needs its own), and the caches start
- * from the same random bytes, so a store at a wrong place or a store that should not have happened
- * shows up against the pair and not only against a clean slate.
+ * `qk_norm_rope_gate_kv_store` is `qk_norm_rope_gate` followed by `kv_store` into the E4M3 or bf16
+ * cache, and must be byte-identical to that pair: q, the rotated k, and every byte of the cache.
+ * Both paths get the same inputs on separate buffers (k is rotated in place) and caches starting
+ * from the same random bytes, so a misplaced or spurious store shows.
  *
- * THE INPUTS SPAN THE CLAMP: v up to +-2000 and k normed and rotated, so E4M3's +-448 saturation
- * and its subnormals are both reached. A pad row (slot -1) and a slot past the cache's end must
- * store nothing. The engine's geometry: 12 query heads and 2 kv heads of 256, rot 64. */
+ * The inputs span the clamp (v up to +-2000, k normed and rotated), reaching E4M3's +-448
+ * saturation and its subnormals. A pad row (slot -1) and a slot past the cache's end must store
+ * nothing. The engine's geometry: 12 query heads and 2 kv heads of 256, rot 64. */
 static void qk_kv_fold_case(const Plugin& pl, bool bf16) {
     const char* row = bf16 ? "qk_norm_rope_gate_kv_store_bf16" : "qk_norm_rope_gate_kv_store_fp8";
     if (!sel(row)) return;
@@ -1873,7 +1717,7 @@ static void qk_kv_fold_case(const Plugin& pl, bool bf16) {
         for (size_t i = 0; i < a.size(); ++i) n += a[i] != b[i];
         return n;
     };
-    /* And the store did happen: the pair's cache is not the initial bytes. */
+    /* And the store happened: the pair's cache differs from the initial bytes. */
     const int64_t dq = ndiff(qa, qbv), dk = ndiff(ka, kbv), dc = ndiff(ca, cb), moved = ndiff(ca, hc);
     char msg[160];
     std::snprintf(msg, sizeof msg, "q %lld, k %lld, cache %lld of %zu bytes differ; the pair wrote "
@@ -1881,23 +1725,18 @@ static void qk_kv_fold_case(const Plugin& pl, bool bf16) {
                   (long long)moved);
     ok(name, dq == 0 && dk == 0 && dc == 0 && moved > 0, msg);
 }
-/* ------------------------------------------------ the K-ONLY form, against the pair IT replaces
+/* ------------------------------------------------ the k-only form, against the pair it replaces
  *
- * `n_head` 0 is what the QSA indexer asks for: its query heads are already one plain `head_dim`
- * run each inside the `heads + 1` projection, so there is no [q|gate] split to do and no q
- * operands to pass. The unfused pair it replaces is `heads` rmsnorms on a STRIDED view plus one
- * rope -- five launches a layer, sixteen indexer calls a step -- and the only thing that makes
- * the fusion worth having is that the model which comes out is the same model.
+ * `n_head` 0 is what the QSA indexer asks for: its query heads are already plain `head_dim` runs
+ * inside the `heads + 1` projection, so there is no [q|gate] split and no q operand. It replaces
+ * `heads` rmsnorms on a strided view plus one rope, and must be byte-identical to them.
  *
- * THE STRIDE IS THE POINT AND IT IS WHY THIS IS A SECOND CASE. The pair above feeds the fused
- * kernel a [tokens, heads, head_dim] k whose heads are contiguous; this one feeds it a head that
- * is 128 columns inside a 640-column row, which is the only layout the indexer has. If the shim
- * ever took the row pitch from the head count rather than from the operand, that case would still
- * pass and this one would read another head's numbers.
+ * The stride is why this is a separate case: the head here is 128 columns inside a 640-column row,
+ * the indexer's layout. A shim taking the row pitch from the head count rather than the operand
+ * would pass the case above and fail this one.
  *
- * THE GEOMETRY IS THE MODEL'S: 4 heads of 128 at rot 64, the fifth head of the projection being
- * the raw key that this op must leave ALONE. It is checked explicitly -- an off-by-one in the
- * head loop would otherwise be invisible, since nothing downstream of here reads it in this file. */
+ * The model's geometry: 4 heads of 128 at rot 64. The projection's fifth head is the raw key, which
+ * this op must leave untouched; that is checked explicitly. */
 static void qsa_qprep_case(const Plugin& pl) {
     if (!sel("qk_norm_rope_gate") && !sel("rope_table_f32")) return;
     const RadKernelInfo* rf = find(pl, "qk_norm_rope_gate");
@@ -1968,7 +1807,7 @@ static void qsa_qprep_case(const Plugin& pl) {
     {
         std::vector<RadTensor> ts = {
             T(d_qk, RAD_BF16, { M, nw }),            /* q_gate -- made absent below */
-            T(d_qk, RAD_BF16, { M, nw }),            /* k: the projection WHOLE, at its own pitch */
+            T(d_qk, RAD_BF16, { M, nw }),            /* k: the whole projection, at its pitch */
             T(d_cs, RAD_F32,  { ctx, rot }),         T(d_p, RAD_I32, { M }),
             T(d_w,  RAD_F32,  { hd }),               /* q_w -- absent */
             T(d_w,  RAD_F32,  { hd }),
@@ -2002,9 +1841,8 @@ static void qsa_qprep_case(const Plugin& pl) {
     ok("qk_norm_rope_gate k-only is byte-identical to heads norms plus a rope",
        n_off == 0, std::string(rate) + where);
 
-    /* THE HEAD IT MUST NOT TOUCH. `k_out` is `heads` wide, so the raw key at columns
-     * [heads*hd, nw) of the INPUT is not addressed by the output at all -- but the input is what
-     * a caller passes in place and an over-long head loop would norm it. */
+    /* The head it must not touch: `k_out` is `heads` wide, so the raw key at input columns
+     * [heads*hd, nw) is never an output, but an over-long head loop would norm it in place. */
     std::vector<uint16_t> back((size_t)M * nw);
     st_memcpy(back.data(), d_qk, qkb, hipMemcpyDeviceToHost);
     ok("qk_norm_rope_gate k-only leaves the projection's untouched heads alone",
@@ -2013,35 +1851,24 @@ static void qsa_qprep_case(const Plugin& pl) {
 
 /* -------------------------------------------- router_topk + moe_scatter, against the pair
  *
- * The claim is byte equality on all five outputs, and it is structural rather than hopeful: the
- * fused kernel calls the SAME two device functions the standalone kernels call. What this case
- * exists to catch is the wiring around them -- and there is one specific way to get it wrong that
- * would otherwise produce plausible numbers.
+ * Byte equality on all five outputs. The fused kernel calls the same two device functions as the
+ * standalone kernels, so this checks the wiring around them.
  *
- * THE TWO EXPERT COUNTS ARE DIFFERENT NUMBERS. The selection runs over the WHOLE router, because
- * the router is replicated and every rank picks from every expert; the sort runs over THIS RANK'S
- * SLICE and drops what went elsewhere. Under expert parallelism the two are different numbers --
- * a 512-expert router against a rank slice of 254, say. So this case is run with
- * `n_local < n_expert` and a non-zero `expert_base` -- a fused op
- * handed one count for both would rank half the experts, or index its histogram past the end, and
- * a case built at n_local == n_expert would not notice either.
+ * The two expert counts differ: the selection runs over the whole (replicated) router, the sort
+ * over this rank's slice. The case runs with `n_local < n_expert` and a non-zero `expert_base`, so
+ * a fused op using one count for both would fail.
  *
- * ROWS ENOUGH TO CROSS EVERY WAVE ASSIGNMENT. The standalone selection gives a workgroup NW = 4
- * rows; the fused one launches a wave a row, eight, sixteen or thirty-two of them, and wraps
- * above thirty-two. 5, 13 and 20 rows reach each width with a partial final pass, 45 wraps, and
- * the answer must not depend on which wave got a row -- which is the property that makes the
- * fusion legal in the first place.
+ * Rows cross every wave assignment: the standalone selection gives a workgroup NW = 4 rows, the
+ * fused one a wave per row with 8, 16 or 32 waves, wrapping above 32. 5, 13 and 20 rows reach each
+ * width with a partial final pass, and 45 wraps.
  */
 static void topk_scatter_at(const RadKernelInfo* rf, const RadKernelInfo* rt,
                             const RadKernelInfo* rs, int64_t M, const char* prot = nullptr);
 
 static void topk_scatter_case(const Plugin& pl) {
-    /* ROW names, not op names. `sel` compares against whatever the sweep is naming, and the
-     * sweep names ROWS -- every other case here guards on `rowtopk_bf16`, `gated_had_quant_i8`,
-     * `rmsnorm_bf16`. `qk_prologue_case` reads as an exception and is not one: its row is spelled
-     * `qk_norm_rope_gate`, the same as its op. Guarding on the op name where the row carries a
-     * suffix means the case never runs and reports nothing, which is indistinguishable from
-     * passing. */
+    /* Row names, not op names: `sel` matches the row the sweep names. Guarding on an op name
+     * whose row carries a suffix would never run the case. (qk_prologue_case's row is spelled
+     * like its op.) */
     if (!sel("router_topk_scatter_bf16") && !sel("router_topk_bf16") && !sel("moe_scatter_i32"))
         return;
     const RadKernelInfo* rf = find(pl, "router_topk_scatter_bf16");
@@ -2049,7 +1876,7 @@ static void topk_scatter_case(const Plugin& pl) {
     const RadKernelInfo* rs = find(pl, "moe_scatter_i32");
     if (!rf || !rt || !rs) { ok("router_topk_scatter", false, "row absent"); return; }
     for (const int64_t M : { 5, 13, 20, 45 }) topk_scatter_at(rf, rt, rs, M);
-    /* ...and with protected experts sorted last: the first, a middle and the last of the slice. */
+    /* And with protected experts sorted last: the first, a middle and the last of the slice. */
     for (const int64_t M : { 13, 45 }) topk_scatter_at(rf, rt, rs, M, "0,17,101,253");
 }
 
@@ -2150,23 +1977,19 @@ static void topk_scatter_at(const RadKernelInfo* rf, const RadKernelInfo* rt,
 
 /* -------------------------------- router_gemm_topk_scatter, against the launches it stands in for
  *
- * The claim is byte equality with THREE launches: the router's gemm_nt, the shared gate's gemm_nt
- * at N = 1, and router_topk_scatter over the router's logits -- so all seven outputs are compared,
- * the logits and the gate included. Those two are what the claim rests on: an element of the
- * skinny bf16 GEMM is a function of its split-K count alone, and the fused op asks the unfused
- * launch's own law for that count at each N (four at 512 x 2560, twenty for the one-column gate;
- * eight and sixteen at 256 x 2048).
+ * Byte equality with three launches: the router's gemm_nt, the shared gate's gemm_nt at N = 1,
+ * and router_topk_scatter over the logits; all seven outputs are compared, logits and gate
+ * included. An element of the skinny bf16 GEMM depends only on its split-K count, and the fused op
+ * asks the unfused launch's law for that count at each N (four at 512 x 2560, twenty for the
+ * one-column gate; eight and sixteen at 256 x 2048).
  *
- * ROWS AT EVERY WAVE COUNT AND EVERY ROW-TILE COUNT the fused op launches -- 8, 16 and 32 waves,
- * one to four 16-row tiles, partial tiles included -- at the served geometry (512 experts,
- * top_k 10, K 2560) and at a 256-expert one, which takes the other selection instantiation and
- * other splits. An expert-parallel slice with a protect list, and the form without the gate.
+ * Rows cover every wave count (8, 16, 32) and row-tile count (one to four 16-row tiles, partial
+ * included) at the served geometry (512 experts, top_k 10, K 2560) and a 256-expert one (the other
+ * selection instantiation). Also an expert-parallel slice with a protect list, and no gate.
  *
- * AND TWICE, BACK TO BACK, ON ONE OUTPUT. The last workgroup is named by a counter that resets
- * itself; a counter left behind by one launch would make the next one rank before the GEMM was
- * done, or never. The counter is the instance's, taken by the row's init as the engine takes it,
- * and every launch here shares that one instance -- and with it one counter -- in an order that
- * changes the grid between consecutive launches. A launch with no instance is refused. */
+ * Each shape runs twice back to back on one output: the last workgroup is found by a
+ * self-resetting counter, owned by the instance the row's init creates, which all launches here
+ * share while the grid changes between them. A launch with no instance is refused. */
 static void router_gemm_fused_case(const Plugin& pl) {
     if (!sel("router_gemm_topk_scatter_bf16")) return;
     const RadKernelInfo* rg  = find(pl, "router_gemm_topk_scatter_bf16");
@@ -2224,8 +2047,7 @@ static void router_gemm_fused_case(const Plugin& pl) {
     }
 
     for (const RgCase& c : cfgs) {
-        /* A trained router's logits are a few units wide; these are about that, with a tie
-         * planted in every row so the selection's tie rule decides something. */
+        /* Logits a few units wide, like a trained router's, with a tie planted in every row. */
         std::vector<uint16_t> hw((size_t)c.ne * c.K), hwg((size_t)c.K);
         for (auto& v : hw)  v = h_to_bf16(uni(-0.06f, 0.06f));
         for (auto& v : hwg) v = h_to_bf16(uni(-0.06f, 0.06f));
@@ -2371,18 +2193,14 @@ static void router_gemm_fused_case(const Plugin& pl) {
     rg->fini(inst);
 }
 
-/* THE PROTECTED EXPERTS ARE SORTED LAST, against a host stable sort by place. A layer that keeps a
- * few experts at a higher precision serves them with a second grouped GEMM over a trailing run of
- * the offsets, so the sort has to put their rows after every other expert's, in the order listed,
- * with the rest closed up -- and keep every run stable. Both forms of the standalone sort run: 450
- * slots is the one-workgroup form, 3000 the three-pass one, and the first, a middle and the last
- * expert of a rank's slice are protected so the closing-up is tested at both ends. The fused
- * decode kernel is held to the standalone pair in topk_scatter_case.
+/* Protected experts are sorted last, checked against a host stable sort. Their rows must follow
+ * every other expert's, in the listed order, with the rest closed up and every run stable. Both
+ * standalone sort forms run (450 slots: one workgroup; 3000: three passes), with the first, a
+ * middle and the last expert of a slice protected. topk_scatter_case covers the fused kernel.
  *
- * The general form also runs at a prefill chunk's sizes: 79 and 80 tiles of 256 slots, so a
- * scan thread's column of tile counts takes several batches of loads with a short last one, on a
- * rank's slice and with every one of 512 experts local (the mod4 split's case), where the scan's
- * workgroup is every thread an expert. */
+ * The general form also runs at prefill sizes: 79 and 80 tiles of 256 slots (several batches of
+ * loads per scan thread, a short last one), on a rank's slice and with all 512 experts local (the
+ * mod4 split's case), where every scan thread is an expert. */
 static void scatter_protect_at(const RadKernelInfo* rs, int64_t M, int64_t nl, int64_t base);
 
 static void scatter_protect_case(const Plugin& pl) {
@@ -2407,8 +2225,8 @@ static void scatter_protect_at(const RadKernelInfo* rs, int64_t M, int64_t nl, i
         const int64_t NS = M * k;
         const std::string at = " (" + std::to_string(NS) + " slots, slice " + std::to_string(nl) +
                                ")";
-        /* Each row's k distinct experts from the whole router, a quarter of them in this slice and
-         * the protected ones over-represented so their runs are long. */
+        /* Each row's k distinct experts from the whole router, a quarter in this slice, the
+         * protected ones over-represented so their runs are long. */
         std::vector<int32_t> ids((size_t)NS);
         uint64_t rs64 = 0x9E3779B97F4A7C15ull ^ (uint64_t)M;
         auto rnd = [&]() { rs64 ^= rs64 << 13; rs64 ^= rs64 >> 7; rs64 ^= rs64 << 17; return rs64; };
@@ -2473,18 +2291,17 @@ static void scatter_protect_at(const RadKernelInfo* rs, int64_t M, int64_t nl, i
     }
 }
 
-/* moe_gather'S FORMS, against each other byte for byte.
+/* moe_gather's forms, against each other byte for byte.
  *
- * Past the self-scan cap the op builds the slot inverse in scratch and sums each token's slots.
- * Its rule takes gather_wide_kernel there -- a wave a token and sixteen bytes a lane -- wherever
- * the slots fit its registers and every row starts on sixteen bytes, and gather_kernel -- a column
- * a thread -- everywhere else. r4d_moe_gather_pin_form pins each (1 the column a thread, 2 the wave
- * a token), and every form must write the column-a-thread form's bytes: with and without the shared arm folded
- * in, under both gates, with dropped slots, at a width that ends inside a column group, and at
- * Qwen3.8-Flash-Next's 2048-token chunk on a rank of four -- where the case also prints what each
- * form costs. A decode step (under the cap), a top_k past the wide form's registers and a width it
- * cannot take in sixteen-byte pieces must refuse the wide pins, and the rule then writes the same
- * bytes as the column a thread. `wide` is whether the shape takes the wide form. */
+ * Past the self-scan cap the op builds the slot inverse in scratch and sums each token's slots,
+ * using gather_wide_kernel (a wave per token, sixteen bytes per lane) where the slots fit its
+ * registers and every row starts on sixteen bytes, and gather_kernel (a column per thread)
+ * elsewhere. r4d_moe_gather_pin_form pins each (1 column per thread, 2 wave per token), and every
+ * form must write the column-per-thread bytes: with and without the shared arm, under both gates,
+ * with dropped slots, at a width ending inside a column group, and at Qwen3.8-Flash-Next's
+ * 2048-token chunk on a rank of four (also timed). A decode step (under the cap), a top_k past the
+ * wide form's registers, and a width not tiled by sixteen-byte pieces must refuse the wide pin.
+ * `wide` says whether the shape takes the wide form. */
 struct MoeGatherShape { int64_t M, n, k; const char* act; bool wide; };
 
 static void moe_gather_at(const Plugin& pl, const RadKernelInfo* r, const MoeGatherShape& sh) {
@@ -2496,8 +2313,8 @@ static void moe_gather_at(const Plugin& pl, const RadKernelInfo* r, const MoeGat
     uint64_t rs = 0x9E3779B97F4A7C15ull ^ ((uint64_t)M * 1315423911ull) ^
                   ((uint64_t)n * 2654435761ull) ^ (uint64_t)k;
     auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
-    /* Each slot to one of 64 experts or, one in thirty-one, dropped; `sorted` is the stable sort by
-     * expert with the live slots first and -1 after them, as moe_scatter writes it. */
+    /* Each slot to one of 64 experts, or dropped one in thirty-one; `sorted` is the stable sort by
+     * expert, live slots first and -1 after, as moe_scatter writes it. */
     std::vector<int32_t> ex((size_t)NS), sorted((size_t)NS, -1);
     for (int64_t i = 0; i < NS; ++i) {
         const uint64_t v = rnd();
@@ -2640,6 +2457,17 @@ static void moe_gather_case(const Plugin& pl) {
     for (const MoeGatherShape& sh : kSh) moe_gather_at(pl, r, sh);
 }
 
+/* ------------------------------------------------------- the vocab-parallel top-R, end to end
+ *
+ * A top-R over one plane must equal the merge of the two half-plane top-Rs, index for index and
+ * value for value. This covers the `vocab_off` shift, the `pairs` plane row_topk writes and the
+ * merge at once; a sharded draft head must propose exactly what the replicated one does.
+ *
+ * The values are full of ties (a 23-value alphabet over 2048 columns), because a dense top-R
+ * breaks ties on the lower column and a merge that broke them on rank order would disagree.
+ *
+ * The gathered plane is assembled as `all_gather` with `row = R*2` does: rank r's R pairs at
+ * [r*R, (r+1)*R) of each row. */
 static void rowtopk_shard_case(const Plugin& pl) {
     if (!sel("rowtopk_merge") && !sel("rowtopk_bf16")) return;
     const RadKernelInfo* rt = find(pl, "rowtopk_bf16");
@@ -2678,12 +2506,8 @@ static void rowtopk_shard_case(const Plugin& pl) {
     st_memcpy(wv.data(), d_v0, (size_t)M * R * 4, hipMemcpyDeviceToHost);
 
     /* Each rank's own slice, reporting global columns, plus the pairs an all_gather would move.
-     *
-     * THE SLICE IS COPIED OUT RATHER THAN VIEWED. libr4d's top-R takes a CONTIGUOUS [M, N] plane
-     * and refuses a strided one, so a column slice of the wide plane is not an operand it accepts
-     * -- and it does not have to be: under a real shard each rank's draft head writes only its own
-     * rows, so the plane it hands this op is contiguous and `SH` wide by construction. Passing a
-     * view here would be testing a shape the engine never produces. */
+     * The slice is copied out: the top-R refuses a strided plane, and under a real shard each
+     * rank's plane is contiguous and `SH` wide anyway. */
     std::vector<uint16_t> half((size_t)M * SH);
     std::vector<float> gath((size_t)M * W * R * 2);
     for (int64_t r = 0; r < W; ++r) {
@@ -2734,18 +2558,17 @@ static void rowtopk_shard_case(const Plugin& pl) {
 /* --------------------------- the attention with the output gate and quantiser in its merge, vs the pair
  *
  * `attn_decode_gq_h256_gqa12_<kv>` is `attn_decode_h256_gqa12_<kv>` followed by `gate_quant_fp8`
- * over its output, for the E4M3 cache and the bf16 one, and the claim is byte equality with that
- * pair: the gated bf16 product it leaves in `out`, every E4M3 code and every scale. The engine's
- * sparse-path geometry -- 12 query heads over one kv head of 256, 4-token pages, one query row a
- * sequence -- with the gate a column view of a [q|gate] plane exactly as the block hands it over.
+ * over its output, for E4M3 and bf16 caches, and must be byte-identical to that pair: the gated
+ * bf16 product in `out`, every code and every scale. The engine's sparse-path geometry: 12 query
+ * heads over one kv head of 256, 4-token pages, one query row per sequence, the gate a column view
+ * of a [q|gate] plane as the block passes it.
  *
- * TWO BATCH SIZES, because the merge has two forms: three rows is 36 (row, head) jobs and takes
- * the one-thread-a-column merge, 24 rows is 288 and takes the one-wave-a-row form. Each has one
- * padded row (no context), which the pair gives zeros, a zero scale group and a scale of 1. The
- * E4M3 cache is random bytes but for the NaN codes, the bf16 one random finite values, and the
- * descales are not 1. */
-/* `i8` runs both at INT8 codes -- the codes operand an int8 out projection reads -- and the claim
- * is the same: the fold's int8 merge leaves what gate_quant_fp8's int8 form leaves. */
+ * Two batch sizes cover the merge's two forms: 3 rows (36 (row, head) jobs, one thread per column)
+ * and 24 rows (288, one wave per row). Each has one padded row (no context), which gets zeros, a
+ * zero scale group and a scale of 1. The E4M3 cache is random bytes except NaN codes, the bf16 one
+ * random finite values, and the descales are not 1.
+ *
+ * `i8` runs both at int8 codes (the operand an int8 out projection reads), with the same claim. */
 static void attn_gq_fold_case(const Plugin& pl, int64_t S, bool bf16, bool i8 = false) {
     const std::string kvs = bf16 ? "bf16kv" : "fp8kv";
     const std::string fold = "attn_decode_gq_h256_gqa12_" + kvs;
@@ -2868,7 +2691,7 @@ static void attn_gq_fold_case(const Plugin& pl, int64_t S, bool bf16, bool i8 = 
         for (size_t i = 0; i < a.size(); ++i) n += a[i] != b[i];
         return n;
     };
-    /* And the pair did write something: its codes are not all zero. */
+    /* And the pair wrote something: its codes are not all zero. */
     int64_t live = 0;
     for (uint8_t x : qa) live += x != 0;
     const int64_t n_o = ndiff(oa, obv), n_q = ndiff(qa, qbv), n_s = ndiff(sa, sbv);
@@ -2879,6 +2702,18 @@ static void attn_gq_fold_case(const Plugin& pl, int64_t S, bool bf16, bool i8 = 
     ok(name.c_str(), n_o == 0 && n_q == 0 && n_s == 0 && live > 0, msg);
 }
 
+/* kv_store, both widths, against an exactly representable set so the check is equality: halves
+ * and integers up to 8 survive E4M3 (three mantissa bits) and bf16 unchanged, so `h_e4m3` or
+ * `h_bf16` of what landed must equal what went in.
+ *
+ * The op scatters into kv_cache[n_blocks, kv_heads, block_size, 2*head_dim], K at [.., d] and V at
+ * [.., head_dim + d], at (slot / block_size, slot % block_size). Each value is built from (token,
+ * head, dim) and K and V have disjoint sign, so a k/v swap, head transposition or off-by-a-block
+ * shows.
+ *
+ * A negative or out-of-range slot (a pad row) must store nothing: the cache is prefilled with a
+ * sentinel and those slots must still hold it. Slot 0 is a real slot (as in libref and
+ * r4d_gdn_conv_w4_h128_bf16.hip) and is used deliberately. */
 static void kv_store_case(const Plugin& pl, const char* name, const char* kv_dtype) {
     if (!sel(name)) return;
     const RadKernelInfo* r = find(pl, name);
@@ -2892,8 +2727,8 @@ static void kv_store_case(const Plugin& pl, const char* name, const char* kv_dty
     const std::vector<int32_t> slots = { 0, 17, 63, -1, (int32_t)(n_blocks * block_size), 33 };
     const int64_t  T_tok      = (int64_t)slots.size();
 
-    /* Exact in E4M3 and in bf16. Sign separates K from V, the magnitude carries the head and the
-     * column, so no two (token, head, dim) triples that this could confuse share a value. */
+    /* Exact in E4M3 and bf16. Sign separates K from V, the magnitude encodes head and column, so
+     * no two confusable (token, head, dim) triples share a value. */
     auto want = [&](int64_t t, int64_t h, int64_t d, bool is_v) {
         static const float mag[8] = { 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 8.0f };
         const float m = mag[(size_t)((t * 3 + h * 5 + d) % 8)];
@@ -2917,8 +2752,8 @@ static void kv_store_case(const Plugin& pl, const char* name, const char* kv_dty
     st_memcpy(d_k, hk.data(), (size_t)T_tok * lane * 2, hipMemcpyHostToDevice);
     st_memcpy(d_v, hv.data(), (size_t)T_tok * lane * 2, hipMemcpyHostToDevice);
     st_memcpy(d_sm, slots.data(), (size_t)T_tok * 4, hipMemcpyHostToDevice);
-    /* 0x7f is NaN in E4M3 and a large number in bf16 -- either way it is a value the store cannot
-     * produce from the inputs above, so anything still holding it was not written. */
+    /* 0x7f is NaN in E4M3 and large in bf16; the store cannot produce it from these inputs, so
+     * anything still holding it was not written. */
     st_memset(d_c, 0x7f, cbytes);
 
     std::vector<RadTensor> ts = {
@@ -2962,11 +2797,8 @@ static void kv_store_case(const Plugin& pl, const char* name, const char* kv_dty
                 }
             }
     }
-    /* Every element of a block no live slot names must still be the sentinel, and that is checked
-     * on the RAW STORAGE rather than through `at`. 0x7f is the NaN encoding in E4M3 and this
-     * file's `h_e4m3` does not implement it -- it reads exponent 15, mantissa 7 as 480.0 -- so a
-     * decoded comparison against NaN reports every untouched byte as written. The bytes are what
-     * the question is about anyway: "was this written", not "what does it mean". */
+    /* Every element no live slot names must still be the sentinel, checked on raw storage: 0x7f
+     * is E4M3's NaN, which h_e4m3 decodes as 480.0, so a decoded comparison would misreport. */
     for (int64_t i = 0; i < cache_elts; ++i) {
         const int64_t blk = i / (kv_heads * block_size * 2 * head_dim);
         const int64_t off = (i / (2 * head_dim)) % block_size;
@@ -2991,91 +2823,30 @@ static void kv_store_case(const Plugin& pl, const char* name, const char* kv_dty
        pad_touched == 0, pad_touched ? "written: " + first : "");
 }
 
-/* THE FP8 GEMM, CHECKED AGAINST A HOST REFERENCE ON THE SAME BYTES.
+/* The anchor state form, end to end.
  *
- * A kernel that produces plausible numbers is not evidence (spec §17). This builds a weight's two
- * block-fp8 planes, has the plugin's OWN layout hooks arrange them, dequantises the planes on the
- * host -- the same E4M3 codes and the same bf16 block scales the kernel will read -- and compares.
- * So it falsifies four things at once: the arrangement, the kernel's scale INDEXING (a `>> 7` off
- * by one reads a neighbouring tile and still looks like weights), the fold's placement inside the
- * K loop, and -- for fp8a8 -- the activation quantiser and the epilogue's transpose.
- *
- * It is deliberately NOT a tolerance on the quantisation error: both sides see the same quantised
- * weight, so the only difference permitted is summation order. The bound is bf16's own resolution
- * on the output, 2^-8 relative, loosened to 3e-2 because a K=512 reduction reordered across 32
- * lanes moves the last bf16 mantissa bit on values near a rounding boundary and this is a
- * correctness gate, not a numerics measurement -- a transposed operand or a misread scale lands
- * two orders of magnitude away from it, which is the thing being caught.
- *
- * WHAT IT ACTUALLY MEASURES, so a later loosening is visible: 1.739e-3 for the matvec at every one
- * of the five rb variants, agreeing to six digits, and 1.1731e-2 for BOTH W8A8 rows. 2^-9 is
- * 1.95e-3, so the matvec is sitting on bf16's own rounding floor and nothing else; the W8A8 rows
- * are higher because their ACTIVATION is quantised to E4M3 as well, whose three mantissa bits are
- * ~6% per element before the K=512 average. On real checkpoint weights (--real) the matvec measures
- * 1.66e-3 at gate_proj, o_proj and q_proj alike.
- *
- * THE TWO W8A8 ROWS AGREEING TO SIX DIGITS IS THE RESULT WORTH READING. They put the weight on
- * OPPOSITE operands, fold opposite scale shapes, and store through opposite epilogues -- one
- * transposed and split over K, one coalesced and not -- and they land on the same number. Two
- * independent paths agreeing with the host is a much stronger statement than either agreeing on
- * its own, because the ways they could each be wrong do not overlap. */
-/* THE GROUPED DYNAMIC CONVOLUTION AGAINST A HOST MIRROR OF DFlash2's `_grouped_conv`.
- *
- * The smoke case above launches it against zeroed buffers, which cannot tell a convolution from a
- * copy: every tap term is zero, the block-position mask is never exercised, and the group index is
- * irrelevant when every delta is the same. This one puts the reference formula on the host --
- *
- *   out[t,h] = SUM over k of (base[k][h] + delta[t][k*NG + h/group]) * x[t-k][h] * (t%block >= k)
- *
- * -- and asks whether the kernel agrees. The three things it can get wrong and the smoke case
- * cannot see are all in that line: which delta belongs to which channel (the group index), whether
- * the tap shift is within the block or across it (the mask), and whether base is indexed by
- * channel or by group. */
-/* THE ANCHOR STATE FORM, END TO END.
- *
- * `gdn_recurrent_update` serves two contracts for the same arithmetic. Under `per_candidate` every
- * candidate token writes its own state slot and the next step reads the one the last accepted
- * token wrote. Under `anchor` a sequence keeps ONE state, the step's tokens are recorded beside it
- * as replay factors, and the next step folds the accepted prefix back in before it runs. The two
- * produce the same output from a completely different cache, so nothing that compares the state
- * can compare them -- and a fixture recording cannot reach the anchor at all, because drawing one
- * state index per candidate IS the per-candidate contract.
- *
- * What that leaves unchecked is the whole anchor path: the replay loop, the factor block's layout,
- * and the column algebra that has to survive a paged cache whose window slides. So this drives a
- * multi-step schedule against a host walk of the delta rule with a rollback between steps, which
- * is the per-candidate contract's answer by definition:
+ * `gdn_recurrent_update` serves two state contracts with the same arithmetic. Under
+ * `per_candidate` every candidate token writes its own state slot and the next step reads the one
+ * the last accepted token wrote. Under `anchor` a sequence keeps one state, the step's tokens are
+ * recorded beside it as replay factors, and the next step folds the accepted prefix back in. Both
+ * give the same output from different caches, so this drives a multi-step schedule against a host
+ * walk of the delta rule with rollback:
  *
  *     the state a step starts from is the state after the previous step's first `num_accepted`
- *     tokens, whatever the cache did to hold on to it.
+ *     tokens.
  *
- * THE WINDOW MOVES ALL THREE WAYS. A paged caller re-derives the page index every step, so the six
- * columns slide by -1, 0 or +1 and the kernel finds its anchor through a marker it left in the
- * factor block. The schedule below takes +1, then 0, then -1. With a window that never moves,
- * every read lands where it was written whatever the algebra says and the marker is untested.
+ * The window moves all three ways: a paged caller re-derives the page index every step, so the six
+ * columns slide by -1, 0 or +1 and the kernel finds its anchor through a marker in the factor
+ * block. The schedule takes +1, then 0, then -1.
  *
- * AND IT ASSERTS ITS OWN SENSITIVITY. A second host chain rolls back to the FIRST token at every
- * step -- what a kernel that ignored `num_accepted` would produce -- and the check requires that
- * one to DISAGREE with the device. Without it, a schedule whose acceptances all happened to be one
- * would pass with the replay loop deleted.
- *
- * It needs a process of its own. The state form is selected by an environment variable read once
- * and cached, so the smoke case above and this one cannot share one; the child is spawned the same
- * way and for the same reason the per-row children are.
+ * A second host chain always rolls back to the first token (what a kernel ignoring `num_accepted`
+ * would produce) and must disagree with the device, so the check is sensitive.
  */
 static void gdn_recurrent_anchor(const Plugin& pl) {
     const char* row = "gdn_recurrent_update_k128_v128_bf16_fp32state";
     const char* nm  = "gdn_recurrent_update anchor replays the accepted prefix";
 
-    if (sel(row)) {                       /* the per-candidate child hands the form to its own */
-        if (!g_exe || !g_plugin) { ok(nm, false, "no re-exec path"); return; }
-        const int st = spawn_anchor_child(nm);
-        if (st == CH_FAIL)      ++g_fail;         /* the child printed the line and the detail */
-        else if (st == CH_SKIP) ++g_skip;
-        else if (st != CH_OK)   ok(nm, false, "child exit " + std::to_string(st));
-        return;
-    }
-    if (!sel(nm)) return;
+    if (!sel(row) && !sel(nm)) return;
     const RadKernelInfo* r = find(pl, row);
     if (!r) { ok(nm, false, "row absent"); return; }
 
@@ -3084,9 +2855,9 @@ static void gdn_recurrent_anchor(const Plugin& pl) {
     const int64_t PAGES = 7;              /* the widest window the schedule below slides over */
     const int64_t SLOTS = N * PAGES;
     const double  scale = 0.088388, neps = 1e-6;
-    /* `win` is the window's first page and `nacc` is what the PREVIOUS step committed. The first
-     * step is the bootstrap: its factor block is the zeros a freshly handed out slot carries, the
-     * marker reads as absent, and replaying one zeroed token leaves the anchor alone. */
+    /* `win` is the window's first page, `nacc` what the previous step committed. The first step
+     * bootstraps: its factor block is a fresh slot's zeros, the marker reads as absent, and
+     * replaying one zeroed token leaves the anchor alone. */
     struct Step { int nacc, win; };
     const Step sched[] = { {1, 0}, {2, 1}, {3, 1}, {1, 0} };
     const int NS = (int)(sizeof(sched) / sizeof(sched[0]));
@@ -3103,8 +2874,8 @@ static void gdn_recurrent_anchor(const Plugin& pl) {
         rs = rs * 1664525u + 1013904223u;
         return (float)((rs >> 9) & 0xFFFFu) * (1.0f / 32768.0f) - 1.0f;
     };
-    /* A_log sits where the decay is a few percent a token: exp(A_log) * softplus(a + dt_bias) of
-     * order 0.05, so the state neither freezes nor forgets inside twelve tokens. */
+    /* A_log gives a decay of a few percent per token (exp(A_log) * softplus(a + dt_bias) ~ 0.05),
+     * so the state neither freezes nor forgets within twelve tokens. */
     for (int64_t h = 0; h < H; ++h) { halog[(size_t)h] = -2.0f + 0.25f * (float)h;
                                       hdtb[(size_t)h]  = -1.0f + 0.5f * (float)h; }
     for (int64_t j = 0; j < V; ++j) hnw[(size_t)j] = 1.0f + 0.25f * rnd();
@@ -3152,9 +2923,8 @@ static void gdn_recurrent_anchor(const Plugin& pl) {
     a.p = ps.data(); a.n_p = (int)ps.size();
     a.world_size = 1;
 
-    /* Two host chains over the same data: one that rolls back to the accepted token, and one that
-     * always rolls back to the first. `sn` keeps a state per candidate token so the next step's
-     * rollback has somewhere to go. */
+    /* Two host chains over the same data: one rolls back to the accepted token, one always to
+     * the first. `sn` keeps a state per candidate token for the next step's rollback. */
     const size_t selems = (size_t)(N * H * V * K);
     std::vector<float> S(selems), Sw(selems);
     std::vector<float> sn((size_t)NT * selems), snw((size_t)NT * selems);
@@ -3249,10 +3019,8 @@ static void gdn_recurrent_anchor(const Plugin& pl) {
         }
         walk(S,  sn,  ref);
         walk(Sw, snw, refw);
-        /* A RELATIVE L2 AND NOT A PER-ELEMENT MAXIMUM. The gated norm leaves a fair number of
-         * outputs next to zero, and dividing by one of those turns a rounding difference into a
-         * large ratio -- which flatters the sensitivity check exactly as much as it slanders the
-         * agreement, so neither number would mean anything. */
+        /* Relative L2, not a per-element maximum: the gated norm leaves many outputs near zero,
+         * where a per-element ratio would inflate rounding differences. */
         double en = 0.0, ew = 0.0, rn = 0.0;
         for (size_t i = 0; i < hdev.size(); ++i) {
             const double d = h_bf16(hdev[i]);
@@ -3294,24 +3062,21 @@ static int64_t i8_code_misses(const uint16_t* x, int64_t x_ld, const int8_t* q, 
     return miss;
 }
 
-/* THE DECODE CONVOLUTION FOLDED INTO THE RECURRENT UPDATE, AGAINST THE PAIR IT REPLACES.
+/* The decode convolution folded into the recurrent update, against the pair it replaces.
  *
- * gdn_conv_recurrent_update claims to leave every byte gdn_conv_update followed by
- * gdn_recurrent_update leaves: the output, its fp8 codes and scales, the recurrent state and the
- * conv state. So both run from identical copies and all five are compared exactly, over TWO steps
- * -- the second is what catches an arrival counter that does not reset, because the key heads'
- * conv state is then never rewritten.
+ * gdn_conv_recurrent_update must leave every byte gdn_conv_update + gdn_recurrent_update leave:
+ * output, fp8 codes and scales, recurrent state and conv state. Both run from identical copies
+ * and all five are compared over two steps; the second catches an arrival counter that does not
+ * reset (the key heads' conv state would then not be rewritten).
  *
- * The geometry puts two value heads on each key head, which is what makes the last-arriver rewrite
- * run at all; gives the sequences uneven windows and read offsets; slots sequence 1 at conv slot 0,
- * the real slot a `<= 0` test would drop; and makes the last sequence padding, with every slot
- * negative. The projection is one row with the gate behind the convolution's columns, as the
- * block lays it out, so `x` and `z` are both column views with the row's pitch.
+ * Two value heads per key head (so the last-arriver rewrite runs), uneven windows and read
+ * offsets, sequence 1 at conv slot 0 (a real slot a `<= 0` test would drop), and a last sequence
+ * of padding with every slot negative. `x` and `z` are column views of one projection row, the
+ * gate after the convolution's columns, as the block lays it out.
  *
- * AND IT ASSERTS ITS OWN SENSITIVITY: the key heads' conv state has to have moved, or a fold that
- * never rewrote it would pass against a pair that also did not. The state contract is chosen once a
- * process, so the anchor form runs in a child, as gdn_recurrent_anchor's does. */
-/* `i8` runs both at INT8 codes, and holds the pair's codes to quant_act_i8g over its `o` too. */
+ * The key heads' conv state must have moved, so the check is sensitive. The anchor form runs in a
+ * child process, as in gdn_recurrent_anchor. `i8` runs both at int8 codes and also holds the pair's
+ * codes to quant_act_i8g over its `o`. */
 static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form,
                               bool i8 = false) {
     const RadKernelInfo* rf = find(pl, "gdn_conv_recurrent_update_k128_v128_bf16");
@@ -3453,8 +3218,8 @@ static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form
                 break;
             }
         }
-        /* At int8 codes, the real sequences' tokens -- every sequence but the padded last one --
-         * against quant_act_i8g over the `o` the pair left. A (token, head) row is one group. */
+        /* At int8 codes, the real sequences' tokens (all but the padded last) against
+         * quant_act_i8g over the pair's `o`. A (token, head) row is one group. */
         if (i8 && why.empty()) {
             const std::vector<uint8_t> O = fetch(d_o[0], o_b), Q = fetch(d_oq[0], oq_b),
                                        S = fetch(d_os[0], os_b);
@@ -3486,29 +3251,17 @@ static void gdn_conv_fold(const Plugin& pl) {
         gdn_conv_fold_run(pl, "gdn_conv_recurrent_update is byte-identical to the pair at int8 "
                               "codes, which are quant_act_i8g's, per_candidate",
                           "per_candidate", true);
-        if (!g_exe || !g_plugin) { ok(nma, false, "no re-exec path"); return; }
-        const int st = spawn_anchor_child(nma);
-        if (st == CH_FAIL)      ++g_fail;
-        else if (st == CH_SKIP) ++g_skip;
-        else if (st != CH_OK)   ok(nma, false, "child exit " + std::to_string(st));
-        return;
     }
-    if (sel(nma)) gdn_conv_fold_run(pl, nma, "anchor");
+    if (sel(row) || sel(nma)) gdn_conv_fold_run(pl, nma, "anchor");
 }
 
-/* THE GATED NORM'S GATE AS A COLUMN SLICE, WHICH ONE PITCH CANNOT DESCRIBE.
+/* The gated norm's gate as a column slice, which one pitch cannot describe.
  *
- * The fp8 delta net projects [q|k|v|z] in ONE GEMM (arch/common/rad_block_gdn_fp8.h), so the gate
- * this kernel reads is the right-hand columns of a wider row: its (token, head) rows are `channels`
- * apart INSIDE a token and the projection's whole width apart BETWEEN tokens. An implementation
- * that multiplies the flat row index by a single stride therefore walks into the next token after
- * `n_head_v` rows -- still in bounds, still finite, and wrong in a way that reads as a slightly
- * different model rather than as a crash.
- *
- * The smoke case above cannot see it, because it only ever hands over a dense gate. So this one
- * runs the same numbers TWICE -- dense, and as the tail of a row twice as wide -- and requires the
- * two outputs to agree byte for byte. Every value is a multiple of an eighth so the equality is
- * exact and not a tolerance. */
+ * The fp8 delta net projects [q|k|v|z] in one GEMM (arch/common/rad_block_gdn_fp8.h), so the gate
+ * is the right-hand columns of a wider row: its (token, head) rows are `channels` apart within a
+ * token and the projection's width apart between tokens. A single stride walks into the next token
+ * after `n_head_v` rows, silently. This runs the same numbers dense and as the tail of a row twice
+ * as wide and requires identical bytes; values are multiples of an eighth, so equality is exact. */
 static void gdn_gated_norm_sliced_gate(const Plugin& pl) {
     if (!sel("gdn_gated_rmsnorm_h128_bf16")) return;
     const char* nm = "gdn_gated_rmsnorm_h128_bf16 reads a column-sliced gate";
@@ -3586,6 +3339,13 @@ static void gdn_gated_norm_sliced_gate(const Plugin& pl) {
     ok(nm, bad == 0, d);
 }
 
+/* The grouped dynamic convolution against a host mirror of DFlash2's `_grouped_conv`:
+ *
+ *   out[t,h] = SUM over k of (base[k][h] + delta[t][k*NG + h/group]) * x[t-k][h] * (t%block >= k)
+ *
+ * The smoke case runs on zeroed buffers and cannot tell a convolution from a copy. This checks the
+ * group index (which delta belongs to which channel), the block-position mask, and whether base is
+ * indexed by channel or by group. */
 static void dflash_conv_numeric(const Plugin& pl, int64_t nt, int64_t H, int64_t group,
                                 int64_t taps, int64_t bsz) {
     if (!sel("dflash_conv_t2_g16_bf16")) return;
@@ -3599,8 +3359,7 @@ static void dflash_conv_numeric(const Plugin& pl, int64_t nt, int64_t H, int64_t
     const int64_t dpitch = 2 * taps * NG;
     std::vector<uint16_t> hx((size_t)(nt * H)), hd((size_t)(nt * dpitch)),
                           hb((size_t)(taps * H)), hy((size_t)(nt * H), 0);
-    /* Quarters and eighths, so every product and sum is exact in f32 and the comparison is an
-     * equality rather than a tolerance. */
+    /* Quarters and eighths, so every product and sum is exact in f32. */
     for (int64_t t = 0; t < nt; ++t)
         for (int64_t h = 0; h < H; ++h)
             hx[(size_t)(t * H + h)] = h_to_bf16((float)(((t * 5 + h * 3) % 17) - 8) * 0.25f);
@@ -3667,16 +3426,9 @@ static void dflash_conv_numeric(const Plugin& pl, int64_t nt, int64_t H, int64_t
     ok(nm, bad == 0, d);
 }
 
-/* THE SKINNY bf16 GEMM AGAINST A HOST REFERENCE, AT A GIVEN K.
- *
- * The smoke case above launches it; this one says whether the number is right, and it takes K as a
- * parameter because K is the dimension this kernel decomposes along -- pick_sk splits it, rowGo
- * strides rows by it, and the unrolled fragment loop walks it. A K no model has used is therefore
- * exactly the shape that has never been checked, and "it launches" says
- * nothing about it.
- *
- * The weight is plain row-major [N, K]: this row declares no layout hook, so there is nothing to
- * arrange and the bytes the host builds are the bytes the kernel reads. */
+/* The skinny bf16 GEMM against a host reference at a given K. K is the dimension this kernel
+ * decomposes along (pick_sk splits it, rowGo strides rows by it, the unrolled fragment loop walks
+ * it), so it is a parameter. The weight is plain row-major [N, K]: the row has no layout hook. */
 static void bf16_gemm_numeric(const Plugin& pl, const char* row, int64_t M, int64_t N, int64_t K) {
     if (!sel(row)) return;
     char nm[128];
@@ -3685,9 +3437,9 @@ static void bf16_gemm_numeric(const Plugin& pl, const char* row, int64_t M, int6
     const RadKernelInfo* r = find(pl, row);
     if (!r) { ok(nm, false, "row absent"); return; }
 
-    /* Deterministic and in the range the drafter's own fc actually sees: activations to a couple
-     * of hundred, weights inside one. A pattern that is symmetric in k would hide a split-K bug by
-     * making every partial sum equal, so the sign alternates on a period coprime with 16. */
+    /* Deterministic, in the drafter fc's range: activations to a couple of hundred, weights
+     * within one. The sign alternates on a period coprime with 16, since a pattern symmetric in k
+     * would make every split-K partial sum equal. */
     std::vector<uint16_t> ha((size_t)(M * K)), hw((size_t)(N * K)), hy((size_t)(M * N), 0);
     for (int64_t i = 0; i < M; ++i)
         for (int64_t k = 0; k < K; ++k)
@@ -3720,11 +3472,9 @@ static void bf16_gemm_numeric(const Plugin& pl, const char* row, int64_t M, int6
     }
     st_memcpy(hy.data(), ts[2].data, hy.size() * 2, hipMemcpyDeviceToHost);
 
-    /* The reference reads the SAME bf16 values the kernel does, so what is left to disagree about
-     * is the arithmetic and the addressing and nothing else. A wide N is checked on a STRIDED
-     * SAMPLE of its columns: the host cost is M*N*K and the production shape is 655 million
-     * products, while what a column can be wrong about -- which weight row it read -- is a
-     * property of the column index, so sampling the index space finds it. */
+    /* The reference reads the same bf16 values, so only arithmetic and addressing can differ. A
+     * wide N is checked on a strided sample of columns (the host cost is M*N*K); which weight row a
+     * column reads depends only on its index, so sampling finds a misread. */
     const int64_t nstep = N > 64 ? N / 64 : 1;
     double num = 0, den = 0, worst = 0;
     for (int64_t i = 0; i < M; ++i)
@@ -3744,10 +3494,9 @@ static void bf16_gemm_numeric(const Plugin& pl, const char* row, int64_t M, int6
 }
 
 
-/* THE 8-BIT-WEIGHT SKINNY GEMM AGAINST WHAT THE PLANES MEAN. The row reads the w8a16 hooks'
- * fragment-order codes and (scale, zero) dwords, got from its own hooks, and the reference is the
- * planes dequantised on the host, so an arrangement the kernel misread shows as a column that
- * disagrees. `adt` is the activation's dtype, which the row takes as f16 and refuses otherwise. */
+/* The 8-bit-weight skinny GEMM against the planes' meaning. The row reads fragment-order codes
+ * and (scale, zero) dwords from its own w8a16 hooks; the reference dequantises the planes on the
+ * host. `adt` is the activation dtype: the row takes f16 and refuses others. */
 static void w8a16_numeric(const Plugin& pl, const char* row, int64_t M, int64_t N, int64_t K,
                           uint32_t adt) {
     if (!sel(row)) return;
@@ -3840,10 +3589,10 @@ static void w8a16_numeric(const Plugin& pl, const char* row, int64_t M, int64_t 
 }
 
 
-/* An OCP-MXFP4 weight's planes, drawn through st_mix32 of each coordinate and `seed`: codes over
- * all sixteen e2m1 values, and an exponent per (row, 32 of K) within three binades of 127. With
- * `deep`, about one block in eleven sits 6..12 binades lower still -- the folded table's subnormal
- * tail. */
+/* An OCP-MXFP4 weight's planes, drawn from st_mix32 of each coordinate and `seed`: codes over all
+ * sixteen e2m1 values, and an exponent per (row, 32 of K) within three binades of 127. With
+ * `deep`, about one block in eleven sits 6..12 binades lower (the folded table's subnormal
+ * tail). */
 static void mxfp4_fill(Planes& p, int ic, int is, int64_t N, int64_t K, uint32_t seed, bool deep) {
     const int64_t nblk = K / 32;
     for (int64_t n = 0; n < N; ++n)
@@ -3867,30 +3616,26 @@ static float mxfp4_act(int64_t i, int64_t k, uint32_t seed) {
     return (float)((int)(h % 401) - 200) * 0.02f;
 }
 
-/* THE MXFP4 GEMMS AGAINST WHAT THE PLANES MEAN. The weight is an OCP-MXFP4 plane pair -- e2m1
- * codes and an E8M0 exponent per 32 K -- stored through the row's own hooks, so the fragment
- * order, the [K/32][N] exponents and the per-row reference all come from r4d_layout.cpp and the
- * kernel is checked on what the loader would hand it. The reference decodes the planes on the host
- * with no fold at all, so a misread arrangement shows as a column that disagrees.
+/* The MXFP4 GEMMs against the planes' meaning. The weight is an OCP-MXFP4 plane pair (e2m1 codes,
+ * an E8M0 exponent per 32 K) stored through the row's own hooks, so fragment order, [K/32][N]
+ * exponents and the per-row reference all come from r4d_layout.cpp. The host reference decodes
+ * the planes with no fold.
  *
- * Codes, exponents and activations are drawn through st_mix32 of their coordinates, so a misread
- * pitch or lane map reads unrelated numbers rather than a shifted copy of the right ones. The
- * exponents are spread so a row's blocks sit up to 12 binades under its reference: d <= 8 is exact
- * in the folded e4m3 table and d = 9..12 rounds, which is the subnormal tail every MXFP4 row
- * shares. M and N are chosen ragged against the tiled row's 256-row block and 64/128-column tile,
- * so the clamped staging and the guarded epilogue both run. `tn` pins the tiled row's column
- * width; 0 leaves it to the row's own M rule (and is ignored by the skinny row).
+ * Exponents are spread so a row's blocks sit up to 12 binades under its reference: d <= 8 is exact
+ * in the folded e4m3 table, d = 9..12 rounds (the subnormal tail). M and N are ragged against the
+ * tiled row's 256-row block and 64/128-column tile, so clamped staging and the guarded epilogue
+ * run. `tn` pins the tiled row's column width; 0 leaves it to the row's M rule (the skinny row
+ * ignores it).
  *
- * `ablk` hands the activation scale as the block-scaled fp8 family's grid, one f32 per (row, 128
- * of K), instead of one per row -- what an architecture's fused quantisers write. The scales are
- * spread over two decades and every eleventh block's is ZERO with zero codes behind it (an
- * all-zero activation block), which is the case the kernels carry their previous scale through. */
+ * `ablk` passes the activation scale on the block-scaled fp8 grid, one f32 per (row, 128 of K), as
+ * fused quantisers write it. Scales span two decades, and every eleventh block's is zero with zero
+ * codes (an all-zero activation block), where the kernels carry their previous scale through. */
 static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_t N, int64_t K,
                             int tn, bool ablk = false, std::vector<RadParam> extra = {},
                             int64_t pb1 = 0, int64_t pb2 = 0) {
     if (!sel(row)) return;
-    /* PARTS (ParoQuant): the weight's rows [0, pb1), [pb1, pb2), [pb2, N) each meet their own copy
-     * of the activation, the copies side by side in a row. `K` is one copy's width. */
+    /* Parts (ParoQuant): weight rows [0, pb1), [pb1, pb2), [pb2, N) each meet their own copy of
+     * the activation, side by side in a row. `K` is one copy's width. */
     const PartCut cut(N, pb1, pb2);
     const int parts = cut.parts;
     char nm[160];
@@ -3969,8 +3714,8 @@ static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_
     a.t = ts.data(); a.n_t = (int)ts.size();
     a.p = ps.data(); a.n_p = (int)ps.size();
     a.world_size = 1;
-    /* A row with a scratch hook (the decode row's split partial) gets what it asks for, as the
-     * core would hand it; the decode row refuses a split with too little. */
+    /* A row with a scratch hook (the decode row's split partial) gets what it asks for, as from
+     * the core; the decode row refuses a split with too little. */
     if (r->scratch) {
         const int64_t sb = r->scratch(&a);
         if (sb > 0) {
@@ -3986,8 +3731,8 @@ static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_
     }
     st_memcpy(hy.data(), d_y, hy.size() * 2, hipMemcpyDeviceToHost);
 
-    /* Every column for small N, a stride otherwise -- always including the last column, which is
-     * the clamped tail of the tiled row's weight staging. */
+    /* Every column for small N, a stride otherwise, always including the last column (the clamped
+     * tail of the tiled row's weight staging). */
     const int64_t nstep = N > 96 ? N / 96 : 1;
     double num = 0, den = 0, worst = 0;
     for (int64_t i = 0; i < M; ++i)
@@ -4013,16 +3758,16 @@ static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_
 }
 
 
-/* PAROQUANT'S ACTIVATION QUANTISER AGAINST A DOUBLE-PRECISION ROTATION. The tables are real
- * pairings -- every stage of every group is a random permutation of the group's 128 columns read
- * as 64 pairs -- with angles over (-pi, pi) and channel scales over (0.5, 2), drawn through
- * st_mix32 of their coordinates. The reference divides, rotates in f64 and takes the absmax; the
- * kernel's scale must match it to the rounding of its f32 sincos, and every dequantised element
- * must sit within the E4M3 grid of the reference (half a step at the top of the range is 1/16 of
- * the group's maximum, so 7% of it is a bound a wrong pair or a wrong angle cannot meet). */
-/* What givens_numeric runs: the sequential rotation to f16, or the dense rotation with either quantiser. */
+/* What givens_numeric runs: the sequential rotation to f16, or the dense rotation with either
+ * quantiser. */
 enum class GvCase { Rotate, DenseFp8, DenseI8 };
 
+/* ParoQuant's activation quantiser against a double-precision rotation. The tables are real
+ * pairings (each stage of each group a random permutation of its 128 columns read as 64 pairs),
+ * angles over (-pi, pi), channel scales over (0.5, 2). The reference divides, rotates in f64 and
+ * takes the absmax. The kernel's scale must match to the rounding of its f32 sincos, and each
+ * dequantised element must lie within the reference's E4M3 grid (half a step at the top of the
+ * range is 1/16 of the group maximum, so the 7% bound rejects a wrong pair or angle). */
 static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, int stages, GvCase mode) {
     const bool rot_only = mode == GvCase::Rotate, i8 = mode == GvCase::DenseI8, dense = !rot_only;
     const char* row = dense ? "givens_dense_quant" : "givens_rotate";
@@ -4084,8 +3829,8 @@ static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, in
                                  PI("stages", stages), PI("parts", parts) };
     if (dense) {
         // The matrices as a container stores them (the "t.dense" table, abi/rad_encoding.h): one
-        // 128x128 f16 matrix a (part, group), row p * ng + g, element [j][i] the image of column i
-        // under the stages, composed in f64 as rad-convert does. Through the row's own layout hook.
+        // 128x128 f16 matrix per (part, group), row p * ng + g, element [j][i] the image of column
+        // i under the stages, composed in f64 as rad-convert does; through the row's layout hook.
         std::vector<uint16_t> dm((size_t)(parts * ng * G * G));
         std::vector<double> v((size_t)G);
         for (int p = 0; p < parts; ++p)
@@ -4185,17 +3930,17 @@ static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, in
         st_ev_destroy(e0); st_ev_destroy(e1);
         std::printf("        %.1f us a launch   (%s)\n", (double)ms * 50.0, d);
     }
-    // the dense form carries f16 matrices: its scale reads ~1e-3 off the f32 network's, its values stay within the
-    // quantiser's own step
+    // The dense form carries f16 matrices: its scale is ~1e-3 off the f32 network's, and its
+    // values stay within the quantiser's own step.
     ok(nm, rot_only ? worst_val < 1e-3
                     : (worst_scale < (dense ? 3e-3 : 1e-4) && worst_val < (i8 ? 0.01 : 0.07)), d);
 }
 
 
-/* PARO'S 5-BIT SKINNY GEMM against what the planes mean: u5 codes (a bit stream along K), an f16 scale
- * and a zero point 0..31 a 128 of K, an f16 activation, the weight stored through the row's hooks.
- * `pb1`/`pb2` give a partitioned weight (the activation copies side by side). M past 64 runs the
- * dispatcher's 64-row chunks. */
+/* ParoQuant's 5-bit skinny GEMM against the planes' meaning: u5 codes (a bit stream along K), an
+ * f16 scale and a zero point 0..31 per 128 of K, an f16 activation, the weight stored through the
+ * row's hooks. `pb1`/`pb2` give a partitioned weight. M past 64 runs the dispatcher's 64-row
+ * chunks. */
 static void w5a16_numeric(const Plugin& pl, int64_t M, int64_t N, int64_t K, int64_t pb1 = 0,
                           int64_t pb2 = 0) {
     const char* row = "gemm_w5a16_nt_m64";
@@ -4279,9 +4024,9 @@ static void w5a16_numeric(const Plugin& pl, int64_t M, int64_t N, int64_t K, int
 }
 
 
-/* TIMING OF THE 5/4-BIT GEMM AT ONE PREFILL CHUNK, over the row's tuned axes. `--case w5a16_perf`
- * only (it is a measurement, not a check). One weight buffer is replicated past the last-level cache
- * and walked in turn, as perf_row does, so the GB/s printed is the weight stream's. */
+/* Timing of the 5/4-bit GEMM at one prefill chunk over the row's tuned axes; `--case w5a16_perf`
+ * only (a measurement, not a check). The weight is replicated past the last-level cache and walked
+ * in turn, as in perf_row, so the printed GB/s is the weight stream's. */
 static void w5a16_perf(const Plugin& pl, int bits, int64_t M, int64_t N, int64_t K) {
     if (!g_case || std::strcmp(g_case, "w5a16_perf")) return;
     const char* row = bits == 5 ? "gemm_w5a16_nt_m64" : "gemm_w4a16_asym_nt_m64";
@@ -4364,8 +4109,9 @@ static void w5a16_perf(const Plugin& pl, int bits, int64_t M, int64_t N, int64_t
 }
 
 
-/* THE 4/5-BIT ASYMMETRIC x INT8 PREFILL GEMM against what the planes mean: u4/u5 codes, an f16 scale and
- * a u8 zero a 128 of K, an int8 activation with an f32 scale a (row, 128), parts side by side. */
+/* The 4/5-bit asymmetric x int8 prefill GEMM against the planes' meaning: u4/u5 codes, an f16
+ * scale and a u8 zero per 128 of K, an int8 activation with an f32 scale per (row, 128), parts
+ * side by side. */
 static void wpa8i8_numeric(const Plugin& pl, int bits, int64_t M, int64_t N, int64_t K, int64_t pb1 = 0,
                             int64_t pb2 = 0) {
     const char* row = bits == 4 ? "gemm_w4a8i8_tiled" : "gemm_w5a8i8_tiled";
@@ -4475,15 +4221,13 @@ static void wpa8i8_numeric(const Plugin& pl, int bits, int64_t M, int64_t N, int
 }
 
 
-/* TWO DECODE GEMMS THE ENGINE MAY OVERLAP (gemm_mxfp4a8_decode is a concurrent row: its split partial
- * is the op's scratch and its arrival counters are keyed on the output). Each GEMM has its own
- * weights, activations and output and a DISJOINT slice of one scratch allocation, with a split
- * (ks > 1) so the partial and the counters are live. The reference is each launched alone, then the
- * pair is launched on two non-blocking streams with nothing ordering them -- repeated, so the
- * launches overlap in different phases -- and every output must be BYTE-identical to the serial one
- * (the reducer sums the splits in a fixed order, so a lost or shared counter / partial shows as a
- * different byte or a hang). A last serial launch after the loop checks that the counters were
- * left at zero. */
+/* Two decode GEMMs the engine may overlap (gemm_mxfp4a8_decode is a concurrent row: its split
+ * partial is the op's scratch and its arrival counters are keyed on the output). Each GEMM has its
+ * own operands and a disjoint slice of one scratch allocation, with a split (ks > 1) so the partial
+ * and counters are live. Each runs alone for a reference, then pairs run on two unordered
+ * non-blocking streams, repeatedly, and every output must be byte-identical (the reducer sums
+ * splits in a fixed order, so a lost or shared counter or partial shows as a different byte or a
+ * hang). A final serial launch checks the counters were left at zero. */
 struct MxdOverlapGemm {
     int64_t M, N, K;
     int ks;
@@ -4578,7 +4322,7 @@ static void mxd_overlap_case(const Plugin& pl) {
     for (int i = 0; i < 3; ++i) { off[i] = tot; tot += (g[i].scratch + 255) & ~int64_t(255); }
     char* base = (char*)dalloc((size_t)tot);
     if (!base) { ok(nm, false, "hipMalloc failed"); return; }
-    /* The serial reference gets its own scratch, so the two runs share nothing but the kernel. */
+    /* The serial reference gets its own scratch, sharing nothing with the overlapped runs. */
     std::vector<std::vector<uint16_t>> want(3);
     for (int i = 0; i < 3; ++i) {
         void* sc = dalloc((size_t)g[i].scratch);
@@ -4635,7 +4379,7 @@ static void mxd_overlap_case(const Plugin& pl) {
     (void)hipStreamDestroy(s1);
     (void)hipStreamDestroy(s2);
     ok(nm, !bad, bad ? why : std::to_string(iters) + " overlapped pairs identical");
-    /* The counters must be zero again: a serial launch after the storm is still byte-identical. */
+    /* The counters must be zero again: a serial launch afterwards is still byte-identical. */
     bool again = true;
     for (int i = 0; i < 3 && again; ++i) {
         st_memset(g[i].y, 0, (size_t)(g[i].M * g[i].N) * 2);
@@ -4650,19 +4394,18 @@ static void mxd_overlap_case(const Plugin& pl) {
     ok("gemm_mxfp4a8_decode: serial after the overlap storm is still identical (counters left at "
        "zero)", again);
     /* A split given less scratch than its partial is refused, not run unsplit: the hook sized it
-     * for the whole band, so a short one is a caller's error and must surface as one. */
+     * for the whole band, so a short one is a caller error. */
     const int rc = mxd_overlap_launch(r, g[0], base + off[0], nullptr, g[0].scratch / 2);
     (void)st_stream_sync(nullptr);
     ok("gemm_mxfp4a8_decode: a split with half its scratch is refused", rc != RAD_OK,
        "rc=" + std::to_string(rc));
 }
 
-/* THE INT8 TRUNK CHAIN: quant_act_i8g on a bf16 activation, then one of the i8a8 GEMMs on what it
- * wrote, against the planes' meaning. The weight is i8 with a bf16 scale per row per 128 K (what
- * libquant writes for `codes=i8 group=128 scale=bf16 clamp=sym`), stored through the row's own
- * hooks. The reference multiplies the codes the QUANTISER wrote -- read back -- by their scales,
- * so what is left to disagree about is the GEMM alone; the quantiser is checked separately against
- * a host one, code for code. Ragged M reaches the guarded fold; N and K are what the rows take. */
+/* The int8 trunk chain: quant_act_i8g on a bf16 activation, then an i8a8 GEMM on its output,
+ * against the planes' meaning. The weight is i8 with a bf16 scale per row per 128 K (libquant's
+ * `codes=i8 group=128 scale=bf16 clamp=sym`), stored through the row's hooks. The reference uses
+ * the codes the quantiser wrote, read back, so only the GEMM is under test; the quantiser is
+ * checked separately, code for code. Ragged M reaches the guarded fold. */
 static void i8a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_t N, int64_t K) {
     if (!sel(row) && !sel("quant_act_i8g")) return;
     char nm[160];
@@ -4795,12 +4538,11 @@ static void i8a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_t N
 }
 
 
-/* THE TILED bf16 GEMM AGAINST THE SKINNY ONE, BYTE FOR BYTE, at every tile variant. The claim in
- * its row is identity and not closeness: an op declared over M 1..max_tok is served by the skinny
- * row at M <= 64 and by this one above, so any difference would make a decode step and a prefill
- * chunk disagree about the same row. The shapes reach both forms of the sum -- one slice (N wide
- * enough that the split rule answers 1) and several (N 512 answers 4; K 64 answers a slice a k
- * step) -- and ragged M and N, so a clamped fragment row that were ever stored would show. */
+/* The tiled bf16 GEMM against the skinny one, byte for byte, at every tile variant. An op over
+ * M 1..max_tok is served by the skinny row at M <= 64 and the tiled one above, so they must agree
+ * exactly or a decode step and a prefill chunk would disagree about the same row. The shapes reach
+ * one split-K slice and several (N 512 gives 4; K 64 one per k step), with ragged M and N so a
+ * stored clamped fragment row would show. */
 static void bf16_tiled_identity(const Plugin& pl, int64_t M, int64_t N, int64_t K) {
     if (!sel("gemm_bf16_nt_tiled")) return;
     char nm[128];
@@ -4828,7 +4570,7 @@ static void bf16_tiled_identity(const Plugin& pl, int64_t M, int64_t N, int64_t 
     auto run = [&](const RadKernelInfo* r, int64_t tile, std::vector<uint16_t>& out) {
         std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PS("dtype", "bf16") };
         if (tile >= 0) ps.push_back(PI("tile", tile));
-        /* A stale output would compare equal to itself, so the buffer is poisoned before each. */
+        /* Poisoned before each run, since a stale output would compare equal. */
         if (hipMemset(ts[2].data, 0xA5, (size_t)(M * N) * 2) != hipSuccess) return -1;
         RadArgs a;
         std::memset(&a, 0, sizeof(a));
@@ -4863,19 +4605,14 @@ static void bf16_tiled_identity(const Plugin& pl, int64_t M, int64_t N, int64_t 
 
 /* logit_softcap, against an f64 evaluation of the same formula.
  *
- * THE CAP IS THE PARAMETER THE MODEL LIVES IN (Gemma 4's graph issues it at 30.0), so the case
- * runs at two values: the model's, and a smaller one that moves every answer -- a kernel that
- * hard-wires 30.0, or one that swaps `cap` with its inverse, passes one cap and fails the other.
- *
- * The inputs are 0, half, one, two and five TIMES THE CAP, signed: x/cap is then an exact small
- * half-integer, the f64 oracle cap * tanh(x/cap) is five constants deep, and the only room for an
- * error in the comparison is the kernel's own f32 arithmetic and its bf16 store. The tolerance is
- * this file's f32-against-f64 one (1% relative, 1e-3 absolute). */
+ * Two caps: the model's (Gemma 4 issues 30.0) and a smaller one, so a hard-wired 30.0 or a cap
+ * swapped with its inverse fails one of them. Inputs are 0, 0.5, 1, 2 and 5 times the cap, signed,
+ * so x/cap is exact and only the kernel's f32 arithmetic and bf16 store can differ. Tolerance: 1%
+ * relative, 1e-3 absolute. */
 static void logit_softcap_case(const Plugin& pl) {
     const char* what = "logit_softcap vs an f64 evaluation of the same formula";
-    /* Both device legs run the case: bf16 (the gemm's own dtype) and f32 (the 1.3.0 sampling
-     * chain, where the logits reach the softcap as f32 rows). The f32 leg answers in the
-     * arithmetic dtype itself, so its oracle compare reads f32, not a bf16 round trip. */
+    /* Both dtypes: bf16 (the GEMM's) and f32 (the sampling chain's logits). The f32 leg is
+     * compared in f32, not through a bf16 round trip. */
     for (const uint32_t dt : { (uint32_t)RAD_BF16, (uint32_t)RAD_F32 }) {
         const char* row = dt == RAD_BF16 ? "logit_softcap_bf16" : "logit_softcap_f32";
         const size_t es = dt == RAD_BF16 ? 2 : 4;
@@ -4941,15 +4678,10 @@ static void logit_softcap_case(const Plugin& pl) {
 
 /* rmsnorm_p, against an f64 evaluation of the weightless normalisation.
  *
- * THE EPS IS THE PARAMETER THE MODEL LIVES IN (Gemma 4 issues it at 1e-6), so the case runs at
- * two values: the model's, and a larger one (1e-2) that moves every answer -- a kernel that hard-
- * wires 1e-6, or one that drops the +eps and answers a bare 1/rms, passes the small one and fails
- * the large.
- *
- * The inputs are a fixed set of magnitudes, signed, so the f64 oracle x * rsqrt(mean(x^2) + eps)
- * is exact and the only room for an error in the comparison is the kernel's own f32 accumulation
- * and its bf16 store. The oracle is computed from the bf16 values the kernel actually reads. The
- * tolerance is this file's f32-against-f64 one (1% relative, 1e-3 absolute). */
+ * Two eps values: the model's (Gemma 4 issues 1e-6) and 1e-2, so a hard-wired 1e-6 or a dropped
+ * +eps fails the larger one. The inputs are a fixed set of signed magnitudes, and the f64 oracle
+ * x * rsqrt(mean(x^2) + eps) is computed from the bf16 values the kernel reads. Tolerance: 1%
+ * relative, 1e-3 absolute. */
 static void rmsnorm_p_case(const Plugin& pl) {
     const char* what = "rmsnorm_p vs an f64 evaluation of the weightless normalisation";
     const RadKernelInfo* r = find(pl, "rmsnorm_p_bf16");
@@ -5016,11 +4748,10 @@ static void rmsnorm_p_case(const Plugin& pl) {
 
 /* gelu_mul, against an f64 evaluation of the tanh-approximation GELU.
  *
- * The inputs are a fixed set of magnitudes, signed, for both the gate and the up half, so the f64
- * oracle 0.5*g*(1 + tanh(0.7978845608028654*(g + 0.044715*g^3))) * u is exact and the only room for
- * an error in the comparison is the kernel's own f32 tanhf and its bf16 store. The oracle is computed
- * from the bf16 values the kernel reads; the gate is the first half of the [M, 2n] row. The
- * tolerance is this file's f32-against-f64 one (1% relative, 1e-3 absolute). */
+ * Fixed signed magnitudes for the gate and up halves; the f64 oracle
+ * 0.5*g*(1 + tanh(0.7978845608028654*(g + 0.044715*g^3))) * u uses the bf16 values the kernel
+ * reads, the gate being the first half of the [M, 2n] row. Tolerance: 1% relative, 1e-3
+ * absolute. */
 static void gelu_mul_case(const Plugin& pl) {
     const char* what = "gelu_mul vs an f64 evaluation of the tanh GELU";
     const RadKernelInfo* r = find(pl, "gelu_mul_bf16");
@@ -5083,16 +4814,10 @@ static void gelu_mul_case(const Plugin& pl) {
 
 /* scale, against an f64 evaluation of the same multiply.
  *
- * THE SCALAR IS THE [1] WEIGHT THE MODEL LIVES IN (Gemma 4's per-layer scalar, 0.03-0.99), so the
- * case runs at three values: two positive of different magnitude (a kernel that hard-wires one of
- * them, or one that squares the scalar, passes one and fails the other) and a negative (a kernel
- * that drops the sign passes the positives and fails this).
- *
- * The inputs are a fixed set of magnitudes, signed, so the f64 oracle x * s is five constants deep
- * and the only room for an error in the comparison is the kernel's own f32 arithmetic and its bf16
- * store. The tolerance is this file's f32-against-f64 one (1% relative, 1e-3 absolute). The scalar
- * is stored as f32 (the kernel's branch reads it as such); a bf16 `s` takes the other branch and is
- * not exercised here, which is fine -- the multiply is the same either way. */
+ * Three scalars (Gemma 4's per-layer scalar is 0.03-0.99): two positive of different magnitude,
+ * catching a hard-wired or squared scalar, and a negative one, catching a dropped sign. Inputs are
+ * fixed signed magnitudes. Tolerance: 1% relative, 1e-3 absolute. The scalar is stored as f32; the
+ * bf16 `s` branch is not exercised (same multiply). */
 static void scale_case(const Plugin& pl) {
     const char* what = "scale vs an f64 evaluation of the same multiply";
     const RadKernelInfo* r = find(pl, "scale_bf16");
@@ -5151,10 +4876,9 @@ static void scale_case(const Plugin& pl) {
     }
 }
 
-/* rope_bf16, against an f32 mirror of rope_kernel at each ladder width. `den` is the ladder's
- * width -- `rot` for `rotary`/absent and `head_dim` for `head` -- so the same kernel body is
- * checked under both. The V head is untouched in every case; the absences there would be invisible
- * in magnitude (the rotation preserves length) and rel_l2 is what sees the angle itself. */
+/* rope_bf16 against an f32 mirror of rope_kernel at each ladder width. `den` is the ladder's
+ * width (`rot` for `rotary`/absent, `head_dim` for `head`). The V head must stay untouched. rel_l2
+ * catches a wrong angle, which magnitude alone would not (rotation preserves length). */
 static void rope_ladder_case(const Plugin& pl) {
     const char* what = "rope ladder vs an f32 mirror of rope_kernel at each width";
     const RadKernelInfo* r = find(pl, "rope_bf16");
@@ -5233,14 +4957,13 @@ static void rope_ladder_case(const Plugin& pl) {
 
 /* ---- the two fp8 fusions, against the pair each one replaces -------------------------------- */
 //
-// THE INVARIANT IS NOT "CLOSE", IT IS BYTE-IDENTICAL, which is why this compares against the
-// UNFUSED KERNELS rather than a host mirror. The engine's own acceptance test is that generated
-// text does not move across builds; a fused quantiser whose codes differed by one in the last
-// place on a few channels a layer would pass any tolerance-based check and change the text anyway.
+// Byte-identical, so the comparison is against the unfused kernels, not a host mirror: generated
+// text must not move across builds, and a last-place code difference on a few channels would pass
+// any tolerance.
 //
-// The trap it guards is a single line. The unfused pair writes a BF16 norm output and the
-// quantiser reads those bytes back, so the amax and the codes are taken over bf16-ROUNDED values.
-// A fused kernel that quantises the f32 it already has in a register is MORE accurate, and wrong.
+// The unfused pair writes a bf16 norm output and the quantiser reads it back, so amax and codes are
+// taken over bf16-rounded values. A fused kernel quantising its f32 register value is more
+// accurate, and wrong.
 static int launch_row(const RadKernelInfo* r, std::vector<RadTensor> ts,
                       std::vector<RadParam> ps) {
     RadArgs a;
@@ -5266,9 +4989,8 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
         ok("fp8 fusions vs the unfused pair", false, "rows absent");
         return;
     }
-    /* M is a speculative decode step's token count and K is a per-rank hidden width that is a
-     * whole number of 128-column groups without being a power of two -- five groups, so a wave
-     * that got its group stride wrong lands somewhere visible. */
+    /* M is a speculative decode step's token count; K is five 128-column groups, not a power of
+     * two, so a wrong group stride lands somewhere visible. */
     const int64_t M = 8, K = 640, nkb = K / 128;
 
     std::vector<uint16_t> hx((size_t)M * K), hgu((size_t)M * 2 * K);
@@ -5276,15 +4998,15 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
     for (int64_t r = 0; r < M; ++r)
         for (int64_t c = 0; c < K; ++c) {
             /* Per-group magnitudes an order of magnitude apart, so one group's amax cannot stand
-               in for its neighbour's, and one channel per row far above the rest, which is what a
-               dropped clamp turns into a NaN. */
+               in for its neighbour's, and one channel per row far above the rest (a dropped clamp
+               turns it into a NaN). */
             const float m = std::ldexp(1.0f, (int)(c / 128) - 2);
             const float v = m * (0.037f * (float)((r * 29 + c * 13) % 71) - 1.3f);
             hx[(size_t)r * K + c]        = h_to_bf16(c == (r * 37) % K ? v * 19.0f : v);
             hgu[(size_t)r * 2 * K + c]   = h_to_bf16(v * 0.75f);
             hgu[(size_t)r * 2 * K + K + c] = h_to_bf16(m * (0.011f * (float)((r + c * 7) % 43) - 0.2f));
         }
-    /* A zero-centred gain, which is what GemmaRMSNorm stores and what makes `wadd` matter. */
+    /* A zero-centred gain, as GemmaRMSNorm stores, so `wadd` matters. */
     for (int64_t c = 0; c < K; ++c) hw[(size_t)c] = 0.004f * (float)((c * 19) % 51) - 0.1f;
 
     void* d_x  = dalloc((size_t)M * K * 2);
@@ -5317,8 +5039,7 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
         for (size_t i = 0; i < y0.size(); ++i) ny += y0[i] != y1[i];
         for (size_t i = 0; i < q0.size(); ++i) nq += q0[i] != q1[i];
         for (size_t i = 0; i < s0.size(); ++i) ns += std::memcmp(&s0[i], &s1[i], 4) != 0;
-        /* A run that wrote nothing at all would compare equal against a zeroed buffer, so the
-         * codes are also required to be non-trivial. */
+        /* The codes must also be non-trivial: a run that wrote nothing would compare equal. */
         int nz = 0;
         for (size_t i = 0; i < q1.size(); ++i) nz += q1[i] != 0;
         ok(what, ny == 0 && nq == 0 && ns == 0 && nz > (int)q1.size() / 2,
@@ -5364,11 +5085,9 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
 
     /* --- sigmoid + mul + quant_act_fp8, against gate_quant_fp8 ---
      *
-     * The gated attention's epilogue, and the case that says the two-buffer form agrees with the
-     * three passes it replaces. The gate is the FIRST half of `gu` and the thing it scales is the
-     * second, which is the packed layout; the strided form -- a column view of a [q|gate]
-     * projection -- differs from it only in the pitch the shim reads off the operand, and the
-     * arch is the only place that shape exists. */
+     * The gated attention's epilogue. The gate is the first half of `gu` and the scaled value the
+     * second; the engine's strided form (a column view of a [q|gate] projection) differs only in
+     * the pitch the shim reads off the operand. */
     rc = launch_row(sg, { T(d_gu, RAD_BF16, { M, K }), T(d_y[0], RAD_BF16, { M, K }) },
                     { PI("M", M), PI("n", K), PS("dtype", "bf16") });
     if (rc == RAD_OK)
@@ -5389,11 +5108,10 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
                          "rc=" + std::to_string(rc));
     else same("gate_quant_fp8 is byte-identical to sigmoid + mul + quant_act_fp8");
 
-    /* --- the same two at INT8 codes, against the same products and quant_act_i8g ---
+    /* --- the same two at int8 codes, against the same products and quant_act_i8g ---
      *
-     * An int8 trunk linear reads int8 codes, and the producer in front of it writes them itself
-     * when its codes operand is I8: the bf16 product must not move, and the codes and scales must
-     * be what quant_act_i8g takes over that product. */
+     * With an I8 codes operand the producer writes int8 codes for an int8 trunk linear: the bf16
+     * product must not move, and codes and scales must equal quant_act_i8g's over it. */
     if (const RadKernelInfo* qi = find(pl, "quant_act_i8g")) {
         rc = launch_row(smu, { T(d_gu, RAD_BF16, { M, 2 * K }), T(d_y[0], RAD_BF16, { M, K }) },
                         { PI("M", M), PI("n", K), PS("dtype", "bf16") });
@@ -5430,8 +5148,7 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
                              "rc=" + std::to_string(rc));
         else same("gate_quant_fp8 at int8 codes is byte-identical to sigmoid + mul + quant_act_i8g");
 
-        /* The rotated form pairs with E4M3 experts only, and says so rather than writing codes
-         * no reader could use. */
+        /* The rotated form pairs with E4M3 experts only and refuses int8 codes. */
         if (const RadKernelInfo* gh = find(pl, "gated_had_quant_fp8")) {
             rc = launch_row(gh, { T(d_gu, RAD_BF16, { M, 2 * K }), T(d_q[1], RAD_I8, { M, K }),
                                   T(d_s[1], RAD_F32, { M, nkb }) },
@@ -5443,16 +5160,13 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
 
     /* --- add + rmsnorm + quant_act_fp8, against the same three fused ---
      *
-     * The residual is what a block folds into the norm in front of it, and it is the case where
-     * "bit-identical" is a real choice rather than a formality: the sum is f32 and the pair this
-     * replaces ROUNDS IT TO BF16 in `add`'s store before `rmsnorm` ever sees it. Keeping the f32
-     * sum -- which is what the int8 sibling does, and is more accurate -- moves the text. */
+     * The residual sum is f32, and the replaced pair rounds it to bf16 in `add`'s store before
+     * `rmsnorm` reads it. Keeping the f32 sum (as the int8 sibling does) would move the text. */
     const RadKernelInfo* ad = find(pl, "add_bf16");
     if (!ad) { ok("rmsnorm_quant_fp8 residual", false, "add_bf16 absent"); return; }
     void* d_r[2] = { dalloc((size_t)M * K * 2), dalloc((size_t)M * K * 2) };
     if (!d_r[1]) { ok("fp8 fusion residual alloc", false, "hipMalloc failed"); return; }
-    /* A residual with its own structure, and BOTH copies start from it: the fused form updates it
-     * in place, so a shared buffer would have the second run reading the first run's output. */
+    /* A structured residual, copied for each run: the fused form updates it in place. */
     std::vector<uint16_t> hr((size_t)M * K);
     for (int64_t r = 0; r < M; ++r)
         for (int64_t c = 0; c < K; ++c)
@@ -5547,12 +5261,11 @@ static void gelu_mul_quant_i8_numeric(const Plugin& pl) {
 
 /* ---- qkv_norm_rope, against the five ops it replaces ------------------------------------------
  *
- * rmsnorm_p (v, or the raw k under v_from_k), rmsnorm over the q heads and over the k heads, then
- * rope over q and over k -- kernel by kernel, against the one dispatch. Both of Gemma 4 31B's
- * classes at one rank of two: sliding (head_dim 256, 16 q over 8 kv heads, full rotary, separate v)
- * and global (512, 16 over 2, the proportional `head` ladder over 128, k == v), at batch heights
- * that put the q/k norms at every width r4d_act_threads answers -- including 256 at head_dim 512,
- * where a thread of the standalone norm folds two channels. */
+ * rmsnorm_p (v, or the raw k under v_from_k), rmsnorm over the q heads and the k heads, then rope
+ * over q and k, kernel by kernel, against the one dispatch. Both of Gemma 4 31B's classes at one
+ * rank of two: sliding (head_dim 256, 16 q over 8 kv heads, full rotary, separate v) and global
+ * (512, 16 over 2, the proportional `head` ladder over 128, k == v), at batch heights reaching
+ * every width r4d_act_threads answers, including 256 at head_dim 512 (two channels per thread). */
 static void qkv_norm_rope_numeric(const Plugin& pl) {
     const RadKernelInfo* np  = find(pl, "rmsnorm_p_bf16");
     const RadKernelInfo* nrm = find(pl, "rmsnorm_bf16");
@@ -5633,12 +5346,12 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
 
 /* ---- rmsnorm_quant_i8, against the chain it replaces ------------------------------------------
  *
- * Byte-identical, for the reason the fp8 fusions above give, in all three forms a sandwich-norm
- * model issues: the plain norm + quantiser (a first block's entry), the junction without a scalar
- * (attention -> feed-forward) and with one (feed-forward -> the next layer). The unfused chain is
- * rmsnorm(x; w_post) -> add(residual) -> scale -> rmsnorm(residual; w) -> quant_act_i8, run here
- * kernel by kernel. bf16 gains, which is what Gemma's checkpoint stores, and two batch heights so
- * both of r4d_act_threads' widths a decode step meets are covered (1024 at M <= 32, 512 above). */
+ * Byte-identical, as the fp8 fusions above, in the three forms a sandwich-norm model issues: the
+ * plain norm + quantiser (a first block's entry), the junction without a scalar (attention ->
+ * feed-forward) and with one (feed-forward -> next layer). The unfused chain, kernel by kernel, is
+ * rmsnorm(x; w_post) -> add(residual) -> scale -> rmsnorm(residual; w) -> quant_act_i8. bf16 gains
+ * (as Gemma's checkpoint stores), and two batch heights covering both r4d_act_threads widths a
+ * decode step meets (1024 at M <= 32, 512 above). */
 static void rmsnorm_quant_i8_numeric(const Plugin& pl) {
     const RadKernelInfo* nrm = find(pl, "rmsnorm_bf16");
     const RadKernelInfo* ad  = find(pl, "add_bf16");
@@ -5647,7 +5360,7 @@ static void rmsnorm_quant_i8_numeric(const Plugin& pl) {
     const RadKernelInfo* rq  = find(pl, "rmsnorm_quant_i8");
     if (!nrm || !ad || !scl || !qz || !rq) { ok("rmsnorm_quant_i8 vs its chain", false, "rows absent"); return; }
     for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)40 }) {
-        const int64_t K = 5376;   /* Gemma 4 31B's hidden width: 336 sixteen-byte k steps, not a power of two */
+        const int64_t K = 5376;   /* Gemma 4 31B's hidden width: 336 sixteen-byte k steps */
         std::vector<uint16_t> hx((size_t)M * K), hr((size_t)M * K), hw((size_t)K), hp((size_t)K);
         for (int64_t r = 0; r < M; ++r)
             for (int64_t c = 0; c < K; ++c) {
@@ -5744,17 +5457,15 @@ static void rmsnorm_quant_i8_numeric(const Plugin& pl) {
     }
 }
 
-/* THE fp8 lm_head, end to end through its OWN hooks.
+/* The fp8 lm_head, end to end through its own hooks.
  *
- * The arrangement is the odd one in this library -- E4M3 codes with the row's own bf16 scales in
- * the tail of the same row, rather than the separate [sn][sk] plane the linears read -- so the
- * things that can go wrong are the interleave (a scale read from the wrong row), the f32 store
- * (this is the op most prone to a bf16 write into an f32 plane), and the m_real mask on the
- * instantiations that round M up.
+ * Unlike the linears' separate [sn][sk] plane, each stored row carries its own bf16 scales in its
+ * tail, so this checks the interleave (a scale read from the wrong row), the f32 store (a bf16
+ * write into the f32 plane) and the m_real mask on instantiations that round M up.
  *
- * The weight is block fp8's two planes, relaid by the row's own hooks into the row it reads; the
- * oracle is those planes, code times its block's scale. The inverse must give the planes back. */
-/* `i8`: the int8 head, logits_gemm_i8 -- i8 codes with a bf16 scale a ROW per 128 columns. */
+ * The weight is block fp8's two planes, relaid by the row's hooks; the oracle is code times its
+ * block's scale, and the inverse must return the planes. `i8` selects the int8 head
+ * (logits_gemm_i8): i8 codes with a bf16 scale per row per 128 columns. */
 static void fp8_logits_numeric(const Plugin& pl, int64_t N, int64_t K, int64_t M, bool i8 = false) {
     const char* row = i8 ? "logits_gemm_i8" : "logits_gemm_fp8";
     const RadKernelInfo* lg = find(pl, row);
@@ -5839,13 +5550,12 @@ static void fp8_logits_numeric(const Plugin& pl, int64_t N, int64_t K, int64_t M
     if (!d_w || !d_x || !d_y) { ok(i8 ? "i8 logits alloc" : "fp8 logits alloc", false, std::string("hipMalloc failed") + tag); return; }
     st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
     st_memcpy(d_x, xb.data(), (size_t)M * K * 2, hipMemcpyHostToDevice);
-    /* Poisoned, so a kernel that writes bf16 pairs into the f32 plane -- the failure mode this op
-     * is prone to -- cannot pass by leaving the high half of each word at zero. */
+    /* Poisoned, so a kernel writing bf16 pairs into the f32 plane cannot pass on zeroed high
+     * halves. */
     st_memset(d_y, 0x5a, (size_t)M * N * 4);
 
-    // THE DECLARED SHAPE, [N][K] and not [N][K + 2*nkb], because that is what the engine hands a
-    // kernel: core/runtime/ctx.cpp builds a weight's tensor from decl.shape with the layout
-    // hook's dtype. Passing the stored width here would test a call the engine never makes.
+    // The declared shape [N][K], not the stored [N][K + 2*nkb]: core/runtime/ctx.cpp builds a
+    // weight's tensor from decl.shape with the layout hook's dtype.
     const int rc = launch_row(lg, { T(d_x, RAD_BF16, { M, K }),
                                     T(d_w, i8 ? RAD_I8 : RAD_F8E4M3, { N, K }),
                                     T(d_y, RAD_F32, { M, N }) },
@@ -5865,9 +5575,9 @@ static void fp8_logits_numeric(const Plugin& pl, int64_t N, int64_t K, int64_t M
     ok(i8 ? "logits_gemm_i8 vs host ref over its planes" : "logits_gemm_fp8 vs host ref over its planes",
        e < 2e-3, "rel_l2 " + std::to_string(e) + tag);
 
-    /* THE DRAFTER'S RESCORING READS THE SAME STORED HEAD, so it is checked over the same bytes:
-     * R candidates a row -- one of them an id past the shard, which must come back a pad -- each
-     * scored against the planes, and the answer sorted by value. */
+    /* The drafter's rescoring reads the same stored head, so it is checked over the same bytes:
+     * R candidates per row (one an id past the shard, which must come back a pad), each scored
+     * against the planes, sorted by value. */
     const RadKernelInfo* rr = find(pl, i8 ? "logit_rerank_i8" : "logit_rerank");
     if (!rr) return;
     const int64_t R = std::min<int64_t>(8, N);
@@ -5910,6 +5620,18 @@ static void fp8_logits_numeric(const Plugin& pl, int64_t N, int64_t K, int64_t M
     ok(rn.c_str(), bad == 0, std::to_string(bad) + " wrong ids, values or orderings");
 }
 
+/* The fp8 GEMM against a host reference on the same bytes (spec §17). A weight's two block-fp8
+ * planes are arranged by the plugin's own layout hooks, the planes are dequantised on the host,
+ * and the results compared. This catches a wrong arrangement, wrong scale indexing (an off-by-one
+ * `>> 7` reads a neighbouring tile), a misplaced fold in the K loop and, for fp8a8, a wrong
+ * activation quantiser or epilogue transpose.
+ *
+ * Both sides use the same quantised weight, so only summation order may differ. The bound is
+ * bf16's resolution (2^-8 relative) loosened to 3e-2, since a K=512 reduction reordered across 32
+ * lanes moves the last bf16 bit near a rounding boundary; a transposed operand or misread scale
+ * lands two orders of magnitude away. The W8A8 rows also quantise the activation to E4M3 (about 6%
+ * per element before averaging), so their error is higher. The two W8A8 rows put the weight on
+ * opposite operands with opposite scale shapes and epilogues, so their failure modes differ. */
 static void fp8_numeric(const Plugin& pl, int64_t N, int64_t K) {
     const RadKernelInfo* mv = find(pl, "gemm_fp8a16_nt_m1");
     const RadKernelInfo* tl = find(pl, "gemm_fp8a8_tiled");
@@ -5921,19 +5643,12 @@ static void fp8_numeric(const Plugin& pl, int64_t N, int64_t K) {
     }
     const int64_t sn = N / 128, sk = K / 128;
 
-    /* A weight with real structure: an asymmetric, per-block-varying magnitude. A constant or a
-     * symmetric pattern cannot tell a transposed fragment from a correct one -- both give zero
-     * error -- and cannot tell one block scale from its neighbour either.
+    /* A weight with an asymmetric, per-block-varying magnitude; a constant or symmetric pattern
+     * cannot distinguish a transposed fragment or a neighbouring block's scale.
      *
-     * THE EXPONENT WRAPS, and it has to. An unwrapped `(r/128)*3 - (c/128)` reaches 405 by row
-     * 17408 at 128 rows a step, and ldexp(1.0f, 405) is INFINITY -- so the generator would produce
-     * a valid weight only below about 5400 rows and every fp8 numeric case in this file would be
-     * pinned to N = 256: raising it would fill the weight with inf rather than exercise a bigger
-     * shape. Every large projection in the model is 17408 rows.
-     *
-     * Wrapping the block index keeps what the variation is FOR -- neighbouring 128-row blocks still
-     * differ by 8x, which is what tells one block scale from the next -- and bounds the range at
-     * 2^12, comfortably inside float and inside E4M3's own reach after the per-block scale. */
+     * The exponent wraps: unwrapped, `(r/128)*3 - (c/128)` reaches 405 by row 17408 and
+     * ldexp(1.0f, 405) is infinity. Wrapped, neighbouring 128-row blocks still differ by 8x and the
+     * range stays within 2^12. */
     std::vector<float> wf((size_t)N * K);
     for (int64_t r = 0; r < N; ++r)
         for (int64_t c = 0; c < K; ++c)
@@ -5941,16 +5656,9 @@ static void fp8_numeric(const Plugin& pl, int64_t N, int64_t K) {
                 std::ldexp(1.0f, (int)(((r / 128) % 5) * 3 - ((c / 128) % 4)))
                 * (0.031f * (float)((r * 37 + c * 11) % 61) - 0.9f);
 
-    /* TWO ARRANGEMENTS OF ONE PAIR OF PLANES, and the two-arrangement part is not optional. The
-     * fp8a16 matvec reads the planes ROW-MAJOR, as they are; the two fp8a8 GEMMs read the same
-     * codes permuted into WMMA FRAGMENT ORDER, and each row's own layout hook says which it wants.
-     *
-     * Building ONE arrangement and testing all three kernels against it is how this test lies: the
-     * oracle and a fp8a8 kernel would then read the same bytes the same way, agree with each
-     * other, both disagree with the weight, and the case would report ok.
-     *
-     * ONE oracle is still right, because an arrangement does not change VALUES: the planes,
-     * dequantised on the host, are the reference for every kernel. */
+    /* Two arrangements of one pair of planes: the fp8a16 matvec reads them row-major, the fp8a8
+     * GEMMs read the codes in WMMA fragment order, each as its own layout hook says. One oracle
+     * serves all: the planes dequantised on the host. */
     const Planes p = fp8_block_planes(wf, N, K);
     std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 128) };
     std::vector<uint8_t> wq, wqf, wsb, wsf;
@@ -6014,8 +5722,7 @@ static void fp8_numeric(const Plugin& pl, int64_t N, int64_t K) {
     };
 
     /* --- the matvec, at every point of its declared space: `rb` changes which rows share an
-     *     activation window, and a wrong RB reads the neighbouring row's scale. That is exactly
-     *     the bug a smoke test misses. */
+     *     activation window, and a wrong RB reads the neighbouring row's scale. */
     for (const TunePoint& tp : tune_points(mv, std::vector<RadParam>{ PI("M", 1), PI("N", N),
                                                                      PI("K", K), PI("group", 128),
                                                                      PS("dtype", "fp8a16") })) {
@@ -6038,17 +5745,11 @@ static void fp8_numeric(const Plugin& pl, int64_t N, int64_t K) {
         ok(what.c_str(), e < 3e-2, "rel_l2 " + std::to_string(e));
     }
 
-    /* --- THE MULTI-ROW MATVEC, which is what a speculative verify step runs: M = 1 + n_spec token
-     *     rows against one weight read.
-     *
-     *     THE ROWS ARE DELIBERATELY DISTINCT, and that is the whole value of this case. The failure
-     *     it exists to catch is a token row reading another row's activation -- an `a_ld` off by
-     *     anything, or a hoisted pointer -- and the W8A8 case below CANNOT see that, because every
-     *     row there holds the same vector and a kernel that read row 0 five times would pass it.
-     *     Each row is checked against its own host reference.
-     *
-     *     M = 5 rather than a power of two: it is 1 + n_spec at n_spec 4, and rounding a token count
-     *     up to a template instantiation is exactly the kind of thing that works at 4 and 8. */
+    /* --- the multi-row matvec, as a speculative verify step runs it: M = 1 + n_spec token rows
+     *     against one weight read. The rows are distinct, each with its own host reference, to
+     *     catch a row reading another's activation (a wrong `a_ld`, a hoisted pointer). M = 5
+     *     (n_spec 4) is not a power of two, so a token count rounded up to an instantiation
+     *     shows. */
     {
         const int64_t M = 5;
         void* d_xm = dalloc((size_t)M * K * 2);
@@ -6100,27 +5801,21 @@ static void fp8_numeric(const Plugin& pl, int64_t N, int64_t K) {
         }
     }
 
-    /* --- the NARROW W8A8 row, which is the riskiest kernel in the family and the only one where
-     *     two hazards meet: the epilogue TRANSPOSES (the weight is on the A
-     *     operand there, so D is [N][M] and C must be [M][N]), and split-K is on. At N=256, K=512
-     *     the split law gives ksplit=2, so the partial plane and the reduce are both exercised.
-     *     M=8 is deliberately not a multiple of the 16-wide token tile: the ragged path is what a
-     *     speculative batch actually runs. Every one of the 8 rows must match, because a wrong
-     *     transposed stride writes one right row and seven wrong ones. */
+    /* --- the narrow W8A8 row, where two hazards meet: the epilogue transposes (the weight is the
+     *     A operand, so D is [N][M] and C must be [M][N]), and split-K is on (N=256, K=512 gives
+     *     ksplit=2, exercising the partial plane and the reduce). Ragged M (not a multiple of the
+     *     16-wide token tile) is what a speculative batch runs. Every row must match, since a
+     *     wrong transposed stride writes one right row. */
     {
-        /* EVERY TOKEN-TILE COUNT AND BOTH SIDES OF `Full`. The narrow tile covers NT * 16 tokens
-         * with one weight read, and NT is chosen from M, so the M list has to cross every
-         * boundary: 1 and 8 are NT = 1 (and M = 1 is the only M where the Full predicate and the
-         * transposed epilogue see a single token), 24 and 32 are NT = 2, 40 and 48 are NT = 3,
-         * and 64 is NT = 4.
+        /* Every token-tile count and both sides of `Full`. The narrow tile covers NT * 16 tokens
+         * per weight read, NT chosen from M: 1 and 8 give NT = 1, 24 and 32 NT = 2, 40 and 48
+         * NT = 3, 64 NT = 4.
          *
-         * The ODD ones are the point. `Full` drops the epilogue's column guard, and it means "all
-         * NT tiles are live", NOT "M is a multiple of 16" -- at M = 48 with NT = 4 the second is
-         * true and the first is false, and a kernel that conflated them writes columns 48..63
-         * past the end of a split-K scratch sized for 48, over the arrival counter, and the
-         * finisher spins forever. 24 and 48 are here to keep that covered, and 40 is the one M in
-         * the band that is ragged under NT = 3 as well -- 48 is a whole number of tiles there and
-         * would not exercise it. */
+         * `Full` drops the epilogue's column guard and means "all NT tiles are live", not "M is a
+         * multiple of 16": at M = 48 with NT = 4 the second holds and the first does not, and a
+         * kernel conflating them writes columns 48..63 past a split-K scratch sized for 48, over
+         * the arrival counter, and the finisher hangs. 24 and 48 cover that; 40 is ragged under
+         * NT = 3 as well. */
         for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)24, (int64_t)32, (int64_t)40,
                                  (int64_t)48, (int64_t)64 }) {
         void* d_xm = dalloc((size_t)M * K * 2);
@@ -6131,9 +5826,8 @@ static void fp8_numeric(const Plugin& pl, int64_t N, int64_t K) {
         if (!nr) { ok("gemm_fp8a8_nt_m16 numeric", false, "row absent"); }
         else if (!d_xm || !d_q || !d_qs || !d_ym) { ok("fp8 narrow alloc", false, "hipMalloc failed"); }
         else {
-            /* DISTINCT ROWS, because identical ones cannot see the failure this case exists
-             * for: a token tile reading another tile's activation. With every row the same vector
-             * a kernel that read row 0 sixty-four times passes. Each row gets its own reference. */
+            /* Distinct rows, each with its own reference, so a token tile reading another tile's
+             * activation shows. */
             std::vector<uint16_t> xm((size_t)M * K);
             for (int64_t m = 0; m < M; ++m)
                 for (int64_t c = 0; c < K; ++c)
@@ -6185,27 +5879,23 @@ static void fp8_numeric(const Plugin& pl, int64_t N, int64_t K) {
                 " DISTINCT rows (transposed store + split-K)").c_str(),
                worst < 8e-2, "rel_l2 " + std::to_string(worst));
 
-            /* THE WAVE COUNT MUST NOT MOVE A BYTE, and this is the only place that can be asked.
-             * MW is a launch heuristic chosen from (N, M) inside libr4d, so a rule change is
-             * invisible from out here and the environment pin that sweeps it is read once a
-             * process -- one run cannot hold two settings. A rel_l2 against a host reference will
-             * not answer it either: a wave count that moved the last bit of every element passes
-             * that at 1e-7 and changes the emitted text.
+            /* The wave count must not move a byte. MW is a launch heuristic chosen from (N, M)
+             * inside libr4d, pinned here through the test hook; a rel_l2 check would pass a
+             * last-bit change that moves the emitted text.
              *
-             * A DIFFERENT GRID IS ALLOWED TO DIFFER. `narrow_ksplit` decides from `gx * mw`, which
-             * is N/16 only when N divides MW*16; where it does not, the split repartitions K and
-             * the accumulation chain legitimately changes. So the sweep compares the wave counts
-             * whose grid the shape actually admits, which is the same test the rule applies to
-             * itself when it asks `n % 128` and `n % 256`. */
+             * A different grid may differ: `narrow_ksplit` decides from `gx * mw`, which is N/16
+             * only when N divides MW*16; otherwise the split repartitions K. So only the wave
+             * counts whose grid the shape admits are compared (the rule's own `n % 128` and
+             * `n % 256` test). */
             if (pl.pin_mw) {
                 const std::vector<uint16_t> base = got;
                 std::vector<uint16_t> alt((size_t)M * N);
                 std::string why;
                 for (const int mw : { 1, 2, 4, 8, 16 }) {
                     if (N % (mw * 16)) continue;
-                    /* A K that is not a multiple of 256 runs the 128-wide staged set, which
-                     * compiles only the wave counts the rule answers (4, 8, 16); a pin outside
-                     * them is refused by contract -- see R4D_F8D_NT128 in r4d_gemm_fp8a8.hip. */
+                    /* A K not a multiple of 256 runs the 128-wide staged set, which compiles
+                     * only the wave counts the rule answers (4, 8, 16); other pins are refused
+                     * (R4D_F8D_NT128 in r4d_gemm_fp8a8.hip). */
                     if (K % 256 && mw != 4 && mw != 8 && mw != 16) continue;
                     pl.pin_mw(mw);
                     st_memset(d_ym, 0, (size_t)M * N * 2);
@@ -6219,12 +5909,10 @@ static void fp8_numeric(const Plugin& pl, int64_t N, int64_t K) {
                    why.empty(), why);
             }
 
-            /* AND THE TOKEN-TILE COUNT MUST NOT MOVE A BYTE EITHER, for the same reason and with
-             * one extra hazard the wave count does not have. NT decides which wave owns which
-             * token AND it feeds `Full`: at M = 48 the rule's NT = 3 makes Full true where NT = 4
-             * makes it false, so the pin sweeps two different epilogue paths as well as two
-             * different tilings. The pin only goes UP -- NT*16 is the column extent the epilogue
-             * may write, so NT below ceil(M/16) drops rows rather than running a slower variant. */
+            /* Nor may the token-tile count. NT also feeds `Full`: at M = 48, NT = 3 makes Full
+             * true and NT = 4 false, so the pin sweeps two epilogue paths. The pin only goes up:
+             * NT*16 is the column extent the epilogue may write, so NT below ceil(M/16) would
+             * drop rows. */
             if (pl.pin_nt) {
                 const std::vector<uint16_t> base = got;
                 std::vector<uint16_t> alt((size_t)M * N);
@@ -6243,31 +5931,21 @@ static void fp8_numeric(const Plugin& pl, int64_t N, int64_t K) {
                    why.empty(), why);
             }
 
-            /* ---- ...AND WITH THE GATE AND THE QUANTISER FOLDED INTO ITS EPILOGUE -------------
+            /* ---- ...and with the gate and the quantiser folded into its epilogue -------------
              *
-             * THE QUESTION IS BYTE EQUALITY AND NOTHING ELSE, for the reason the wave-count sweep
-             * above gives from the other side: the engine substitutes the fold for the pair on a
-             * band, so a fold that moved the last bit of every code would be a SECOND numerical
-             * path wearing the first one's name, and a rel_l2 against a host reference would pass
-             * it at 1e-7 while the emitted text moved. The pair is this GEMM's bf16 output read
-             * back by `gated_quant_fp8`; the fold never writes that tensor at all.
-             *
-             * Run over the same M list, which crosses every token-tile count, and over N = 256,
-             * 5120 and 17408 -- the last is gate_up's own per-rank width, so the shape the engine
-             * issues is one of the shapes checked and not an extrapolation from smaller ones. */
+             * Byte equality: the engine substitutes the fold for the pair (this GEMM's bf16
+             * output read back by `gated_quant_fp8`), so any last-bit difference would be a second
+             * numerical path. Over the same M list and N = 256, 5120 and 17408 (gate_up's
+             * per-rank width). */
             const RadKernelInfo* gq = find(pl, "gated_quant_fp8");
             const RadKernelInfo* gg = find(pl, "gemm_fp8a8_gated_nt_m16");
-            /* The fold stages K 256 wide and refuses any other K. The one K % 256 shape in
-             * the engine is the shared expert's down projection, which is never gated. */
+            /* The fold stages K 256 wide and refuses other K; the engine's one K % 256 shape,
+             * the shared expert's down projection, is never gated. */
             if (gq && gg && N % 256 == 0 && K % 256 == 0) {
                 const int64_t nout = N / 2, gkb = nout / 128;
-                /* THE FOLD REFUSES A SHAPE WHOSE GRID THE SPLIT RULE WOULD WIDEN, and that is a
-                 * contract and not an accident: it has no partial plane to reduce and no second
-                 * launch to fold a reduce into. `narrow_ksplit` splits when `K >= 512` and
-                 * `N/16 < 128`, so N = 256 here is a REFUSAL and the equality question does not
-                 * arise. gate_up is 17408 rows and never comes near it; the k and v projections
-                 * that do are not gated. Asserted rather than skipped, because a fold that served
-                 * this shape by ignoring the split would be silently wrong. */
+                /* The fold refuses a shape the split rule would split (it has no partial plane):
+                 * `narrow_ksplit` splits when `K >= 512` and `N/16 < 128`, so N = 256 must be
+                 * refused. Asserted, since serving it while ignoring the split would be wrong. */
                 const bool splits = K >= 512 && N < 2048;
                 void* d_gq[2] = { dalloc((size_t)M * nout),     dalloc((size_t)M * nout) };
                 void* d_gs[2] = { dalloc((size_t)M * gkb * 4),  dalloc((size_t)M * gkb * 4) };
@@ -6275,8 +5953,7 @@ static void fp8_numeric(const Plugin& pl, int64_t N, int64_t K) {
                 if (!d_gq[1] || !d_gs[1] || !d_gy[1]) {
                     ok("gated fold alloc", false, "hipMalloc failed");
                 } else {
-                    /* The GEMM is re-run because the wave-count sweep left the LAST pin's output
-                     * in d_ym, and a pinned wave count is not what the engine issues. */
+                    /* Re-run the GEMM: d_ym holds the last pinned wave count's output. */
                     st_memset(d_ym, 0, (size_t)M * N * 2);
                     run_case(nr, ts, ps);
                     int rc = launch_row(gq, { T(d_ym, RAD_BF16, { M, N }),
@@ -6322,8 +5999,7 @@ static void fp8_numeric(const Plugin& pl, int64_t N, int64_t K) {
                         for (size_t i = 0; i < z0.size(); ++i)
                             nz += std::memcmp(&z0[i], &z1[i], 4) != 0;
                         for (size_t i = 0; i < b0.size(); ++i) nb += b0[i] != b1[i];
-                        /* Two zeroed buffers compare equal, so the codes are also required to be
-                         * non-trivial -- the failure mode a fold that wrote nothing would have. */
+                        /* The codes must also be non-trivial: zeroed buffers compare equal. */
                         for (size_t i = 0; i < c1.size(); ++i) live += c1[i] != 0;
                         ok((std::string("gemm_fp8a8_gated_nt_m16 is byte-identical to the GEMM + "
                                         "gated_quant_fp8, N ") + std::to_string((long long)N) +
@@ -6339,11 +6015,11 @@ static void fp8_numeric(const Plugin& pl, int64_t N, int64_t K) {
         }
     }
 
-    /* --- A ROW SHARD, AS THE LOADER MAKES ONE: rank 1's share of each canonical plane -- rows
-     *     [N/2, N) of the codes and the scale rows that cover them, cut on the scale plane's 128-row
-     *     blocks -- relaid by the row's own hook as a weight of N/2 rows, which has to reproduce
-     *     rows [N/2, N) of the full run. The share is cut BEFORE the arrangement, so a relayout
-     *     that leaned on rows it was not handed shows here. */
+    /* --- a row shard, as the loader makes one: rank 1's share of each canonical plane (rows
+     *     [N/2, N) of the codes and the scale rows covering them, cut on 128-row blocks), relaid
+     *     by the row's hook as an N/2-row weight, must reproduce rows [N/2, N) of the full run.
+     *     The share is cut before the arrangement, so a relayout reading rows it was not handed
+     *     shows. */
     if (N % 32 == 0 && (N / 2) % 128 == 0) {
         const int64_t Nh = N / 2, snh = Nh / 128, M = 8;
         const Planes half = share(p, Nh, N, 0, K);
@@ -6405,15 +6081,12 @@ static void fp8_numeric(const Plugin& pl, int64_t N, int64_t K) {
         }
     }
 
-    /* --- A COLUMN SHARD, which is where a fragment plane and a row-major one stop agreeing.
+    /* --- a column shard, where a fragment plane and a row-major one stop agreeing.
      *
-     * The fragment arrangement groups sixteen rows into one run, so a K-slice of the WHOLE
-     * arranged plane is a 2D copy of pitch K*16 and width (K/tp)*16 -- the shape a loader that cut
-     * arranged bytes would have to know. The loader cuts the CANONICAL planes instead, where a
-     * column share is a plain rectangle of the codes and of the scale plane, and the kernel's hook
-     * arranges each rank's share as a weight of K/2. Both shares are made that way here and run
-     * as independent weights; their sum is what the all-reduce forms, and it has to be the
-     * unsharded product. */
+     * The loader cuts the canonical planes (a column share is a plain rectangle of codes and
+     * scales) and the hook arranges each share as a K/2 weight, rather than slicing the arranged
+     * plane (a pitch-K*16 copy). Both shares run as independent weights; their sum, as the
+     * all-reduce forms it, must equal the unsharded product. */
     if (K % 256 == 0) {
         const int64_t Kh = K / 2, skh = Kh / 128, M = 8;
         void* d_xh = dalloc((size_t)M * Kh * 2);
@@ -6487,12 +6160,12 @@ static void fp8_numeric(const Plugin& pl, int64_t N, int64_t K) {
         }
     }
 
-    /* --- the tiled W8A8 path: quantise the activation with the library's own quantiser, then GEMM.
-     *     M is 128 so the tile is exactly full; every row holds the SAME activation, so a wrong
-     *     epilogue index shows up as one row of the output being right and the rest not. */
+    /* --- the tiled W8A8 path: quantise the activation with the library's own quantiser, then
+     *     GEMM. Every row holds the same activation, so a wrong epilogue index shows as one row
+     *     right and the rest wrong. */
     {
-        /* THE PREFILL WIDTH. 128 is one FM tile and grid.x = 1; a prefill chunk is 2048 and
-         * sixteen of them, which is the only place a per-M-block staging bug can show. */
+        /* A prefill chunk: 2048 rows is sixteen 128-row tiles, so a per-M-block staging bug
+         * shows. */
         const int64_t M = 2048;
         void* d_xm = dalloc((size_t)M * K * 2);
         void* d_q  = dalloc((size_t)M * K);
@@ -6525,9 +6198,9 @@ static void fp8_numeric(const Plugin& pl, int64_t N, int64_t K) {
         run_case(tl, ts, ps);
         std::vector<uint16_t> got((size_t)M * N);
         st_memcpy(got.data(), d_ym, (size_t)M * N * 2, hipMemcpyDeviceToHost);
-        /* Every row must match, not just row 0: a wrong epilogue stride writes one right row. The
-         * tolerance is looser than the matvec's because the ACTIVATION is quantised here too, and
-         * E4M3's three mantissa bits are 6% of a value on their own. */
+        /* Every row must match (a wrong epilogue stride writes one right row). The tolerance is
+         * looser than the matvec's: the activation is quantised too, and E4M3's three mantissa
+         * bits are 6% of a value. */
         double worst = 0;
         for (int64_t m = 0; m < M; ++m) {
             double num = 0, den = 0;
@@ -6544,28 +6217,21 @@ static void fp8_numeric(const Plugin& pl, int64_t N, int64_t K) {
     }
 }
 
-/* THE SAME CHECK ON A REAL CHECKPOINT WEIGHT.
+/* The same check on a real checkpoint weight (spec §17 without the .rad container).
  *
- * `fp8_numeric` above builds its own weight, so it proves the kernel agrees with this file's idea
- * of the format. That is necessary and it is not sufficient: both sides could share a wrong idea.
- * This runs the identical comparison against BYTES READ OUT OF THE SAFETENSORS FILE -- real
- * magnitudes, real per-block scale variation, whatever subnormals and zero blocks the checkpoint
- * actually contains -- so what it falsifies is the claim that radiance can serve THIS model. The
- * file's two tensors ARE block fp8's canonical planes, and the matvec reads them as they are, so
- * the kernel and the oracle both read them row-major.
+ * `fp8_numeric` builds its own weight, so kernel and test could share a wrong idea of the format.
+ * This runs the same comparison on bytes read from a safetensors file: real magnitudes, scale
+ * variation, subnormals and zero blocks. The file's two tensors are block fp8's canonical planes,
+ * and the matvec and the oracle both read them row-major.
  *
- * The offsets are arguments rather than parsed here, because a safetensors header is JSON and this
- * binary has no business carrying a JSON parser. The parameters are: the file, the weight's byte
- * offset, the scale plane's byte offset, N and K. Reading the two offsets out of the file needs no
- * parser either -- the header length is a u64 at byte 0 and the JSON follows it, so the data
- * region begins at 8 + that, and each tensor's `data_offsets[0]` is relative to there:
+ * Arguments: the file, the weight's byte offset, the scale plane's byte offset, N and K. The
+ * header length is a u64 at byte 0 followed by the JSON header, so the data region starts at 8 +
+ * that and each tensor's `data_offsets[0]` is relative to it:
  *
  *     N=$(od -An -tu8 -N8 w.safetensors | tr -d ' ')
  *     dd if=w.safetensors bs=1 skip=8 count=$N status=none | tr ',' '\n' | grep -A2 gate_proj
  *
- * then pass 8 + $N + data_offsets[0], once for the weight and once for its scale plane.
- *
- * It is spec §17's assertion with the .rad container taken out of the path. */
+ * then pass 8 + $N + data_offsets[0] for the weight and for its scale plane. */
 static void fp8_real(const Plugin& pl, const char* file, long long woff, long long soff,
                      int64_t N, int64_t K) {
     const RadKernelInfo* mv = find(pl, "gemm_fp8a16_nt_m1");
@@ -6584,8 +6250,8 @@ static void fp8_real(const Plugin& pl, const char* file, long long woff, long lo
     std::fclose(f);
     if (!okread) { ok("fp8 real-weight check", false, "short read"); return; }
 
-    /* A checkpoint block scale is ~1e-4 and a weight byte spans E4M3's whole range, so a plane read
-     * at the wrong offset shows up here rather than as a tolerance failure fifty lines later. */
+    /* A checkpoint block scale is ~1e-4 and a weight byte spans E4M3's whole range, so a plane
+     * read at the wrong offset shows here first. */
     double smin = 1e30, smax = -1e30;
     for (size_t i = 0; i < ws.size(); ++i) {
         const double v = h_bf16(ws[i]);
@@ -6640,41 +6306,31 @@ static void fp8_real(const Plugin& pl, const char* file, long long woff, long lo
         den += (double)ref[(size_t)r] * (double)ref[(size_t)r];
     }
     const double e = den > 0 ? std::sqrt(num / den) : 1.0;
-    /* Printed whether it passes or not. `ok` shows its detail only on failure, and a correctness
-     * gate whose margin is invisible when it passes is a gate nobody can tell has loosened. */
+    /* Printed even on a pass (`ok` shows detail only on failure), so the margin stays visible. */
     std::printf("        N=%lld K=%lld  rel_l2 %.6g  (bound 3e-2; bf16 output rounding alone is "
                 "~2e-3)\n", (long long)N, (long long)K, e);
     ok("gemm_fp8a16_nt_m1 vs host ref on REAL checkpoint bytes", e < 3e-2,
        "rel_l2 " + std::to_string(e));
 }
 
-/* ---- THE DECODE GEMM, TIMED --------------------------------------------------------------------
+/* ---- the decode GEMM, timed ------------------------------------------------------------------
  *
- * The cases above answer "is it right". This answers "at what fraction of the card", which is the
- * only other question a decode GEMM has, and it lives here because the alternatives do not reach
- * it: rad-tune searches a row's declared axes and the fp8a8 rows declare none, and a serve is a
- * round trip that buries one shape under thirty other ops. This is a second per point.
+ * Timing per shape for rows rad-tune cannot reach (the fp8a8 rows declare no axes).
  *
- * WHY THE WEIGHT IS ROTATED. Back-to-back launches on ONE weight buffer measure the last level of
- * cache, not HBM, and this part has enough of it to hold a whole decode GEMM's weight. Decode
- * reads every weight in the model exactly once and hits none of it, so the buffer is replicated
- * until it is comfortably past any cache on the card and the launches walk the copies in turn.
- * Without that the same kernel reads more than twice the bandwidth here that it reaches in a
- * serve, and the faster number is the useless one.
+ * The weight is replicated past the last-level cache and the launches walk the copies in turn:
+ * back-to-back launches on one buffer would measure cache, while decode reads every weight once.
  *
- * The reported bandwidth is the WEIGHT stream and nothing else: at M <= 16 the activation is 16*K
- * bytes against N*K and the output 16*N, so the two together are under a percent of the traffic at
- * any shape this band serves. That makes the number directly comparable to the 638 GB/s a plain
- * stream of the same bytes reaches, which is the point of printing it.
+ * The reported bandwidth is the weight stream only: at M <= 16 the activation (16*K) and output
+ * (16*N) are under a percent of the traffic, so it compares directly with the part's plain-stream
+ * bandwidth (638 GB/s).
  */
 static void perf_row(const Plugin& pl, const char* name, std::vector<RadTensor> ts,
                      std::vector<RadParam> ps, void* wbase, size_t wbytes, int copies,
                      double bytes, int iters, int widx = 2, const char* point = nullptr) {
     const RadKernelInfo* r = find(pl, name);
     if (!r) { std::printf("  %-22s row absent\n", name); return; }
-    /* The label is the row unless a sweep named the tuned point, because a sweep that prints one
-     * row name fifteen times is a sweep nobody can read. `ps` already CARRIES that point -- the
-     * caller appended it -- so this is only how it is spelled, never how it is applied. */
+    /* The label is the row, or the tuned point in a sweep. `ps` already carries that point; this
+     * only names it. */
     char lbl[64];
     std::snprintf(lbl, sizeof lbl, "%s", (point && *point && std::strcmp(point, "-")) ? point : name);
     name = lbl;
@@ -6691,9 +6347,8 @@ static void perf_row(const Plugin& pl, const char* name, std::vector<RadTensor> 
         if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
     }
 
-    /* One warm launch, and it is also the check that the row SERVES this shape. A row that refuses
-     * is reported rather than timed: timing a kernel that returned -3 without launching is how a
-     * heuristic sweep gets a spectacular wrong answer. */
+    /* One warm launch, which also checks the row serves this shape; a refusal is reported, not
+     * timed. */
     const int rc = r->launch(&a, nullptr);
     if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
         std::printf("  %-22s rc=%d (shape not served)\n", name, rc);
@@ -6710,16 +6365,10 @@ static void perf_row(const Plugin& pl, const char* name, std::vector<RadTensor> 
 
 /* ------------------------------------------------------------------ the small ops, timed
  *
- * A decode step issues roughly twelve hundred kernels and only about four hundred of them are
- * GEMMs. The other eight hundred each move a few tens of kilobytes, which is nothing, so what
- * they actually cost is a question about LAUNCHES rather than about bandwidth -- and the per-op
- * profiler cannot answer it, because enabling it restores a synchronisation per call and that
- * sync is the same order as the thing being measured.
- *
- * So: back-to-back launches with no host synchronisation between them, over a buffer set that
- * makes every one of them independent. The number that comes out is the floor a fusion would
- * have to beat, and the gap between it and the profiler's per-call figure is what the step is
- * paying to dispatch. */
+ * Most of a decode step's kernels are small ops moving a few tens of kilobytes, so their cost is
+ * launch overhead. The per-op profiler cannot measure it, since it adds a synchronisation per call
+ * of the same order. So this times back-to-back launches with no host synchronisation over
+ * independent buffers: the floor a fusion would have to beat. */
 static void smallop_perf(const Plugin& pl, int64_t M, int64_t K, int iters) {
     if (iters <= 0) iters = 2000;
     const int64_t nkb = K / 128;
@@ -6811,17 +6460,14 @@ static void smallop_perf(const Plugin& pl, int64_t M, int64_t K, int iters) {
 
 /* ------------------------------------------------------------- the QSA indexer, timed at length
  *
- * THE INDEXER IS THE ONLY PART OF A DECODE STEP THAT GROWS WITH CONTEXT. `qsa_score` and
- * `qsa_select` both scale with the number of compressed blocks in the history and both run once a
- * layer, so between them they account for the whole of the step-time-against-context curve; every
- * other op in the step is flat to within noise. That makes the pair worth timing AT LENGTH rather
- * than at a convenient context.
+ * The indexer is the only part of a decode step that grows with context: `qsa_score` and
+ * `qsa_select` scale with the compressed blocks of history and run once per layer, so they are
+ * timed at length.
  *
- * `blocks` is the DECLARED width (max_ctx / ratio) and `ctx` the live one, because the launch
- * geometry is sized from the declaration and the work from `nc` -- so a harness that passes the
- * live count for both measures a kernel the deployment never runs.
+ * `blocks` is the declared width (max_ctx / ratio) and `ctx` the live one: the launch geometry
+ * comes from the declaration and the work from `nc`, as in the deployment.
  *
- * M IS 1 + n_spec, not the sequence count: every draft row selects its own set. */
+ * M is 1 + n_spec, not the sequence count: every draft row selects its own set. */
 static void qsa_perf(const Plugin& pl, int64_t ctx, int64_t M, int iters) {
     if (iters <= 0) iters = 200;
     const int64_t ratio = 4, heads = 4, n = 128, topk = 512;
@@ -6838,14 +6484,12 @@ static void qsa_perf(const Plugin& pl, int64_t ctx, int64_t M, int iters) {
         qh[(size_t)i] = h_to_bf16((float)(((i * 29 + 7) % 83) - 41) / 47.0f);
     for (int64_t i = 0; i < pages * n; ++i)
         bkh[(size_t)i] = h_to_bf16((float)(((i * 41 + 13) % 71) - 35) / 39.0f);
-    /* A SCATTERED TABLE, because a paged pool hands out whatever is free and the block key read
-     * is the only random access in the kernel -- a table in page order measures a different
-     * machine. */
+    /* A scattered table, as a paged pool hands out pages; the block key read is the kernel's only
+     * random access. */
     std::vector<int32_t> bth((size_t)nb, -1);
     for (int64_t b = 0; b < live; ++b) bth[(size_t)b] = (int32_t)((b * 7919 + 13) % pages);
-    /* ...AND THE SAME TABLE IN PAGE ORDER, because the difference between the two IS the price of
-     * the paged pool, and it is the only number that says whether a contiguous block-key store
-     * would be worth building. Nothing else in this kernel is a random access. */
+    /* And the same table in page order: the difference is the cost of the paged pool, i.e. what a
+     * contiguous block-key store could save. */
     std::vector<int32_t> bti((size_t)nb, -1);
     for (int64_t b = 0; b < live; ++b) bti[(size_t)b] = (int32_t)b;
     std::vector<int32_t> nch(1, (int32_t)live), cuh(2), posh((size_t)M);
@@ -6876,8 +6520,7 @@ static void qsa_perf(const Plugin& pl, int64_t ctx, int64_t M, int iters) {
     st_memcpy(d_cu, cuh.data(), 8, hipMemcpyHostToDevice);
     st_memcpy(d_po, posh.data(), posh.size() * 4, hipMemcpyHostToDevice);
 
-    /* `row` finds the kernel, `label` names the LINE -- two forms of the same row is the point of
-     * this harness, and a lambda that used one string for both could not express it. */
+    /* `row` finds the kernel and `name` labels the line, so one row can be timed in two forms. */
     auto run = [&](const char* row, const char* name, std::vector<RadTensor> ts,
                    std::vector<RadParam> ps, double bytes) {
         const RadKernelInfo* r = find(pl, row);
@@ -6896,15 +6539,9 @@ static void qsa_perf(const Plugin& pl, int64_t ctx, int64_t M, int iters) {
             std::printf("  %-18s rc=%d (shape not served)\n", name, rc);
             return;
         }
-        /* WARM THE CLOCKS, NOT JUST THE CACHES, and one launch does not do it. `rocm-smi` reports
-         * these cards in a LOW-POWER STATE whenever nothing is running, and 300 iterations of a
-         * 100 us kernel is ~30 ms -- comfortably inside the ramp back up. On an UNCHANGED kernel
-         * the same shape can take close to twice as long after an idle gap as it does after other
-         * work, and the whole of that swing is the governor. Half a second of launches first, so
-         * the timed window runs at the clock the deployment runs at.
-         *
-         * A harness that starts cold does not measure a slow kernel, it measures a sleeping card,
-         * and the failure is invisible: the number is plausible and it moves with the shape. */
+        /* Warm the clocks, not just the caches: an idle card drops to a low-power state, and a
+         * ~30 ms timed window falls inside the ramp back up (up to ~2x slower after an idle gap).
+         * Half a second of launches first, so the timed window runs at deployment clocks. */
         {
             hipEvent_t w0, w1;
             st_ev_create(&w0); st_ev_create(&w1);
@@ -6922,18 +6559,14 @@ static void qsa_perf(const Plugin& pl, int64_t ctx, int64_t M, int iters) {
         std::printf("  %-30s %9.2f us   %6.1f GB/s\n", name, us, bytes / (us * 1e3));
     };
 
-    /* THE SCORE PLANE IS NARROWED TO THE LIVE REACH, exactly as the architecture narrows it
-     * (arch/common/rad_qsa.h): the pitch stays the declared `nb` and the column count is what the
-     * host knows the context can have reached. Both kernels size their grid from it, so a harness
-     * that passed the declared width would measure a grid the deployment never launches. */
+    /* The score plane is narrowed to the live reach as the architecture does (arch/common/
+     * rad_qsa.h): pitch the declared `nb`, column count what the context can have reached. Both
+     * kernels size their grid from it. */
     RadTensor sc_t = T(d_sc, RAD_F32, { M, nb });
     sc_t.shape[1] = live + 1;
 
-    /* THE BYTES ARE `live * n * 2` AND NOT `M *` THAT. The kernel tiles `kQT` query rows through
-     * LDS, so the key history is read ONCE for the tile and not once a row. Counting it once a
-     * query row overstates the bandwidth by exactly the factor that tiling saved -- a gauge that
-     * flatters a kernel by the size of its own best optimisation is worse than none, because it
-     * hides the headroom that optimisation left. */
+    /* `live * n * 2` bytes, not `M *` that: the kernel tiles `kQT` query rows through LDS and reads
+     * the key history once per tile. */
     const double score_bytes = (double)live * n * 2.0;
     auto score_args = [&]() {
         return std::vector<RadTensor>{ T(d_q,  RAD_BF16, { M, heads * n }),
@@ -6944,9 +6577,9 @@ static void qsa_perf(const Plugin& pl, int64_t ctx, int64_t M, int iters) {
     const std::vector<RadParam> score_params = { PI("M", M), PI("n", n), PI("heads", heads),
                                                  PI("blocks", nb), PI("seqs", 1),
                                                  PS("dtype", "bf16") };
-    /* BOTH FORMS ON ONE INPUT, timed and compared. They multiply the same bf16 pairs and sum them
-     * in different orders, so the comparison is a tolerance on the live plane -- and the -inf of
-     * an absent block has to match exactly, which a tolerance on finite values would not see. */
+    /* Both forms on one input, timed and compared. They sum the same products in different
+     * orders, so the live plane is compared within a tolerance, and an absent block's -inf must
+     * match exactly. */
     if (pl.pin_qsa) {
         std::vector<float> plane[2];
         const char* label[2] = { "qsa_score_bf16 scalar form", "qsa_score_bf16 matrix form" };
@@ -6999,24 +6632,19 @@ static void qsa_perf(const Plugin& pl, int64_t ctx, int64_t M, int iters) {
 }
 
 
-/* THE ROUTED-EXPERT GEMM AT A PREFILL CHUNK, both projections, every prefill form.
+/* The routed-expert GEMM at a prefill chunk, both projections, every prefill form.
  *
- * WHY IT NEEDS ITS OWN MODE. rad-kbench declares at world 1, where the width split does not exist
- * and the geometry is the whole 1280-column expert, and its fixture does not serve the rotated w4
- * dtype -- so the shape the engine runs at tp2 is reachable only in the engine, where a profile
- * restores a synchronisation per op and a run moves ~8% between servers. This is rank 0's shape at
- * Qwen3.8-Flash-Next: gate_up with three 128-column blocks of an even expert and two of an odd one
- * (parts 2), and the down projection with the matching K slices over the SORTED rows.
+ * rad-kbench declares at world 1 (no width split) and does not serve the rotated w4 dtype, so the
+ * engine's tp2 shape is timed here: rank 0's at Qwen3.8-Flash-Next, gate_up with three 128-column
+ * blocks of an even expert and two of an odd one (parts 2), and the down projection with the
+ * matching K slices over the sorted rows.
  *
- * THE ROUTING IS SKEWED, because the kernel's cost is a function of the run lengths and a uniform
- * routing gives every expert the mean. Expert popularity is lognormal (sigma 0.8) and each token
- * takes its top_k by a Gumbel draw, so a run ranges from a handful of rows to several times the
- * mean, as a real chunk's do. The weights are random codes: what is timed is the traffic and the
- * arithmetic, and both are value-independent.
+ * The routing is skewed, since cost depends on run lengths: expert popularity is lognormal (sigma
+ * 0.8) and each token takes its top_k by a Gumbel draw. Weights are random codes; traffic and
+ * arithmetic do not depend on values.
  *
- * EVERY FORM IS RUN ON THE SAME BYTES and compared with the first -- the run-aligned prefill form,
- * the (tile, run) decode form and the uniform prefill grid, whatever the band would pick. All three
- * keep each output element's accumulation order, so they must match byte for byte. */
+ * Every form (run-aligned prefill, (tile, run) decode, uniform prefill grid) runs on the same bytes
+ * and must match the first byte for byte, since all keep each element's accumulation order. */
 static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512, int64_t top_k = 10,
                      int pool_pct = 0) {
     if (iters <= 0) iters = 20;
@@ -7063,9 +6691,9 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
     struct Proj { const char* name; int64_t N0, K0, N1, K1, parts; bool srt; };
     const Proj projs[2] = { { "gate_up", 768, 2560, 512, 2560, 2, false },
                             { "down",    2560, 384, 2560, 256, 1, true } };
-    /* Form 4, where the plugin has the pin, is the decode form at two 128-wide K blocks a pass:
-     * the timing kMoeGuFk256Rows is set from. Only gate_up has it (K a multiple of 256 and a
-     * format that folds scale groups); elsewhere it runs as form 2. */
+    /* Form 4, where pinnable, is the decode form at two 128-wide K blocks per pass (the timing
+     * kMoeGuFk256Rows is set from). Only gate_up has it (K a multiple of 256 and a format that
+     * folds scale groups); elsewhere it runs as form 2. */
     const int nforms = pl.pin_moe ? (pl.pin_fk ? 4 : 3) : 1;
     for (const Proj& P : projs) {
         const int64_t N = std::max(P.N0, P.N1), K = std::max(P.K0, P.K1), kb = K / group;
@@ -7086,16 +6714,14 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
         st_memcpy(d_as, asc.data(), asc.size() * 4, hipMemcpyHostToDevice);
         void* d_w[2]; void* d_ws[2]; void* d_tab[2] = { nullptr, nullptr };
         for (int c = 0; c < 2; ++c) {
-            /* Five bits an element: the five-bit pass reads the same plane at its own pitch, and
-             * the four-bit ones the front of each expert's share of it. */
+            /* Five bits per element: the five-bit pass reads the plane at its own pitch, the
+             * four-bit passes the front of each expert's share. */
             d_w[c] = dalloc((size_t)(nec[c] * Nc[c] * Kc[c] / 8 * 5));
             fill((size_t)(nec[c] * Nc[c] * Kc[c] / 8 * 5), 0, 255);
             st_memcpy(d_w[c], hb.data(), hb.size(), hipMemcpyHostToDevice);
-            /* POOLED EXPERTS, as the engine has them: a pointer table, with `pool_pct` percent of
-             * the entries pointing into pinned host memory the GEMM reads over the link. The
-             * LEAST ROUTED ones, because residency keeps the hot experts on the card and pools the
-             * cold tail -- a random choice would pool hot experts whose long runs the engine never
-             * streams. */
+            /* Pooled experts, as in the engine: a pointer table with `pool_pct` percent of entries
+             * in pinned host memory read over the link. The least routed ones are pooled, as
+             * residency keeps hot experts on the card. */
             if (pool_pct > 0) {
                 const size_t eb = (size_t)(Nc[c] * Kc[c] / 2);
                 std::vector<const void*> tab((size_t)nec[c]);
@@ -7132,7 +6758,7 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
                 d_tab[c] = dalloc(tab.size() * sizeof(void*));
                 st_memcpy(d_tab[c], tab.data(), tab.size() * sizeof(void*), hipMemcpyHostToDevice);
             }
-            /* Room for the 32-wide grid's four E4M3 bytes a 128, twice the bf16 grid's two. */
+            /* Room for the 32-wide grid's four E4M3 bytes per 128 (the bf16 grid's two bytes). */
             std::vector<uint16_t> wsc((size_t)(2 * nec[c] * Nc[c] * (Kc[c] / group)), h_to_bf16(0.02f));
             d_ws[c] = dalloc(wsc.size() * 2);
             st_memcpy(d_ws[c], wsc.data(), wsc.size() * 2, hipMemcpyHostToDevice);
@@ -7165,9 +6791,8 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
         std::memset(&a, 0, sizeof(a));
         a.t = ts.data(); a.n_t = (int)ts.size();
         a.p = ps.data(); a.n_p = (int)ps.size();
-        /* The run map the aligned prefill form reads, sized for it whatever the hook answers:
-         * inside the decode band the hook sizes none, because the rule runs no map there, and
-         * the pinned aligned form would then time the uniform grid it falls back to. */
+        /* The aligned prefill form's run map, sized regardless of the hook: inside the decode band
+         * the hook sizes none, and the pinned aligned form would fall back to the uniform grid. */
         {
             const int64_t need = std::max<int64_t>(r->scratch ? r->scratch(&a) : 0,
                                                    (1 + 2 * (E + Tr / 32 + 2)) * 4);
@@ -7177,11 +6802,10 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
         const double flop = 2.0 * ((double)rows_c[0] * P.N0 * P.K0 + (double)rows_c[1] * P.N1 * P.K1);
         const double welems = (double)nec[0] * P.N0 * P.K0 + (double)nec[1] * P.N1 * P.K1;
         std::vector<uint16_t> first((size_t)(Tr * N)), got((size_t)(Tr * N));
-        /* EVERY SCALE GRID over the same bytes: w4a8h's bf16 a (row, 128 of K), then
-         * w4nl64a8h's two E4M3 a 128 and w4nl32a8h's four -- the same plane read as more groups,
-         * so the later passes time the extra accumulators and fold and nothing else -- and last
-         * w5nl64a8h (`sub` 5 here), w4nl64a8h's grid over five-bit rows: the sign plane's loads
-         * and the sign merge. Not over pooled experts, whose blocks are sized for four bits. */
+        /* Every scale grid over the same bytes: w4a8h's bf16 per (row, 128 of K), w4nl64a8h's two
+         * E4M3 per 128 and w4nl32a8h's four (timing only the extra accumulators and fold), and
+         * w5nl64a8h (`sub` 5), which adds the sign plane's loads and merge. Not over pooled
+         * experts, whose blocks are sized for four bits. */
         for (const int sub : { 1, 2, 4, 5 }) {
         const bool g64 = sub > 1, w5 = sub == 5;
         if (w5 && (d_tab[0] || d_tab[1])) continue;
@@ -7226,8 +6850,8 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
             std::string same = "";
             if (f == 0) {
                 first = got;
-                /* A hash of the first form's bytes, so two BUILDS can be compared as well as two
-                 * forms of one: the inputs are a fixed function of the arguments. */
+                /* A hash of the first form's bytes, to compare builds; the inputs are a fixed
+                 * function of the arguments. */
                 uint64_t hsh = 1469598103934665603ull;
                 for (uint16_t v : got) { hsh ^= v; hsh *= 1099511628211ull; }
                 same = "  fnv " + std::to_string(hsh);
@@ -7251,13 +6875,11 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
  * sizes `u` for its weight planes; below it the pin to PF2 is refused. */
 static constexpr int64_t kHcPf2MinRows = 512;
 
-/* THE GATED RESIDUAL'S READ AT INT8 CODES. The same inputs run twice, the codes plane once E4M3
- * and once I8: the bf16 block input and the rotated E4M3 twin must come out byte-identical -- the
- * codes' format is the only thing the dtype changes -- and the int8 codes must be the bf16 input
- * quantised per (row, 128) at amax / 127, code for code, which is what quant_act_i8g would have
- * written from it. Row counts reach the per-row kernels, the decode tiles and the prefill tile; the
- * null stream takes the unfused path and a real one the fused finishers, and `form` pins the
- * launcher to one family of kernels where the plugin exports the pin (0 leaves it the rule). */
+/* The gated residual's read at int8 codes. The same inputs run with the codes plane as E4M3 and
+ * as I8: the bf16 block input and the rotated E4M3 twin must be byte-identical, and the int8 codes
+ * must equal quant_act_i8g's over the bf16 input (per (row, 128) at amax / 127). Row counts reach
+ * the per-row kernels, decode tiles and prefill tile; the null stream takes the unfused path, a
+ * real one the fused finishers. `form` pins one kernel family where exported (0: the rule). */
 static void hc_read_i8(const Plugin& pl, int64_t M, bool real_stream, int form) {
     const RadKernelInfo* r = find(pl, "hc_read_e4m3");
     if (!r) { skip("hc_read_e4m3 int8 codes", "row absent"); return; }
@@ -7371,19 +6993,17 @@ static void hc_read_i8(const Plugin& pl, int64_t M, bool real_stream, int form) 
                    : "the int8 run changed" + bad);
 }
 
-/* THE GATED RESIDUAL'S READ AT A PREFILL CHUNK: hc_read_e4m3 at Qwen3.8-Flash-Next's shape (n
- * 2560, four streams, lowrank 320, the inject gains, the fp8 twin and its rotated twin). At prefill
- * it is several launches, so this is also the harness to run under libr4d/isa/trace.sh for their
- * split. Random codes and small positive scales: what is timed is the traffic and the arithmetic.
+/* The gated residual's read at a prefill chunk: hc_read_e4m3 at Qwen3.8-Flash-Next's shape (n
+ * 2560, four streams, lowrank 320, inject gains, the fp8 twin and its rotated twin). Several
+ * launches at prefill, so also a harness for libr4d/isa/trace.sh. Random codes, small positive
+ * scales.
  *
- * EVERY FORM OF THE PREFILL TILE is run -- the decode tiles' kernels at 128 rows, the wide kernels
- * and, from kHcPf2MinRows rows, the PF2 kernels, through the r4d_hc_read_pin_prefill hook -- and
- * their outputs compared BYTE FOR BYTE, which is what the wide and the PF2 kernels claim. `timed`
- * times each form as well.
+ * Every form of the prefill tile runs through the r4d_hc_read_pin_prefill hook (the decode tiles'
+ * kernels at 128 rows, the wide kernels, and from kHcPf2MinRows the PF2 kernels), compared byte
+ * for byte. `timed` also times each form.
  *
- * `f8` picks the row: hc_read_e4m3, or hc_read_bf16 over bf16 mixing matrices. Both enter the same
- * launcher and both reach PF2, whose prologue then copies mix_down where it decodes it at E4M3 and
- * whose up product reads the stored mix_up where it reads a decoded one -- a path of its own. */
+ * `f8` picks hc_read_e4m3, or hc_read_bf16 over bf16 mixing matrices; at bf16, PF2's prologue
+ * copies mix_down instead of decoding it, and its up product reads the stored mix_up. */
 static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool f8 = true) {
     if (iters <= 0) iters = 20;
     const char* const rn = f8 ? "hc_read_e4m3" : "hc_read_bf16";
@@ -7445,8 +7065,8 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
     st_memcpy(d_up, up.data(), up.size(), hipMemcpyHostToDevice);
     st_memcpy(d_iw, injw.data(), injw.size() * 2, hipMemcpyHostToDevice);
 
-    /* The mixing matrices arrive at their DECLARED shape with the stored dtype, as the engine
-     * hands them; the launcher derives the stored row pitch itself. */
+    /* The mixing matrices at their declared shape with the stored dtype, as the engine passes
+     * them; the launcher derives the stored row pitch. */
     const uint32_t mdt = f8 ? (uint32_t)RAD_F8E4M3 : (uint32_t)RAD_BF16;
     std::vector<RadTensor> ts = {
         T(d_h,  RAD_BF16,   { M, HN }),     T(d_w,  RAD_F32,    { HN }),
@@ -7469,8 +7089,8 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
         const int64_t need = r->scratch(&a);
         if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
     }
-    /* A REAL STREAM, because the op keys per-stream state on it -- the fused forms' arrival
-     * counters -- and on the null stream it finds none and takes the unfused path. */
+    /* A real stream: the fused forms key their arrival counters on it, and the null stream takes
+     * the unfused path. */
     hipStream_t hs = nullptr;
     if (hipStreamCreate(&hs) != hipSuccess) {
         ok(fmt("%s prefill forms: stream", rn).c_str(), false);
@@ -7512,7 +7132,7 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
         if (outs[0].qs != outs[f].qs)   bad += " qs";
         if (outs[0].rq != outs[f].rq)   bad += " rq";
         if (outs[0].rs != outs[f].rs)   bad += " rs";
-        /* A zero output would pass a byte comparison between two forms that both wrote nothing. */
+        /* Non-zero output required: two forms that wrote nothing would compare equal. */
         size_t nz = 0;
         for (uint8_t v : outs[f].q) nz += v != 0;
         ok(fmt("%s prefill tile at M=%lld, %s: byte-identical to the decode tiles' kernels", rn,
@@ -7548,43 +7168,19 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
     (void)hipStreamDestroy(hs);
 }
 
-/* THE INT2 DRAFT HEAD, at every variant it has.
+/* The bf16 skinny GEMM at one shape, every variant, side by side, with the working set rotated
+ * past the last-level cache (rad-tune's absolute numbers vary too much between runs to choose a
+ * default from).
  *
- * WHY IT NEEDS ITS OWN MODE. rad-tune walks the declared graph and never reaches this row -- on
- * the DFlash2 container the requests it lists are `gemm_nt` and `all_reduce` -- so the one kernel
- * in the drafter that is not at bandwidth is never swept. It streams 178.8 MB a decode step at
- * well under the 638 GB/s the part sustains, and the file's own header sets the target: a 280 us
- * memory roofline and a 200 us compute floor with the codes on v_wmma_i32_16x16x16_iu8.
- *
- * The numbers are safe to chase harder than the trunk's. This head only PROPOSES; greedy verify
- * takes the trunk's argmax whatever the draft said, so a variant that changes the head's output
- * bits changes the acceptance rate and not the text. Nothing else in the step has that property.
- *
- * The weight is one packed blob -- N*K/4 bytes of codes plus N*(K/128)*4 of scale/zero pairs --
- * and the activation is the int8 the quantiser writes with its per-group sums, so this builds the
- * gemm_nt_q operand list rather than the fp8 one. Contents are shape-correct garbage: what is
- * being timed is a stream of the right size in the right order.
- */
-
-/* The bf16 skinny GEMM at one shape, every variant. rad-tune reaches these rows, but its absolute
- * numbers are not repeatable enough between back-to-back runs of the same command to base a
- * default on -- the same reason `--perf` and `--perfw2` exist beside it. This rotates a working
- * set past the last level, times each variant the same way, and prints them together.
- *
- * THE SHAPES THIS IS FOR are the three the model's declared graph reaches: N = 48 (the GDN a|b
- * projection, forty-eight times a step and the only TRUNK caller), N = 1280 and N = 256 (the
- * DFlash2 drafter's, ten and one). The distinction matters more than the sizes: a default that
- * changes the drafter's bits changes which tokens it PROPOSES and not which the model emits, and
- * one that changes the trunk's changes the model. */
+ * The shapes the model's graph reaches: N = 48 (the GDN a|b projection, the only trunk caller),
+ * N = 1280 and N = 256 (the DFlash2 drafter's). A default that changes the drafter's bits changes
+ * only its proposals; one that changes the trunk's changes the model. */
 static void bf16_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iters) {
     if (N % 16 || K % 16 || M < 1) {
         std::printf("--perfbf16: N and K must be 16-aligned and M >= 1\n");
         return;
     }
-    /* R4D_PERFBF16_M64 forces the WMMA kernel onto the M <= 16 band the registry gives to the
-     * scalar one, which is the only way to ask whether that row still earns its place. */
-    static const bool f64 = std::getenv("R4D_PERFBF16_M64") != nullptr;
-    const RadKernelInfo* r = find(pl, (M <= 16 && !f64) ? "gemm_bf16_nt_m16" : "gemm_bf16_nt_m64");
+    const RadKernelInfo* r = find(pl, M <= 16 ? "gemm_bf16_nt_m16" : "gemm_bf16_nt_m64");
     if (!r) { std::printf("--perfbf16: row absent\n"); return; }
 
     const size_t wbytes = (size_t)N * (size_t)K * 2;
@@ -7613,15 +7209,12 @@ static void bf16_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int ite
                 "%d iters\n", r->name, (long long)N, (long long)K, (long long)M,
                 (double)wbytes / (1 << 20), copies, iters);
 
-    /* EVERY LEGAL POINT OF THE DECLARED SPACE, capped. The skinny GEMM's five axes are ~900 points
-     * and tune_valid prunes that to a few hundred at any one K -- more than an interactive sweep
-     * wants but exactly what rad-tune walks. `kPerfCap` keeps this readable; the cap is a property
-     * of the HARNESS and not of the kernel, which is the whole reason the space is declared. */
+    /* Every legal point of the declared space (~900, pruned to a few hundred at one K by
+     * tune_valid), capped at `kPerfCap` for readability. */
     std::vector<RadParam> geom = {
         PI("M", M), PI("N", N), PI("K", K), PS("dtype", "bf16"),
     };
-    /* Above the skinny band the tiled row is timed as well, at each of its tile variants: the two
-     * serve the same op, so the numbers belong side by side. */
+    /* Above the skinny band the tiled row (same op) is timed too, at each tile variant. */
     const RadKernelInfo* rt = M > 64 && N >= 128 && K % 64 == 0 ? find(pl, "gemm_bf16_nt_tiled")
                                                                  : nullptr;
     for (const RadKernelInfo* row : { r, rt }) {
@@ -7638,6 +7231,14 @@ static void bf16_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int ite
         }
     }
 }
+/* The int2 draft head at every variant. rad-tune never reaches this row (on the DFlash2
+ * container its requests are `gemm_nt` and `all_reduce`), and it runs well under the part's
+ * 638 GB/s. Tuning it is safe: the head only proposes, and greedy verify takes the trunk's argmax,
+ * so changed output bits change the acceptance rate, not the text.
+ *
+ * The weight is one packed blob (N*K/4 bytes of codes plus N*(K/128)*4 of scale/zero pairs) and
+ * the activation the quantiser's int8 with per-group sums: the gemm_nt_q operand list. Contents are
+ * shape-correct garbage; only the stream is timed. */
 static void w2_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iters) {
     if (N % 16 || K % 128 || M < 1) {
         std::printf("--perfw2: N must be 16-aligned, K 128-aligned, M >= 1\n");
@@ -7649,8 +7250,7 @@ static void w2_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iters
     const int64_t nkb = K / 128;
     const size_t  wbytes = (size_t)N * (size_t)K / 4;
     const size_t  sbytes = (size_t)N * (size_t)nkb * 4;
-    /* Same rotation argument as fp8_perf: enough copies that the working set is past the last
-     * level, capped so a 160 MiB weight does not try to allocate the card. */
+    /* Copies past the last-level cache, as in fp8_perf, capped for large weights. */
     int copies = (int)(((size_t)768 << 20) / wbytes) + 1;
     if (copies > 16) copies = 16;
 
@@ -7665,8 +7265,7 @@ static void w2_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iters
                     (wbytes * (size_t)copies) >> 20);
         return;
     }
-    /* A zeroed scale/zero pair is two f16 zeroes, which makes every dequant zero and is exactly
-     * the shape of measurement that finds a denormal fast path instead of the kernel. */
+    /* Non-zero scales: all-zero dequants could hit a denormal fast path and mismeasure. */
     {
         std::vector<uint32_t> sz((size_t)N * (size_t)nkb, 0x00003C00u);   /* zp 0, scale 1.0 */
         st_memcpy(d_s, sz.data(), sz.size() * 4, hipMemcpyHostToDevice);
@@ -7711,9 +7310,8 @@ static void fp8_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iter
     }
     const int64_t sn = N / 128, sk = K / 128;
     const size_t wbytes = (size_t)N * K;
-    /* Enough copies that the rotation's whole working set is past the last level of cache on this
-     * part, with a ceiling so a 600 MiB weight does not try to allocate the card. A shape small
-     * enough to sit in cache would otherwise report a bandwidth decode can never see. */
+    /* Enough copies to push the working set past the last-level cache, capped for large
+     * weights. */
     int copies = (int)(((size_t)768 << 20) / wbytes) + 1;
     if (copies > 64) copies = 64;
 
@@ -7728,8 +7326,7 @@ static void fp8_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iter
                     (wbytes * (size_t)copies) >> 20);
         return;
     }
-    /* Zeroed scales would make every dequant a zero, which some day will be a denormal-flush fast
-     * path somewhere and a wrong measurement here. Fill with a checkpoint-shaped multiplier. */
+    /* Non-zero, checkpoint-like scales, so no dequant is zero (a possible fast path). */
     {
         std::vector<uint16_t> s((size_t)sn * sk, h_to_bf16(3.0e-4f));
         st_memcpy(d_s, s.data(), s.size() * 2, hipMemcpyHostToDevice);
@@ -7774,12 +7371,9 @@ static void fp8_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iter
         perf_row(pl, "gemm_fp8a8_tiled", ts, ps, d_w, wbytes, copies, bytes, iters);
     }
 
-    /* THE LM HEAD, which is a decode GEMM too and the one nothing could time. Its weight is a
-     * plane of its own shape -- [N][K + 2*nkb] E4M3, each row's bf16 scales in its own tail, see
-     * r4d_fp8_layout.cpp -- so it cannot share the rotation buffer above, and its row is the
-     * SECOND operand rather than the third. At this model's 124160 x 5120 it is the largest
-     * single kernel of a decode step after the trunk's GEMMs, and without this block the only way
-     * to measure it is a rocprofv3 trace of a serving engine. */
+    /* The lm head, a decode GEMM too. Its weight is [N][K + 2*nkb] E4M3 with each row's bf16
+     * scales in its tail (r4d_fp8_layout.cpp), so it has its own buffer, and the weight is the
+     * second operand. */
     if (M <= 64) {
         const int64_t lstride = r4d_fp8::lm_row_bytes(K);
         const size_t  lwb = (size_t)N * (size_t)lstride;
@@ -7801,9 +7395,8 @@ static void fp8_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iter
             for (int c = 0; c < lcopies; ++c)
                 st_memcpy((uint8_t*)d_lw + (size_t)c * lwb, plane.data(), lwb,
                           hipMemcpyHostToDevice);
-            /* The DECLARED shape, [N][K], because that is what reaches the shim -- the stored
-             * width is derived there from n_embd; the fp8 logits_gemm launcher in
-             * r4d_gemm_fp8a16_nt_m1.hip says why. */
+            /* The declared shape, [N][K], as the shim receives it; it derives the stored width
+             * from n_embd (r4d_gemm_fp8a16_nt_m1.hip). */
             std::vector<RadTensor> ts = {
                 T(d_x, RAD_BF16, { M, K }),
                 T(d_lw, RAD_F8E4M3, { N, K }),
@@ -7817,10 +7410,9 @@ static void fp8_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iter
     }
 }
 
-/* THE 8-BIT TRUNK GEMMS, side by side: block E4M3 W8A8 (the fp8 trunk), the int8 W8A8
- * tiled kernel, and the fp8 kernels' int8 twins (gemm_i8a8_*), one shape, each with its useful
- * TFLOP/s -- and at M <= 64 the two narrow rows too. The operands hold constants: timing does not
- * depend on the values, and the bytes are only the shape each row's shim checks. */
+/* The 8-bit trunk GEMMs side by side at one shape, each with its useful TFLOP/s: block E4M3 W8A8
+ * (the fp8 trunk), the int8 W8A8 tiled kernel, and the fp8 kernels' int8 twins (gemm_i8a8_*); at
+ * M <= 64 also the two narrow rows. Operands hold constants (timing does not depend on values). */
 static void w8_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iters) {
     if (N % 256 || K % 128 || M < 1) {
         std::printf("--perfw8: N a multiple of 256, K of 128, M >= 1\n");
@@ -7905,7 +7497,7 @@ static void w8_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iters
     absent(i8[5]); absent(i8[6]);
     run("gemm_w8a8_tiled", "w8a8", i8);
     /* The int8 twin of the fp8 row: i8 activation with an f32 scale per (row, 128), i8 weight with
-     * a bf16 scale per row per 128. The fp8 row's own scale buffers are the right size for both. */
+     * a bf16 scale per row per 128; the fp8 row's scale buffers fit both. */
     std::vector<uint16_t> rs((size_t)N * sk, h_to_bf16(3.0e-4f));
     void* d_rs = dalloc(rs.size() * 2);
     if (!d_rs) { std::printf("--perfw8: hipMalloc failed\n"); return; }
@@ -7923,10 +7515,9 @@ static void w8_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iters
     }
 }
 
-/* THE W4 ARRANGEMENT, CHECKED AGAINST libr4d's OWN DEQUANT. The relayout writes the fragment
- * order and the (scale, zero) dwords and dequant_w4_bf16 undoes both on the card, so a disagreement
- * between the two is exactly the class of bug that would otherwise reach a model. The planes are
- * an i4 grid with an f16 scale a group of 128, and what comes back must be code times scale. */
+/* The w4 arrangement against libr4d's own dequant: the relayout writes fragment order and (scale,
+ * zero) dwords and dequant_w4_bf16 undoes both on the card. The planes are an i4 grid with an f16
+ * scale per 128, and the result must be code times scale. */
 static void w4_roundtrip(const Plugin& pl) {
     const RadKernelInfo* wrow = find(pl, "gemm_w4a8_nt_m64");
     const RadKernelInfo* drow = find(pl, "dequant_w4_bf16");
@@ -7986,8 +7577,7 @@ static void w4_roundtrip(const Plugin& pl) {
     std::vector<uint16_t> got((size_t)(N * K));
     st_memcpy(got.data(), dout, got.size() * 2, hipMemcpyDeviceToHost);
 
-    /* Code times scale exactly as the planes hold them, rounded to bf16 as the kernel's output
-     * is -- so the only freedom left is the rounding of one product. */
+    /* Code times scale as the planes hold them, rounded to bf16 like the kernel's output. */
     const int64_t ng = K / group;
     double worst = 0.0;
     int64_t bad = 0;
@@ -8000,7 +7590,7 @@ static void w4_roundtrip(const Plugin& pl) {
             const float want = h_bf16(h_to_bf16(
                 (float)code_at(p, n, k) * rad_load_f32(p.data[1].data(), RAD_F16, n * ng + k / group)));
             const double err = std::fabs((double)f - (double)want);
-            /* one bf16 step either way: the two sides may round the same product apart */
+            /* one bf16 step either way: the two sides may round one product differently */
             if (!(err <= 1e-6 + 1e-2 * std::fabs((double)want))) { ++bad; if (err > worst) worst = err; }
         }
     ok("w4 relayout round-trips through libr4d's own dequant_w4_bf16", bad == 0,
@@ -8008,99 +7598,61 @@ static void w4_roundtrip(const Plugin& pl) {
 }
 
 
-/* THE 4-BIT GROUPED MoE GEMM, AGAINST A HOST PRODUCT OVER THE SAME PLANES.
- *
- * This is the check the `moe_gemm_w4a8` registry row promises in place of a kbench case, and it is
- * the one that can actually fail. The relayout reorders each dword's nibbles; the kernel expands
- * them with three V_PERM_B32 on the way into LDS; the two have to agree about the nibble order,
- * the row pitch (the launcher halves an ELEMENT stride into bytes -- get that wrong and every row
- * is read from the wrong place) and the scale grid (one bf16 per ROW per group of 128, not per
- * 128x128 tile). The reference reads the canonical planes -- code k of row n, times its group's
- * scale -- so it shares nothing with either side's arrangement.
- *
- * BOTH BANDS. `T <= 128` runs a 16-row M tile and above it a 128-row one, and the two differ in
- * the wave grid and in how many experts a block's row range straddles -- which is the part with
- * the binary search and the run loop in it. A case in only one band tests half the kernel. */
-static float st_e4m3(uint8_t b) {
-    const uint32_t sign = (uint32_t)(b & 0x80u) << 24, ex = (b >> 3) & 0x0Fu, mn = b & 0x07u;
-    const uint32_t nrm = ((ex + 120u) << 23) | (mn << 20);
-    float f;
-    std::memcpy(&f, &nrm, 4);
-    const float v = ex ? f : (float)mn * (1.0f / 512.0f);
-    uint32_t u;
-    std::memcpy(&u, &v, 4);
-    u |= sign;
-    std::memcpy(&f, &u, 4);
-    return f;
-}
-
-/* One geometry per class -- the even experts' and the odd ones' -- and the number of stacked parts
- * along the weight rows and the output. One class shape is the plain grouped GEMM; two are a
- * rank's uneven slice of every expert, where the narrower class's gate/up pair writes zeros past
- * its part and its down projection reads a shorter K. */
-/* `sorted_a`: the down projection's operand, one row a routed slot in sorted order (a_order
- * sorted), where the others read the token rows (a_order token). */
+/* One geometry per class (even and odd experts) and the number of stacked parts along the weight
+ * rows and the output. One class shape is the plain grouped GEMM; two are a rank's uneven slice of
+ * every expert, where the narrower class's gate/up pair writes zeros past its part and its down
+ * projection reads a shorter K. `sorted_a`: the down projection's operand, one row per routed slot
+ * in sorted order (a_order sorted); otherwise token rows (a_order token). */
 struct MoeW4Shape { const char* name; int64_t N0, K0, N1, K1, parts, ne; bool sorted_a = false; };
 
-/* THE DECODE FORM'S STAGED K, BOTH WAYS, byte for byte: one 128-wide K block a pass and two. Every
- * launch is DESCRIBED first: a pin that named the other's kernel would match it trivially, so two
- * pins naming one function is a failure, not a pass. `fk2` is whether this shape can take two
- * blocks a pass -- the token operand, a format that folds scale groups, every class's K a multiple
- * of 256; a shape that cannot has one form only, which the form loop already held to the host
- * decode. Both launches are PINNED, so the launcher's row limit cannot make the comparison one form
- * against itself.
- *
- * A row with no describe hook -- moe_gemm_fp8a8_mod4 -- is compared on its bytes alone, and says
- * so in its label: that the variant ran is then not shown, only that what ran agrees. */
+/* The last kernel one launch dispatches, as r4d_record_dispatches saw it; null if it dispatched
+ * none. */
+static const void* last_dispatch(const Plugin& pl, const RadKernelInfo* row, RadArgs& a, int* rc) {
+    const void* fns[8] = {};
+    pl.record(fns, 8);
+    *rc = row->launch(&a, nullptr);
+    const int n = pl.record(nullptr, 0);
+    return n >= 1 && n <= 8 ? fns[n - 1] : nullptr;
+}
+
+/* The decode form's staged K both ways, byte for byte: one 128-wide K block per pass and two.
+ * Two pins dispatching one function fail, so a form is never compared against itself. Both
+ * launches are pinned, for the same reason. `fk2` says whether the shape can take two blocks per
+ * pass (token operand, a format that folds scale groups, every class's K a multiple of 256);
+ * otherwise there is one form, already checked by the form loop. */
 static void moe_dec_variants(const Plugin& pl, const RadKernelInfo* row, RadArgs& a, void* d_y,
                              size_t elems, bool fk2, const std::string& what) {
     if (!fk2 || !pl.pin_fk || !pl.pin_moe) return;
-    const bool described = row->describe != nullptr;
     struct Var { int fk; const char* name; };
     static const Var kVar[] = { { 1, "one K block a pass" }, { 2, "two K blocks a pass" } };
     constexpr int kN = (int)(sizeof(kVar) / sizeof(kVar[0]));
     const void* fn[kN] = {};
     std::vector<uint16_t> base;
     for (int v = 0; v < kN; ++v) {
-        const std::string label = what + " decode form, " + kVar[v].name +
-                                  (described ? "" : " (launch not described)");
-        auto pin = [&](bool on) {
-            pl.pin_moe(on ? 2 : 0);
-            pl.pin_fk(on ? kVar[v].fk : 0);
-        };
-        if (described) {
-            static RadLaunchDesc d[4];
-            int n = 0;
-            pin(true);
-            const int drc = row->describe(&a, nullptr, d, 4, &n);
-            pin(false);
-            if (drc != RAD_OK || n < 1) {
-                ok(label.c_str(), false, "describe rc=" + std::to_string(drc) + " n=" +
-                                         std::to_string(n));
-                return;
-            }
-            fn[v] = d[n - 1].func;
-            int same = -1;
-            for (int u = 0; u < v; ++u)
-                if (fn[u] && fn[u] == fn[v]) same = u;
-            if (same >= 0) {
-                ok(label.c_str(), false,
-                   std::string("named the same kernel as ") + kVar[same].name);
-                continue;
-            }
-        }
+        const std::string label = what + " decode form, " + kVar[v].name;
         {
             std::vector<uint16_t> junk(elems, 0x7f7fu);
             st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
         }
-        pin(true);
-        const int rc = row->launch(&a, nullptr);
+        pl.pin_moe(2);
+        pl.pin_fk(kVar[v].fk);
+        int rc = RAD_OK;
+        fn[v] = last_dispatch(pl, row, a, &rc);
         st_stream_sync(nullptr);
-        pin(false);
+        pl.pin_moe(0);
+        pl.pin_fk(0);
         if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); return; }
+        int same = -1;
+        for (int u = 0; u < v; ++u)
+            if (fn[u] && fn[u] == fn[v]) same = u;
+        if (same >= 0) {
+            ok(label.c_str(), false, std::string("dispatched the same kernel as ") +
+                                     kVar[same].name);
+            continue;
+        }
         std::vector<uint16_t> got(elems);
         st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
-        if (v == 0) { base = got; continue; }     /* the form loop held it to the host decode */
+        if (v == 0) { base = got; continue; }     /* checked against the host by the form loop */
         int64_t diff = 0;
         for (size_t i = 0; i < got.size(); ++i) diff += got[i] != base[i];
         ok(label.c_str(), diff == 0, std::to_string(diff) + " of " + std::to_string(elems) +
@@ -8108,17 +7660,15 @@ static void moe_dec_variants(const Plugin& pl, const RadKernelInfo* row, RadArgs
     }
 }
 
-/* THE RUN-ALIGNED FORM'S TWO COLUMN TILES ON THE DOWN PROJECTION, byte for byte. Where the
- * sorted operand, one part and every class's width in whole 256-column tiles let the rule take the
- * 256-column tile, the 128-column tile (r4d_moe_gemm_pin_down_tile 1) must write its bytes. Every
- * launch is DESCRIBED first where the row can be: the rule and the 256 pin must name one GEMM and
- * the 128 pin another, so the bytes below are never one kernel against itself. Where the shape
- * cannot take the 256-column tile, the pin to it is refused. `base` is the aligned form's own bytes
- * under the rule, already held to the host decode by the form loop.
+/* The run-aligned form's two column tiles on the down projection, byte for byte. Where the sorted
+ * operand, one part and every class's width in whole 256-column tiles let the rule take the
+ * 256-column tile, the 128-column tile (r4d_moe_gemm_pin_down_tile 1) must write the same bytes.
+ * Each launch records its two dispatches (the run map, then the GEMM): the rule and the 256 pin
+ * must dispatch one GEMM and the 128 pin another. Where the 256-column tile does not fit, its pin is refused. `base` is the
+ * aligned form's bytes under the rule, already checked against the host.
  *
- * PAST 512 EXPERTS THERE IS NO ALIGNED LAUNCH: the map's builder holds kMaxExpert + 1 offsets, so
- * the launcher hands a wider expert count the uniform grid whatever scratch it is given. Such a
- * shape is skipped, not failed. */
+ * Past 512 experts there is no aligned launch (the map holds kMaxExpert + 1 offsets), so such a
+ * shape is skipped. */
 static void moe_aligned_down_tile(const Plugin& pl, const RadKernelInfo* row, RadArgs& a,
                                   void* d_y, void* d_map, int64_t map_bytes, size_t elems,
                                   const std::vector<uint16_t>& base, bool dn_wide, int64_t ne,
@@ -8140,15 +7690,20 @@ static void moe_aligned_down_tile(const Plugin& pl, const RadKernelInfo* row, Ra
         a.scratch = sc0;
         a.scratch_bytes = sb0;
     };
-    auto launch = [&](int pin, std::vector<uint16_t>* got) {
+    /* One pinned launch into stale bytes; `gemm` gets its second dispatch, the GEMM. */
+    auto launch = [&](int pin, std::vector<uint16_t>* got, const void** gemm) {
         {
             std::vector<uint16_t> junk(elems, 0x7f7fu);
             st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
         }
+        const void* fns[4] = {};
         pl.pin_dtile(pin);
+        pl.record(fns, 4);
         const int rc = row->launch(&a, nullptr);
+        const int n = pl.record(nullptr, 0);
         st_stream_sync(nullptr);
         pl.pin_dtile(0);
+        if (gemm) *gemm = n == 2 ? fns[1] : nullptr;
         if (got) {
             got->assign(elems, 0);
             st_memcpy(got->data(), d_y, elems * 2, hipMemcpyDeviceToHost);
@@ -8156,64 +7711,61 @@ static void moe_aligned_down_tile(const Plugin& pl, const RadKernelInfo* row, Ra
         return rc;
     };
     if (!dn_wide) {
-        const int rc = launch(2, nullptr);
+        const int rc = launch(2, nullptr, nullptr);
         restore();
         ok((head + ", the 256-column down tile is refused on this shape").c_str(),
            rc == RAD_E_UNSUPPORTED, "rc=" + std::to_string(rc));
         return;
     }
-    if (row->describe) {
-        const void* fn[3] = {};
-        for (int pin = 0; pin < 3; ++pin) {
-            static RadLaunchDesc d[4];
-            int n = 0;
-            pl.pin_dtile(pin);
-            const int drc = row->describe(&a, nullptr, d, 4, &n);
-            pl.pin_dtile(0);
-            if (drc != RAD_OK || n != 2) {
-                restore();
-                ok((head + ", column tiles described").c_str(), false,
-                   "pin " + std::to_string(pin) + ": describe rc " + std::to_string(drc) +
-                       ", launches " + std::to_string(n));
-                return;
-            }
-            fn[pin] = d[1].func;
-        }
-        if (fn[0] != fn[2] || fn[1] == fn[2]) {
+    const void* fn[3] = {};
+    std::vector<uint16_t> got[3];
+    for (int pin = 0; pin < 3; ++pin) {
+        const int rc = launch(pin, &got[pin], &fn[pin]);
+        if (rc != RAD_OK || !fn[pin]) {
             restore();
-            ok((head + ", column tiles described").c_str(), false,
-               std::string("the rule ") + (fn[0] == fn[2] ? "names" : "does not name") +
-                   " the 256-column GEMM; the 128 pin " +
-                   (fn[1] == fn[2] ? "names it too" : "names another"));
+            ok((head + ", column tiles").c_str(), false,
+               "pin " + std::to_string(pin) + ": launch rc " + std::to_string(rc) +
+                   (fn[pin] ? "" : ", not two dispatches"));
             return;
         }
+    }
+    restore();
+    if (fn[0] != fn[2] || fn[1] == fn[2]) {
+        ok((head + ", column tiles").c_str(), false,
+           std::string("the rule ") + (fn[0] == fn[2] ? "dispatches" : "does not dispatch") +
+               " the 256-column GEMM; the 128 pin " +
+               (fn[1] == fn[2] ? "dispatches it too" : "dispatches another"));
+        return;
     }
     struct Var { int pin; const char* name; };
     static const Var kVar[] = { { 1, "the 128-column down tile" },
                                 { 2, "the 256-column down tile, pinned" } };
     for (const Var& v : kVar) {
-        const std::string label = head + ", " + v.name +
-                                  (row->describe ? "" : " (launch not described)");
-        std::vector<uint16_t> got;
-        const int rc = launch(v.pin, &got);
-        if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); continue; }
         int64_t diff = 0;
-        for (size_t i = 0; i < elems; ++i) diff += got[i] != base[i];
-        ok(label.c_str(), diff == 0, std::to_string(diff) + " of " + std::to_string(elems) +
-                                     " elements differ from the rule's 256-column tile");
+        for (size_t i = 0; i < elems; ++i) diff += got[v.pin][i] != base[i];
+        ok((head + ", " + v.name).c_str(), diff == 0,
+           std::to_string(diff) + " of " + std::to_string(elems) +
+               " elements differ from the rule's 256-column tile");
     }
-    restore();
 }
 
-/* EVERY FORM THE LAUNCHER HAS, each against the host decode: the run-aligned prefill form (a run
- * map in the scratch it is handed), the (tile, run) decode form, and the uniform prefill grid a
- * caller with no scratch gets. The rule picks one by the routed-row count, so a case that only
- * ran the rule would test whichever form its row count landed on. */
-/* `sub` 2 runs the codebook at E4M3 scales a 64 of K (w4nl64a8h), 4 at a 32 (w4nl32a8h): the
- * codes' values are the table's and each part of a 128-wide group has its own scale, the fold the
- * forms must agree on. `w5` with `sub` 2 runs the five-bit codebook (w5nl64a8h), whose stored row
- * is its nibbles and then its signs. `four` also runs `moe_gemm_w4a8_mod4` over the same experts
- * and holds it to the two-class op's bytes -- that row's own case. */
+/* The 4-bit grouped MoE GEMM against a host product over the same planes (the check the
+ * `moe_gemm_w4a8` row promises instead of a kbench case). The relayout reorders each dword's
+ * nibbles and the kernel expands them with V_PERM_B32 into LDS; they must agree on nibble order,
+ * row pitch (the launcher halves an element stride into bytes) and scale grid (one bf16 per row
+ * per 128, not per 128x128 tile). The reference reads the canonical planes, independent of either
+ * arrangement.
+ *
+ * Both bands: `T <= 128` runs a 16-row M tile, above it a 128-row one, differing in wave grid and
+ * in how many experts a block's row range straddles (the binary search and run loop).
+ *
+ * Every launcher form runs against the host: the run-aligned prefill form (a run map in its
+ * scratch), the (tile, run) decode form, and the uniform prefill grid of a caller with no scratch.
+ *
+ * `sub` 2 runs the codebook at E4M3 scales per 64 of K (w4nl64a8h), 4 per 32 (w4nl32a8h): each part
+ * of a 128-wide group has its own scale. `w5` with `sub` 2 runs the five-bit codebook (w5nl64a8h),
+ * whose stored row is its nibbles then its signs. `four` also runs `moe_gemm_w4a8_mod4` over the
+ * same experts and holds it to the two-class op's bytes. */
 static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int sub = 0,
                         bool w5 = false, bool four = false) {
     const bool g64 = sub > 1;
@@ -8241,9 +7793,9 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     std::vector<RadParam> lp = { PI("N", sh.N0), PI("K", sh.K0), PI("N_odd", sh.N1),
                                  PI("K_odd", sh.K1), PI("group", group), PS("dtype", dt) };
 
-    /* Each class's stored bytes from the hooks, asked through the class's own operands -- 2/3 and
-     * 6/7 -- so the view that answers for the odd table is under test as well. One float source an
-     * expert, its planes, and the arrangement beside them; the planes are kept for the reference. */
+    /* Each class's stored bytes from the hooks via its own operands (2/3 and 6/7), so the odd
+     * table's view is tested too. Per expert: a float source, its planes (kept for the reference)
+     * and the arrangement. */
     std::vector<uint8_t>  wq[2];
     std::vector<uint16_t> ws[2];
     std::vector<Planes>   cp[2];
@@ -8283,25 +7835,22 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
         }
     }
 
-    /* The activation is written as E4M3 BYTES and a per-(row, group) f32 scale, so the host and
-     * the device read the same numbers and the only difference left is summation order. The scale
-     * varies along the rows as well as the groups: one the same for every row would let a kernel
-     * that reads another row's scale pass. */
+    /* The activation as E4M3 bytes and a per-(row, group) f32 scale, so host and device read the
+     * same numbers. The scale varies along rows and groups, so reading another row's scale
+     * shows. */
     std::vector<uint8_t> aq((size_t)(M * K));
     std::vector<float>   as((size_t)(M * kb));
     for (int64_t m = 0; m < M; ++m) {
         for (int64_t g = 0; g < kb; ++g)
             as[(size_t)(m * kb + g)] = 0.011f + 0.003f * (float)g + 0.0007f * (float)(m % 11);
         for (int64_t k = 0; k < K; ++k) {
-            /* 8..126: no subnormal, and no 0x7F -- which is E4M3's NaN, and which a comparison
-             * that lets NaN through never noticed. */
+            /* 8..126: no subnormal and no 0x7F (E4M3's NaN). */
             const uint32_t c = (uint32_t)((m * 13 + k * 5) % 119) + 8;
             aq[(size_t)(m * K + k)] = (uint8_t)(((m + k) & 1) ? (c | 0x80u) : c);
         }
     }
 
-    /* A routing that puts an uneven run on each expert and drops the tail, which is what the run
-     * loop and the dropped-slot zeroing have to survive. */
+    /* Uneven runs per expert and a dropped tail, for the run loop and dropped-slot zeroing. */
     std::vector<int32_t> off((size_t)(ne + 1), 0), sorted((size_t)Tr, -1);
     const int64_t live = Tr - 3;
     for (int64_t e = 0; e <= ne; ++e) off[(size_t)e] = (int32_t)((live * e) / ne);
@@ -8329,9 +7878,8 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
         st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
     }
 
-    /* THE STACKED WEIGHT-TABLE FORM (a leading stride that is not zero). A pointer array is what
-     * the engine hands the kernel; a test has nowhere to put one, and the kernel reads both
-     * precisely so that this case runs against the same bytes. */
+    /* The stacked weight-table form (a non-zero leading stride); the engine passes a pointer
+     * array, and the kernel reads both. */
     std::vector<RadTensor> ts = {
         T(d_a,     RAD_F8E4M3,   { M, K }),
         T(d_as,    RAD_F32,      { M, kb }),
@@ -8354,8 +7902,8 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     std::memset(&a, 0, sizeof(a));
     a.t = ts.data(); a.n_t = (int)ts.size();
     a.p = ps.data(); a.n_p = (int)ps.size();
-    /* Room for the run map at the smallest prefill tile, whatever the hook answers: the hook sizes
-     * none inside the decode band, and the aligned form pinned there would then not run. */
+    /* Room for the run map at the smallest prefill tile regardless of the hook, which sizes none
+     * inside the decode band. */
     const int64_t map_bytes = (1 + 2 * (ne + Tr / 16 + 2)) * 4;
     void* d_map = dalloc((size_t)map_bytes);
 
@@ -8374,14 +7922,14 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
                 const int64_t tok = sh.sorted_a ? i : f / top_k, wr = pp * fc + j;
                 for (int64_t g = 0; g < kbc; ++g) {
                     if (g64) {
-                        /* `sub` scale groups a 128, each an E4M3 byte under the fixed constant. */
+                        /* `sub` scale groups per 128, each E4M3 under the fixed constant. */
                         const Planes& q = cp[c][(size_t)x];
                         const int64_t gw = group / sub;
                         for (int64_t h = 0; h < sub; ++h) {
                             double part = 0.0;
                             for (int64_t k = g * group + h * gw; k < g * group + (h + 1) * gw; ++k)
                                 part += (double)tab[code_at(q, wr, k)] *
-                                        (double)st_e4m3(aq[(size_t)(tok * K + k)]);
+                                        (double)h_e4m3(aq[(size_t)(tok * K + k)]);
                             const double sf = (double)h_e4m3(q.data[1][(size_t)(wr * q.row_bytes(1) +
                                                                                  sub * g + h)]) *
                                               (double)kW4G64Scale;
@@ -8392,7 +7940,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
                     double sub = 0.0;
                     for (int64_t k = g * group; k < (g + 1) * group; ++k)
                         sub += (double)code_at(cp[c][(size_t)x], wr, k) *
-                               (double)st_e4m3(aq[(size_t)(tok * K + k)]);
+                               (double)h_e4m3(aq[(size_t)(tok * K + k)]);
                     const float sf = rad_load_f32(cp[c][(size_t)x].data[1].data(), RAD_BF16,
                                                   wr * kbc + g);
                     want += sub * (double)sf * (double)as[(size_t)(tok * kb + g)];
@@ -8407,8 +7955,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     for (int form = f_lo; form <= f_hi; ++form) {
         const std::string label = what + " " + kForm[form];
         if (pl.pin_moe) pl.pin_moe(form);
-        /* Stale bytes again, so a form that leaves a pad tile unwritten cannot inherit the zeros
-         * the form before it wrote. */
+        /* Stale bytes again, so a form cannot inherit the previous form's zeros. */
         {
             std::vector<uint16_t> junk((size_t)(Tr * N), 0x7f7fu);
             st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
@@ -8431,10 +7978,8 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
                 const uint32_t u = (uint32_t)got[(size_t)(i * N + n)] << 16;
                 float gf;
                 std::memcpy(&gf, &u, 4);
-                /* bf16 carries eight mantissa bits, so a relative half-ulp is 1/512; the tolerance
-                 * is that plus room for a 256-term f32 sum taken in a different order. Written so
-                 * that a NaN on either side counts as a miss: `err > tol` is false for one, and a
-                 * NaN is exactly what a kernel that read a stale row would produce. */
+                /* A bf16 relative half-ulp (1/512) plus room for a reordered 256-term f32 sum.
+                 * Written so a NaN on either side counts as a miss. */
                 const double err = std::fabs((double)gf - want);
                 if (!(err <= 0.004 * std::fabs(want) + 1e-4)) {
                     if (!bad++)
@@ -8448,12 +7993,9 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
                                     " elements off, worst " + std::to_string(worst) + first);
         two_cls[form] = got;
     }
-    /* THE DECODE FORM AGAINST THE UNIFORM PREFILL GRID, byte for byte. Every form keeps each
-     * output element's accumulation order, so the bytes agree exactly, not within the host
-     * decode's tolerance. The decode form finds its runs by the one-round-trip search up to 512
-     * experts and by the chunked search above that; the uniform grid walks the offsets from a
-     * binary search, so this holds whichever search the expert count picks to a third way of
-     * finding the same runs. */
+    /* The decode form against the uniform prefill grid, byte for byte (every form keeps each
+     * element's accumulation order). The decode form finds runs by a one-round-trip search up to
+     * 512 experts and a chunked search above; the grid uses a binary search, a third way. */
     if (!two_cls[2].empty() && !two_cls[3].empty()) {
         int64_t diff = 0;
         for (size_t i = 0; i < two_cls[2].size(); ++i) diff += two_cls[2][i] != two_cls[3][i];
@@ -8461,23 +8003,21 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
            diff == 0, std::to_string(diff) + " of " + std::to_string(Tr * N) +
                       " elements differ");
     }
-    /* The aligned form's two column tiles on the down projection, where the sorted operand's every
-     * class is whole 256-column tiles; elsewhere the 256-column pin is refused. */
+    /* The aligned form's two column tiles on the down projection where every class is whole
+     * 256-column tiles; elsewhere the 256-column pin is refused. */
     const bool dn_wide = sh.sorted_a && sh.parts == 1 && sh.N0 % 256 == 0 && sh.N1 % 256 == 0;
     moe_aligned_down_tile(pl, r, a, d_y, d_map, map_bytes, (size_t)(Tr * N), two_cls[1], dn_wide,
                           ne, what);
-    /* The decode form's staged K both ways, where this shape can take two blocks a pass --
-     * never on the sorted operand, which the rule keeps at one. */
+    /* The decode form's staged K both ways, where the shape can take two blocks per pass (never on
+     * the sorted operand). */
     const bool fk2 = !sh.sorted_a && g64 && sh.K0 % 256 == 0 && sh.K1 % 256 == 0;
     moe_dec_variants(pl, r, a, d_y, (size_t)(Tr * N), fk2, what);
     if (!four) return;
 
-    /* AND THE SAME EXPERTS AS FOUR CLASSES, by number mod 4 (`moe_gemm_q_mod4`). Each parity table
-     * read at twice its stride is two of them -- from its first entry, the experts 0, 4, 8, ... of
-     * its parity's numbers mod 4, and from its second the others -- so classes 0 and 2 are the even
-     * table's halves and 1 and 3 the odd one's, at the even and the odd geometry. The same experts
-     * at the same geometry, read in the same order: every form must give the two-class op's bytes,
-     * byte for byte. What this checks is the class and entry each run resolves to. */
+    /* The same experts as four classes by number mod 4 (`moe_gemm_q_mod4`): each parity table read
+     * at twice its stride from its first and second entries gives two classes, so classes 0 and 2
+     * are the even table's halves and 1 and 3 the odd one's. Every form must reproduce the
+     * two-class op's bytes, checking the class and entry each run resolves to. */
     const RadKernelInfo* r4 = find(pl, "moe_gemm_w4a8_mod4");
     const std::string what4 = what + ", four classes";
     if (!r4) {
@@ -8514,7 +8054,7 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     a4.p = ps4.data(); a4.n_p = (int)ps4.size();
     for (int form = f_lo; form <= f_hi; ++form) {
         const std::string label = what4 + " " + kForm[form];
-        if (two_cls[form].empty()) continue;      /* the two-class launch failed, and said so */
+        if (two_cls[form].empty()) continue;      /* the two-class launch failed (reported) */
         if (pl.pin_moe) pl.pin_moe(form);
         {
             std::vector<uint16_t> junk((size_t)(Tr * N), 0x7f7fu);
@@ -8538,25 +8078,22 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     moe_dec_variants(pl, r4, a4, d_y, (size_t)(Tr * N), fk2, what4);
 }
 
-/* THE FOUR-CLASS GROUPED GEMM, EACH CLASS AT ITS OWN GEOMETRY, AGAINST A HOST DECODE.
+/* The four-class grouped GEMM, each class at its own geometry, against a host decode.
  *
- * moe_w4_gemm's four-class pass reads the two-class op's tables as four, so its classes come in
- * geometry pairs -- 0 with 2, 1 with 3 -- and class 0 is always among the wide ones. A rank of four
- * holds two blocks of its own class of every five-block expert and one of each other: ONE wide
- * class, which is class 0 on rank 0 only. Here every class is built at its own [N_q, K_q], stored
- * through the row's own hooks at its own operands (2/3, 6/7, 8/9, 10/11), and checked against the
- * planes, so a wide class 1, 2 or 3 has to read its own width and pitch, and a narrow class 0 has
- * to write the zeros past its part. `dt` names the format: fp8a8 runs `moe_gemm_fp8a8_mod4`, block
- * E4M3 with a bf16 scale a 128x128 tile; the four-bit ones run `moe_gemm_w4a8_mod4`, as
- * moe_w4_gemm reads them. Every form, as there. */
+ * moe_w4_gemm's four-class pass pairs geometries (0 with 2, 1 with 3), with class 0 always wide.
+ * A rank of four holds one wide class (two blocks of each five-block expert, one of the others),
+ * which is class 0 only on rank 0. Here each class is built at its own [N_q, K_q], stored through
+ * the row's hooks at its own operands (2/3, 6/7, 8/9, 10/11) and checked against the planes, so a
+ * wide class 1, 2 or 3 must read its own width and pitch and a narrow class 0 must write zeros past
+ * its part. `dt`: fp8a8 runs `moe_gemm_fp8a8_mod4` (block E4M3, a bf16 scale per 128x128 tile);
+ * the four-bit formats run `moe_gemm_w4a8_mod4`. Every form, as in moe_w4_gemm. */
 struct MoeQ4Shape { const char* name; int64_t N[4], K[4], parts, ne; };
 
-/* A rank of four's slices of a five-block expert: the gate/up pair (two parts) at two 128-column
- * blocks a part for the wide class and one for the others, the down projection at 256 and 128 of
- * K. The wide class is 1, 2 or 3 -- what the ranks other than 0 hold. Ten experts make classes 0
- * and 1 one expert longer than 2 and 3; three hundred spread a decode step's few runs over
- * experts that are mostly empty. Every part is whole 128-row blocks of the fp8 scale grid or lies
- * inside one, so no output tile's weight rows straddle two -- block fp8 reads one scale a tile. */
+/* A rank of four's slices of a five-block expert: gate/up (two parts) at two 128-column blocks per
+ * part for the wide class and one for the others, down at 256 and 128 of K. The wide class is 1, 2
+ * or 3 (ranks other than 0). Ten experts make classes 0 and 1 one expert longer; three hundred
+ * spread a decode step's runs over mostly empty experts. Every part is whole 128-row blocks of the
+ * fp8 scale grid or inside one, since block fp8 reads one scale per tile. */
 static const MoeQ4Shape kMoeQ4Shapes[] = {
     { "gate/up, class 1 wide", { 256, 512, 256, 256 }, { 256, 256, 256, 256 }, 2, 10 },
     { "gate/up, class 2 wide", { 256, 256, 512, 256 }, { 256, 256, 256, 256 }, 2, 10 },
@@ -8567,7 +8104,7 @@ static const MoeQ4Shape kMoeQ4Shapes[] = {
 
 static void moe_q4_gemm(const Plugin& pl, int64_t Tr, const MoeQ4Shape& sh, const char* dt) {
     const bool fp8 = std::strcmp(dt, "fp8a8") == 0, w5 = std::strcmp(dt, "w5nl64a8h") == 0;
-    /* Scale groups a 128 of K at the E4M3-scaled forms (moe_w4_gemm's `sub`), 0 at the others. */
+    /* Scale groups per 128 of K at the E4M3-scaled forms (moe_w4_gemm's `sub`), 0 otherwise. */
     const int64_t sub = std::strcmp(dt, "w4nl32a8h") == 0 ? 4
                       : (w5 || std::strcmp(dt, "w4nl64a8h") == 0) ? 2 : 0;
     const bool g64 = sub > 1;
@@ -8596,10 +8133,10 @@ static void moe_q4_gemm(const Plugin& pl, int64_t Tr, const MoeQ4Shape& sh, cons
         PI("group", group), PS("dtype", dt),
     };
 
-    /* Each class's experts e = 4x + q, from moe_w4_gemm's float source; their planes, kept for
-     * the reference, and the bytes the hooks store for them, asked at the class's own operands.
-     * Block fp8 is stored as its planes are, in both views; the four-bit codes are re-laid, and so
-     * is the E4M3 scale view with its second level, while a bf16 scale plane is stored as it is. */
+    /* Each class's experts e = 4x + q from moe_w4_gemm's float source: their planes (kept for the
+     * reference) and the hooks' stored bytes at the class's operands. Block fp8 is stored as its
+     * planes; four-bit codes and the E4M3 scale view are relaid; a bf16 scale plane is stored
+     * as is. */
     std::vector<uint8_t> wq[4], ws[4];
     std::vector<Planes>  cp[4];
     int64_t nec[4] = { 0, 0, 0, 0 };
@@ -8643,8 +8180,8 @@ static void moe_q4_gemm(const Plugin& pl, int64_t Tr, const MoeQ4Shape& sh, cons
         }
     }
 
-    /* moe_w4_gemm's activation and routing: E4M3 bytes with no subnormal and no NaN, an f32 scale
-     * a (row, group) that varies along both, an uneven run on each expert and a dropped tail. */
+    /* moe_w4_gemm's activation and routing: E4M3 bytes without subnormals or NaN, an f32 scale per
+     * (row, group) varying along both, uneven runs and a dropped tail. */
     std::vector<uint8_t> aq((size_t)(M * K));
     std::vector<float>   as((size_t)(M * kb));
     for (int64_t m = 0; m < M; ++m) {
@@ -8727,21 +8264,21 @@ static void moe_q4_gemm(const Plugin& pl, int64_t Tr, const MoeQ4Shape& sh, cons
                 for (int64_t g = 0; g < kbq; ++g) {
                     const double a_s = (double)as[(size_t)(tok * kb + g)];
                     if (fp8) {
-                        /* E4M3 codes, and the bf16 scale of the 128x128 tile the element is in. */
+                        /* E4M3 codes and the bf16 scale of the element's 128x128 tile. */
                         double part = 0.0;
                         for (int64_t k = g * group; k < (g + 1) * group; ++k)
                             part += (double)h_e4m3(p.data[0][(size_t)(wr * Kq + k)]) *
-                                    (double)st_e4m3(aq[(size_t)(tok * K + k)]);
+                                    (double)h_e4m3(aq[(size_t)(tok * K + k)]);
                         want += part * (double)rad_load_f32(p.data[1].data(), RAD_BF16,
                                                             (wr / group) * kbq + g) * a_s;
                     } else if (g64) {
-                        /* `sub` scale groups a 128, each an E4M3 byte under the fixed constant. */
+                        /* `sub` scale groups per 128, each E4M3 under the fixed constant. */
                         const int64_t gw = group / sub;
                         for (int64_t h = 0; h < sub; ++h) {
                             double part = 0.0;
                             for (int64_t k = g * group + h * gw; k < g * group + (h + 1) * gw; ++k)
                                 part += (double)tab[code_at(p, wr, k)] *
-                                        (double)st_e4m3(aq[(size_t)(tok * K + k)]);
+                                        (double)h_e4m3(aq[(size_t)(tok * K + k)]);
                             const uint8_t sb =
                                 p.data[1][(size_t)(wr * p.row_bytes(1) + sub * g + h)];
                             want += part * (double)h_e4m3(sb) * (double)kW4G64Scale * a_s;
@@ -8750,7 +8287,7 @@ static void moe_q4_gemm(const Plugin& pl, int64_t Tr, const MoeQ4Shape& sh, cons
                         double part = 0.0;
                         for (int64_t k = g * group; k < (g + 1) * group; ++k)
                             part += (double)code_at(p, wr, k) *
-                                    (double)st_e4m3(aq[(size_t)(tok * K + k)]);
+                                    (double)h_e4m3(aq[(size_t)(tok * K + k)]);
                         want += part * (double)rad_load_f32(p.data[1].data(), RAD_BF16,
                                                             wr * kbq + g) * a_s;
                     }
@@ -8786,7 +8323,7 @@ static void moe_q4_gemm(const Plugin& pl, int64_t Tr, const MoeQ4Shape& sh, cons
             for (int64_t n = 0; n < N; ++n) {
                 const double want = ref[(size_t)(i * N + n)];
                 const double err = std::fabs((double)h_bf16(got[(size_t)(i * N + n)]) - want);
-                /* moe_w4_gemm's tolerance, written so that a NaN on either side is a miss. */
+                /* moe_w4_gemm's tolerance; a NaN on either side is a miss. */
                 if (!(err <= 0.004 * std::fabs(want) + 1e-4)) {
                     if (!bad++)
                         first = ", first at row " + std::to_string(i) + " col " +
@@ -8809,11 +8346,10 @@ static void moe_q4_gemm(const Plugin& pl, int64_t Tr, const MoeQ4Shape& sh, cons
     moe_dec_variants(pl, r, a, d_y, (size_t)(Tr * N), fk2, what);
 }
 
-/* A DECODE STEP'S ROUTING, the way router_topk_scatter leaves it: M tokens, `top_k` distinct experts
- * each -- half of the picks from thirty-two popular experts, the rest anywhere -- and, with `hot`,
- * every token's first slot on one expert, whose run is then M rows long and crosses 16-row tiles.
- * Every 37th slot goes to another rank (dropped, so the live count is short of T). Then the
- * scatter's stable counting sort: runs in expert order, a run's slots in slot order. */
+/* A decode step's routing as router_topk_scatter leaves it: M tokens with `top_k` distinct experts
+ * each (half from thirty-two popular experts) and, with `hot`, every token's first slot on one
+ * expert, whose M-row run crosses 16-row tiles. Every 37th slot goes to another rank (dropped).
+ * Then the scatter's stable counting sort: runs in expert order, slots in slot order. */
 static void moe_route(int64_t M, int64_t top_k, int64_t ne, uint64_t seed, bool hot,
                       std::vector<int32_t>& off, std::vector<int32_t>& sorted) {
     const int64_t T = M * top_k;
@@ -8849,23 +8385,18 @@ static void moe_route(int64_t M, int64_t top_k, int64_t ne, uint64_t seed, bool 
         if (ids[(size_t)i] >= 0) sorted[(size_t)(at[(size_t)ids[(size_t)i]]++)] = (int32_t)i;
 }
 
-/* THE SORTED OPERAND -- the down projection -- AT DECODE, every form against a host decode, and
- * moe_down_dec_kernel, which the rule gives the decode form here, against the (tile, run) form
- * BYTE FOR BYTE.
+/* The sorted operand (the down projection) at decode: every form against a host decode, and
+ * moe_down_dec_kernel (the rule's decode form here) against the (tile, run) form byte for byte.
  *
- * moe_q4_gemm reads the activation in token order; down reads it in sorted order, one row a routed
- * slot, so that is the operand here, with a routing shaped like a decode step's (moe_route): at
- * T = 40 one sequence at depth 3, at T = 640 sixteen, a run longer than a tile, runs that cross
- * tile boundaries, a dropped tail. Each class has its own [N_q, K_q]; one class narrower than the
- * output puts a column tile past its width, which both forms must zero. The decode kernel runs at
- * several column groups, three of them uneven over the output's 64-column tiles; and the (tile,
- * run) form itself against the uniform prefill grid, byte for byte, on the sorted-operand path the
- * token-order cases never take. Every pinned variant is DESCRIBED first where the row can be: one
- * that named the reference's kernel would match it trivially.
+ * Down reads the activation in sorted order, one row per routed slot, with a decode-shaped routing
+ * (moe_route): T = 40 (one sequence at depth 3) and T = 640 (sixteen), a run longer than a tile,
+ * runs crossing tiles, a dropped tail. Each class has its own [N_q, K_q]; one narrower than the
+ * output must zero the column tile past its width. The decode kernel runs at several column groups,
+ * three uneven over the 64-column tiles, and the (tile, run) form is checked against the uniform
+ * prefill grid on this sorted-operand path. Each pinned variant must dispatch a kernel of its own.
  *
- * AND AN OUTPUT THAT NAMES FEWER ROWS THAN ITS BUFFER, while the offsets still name the whole
- * routing: both decode forms must write those rows as the full launch did and never a row past
- * them. */
+ * Also an output naming fewer rows than its buffer while the offsets name the whole routing: both
+ * decode forms must write those rows as the full launch did and nothing past them. */
 struct MoeDnShape { const char* name; int64_t N[4], K[4], ne, top_k; };
 
 static void moe_down_dec_case(const Plugin& pl, const MoeDnShape& sh, const char* dt,
@@ -8902,8 +8433,8 @@ static void moe_down_dec_case(const Plugin& pl, const MoeDnShape& sh, const char
         PI("group", group), PS("dtype", dt),
     };
 
-    /* The experts, as moe_q4_gemm builds them: e = 4x + q, each class at its own geometry, the
-     * bytes the row's own hooks store for them at the class's operands. */
+    /* The experts as moe_q4_gemm builds them: e = 4x + q, each class at its own geometry, stored
+     * by the row's hooks at the class's operands. */
     std::vector<uint8_t> wq[4], ws[4];
     std::vector<Planes>  cp[4];
     int64_t nec[4] = { 0, 0, 0, 0 };
@@ -8975,8 +8506,8 @@ static void moe_down_dec_case(const Plugin& pl, const MoeDnShape& sh, const char
             longest = std::max(longest, n);
         }
 
-        /* One activation row a routed slot: E4M3 bytes with no subnormal and no NaN, an f32 scale
-         * a (row, group) that varies along both, so a row read under another's scale shows. */
+        /* One activation row per routed slot: E4M3 bytes without subnormals or NaN, an f32 scale
+         * per (row, group) varying along both. */
         std::vector<uint8_t> aq((size_t)(Tr * K));
         std::vector<float>   as((size_t)(Tr * kb));
         for (int64_t m = 0; m < Tr; ++m) {
@@ -9031,7 +8562,7 @@ static void moe_down_dec_case(const Plugin& pl, const MoeDnShape& sh, const char
                         double part = 0.0;
                         for (int64_t k = g * group; k < (g + 1) * group; ++k)
                             part += (double)h_e4m3(p.data[0][(size_t)(n * Kq + k)]) *
-                                    (double)st_e4m3(aq[(size_t)(i * K + k)]);
+                                    (double)h_e4m3(aq[(size_t)(i * K + k)]);
                         want += part * (double)rad_load_f32(p.data[1].data(), RAD_BF16,
                                                             (n / group) * kbq + g) * a_s;
                     } else if (g64) {
@@ -9040,7 +8571,7 @@ static void moe_down_dec_case(const Plugin& pl, const MoeDnShape& sh, const char
                             double part = 0.0;
                             for (int64_t k = g * group + h * gw; k < g * group + (h + 1) * gw; ++k)
                                 part += (double)tab[code_at(p, n, k)] *
-                                        (double)st_e4m3(aq[(size_t)(i * K + k)]);
+                                        (double)h_e4m3(aq[(size_t)(i * K + k)]);
                             const uint8_t sb = p.data[1][(size_t)(n * p.row_bytes(1) + sub * g + h)];
                             want += part * (double)h_e4m3(sb) * (double)kW4G64Scale * a_s;
                         }
@@ -9048,7 +8579,7 @@ static void moe_down_dec_case(const Plugin& pl, const MoeDnShape& sh, const char
                         double part = 0.0;
                         for (int64_t k = g * group; k < (g + 1) * group; ++k)
                             part += (double)code_at(p, n, k) *
-                                    (double)st_e4m3(aq[(size_t)(i * K + k)]);
+                                    (double)h_e4m3(aq[(size_t)(i * K + k)]);
                         want += part * (double)rad_load_f32(p.data[1].data(), RAD_BF16,
                                                             n * kbq + g) * a_s;
                     }
@@ -9057,9 +8588,11 @@ static void moe_down_dec_case(const Plugin& pl, const MoeDnShape& sh, const char
             }
         }
 
-        /* One pinned launch into stale bytes, its output back. `pins` is (form, the sorted
-         * operand's decode kernel: -1 the (tile, run) form, 0 the rule, n its column tiles). */
-        auto run = [&](const int (&pins)[2], std::vector<uint16_t>* got) {
+        /* One pinned launch into stale bytes, returning its output and its last dispatch. `pins`
+         * is (form, the sorted operand's decode kernel: -1 the (tile, run) form, 0 the rule, n
+         * its column tiles). */
+        auto run = [&](const int (&pins)[2], std::vector<uint16_t>* got,
+                       const void** fn = nullptr) {
             {
                 std::vector<uint16_t> junk((size_t)(Tr * N), 0x7f7fu);
                 st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
@@ -9068,35 +8601,25 @@ static void moe_down_dec_case(const Plugin& pl, const MoeDnShape& sh, const char
             a.scratch_bytes = pins[0] == 3 ? 0 : map_bytes;
             pl.pin_moe(pins[0]);
             pl.pin_ddec(pins[1]);
-            const int rc = r->launch(&a, nullptr);
+            int rc = RAD_OK;
+            const void* last = last_dispatch(pl, r, a, &rc);
             st_stream_sync(nullptr);
             pl.pin_moe(0);
             pl.pin_ddec(0);
+            if (fn) *fn = last;
             got->assign((size_t)(Tr * N), 0);
             st_memcpy(got->data(), d_y, got->size() * 2, hipMemcpyDeviceToHost);
             return rc;
         };
-        auto described = [&](const int (&pins)[2]) -> const void* {
-            if (!r->describe) return nullptr;
-            static RadLaunchDesc d[4];
-            int n = 0;
-            a.scratch = pins[0] == 3 ? nullptr : d_map;
-            a.scratch_bytes = pins[0] == 3 ? 0 : map_bytes;
-            pl.pin_moe(pins[0]);
-            pl.pin_ddec(pins[1]);
-            const int drc = r->describe(&a, nullptr, d, 4, &n);
-            pl.pin_moe(0);
-            pl.pin_ddec(0);
-            return drc == RAD_OK && n >= 1 ? d[n - 1].func : nullptr;
-        };
 
         /* Every form with the decode kernel off, against the host. */
         std::vector<uint16_t> base, grid;
+        const void* fn0 = nullptr;    /* the (tile, run) form's kernel */
         for (int form = 1; form <= 3; ++form) {
             const std::string label = what + " " + kForm[form];
             const int pins[2] = { form, -1 };
             std::vector<uint16_t> got;
-            const int rc = run(pins, &got);
+            const int rc = run(pins, &got, form == 2 ? &fn0 : nullptr);
             if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); continue; }
             double worst = 0.0;
             int64_t bad = 0;
@@ -9122,8 +8645,7 @@ static void moe_down_dec_case(const Plugin& pl, const MoeDnShape& sh, const char
         if (base.empty()) continue;
 
         /* The (tile, run) form on the sorted operand against the uniform prefill grid, byte for
-         * byte: every form keeps each output element's accumulation order, and the grid finds the
-         * runs a third way. */
+         * byte. */
         if (!grid.empty()) {
             int64_t diff = 0;
             for (size_t i = 0; i < grid.size(); ++i) diff += grid[i] != base[i];
@@ -9132,9 +8654,8 @@ static void moe_down_dec_case(const Plugin& pl, const MoeDnShape& sh, const char
                           " elements differ");
         }
 
-        /* The sorted operand's own decode kernel under the rule and at several column groups --
-         * sixteen is the cap, past the output's five tiles here -- each against the (tile, run)
-         * form's bytes. */
+        /* The sorted operand's decode kernel under the rule and at several column groups (sixteen,
+         * the cap, exceeds the output's five tiles), each against the (tile, run) form's bytes. */
         struct Var { int dn; const char* name; };
         static const Var kVar[] = {
             { 0, "down kernel, the rule's column tiles" },
@@ -9145,34 +8666,29 @@ static void moe_down_dec_case(const Plugin& pl, const MoeDnShape& sh, const char
             { 8, "down kernel, eight column tiles a block" },
             { 16, "down kernel, sixteen column tiles a block" },
         };
-        const int ref_pins[2] = { 2, -1 };
-        const void* fn0 = described(ref_pins);
         for (const Var& v : kVar) {
             const std::string label = what + " decode form, " + v.name + " (" +
                                       std::to_string(nrun) + " runs, longest " +
-                                      std::to_string(longest) + ")" +
-                                      (r->describe ? "" : " (launch not described)");
+                                      std::to_string(longest) + ")";
             const int pins[2] = { 2, v.dn };
-            if (r->describe) {
-                const void* fn = described(pins);
-                if (!fn || fn == fn0) {
-                    ok(label.c_str(), false, fn ? "named the (tile, run) form's kernel"
-                                                : "describe failed");
-                    continue;
-                }
-            }
             std::vector<uint16_t> got;
-            const int rc = run(pins, &got);
+            const void* fn = nullptr;
+            const int rc = run(pins, &got, &fn);
             if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); continue; }
+            if (!fn || fn == fn0) {
+                ok(label.c_str(), false, fn ? "dispatched the (tile, run) form's kernel"
+                                            : "dispatched nothing");
+                continue;
+            }
             int64_t diff = 0;
             for (size_t i = 0; i < got.size(); ++i) diff += got[i] != base[i];
             ok(label.c_str(), diff == 0, std::to_string(diff) + " of " + std::to_string(Tr * N) +
                                          " elements differ from the (tile, run) form");
         }
 
-        /* THE OUTPUT SEVEN ROWS SHORT: Y declared at Tr - 7 rows over the same buffer, the
-         * offsets unchanged, so the routing names rows past the output's last. Each decode form
-         * must write the rows it has exactly as the full launch did and leave the rest stale. */
+        /* The output seven rows short: Y declared at Tr - 7 rows over the same buffer with the
+         * offsets unchanged. Each decode form must write its rows as the full launch did and leave
+         * the rest stale. */
         {
             const int64_t Tv = Tr - 7;
             ts[12] = T(d_y, RAD_BF16, { Tv, N });
@@ -9199,25 +8715,21 @@ static void moe_down_dec_case(const Plugin& pl, const MoeDnShape& sh, const char
     }
 }
 
-/* QFN's down projection at rank 0 of four, narrowed: 512 experts at top 10, K 256 for class 0 and
- * 128 for the others -- and 384 for class 3, so a run takes three K blocks -- and N five 64-column
- * tiles, class 2 one short of it. The other formats at 64 experts, top 4. */
+/* Qwen3.8-Flash-Next's down projection at rank 0 of four, narrowed: 512 experts at top 10, K 256
+ * for class 0, 128 for classes 1-2 and 384 for class 3 (three K blocks per run), N five 64-column
+ * tiles with class 2 one short. The other formats at 64 experts, top 4. */
 static const MoeDnShape kMoeDnShapes[] = {
     { "512 experts, top 10", { 320, 320, 256, 320 }, { 256, 128, 128, 384 }, 512, 10 },
     { "64 experts, top 4",   { 320, 320, 256, 320 }, { 256, 128, 128, 384 }, 64, 4 },
 };
 
-/* THE ARRANGED PLANE, AGAINST THE FORMAT IT STATES, AND BACK.
+/* The arranged plane against the format it states, and back.
  *
- * `moe_gemm_w4a8` is the one large weight of a routed model, and what a checker reads it through is
- * the row's inverse: a reference handed the arranged nibbles reads the wrong element in most
- * positions and reports a correct kernel as wrong. So the inverse has to give back exactly the
- * planes the relayout was handed.
- *
- * AND THE ARRANGEMENT HAS TO BE THE ONE r4d_layout.cpp STATES, which is checked from the
- * statement and not from either hook: byte b of a packed dword holds element b low and element
- * b+4 high, two's complement. The scale plane is read as it is stored, so its hook must answer
- * RAD_E_UNSUPPORTED -- "nothing to arrange", which a caller has to be able to tell from a refusal. */
+ * A checker reads `moe_gemm_w4a8`'s weight through the row's inverse, so the inverse must return
+ * exactly the planes the relayout was given. The arrangement is checked against r4d_layout.cpp's
+ * statement, not either hook: byte b of a packed dword holds element b low and b+4 high, two's
+ * complement. The scale plane is stored as is, so its hook must answer RAD_E_UNSUPPORTED
+ * ("nothing to arrange"). */
 static void moe_w4_unlayout(const Plugin& pl) {
     const char* what = "moe_gemm_w4a8's arranged plane, vs the stated format and its inverse";
     const RadKernelInfo* r = find(pl, "moe_gemm_w4a8");
@@ -9258,10 +8770,10 @@ static void moe_w4_unlayout(const Plugin& pl) {
        std::to_string(bad_code) + " code(s) not where the format puts them" +
        (back ? std::string() : "; inverse: " + why));
 
-    /* w5nl64a8h's row, against the same statement: the low four bits of every code where w4a8's
-     * nibble would be, in a row K/2 + K/8 bytes long, and the high bit -- the sign -- of element
-     * 4m+b of a 32 at bit 7-m of byte b of that 32's dword, from byte K/2 on. The table beside
-     * the codes is the kernel's, and its inverse restores both planes. */
+    /* w5nl64a8h's row against the same statement: the low four bits of every code where w4a8's
+     * nibble would be, in a K/2 + K/8-byte row, and the high bit (the sign) of element 4m+b of a
+     * 32 at bit 7-m of byte b of that 32's dword, from byte K/2 on. The table is the kernel's, and
+     * the inverse restores both planes. */
     const char* what5 = "moe_gemm_w4a8's five-bit arranged plane, vs the stated format and its "
                         "inverse";
     std::vector<RadParam> lp5 = { PI("N", N), PI("K", K), PI("group", group),
@@ -9289,30 +8801,22 @@ static void moe_w4_unlayout(const Plugin& pl) {
         }
     std::string why5;
     const bool back5 = restores(r, lp5, 2, p5, { "codes", "table" }, w5, &why5);
-    /* Half the source is negative, so a fixture with no sign bits set proves nothing. */
+    /* Half the source is negative, so sign bits are exercised. */
     ok(what5, bad5 == 0 && back5 && neg > N * K / 4,
        std::to_string(bad5) + " code(s) not where the format puts them, " + std::to_string(neg) +
        " negative" + (back5 ? std::string() : "; inverse: " + why5));
 }
-/* ---- THE ROTATED EXPERT FORMAT, end to end and against the float it approximates.
+/* ---- the rotated expert format, end to end, against the float it approximates.
  *
- * WHAT THIS CATCHES AND moe_w4_gemm CANNOT. That case compares the kernel against a host product
- * over the planes: it proves the arrangement, the two's complement and the scale grid, and it would
- * pass just as happily if the WEIGHT had been rotated by one Hadamard and the ACTIVATION by a
- * different one, because it never looks at what the numbers mean. The rotated pair is only a model
- * if the quantiser's Hadamard (this file's h_fwht, libquant's fwht_inplace) and r4d_fwht.h's
- * r4d_fwht_wave are the same transform -- and they are written independently, one iterative over a
- * host array and one in registers across a wave with five shuffles, so nothing but a test says so.
+ * moe_w4_gemm checks against the planes, so it would pass if the weight and the activation were
+ * rotated by different Hadamards. The quantiser's transform (h_fwht here, libquant's
+ * fwht_inplace) and r4d_fwht.h's r4d_fwht_wave are written independently (a host loop versus
+ * five in-register shuffles across a wave), so the oracle here is the exact dot product of the
+ * source weight and activation in original coordinates, against which both formats are measured.
+ * A mismatched rotation gives rel_l2 around 5 instead of around 0.1.
  *
- * The oracle is therefore the exact f32 dot product of the SOURCE weight and the SOURCE
- * activation, in the original coordinates, and both formats are measured against it in one run.
- * A rotation mismatch is not subtle when read that way -- rotating the activation and not the
- * weight measures rel_l2 5.32 against 0.13 -- but it is invisible without this oracle.
- *
- * The two numbers it prints are also the instrument the format decision rests on, which is why
- * the source has a few outlier channels in it: sixteen levels spent covering one outlier is
- * exactly the error a rotation is supposed to remove, and a source with none would make the two
- * formats look alike for a reason that is not true of a real expert. */
+ * The printed numbers also compare the two formats, so the source has a few outlier channels:
+ * covering an outlier with sixteen levels is the error rotation removes. */
 static void moe_w4_rot(const Plugin& pl) {
     const char* what = "moe_gemm_w4a8h/w4nla8h/w4nl64a8h/w5nl64a8h + had_quant_act_fp8 vs the f32 "
                        "they approximate";
@@ -9327,8 +8831,8 @@ static void moe_w4_rot(const Plugin& pl) {
     const int64_t ne = 3, N = 64, K = 256, group = 128, top_k = 2, Tr = 24;
     const int64_t kb = K / group, M = Tr / top_k;
 
-    /* The source weight and activation, in float. Outliers every 37th and 23rd column -- six
-     * times the body, which is mild beside a real MoE input and enough to separate the grids. */
+    /* The source weight and activation in float, with outliers every 37th and 23rd column at six
+     * times the body (milder than a real MoE input, enough to separate the grids). */
     std::vector<float>    wsrc((size_t)(ne * N * K));
     std::vector<uint16_t> xbf ((size_t)(M * K));
     std::vector<float>    xsrc((size_t)(M * K));
@@ -9343,8 +8847,8 @@ static void moe_w4_rot(const Plugin& pl) {
         for (int64_t k = 0; k < K; ++k) {
             float v = (float)(((m * 29 + k * 11) % 53) - 26) / 41.0f;
             if (k % 23 == 0) v *= 6.0f;
-            /* Rounded through bf16 HERE, so the oracle reads the same number the device does and
-             * the residual is the format's and not the input's. */
+            /* Rounded through bf16 here, so the oracle reads the device's value and the residual
+             * is the format's. */
             const uint16_t h = h_to_bf16(v);
             xbf [(size_t)(m * K + k)] = h;
             xsrc[(size_t)(m * K + k)] = h_bf16(h);
@@ -9364,7 +8868,7 @@ static void moe_w4_rot(const Plugin& pl) {
     st_memcpy(d_s, sorted.data(), sorted.size() * 4, hipMemcpyHostToDevice);
     st_memcpy(d_o, off.data(),    off.size() * 4,    hipMemcpyHostToDevice);
 
-    /* The exact answer, in the ORIGINAL coordinates: no rotation, no grid, f64 accumulation. */
+    /* The exact answer in the original coordinates: no rotation, no grid, f64 accumulation. */
     std::vector<double> want((size_t)(Tr * N), 0.0);
     for (int64_t i = 0; i < live; ++i) {
         const int64_t tok = sorted[(size_t)i] / top_k;
@@ -9379,21 +8883,21 @@ static void moe_w4_rot(const Plugin& pl) {
         }
     }
 
-    /* Six formats: plain, rotated, rotated with the w4nl codebook -- whose codes view takes the
-     * table beside the codes and whose kernel decodes that table -- the codebook at E4M3 scales a
-     * 64 and a 32 of K, whose scale view takes the fixed second level beside the scales, and the
-     * five-bit codebook at a 64, whose codes carry their signs in a plane of their own. */
+    /* Six formats: plain; rotated; rotated with the w4nl codebook (the codes view takes the table
+     * and the kernel decodes it); the codebook at E4M3 scales per 64 and per 32 of K (the scale
+     * view takes the fixed second level); and the five-bit codebook per 64, with its signs in a
+     * separate plane. */
     double rel[6] = { -1.0, -1.0, -1.0, -1.0, -1.0, -1.0 };
     for (int pass = 0; pass < 6; ++pass) {
         const bool rot = pass >= 1, nl = pass >= 2, g64 = pass >= 3, w5 = pass == 5;
-        const int64_t sub = pass == 4 ? 4 : g64 ? 2 : 1;   /* scale groups a 128 */
+        const int64_t sub = pass == 4 ? 4 : g64 ? 2 : 1;   /* scale groups per 128 */
         const char* dt = w5 ? "w5nl64a8h" : pass == 4 ? "w4nl32a8h" : g64 ? "w4nl64a8h"
                        : nl ? "w4nla8h" : rot ? "w4a8h" : "w4a8";
 
         std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", group), PS("dtype", dt) };
         const int64_t wbytes = w5 ? N * K / 8 * 5 : N * K / 2;
         std::vector<uint8_t>  wq((size_t)(ne * wbytes), 0);
-        std::vector<uint16_t> ws((size_t)(ne * N * kb * (sub > 2 ? 2 : 1)), 0);   /* bytes a 128: 2, or 4 */
+        std::vector<uint16_t> ws((size_t)(ne * N * kb * (sub > 2 ? 2 : 1)), 0);   /* 2 or 4 B/128 */
         for (int64_t e = 0; e < ne; ++e) {
             const std::vector<float> we(wsrc.begin() + e * N * K, wsrc.begin() + (e + 1) * N * K);
             const Planes pe = g64 ? nl64_planes(we, N, K, 128 / sub, w5)
@@ -9409,10 +8913,9 @@ static void moe_w4_rot(const Plugin& pl) {
                 ok(what, false, "relayout rc " + std::to_string(rw) + "/" + std::to_string(rs));
                 return;
             }
-            /* THE ENCODING IS THE WHOLE GUARD AGAINST A MIS-SERVED CONTAINER, so it is checked
-             * here and not merely produced: the arrangement, the extents and the byte count are
-             * identical between the two formats, and only the encoding's transform differs. The
-             * hook must take the one its dtype names and refuse the other at declare. */
+            /* The encoding is the only guard against a mis-served container (arrangement,
+             * extents and byte count are identical across formats), so the hook must accept the
+             * encoding its dtype names and refuse the other. */
             if (e == 0) {
                 const Planes other = int4_planes(we, N, K, group, RAD_BF16, nl || !rot);
                 std::vector<uint8_t> scratch;
@@ -9435,8 +8938,8 @@ static void moe_w4_rot(const Plugin& pl) {
             std::memcpy((uint8_t*)ws.data() + (size_t)e * sc.size(), sc.data(), sc.size());
         }
 
-        /* The activation goes through the DEVICE quantiser -- the whole point is that its
-         * rotation is the one the weight's planes were quantised under. */
+        /* The activation goes through the device quantiser, whose rotation must match the one
+         * the weight's planes were quantised under. */
         void* d_q  = dalloc((size_t)(M * K));
         void* d_qs = dalloc((size_t)(M * kb) * 4);
         std::vector<RadTensor> qt = {
@@ -9497,23 +9000,18 @@ static void moe_w4_rot(const Plugin& pl) {
         rel[pass] = den > 0.0 ? std::sqrt(num / den) : -1.0;
     }
 
-    /* 0.6 is loose ON PURPOSE. The measured pair is 0.20 and 0.13, and a quantiser that improves
-     * on either must not have to come back here and move a number. The failure it is set to catch is
-     * much further away than that: feeding the ROTATED activation to the UNROTATED weight -- the
-     * exact mismatch a mis-served container would produce -- measures 5.32, because the rotated
-     * values are also sqrt(128) larger. */
+    /* 0.6 is deliberately loose, well above the formats' error, so a better quantiser needs no
+     * change here. A mis-served container (rotated activation, unrotated weight) measures around 5,
+     * since the rotated values are also sqrt(128) larger. */
     bool pass = true;
     for (double x : rel) pass = pass && x >= 0.0 && x < 0.6;
-    /* PRINTED WHETHER OR NOT IT PASSES, because the pass is about the plumbing and the numbers
-     * are about the format: a reader comparing two quantisers wants them either way, and `ok` shows
-     * its detail only on a failure. A kernel that decoded the w4nl codes as -8..7 would read
-     * every code as a different number and measure near 1. */
+    /* Printed even on a pass, to compare the formats (`ok` shows detail only on failure). A kernel
+     * decoding w4nl codes as -8..7 would measure near 1. */
     std::printf("        rel_l2 vs f32: w4a8 %.4f, w4a8h %.4f, w4nla8h %.4f, w4nl64a8h %.4f, "
                 "w4nl32a8h %.4f, w5nl64a8h %.4f\n", rel[0], rel[1], rel[2], rel[3], rel[4], rel[5]);
-    /* The finer groups have to show: a fold that read one group's scale for another, or the bytes
-     * in another order, lands at or above the coarser form. And the fifth bit has to: a sign plane
-     * read for the wrong elements -- or not at all -- flips half the signs, which measures near 1,
-     * and one read for the right elements of the wrong row measures well above w4nl64a8h. */
+    /* The finer groups must improve on the coarser form (a fold reading the wrong group's scale,
+     * or bytes in another order, would not), and the fifth bit must too: a sign plane misread or
+     * ignored flips half the signs (near 1), and the wrong row's lands well above w4nl64a8h. */
     pass = pass && rel[3] < rel[2] && rel[4] < rel[3] && rel[5] < 0.75 * rel[3];
     ok(what, pass, "rel_l2 w4a8 " + std::to_string(rel[0]) + ", w4a8h " + std::to_string(rel[1]) +
                    ", w4nla8h " + std::to_string(rel[2]) + ", w4nl64a8h " + std::to_string(rel[3]) +
@@ -9523,33 +9021,25 @@ static void moe_w4_rot(const Plugin& pl) {
 
 /* qsa_work, against a host walk of the same batch.
  *
- * THE FIXTURE IS A MIXED STEP, because that is the case the op exists for and the one a
- * single-sequence test cannot reach: a long prefill chunk that completes many blocks and STRADDLES
- * the boundary (so its first block takes keys from the tail AND from the chunk), a short chunk
- * that stops inside a block, a speculative decode row of four that completes one out of two
- * tail keys and two of its own, and a fresh three-token prompt that stops before its first block
- * ends. Four sequences, four shapes, one launch.
+ * A mixed step: a long prefill chunk that completes many blocks and straddles a boundary (its
+ * first block takes keys from the tail and the chunk), a short chunk stopping inside a block, a
+ * four-row speculative decode completing a block from two tail keys and two of its own, and a
+ * fresh three-token prompt ending before its first block. One launch.
  *
- * THREE THINGS HERE ARE REGRESSION TESTS AND NOT COVERAGE.
+ * Pinned on purpose:
  *
- *   THE STATE SLOTS ARE PERMUTED AND WIDER THAN THE BATCH -- {5, 0, 8} out of nine. A kernel that
- *   indexed the tail by the BATCH ROW reads slots 0, 1, 2 and every tail key comes back wrong.
- *   That is not a synthetic worry: the scheduler builds a step from the running set in priority
- *   order and stable-sorts decode first, so the row a sequence
- *   occupies changes under it and a long-lived request inherits a retired one's keys.
+ *   The state slots are permuted and wider than the batch ({5, 0, 8, 3} of nine). The scheduler
+ *   reorders rows between steps, so a kernel indexing the tail by batch row reads another
+ *   sequence's keys.
  *
- *   THE RING IS 7 AND THE RATIO IS 4, so `q % ring` and `q % ratio` name different rows for every
- *   tail key in the fixture. A kernel that used `% ratio` passes a ring==ratio fixture and fails
- *   this one.
+ *   The ring is 7 and the ratio 4, so `q % ring` and `q % ratio` name different rows for every
+ *   tail key.
  *
- *   THE THREE-TOKEN PROMPT ENDS BEFORE ITS FIRST BLOCK DOES. A block bound taken with C's
- *   truncating division counts block 0 complete from position 0 and gathers a key past the end
- *   of the sequence; here that is a work item where the padding must say -1.
+ *   The three-token prompt: a block bound from truncating division would count block 0 complete
+ *   and gather a key past the sequence's end, where the padding must say -1.
  *
- * What is otherwise checked is every operand the block-key kernel will read: the page, the
- * first-token position, the `ratio` staged rows a block -- each against the source it should have
- * come from -- and that the slots past the real count say -1 rather than naming a page nobody
- * meant.
+ * Also checked: every operand the block-key kernel reads (page, first-token position, the `ratio`
+ * staged rows per block) against its source, and -1 in the slots past the real count.
  */
 static void qsa_work_case(const Plugin& pl) {
     const char* what = "qsa_work vs a host walk of a mixed prefill/decode batch";
@@ -9559,12 +9049,12 @@ static void qsa_work_case(const Plugin& pl) {
     const int64_t n = 32, ratio = 4, ring = 7, seqs = 4, btw = 64, slots = 9;
     const int32_t cuh[5] = { 0, 22, 25, 29, 32 };
     const int64_t NT = cuh[4];
-    /* NOT the batch rows, and wider than the batch -- see the header. */
+    /* Not the batch rows, and wider than the batch (see the header). */
     const int32_t sxh[4] = { 5, 0, 8, 3 };
-    /* Sequence 0 starts at 11 -- NOT a block boundary -- so its first complete block (indices
-     * 8..11) needs 8, 9 and 10 from the tail and only 11 from the chunk. Sequence 1 starts ON a
-     * boundary and needs none. Sequence 2 is a four-row speculative decode whose block takes two
-     * of each. Sequence 3 is positions 0..2, one short of its first block. */
+    /* Sequence 0 starts at 11, mid-block, so its first complete block (8..11) takes 8-10 from the
+     * tail and 11 from the chunk. Sequence 1 starts on a boundary. Sequence 2 is a four-row
+     * speculative decode whose block takes two of each. Sequence 3 is positions 0..2, one short of
+     * its first block. */
     const int64_t start[4] = { 11, 60, 130, 0 };
 
     std::vector<uint16_t> kh((size_t)(NT * n));
@@ -9575,8 +9065,7 @@ static void qsa_work_case(const Plugin& pl) {
             for (int64_t d = 0; d < n; ++d)
                 kh[(size_t)(t * n + d)] = h_to_bf16((float)((t * 31 + d * 17) % 89) / 23.0f);
         }
-    /* The tail pool, [slots][ring][n], and every slot holds something DIFFERENT: a kernel reading
-     * the wrong slot has to come back with the wrong bytes, not with bytes that happen to match. */
+    /* The tail pool, [slots][ring][n], every slot holding different values. */
     std::vector<uint16_t> th((size_t)(slots * ring * n));
     for (int64_t sl = 0; sl < slots; ++sl)
         for (int64_t row = 0; row < ring; ++row)
@@ -9649,9 +9138,8 @@ static void qsa_work_case(const Plugin& pl) {
     std::vector<int32_t> gnc((size_t)seqs);
     st_memcpy(gnc.data(), d_nc, gnc.size() * 4, hipMemcpyDeviceToHost);
 
-    /* COMPLETE BLOCKS A SEQUENCE, which the scorer and the selection read. It is (last position
-     * + 1) / ratio and not the number of blocks that completed THIS step -- a distinction worth a
-     * check, because the two are the same on a sequence that starts at zero and nothing else. */
+    /* Complete blocks per sequence, (last position + 1) / ratio, not the blocks completed this
+     * step (the two agree only for a sequence starting at zero). */
     bool nc_ok = true;
     for (int64_t s = 0; s < seqs; ++s) {
         const int32_t w2 = (int32_t)((ph[(size_t)(cuh[s + 1] - 1)] + 1) / ratio);
@@ -9678,11 +9166,10 @@ static void qsa_work_case(const Plugin& pl) {
                 if (gs[(size_t)((w * ratio + i) * n + d)] != src[(size_t)d]) key_ok = false;
         }
     }
-    /* UNDER M-RoPE, with the step's rotary planes: `bpos` is [work, 3], a block's components
-     * side by side. A block's first token in this step reads its own three; one committed
-     * earlier is text, at its index plus the shift the sequence's first row carries -- and the
-     * shift differs per sequence here, as it does after a picture, so a kernel that took one
-     * sequence's shift for another's is wrong. The components differ from each other too. */
+    /* Under M-RoPE, with the step's rotary planes: `bpos` is [work, 3]. A block whose first
+     * token is in this step reads that token's three components; one committed earlier is text,
+     * at its index plus the shift of the sequence's first row. Shifts differ per sequence (as
+     * after a picture), and the components differ from each other. */
     const int32_t shift[4] = { 0, -9, 17, 5 };
     std::vector<int32_t> rh((size_t)(3 * NT));
     for (int64_t s = 0; s < seqs; ++s)
@@ -9719,9 +9206,8 @@ static void qsa_work_case(const Plugin& pl) {
             if (g3[(size_t)(w * 3 + c)] != e) mc_ok = false;
         }
     }
-    /* And a pass WITHOUT the planes on the same buffer, as a text-only step hands it: the first
-     * column alone, [work, 1] at a row pitch of 3. Component 0 is written and the other two
-     * columns keep what they held. */
+    /* And a pass without the planes, as a text-only step: [work, 1] at a row pitch of 3.
+     * Component 0 is written; the other two columns keep their values. */
     st_memcpy(d_b3, sentinel.data(), sentinel.size() * 4, hipMemcpyHostToDevice);
     std::vector<RadTensor> tt = ts;
     RadTensor col = T(d_b3, RAD_I32, { W_, 1 });
@@ -9739,8 +9225,7 @@ static void qsa_work_case(const Plugin& pl) {
     std::printf("        M-RoPE: [work, 3] positions %s (%ld from committed text); one column at "
                 "pitch 3 %s\n", mc_ok ? "ok" : "NO", mc_text, col_ok ? "ok" : "NO");
 
-    /* The straddling block is what makes this a real test rather than a copy of the chunk, and
-     * `ring_differs` is what makes it a test of the RING rather than of the modulus. */
+    /* `from_tail` requires a straddling block, `ring_differs` that ring and ratio rows differ. */
     const bool pass = page_ok && pos_ok && key_ok && pad_ok && nc_ok && from_tail > 0 &&
                       ring_differs > 0 && !want.empty() && mc_ok && mc_text > 0 && col_ok;
     std::printf("        %zu blocks (%ld keys from the tail, %ld at a row the old modulus would "
@@ -9755,26 +9240,16 @@ static void qsa_work_case(const Plugin& pl) {
 
 /* qsa_tail_store, against a token-by-token loop.
  *
- * THE WHOLE CASE IS THE RACE. Positions p and p + ring share a row, so a prefill chunk carrying
- * many tokens a sequence has several tokens targeting one row -- and the kernel is allowed to
- * write only the last of them. The fixture therefore gives one sequence a long chunk, another a
- * short one, and a third a four-row speculative decode, and the oracle is the SERIAL loop: every
- * token in order, last writer wins. A kernel that wrote them all would agree with this on the
- * short and single cases and disagree on the long one, non-deterministically -- so the case also
- * runs twice and requires the same bytes.
+ * Positions p and p + ring share a row, so a long prefill chunk has several tokens per row and
+ * the kernel may write only the last. The fixture has a long chunk, a short one and a four-row
+ * speculative decode; the oracle is the serial loop (last writer wins). Writing every token would
+ * race on the long chunk, so the case also runs twice and requires identical bytes.
  *
- * TWO THINGS HERE ARE PINNED DELIBERATELY AND ARE NOT COVERAGE:
+ * Pinned on purpose: the state slots are permuted and wider than the batch ({5, 0, 8} of nine),
+ * since the row is step-local and the slot belongs to the sequence; and the ring is 7 with ratio
+ * 4, so `pos % ring` and `pos % ratio` disagree.
  *
- *   THE STATE SLOTS ARE PERMUTED AND WIDER THAN THE BATCH -- {5, 0, 8} out of nine -- so a kernel
- *   that indexed by the BATCH ROW writes slots 0, 1, 2 and the untouched-row count collapses.
- *   The row a sequence occupies is step-local; the slot is the sequence's for its life.
- *
- *   THE RING IS 7 AND THE RATIO IS 4. `pos % ring` and `pos % ratio` disagree for most of this
- *   fixture, so a kernel that used `% ratio` fails on the rows, and `ring` rows of a sequence's
- *   state are in play rather than four.
- *
- * The other thing it pins is that rows nothing targets KEEP WHAT THEY HELD. That is what makes
- * the tail a tail: at decode a handful of rows are written a step and the rest are the point.
+ * Rows nothing targets must keep their values.
  */
 static void qsa_tail_store_case(const Plugin& pl) {
     const char* what = "qsa_tail_store vs the serial last-writer-wins loop";
@@ -9786,9 +9261,7 @@ static void qsa_tail_store_case(const Plugin& pl) {
     const int32_t cuh[4] = { 0, 19, 22, 26 };
     const int64_t NT = cuh[3];
     const int32_t sxh[3] = { 5, 0, 8 };
-    /* Each sequence starts somewhere different, and NOT on a block boundary for two of them --
-     * `pos % ring` is the row and a fixture that only ever started at 0 would never see a
-     * sequence whose first token lands mid-block. */
+    /* Different starts, two of them mid-block, since `pos % ring` is the row. */
     const int64_t start[3] = { 40, 7, 131 };
 
     std::vector<uint16_t> kh((size_t)(NT * n));
@@ -9800,13 +9273,12 @@ static void qsa_tail_store_case(const Plugin& pl) {
                 kh[(size_t)(t * n + d)] = h_to_bf16((float)((t * 13 + d * 7) % 97) / 31.0f);
         }
 
-    /* The pool arrives holding something, and most of it must still hold it afterwards -- every
-     * row of every slot, including the six slots this batch does not name at all. */
+    /* A pre-filled pool; untargeted rows, including the six unnamed slots, must keep it. */
     std::vector<uint16_t> pre((size_t)(slots * ring * n));
     for (size_t i = 0; i < pre.size(); ++i) pre[i] = h_to_bf16(-3.5f - (float)(i % 5));
     std::vector<uint16_t> want = pre;
     for (int64_t s = 0; s < seqs; ++s)
-        for (int64_t t = cuh[s]; t < cuh[s + 1]; ++t) {          /* IN ORDER: last writer wins */
+        for (int64_t t = cuh[s]; t < cuh[s + 1]; ++t) {          /* in order: last writer wins */
             const int64_t row = ph[(size_t)t] % ring;
             for (int64_t d = 0; d < n; ++d)
                 want[(size_t)((sxh[s] * ring + row) * n + d)] = kh[(size_t)(t * n + d)];
@@ -9853,9 +9325,8 @@ static void qsa_tail_store_case(const Plugin& pl) {
         if (got[0][i] == pre[i]) ++kept;
         if (want[i] == pre[i]) ++kept_want;
     }
-    /* THE SLOTS THIS BATCH DOES NOT NAME MUST BE UNTOUCHED, and they are the ones a batch-row
-     * index would have walked straight into. Counted separately, because the aggregate above
-     * would still look plausible if three wrong slots were written and three right ones were not. */
+    /* Slots the batch does not name must be untouched; a batch-row index would write them.
+     * Counted separately from the aggregate above. */
     bool other_ok = true;
     for (int64_t sl = 0; sl < slots; ++sl) {
         bool named = false;
@@ -9879,22 +9350,14 @@ static void qsa_tail_store_case(const Plugin& pl) {
 
 /* sample_argmax, against a host scan.
  *
- * WHAT MAKES THIS WORTH A CASE IS THE TIE RULE AND THE TWO LOAD BODIES, not finding a maximum.
- * Greedy must break ties to the LOWEST token id -- that is what lets a greedy step and a top-1
- * step never disagree -- and the kernel gets it by packing (key, ~id) into one word, which is
- * right only if the packing is monotone in the key and ANTI-monotone in the id. A row whose
- * maximum occurs at four ids is the only input that can tell the two apart; a row of distinct
- * values passes either way.
+ * Checks the tie rule and both load bodies. Greedy breaks ties to the lowest token id (so greedy
+ * and top-1 agree); the kernel packs (key, ~id) into one word, monotone in the key and
+ * anti-monotone in the id. Each row's maximum occurs at four ids.
  *
- * The kernel also has two bodies: a float4 one when the row base AND the row pitch are 16-byte
- * aligned, and a scalar one when they are not. Both run here. `n_vocab` is deliberately not a
- * multiple of four, so the vector body also has a two-entry tail to pick up scalar-wise, and one
- * of the tied ids is inside that tail.
- *
- * THE PITCH IS THE THING THE ALIGNMENT TEST GETS WRONG IF IT ONLY LOOKS AT THE BASE: row m starts
- * at m * lg_ld floats, so with an odd pitch every row after the first is misaligned even though
- * the allocation is not. Pass 0 gives a pitch that is a multiple of four and pass 1 one that is
- * not, and both must produce the same answer.
+ * The float4 body runs when both row base and row pitch are 16-byte aligned, the scalar body
+ * otherwise. `n_vocab` is not a multiple of four, so the vector body has a two-entry scalar tail,
+ * which holds one of the tied ids. Pass 0's pitch is a multiple of four, pass 1's is not (every
+ * row after the first misaligned); both must give the same answer.
  */
 static void sample_argmax_case(const Plugin& pl) {
     const char* what = "sample_argmax vs a host scan, with ties and both load bodies";
@@ -9910,7 +9373,7 @@ static void sample_argmax_case(const Plugin& pl) {
             rs = rs * 1664525u + 1013904223u;
             rows[(size_t)m][(size_t)i] = (float)((int32_t)((rs >> 8) % 20001u) - 10000) * 0.001f;
         }
-        /* Four ids hold the maximum exactly; the last of them is in the vector body's tail. */
+        /* Four ids hold the maximum; the last is in the vector body's tail. */
         const int64_t ties[4] = { 7, V / 3, V - 6, V - 1 };
         for (int k = 0; k < 4; ++k) rows[(size_t)m][(size_t)ties[k]] = 11.0f + (float)m;
         want[(size_t)m] = (int32_t)ties[0];
@@ -9955,19 +9418,15 @@ static void sample_argmax_case(const Plugin& pl) {
 
 /* qsa_select, against a host sort of the same scores.
  *
- * WHAT MAKES THIS WORTH A CASE IS THE TIES AND THE TAIL, not the selection. A top-k is easy to get
- * right on distinct inputs and easy to get wrong on equal ones, and a block score is a sum of four
- * relus over a shared grid -- equal scores are ordinary, not pathological. So the fixture gives
- * the threshold value to more blocks than there are slots left, and the oracle is a full sort by
- * (score descending, index ascending), which is exactly the rule the kernel's two prefix counts
- * implement.
+ * Focused on ties and the tail. Block scores (sums of relus over a shared grid) tie often, so the
+ * fixture gives the threshold value to more blocks than there are slots left, and the oracle is a
+ * full sort by (score descending, index ascending), the rule the kernel's prefix counts implement.
  *
- * Four things are checked and three of them are not the answer itself:
- *   the SET matches a host sort
- *   the partial page is LAST, because that is what lets the attention's own causal bound mask
- *     inside it and nowhere else
- *   a page id of -1 inside the scored range is never selected, however good its score
- *   two runs produce byte-identical tables -- a top-k placed by atomics would not
+ * Checked:
+ *   the set matches a host sort;
+ *   the partial page is last, so the attention's causal bound masks inside it only;
+ *   a page id of -1 inside the scored range is never selected, whatever its score;
+ *   two runs give byte-identical tables (atomic placement would not).
  */
 static void qsa_select_case(const Plugin& pl) {
     const char* what = "qsa_select vs a host sort, with ties, a tail and a dead page";
@@ -9979,18 +9438,17 @@ static void qsa_select_case(const Plugin& pl) {
     std::vector<float>   sc((size_t)(M * nb), 0.0f);
     std::vector<int32_t> bt((size_t)(M * nb), -1), nc((size_t)M, 0);
     for (int64_t m = 0; m < M; ++m) {
-        /* Row 0 and 1 are shorter than topk -- the fast path, where everything live is selected.
-         * The rest run the radix. Rows alternate on whether a partial page exists. */
+        /* Rows 0 and 1 have at most topk live blocks (the fast path, all selected); the rest run
+         * the radix. Rows alternate on whether a partial page exists. */
         const int64_t live = (m == 0) ? 9 : (m == 1) ? topk : (100 + m * 137);
         nc[(size_t)m] = (int32_t)live;
         for (int64_t b = 0; b < nb; ++b) {
             const size_t i = (size_t)(m * nb + b);
             if (b < live) {
-                /* A COARSE GRID ON PURPOSE: 40 distinct values over hundreds of blocks puts many
-                 * blocks on the threshold exactly, which is the case the tie rule is for. */
+                /* A coarse grid: 40 values over hundreds of blocks puts many on the threshold. */
                 sc[i] = (float)((b * 17 + m * 7) % 40) * 0.25f;
                 bt[i] = (int32_t)((b * 31 + m * 11) % pages);
-                /* A DEAD PAGE WITH A WINNING SCORE, inside the scored range. */
+                /* A dead page with a winning score, inside the scored range. */
                 if (b == live / 3) { sc[i] = 1e6f; bt[i] = -1; }
             } else if (b == live) {
                 bt[i] = (m % 2 == 0) ? (int32_t)((m * 97 + 5) % pages) : -1;   /* the tail */
@@ -10029,9 +9487,8 @@ static void qsa_select_case(const Plugin& pl) {
         pos[(size_t)m] = (int32_t)(want_tail[(size_t)m] >= 0 ? live * ratio + (m % 3)
                                                              : live * ratio - 1);
     }
-    /* ONE QUERY A SEQUENCE: the decode shape, where `seq(m) == m` and each row's `nc` is its own.
-     * That is what the oracle above assumes, and it is deliberate -- the point of this case is the
-     * radix and the tie rule, not the join. qsa_select_prefill_case is the join. */
+    /* One query per sequence (decode shape, `seq(m) == m`), as the oracle assumes;
+     * qsa_select_prefill_case covers the join. */
     std::vector<int32_t> cuh((size_t)(M + 1));
     for (int64_t i = 0; i <= M; ++i) cuh[(size_t)i] = (int32_t)i;
 
@@ -10092,11 +9549,9 @@ static void qsa_select_case(const Plugin& pl) {
         std::sort(ref.begin(), ref.end());
         if (mine != ref) set_ok = false;
     }
-    /* THE CAUSAL BOUND THE ATTENTION WILL BE GIVEN. The flat KV is `nsel` pages of `ratio` with
-     * the partial page LAST, so the query sits at `(nsel-1)*ratio + pos%ratio` and the length is
-     * one past it. Checked here because it is the number that decides whether the sparse
-     * attention reads the query's own token and stops there -- and because it is an off-by-one
-     * away from reading tokens the query cannot see. */
+    /* The causal bound for the attention: the flat KV is `nsel` pages of `ratio`, partial page
+     * last, so the query sits at `(nsel-1)*ratio + pos%ratio` and the length is one past it. Off
+     * by one, the attention would skip the query's own token or read beyond it. */
     bool su_ok = true;
     for (int64_t m = 0; m < M; ++m) {
         const int32_t ns = gn[0][(size_t)m];
@@ -10115,19 +9570,15 @@ static void qsa_select_case(const Plugin& pl) {
                    " su=" + (su_ok ? "1" : "0") + " det=" + (det ? "1" : "0"));
 }
 
-/* qsa_select AT PREFILL: many queries over one history, each bounded by its own position.
+/* qsa_select at prefill: many queries over one history, each bounded by its own position.
  *
- * THIS IS THE CASE THE DECODE FIXTURE CANNOT REACH. There, one query a sequence makes the
- * sequence's complete-block count and the query's own the same number, and `bt[nc]` is the page
- * after the sequence's last -- which the KV manager leaves -1, so a partial page could never be
- * wrongly appended. Mid-CHUNK both of those stop being true at once: the sequence's count runs to
- * the end of the chunk while the query's runs to the query, and the page the query sits in is a
- * live one with LATER TOKENS OF THE SAME CHUNK in it. A selection that appended it and set
- * `seqused` past the query would attend to its own future, which is not a wrong ranking -- it is
- * a model that cheats, and it would show up as an implausibly good prefill and nothing else.
+ * At decode the sequence's complete-block count equals the query's and `bt[nc]` is -1. Mid-chunk,
+ * the sequence's count runs to the chunk's end while the query's runs to the query, and the query's
+ * page holds later tokens of the same chunk; appending it with `seqused` past the query would let
+ * the query attend to its own future (an implausibly good prefill).
  *
- * So the two things checked here are the per-query bound `n = min(nc[seq], (pos+1)/ratio)` and the
- * rule that the partial page exists exactly when `(pos + 1) % ratio != 0`.
+ * Checked: the per-query bound `n = min(nc[seq], (pos+1)/ratio)`, and that the partial page exists
+ * exactly when `(pos + 1) % ratio != 0`.
  */
 static void qsa_select_prefill_case(const Plugin& pl) {
     const char* what = "qsa_select at prefill: per-query bound and the partial-page rule";
@@ -10135,9 +9586,8 @@ static void qsa_select_prefill_case(const Plugin& pl) {
     if (!r) { ok(what, false, "row absent"); return; }
 
     const int64_t S = 2, nb = 96, topk = 5, pages = 512, ratio = 4;
-    /* Two chunks of different lengths over two histories, which is the ragged case the engine
-     * actually builds -- and it makes a query's row index and its position different numbers, so
-     * a kernel that confused them fails here rather than agreeing by accident. */
+    /* Two chunks of different lengths over two histories, as the engine builds them, so a query's
+     * row index and position differ. */
     const int64_t q0 = 9, q1 = 14, M = q0 + q1;
     const int64_t base[2] = { 137, 4 };          /* each sequence's first position in the chunk */
 
@@ -10146,19 +9596,19 @@ static void qsa_select_prefill_case(const Plugin& pl) {
     for (int64_t i = 0; i < q0; ++i) pos[(size_t)i] = (int32_t)(base[0] + i);
     for (int64_t i = 0; i < q1; ++i) pos[(size_t)(q0 + i)] = (int32_t)(base[1] + i);
 
-    /* `nc` is the SEQUENCE's count after the chunk: every block the chunk's last token completed. */
+    /* `nc` is the sequence's count after the chunk: every block its last token completed. */
     std::vector<int32_t> nc((size_t)S);
     nc[0] = (int32_t)((base[0] + q0) / ratio);
     nc[1] = (int32_t)((base[1] + q1) / ratio);
 
-    /* The table and the scores are per SEQUENCE and are the same for every query in it -- which is
-     * the whole point: the queries differ only in how much of the row they may see. */
+    /* The table and scores are per sequence, the same for every query in it; queries differ only
+     * in how much of the row they may see. */
     std::vector<float>   sc((size_t)(M * nb), 0.0f);
     std::vector<int32_t> bt((size_t)(S * nb), -1);
     for (int64_t s = 0; s < S; ++s)
         for (int64_t b = 0; b < nb; ++b)
-            /* Live up to and including the block the chunk's last token is IN, so `bt[n]` is a
-             * real page for every query that has a partial one. */
+            /* Live up to the block containing the chunk's last token, so `bt[n]` is a real page
+             * for every query with a partial one. */
             bt[(size_t)(s * nb + b)] =
                 b <= (base[s] + (s == 0 ? q0 : q1) - 1) / ratio ? (int32_t)((b * 29 + s * 7) % pages)
                                                                 : -1;
@@ -10244,8 +9694,8 @@ static void qsa_select_prefill_case(const Plugin& pl) {
         const int32_t want_su = want_n == 0 ? 0
                               : (int32_t)((want_n - 1) * ratio + (p % ratio) + 1);
         if (gs[(size_t)m] != want_su) su_ok = false;
-        /* THE PREDICATE THAT MATTERS: the flat KV the attention will walk is `nsel` pages of
-         * `ratio`, and `seqused` must not reach past the query's own token in the last one. */
+        /* The flat KV is `nsel` pages of `ratio`; `seqused` must not reach past the query's own
+         * token in the last one. */
         if (want_n > 0 && gs[(size_t)m] > (int32_t)((want_n - 1) * ratio + (p % ratio) + 1))
             future_ok = false;
     }
@@ -10260,12 +9710,11 @@ static void qsa_select_prefill_case(const Plugin& pl) {
                    " varied=" + (varied ? "1" : "0"));
 }
 
-/* qsa_select's WIDE-LAUNCH FORM against its single-workgroup form, byte for byte: the table, the
- * count and seqused. Two sequences, a hundred and twenty queries, each bounded by its own position
- * so some select from fewer blocks than topk; dead pages and -inf scores scattered through the
- * history; and five score distributions -- continuous, coarse with heavy ties, two packed into a
- * single first-digit bin, one small enough for the LDS list and one past it, which is the form's
- * fallback, and fine ties, where the sampled form's list is short and ends in a tie. */
+/* qsa_select's wide-launch form against its single-workgroup form, byte for byte: table, count
+ * and seqused. Two sequences, 120 queries each bounded by its own position (some below topk), dead
+ * pages and -inf scores scattered through the history, and five score distributions: continuous;
+ * coarse with heavy ties; two packed into one first-digit bin, one fitting the LDS list and one
+ * past it (the fallback); and fine ties, where the sampled list is short and ends in a tie. */
 static void qsa_select_wide_case(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "qsa_select_i32");
     if (!r || !pl.pin_qsel) { ok("qsa_select wide form", false, "row or hook absent"); return; }
@@ -10295,13 +9744,13 @@ static void qsa_select_wide_case(const Plugin& pl) {
             switch (dist) {
                 case 0: v = (float)(u % 1000003) / 1000.0f; break;
                 case 1: v = (float)(u % 23) * 0.25f; break;
-                /* 1.0 to 1.06 is one bin of the first digit, whose bins are 1/16 of an octave;
-                 * a few thousand of those sit in it, then the whole history. */
+                /* 1.0 to 1.06 is one first-digit bin (1/16 of an octave); a few thousand scores
+                 * fall in it. */
                 case 2: v = (u % 8 == 0) ? 1.0f + (float)(u % 60000) * 1e-6f
                                          : (float)(u % 1000) / 2000.0f; break;
                 case 3: v = 1.0f + (float)(u % 60000) * 1e-6f; break;
-                /* ~5000 distinct scores a few times each: the sampled form's list is short and
-                 * the threshold is a tie, which is the case its emit has to place exactly. */
+                /* ~5000 distinct scores, a few times each: the sampled list is short and the
+                 * threshold is a tie. */
                 default: v = (float)(u % 4999) * 0.01f; break;
             }
         }
@@ -10357,32 +9806,26 @@ static void qsa_select_wide_case(const Plugin& pl) {
     }
 }
 
-/* qsa_select WITH THE BLOCK LIST SPLIT ACROSS THE DEVICE, against the same launch unsplit.
+/* qsa_select with the block list split across the device, against the same launch unsplit.
  *
- * WHY IT SPLITS. One workgroup a query is 6% of the device and the whole of the kernel at length,
- * so the launcher cuts the list into chunks, takes each chunk's own top-k, and merges -- which is
- * exact because a chunk's local top-k contains every global top-k member of that chunk (the proof
- * is above the split in r4d_qsa_select_bf16.hip). "Exact" here means BIT-IDENTICAL, not equivalent:
- * the selection decides which keys the attention reads, so a set that differed by one block on a
- * tie would be a different model.
+ * One workgroup per query uses 6% of the device, so the launcher splits the block list into
+ * chunks, takes each chunk's top-k and merges. That is exact because a chunk's local top-k holds
+ * every global top-k member in it (proof above the split in r4d_qsa_select_bf16.hip), and the
+ * result must be bit-identical.
  *
- * THE TWO FORMS ARE THE SAME LAUNCH WITH AND WITHOUT SCRATCH, which is what makes this a test of
- * the split rather than of a second oracle: the launcher falls back to the single-workgroup kernel
- * when the arena is absent, so withholding it selects that form. A fixture that never crossed the
- * chunk threshold would pass while testing nothing, so `nb` is over four thousand -- and the
- * scores are drawn from a SMALL SET so that ties are everywhere, because the tie rule (lowest
- * block index first, by prefix count) is the part a split can get wrong without being obviously
- * wrong. */
+ * The two forms are the same launch with and without scratch: without the arena the launcher falls
+ * back to the single-workgroup kernel. `nb` is over four thousand so the chunk threshold is
+ * crossed, and the scores come from a small set so ties (lowest block index first, by prefix
+ * count) are everywhere. */
 static void qsa_select_split_one(const Plugin& pl, const char* what, int64_t S, int64_t per) {
     const RadKernelInfo* r = find(pl, "qsa_select_i32");
     if (!r) { ok(what, false, "row absent"); return; }
 
     const int64_t M = S * per, nb = 20001, topk = 512, ratio = 4, pages = 8192;
     std::vector<float>   sc((size_t)(M * nb));
-    /* ONE TABLE A SEQUENCE AND A DIFFERENT LIVE COUNT ON EACH, because the chunk pass reads both
-     * off the SEQUENCE while its grid is indexed by the QUERY -- a fixture with one sequence would
-     * never catch a `seq` that came from the wrong side of that join. At decode a sequence
-     * contributes exactly `1 + n_spec` query rows, which is what `per` is. */
+    /* One table per sequence with different live counts: the chunk pass reads both per sequence
+     * while its grid is indexed by query. `per` is a sequence's query rows (`1 + n_spec` at
+     * decode). */
     std::vector<int32_t> bt((size_t)(S * nb)), nc((size_t)S), pos((size_t)M),
                          cuh((size_t)(S + 1));
     const int64_t n = 19000;
@@ -10397,8 +9840,7 @@ static void qsa_select_split_one(const Plugin& pl, const char* what, int64_t S, 
             pos[(size_t)(s * per + j)] = (int32_t)(ns * ratio + j - 2);
     }
     cuh[(size_t)S] = (int32_t)M;
-    /* Only 96 distinct scores over 19000 blocks, so the threshold bin is thousands deep and the
-     * answer is decided by the tie rule rather than by the radix. */
+    /* Only 96 distinct scores over 19000 blocks, so the tie rule decides the answer. */
     for (int64_t m = 0; m < M; ++m)
         for (int64_t b = 0; b < nb; ++b)
             sc[(size_t)(m * nb + b)] = (float)(((b * 31 + m * 17) % 96)) * 0.125f;
@@ -10452,14 +9894,12 @@ static void qsa_select_split_one(const Plugin& pl, const char* what, int64_t S, 
         st_memcpy(su[pass].data(), d_su, su[pass].size() * 4, hipMemcpyDeviceToHost);
     }
 
-    /* THE TWO RUNS HAVE TO HAVE TAKEN DIFFERENT FORMS. Without the scratch hook the launcher takes
-     * the fallback in both, and three identical runs would then prove nothing at all. */
+    /* The runs must take different forms: without the scratch hook all would be the fallback. */
     const bool split_ran = need > 0;
     const bool same = se[0] == se[2] && ns[0] == ns[2] && su[0] == su[2];
     const bool det  = se[0] == se[1] && ns[0] == ns[1] && su[0] == su[1];
-    /* A SET COMPARISON BESIDE THE BYTE ONE, because the two fail for different reasons: a wrong
-     * SET is a wrong selection, and a right set in a different ORDER is a table the attention sums
-     * in another order -- different text, same model. Reporting them apart is what says which. */
+    /* A set comparison beside the byte one: a wrong set is a wrong selection, while a right set in
+     * another order changes only the attention's summation order. */
     bool set_ok = true;
     long slots = 0;
     long long first = -1;
@@ -10487,18 +9927,179 @@ static void qsa_select_split_one(const Plugin& pl, const char* what, int64_t S, 
                    " same=" + (same ? "1" : "0") + " det=" + (det ? "1" : "0"));
 }
 
+/* qsa_select over more than topk blocks with topk or fewer live, in every form, against libref's
+ * rule byte for byte: the table (sentinel-filled before each launch, so a slot the kernel leaves
+ * alone shows), the count and seqused.
+ *
+ * With topk or fewer live (dead pages, -inf scores), every live block is taken in block order and
+ * the count says how many. The radix's first digit is the only one that sees every live key; a
+ * later digit run on too few would narrow into bin 0, where a score of exactly zero lives, and
+ * tie on it. Each row below is one way in:
+ *   0  few live pages, continuous scores           1  few live, most of them scoring zero or less
+ *   2  live pages, most scores -inf                3  exactly topk live, a third tied at zero
+ *   4  all live keys in the first chunk, more than topk, ties at the threshold (the split merge
+ *      sees exactly topk candidates and must still put the ties last)
+ *   5  nothing live                                6  at most topk blocks (control)
+ *   7  everything live (control)
+ * -0.0 scores are planted in rows 1 and 4: libref ranks them as zero. */
+static void qsa_select_few_live_case(const Plugin& pl) {
+    const char* what = "qsa_select with topk or fewer live blocks, every form vs libref's rule";
+    const RadKernelInfo* r = find(pl, "qsa_select_i32");
+    if (!r || !pl.pin_qsel) { ok(what, false, "row or hook absent"); return; }
+
+    const int64_t S = 8, M = S, nb = 9000, topk = 512, ratio = 4, pages = 1 << 20;
+    const int64_t nrow[S] = { 8000, 8000, 8000, 8000, 2000, 8000, 300, 8000 };
+    std::vector<float>   sc((size_t)(M * nb), -INFINITY);
+    std::vector<int32_t> bt((size_t)(S * nb), -1), nc((size_t)S), pos((size_t)M),
+                         cuh((size_t)(S + 1));
+    uint64_t x = 0x9E3779B97F4A7C15ull;
+    auto rnd = [&]() { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; };
+    for (int64_t s = 0; s < S; ++s) {
+        const int64_t n = nrow[s];
+        nc[(size_t)s] = (int32_t)n;
+        cuh[(size_t)s] = (int32_t)s;
+        pos[(size_t)s] = (int32_t)(n * ratio + (s % 3));        /* mid-block: a partial page */
+        for (int64_t b = 0; b < n; ++b) {
+            float*   v  = &sc[(size_t)(s * nb + b)];
+            int32_t* pg = &bt[(size_t)(s * nb + b)];
+            const uint64_t u = rnd();
+            const float cont = (float)(u % 1000003) / 1000.0f + 0.001f;
+            *pg = (int32_t)(u % pages);
+            switch (s) {
+                case 0: if (b % 80 != 3) *pg = -1; *v = cont; break;             /* 100 live */
+                /* 400 live, three in four scoring zero or less: more zeros than the slots the
+                 * live keys leave, so a radix that kept narrowing past the first digit would
+                 * find a "threshold" among them. */
+                case 1: if (b % 20 != 7) *pg = -1;
+                        *v = (b / 20) % 4 == 0 ? cont
+                           : (b / 20) % 3 == 0 ? -2.5f : (b / 20) % 3 == 1 ? -0.0f : 0.0f;
+                        break;
+                case 2: *v = (b % 40 == 1) ? cont : -INFINITY; break;            /* 200 live */
+                case 3: if (b % 15 != 2 || b >= 15 * 512) *pg = -1;              /* 512 live */
+                        *v = (b % 45 == 2) ? 0.0f : cont; break;
+                case 4: *v = (b % 7 == 0) ? cont : (b % 2 ? 0.0f : -0.0f); break;
+                case 5: *pg = -1; *v = cont; break;
+                case 6: if (b % 9 == 4) *pg = -1; *v = (float)(u % 13) * 0.5f; break;
+                default: *v = cont; break;
+            }
+        }
+        bt[(size_t)(s * nb + n)] = (s % 2 == 0) ? (int32_t)(rnd() % pages) : -1;  /* the tail */
+    }
+    cuh[(size_t)S] = (int32_t)M;
+
+    /* libref's rule (ref_qsa_select): every live block when topk or fewer are live, else the
+     * blocks above the topk-th largest value in block order, then its ties in block order. */
+    std::vector<int32_t> want((size_t)(M * (topk + 1)), -1), want_n((size_t)M), want_su((size_t)M);
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t n = nrow[m];
+        std::vector<int64_t> live;
+        std::vector<float> val((size_t)n, 0.0f);
+        for (int64_t b = 0; b < n; ++b) {
+            const float v = sc[(size_t)(m * nb + b)];
+            if (bt[(size_t)(m * nb + b)] < 0 || !(v > -1e30f)) continue;
+            val[(size_t)b] = v > 0.0f ? v : 0.0f;
+            live.push_back(b);
+        }
+        std::vector<int64_t> take;
+        if ((int64_t)live.size() <= topk) {
+            take = live;
+        } else {
+            std::vector<float> ord;
+            for (int64_t b : live) ord.push_back(val[(size_t)b]);
+            std::nth_element(ord.begin(), ord.begin() + (topk - 1), ord.end(),
+                             [](float l, float r) { return l > r; });
+            const float thr = ord[(size_t)(topk - 1)];
+            for (int64_t b : live) if (val[(size_t)b] > thr) take.push_back(b);
+            for (int64_t b : live)
+                if ((int64_t)take.size() < topk && val[(size_t)b] == thr) take.push_back(b);
+        }
+        int32_t* row = &want[(size_t)(m * (topk + 1))];
+        int64_t out = 0;
+        for (int64_t b : take) row[out++] = bt[(size_t)(m * nb + b)];
+        const int32_t part = (n < nb && (pos[(size_t)m] + 1) % ratio != 0)
+                           ? bt[(size_t)(m * nb + n)] : -1;
+        if (part >= 0) row[out++] = part;
+        want_n[(size_t)m] = (int32_t)out;
+        want_su[(size_t)m] = out == 0 ? 0
+                           : (int32_t)((out - 1) * ratio + pos[(size_t)m] % ratio + 1);
+    }
+
+    void* d_sc = dalloc(sc.size() * 4);
+    void* d_bt = dalloc(bt.size() * 4);
+    void* d_nc = dalloc(nc.size() * 4);
+    void* d_po = dalloc(pos.size() * 4);
+    void* d_cu = dalloc(cuh.size() * 4);
+    void* d_se = dalloc((size_t)(M * (topk + 1)) * 4);
+    void* d_ns = dalloc((size_t)M * 4);
+    void* d_su = dalloc((size_t)M * 4);
+    if (!d_sc || !d_bt || !d_nc || !d_po || !d_cu || !d_se || !d_ns || !d_su) {
+        ok(what, false, "alloc failed"); return;
+    }
+    st_memcpy(d_sc, sc.data(), sc.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_bt, bt.data(), bt.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_nc, nc.data(), nc.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_po, pos.data(), pos.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_cu, cuh.data(), cuh.size() * 4, hipMemcpyHostToDevice);
+    std::vector<RadTensor> ts = {
+        T(d_sc, RAD_F32, { M, nb }), T(d_bt, RAD_I32, { S, nb }), T(d_nc, RAD_I32, { S }),
+        T(d_po, RAD_I32, { M }),     T(d_cu, RAD_I32, { S + 1 }),
+        T(d_se, RAD_I32, { M, topk + 1 }), T(d_ns, RAD_I32, { M }), T(d_su, RAD_I32, { M }) };
+    std::vector<RadParam> ps = { PI("M", M), PI("blocks", nb), PI("topk", topk),
+                                 PI("ratio", ratio), PI("seqs", S) };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    const int64_t need = r->scratch ? r->scratch(&a) : 0;
+    void* d_sk = need > 0 ? dalloc((size_t)need) : nullptr;
+    if (need <= 0 || !d_sk) { ok(what, false, "the split path's scratch is unavailable"); return; }
+
+    static const char* const kForm[] = { "single workgroup", "wide", "split" };
+    for (int f = 0; f < 3; ++f) {
+        a.scratch       = f == 2 ? d_sk : nullptr;
+        a.scratch_bytes = f == 2 ? need : 0;
+        st_memset(d_se, 0x55, (size_t)(M * (topk + 1)) * 4);
+        st_memset(d_ns, 0x55, (size_t)M * 4);
+        st_memset(d_su, 0x55, (size_t)M * 4);
+        pl.pin_qsel(f == 2 ? 0 : f + 1);
+        const int rc = r->launch(&a, nullptr);
+        pl.pin_qsel(0);
+        if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+            ok(fmt("%s: the %s form is served", what, kForm[f]).c_str(), false, fmt("rc=%d", rc));
+            continue;
+        }
+        std::vector<int32_t> se((size_t)(M * (topk + 1))), ns((size_t)M), su((size_t)M);
+        st_memcpy(se.data(), d_se, se.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(ns.data(), d_ns, ns.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(su.data(), d_su, su.size() * 4, hipMemcpyDeviceToHost);
+        std::string bad;
+        for (int64_t m = 0; m < M; ++m) {
+            int64_t diff = 0, first = -1;
+            for (int64_t i = 0; i <= topk; ++i)
+                if (se[(size_t)(m * (topk + 1) + i)] != want[(size_t)(m * (topk + 1) + i)]) {
+                    ++diff;
+                    if (first < 0) first = i;
+                }
+            if (diff || ns[(size_t)m] != want_n[(size_t)m] || su[(size_t)m] != want_su[(size_t)m])
+                bad += fmt(" row %lld: nsel %d (want %d), %lld slot(s) differ from %lld;",
+                           (long long)m, ns[(size_t)m], want_n[(size_t)m], (long long)diff,
+                           (long long)first);
+        }
+        ok(fmt("%s: the %s form", what, kForm[f]).c_str(), bad.empty(),
+           bad.empty() ? std::string("8 rows exact") : bad);
+    }
+}
+
 /* qsa_score, against an f64 evaluation of the same formula.
  *
- * TWO CONTROLS, AND BOTH ARE ORDERING MISTAKES A READER MAKES rather than transcription slips.
+ * Two controls:
  *
- *   sum-then-relu instead of relu-then-sum. Arithmetically it is one line either way and both
- *   rank blocks plausibly; it is a different model. Measured here at a rel_l2 of order one.
+ *   sum-then-relu instead of relu-then-sum: both rank blocks plausibly, but it is a different
+ *   model (rel_l2 of order one).
  *
- *   a padded table entry scoring ZERO instead of -inf. A real score can be zero -- every head
- *   vetoed the block -- so this is the mistake that makes padding outrank a block the model
- *   deliberately ignored, and it is invisible in the scores themselves. The case checks the
- *   padding lanes directly rather than through an l2, because an l2 over a mostly-live row
- *   drowns them.
+ *   a padded entry scoring zero instead of -inf: a real score can be zero, so padding would
+ *   outrank blocks every head rejected. The padding lanes are checked directly, since an l2 over
+ *   a mostly live row would hide them.
  */
 static void qsa_score_case(const Plugin& pl) {
     const char* what = "qsa_score vs an f64 evaluation of the same formula";
@@ -10513,8 +10114,8 @@ static void qsa_score_case(const Plugin& pl) {
         qh[(size_t)i] = h_to_bf16((float)(((i * 29 + 7) % 83) - 41) / 47.0f);
     for (int64_t i = 0; i < pages * n; ++i)
         bkh[(size_t)i] = h_to_bf16((float)(((i * 41 + 13) % 71) - 35) / 39.0f);
-    /* A scattered table with real padding at the end of every row, which is what a sequence
-     * shorter than the declared width actually produces. */
+    /* A scattered table with padding at the end of every row, as a sequence shorter than the
+     * declared width produces. */
     for (int64_t m = 0; m < M; ++m) {
         const int64_t live = nb - 3 - m * 4;
         for (int64_t b = 0; b < nb; ++b)
@@ -10533,7 +10134,7 @@ static void qsa_score_case(const Plugin& pl) {
                 for (int64_t j = 0; j < n; ++j)
                     d += (double)h_bf16(qh[(size_t)((m * heads + h) * n + j)]) *
                          (double)h_bf16(bkh[(size_t)(p * n + j)]);
-                s += d > 0.0 ? d : 0.0;     /* relu per (block, head), THEN the head sum */
+                s += d > 0.0 ? d : 0.0;     /* relu per (block, head), then the head sum */
                 raw += d;                   /* the control: sum first, clamp after */
             }
             const double inv = 1.0 / std::sqrt((double)n);
@@ -10541,10 +10142,8 @@ static void qsa_score_case(const Plugin& pl) {
             sumrelu[(size_t)(m * nb + b)] = (raw > 0.0 ? raw : 0.0) * inv;
         }
 
-    /* ONE QUERY A SEQUENCE, which is the decode shape and makes `seq(m) == m` -- so the oracle
-     * above, which treats `m` as the sequence, describes what the kernel computes. The
-     * prefill shape (many queries over one history) is qsa_select_prefill_case's job, because it
-     * is the SELECTION that has to bound each query separately. */
+    /* One query per sequence (decode shape, `seq(m) == m`), as the oracle assumes. Many queries
+     * per history are covered by qsa_score_rows_case and qsa_select_prefill_case. */
     std::vector<int32_t> cuh((size_t)(M + 1)), nch((size_t)M, (int32_t)nb);
     for (int64_t i = 0; i <= M; ++i) cuh[(size_t)i] = (int32_t)i;
 
@@ -10583,8 +10182,7 @@ static void qsa_score_case(const Plugin& pl) {
     std::vector<float> got((size_t)(M * nb));
     st_memcpy(got.data(), d_o, got.size() * 4, hipMemcpyDeviceToHost);
 
-    /* The l2 is over the LIVE entries only; the padding is checked as a predicate, because an l2
-     * that mixed -inf with real scores is not a number. */
+    /* The l2 covers live entries only; the padding (-inf) is checked as a predicate. */
     auto rel = [&](const std::vector<double>& ref) {
         double num = 0.0, den = 0.0;
         for (size_t i = 0; i < ref.size(); ++i) {
@@ -10607,14 +10205,12 @@ static void qsa_score_case(const Plugin& pl) {
                    ", padding " + std::to_string(pad_ninf) + "/" + std::to_string(pad));
 }
 
-/* qsa_score over SEQUENCES OF MANY ROWS, against the same f64 formula.
+/* qsa_score over sequences of many rows, against the same f64 formula.
  *
- * The case above is one row a sequence, the decode shape. A prefill chunk is many rows over one
- * history, and in a mixed step the chunk sits beside other sequences' decode rows, so a 16-row
- * query tile can hold the end of one sequence and the start of the next. Rows {7, 20, 5}: the
- * second sequence starts inside the first tile and ends inside the second, and each sequence has
- * its own table row with its own padding and its own live count. The control is scoring every row
- * against sequence 0's table -- what a tile that forgot to split at the boundary would do. */
+ * In a mixed step a 16-row query tile can hold the end of one sequence and the start of the next.
+ * Rows {7, 20, 5}: the second sequence starts inside the first tile and ends inside the second,
+ * and each sequence has its own table row, padding and live count. The control scores every row
+ * against sequence 0's table, as a tile that ignored the boundary would. */
 static void qsa_score_rows_case(const Plugin& pl) {
     const char* what = "qsa_score, three sequences of 7, 20 and 5 rows, vs f64";
     const RadKernelInfo* r = find(pl, "qsa_score_bf16");
@@ -10634,7 +10230,7 @@ static void qsa_score_rows_case(const Plugin& pl) {
     std::vector<int32_t> bth((size_t)(S * nb));
     for (int64_t sq = 0; sq < S; ++sq) {
         const int64_t live = nb - 2 - sq * 9;
-        nch[(size_t)sq] = (int32_t)(live - 1);           /* one table entry past the live count */
+        nch[(size_t)sq] = (int32_t)(live - 1);           /* the table has one entry past nc */
         for (int64_t b = 0; b < nb; ++b)
             bth[(size_t)(sq * nb + b)] =
                 b < live && (b % 11) != 4 ? (int32_t)((b * 17 + sq * 7) % pages) : -1;
@@ -10665,7 +10261,7 @@ static void qsa_score_rows_case(const Plugin& pl) {
     st_memcpy(d_bt, bth.data(), bth.size() * 4, hipMemcpyHostToDevice);
     st_memcpy(d_cu, cuh.data(), cuh.size() * 4, hipMemcpyHostToDevice);
     st_memcpy(d_nc, nch.data(), nch.size() * 4, hipMemcpyHostToDevice);
-    /* A sentinel in every entry, so a store past a sequence's live count is caught. */
+    /* A sentinel in every entry catches a store past a sequence's live count. */
     std::vector<float> sentinel((size_t)(M * nb), 12345.0f);
     st_memcpy(d_o, sentinel.data(), sentinel.size() * 4, hipMemcpyHostToDevice);
 
@@ -10712,16 +10308,13 @@ static void qsa_score_rows_case(const Plugin& pl) {
 
 /* qsa_block_key, against an f64 evaluation of the same formula.
  *
- * THE ROUNDING POINT IS THE PART WORTH TESTING. The reference pools in f32 and rounds to bf16
- * BEFORE the norm reads it; carrying f32 straight through is the convenient order and a different
- * number. So this builds BOTH oracles and reports how far apart they are, which is what says the
- * decision is load-bearing rather than pedantry -- and then checks the kernel against the right
- * one.
+ * The reference pools in f32 and rounds to bf16 before the norm; carrying f32 through gives a
+ * different number. Both oracles are built and their distance reported, and the kernel is checked
+ * against the rounding one.
  *
- * The negative control is the POSITION. `pos0` off by the ratio rotates every block key by one
- * block's worth of angle, which is the mistake a reader makes when they take the position of the
- * block's LAST token instead of its first, and it is invisible in magnitude: the vectors stay the
- * same length and point somewhere else. rel_l2 is what sees it. */
+ * The negative control is the position: `pos0` off by the ratio (the block's last token instead of
+ * its first) rotates every key by one block's angle, invisible in magnitude but caught by
+ * rel_l2. */
 static void qsa_block_key_case(const Plugin& pl) {
     const char* what = "qsa_block_key vs an f64 evaluation of the same formula";
     const RadKernelInfo* r = find(pl, "qsa_block_key_bf16");
@@ -10735,12 +10328,12 @@ static void qsa_block_key_case(const Plugin& pl) {
     for (int64_t i = 0; i < M * ratio; ++i)
         for (int64_t d = 0; d < n; ++d) {
             float v = (float)(((i * 37 + d * 11) % 97) - 48) / 53.0f;
-            if (d % 31 == 0) v *= 5.0f;         /* outlier channels, as a real key has */
+            if (d % 31 == 0) v *= 5.0f;         /* outlier channels, as in a real key */
             kh[(size_t)(i * n + d)] = h_to_bf16(v);
         }
     for (int64_t d = 0; d < n; ++d) wh[(size_t)d] = 0.1f + (float)((d * 7) % 13) / 40.0f;
 
-    /* `round_mean` false is the convenient order the reference does NOT take. */
+    /* `round_mean` false is the order the reference does not take. */
     auto oracle = [&](bool round_mean, int64_t p0, std::vector<double>* out) {
         out->assign((size_t)(M * n), 0.0);
         std::vector<double> v((size_t)n);
@@ -10786,9 +10379,8 @@ static void qsa_block_key_case(const Plugin& pl) {
     st_memcpy(d_k, kh.data(), kh.size() * 2, hipMemcpyHostToDevice);
     st_memcpy(d_w, wh.data(), wh.size() * 4, hipMemcpyHostToDevice);
 
-    /* `page` ABSENT, which is one entry with a null pointer and NOT a shorter list -- operands are
-     * positional, so a three-entry list would hand `out` to `page` and the shim would refuse. The
-     * scattered form is the pass below. */
+    /* `page` absent: an entry with a null pointer, not a shorter list (operands are positional).
+     * The scattered form is the pass below. */
     std::vector<RadTensor> ts = {
         T(d_k, RAD_BF16, { M * ratio, n }),
         T(d_w, RAD_F32,  { n }),
@@ -10812,11 +10404,9 @@ static void qsa_block_key_case(const Plugin& pl) {
     std::vector<uint16_t> got((size_t)(M * n));
     st_memcpy(got.data(), d_o, got.size() * 2, hipMemcpyDeviceToHost);
 
-    /* THE SCATTERED FORM, which is the one the engine uses: a page list sends block b to page
-     * `pg[b]` of a store as tall as the POOL, and a -1 says the block has no page and must not be
-     * written anywhere. Same arithmetic, so the same oracle holds -- what is under test is that
-     * the destination moved and the block count came off the PAGE LIST and not off `out`, which
-     * is taller than the launch. */
+    /* The scattered form the engine uses: a page list sends block b to page `pg[b]` of a store as
+     * tall as the pool, and -1 means no page (nothing written). Same oracle; under test are the
+     * destination and that the block count comes from the page list, not from the taller `out`. */
     const int64_t store = M * 3 + 11;
     std::vector<int32_t> pg((size_t)M);
     for (int64_t b = 0; b < M; ++b)
@@ -10851,17 +10441,14 @@ static void qsa_block_key_case(const Plugin& pl) {
         for (int64_t b = 0; b < M; ++b) if (pg[(size_t)b] == (int32_t)p) named = true;
         if (!named && got2[(size_t)(p * n)] == h_to_bf16(-7.0f)) ++untouched;
     }
-    /* Every page nothing named must still hold the fill, INCLUDING the one the -1 block would have
-     * landed on if the guard were missing. */
+    /* Every unnamed page must still hold the fill, including where the -1 block would land if the
+     * guard were missing. */
     const bool scatter_clean = scatter_ok && untouched == store - (M - 1);
 
-    /* THE WORK-LIST FORM. `pos` given, the same positions the tiling would have produced but
-     * handed over one at a time and in a SHUFFLED block order -- which is what a decode step
-     * looks like, where the blocks completing in one launch belong to different sequences. The
-     * answer for block b must be the answer the tiled form gave for whichever block holds those
-     * positions, so the fixture permutes the POSITIONS and checks against the permuted oracle.
-     * Reading the same keys at a different position is the exact mistake this catches, and the
-     * pos0 control above shows it is worth 5.8e-01 of error. */
+    /* The work-list form: `pos` given per block in shuffled order, as at decode, where the blocks
+     * completing in one launch belong to different sequences. The positions are permuted and each
+     * block is checked against the oracle at its permuted position, catching keys read at the wrong
+     * position. */
     std::vector<int32_t> bpos((size_t)M);
     std::vector<int64_t> perm((size_t)M);
     for (int64_t b = 0; b < M; ++b) perm[(size_t)b] = (b * 5 + 2) % M;
@@ -10884,8 +10471,8 @@ static void qsa_block_key_case(const Plugin& pl) {
     std::vector<uint16_t> got3((size_t)(M * n));
     st_memcpy(got3.data(), d_o3, got3.size() * 2, hipMemcpyDeviceToHost);
     {
-        /* Block b read rows [b*ratio, (b+1)*ratio) as before -- only the ANGLE moved -- so the
-         * oracle is the one built at the permuted position for the same keys. */
+        /* Block b reads rows [b*ratio, (b+1)*ratio) as before and only the angle moves, so the
+         * oracle is built at the permuted position for the same keys. */
         std::vector<double> wantp;
         oracle(true, pos0, &wantp);          /* shape only; recomputed per block below */
         for (int64_t b = 0; b < M && list_ok; ++b) {
@@ -10900,11 +10487,10 @@ static void qsa_block_key_case(const Plugin& pl) {
         }
     }
 
-    /* UNDER M-RoPE: `mode` imrope with Qwen3.8's sections, and each block's three components
-     * side by side in a [M, 3] view of a buffer with a row pitch of 4 -- so a kernel that took
-     * the view as dense reads the wrong block's components. Frequency i reads H when i % 3 == 1
-     * and i < 33, W when i % 3 == 2 and i < 30, and T otherwise; every component differs, so a
-     * frequency that read the wrong one is off by at least one position's angle. */
+    /* Under M-RoPE: `mode` imrope with Qwen3.8's sections, each block's three components in an
+     * [M, 3] view of a buffer with row pitch 4 (a dense reading picks the wrong block). Frequency i
+     * reads H when i % 3 == 1 and i < 33, W when i % 3 == 2 and i < 30, T otherwise; the components
+     * all differ, so a wrong component shows. */
     const int64_t pitch = 4;
     std::vector<int32_t> b4((size_t)(M * pitch), -1);
     for (int64_t b = 0; b < M; ++b) {
@@ -10937,8 +10523,8 @@ static void qsa_block_key_case(const Plugin& pl) {
     st_memcpy(got4.data(), d_o4, got4.size() * 2, hipMemcpyDeviceToHost);
     double mr_num = 0.0, mr_den = 0.0, mr_t = 0.0;
     for (int64_t b = 0; b < M && mrope_ok; ++b) {
-        /* The one-component oracle at each component's position, and per frequency the one the
-         * interleave names. */
+        /* The one-component oracle at each component's position; per frequency, the interleave
+         * picks one. */
         std::vector<double> oc[3];
         for (int c = 0; c < 3; ++c) {
             std::vector<double> full;
@@ -10957,8 +10543,8 @@ static void qsa_block_key_case(const Plugin& pl) {
     }
     const double r_mr = mr_den > 0.0 ? std::sqrt(mr_num / mr_den) : -1.0;
     const double r_mr_t = mr_den > 0.0 ? std::sqrt(mr_t / mr_den) : -1.0;
-    /* The same buffer's FIRST COLUMN, as a text-only step hands it: the one-component form,
-     * which must be the tiled answer bit for bit, since column 0 holds exactly the tiling. */
+    /* The same buffer's first column, as a text-only step passes it: must equal the tiled answer
+     * bit for bit, since column 0 holds the tiling. */
     RadTensor b1v = T(d_b4, RAD_I32, { M, 1 });
     b1v.stride[0] = pitch;
     ts4[3] = b1v;
@@ -10986,19 +10572,11 @@ static void qsa_block_key_case(const Plugin& pl) {
     sep = den > 0.0 ? std::sqrt(sep / den) : -1.0;
 
     const double r_ok = rel(want), r_shift = rel(shifted), r_unr = rel(unrounded);
-    /* 0.01 is the bf16 STORE and nothing tighter is available: the output is bf16, so a correct
-     * kernel lands within the grid's own spacing of the exact answer -- 1.7e-03 measured, against
-     * 2^-9 = 2.0e-03 of grid. Two controls give that bar its meaning.
-     *
-     * The POSITION control is the loud one: off by one block it measures 5.8e-01, three hundred
-     * times worse, because a wrong rope angle leaves the vector's length alone and only moves
-     * where it points.
-     *
-     * The ROUNDING control is the quiet one and it is the reason this case exists. The kernel
-     * must be closer to the order that rounds the pooled mean to bf16 before the norm than to the
-     * order that does not -- 1.68e-03 against 2.27e-03, a 35% separation out of two numbers only
-     * 1.6e-03 apart. It is not much, and it is the whole discrimination available at a bf16
-     * output; a kernel that took the convenient order fails here and nowhere else. */
+    /* 0.01 reflects the bf16 output: a correct kernel lands within the grid spacing (2^-9) of the
+     * exact answer. The position control (off by one block) must be over 20x worse. The rounding
+     * control is subtle: the kernel must be closer to the oracle that rounds the pooled mean to
+     * bf16 before the norm than to the one that does not; the two differ by only ~35%, the only
+     * discrimination a bf16 output allows. */
     const bool pass = r_ok >= 0.0 && r_ok < 0.01 && r_shift > 20.0 * r_ok &&
                       r_unr > 0.0 && r_ok < 0.9 * r_unr && scatter_clean && list_ok && mrope_ok;
     std::printf("        rel_l2 vs f64: %.3e (unrounded-mean order %.3e, the two orders %.3e "
@@ -11060,20 +10638,15 @@ static void qsa_block_key_yarn_case(const Plugin& pl) {
 
 /* gram_accum, against an f64 host Gram of the same dequantised bytes.
  *
- * THE THING THIS IS ACTUALLY FOR IS THE ACCUMULATE. A kernel that stored instead of adding would
- * agree with any single-call oracle and be wrong on the second launch, which is the only way this
- * op is ever used -- a corpus is many launches into one buffer. So `h` is SEEDED with a non-zero
- * pattern and the kernel is launched TWICE, and the expectation is seed + 2*want. Either mistake
- * -- storing, or dropping the seed -- fails; neither would fail a zero-seeded single call.
+ * The accumulate is what matters: a corpus is many launches into one buffer. So `h` is seeded with
+ * a non-zero pattern and the kernel launched twice; the expectation is seed + 2*want, which a
+ * kernel that stores, or drops the seed, fails.
  *
- * The activation goes through the DEVICE quantiser rather than being synthesised, so the case also
- * pins the two ops' scale convention to each other: gram_accum reads `scale` as a DEQUANT
- * multiplier, and reading it the other way would be a factor of 448^2 on every entry.
+ * The activation goes through the device quantiser, pinning the two ops' scale convention:
+ * gram_accum reads `scale` as a dequant multiplier (the other reading is off by 448^2).
  *
- * K = 260 is deliberate and is three awkward things at once: not a multiple of the 64-wide output
- * tile (the last tile has four live columns of sixty-four), not a multiple of the 128-wide scale
- * group (the last group has four), and a multiple of four (the staging dword). A square K would
- * have exercised none of the masking. */
+ * K = 260 is not a multiple of the 64-wide output tile (four live columns in the last) or of the
+ * 128-wide scale group (four in the last), but is a multiple of four (the staging dword). */
 static void gram_accum_case(const Plugin& pl) {
     const char* what = "gram_accum vs an f64 host Gram of the same bytes, accumulated twice";
     const RadKernelInfo* g = find(pl, "gram_accum");
@@ -11086,7 +10659,7 @@ static void gram_accum_case(const Plugin& pl) {
     for (int64_t m = 0; m < M; ++m)
         for (int64_t k = 0; k < K; ++k) {
             float v = (float)(((m * 29 + k * 11) % 53) - 26) / 41.0f;
-            if (k % 23 == 0) v *= 6.0f;          /* outlier channels, so the scales differ by group */
+            if (k % 23 == 0) v *= 6.0f;          /* outliers, so the scales differ by group */
             xbf[(size_t)(m * K + k)] = h_to_bf16(v);
         }
 
@@ -11111,9 +10684,7 @@ static void gram_accum_case(const Plugin& pl) {
     st_stream_sync(nullptr);
     if (qrc != RAD_OK) { ok(what, false, "quantiser rc=" + std::to_string(qrc)); return; }
 
-    /* Read the codes back and build the oracle from THEM, not from the bf16 source: the kernel
-     * contracts the codes, and an oracle that quantised again on the host would be measuring the
-     * quantiser as well as the Gram. */
+    /* The oracle uses the codes read back, not the bf16 source, so only the Gram is measured. */
     std::vector<uint8_t> qc((size_t)(M * K));
     std::vector<float>   qsc((size_t)(M * kb));
     st_memcpy(qc.data(),  d_q,  qc.size(),      hipMemcpyDeviceToHost);
@@ -11167,8 +10738,8 @@ static void gram_accum_case(const Plugin& pl) {
         if (r > worst) worst = r;
     }
     const double rel = den > 0.0 ? std::sqrt(num / den) : -1.0;
-    /* f32 accumulation over 200 rows in a register tree against f64: 1e-5 is three orders of
-     * margin on what that costs, and four below anything the consumer's damping would notice. */
+    /* f32 accumulation over 200 rows against f64: 1e-5 leaves three orders of margin, well below
+     * what the consumer's damping would notice. */
     const bool pass = rel >= 0.0 && rel < 1e-5;
     std::printf("        rel_l2 %.3e, worst entry %.3e\n", rel, worst);
     ok(what, pass, "rel_l2 " + std::to_string(rel) + ", worst " + std::to_string(worst));
@@ -11176,14 +10747,12 @@ static void gram_accum_case(const Plugin& pl) {
 
 /* gram_accum at bf16, against an f64 host Gram of the same bf16 values.
  *
- * The fp8 case above holds the accumulate to a seeded buffer and two launches; this one does the
- * same for the form with no scale operand, and adds the property the consumer leans on hardest: a
- * Gram is SYMMETRIC, and GPTQ's Cholesky takes the matrix as symmetric without looking. Each entry
- * and its mirror are the same products summed in the same row order by two different blocks, so
- * the kernel's output has to be symmetric to the bit, not to a tolerance.
+ * The same seeded two-launch accumulate for the form with no scale operand, plus symmetry: GPTQ's
+ * Cholesky assumes it, and each entry and its mirror are the same products summed in the same row
+ * order by two blocks, so the output must be symmetric to the bit.
  *
- * Two shapes: K = 260 for the masking (see the fp8 case) and an M that is not a whole number of
- * staged row blocks, and the routed down projection's width at a pass of sorted rows. */
+ * Shapes: K = 260 for the masking (see the fp8 case) with M not a whole number of staged row
+ * blocks, and the routed down projection's width over sorted rows. */
 static void gram_accum_bf16_case(const Plugin& pl, int64_t M, int64_t K) {
     const std::string what = "gram_accum_bf16 vs an f64 host Gram (M=" + std::to_string(M) +
                              ", K=" + std::to_string(K) + "), accumulated twice";
@@ -11235,7 +10804,7 @@ static void gram_accum_bf16_case(const Plugin& pl, int64_t M, int64_t K) {
     ok((what + ": symmetric to the bit").c_str(), asym == 0,
        std::to_string(asym) + " mirrored pairs differ");
 
-    /* Seed, then two launches: seed + 2 * want, which neither a store nor a dropped seed passes. */
+    /* Seed, then two launches: expect seed + 2 * want. */
     std::vector<float> seed((size_t)(K * K));
     for (int64_t i = 0; i < K * K; ++i) seed[(size_t)i] = (float)((i % 17) - 8) * 0.25f;
     st_memcpy(d_h, seed.data(), seed.size() * 4, hipMemcpyHostToDevice);
@@ -11259,31 +10828,26 @@ static void gram_accum_bf16_case(const Plugin& pl, int64_t M, int64_t K) {
     ok(what.c_str(), rel >= 0.0 && rel < 1e-5,
        "rel_l2 " + std::to_string(rel) + ", worst " + std::to_string(worst));
 
-    /* A scale handed to the bf16 form is a caller that thinks the input is quantised: refused. */
+    /* A scale handed to the bf16 form is refused. */
     ts[1] = T(d_h, RAD_F32, { M, 1 });
     rc = g->launch(&a, nullptr);
     ok((what + ": refuses a scale operand").c_str(), rc != RAD_OK, "rc=" + std::to_string(rc));
     dfree_all();
 }
 
-/* THE bf16 GROUPED MoE GEMM, AGAINST A HOST PRODUCT, EVERY FORM AGAINST EVERY OTHER.
+/* The bf16 grouped MoE GEMM against a host product, every form against every other.
  *
- * The routing is SKEWED the way moe_perf's is -- lognormal popularity, a Gumbel top-k a token -- so
- * runs go from empty to several times the mean, and the last few sorted rows are dropped slots
- * (sorted -1, past the live count) whose output must be zeros and not the stale bytes the output
- * is seeded with. Every form the launcher has -- the run-aligned prefill form, the (tile, run)
- * decode form and the uniform prefill grid -- runs on the same bytes and must match the first
- * byte for byte: each output element is one wave's accumulation over K in one order whichever
- * block computes it, so a byte apart is a form reading a different row or expert.
+ * The routing is skewed as in moe_perf (lognormal popularity, Gumbel top-k), and the last sorted
+ * rows are dropped slots (-1, past the live count) whose output must be zeros, not the seeded
+ * stale bytes. Every launcher form runs on the same bytes and must match the first byte for byte:
+ * each element is one wave's accumulation over K in one order, whichever block computes it.
  *
- * THE WEIGHTS ARE ALSO HANDED AS A POINTER TABLE, which is what the engine hands the kernel, with
- * the experts laid out in a PERMUTED order behind it where the shape is small enough to keep two
- * copies: an entry the kernel addressed by arithmetic instead of through the table would then read
- * another expert's plane.
+ * The weights are also passed as a pointer table, as the engine does, with the experts in permuted
+ * order behind it where two copies fit, so an entry addressed by arithmetic rather than through
+ * the table reads another expert.
  *
- * THE NEGATIVE CONTROL is the down projection with `a_order` swapped to "token": the activation
- * still has a row per (token, slot), so the launch is legal and gathers the wrong rows, and the
- * comparison has to fail. A harness that passes it has stopped looking at the numbers. */
+ * Negative control: the down projection with `a_order` swapped to "token" is legal but gathers the
+ * wrong rows, and must fail the comparison. */
 struct MoeBf16Shape { const char* name; int64_t N, K, ne, top_k; bool srt; };
 
 static void moe_gemm_bf16_case(const Plugin& pl, int64_t Mtok, const MoeBf16Shape& sh,
@@ -11302,8 +10866,8 @@ static void moe_gemm_bf16_case(const Plugin& pl, int64_t Mtok, const MoeBf16Shap
     auto rnd  = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
     auto unif = [&]() { return ((double)(rnd() >> 11) + 0.5) * (1.0 / 9007199254740992.0); };
 
-    /* The routing: every token's top_k distinct experts, then a stable sort by expert. The last
-     * three tokens' slots are left out of the sort as dropped slots. */
+    /* Each token's top_k distinct experts, then a stable sort by expert; the last three tokens'
+     * slots are dropped. */
     std::vector<double> logp((size_t)E);
     for (int64_t e = 0; e < E; ++e)
         logp[(size_t)e] = 1.0 * std::sqrt(-2.0 * std::log(unif())) * std::cos(6.283185307 * unif());
@@ -11332,19 +10896,19 @@ static void moe_gemm_bf16_case(const Plugin& pl, int64_t Mtok, const MoeBf16Shap
     }
     const int64_t live = off[(size_t)E];
     sorted.resize((size_t)Tr, -1);
-    /* A CALL SERVING A TRAILING SEGMENT -- a layer's protected experts, sorted last -- is handed the
-     * offsets from that segment's first expert on and that segment's weights, and every row below
-     * the segment is another call's output: it must keep the seeded bytes exactly. */
+    /* A call serving a trailing segment (a layer's protected experts, sorted last) gets the
+     * offsets from the segment's first expert and its weights; rows below the segment belong to
+     * another call and must keep the seeded bytes. */
     const int64_t e0 = seg ? E - seg : 0, En = seg ? seg : E;
     const int64_t s0 = off[(size_t)e0];
 
-    /* The activation: one row a token, or one a (token, slot) for the down projection. */
+    /* The activation: one row per token, or per (token, slot) for the down projection. */
     const int64_t AR = sh.srt ? Tr : Mtok;
     std::vector<uint16_t> ah((size_t)(AR * K)), wh((size_t)(E * N * K));
     for (auto& v : ah) v = h_to_bf16((float)((double)(int64_t)(rnd() % 2001) - 1000.0) / 700.0f);
     for (auto& v : wh) v = h_to_bf16((float)((double)(int64_t)(rnd() % 2001) - 1000.0) / 9000.0f);
 
-    /* The reference, every output element, in f64 over the bf16 inputs exactly. */
+    /* The reference for every output element, in f64 over the exact bf16 inputs. */
     std::vector<double> ref((size_t)(Tr * N), 0.0);
     for (int64_t i = 0; i < live; ++i) {
         const int32_t f = sorted[(size_t)i];
@@ -11361,8 +10925,8 @@ static void moe_gemm_bf16_case(const Plugin& pl, int64_t Mtok, const MoeBf16Shap
         }
     }
 
-    /* Two copies of the weights where they are small: the stacked plane in expert order, and a
-     * permuted one the pointer table reads. One copy otherwise, and the table points into it. */
+    /* Where small, two weight copies: the stacked plane in expert order and a permuted one for the
+     * pointer table. Otherwise one copy, which the table points into. */
     const size_t eb = (size_t)(N * K) * 2;
     const bool permute = E * (int64_t)eb <= ((int64_t)16 << 20);
     void* d_w  = dalloc((size_t)E * eb);
@@ -11453,14 +11017,13 @@ static void moe_gemm_bf16_case(const Plugin& pl, int64_t Mtok, const MoeBf16Shap
                     }
                     const double want = ref[(size_t)(i * N + n)];
                     const double gf = (double)h_bf16(got[(size_t)(i * N + n)]);
-                    /* Half a bf16 ulp of the output, plus room for a K-term f32 sum taken in the
-                     * WMMA's order; NaN counts as a miss. `rel_max` is the worst element as a
-                     * fraction of that allowance, printed so a margin shows and not only a pass. */
+                    /* Half a bf16 ulp plus room for a K-term f32 sum in the WMMA's order; NaN is a
+                     * miss. `rel_max`, the worst element as a fraction of that, is printed. */
                     const double err = std::fabs(gf - want);
                     const double tol = 0.004 * std::fabs(want) + 2e-3;
                     if (err / tol > rel_max) rel_max = err / tol;
-                    /* ...and in bf16 ulps from the f64 product rounded once, on the
-                     * sign-magnitude ordering of the bits. */
+                    /* And in bf16 ulps from the once-rounded f64 product, on the sign-magnitude
+                     * ordering of the bits. */
                     {
                         const uint16_t rb = h_to_bf16((float)want), gb = got[(size_t)(i * N + n)];
                         const int32_t ro = (rb & 0x8000) ? -(int32_t)(rb & 0x7fff) : (int32_t)rb;
@@ -11505,14 +11068,13 @@ static void moe_gemm_bf16_case(const Plugin& pl, int64_t Mtok, const MoeBf16Shap
     dfree_all();
 }
 
-/* THE bf16 EXPERT GEMM AT A PREFILL CHUNK: Qwen3.8-Flash-Next's whole experts (gate_up 1280 x 2560
+/* The bf16 expert GEMM at a prefill chunk: Qwen3.8-Flash-Next's whole experts (gate_up 1280 x 2560
  * over token rows, down 2560 x 640 over sorted rows) under a skewed routing, every form timed and
  * compared with the first byte for byte.
  *
- * `distinct` planes back the `experts` table entries, entry e reading plane e % distinct. Equal to
- * `experts` it is the real weight traffic; smaller, it is what fits beside a running server, and
- * the time is then the kernel's arithmetic and staging over planes the last-level cache can hold --
- * a floor on the real figure rather than the figure, and the line printed says which it was. */
+ * `distinct` planes back the table entries (entry e reads plane e % distinct). Equal to `experts`
+ * it is the real weight traffic; smaller, the planes may sit in the last-level cache and the time
+ * is a floor, as the printed line says. */
 static void moe16_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_t top_k,
                        int64_t distinct) {
     if (iters <= 0) iters = 20;
@@ -11644,11 +11206,11 @@ struct ArThread {
     void* inst = nullptr;
     int rc_init = RAD_E_STATE, rc_launch = RAD_E_STATE;
     std::vector<float> out;
-    /* The all-gather row width in ELEMENTS. 0 is the plain concatenation; anything else asks for
-     * the row-interleaved placement the vocab-parallel sampler needs. */
+    /* The all-gather row width in elements: 0 is plain concatenation, otherwise the
+     * row-interleaved placement the vocab-parallel sampler needs. */
     int64_t row_elems = 0;
-    /* Ranks in the collective. 2 is the pair; 3 exercises the wide family at the one width that
-     * is not a power of two. */
+    /* Ranks in the collective: 2, or 3 for the wide family at a width that is not a power of
+     * two. */
     int world = 2;
 };
 
@@ -11690,8 +11252,8 @@ static void ar_two_rank(const Plugin& pl, const std::vector<int>& devs, const ch
     if (!row) { ok(name, false, "row absent"); return; }
     if (devs.size() < 2) { skip(name, "fewer than two gfx1201 cards"); return; }
 
-    /* 8192 fp32 elements: a whole number of 16-byte pushes and small enough that the handshake,
-     * not the link, is what is being exercised. */
+    /* 8192 fp32 elements: whole 16-byte pushes, small enough to exercise the handshake rather
+     * than the link. */
     const int64_t numel = 8192;
     ArThread a{ row, 0, devs[0], numel }, b{ row, 1, devs[1], numel };
     std::thread ta(ar_worker, &a), tb(ar_worker, &b);
@@ -11719,19 +11281,17 @@ static void ar_two_rank(const Plugin& pl, const std::vector<int>& devs, const ch
 }
 
 /* ------------------------------------------------------------------ changing block counts */
-/* BACK-TO-BACK ALL-REDUCES ON ONE INSTANCE, AT DIFFERENT BLOCK COUNTS. The block count follows the
- * message, so the ops sharing an instance run different grids, and consecutive launches must still
- * take opposite scratch slots as a whole: a slot taken per block lets a block of one launch push
- * into bytes a different block of the previous launch is still reducing (r4d_ar_seq.h). Nothing
- * synchronises between the launches here, and each has its own values and its own output, so a
- * slot two in-flight launches share reads as a wrong sum and a counter the kernels disagree on as
- * a hang. The sizes give 11, 4 and 7 blocks under the default block rule. */
+/* Back-to-back all-reduces on one instance at different block counts. The block count follows the
+ * message, so ops sharing an instance run different grids, and consecutive launches must alternate
+ * scratch slots as a whole (per-block slots would let one launch push into bytes the previous one
+ * is still reducing; r4d_ar_seq.h). Nothing synchronises between launches and each has its own
+ * values and output, so a shared slot shows as a wrong sum and a counter mismatch as a hang. The
+ * sizes give 11, 4 and 7 blocks under the default block rule. */
 static const int64_t kArSweepNumel[] = { 65536, 8192, 40000, 65536, 12000, 24576, 65536, 8192 };
 constexpr int kArSweepN = (int)(sizeof(kArSweepNumel) / sizeof(kArSweepNumel[0]));
-/* The sweep again and again with new values each round, so every slot is reused many times over.
- * A reader that is served a slot's previous contents -- a cached line of host memory or of a
- * peer's, a flag seen before the bytes behind it -- folds the value of an earlier launch, and every
- * launch's value is distinct, so that is a wrong sum and not a lucky one. */
+/* Rounds of the sweep with new values each, so every slot is reused many times; a reader served a
+ * slot's previous contents (a stale cached line, a flag seen before its bytes) yields a wrong sum,
+ * since every launch's value is distinct. */
 constexpr int kArSweepRounds = 32;
 
 struct ArSweep {
@@ -11819,11 +11379,10 @@ static void ar_two_rank_sweep(const Plugin& pl, const std::vector<int>& devs, co
 }
 
 /* ------------------------------------------------------------------ the two-rank all-gather */
-/* The payload is what the vocab-parallel sampler really gathers: (u32 global token id, f32 logit)
- * pairs. THE IDS ARE THE POINT. A token id is a small integer, and its bit pattern read as f32 is
- * a DENORMAL -- so an all-gather faked as an all-reduce over zero-padded planes returns the ids
- * flushed to zero anywhere denormals are flushed, and the model then samples token 0 forever while
- * every logit still looks right. This checks the bytes, on both ranks, for both halves. */
+/* The payload is what the vocab-parallel sampler gathers: (u32 global token id, f32 logit) pairs.
+ * A token id's bit pattern read as f32 is a denormal, so an all-gather emulated by an all-reduce
+ * over zero-padded planes would flush ids to zero where denormals flush. This checks the bytes on
+ * both ranks, for both halves. */
 static void gather_worker(ArThread* t) {
     if (st_set_device(t->dev) != hipSuccess) { t->rc_init = RAD_E_DEVICE; return; }
     std::vector<RadParam> ps = {
@@ -11845,7 +11404,7 @@ static void gather_worker(ArThread* t) {
         std::memcpy(&h[(size_t)i + 1], &v, 4);
     }
     st_memcpy(in, h.data(), h.size() * 4, hipMemcpyHostToDevice);
-    st_memset(out, 0xAB, (size_t)t->numel * 4 * t->world);   /* so an untouched slice is visibly untouched */
+    st_memset(out, 0xAB, (size_t)t->numel * 4 * t->world);   /* marks untouched slices */
 
     RadTensor ts[2] = { T(in, RAD_F32, { t->numel }), T(out, RAD_F32, { t->numel * t->world }) };
     RadArgs a;
@@ -11883,8 +11442,7 @@ static void gather_two_rank(const Plugin& pl, const std::vector<int>& devs, cons
        a.rc_launch == RAD_OK && b.rc_launch == RAD_OK,
        "rc " + std::to_string(a.rc_launch) + "/" + std::to_string(b.rc_launch));
 
-    /* What each rank sent, rebuilt here rather than read back off the device: the check is that
-     * the OUTPUT holds it, so the expectation must not come from the same memory. */
+    /* What each rank sent, rebuilt on the host rather than read from the device. */
     auto sent = [numel](int rank, int64_t i) -> uint32_t {
         if ((i & 1) == 0) return (uint32_t)(rank * 124160 + (int)i + 1);
         uint32_t u; const float v = (float)(rank + 1) * 0.5f + (float)(i - 1);
@@ -11908,11 +11466,9 @@ static void gather_two_rank(const Plugin& pl, const std::vector<int>& devs, cons
 
     if (row->fini) { row->fini(a.inst); row->fini(b.inst); }
 
-    /* THE ROW-INTERLEAVED PLACEMENT, which is the one the sampler actually asks for: the input is
-     * [rows][row] and the output must be [rows][2][row], so rank 1's row m sits immediately after
-     * rank 0's rather than a whole message away. A concatenating gather passes the check above and
-     * fails this one, and the difference between them is a merge that reads one rank's candidates
-     * twice and the other rank's never. */
+    /* The row-interleaved placement the sampler uses: input [rows][row], output [rows][2][row],
+     * rank 1's row m directly after rank 0's. A concatenating gather passes the check above and
+     * fails this one. */
     const int64_t rowe = 2048;                     /* 4 rows of 1024 (id, logit) pairs */
     ArThread c{ row, 0, devs[0], numel }, d{ row, 1, devs[1], numel };
     c.row_elems = d.row_elems = rowe;
@@ -11948,83 +11504,81 @@ static void gather_two_rank(const Plugin& pl, const std::vector<int>& devs, cons
     ok("2-rank all-gather fini ran", true);
 }
 
-/* ------------------------------------------------------------------ the three-rank wide family */
-/* THE ONE WIDTH THAT IS NOT A POWER OF TWO. The wide kernels are templated on the world size and
- * shipped at 4 and 8; three cards instantiate the same template at 3, and these are the checks that
- * the instantiation, the dispatch rows and the entry points agree: a rendezvous of three, a sum of
- * 1 + 2 + 3 on every rank bit for bit, the slot parity surviving a block-count sweep, and the
- * gather placing three slices in both of its layouts. Skipped, not failed, on fewer cards. */
-static void ar_three_rank(const Plugin& pl, const std::vector<int>& devs, const char* name) {
+/* ------------------------------------------------------------------ the wide (3/4/8-rank) family */
+/* The wide kernels are templated on the world size; these cases run them at 3 and 4 ranks (4 is
+ * the TP4 width). Checked: a rendezvous of `world`, a sum of 1 + 2 + .. + world on every rank bit
+ * for bit, slot parity surviving a block-count sweep, and the gather placing every slice in both
+ * layouts. Skipped on fewer cards than the width, with the width named in the skip. */
+static void ar_wide_rank(const Plugin& pl, const std::vector<int>& devs, const char* name,
+                         int world) {
     const RadKernelInfo* row = find(pl, name);
     if (!row) { ok(name, false, "row absent"); return; }
-    if (devs.size() < 3) { skip(name, "fewer than three gfx1201 cards"); return; }
-    const int64_t numel = 8192;
-    ArThread a{ row, 0, devs[0], numel }, b{ row, 1, devs[1], numel }, c{ row, 2, devs[2], numel };
-    a.world = b.world = c.world = 3;
-    std::thread ta(ar_worker, &a), tb(ar_worker, &b), tc(ar_worker, &c);
-    ta.join();
-    tb.join();
-    tc.join();
-    ok("3-rank all-reduce init (peer rendezvous)",
-       a.rc_init == RAD_OK && b.rc_init == RAD_OK && c.rc_init == RAD_OK,
-       "rc " + std::to_string(a.rc_init) + "/" + std::to_string(b.rc_init) + "/" +
-           std::to_string(c.rc_init));
-    if (a.rc_init != RAD_OK || b.rc_init != RAD_OK || c.rc_init != RAD_OK) return;
-    ok("3-rank all-reduce launch",
-       a.rc_launch == RAD_OK && b.rc_launch == RAD_OK && c.rc_launch == RAD_OK,
-       "rc " + std::to_string(a.rc_launch) + "/" + std::to_string(b.rc_launch) + "/" +
-           std::to_string(c.rc_launch));
-    int64_t bad = 0;
-    for (int64_t i = 0; i < numel; ++i) {
-        if (a.out[(size_t)i] != 6.0f) ++bad;
-        if (b.out[(size_t)i] != 6.0f) ++bad;
-        if (c.out[(size_t)i] != 6.0f) ++bad;
+    if ((int)devs.size() < world) {
+        skip(name, (std::string("needs ") + std::to_string(world) + " gfx1201 cards").c_str());
+        return;
     }
-    ok("3-rank all-reduce sums 1 + 2 + 3 == 6 on every rank, bit for bit", bad == 0,
+    const int64_t numel = 8192;
+    const std::string w = std::to_string(world);
+    std::vector<ArThread> t;
+    std::vector<std::thread> th;
+    for (int r = 0; r < world; ++r) t.push_back(ArThread{ row, r, devs[(size_t)r], numel });
+    for (int r = 0; r < world; ++r) { t[(size_t)r].world = world; th.emplace_back(ar_worker, &t[(size_t)r]); }
+    for (std::thread& x : th) x.join();
+    bool up = true;
+    std::string rcs;
+    for (const ArThread& a : t) { up = up && a.rc_init == RAD_OK; rcs += std::to_string(a.rc_init) + "/"; }
+    ok((w + "-rank all-reduce init (peer rendezvous)").c_str(), up, rcs);
+    if (!up) return;
+    up = true; rcs.clear();
+    for (const ArThread& a : t) { up = up && a.rc_launch == RAD_OK; rcs += std::to_string(a.rc_launch) + "/"; }
+    ok((w + "-rank all-reduce launch").c_str(), up, rcs);
+    /* Rank r contributes (r + 1), so the fold is the triangular number -- 6 at three, 10 at four. */
+    const float want = (float)(world * (world + 1) / 2);
+    int64_t bad = 0;
+    for (const ArThread& a : t)
+        for (int64_t i = 0; i < numel; ++i) if (a.out[(size_t)i] != want) ++bad;
+    ok((w + "-rank all-reduce sums 1 + 2 + .. + " + w + " == " + std::to_string((int)want) +
+        " on every rank, bit for bit").c_str(), bad == 0,
        std::to_string(bad) + " elements wrong");
-    if (row->fini) { row->fini(a.inst); row->fini(b.inst); row->fini(c.inst); }
-    ok("3-rank all-reduce fini ran", true);
+    if (row->fini) for (ArThread& a : t) row->fini(a.inst);
+    ok((w + "-rank all-reduce fini ran").c_str(), true);
 
     /* Block counts that change launch to launch on one instance: the wide family takes its slot
      * parity from the shared counters exactly as the pair does, and this is the check that it
-     * does so at a width whose flag array is [block][3]. */
-    ArSweep x{ row, 0, devs[0] }, y{ row, 1, devs[1] }, z{ row, 2, devs[2] };
-    x.world = y.world = z.world = 3;
-    std::thread tx(ar_sweep_worker, &x), ty(ar_sweep_worker, &y), tz(ar_sweep_worker, &z);
-    tx.join();
-    ty.join();
-    tz.join();
-    const bool up = x.rc_init == RAD_OK && y.rc_init == RAD_OK && z.rc_init == RAD_OK &&
-                    x.rc_launch == RAD_OK && y.rc_launch == RAD_OK && z.rc_launch == RAD_OK;
-    ok("3-rank all-reduce, 32 rounds of eight launches at changing block counts on one instance",
-       up && x.bad == 0 && y.bad == 0 && z.bad == 0,
-       up ? std::to_string(x.bad + y.bad + z.bad) + " elements wrong"
-          : "rc " + std::to_string(x.rc_init) + "/" + std::to_string(y.rc_init) + "/" +
-                std::to_string(z.rc_init) + " init, " + std::to_string(x.rc_launch) + "/" +
-                std::to_string(y.rc_launch) + "/" + std::to_string(z.rc_launch) + " launch");
-    if (row->fini) {
-        if (x.inst) row->fini(x.inst);
-        if (y.inst) row->fini(y.inst);
-        if (z.inst) row->fini(z.inst);
+     * does so at a width whose flag array is [block][world]. */
+    std::vector<ArSweep> s;
+    std::vector<std::thread> sh2;
+    for (int r = 0; r < world; ++r) s.push_back(ArSweep{ row, r, devs[(size_t)r] });
+    for (int r = 0; r < world; ++r) { s[(size_t)r].world = world; sh2.emplace_back(ar_sweep_worker, &s[(size_t)r]); }
+    for (std::thread& x : sh2) x.join();
+    up = true; rcs.clear();
+    int64_t bad2 = 0;
+    for (const ArSweep& a : s) {
+        up = up && a.rc_init == RAD_OK && a.rc_launch == RAD_OK;
+        bad2 += a.bad;
+        rcs += std::to_string(a.rc_init) + "/" + std::to_string(a.rc_launch) + " ";
     }
+    ok((w + "-rank all-reduce, 32 rounds of eight launches at changing block counts on one "
+        "instance").c_str(),
+       up && bad2 == 0,
+       up ? std::to_string(bad2) + " elements wrong" : "init/launch rc " + rcs);
+    if (row->fini) for (ArSweep& a : s) if (a.inst) row->fini(a.inst);
 }
 
-/* THE THREE-RANK ALL-REDUCE ROWS, at the sizes the two-shot is selected for and the ones that do
- * not divide.
+/* The three-rank all-reduce rows, at the sizes that select the two-shot and sizes that do not
+ * divide.
  *
- * ar_three_rank's input is a constant per rank, which a shard landing at the wrong offset still
- * sums correctly. This one gives every element its own value, so a word reduced by the wrong
- * owner, gathered from the wrong slot or dropped at a short shard's end is a wrong number at a
- * known index. The sizes walk the uneven split: words % 3 of 0, 1 and 2, from a 16-word message
- * to past the old 20971520 ceiling, in place (how every block issues it) and once out of
- * place, back to back on ONE instance so the slot parity and the changing block count are
- * exercised the way a step's mixed messages exercise them. The oracle is the fold the kernel
- * claims -- fp32 in ascending rank order, rounded once -- so it is bit for bit, and so it is also
- * the one-shot's answer: the band edge between the two rows changes no bits. */
+ * Every element has its own value, so a word reduced by the wrong owner, gathered from the wrong
+ * slot or dropped at a short shard's end shows at a known index. The sizes walk the uneven split
+ * (words % 3 of 0, 1 and 2) from 16 words to past 20971520, in place and once out of place, back
+ * to back on one instance (slot parity, changing block counts). The oracle is the kernel's fold:
+ * fp32 in ascending rank order, rounded once, bit for bit; it is also the one-shot's answer, so
+ * the band edge between the rows changes no bits. */
 struct ArPattern {
-    const RadKernelInfo* row;
-    int rank, dev;
-    const char* dtype;                 /* "bf16" or "fp32" */
+    const RadKernelInfo* row = nullptr;
+    int rank = 0, dev = 0;
+    int world = 3;
+    const char* dtype = nullptr;       /* "bf16" or "fp32" */
     std::vector<int64_t> sizes;
     int out_of_place = -1;             /* index into sizes, or -1 */
     void* inst = nullptr;
@@ -12033,8 +11587,8 @@ struct ArPattern {
 };
 
 static float ar_pattern_value(int rank, int64_t i) {
-    /* Integers up to 254 over 64: exact in bf16 (8 significant bits), and three of them need ten,
-     * so the bf16 sum is rounded and the rounding is checked too. */
+    /* Integers up to 254 over 64: exact in bf16 (8 significant bits), while sums of three need
+     * ten, so the bf16 sum's rounding is checked too. */
     return (float)((int)((i * 37 + (int64_t)rank * 101) % 509) - 254) / 64.0f;
 }
 
@@ -12045,9 +11599,9 @@ static void ar_pattern_worker(ArPattern* t) {
     int64_t most = 0;
     for (int64_t n : t->sizes) most = n > most ? n : most;
     std::vector<RadParam> ps = {
-        PI("world_size", 3), PI("numel", most), PS("dtype", t->dtype), PI("exact", 1),
+        PI("world_size", t->world), PI("numel", most), PS("dtype", t->dtype), PI("exact", 1),
     };
-    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, 3, &t->inst);
+    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, t->world, &t->inst);
     if (t->rc_init != RAD_OK) return;
     void* in = nullptr;
     void* out = nullptr;
@@ -12072,7 +11626,7 @@ static void ar_pattern_worker(ArPattern* t) {
         a.p = ps.data(); a.n_p = (int)ps.size();
         a.instance = t->inst;
         a.rank = t->rank;
-        a.world_size = 3;
+        a.world_size = t->world;
         const int rc = t->row->launch(&a, nullptr);
         st_stream_sync(nullptr);
         if (rc != RAD_OK && t->rc_launch == RAD_OK) t->rc_launch = rc;
@@ -12088,38 +11642,60 @@ static void ar_pattern_worker(ArPattern* t) {
     st_free(out);
 }
 
-static void ar_three_rank_pattern(const Plugin& pl, const std::vector<int>& devs, const char* name) {
+static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, const char* name,
+                            int world) {
     const RadKernelInfo* row = find(pl, name);
     if (!row) { ok(name, false, "row absent"); return; }
-    if (devs.size() < 3) { skip(name, "fewer than three gfx1201 cards"); return; }
+    if ((int)devs.size() < world) {
+        skip(name, (std::string("needs ") + std::to_string(world) + " gfx1201 cards").c_str());
+        return;
+    }
     struct Run { const char* dtype; std::vector<int64_t> sizes; int oop; };
-    const std::vector<Run> runs = {
-        /* bf16, the residual: words = numel / 8. 2048 x 2048 rows is words % 3 == 2, x 2049 is
-         * 0, x 2050 is 1; 128 is 16 words (1), 24008 is 3001 (1); 20971520 the old ceiling (1);
-         * 46137344, Gemma 4's feed-forward reduce at an 8192-token chunk, past it (1). */
-        { "bf16", { 4194304, 128, 4196352, 24008, 4198400, 20971520, 46137344, 4194304 }, 2 },
-        /* fp32: words = numel / 4. 8196 -> 2049 (0), 4100 -> 1025 (2), 1048580 -> 262145 (2). */
-        { "fp32", { 8196, 4100, 1048580 }, 0 },
-    };
+    /* The three-rank list walks the UNEVEN split (words % 3 of 0, 1 and 2); the four-rank rows
+     * cannot be given one -- cArTsExact4/cArTi8Ts4 constrain numel so the words divide evenly
+     * (r4d_rows.cpp), and the two-shot's own entry refuses any other message -- so its list keeps
+     * the whole-word sizes and the band edges instead. */
+    std::vector<Run> runs;
+    if (world == 3) {
+        runs = {
+            /* bf16, the residual: words = numel / 8. 2048 x 2048 rows is words % 3 == 2, x 2049 is
+             * 0, x 2050 is 1; 128 is 16 words (1), 24008 is 3001 (1); 20971520 the old ceiling
+             * (1); 46137344, Gemma 4's feed-forward reduce at an 8192-token chunk, past it (1). */
+            { "bf16", { 4194304, 128, 4196352, 24008, 4198400, 20971520, 46137344, 4194304 }, 2 },
+            /* fp32: words = numel / 4. 8196 -> 2049 (0), 4100 -> 1025 (2), 1048580 -> 262145 (2). */
+            { "fp32", { 8196, 4100, 1048580 }, 0 },
+        };
+    } else {
+        runs = {
+            /* bf16: 524288 the one-shot band's top, 524352 the first message the two-shot's rows
+             * take (numel % 64 == 0 either way, so both divide); the shipped chunk sizes; and
+             * 4194304 again to close the run on a size already folded. */
+            { "bf16", { 4194304, 128, 524288, 524352, 4196352, 20971520, 46137344, 4194304 }, 2 },
+            /* fp32: words = numel / 4, whole groups of four either side of the same edge. */
+            { "fp32", { 1048580 - 4, 524352 }, 0 },
+        };
+    }
     for (const Run& run : runs) {
-        ArPattern t[3];
-        for (int r = 0; r < 3; ++r) {
-            t[r].row = row; t[r].rank = r; t[r].dev = devs[(size_t)r];
-            t[r].dtype = run.dtype; t[r].sizes = run.sizes; t[r].out_of_place = run.oop;
+        std::vector<ArPattern> t((size_t)world);
+        std::vector<std::thread> th;
+        for (int r = 0; r < world; ++r) {
+            t[(size_t)r].row = row; t[(size_t)r].rank = r; t[(size_t)r].dev = devs[(size_t)r];
+            t[(size_t)r].world = world;
+            t[(size_t)r].dtype = run.dtype; t[(size_t)r].sizes = run.sizes;
+            t[(size_t)r].out_of_place = run.oop;
+            th.emplace_back(ar_pattern_worker, &t[(size_t)r]);
         }
-        std::thread a(ar_pattern_worker, &t[0]), b(ar_pattern_worker, &t[1]), c(ar_pattern_worker, &t[2]);
-        a.join(); b.join(); c.join();
+        for (std::thread& x : th) x.join();
         const std::string what = std::string(name) + " " + run.dtype;
-        const bool up = t[0].rc_init == RAD_OK && t[1].rc_init == RAD_OK && t[2].rc_init == RAD_OK;
-        ok((what + " init (peer rendezvous)").c_str(), up,
-           "rc " + std::to_string(t[0].rc_init) + "/" + std::to_string(t[1].rc_init) + "/" +
-               std::to_string(t[2].rc_init));
+        bool up = true, ran = true;
+        std::string rcs;
+        for (const ArPattern& a : t) {
+            up = up && a.rc_init == RAD_OK; ran = ran && a.rc_launch == RAD_OK;
+            rcs += std::to_string(a.rc_init) + "/" + std::to_string(a.rc_launch) + " ";
+        }
+        ok((what + " init (peer rendezvous)").c_str(), up, "init/launch rc " + rcs);
         if (!up) return;
-        const bool ran = t[0].rc_launch == RAD_OK && t[1].rc_launch == RAD_OK &&
-                         t[2].rc_launch == RAD_OK;
-        ok((what + " launches").c_str(), ran,
-           "rc " + std::to_string(t[0].rc_launch) + "/" + std::to_string(t[1].rc_launch) + "/" +
-               std::to_string(t[2].rc_launch));
+        ok((what + " launches").c_str(), ran, "init/launch rc " + rcs);
         if (ran) {
             const bool bf = !std::strcmp(run.dtype, "bf16");
             for (size_t k = 0; k < run.sizes.size(); ++k) {
@@ -12127,13 +11703,13 @@ static void ar_three_rank_pattern(const Plugin& pl, const std::vector<int>& devs
                 int64_t bad = 0, first = -1;
                 for (int64_t i = 0; i < n; ++i) {
                     float acc = 0.0f;
-                    for (int r = 0; r < 3; ++r) {
+                    for (int r = 0; r < world; ++r) {
                         const float v = ar_pattern_value(r, i);
                         acc += bf ? h_bf16(h_to_bf16(v)) : v;
                     }
                     const float want = bf ? h_bf16(h_to_bf16(acc)) : acc;
-                    for (int r = 0; r < 3; ++r)
-                        if (t[r].out.size() <= k || t[r].out[k][(size_t)i] != want) {
+                    for (int r = 0; r < world; ++r)
+                        if (t[(size_t)r].out.size() <= k || t[(size_t)r].out[k][(size_t)i] != want) {
                             if (first < 0) first = i;
                             ++bad;
                         }
@@ -12141,31 +11717,54 @@ static void ar_three_rank_pattern(const Plugin& pl, const std::vector<int>& devs
                 const int64_t words = n * (bf ? 2 : 4) / 16;
                 const std::string label =
                     what + " numel " + std::to_string(n) + " (" + std::to_string(words) +
-                    " words, % 3 = " + std::to_string(words % 3) +
+                    " words, % " + std::to_string(world) + " = " +
+                    std::to_string(words % world) +
                     ((int)k == run.oop ? ", out of place" : ", in place") +
                     ") == fp32 ascending-rank fold on every rank, bit for bit";
                 ok(label.c_str(), bad == 0,
                    std::to_string(bad) + " elements wrong, first at " + std::to_string(first));
             }
         }
-        if (row->fini) for (int r = 0; r < 3; ++r) if (t[r].inst) row->fini(t[r].inst);
+        if (row->fini) for (ArPattern& a : t) if (a.inst) row->fini(a.inst);
+    }
+    /* The four-rank rows' even-shard rule, checked from the one place that can: a message whose
+     * 16-byte words do not divide by four must be REFUSED (r4d_ar_twoshot_Nrank_exact.hip shards
+     * it evenly and the entry throws on any residual), not launched with a truncated tail. The
+     * three-rank row has no such rule -- it splits unevenly by design. */
+    if (world == 4 && std::strstr(name, "twoshot")) {
+        ArPattern t[4];
+        for (int r = 0; r < 4; ++r) {
+            t[r].row = row; t[r].rank = r; t[r].dev = devs[(size_t)r]; t[r].world = 4;
+            t[r].dtype = "bf16"; t[r].sizes = { 524288, 40 };   /* 40 elems = 5 words: 5 % 4 != 0 */
+            t[r].out_of_place = 1;
+        }
+        std::thread a(ar_pattern_worker, &t[0]), b(ar_pattern_worker, &t[1]),
+                    c(ar_pattern_worker, &t[2]), d(ar_pattern_worker, &t[3]);
+        a.join(); b.join(); c.join(); d.join();
+        int refused = 0;
+        for (const ArPattern& x : t) {
+            if (x.rc_init == RAD_OK && x.rc_launch == RAD_E_SHAPE) ++refused;
+            if (x.inst) row->fini(x.inst);
+        }
+        ok((std::string(name) + " refuses a 5-word message at 4 ranks (RAD_E_SHAPE, not a launch)").c_str(),
+           refused == 4,
+           std::to_string(refused) + " of 4 ranks refused, rc " + std::to_string(t[0].rc_launch));
     }
 }
 
-/* THE THREE-RANK TIERED-INT8 WIRE, held to what a lossy wire can be held to.
+/* The three-rank tiered-int8 wire.
  *
- * Exactly: every rank ends with the same bytes (the owner stores the decode of the words it
- * published, so the wire is bit-identical across ranks by construction), and a message the wire
- * declines -- under `min_bytes`, or not whole 32-element groups -- is the exact one-shot's fold,
- * bit for bit. Statistically: the rest is within a quantisation error of the fp32 sum. The input is
- * the per-element pattern plus a large outlier every 997 elements on rank 1 (the record's tier 2
- * keeps a dominant element exact), and the sizes walk groups % 3 of 0, 1 and 2 to the 20971520
- * ceiling, so a group reduced by the wrong owner or read from the wrong slot is an error of the
- * order of the values themselves -- a relative RMS near 1, not the few tenths of a percent an int8
- * wire costs. */
+ * Exact: every rank ends with the same bytes (the owner stores the decode of what it published),
+ * and a message the wire declines (under `min_bytes`, or not whole 32-element groups) equals the
+ * exact one-shot's fold bit for bit. Statistical: the rest is within quantisation error of the
+ * fp32 sum. The input is the per-element pattern plus an outlier every 997 elements on rank 1
+ * (tier 2 keeps a dominant element exact); sizes walk groups % 3 of 0, 1 and 2 up to 20971520, so
+ * a wrong owner or slot gives a relative RMS near 1, versus a fraction of a percent for the
+ * wire. */
 struct ArTi8 {
-    const RadKernelInfo* row;
-    int rank, dev;
+    const RadKernelInfo* row = nullptr;
+    int rank = 0, dev = 0;
+    int world = 3;
     std::vector<int64_t> sizes;
     void* inst = nullptr;
     int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
@@ -12182,10 +11781,10 @@ static void ar_ti8_worker(ArTi8* t) {
     int64_t most = 0;
     for (int64_t n : t->sizes) most = n > most ? n : most;
     std::vector<RadParam> ps = {
-        PI("world_size", 3), PI("numel", most), PS("dtype", "bf16"), PI("exact", 0),
+        PI("world_size", t->world), PI("numel", most), PS("dtype", "bf16"), PI("exact", 0),
         PI("min_bytes", 131072),
     };
-    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, 3, &t->inst);
+    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, t->world, &t->inst);
     if (t->rc_init != RAD_OK) return;
     void* buf = nullptr;
     if (hipMalloc(&buf, (size_t)most * 2) != hipSuccess) { t->rc_launch = RAD_E_NOMEM; return; }
@@ -12200,7 +11799,7 @@ static void ar_ti8_worker(ArTi8* t) {
         a.p = ps.data(); a.n_p = (int)ps.size();
         a.instance = t->inst;
         a.rank = t->rank;
-        a.world_size = 3;
+        a.world_size = t->world;
         const int rc = t->row->launch(&a, nullptr);
         st_stream_sync(nullptr);
         if (rc != RAD_OK && t->rc_launch == RAD_OK) t->rc_launch = rc;
@@ -12211,40 +11810,53 @@ static void ar_ti8_worker(ArTi8* t) {
     st_free(buf);
 }
 
-static void ar_three_rank_ti8(const Plugin& pl, const std::vector<int>& devs, const char* name) {
+static void ar_wide_ti8(const Plugin& pl, const std::vector<int>& devs, const char* name,
+                        int world) {
     const RadKernelInfo* row = find(pl, name);
     if (!row) { ok(name, false, "row absent"); return; }
-    if (devs.size() < 3) { skip(name, "fewer than three gfx1201 cards"); return; }
-    /* 32768 is under the 128 KiB floor and 65544 is not whole groups: both exact. The rest are
+    if ((int)devs.size() < world) {
+        skip(name, (std::string("needs ") + std::to_string(world) + " gfx1201 cards").c_str());
+        return;
+    }
+    /* 32768 is under the 128 KiB floor and 65544 is not whole groups (at four ranks, not whole
+     * SHARD groups -- the 4-rank wire tiles numel by 128): both exact. The rest are
      * lossy: 65536 sits ON the floor (2048 groups, % 3 = 2), then 2048 x 2048 / 2049 / 2050 rows
      * (groups % 3 = 2, 0, 1) and the ceiling (655360 groups, % 3 = 1), and 2048 rows again. */
     const std::vector<int64_t> sizes = { 4194304, 32768, 65536, 4196352, 65544, 4198400, 20971520,
                                          4194304 };
-    ArTi8 t[3];
-    for (int r = 0; r < 3; ++r) { t[r].row = row; t[r].rank = r; t[r].dev = devs[(size_t)r]; t[r].sizes = sizes; }
-    std::thread a(ar_ti8_worker, &t[0]), b(ar_ti8_worker, &t[1]), c(ar_ti8_worker, &t[2]);
-    a.join(); b.join(); c.join();
+    /* The wire's tile: at three any whole group of 32 goes lossy (the 3-rank entry only asks
+     * numel % 32 == 0); at four the shard must be whole groups too, so the fallback rule is
+     * numel % (32 * 4) == 0 (r4d_rad_ar_twoshot_4rank_ti8). */
+    const int64_t tile = world == 3 ? 32 : 32 * (int64_t)world;
+    std::vector<ArTi8> t((size_t)world);
+    std::vector<std::thread> th;
+    for (int r = 0; r < world; ++r) {
+        t[(size_t)r].row = row; t[(size_t)r].rank = r; t[(size_t)r].dev = devs[(size_t)r];
+        t[(size_t)r].world = world; t[(size_t)r].sizes = sizes;
+        th.emplace_back(ar_ti8_worker, &t[(size_t)r]);
+    }
+    for (std::thread& x : th) x.join();
     const std::string nm(name);
-    const bool up = t[0].rc_init == RAD_OK && t[1].rc_init == RAD_OK && t[2].rc_init == RAD_OK;
-    ok((nm + " init (peer rendezvous)").c_str(), up,
-       "rc " + std::to_string(t[0].rc_init) + "/" + std::to_string(t[1].rc_init) + "/" +
-           std::to_string(t[2].rc_init));
+    bool up = true, ran = true;
+    std::string rcs;
+    for (const ArTi8& a : t) {
+        up = up && a.rc_init == RAD_OK; ran = ran && a.rc_launch == RAD_OK;
+        rcs += std::to_string(a.rc_init) + "/" + std::to_string(a.rc_launch) + " ";
+    }
+    ok((nm + " init (peer rendezvous)").c_str(), up, "init/launch rc " + rcs);
     if (!up) return;
-    const bool ran = t[0].rc_launch == RAD_OK && t[1].rc_launch == RAD_OK && t[2].rc_launch == RAD_OK;
-    ok((nm + " launches").c_str(), ran,
-       "rc " + std::to_string(t[0].rc_launch) + "/" + std::to_string(t[1].rc_launch) + "/" +
-           std::to_string(t[2].rc_launch));
+    ok((nm + " launches").c_str(), ran, "init/launch rc " + rcs);
     if (ran) {
         for (size_t k = 0; k < sizes.size(); ++k) {
             const int64_t n = sizes[k];
-            const bool lossy = n * 2 >= 131072 && n % 32 == 0;
+            const bool lossy = n * 2 >= 131072 && n % tile == 0;
             int64_t diff_ranks = 0, inexact = 0;
             double se = 0.0, sx = 0.0, worst = 0.0;
             for (int64_t i = 0; i < n; ++i) {
                 const uint16_t g0 = t[0].out[k][(size_t)i];
-                if (t[1].out[k][(size_t)i] != g0 || t[2].out[k][(size_t)i] != g0) ++diff_ranks;
+                for (int r = 1; r < world; ++r) if (t[(size_t)r].out[k][(size_t)i] != g0) ++diff_ranks;
                 float acc = 0.0f;
-                for (int r = 0; r < 3; ++r) acc += h_bf16(h_to_bf16(ar_ti8_value(r, i)));
+                for (int r = 0; r < world; ++r) acc += h_bf16(h_to_bf16(ar_ti8_value(r, i)));
                 const double e = (double)h_bf16(g0) - (double)acc;
                 if (!lossy && g0 != h_to_bf16(acc)) ++inexact;
                 se += e * e; sx += (double)acc * acc;
@@ -12253,8 +11865,9 @@ static void ar_three_rank_ti8(const Plugin& pl, const std::vector<int>& devs, co
             }
             const double rrms = sx > 0 ? std::sqrt(se / sx) : 0.0;
             const std::string what = nm + " numel " + std::to_string(n) + " (" +
-                                     std::to_string(n / 32) + " groups, % 3 = " +
-                                     std::to_string((n / 32) % 3) + ")";
+                                     std::to_string(n / 32) + " groups, % " +
+                                     std::to_string(world) + " = " +
+                                     std::to_string((n / 32) % world) + ")";
             ok((what + ": every rank holds the same bytes").c_str(), diff_ranks == 0,
                std::to_string(diff_ranks) + " elements differ between ranks");
             if (!lossy) {
@@ -12270,15 +11883,20 @@ static void ar_three_rank_ti8(const Plugin& pl, const std::vector<int>& devs, co
             }
         }
     }
-    if (row->fini) for (int r = 0; r < 3; ++r) if (t[r].inst) row->fini(t[r].inst);
+    if (row->fini) for (ArTi8& a : t) if (a.inst) row->fini(a.inst);
 }
 
-static void gather_three_rank(const Plugin& pl, const std::vector<int>& devs, const char* name) {
+static void gather_wide_rank(const Plugin& pl, const std::vector<int>& devs, const char* name,
+                             int world) {
     const RadKernelInfo* row = find(pl, name);
     if (!row) { ok(name, false, "row absent"); return; }
-    if (devs.size() < 3) { skip(name, "fewer than three gfx1201 cards"); return; }
+    if ((int)devs.size() < world) {
+        skip(name, (std::string("needs ") + std::to_string(world) + " gfx1201 cards").c_str());
+        return;
+    }
     const int64_t numel = 8192;   /* the sampler's own message at 4 rows and 1024 candidates */
-    const int W = 3;
+    const int W = world;
+    const std::string w = std::to_string(world);
     /* What each rank sent, rebuilt here rather than read back off the device (gather_two_rank). */
     auto sent = [](int rank, int64_t i) -> uint32_t {
         if ((i & 1) == 0) return (uint32_t)(rank * 124160 + (int)i + 1);
@@ -12287,63 +11905,70 @@ static void gather_three_rank(const Plugin& pl, const std::vector<int>& devs, co
         return u;
     };
     {
-        ArThread a{ row, 0, devs[0], numel }, b{ row, 1, devs[1], numel }, c{ row, 2, devs[2], numel };
-        a.world = b.world = c.world = W;
-        std::thread ta(gather_worker, &a), tb(gather_worker, &b), tc(gather_worker, &c);
-        ta.join();
-        tb.join();
-        tc.join();
-        ok("3-rank all-gather init (peer rendezvous)",
-           a.rc_init == RAD_OK && b.rc_init == RAD_OK && c.rc_init == RAD_OK,
-           "rc " + std::to_string(a.rc_init) + "/" + std::to_string(b.rc_init) + "/" +
-               std::to_string(c.rc_init));
-        if (a.rc_init != RAD_OK || b.rc_init != RAD_OK || c.rc_init != RAD_OK) return;
-        ok("3-rank all-gather launch",
-           a.rc_launch == RAD_OK && b.rc_launch == RAD_OK && c.rc_launch == RAD_OK,
-           "rc " + std::to_string(a.rc_launch) + "/" + std::to_string(b.rc_launch) + "/" +
-               std::to_string(c.rc_launch));
+        std::vector<ArThread> t((size_t)W);
+        std::vector<std::thread> th;
+        for (int r = 0; r < W; ++r) {
+            t[(size_t)r] = ArThread{ row, r, devs[(size_t)r], numel };
+            t[(size_t)r].world = W;
+            th.emplace_back(gather_worker, &t[(size_t)r]);
+        }
+        for (std::thread& x : th) x.join();
+        bool up = true;
+        std::string rcs;
+        for (const ArThread& a : t) { up = up && a.rc_init == RAD_OK; rcs += std::to_string(a.rc_init) + "/"; }
+        ok((w + "-rank all-gather init (peer rendezvous)").c_str(), up, "rc " + rcs);
+        if (!up) return;
+        bool ran = true;
+        rcs.clear();
+        for (const ArThread& a : t) { ran = ran && a.rc_launch == RAD_OK; rcs += std::to_string(a.rc_launch) + "/"; }
+        ok((w + "-rank all-gather launch").c_str(), ran, "rc " + rcs);
         int64_t bad = 0, bad_id = 0;
-        for (const ArThread* t : { &a, &b, &c }) {
+        for (const ArThread& a : t) {
             for (int r = 0; r < W; ++r) {
                 for (int64_t i = 0; i < numel; ++i) {
                     uint32_t got;
-                    std::memcpy(&got, &t->out[(size_t)(r * numel + i)], 4);
+                    std::memcpy(&got, &a.out[(size_t)(r * numel + i)], 4);
                     if (got == sent(r, i)) continue;
                     ++bad;
                     if ((i & 1) == 0) ++bad_id;
                 }
             }
         }
-        ok("3-rank all-gather places every rank's bytes on every rank, bit for bit", bad == 0,
-           std::to_string(bad) + " words wrong, " + std::to_string(bad_id) + " of them token ids");
-        if (row->fini) { row->fini(a.inst); row->fini(b.inst); row->fini(c.inst); }
+        ok((w + "-rank all-gather places every rank's bytes on every rank, bit for bit").c_str(),
+           bad == 0, std::to_string(bad) + " words wrong, " + std::to_string(bad_id) +
+                          " of them token ids");
+        if (row->fini) for (ArThread& a : t) row->fini(a.inst);
     }
 
-    /* The row-interleaved placement the sampler asks for: [rows][3][row]. */
+    /* The row-interleaved placement the sampler asks for: [rows][world][row]. */
     const int64_t rowe = 2048;                     /* 4 rows of 1024 (id, logit) pairs */
-    ArThread c{ row, 0, devs[0], numel }, d{ row, 1, devs[1], numel }, e{ row, 2, devs[2], numel };
-    c.world = d.world = e.world = W;
-    c.row_elems = d.row_elems = e.row_elems = rowe;
-    std::thread tc(gather_worker, &c), td(gather_worker, &d), te(gather_worker, &e);
-    tc.join();
-    td.join();
-    te.join();
-    if (c.rc_init != RAD_OK || d.rc_init != RAD_OK || e.rc_init != RAD_OK ||
-        c.rc_launch != RAD_OK || d.rc_launch != RAD_OK || e.rc_launch != RAD_OK) {
-        ok("3-rank all-gather, row-interleaved", false,
-           "rc " + std::to_string(c.rc_init) + "/" + std::to_string(d.rc_init) + "/" +
-               std::to_string(e.rc_init) + " init, " + std::to_string(c.rc_launch) + "/" +
-               std::to_string(d.rc_launch) + "/" + std::to_string(e.rc_launch) + " launch");
+    std::vector<ArThread> t((size_t)W);
+    std::vector<std::thread> th;
+    for (int r = 0; r < W; ++r) {
+        t[(size_t)r] = ArThread{ row, r, devs[(size_t)r], numel };
+        t[(size_t)r].world = W;
+        t[(size_t)r].row_elems = rowe;
+        th.emplace_back(gather_worker, &t[(size_t)r]);
+    }
+    for (std::thread& x : th) x.join();
+    bool up = true, ran = true;
+    std::string rcs;
+    for (const ArThread& a : t) {
+        up = up && a.rc_init == RAD_OK; ran = ran && a.rc_launch == RAD_OK;
+        rcs += std::to_string(a.rc_init) + "/" + std::to_string(a.rc_launch) + " ";
+    }
+    if (!up || !ran) {
+        ok((w + "-rank all-gather, row-interleaved").c_str(), false, "init/launch rc " + rcs);
         return;
     }
     const int64_t nrows = numel / rowe;
     int64_t bad = 0, bad_id = 0;
-    for (const ArThread* t : { &c, &d, &e }) {
+    for (const ArThread& a : t) {
         for (int64_t m = 0; m < nrows; ++m) {
             for (int r = 0; r < W; ++r) {
                 for (int64_t j = 0; j < rowe; ++j) {
                     uint32_t got;
-                    std::memcpy(&got, &t->out[(size_t)(m * W * rowe + r * rowe + j)], 4);
+                    std::memcpy(&got, &a.out[(size_t)(m * W * rowe + r * rowe + j)], 4);
                     if (got == sent(r, m * rowe + j)) continue;
                     ++bad;
                     if ((j & 1) == 0) ++bad_id;
@@ -12351,31 +11976,329 @@ static void gather_three_rank(const Plugin& pl, const std::vector<int>& devs, co
             }
         }
     }
-    ok("3-rank all-gather interleaves by row, so one row carries all three ranks", bad == 0,
-       std::to_string(bad) + " words wrong, " + std::to_string(bad_id) + " of them token ids");
-    if (row->fini) { row->fini(c.inst); row->fini(d.inst); row->fini(e.inst); }
-    ok("3-rank all-gather fini ran", true);
+    ok((w + "-rank all-gather interleaves by row, so one row carries all " + w + " ranks").c_str(),
+       bad == 0, std::to_string(bad) + " words wrong, " + std::to_string(bad_id) +
+                     " of them token ids");
+    if (row->fini) for (ArThread& a : t) if (a.inst) row->fini(a.inst);
+    ok((w + "-rank all-gather fini ran").c_str(), true);
+}
+
+/* ------------------------------------------------------------------ the fused write (ar_hc_write*) */
+/* The fused all-reduce + gated-residual-write rows, with the MoE gather optionally in front (the
+ * rows that end the link hold themselves, r4d_rows.cpp). The oracle is the unfused chain rebuilt
+ * on the host in the kernels' own arithmetic: moe_gather's gather word (r4d_ar_gather_word: fp32
+ * ascending-slot accumulate, round-to-nearest-even narrows, the shared arm's product rounded
+ * before the add), then ar_vsum's fp32 ascending-rank fold rounded once to bf16, then hc_write's
+ * word (r4d_ar_hc_write_word, whose pack is round-half-away f2bf rather than the reduce's RTNE,
+ * hence its own helper below). The rows promise bytes identical to the chain they replace, so the
+ * check is byte-exact. Exception: the sigmoid gate is __expf on the card and std::exp here, which
+ * may differ by an f32 ulp and move one bf16 rounding (the tolerance silu_bf16's check names), so
+ * a sigmoid shape counts moved bytes and fails only beyond an ulp.
+ *
+ * Both gather arms are walked: a small M keeps the block slot table in LDS (the launcher widens
+ * its own grid), a prefill-sized M takes the inverse table in the scratch (the same launcher's
+ * by_inv rule), and each rank is given the scratch or not per shape -- the same M, n and scratch
+ * on every rank is what makes the two ranks decide the arm identically. */
+struct ArHc {
+    const RadKernelInfo* row = nullptr;
+    int rank = 0, dev = 0, world = 2;
+    int64_t M = 0, n = 0, hc = 2, top_k = 0;   /* top_k 0: the plain fused write */
+    const char* act = nullptr;                 /* gather's shared arm: null operand, "none", "sigmoid" */
+    bool use_scratch = false;                  /* hand the inverse table's scratch to the gather */
+    void* inst = nullptr;
+    int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
+    std::vector<uint16_t> y_in, inj, h0;       /* what we hand the kernel */
+    std::vector<uint16_t> ye, ew, sh, sg;      /* the gather's inputs */
+    std::vector<int32_t> sorted;
+    std::vector<uint16_t> y_out, h_out;        /* what it leaves behind */
+};
+
+static void ar_hc_worker(ArHc* t) {
+    if (st_set_device(t->dev) != hipSuccess) { t->rc_init = RAD_E_DEVICE; return; }
+    const bool gather = t->top_k > 0;
+    const int64_t Tn = t->M * t->top_k;   /* Tn, not T: T() is this file's RadTensor helper below */
+    std::vector<RadParam> ps = { PI("world_size", t->world), PI("M", t->M), PI("n", t->n),
+                                 PI("hc", t->hc), PS("dtype", "bf16"), PI("wire", 0) };
+    if (gather) ps.push_back(PI("top_k", t->top_k));
+    if (t->act) ps.push_back(PS("act", t->act));
+    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, t->world, &t->inst);
+    if (t->rc_init != RAD_OK) return;
+
+    /* Allocated and freed here, not through dalloc: g_allocs is one host-side list and four
+     * rank threads would race on it (every other cross-rank worker does the same). */
+    void* y = nullptr; void* inj = nullptr; void* h = nullptr;
+    void* ye = nullptr; void* ew = nullptr; void* so = nullptr; void* sh = nullptr; void* sg = nullptr;
+    void* scr = nullptr;
+    const size_t yb = (size_t)(t->M * t->n * 2), hb = (size_t)(t->M * t->hc * t->n * 2);
+    bool mem = hipMalloc(&y, yb) == hipSuccess && hipMalloc(&inj, (size_t)(t->M * t->hc * 2)) ==
+               hipSuccess && hipMalloc(&h, hb) == hipSuccess;
+    if (gather) mem = mem && hipMalloc(&ye, (size_t)(Tn * t->n * 2)) == hipSuccess &&
+                     hipMalloc(&ew, (size_t)(Tn * 2)) == hipSuccess &&
+                     hipMalloc(&so, (size_t)(Tn * 4)) == hipSuccess &&
+                     (!t->act || (hipMalloc(&sh, yb) == hipSuccess &&
+                                  hipMalloc(&sg, (size_t)(t->M * 2)) == hipSuccess));
+    if (!mem) { t->rc_launch = RAD_E_NOMEM; }
+    else {
+        st_memcpy(y, t->y_in.data(), yb, hipMemcpyHostToDevice);
+        st_memcpy(inj, t->inj.data(), (size_t)(t->M * t->hc * 2), hipMemcpyHostToDevice);
+        st_memcpy(h, t->h0.data(), hb, hipMemcpyHostToDevice);
+        if (gather) {
+            st_memcpy(ye, t->ye.data(), (size_t)(Tn * t->n * 2), hipMemcpyHostToDevice);
+            st_memcpy(ew, t->ew.data(), (size_t)(Tn * 2), hipMemcpyHostToDevice);
+            st_memcpy(so, t->sorted.data(), (size_t)(Tn * 4), hipMemcpyHostToDevice);
+            if (t->act) {
+                st_memcpy(sh, t->sh.data(), yb, hipMemcpyHostToDevice);
+                st_memcpy(sg, t->sg.data(), (size_t)(t->M * 2), hipMemcpyHostToDevice);
+            }
+        }
+        std::vector<RadTensor> ts;
+        if (gather) {
+            ts = { T(ye, RAD_BF16, { Tn, t->n }), T(ew, RAD_BF16, { t->M, t->top_k }),
+                   T(so, RAD_I32, { Tn }), T(sh, RAD_BF16, { t->M, t->n }),
+                   T(sg, RAD_BF16, { t->M, 1 }), T(y, RAD_BF16, { t->M, t->n }),
+                   T(inj, RAD_BF16, { t->M, t->hc }), T(h, RAD_BF16, { t->M, t->hc * t->n }) };
+            if (!t->act) { absent(ts[3]); absent(ts[4]); }
+        } else {
+            ts = { T(y, RAD_BF16, { t->M, t->n }), T(inj, RAD_BF16, { t->M, t->hc }),
+                   T(h, RAD_BF16, { t->M, t->hc * t->n }) };
+        }
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.instance = t->inst;
+        a.rank = t->rank;
+        a.world_size = t->world;
+        const int64_t need = gather && t->row->scratch ? t->row->scratch(&a) : 0;
+        if (gather && t->use_scratch) {
+            /* The inverse table's bytes exactly: has_inv is `scratch && scratch_bytes >= Tn * 4`,
+             * and the row's own hook is what says how big that is. */
+            if (need <= 0 || hipMalloc(&scr, (size_t)need) != hipSuccess) {
+                t->rc_launch = RAD_E_NOMEM;
+            } else {
+                st_memset(scr, 0, (size_t)need);
+                a.scratch = scr; a.scratch_bytes = need;
+            }
+        }
+        if (t->rc_launch == RAD_OK) {
+            t->rc_launch = t->row->launch(&a, nullptr);
+            st_stream_sync(nullptr);
+            t->y_out.resize((size_t)(t->M * t->n));
+            t->h_out.resize((size_t)(t->M * t->hc * t->n));
+            st_memcpy(t->y_out.data(), y, yb, hipMemcpyDeviceToHost);
+            st_memcpy(t->h_out.data(), h, hb, hipMemcpyDeviceToHost);
+        }
+    }
+    for (void* p : { y, inj, h, ye, ew, so, sh, sg, scr }) if (p) st_free(p);
+}
+
+/* hc_write's pack (r4d_gdn_wmma.h f2bf): round-half-AWAY, one add. The reduce's from_f and
+ * arg_bf16_rne are round-to-nearest-even; this file's h_to_bf16 is that one, so the write's
+ * oracle needs this. */
+static uint16_t h_bf16_away(float f) {
+    uint32_t u; std::memcpy(&u, &f, 4);
+    return (uint16_t)((u + 0x8000u) >> 16);
+}
+
+static void ar_hc_write_case(const Plugin& pl, const std::vector<int>& devs, const char* name,
+                             int world, bool want_gather) {
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok(name, false, "row absent"); return; }
+    if ((int)devs.size() < world) {
+        skip(name, (std::string("needs ") + std::to_string(world) + " gfx1201 cards").c_str());
+        return;
+    }
+    struct Shape { int64_t M, n, hc, top_k; const char* act; bool scratch; };
+    std::vector<Shape> shapes;
+    if (!want_gather) {
+        /* A decode step's rows and a chunk's, both under the one-shot bands. */
+        shapes = { { 8, 1024, 4, 0, nullptr, false }, { 64, 2560, 2, 0, nullptr, false } };
+    } else {
+        /* The first two stay under the launcher's by_inv line (its own widening keeps the LDS
+         * table at or below eight rows a block); the third is a prefill-sized message where only
+         * the inverse table fits. The shared arm: absent, then "none" (the gate multiplies as it
+         * is -- exact against the host), then "sigmoid" (the ulp-tolerant arm). */
+        shapes = { { 8, 256, 2, 10, nullptr, false }, { 40, 512, 4, 6, "none", false },
+                   { 200, 2048, 2, 10, "sigmoid", true } };
+    }
+    const std::string nm(name);
+    for (const Shape& sh : shapes) {
+        const int64_t M = sh.M, n = sh.n, hc = sh.hc, k = sh.top_k, T = M * k;
+        const bool gather = k > 0;
+        const bool sig = sh.act && !std::strcmp(sh.act, "sigmoid");
+        const std::string at = " M=" + std::to_string(M) + " n=" + std::to_string(n) +
+                               " hc=" + std::to_string(hc) +
+                               (gather ? " top_k=" + std::to_string(k) +
+                                 (sh.act ? std::string(", shared ") + sh.act
+                                         : std::string(", no shared arm"))
+                                       : std::string()) +
+                               (gather && sh.scratch ? ", inverse table" : "");
+
+        /* The routing is replicated across ranks -- every rank sorts the same slots -- while the
+         * routed rows, the weights and the streams are each rank's own. `sorted` is the stable
+         * sort by expert with the live slots first and -1 after, as moe_scatter writes it. */
+        std::vector<int32_t> sorted((size_t)(gather ? T : 0), -1);
+        if (gather) {
+            std::vector<int32_t> ex((size_t)T);
+            uint64_t rs = 0x9E3779B97F4A7C15ull ^ ((uint64_t)M * 1315423911ull) ^
+                          ((uint64_t)n * 2654435761ull) ^ (uint64_t)k;
+            auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+            for (int64_t i = 0; i < T; ++i) {
+                const uint64_t v = rnd();
+                ex[(size_t)i] = (v % 31 == 0) ? -1 : (int32_t)((v >> 8) % 64);
+            }
+            int64_t pos = 0;
+            for (int32_t e = 0; e < 64; ++e)
+                for (int64_t i = 0; i < T; ++i)
+                    if (ex[(size_t)i] == e) sorted[(size_t)pos++] = (int32_t)i;
+        }
+        /* ye's rows are in sorted order, so the kernel resolves token tok, slot j to the sorted
+         * ROW holding slot f = tok*k+j -- the inverse of `sorted` (s_i[f - lo] = i in
+         * r4d_ar_oneshot_2rank_exact.hip's scan, inv[f] = i in r4d_ar_gather_inv_kernel). The
+         * oracle inverts the same way; reading sorted forward would gather the wrong row. */
+        std::vector<int32_t> inv((size_t)(gather ? T : 0), -1);
+        for (int64_t i = 0; gather && i < T; ++i) {
+            const int32_t f = sorted[(size_t)i];
+            if (f >= 0 && f < T) inv[(size_t)f] = (int32_t)i;
+        }
+
+        std::vector<ArHc> t((size_t)world);
+        std::vector<std::thread> th;
+        for (int r = 0; r < world; ++r) {
+            ArHc& x = t[(size_t)r];
+            x.row = row; x.rank = r; x.dev = devs[(size_t)r]; x.world = world;
+            x.M = M; x.n = n; x.hc = hc; x.top_k = k; x.act = sh.act; x.use_scratch = sh.scratch;
+            x.y_in.resize((size_t)(M * n));
+            x.inj.resize((size_t)(M * hc));
+            x.h0.resize((size_t)(M * hc * n));
+            uint64_t rs = 0x9E3779B97F4A7C15ull ^ ((uint64_t)(r + 1) * 0x9E3779B97F4A7C15ull) ^
+                          ((uint64_t)M * 1315423911ull) ^ ((uint64_t)n * 2654435761ull);
+            auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+            for (int64_t i = 0; i < M * n; ++i)
+                x.y_in[(size_t)i] = gather ? (uint16_t)0x7f7fu      /* overwritten or it is junk */
+                                           : h_to_bf16(ar_pattern_value(r, i));
+            for (int64_t i = 0; i < M * hc; ++i)
+                x.inj[(size_t)i] = h_to_bf16(ar_pattern_value(r + 1, i));
+            for (int64_t i = 0; i < M * hc * n; ++i)
+                x.h0[(size_t)i] = h_to_bf16(((int64_t)(rnd() % 4001) - 2000) / 512.0f);
+            if (gather) {
+                x.sorted = sorted;
+                x.ye.resize((size_t)(T * n));
+                x.ew.resize((size_t)T);
+                for (auto& v : x.ye) v = h_to_bf16(((int64_t)(rnd() % 4001) - 2000) / 512.0f);
+                for (auto& v : x.ew) v = h_to_bf16((float)(rnd() % 1000 + 1) / 1024.0f);
+                if (sh.act) {
+                    x.sh.resize((size_t)(M * n));
+                    x.sg.resize((size_t)M);
+                    for (auto& v : x.sh) v = h_to_bf16(((int64_t)(rnd() % 4001) - 2000) / 256.0f);
+                    for (auto& v : x.sg) v = h_to_bf16(((int64_t)(rnd() % 801) - 400) / 100.0f);
+                }
+            }
+            th.emplace_back(ar_hc_worker, &x);
+        }
+        for (std::thread& x : th) x.join();
+
+        bool up = true, ran = true;
+        std::string rcs;
+        for (const ArHc& x : t) {
+            up = up && x.rc_init == RAD_OK; ran = ran && x.rc_launch == RAD_OK;
+            rcs += std::to_string(x.rc_init) + "/" + std::to_string(x.rc_launch) + " ";
+        }
+        ok((nm + at + " init (peer rendezvous)").c_str(), up, "init/launch rc " + rcs);
+        if (!up) return;
+        ok((nm + at + " launch").c_str(), ran, "init/launch rc " + rcs);
+        if (!ran) { if (row->fini) for (ArHc& x : t) if (x.inst) row->fini(x.inst); continue; }
+
+        /* The gather half, per rank, exactly as r4d_ar_gather_word folds it. */
+        std::vector<std::vector<uint16_t>> ymsg((size_t)world, std::vector<uint16_t>((size_t)(M * n)));
+        for (int r = 0; r < world; ++r) {
+            const ArHc& x = t[(size_t)r];
+            if (!gather) { ymsg[(size_t)r] = x.y_in; continue; }
+            for (int64_t tok = 0; tok < M; ++tok)
+                for (int64_t e = 0; e < n; ++e) {
+                    float acc = 0.0f;
+                    for (int64_t j = 0; j < k; ++j) {
+                        const int32_t idx = inv[(size_t)(tok * k + j)];
+                        if (idx < 0) continue;
+                        acc += h_bf16(x.ew[(size_t)(tok * k + j)]) *
+                               h_bf16(x.ye[(size_t)(idx * n + e)]);
+                    }
+                    uint16_t out = h_to_bf16(acc);
+                    if (sh.act) {
+                        const float gate = sig ? 1.0f / (1.0f + std::exp(-h_bf16(x.sg[(size_t)tok])))
+                                               : h_bf16(x.sg[(size_t)tok]);
+                        const uint16_t pr = h_to_bf16(h_bf16(x.sh[(size_t)(tok * n + e)]) * gate);
+                        out = h_to_bf16(h_bf16(pr) + h_bf16(out));
+                    }
+                    ymsg[(size_t)r][(size_t)(tok * n + e)] = out;
+                }
+        }
+        /* The fold, ascending rank, rounded once -- ar_vsum. Then the write -- hc_write_word. */
+        int64_t bad_y = 0, moved_y = 0, bad_h = 0, moved_h = 0, first = -1;
+        double worst = 0.0;
+        for (int64_t i = 0; i < M * n; ++i) {
+            float acc = 0.0f;
+            for (int r = 0; r < world; ++r) acc += h_bf16(ymsg[(size_t)r][(size_t)i]);
+            const uint16_t want_y = h_to_bf16(acc);
+            const int64_t tok = i / n, e = i % n;
+            for (int r = 0; r < world; ++r) {
+                ArHc& x = t[(size_t)r];
+                const uint16_t got = x.y_out[(size_t)i];
+                if (got != want_y) {
+                    const double rel = std::fabs((double)h_bf16(got) - (double)acc) /
+                                       (std::fabs((double)acc) + 1.0);
+                    if (sig && rel <= 0.02) { ++moved_y; if (rel > worst) worst = rel; }
+                    else { ++bad_y; if (first < 0) first = i; }
+                }
+                for (int64_t c = 0; c < hc; ++c) {
+                    const int64_t o = (tok * hc + c) * n + e;
+                    const float wantf = h_bf16(x.h0[(size_t)o]) +
+                                        h_bf16(x.inj[(size_t)(tok * hc + c)]) * h_bf16(want_y);
+                    const uint16_t want = h_bf16_away(wantf);
+                    const uint16_t g = x.h_out[(size_t)o];
+                    if (g != want) {
+                        const double rel = std::fabs((double)h_bf16(g) - (double)wantf) /
+                                           (std::fabs((double)wantf) + 1.0);
+                        if (sig && rel <= 0.02) { ++moved_h; if (rel > worst) worst = rel; }
+                        else { ++bad_h; if (first < 0) first = o; }
+                    }
+                }
+            }
+        }
+        char d[160];
+        std::snprintf(d, sizeof d, "%lld + %lld wrong (first at %lld); %lld + %lld moved by "
+                      "__expf vs std::exp, worst rel %.5f", (long long)bad_y, (long long)bad_h,
+                      (long long)first, (long long)moved_y, (long long)moved_h, worst);
+        ok((nm + at + ": every rank holds the folded y and the written h of the unfused chain, "
+                   "byte for bit").c_str(),
+           bad_y == 0 && bad_h == 0, d);
+        if (gather && !sig) {
+            /* The y the fold leaves is the same bytes on every rank -- the ascending-rank fold is
+             * rank-order symmetric. A rank-local gather output that differs is fine; the folded
+             * one must not. */
+            int64_t skew = 0;
+            for (int64_t i = 0; i < M * n; ++i)
+                for (int r = 1; r < world; ++r)
+                    if (t[(size_t)r].y_out[(size_t)i] != t[0].y_out[(size_t)i]) ++skew;
+            ok((nm + at + ": the folded message is the same bytes on every rank").c_str(),
+               skew == 0, std::to_string(skew) + " elements differ between ranks");
+        }
+        if (row->fini) for (ArHc& x : t) if (x.inst) row->fini(x.inst);
+    }
 }
 
 /* ------------------------------------------------------------------ the device sweep */
 
-/* NGRAM_IDS' `ahead_ids`: the prompt that follows the step, hashed in the same launch. Step one
- * runs two sequences, [5, 6] and [11, 42], with three more tokens of the LAST one, [7, 8, 9], in
- * `tok` behind them. Their ids must be the ids step two computes running [7, 8, 9] against the
- * window step one left; that window must be the step's own; and the step's own ids must be the
- * ones a launch without `ahead_ids` writes. The same property ref_test holds libref to. */
 /* embed_lookup_q against a host gather of the same bytes, through the host side's own conversions.
  *
- * THE BAR IS THE BIT, not a tolerance. libavx's gather decodes a code as
- * rad_f32_to_bf16(rad_fp8e4m3_to_f32(code) * scale), and the device kernel has to produce exactly
- * that for every code, or one model reads a different n-gram embedding depending on which tier
- * --ngram-placement put its table on. So the oracle is those two functions, the table holds every
- * code but the two NaN encodings (no quantiser writes them), and the comparison is of the bytes.
+ * Bit-exact: libavx's gather decodes a code as rad_f32_to_bf16(rad_fp8e4m3_to_f32(code) * scale),
+ * and the device kernel must match for every code, or the n-gram embedding would depend on the
+ * tier --ngram-placement chose. The table holds every code except the two NaN encodings.
  *
- * Five launches: the quad walk and the entry walk (the model's width of 160, and 13); an E4M3
- * table with a scale and a plain bf16 one without, whose rows come back unchanged; the table in
- * VRAM and in pinned host memory read over the link, the placement this kernel exists for. The ids
- * include padding (-1) and one past the table, and both write a zero row. */
+ * Five launches: the quad walk and the entry walk (widths 160, the model's, and 13); an E4M3 table
+ * with a scale and a plain bf16 one (rows unchanged); the table in VRAM and in pinned host memory
+ * read over the link. The ids include padding (-1) and one past the table, both writing a zero
+ * row. */
 static void embed_lookup_q_case(const Plugin& pl) {
     if (!sel("embed_lookup_q_bf16")) return;
     const char* what = "embed_lookup_q vs a host gather, to the bit";
@@ -12434,7 +12357,7 @@ static void embed_lookup_q_case(const Plugin& pl) {
         void* d_tok = dalloc((size_t)M * 4);
         st_memcpy(d_tok, ids.data(), (size_t)M * 4, hipMemcpyHostToDevice);
         void* d_x = dalloc((size_t)(M * sh.ne * 2));
-        st_memset(d_x, 0xFF, (size_t)(M * sh.ne * 2));    /* a zero row has to be written */
+        st_memset(d_x, 0xFF, (size_t)(M * sh.ne * 2));    /* zero rows must be written */
 
         std::vector<RadTensor> ts = { T(d_tok, RAD_I32, { M }),
                                       T(d_tab, sh.e4m3 ? RAD_F8E4M3 : RAD_BF16, { NV, sh.ne }),
@@ -12477,6 +12400,11 @@ static void embed_lookup_q_case(const Plugin& pl) {
     ok(what, bad.empty(), bad);
 }
 
+/* ngram_ids' `ahead_ids`: the prompt following the step, hashed in the same launch. Step one runs
+ * [5, 6] and [11, 42], with three more tokens of the last sequence, [7, 8, 9], in `tok` behind
+ * them. Their ids must equal what step two computes for [7, 8, 9] against the window step one
+ * left; that window must be the step's own; and the step's ids must match a launch without
+ * `ahead_ids`. ref_test holds libref to the same property. */
 static void ngram_ahead_case(const Plugin& pl) {
     if (!sel("ngram_ids_i32")) return;
     const RadKernelInfo* r = find(pl, "ngram_ids_i32");
@@ -12542,10 +12470,9 @@ static void device_phase(const Plugin& pl) {
         skip("device phase", "no HIP device");
         return;
     }
-    /* A host can present more HIP devices than it has discrete cards: an integrated part shows up
-     * alongside them, reporting tens of GiB of "VRAM" that is really system RAM. Filtering on the
-     * arch string rather than taking device 0 is not defensive tidiness -- a rank landing on the
-     * integrated part runs slowly and wrongly and the failure looks like a kernel bug. */
+    /* An integrated GPU can appear beside the discrete cards, reporting system RAM as "VRAM".
+     * Devices are filtered on the arch string, since a rank on the integrated part would fail in a
+     * way that looks like a kernel bug. */
     std::vector<int> devs;
     for (int d = 0; d < n; ++d) {
         hipDeviceProp_t p;
@@ -12574,41 +12501,46 @@ static void device_phase(const Plugin& pl) {
     attn_case(pl, "attn_decode_h128_gqa4_bf16kv",  128, 4,  1, "bf16",     0);
     attn_case(pl, "attn_prefill_h64_gqa4_bf16kv",   64, 4, 32, "bf16",     1);
     attn_case(pl, "attn_prefill_h64_gqa4_bf16kv",   64, 4,  1, "bf16",     1);
-    /* Gemma 4 dense sliding window: decode only, so the window is threaded through -- 1024 is the
-     * model's window. It exercises the windowed split law and the WIN=1 template the way the
-     * drafter leg does; max_ctx here is smaller than the window, so the span clamps to the context. */
+    /* Gemma 4 dense sliding window, decode, with the model's window of 1024: exercises the
+     * windowed split law and the WIN=1 template. max_ctx is below the window, so the span clamps to
+     * the context. */
     attn_case(pl, "attn_decode_h256_gqa2_fp8kv",   256, 2,  1, "fp8_e4m3", 0, 1024);
     attn_case(pl, "attn_decode_h256_gqa2_bf16kv", 256, 2,  1, "bf16",     0, 1024);
-    /* Gemma 4 dense sliding window: the PREFILL leg, the band above q_len 32 that a trunk layer
-     * needs on the device (libref is an opt-in fallback the engine refuses by default, spec §17).
-     * The windowed query-tiled prefill kernel; window 1024 is the model's, threaded through to
-     * instantiate WIN=1 the way the decode leg does. max_ctx here (64) is smaller than the window, so the span clamps to the
-     * context and the launch is the full-attention form. */
+    /* Gemma 4 dense sliding window, prefill (q_len above 32), on the windowed query-tiled kernel
+     * with WIN=1 (window 1024). max_ctx (64) is below the window, so the span clamps to the context
+     * and the launch is the full-attention form. */
     attn_case(pl, "attn_prefill_h256_gqa2_fp8kv",  256, 2, 32, "fp8_e4m3", 1, 1024);
     attn_case(pl, "attn_prefill_h256_gqa2_bf16kv", 256, 2, 32, "bf16",     1, 1024);
-    /* Gemma 4 dense global: head_dim 512, full attention, on the windowed kernel -- one row for
-     * every q_len, so a prefill-shaped launch (q_len 32) and a decode one (1) of the same row; the
-     * numeric check of both follows. */
+    /* Gemma 4 dense global: head_dim 512, full attention, on the windowed kernel (one row for every
+     * q_len): a prefill-shaped launch (q_len 32) and a decode one (1); numeric checks follow. */
     attn_case(pl, "attn_window_h512_gqa8_fp8kv",  512, 8, 32, "fp8_e4m3", 1);
     attn_case(pl, "attn_window_h512_gqa8_bf16kv", 512, 8, 32, "bf16",     1);
     attn_case(pl, "attn_window_h512_gqa8_fp8kv",  512, 8,  1, "fp8_e4m3", 0);
     attn_case(pl, "attn_window_h512_gqa8_bf16kv", 512, 8,  1, "bf16",     0);
-    /* The numeric attention check: the same rows, but with random data and a comparison
-     * against the inline oracle, plus a negative control. */
+    /* Numeric checks of the same rows: random data against the inline oracle, with a negative
+     * control. */
     attn_numeric_case(pl, "attn_window_h512_gqa8_fp8kv",  512, 8, 32, "fp8_e4m3", 0);
     attn_numeric_case(pl, "attn_window_h512_gqa8_bf16kv", 512, 8, 32, "bf16",     0);
     attn_numeric_case(pl, "attn_window_h512_gqa8_fp8kv",  512, 8,  1, "fp8_e4m3", 0);
     attn_numeric_case(pl, "attn_window_h512_gqa8_bf16kv", 512, 8,  1, "bf16",     0);
-    /* The h256/gqa2 PREFILL numeric check. Unlike the decode leg (ctx 64 < window, so the window
-     * clamps to the context), ctx here is 2048 > window 1024, so the window actually bites: for
-     * query row 0, pos = 2048-64 = 1984 and the visible keys are [961..1984], so the kernel's
-     * wlo0 = 961 and tstart = 961/48 = 20 -- exercising both the window mask (keys below 961 are
-     * masked) and the below-window tile skip (tiles 0..19 are never walked). The oracle's
-     * visible() is the same bound, so the two agree. */
+    /* The h256/gqa2 prefill numeric check with ctx 2048 > window 1024, so the window applies: for
+     * query row 0, pos = 2048-64 = 1984 and the visible keys are [961..1984], so wlo0 = 961 and
+     * tstart = 961/48 = 20. This exercises the window mask and the below-window tile skip (tiles
+     * 0..19 are never walked). */
     attn_numeric_case(pl, "attn_prefill_h256_gqa2_fp8kv",    256, 2, 64, "fp8_e4m3", 1024, 2048);
     attn_numeric_case(pl, "attn_prefill_h256_gqa2_bf16kv",   256, 2, 64, "bf16",     1024, 2048);
     attn_numeric_case(pl, "attn_decode_h256_gqa2_fp8kv",    256, 2,  1, "fp8_e4m3", 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa2_bf16kv",   256, 2,  1, "bf16",     1024);
+    /* Two queries per KV head at 128: Qwen3-1.7B, Qwen3-ASR's decoder. */
+    attn_case(pl, "attn_prefill_h128_gqa2_fp8kv",  128, 2, 32, "fp8_e4m3", 1);
+    attn_case(pl, "attn_prefill_h128_gqa2_bf16kv", 128, 2, 32, "bf16",     1);
+    attn_case(pl, "attn_decode_h128_gqa2_fp8kv",   128, 2,  1, "fp8_e4m3", 0);
+    attn_case(pl, "attn_decode_h128_gqa2_bf16kv",  128, 2,  1, "bf16",     0);
+    attn_numeric_case(pl, "attn_prefill_h128_gqa2_fp8kv",  128, 2, 64, "fp8_e4m3", 0, 256);
+    attn_numeric_case(pl, "attn_prefill_h128_gqa2_bf16kv", 128, 2, 64, "bf16",     0, 256);
+    attn_numeric_case(pl, "attn_decode_h128_gqa2_fp8kv",   128, 2,  1, "fp8_e4m3", 0, 256);
+    attn_numeric_case(pl, "attn_decode_h128_gqa2_bf16kv",  128, 2,  1, "bf16",     0, 256);
+    attn_numeric_case(pl, "attn_decode_h128_gqa2_bf16kv",  128, 2, 24, "bf16",     0, 256);
     attn_gq_fold_case(pl, 3, false);
     attn_gq_fold_case(pl, 24, false);
     attn_gq_fold_case(pl, 3, true);
@@ -12637,8 +12569,8 @@ static void device_phase(const Plugin& pl) {
         }
     }
     /* The encoder attention rows: a fused [q|k|v] projection read through column slices, at each
-     * compiled (head_dim, gqa), with and without a window. Numerics are rad-kbench's (libref is
-     * the oracle); this is the launch at every geometry. */
+     * compiled (head_dim, gqa), with and without a window. Launch only; numerics are rad-kbench's
+     * (libref is the oracle). */
     {
         struct G { const char* name; int64_t hd, nh, nkv; };
         for (const G& g : { G{ "attn_dense_h64_bf16", 64, 4, 4 },
@@ -12749,10 +12681,9 @@ static void device_phase(const Plugin& pl) {
             run_case(r, ts, ps);
         }
     }
-    /* --- the audio tower's ops, NUMERICALLY: each kernel against the formula libref implements,
-     * computed here on the host from the same bf16 inputs. rad-kbench's replay fixture predates
-     * these ops and a container-driven run needs the model, so this is where a wrong index in
-     * one of them shows up without either. Relative L2 against a bf16 rounding of the answer. */
+    /* --- the audio tower's ops, numerically: each kernel against the formula libref implements,
+     * computed on the host from the same bf16 inputs (rad-kbench's replay fixture predates these
+     * ops). Relative L2 against a bf16 rounding of the answer. */
     {
         uint64_t seed = 0x5eedull;
         auto rnd = [&]() {
@@ -12817,12 +12748,11 @@ static void device_phase(const Plugin& pl) {
                     const float v = h_bf16(h_to_bf16(x[i]));
                     want[i] = v * (1.0f / (1.0f + std::exp(-v)));
                 }
-                /* expf on the card and std::exp here may differ by an ulp of f32, which can move
-                 * a bf16 rounding; anything beyond that is a wrong kernel. */
+                /* expf and std::exp may differ by an f32 ulp, moving a bf16 rounding. */
                 check("silu_bf16 numerics", down(dy, x.size()), want, 1e-3);
             } else ok("silu_bf16", false, "row absent");
-            /* PAST THE GRID'S Y LIMIT: the audio subsampler's rectifier runs over 96000 rows of
-             * 128, and a launch of one grid row a matrix row stops at 65535. */
+            /* Past the grid's y limit: the audio subsampler's rectifier runs over 96000 rows of
+             * 128, beyond the 65535 a one-grid-row-per-matrix-row launch reaches. */
             if (const RadKernelInfo* r = find(pl, "relu_bf16")) {
                 const int64_t Mb = 70000, nb = 32;
                 std::vector<float> xb = randv((size_t)(Mb * nb), 2.0f);
@@ -12897,7 +12827,7 @@ static void device_phase(const Plugin& pl) {
                 if (!r) break;
                 const int64_t kh = 3, kw = 3, st = 2, pad = 1;
                 const int64_t Wo = (g.W + 2 * pad - kw) / st + 1;
-                const int64_t T0 = g.M / 2;                         /* rows a segment */
+                const int64_t T0 = g.M / 2;                         /* rows per segment */
                 const int64_t To = (T0 + 2 * pad - kh) / st + 1, Mo = 2 * To;
                 std::vector<float> x = randv((size_t)(g.M * g.W * g.cin), 1.0f);
                 std::vector<float> w = randv((size_t)(g.cout * g.cin * kh * kw), 0.3f);
@@ -12944,6 +12874,195 @@ static void device_phase(const Plugin& pl) {
                             }
                 check(g.cin == 1 ? "conv2d_bf16 layer0 numerics" : "conv2d_bf16 layer1 numerics",
                       down(dy, want.size()), want, 1e-2);
+            }
+            /* Qwen3-ASR's: a [mel, time] kernel (time last) with a bias and gelu, over seconds
+             * staged 13 rows apart with the alignment rows masked; and the 7680 -> 1024 linear as
+             * a 1 x W convolution over the frequency axis. Small channel counts, same indexing. */
+            struct Q { int64_t M, W, cin, cout, kh, kw, st, pad, tl; bool bias, gelu; };
+            for (const Q& q : { Q{ 26, 16, 6, 10, 3, 3, 2, 1, 1, true, true },
+                                Q{ 13, 8, 6, 12, 1, 8, 1, 0, 0, false, false } }) {
+                if (!r) break;
+                const int64_t Wo = (q.W + 2 * q.pad - q.kw) / q.st + 1;
+                const int64_t To = (q.M + 2 * q.pad - q.kh) / q.st + 1;
+                std::vector<float> x = randv((size_t)(q.M * q.W * q.cin), 1.0f);
+                std::vector<float> w = randv((size_t)(q.cout * q.cin * q.kh * q.kw), 0.3f);
+                std::vector<float> bias = randv((size_t)q.cout, 0.5f);
+                std::vector<int32_t> cu = { 0, (int32_t)q.M };
+                std::vector<int32_t> valid((size_t)q.M, 1);
+                if (q.bias) for (int64_t t = 0; t < q.M; ++t) valid[(size_t)t] = t % 13 < 11;
+                void* dx = up(x);
+                void* dw = up(w);
+                void* db = up(bias);
+                void* dcu = dalloc(cu.size() * 4);
+                void* dv = dalloc(valid.size() * 4);
+                fill_i32(dcu, cu);
+                fill_i32(dv, valid);
+                void* dy = dalloc((size_t)(To * Wo * q.cout) * 2);
+                std::vector<RadTensor> ts = { T(dx, RAD_BF16, { q.M, q.W * q.cin }),
+                                              T(dw, RAD_BF16, { q.cout, q.cin, q.kh, q.kw }),
+                                              T(dcu, RAD_I32, { 2 }),
+                                              q.bias ? T(dv, RAD_I32, { q.M }) : RadTensor{},
+                                              T(dy, RAD_BF16, { To, Wo * q.cout }),
+                                              q.bias ? T(db, RAD_BF16, { q.cout }) : RadTensor{} };
+                std::vector<RadParam> ps = { PI("M", q.M), PI("width", q.W), PI("cin", q.cin),
+                                             PI("cout", q.cout), PI("kh", q.kh), PI("kw", q.kw),
+                                             PI("stride", q.st), PI("pad", q.pad),
+                                             PS("dtype", "bf16"), PI("t_last", q.tl),
+                                             PS("act", q.gelu ? "gelu" : "none") };
+                run_case(r, ts, ps);
+                std::vector<float> want((size_t)(To * Wo * q.cout), 0.0f);
+                for (int64_t to = 0; to < To; ++to)
+                    for (int64_t wo = 0; wo < Wo; ++wo)
+                        for (int64_t co = 0; co < q.cout; ++co) {
+                            float acc = 0.0f;
+                            for (int64_t i = 0; i < q.kh; ++i) {
+                                const int64_t ti = to * q.st - q.pad + i;
+                                if (ti < 0 || ti >= q.M || (q.bias && !valid[(size_t)ti])) continue;
+                                for (int64_t j = 0; j < q.kw; ++j) {
+                                    const int64_t wi = wo * q.st - q.pad + j;
+                                    if (wi < 0 || wi >= q.W) continue;
+                                    for (int64_t ci = 0; ci < q.cin; ++ci) {
+                                        const int64_t wix = q.tl
+                                            ? ((co * q.cin + ci) * q.kw + j) * q.kh + i
+                                            : ((co * q.cin + ci) * q.kh + i) * q.kw + j;
+                                        acc += x[(size_t)((ti * q.W + wi) * q.cin + ci)] *
+                                               w[(size_t)wix];
+                                    }
+                                }
+                            }
+                            if (q.bias) acc += bias[(size_t)co];
+                            if (q.gelu) {
+                                const float v = h_bf16(h_to_bf16(acc));
+                                acc = 0.5f * v * (1.0f + std::erf(v * 0.70710678118654752f));
+                            }
+                            want[(size_t)((to * Wo + wo) * q.cout + co)] = acc;
+                        }
+                check(q.gelu ? "conv2d_bf16 time-last bias gelu numerics"
+                             : "conv2d_bf16 1 x W projection numerics",
+                      down(dy, want.size()), want, 1e-2);
+            }
+        }
+        if (sel("conv2d_unfold_bf16")) {
+            /* The receptive fields of a [mel, time] 3x3 stride-2 convolution over one segment with
+             * a masked row, columns in the time-last weight's order. A copy: exact. */
+            const RadKernelInfo* r = find(pl, "conv2d_unfold_bf16");
+            if (!r) ok("conv2d_unfold_bf16", false, "row absent");
+            else {
+                const int64_t M = 10, W = 6, cin = 5, Wo = 3, To = 5, K = cin * 9;
+                std::vector<float> x = randv((size_t)(M * W * cin), 1.0f);
+                std::vector<int32_t> cu = { 0, (int32_t)M };
+                std::vector<int32_t> valid((size_t)M, 1);
+                valid[4] = 0;
+                void* dx = up(x);
+                void* dcu = dalloc(8);
+                void* dv = dalloc((size_t)M * 4);
+                fill_i32(dcu, cu);
+                fill_i32(dv, valid);
+                void* dy = dalloc((size_t)(To * Wo * K) * 2);
+                std::vector<RadTensor> ts = { T(dx, RAD_BF16, { M, W * cin }), T(dcu, RAD_I32, { 2 }),
+                                              T(dv, RAD_I32, { M }),
+                                              T(dy, RAD_BF16, { To * Wo, K }) };
+                std::vector<RadParam> ps = { PI("M", M), PI("width", W), PI("cin", cin),
+                                             PI("kh", 3), PI("kw", 3), PI("stride", 2),
+                                             PI("pad", 1), PI("t_last", 1), PS("dtype", "bf16") };
+                run_case(r, ts, ps);
+                std::vector<float> want((size_t)(To * Wo * K), 0.0f);
+                for (int64_t to = 0; to < To; ++to)
+                    for (int64_t wo = 0; wo < Wo; ++wo)
+                        for (int64_t ci = 0; ci < cin; ++ci)
+                            for (int64_t j = 0; j < 3; ++j)
+                                for (int64_t i = 0; i < 3; ++i) {
+                                    const int64_t ti = to * 2 - 1 + i, wi = wo * 2 - 1 + j;
+                                    float v = 0.0f;
+                                    if (ti >= 0 && ti < M && wi >= 0 && wi < W && valid[(size_t)ti])
+                                        v = x[(size_t)((ti * W + wi) * cin + ci)];
+                                    want[(size_t)((to * Wo + wo) * K + (ci * 3 + j) * 3 + i)] = v;
+                                }
+                check("conv2d_unfold_bf16 numerics", down(dy, want.size()), want, 1e-6);
+            }
+        }
+        if (sel("seg_sinusoid_bf16")) {
+            const RadKernelInfo* r = find(pl, "seg_sinusoid_bf16");
+            if (!r) ok("seg_sinusoid_bf16", false, "row absent");
+            else {
+                /* Two clips of 30 and 17 rows in units of 8, positions mod 13. */
+                const int64_t M = 47, n = 64;
+                std::vector<int32_t> cu = { 0, 240, 376 };
+                void* dcu = dalloc(cu.size() * 4);
+                fill_i32(dcu, cu);
+                void* dy = dalloc((size_t)(M * n) * 2);
+                std::vector<RadTensor> ts = { T(dcu, RAD_I32, { 3 }), T(dy, RAD_BF16, { M, n }) };
+                std::vector<RadParam> ps = { PI("M", M), PI("n", n), PI("period", 13),
+                                             PI("cu_div", 8), PS("dtype", "bf16") };
+                run_case(r, ts, ps);
+                std::vector<float> want((size_t)(M * n));
+                const float inc = (float)(std::log(10000.0) / (double)(n / 2 - 1));
+                for (int64_t row = 0; row < M; ++row) {
+                    const int64_t p = (row < 30 ? row : row - 30) % 13;
+                    for (int64_t i = 0; i < n / 2; ++i) {
+                        const float ang = (float)p * std::exp((float)i * -inc);
+                        want[(size_t)(row * n + i)] = std::sin(ang);
+                        want[(size_t)(row * n + n / 2 + i)] = std::cos(ang);
+                    }
+                }
+                check("seg_sinusoid_bf16 numerics", down(dy, want.size()), want, 5e-3);
+            }
+        }
+        if (sel("attn_dense_h64_bf16")) {
+            /* Blocks: two clips of 30 and 17 rows (cu_seqlens in units of 8), each cut into
+             * blocks of 13 rows from its start, attending within the block; 2 heads of 64 in one
+             * fused [q|k|v] row. Against a host softmax over the same bf16 inputs. */
+            const RadKernelInfo* r = find(pl, "attn_dense_h64_bf16");
+            if (r) {
+                const int64_t M = 47, H = 2, D = 64, width = 3 * H * D, blk = 13;
+                std::vector<float> qkv = randv((size_t)(M * width), 1.0f);
+                std::vector<int32_t> cu = { 0, 240, 376 };
+                void* dq = up(qkv);
+                void* dcu = dalloc(cu.size() * 4);
+                fill_i32(dcu, cu);
+                void* dout = dalloc((size_t)(M * H * D) * 2);
+                auto col = [&](int64_t first) {
+                    RadTensor t = T(dq, RAD_BF16, { M, H * D });
+                    t.data = (void*)((uint16_t*)dq + first);
+                    t.stride[0] = width;
+                    return t;
+                };
+                std::vector<RadTensor> ts = { col(0), col(H * D), col(2 * H * D),
+                                              T(dcu, RAD_I32, { 3 }),
+                                              T(dout, RAD_BF16, { M, H * D }) };
+                std::vector<RadParam> ps = { PI("M", M), PI("head_dim", D), PI("gqa", 1),
+                                             PI("causal", 0), PS("dtype", "bf16"),
+                                             PF("scale", 0.125), PI("max_seqlen", M),
+                                             PI("cu_div", 8), PI("block", blk) };
+                run_case(r, ts, ps);
+                std::vector<float> want((size_t)(M * H * D), 0.0f);
+                for (int64_t i = 0; i < M; ++i) {
+                    const int64_t s0 = i < 30 ? 0 : 30, s1 = i < 30 ? 30 : M;
+                    const int64_t b0 = s0 + (i - s0) / blk * blk;
+                    const int64_t b1 = std::min(s1, b0 + blk);
+                    for (int64_t h = 0; h < H; ++h) {
+                        std::vector<double> sc((size_t)(b1 - b0));
+                        double mx = -1e30;
+                        for (int64_t j = b0; j < b1; ++j) {
+                            double d = 0;
+                            for (int64_t e = 0; e < D; ++e)
+                                d += qkv[(size_t)(i * width + h * D + e)] *
+                                     qkv[(size_t)(j * width + H * D + h * D + e)];
+                            sc[(size_t)(j - b0)] = d * 0.125;
+                            mx = std::max(mx, sc[(size_t)(j - b0)]);
+                        }
+                        double sum = 0;
+                        for (auto& v : sc) { v = std::exp(v - mx); sum += v; }
+                        for (int64_t e = 0; e < D; ++e) {
+                            double a = 0;
+                            for (int64_t j = b0; j < b1; ++j)
+                                a += sc[(size_t)(j - b0)] *
+                                     qkv[(size_t)(j * width + 2 * H * D + h * D + e)];
+                            want[(size_t)(i * H * D + h * D + e)] = (float)(a / sum);
+                        }
+                    }
+                }
+                check("attn_dense_h64_bf16 blocks numerics", down(dout, want.size()), want, 2e-2);
             }
         }
         if (sel("conv1d_dw_bf16")) {
@@ -13065,13 +13184,9 @@ static void device_phase(const Plugin& pl) {
 
     /* --- cast: the strided row copy an intermediate-hidden-state tap writes with -------------
      *
-     * The destination is deliberately a COLUMN SLICE of a wider buffer, because that is the only
-     * thing about this row that can be wrong. A contiguous copy is uninteresting; a copy that has
-     * to honour a destination row pitch different from the source's is what puts five taps of the
-     * trunk's residual stream side by side in one [T, 5 * n_embd] row, and getting the pitch wrong
-     * writes a correct-looking tensor into the wrong columns. So the check is exact -- byte for
-     * byte, this is a copy -- and it asserts the UNTOUCHED columns too, since a kernel that
-     * ignored the pitch would fill them. */
+     * The destination is a column slice of a wider buffer, as when five taps of the trunk's
+     * residual stream go side by side in one [T, 5 * n_embd] row; a wrong pitch writes the wrong
+     * columns. Checked byte for byte, including that the untouched columns keep their fill. */
     if (sel("cast_bf16_bf16")) {
         const RadKernelInfo* r = find(pl, "cast_bf16_bf16");
         if (!r) ok("cast_bf16_bf16", false, "row absent");
@@ -13085,13 +13200,13 @@ static void device_phase(const Plugin& pl) {
             if (!d_src || !d_dst) { ok("cast alloc", false, "hipMalloc failed"); }
             else {
                 st_memcpy(d_src, src.data(), (size_t)M * n * 2, hipMemcpyHostToDevice);
-                /* A fill the copy must not spread: every untouched column has to still hold it. */
+                /* A fill every untouched column must keep. */
                 std::vector<uint16_t> fill((size_t)(M * wide), h_to_bf16(-7.5f));
                 st_memcpy(d_dst, fill.data(), (size_t)M * wide * 2, hipMemcpyHostToDevice);
 
                 RadTensor ty = T(d_dst, RAD_BF16, { M, n });
                 ty.data   = (void*)((uint16_t*)d_dst + slot * n);   /* the slice's first element */
-                ty.stride[0] = wide;                                /* ...at the WIDE row pitch */
+                ty.stride[0] = wide;                                /* at the wide row pitch */
                 std::vector<RadTensor> ts = { T(d_src, RAD_BF16, { M, n }), ty };
                 std::vector<RadParam> ps = {
                     PI("M", M), PI("n", n), PS("from", "bf16"), PS("to", "bf16"),
@@ -13127,7 +13242,7 @@ static void device_phase(const Plugin& pl) {
                 RadTensor ty = T(d, RAD_BF16, { M, n });
                 ty.stride[0] = wide;
                 std::vector<RadTensor> ts = { ty };
-                /* Default value: zero. The whole point of the op is that this is exactly 0x0000. */
+                /* The default value, zero, must be exactly 0x0000. */
                 std::vector<RadParam> p0 = { PI("M", M), PI("n", n), PS("dtype", "bf16") };
                 run_case(r, ts, p0);
                 std::vector<uint16_t> got((size_t)(M * wide));
@@ -13155,11 +13270,9 @@ static void device_phase(const Plugin& pl) {
         }
     }
     /* --- byte rows: the KV tier's transfer pair --- */
-    /* PACK AND UNPACK A POOL, which is the only thing these two are ever asked to do. The layout
-     * here is the real one in miniature: a "layer" is `rows` blocks of `n` bytes, the blocks a
-     * session holds are scattered through it, and what must come back is those blocks and nothing
-     * else. Bytes rather than a float dtype because a KV fragment is whatever the attention kernel
-     * wrote -- an exact comparison is the only meaningful one, and at u8 it is available. */
+    /* Pack and unpack a pool, the real layout in miniature: a "layer" is `rows` blocks of `n`
+     * bytes, a session's blocks are scattered through it, and exactly those blocks must come back.
+     * Bytes, since a KV fragment holds arbitrary data and must compare exactly. */
     if (sel("gather_rows_u8") || sel("scatter_rows_u8")) {
         const RadKernelInfo* rg = find(pl, "gather_rows_u8");
         const RadKernelInfo* rs = find(pl, "scatter_rows_u8");
@@ -13195,10 +13308,8 @@ static void device_phase(const Plugin& pl) {
                             pool[(size_t)(sel_blocks[m] * n + i)]) { gathered = false; break; }
                 ok("gather_rows_u8 packs scattered blocks byte for byte", gathered);
 
-                /* Now scatter them back into a DIFFERENT pool prefilled with a marker, and the
-                 * blocks nobody named have to still hold it. That is the property the whole op
-                 * exists for: the destination is shared, and a restore that touched a row it was
-                 * not given would be destroying another session's context. */
+                /* Scatter them into a different pool prefilled with a marker; unnamed blocks must
+                 * keep it, since the destination is shared with other sessions. */
                 std::vector<uint8_t> mark((size_t)(rows * n), 0x5C);
                 st_memcpy(d_pool, mark.data(), (size_t)rows * n, hipMemcpyHostToDevice);
                 std::vector<RadTensor> ts2 = { T(d_pack, RAD_U8, { M, n }),
@@ -13325,19 +13436,16 @@ static void device_phase(const Plugin& pl) {
                     T(nullptr, RAD_F32,  { H }),                 /* dt_bias          */
                     T(nullptr, RAD_F32,  { N, H, V, K }),        /* state            */
                     TI32({ N }, iota_i32(N)),                    /* state_idx        */
-                    /* num_accepted indexes the state-index ROW as `nacc - 1`, so a zero here is
-                     * a read one int before the buffer. One accepted token is the decode step
-                     * this case models. */
+                    /* num_accepted indexes the state-index row as `nacc - 1`, so zero would read
+                     * one int before the buffer; one accepted token is a plain decode step. */
                     TI32({ N }, rep_i32(N, 1)),                  /* num_accepted     */
                     TI32({ N + 1 }, cu_even(N, Td)),             /* cu               */
                     T(nullptr, RAD_BF16, { Td, H, V }),          /* z                */
                     T(nullptr, RAD_F32,  { V }),                 /* norm_w           */
                     T(nullptr, RAD_BF16, { Td, H, V }),          /* o                */
-                    /* THE FOLDED QUANTISER, present so the case covers it: absent, the kernel
-                     * writes bf16 only and the two extra outputs are never compared. head_v is
-                     * the fp8 block width, so the scale plane is one f32 a (token, value head)
-                     * and ref quantises the bf16 it just stored -- which is what makes the two
-                     * agree to the byte rather than to a tolerance. */
+                    /* The folded quantiser, present so it is covered. head_v is the fp8 block
+                     * width, so the scale plane is one f32 per (token, value head), and ref
+                     * quantises the bf16 it stored, so the two agree byte for byte. */
                     T(nullptr, RAD_F8E4M3, { Td, H * V }),       /* o_q              */
                     T(nullptr, RAD_F32,    { Td, H }),           /* o_scale          */
                 };
@@ -13385,24 +13493,19 @@ static void device_phase(const Plugin& pl) {
             };
             run_case(r, ts, ps);
         }
-        /* The drafter's own shape (block 8, 5120 channels) and a wider block, because the tap
-         * mask is the block position and a block of 16 exercises a different mask. */
+        /* The drafter's own shape (block 8, 5120 channels) and a block of 16, whose tap mask
+         * differs. */
         dflash_conv_numeric(pl, 64, 256, 16, 2, 16);
         dflash_conv_numeric(pl, 32, 5120, 16, 2, 8);
     }
 
-    /* --- dflash select: NUMERIC, because the thing worth testing is the CHAINING.
+    /* --- dflash select, numerically: the chaining is what is tested.
      *
-     * The walk's whole reason to exist is that step l's score depends on the token step l-1 chose.
-     * A kernel that scored every step against the anchor instead would still emit K plausible ids
-     * per sequence, in range, in the right shape -- and the drafter would simply accept less. So
-     * the case is built to distinguish the two: it asserts the chained path AND asserts that an
-     * anchor-pinned walk over the same data would have produced a different one, which is what
-     * makes the first assertion mean something.
+     * Step l's score depends on the token step l-1 chose. A kernel scoring every step against the
+     * anchor would still emit plausible ids, and the drafter would just accept less. So the case
+     * asserts the chained path and that an anchor-pinned walk over the same data differs.
      *
-     * Every value is a power of two times a quarter, so the f32 accumulation is EXACT whatever
-     * order the wave reduces in and the expected path is a comparison of exact integers rather
-     * than a tolerance. */
+     * Every value is a power of two times a quarter, so f32 accumulation is exact in any order. */
     if (sel("dflash_select_bf16")) {
         const RadKernelInfo* r = find(pl, "dflash_select_bf16");
         if (!r) ok("dflash_select_bf16", false, "row absent");
@@ -13412,11 +13515,9 @@ static void device_phase(const Plugin& pl) {
             auto sv   = [](int64_t t) { return 0.25f * (float)(t % 4); };
             auto cnd  = [&](int64_t row, int64_t c) { return (int32_t)((row * 7 + c * 10) % V); };
             auto unf  = [&](int64_t row, int64_t c) { return 8.0f * (float)((row + c * 3) % 5); };
-            /* STRIDED, because that is how the drafter passes it: the operand is the step's own
-             * token_ids, which carries `block` ids a sequence with the anchor first. The entries
-             * between the anchors are mask tokens, and reading one instead would be a plausible
-             * walk from the wrong predecessor -- so they are filled with a value that would give a
-             * different answer if the stride were ignored. */
+            /* Strided, as the drafter passes it: the step's token_ids, `block` ids per sequence
+             * with the anchor first. The entries between anchors (mask tokens) hold a value that
+             * changes the answer if the stride is ignored. */
             const int64_t astride = steps + 1;
             const int32_t anchor[2] = { 2, 2 };
             std::vector<int32_t> h_anc((size_t)(M * astride), 7);
@@ -13499,16 +13600,11 @@ static void device_phase(const Plugin& pl) {
                 ok("dflash_select_bf16 case can tell a chained walk from an anchor-pinned one",
                    distinguishes);
 
-                /* THE BIGRAM FORM, which is why `hp` is optional: DSpark's Markov head is this
-                 * walk with no hidden projection. `hp` above is a plane of
-                 * EXACT ones, so absent has to give bit-identical tokens -- a kernel that read a
-                 * null pointer, or skipped the multiply in one branch and not the other, moves
-                 * some token here and none of it would show up as anything but acceptance. */
+                /* The bigram form (`hp` absent), DSpark's Markov head. `hp` above is exact ones,
+                 * so absent must give bit-identical tokens. */
                 std::vector<RadTensor> tb = ts;
-                /* `absent`, NOT a null `data` with the rank left on: run_case allocates for any
-                 * tensor that has a rank and no pointer, so spelling it the other way hands the
-                 * kernel a plane of UNINITIALISED memory and tests the present branch against
-                 * garbage rather than withholding the operand. */
+                /* `absent`, not just a null `data`: run_case allocates any tensor with a rank and
+                 * no pointer, which would pass uninitialised memory instead of no operand. */
                 absent(tb[2]);
                 st_memcpy(d_out, h_cand.data(), (size_t)M * steps * 4, hipMemcpyHostToDevice);
                 run_case(r, tb, ps);
@@ -13569,16 +13665,16 @@ static void device_phase(const Plugin& pl) {
         gemm_case(pl, "gemm_w2a8_nt",        "w2a8",    M, N, K, RAD_I8,  1, 1, 0, N*K/4, N*(K/128)*4);
         gemm_case(pl, "gemm_mxfp4a8_nt_m64", "mxfp4a8", M, N, K, RAD_F8E4M3, 1, 0, 1, N*K/2, (K/32)*N);
         gemm_case(pl, "gemm_mxfp4a8_tiled",  "mxfp4a8", 256, 256, K, RAD_F8E4M3, 1, 0, 1, 256*K/2, (K/32)*256);
-        /* The skinny row is known-good, so it checks the check; the tiled row at both widths, ragged
-         * in M and N, then at the size where tn=0 crosses over to TN=4. */
+        /* The skinny row first (validating the check), then the tiled row at both widths, ragged
+         * in M and N, and at the size where tn=0 crosses over to TN=4. */
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_nt_m64", 40, 272, 640, 0);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 40, 272, 640, 2);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 640, 2);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 400, 640, 4);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 2100, 512, 2560, 0);
-        /* ...and against the fp8 family's (row, 128) activation grid, which is what an architecture
-         * feeds them. K = 640 is five blocks and 2560 twenty, so every split-K segment of the
-         * skinny row and every slab pair of the tiled one crosses block boundaries. */
+        /* And with the fp8 family's (row, 128) activation grid, as architectures feed them. K = 640
+         * is five blocks and 2560 twenty, so split-K segments and slab pairs cross block
+         * boundaries. */
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_nt_m64", 40, 272, 640, 0, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_nt_m64", 7, 512, 2560, 0, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 640, 2, true);
@@ -13587,17 +13683,17 @@ static void device_phase(const Plugin& pl) {
         /* K not a multiple of 128: the TN=2 kernel takes the 64-wide slab. */
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 576, 2);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 576, 2, true);
-        /* The decode row over its whole band: the split rule's own choice, then every split and
-         * slab forced, at both activation grids; N past a 128-column block, K a multiple of 64
-         * but not 128 (the slab falls back to 64), and DTM 1..4. */
+        /* The decode row over its band: the split rule's choice, then every split and slab forced,
+         * at both activation grids; N past a 128-column block, K a multiple of 64 but not 128 (the
+         * slab falls back to 64), and DTM 1..4. */
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 8, 272, 640, 0, false);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 8, 272, 640, 0, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 40, 400, 2560, 0, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 64, 512, 2560, 0, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 5, 1040, 576, 0, true);
         mxd_overlap_case(pl);
-        /* PARTS (ParoQuant): each part of the weight against its own copy of the activation, with
-         * bounds that do not fall on a tile of any kernel's, two parts and three, at every band. */
+        /* Parts (ParoQuant): each weight part against its own activation copy, with bounds off any
+         * kernel's tile, two and three parts, at every band. */
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_nt_m64", 7, 400, 640, 0, true, {}, 144);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_nt_m64", 40, 400, 640, 0, true, {}, 144, 288);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 8, 400, 2560, 0, true, {}, 128);
@@ -13607,9 +13703,9 @@ static void device_phase(const Plugin& pl) {
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 400, 640, 4, true, {}, 96, 304);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 2100, 512, 2560, 0, true, {}, 256);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 34816, 5120, 0, true, {}, 17408);
-        /* Above 64 rows, every branch of the measured table: 110+ column blocks, 48+, 8 or
-         * fewer (with a K that is not a multiple of 128, so the slab falls back to 64), a deep K
-         * on both sides of M=80, and the plain case; then every split and slab forced. */
+        /* Above 64 rows, every branch of the split table: 110+ column blocks, 48+, 8 or fewer
+         * (with K not a multiple of 128, so the slab falls back to 64), a deep K on both sides of
+         * M=80, and the plain case; then every split and slab forced. */
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 96, 14336, 640, 0, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 128, 6144, 1152, 0, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 100, 1024, 576, 0, true);
@@ -13624,8 +13720,8 @@ static void device_phase(const Plugin& pl) {
             for (int bk : { 64, 128 })
                 mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 24, 400, 2560, 0, true,
                                 { PI("ks", ks), PI("bk", bk), PI("nt", ks == 2 ? 2 : 1) });
-        /* ...and the one-fragment form (DTM = 1: the register prefetch and 16 B loads) at every
-         * split, slab and load hint, on both activation grids, N past a column block. */
+        /* And the one-fragment form (DTM = 1: register prefetch, 16 B loads) at every split, slab
+         * and load hint, on both activation grids, N past a column block. */
         for (int ks : { 1, 2, 4, 8, 16 })
             for (int bk : { 64, 128 })
                 for (int nt : { 1, 2 }) {
@@ -13638,10 +13734,9 @@ static void device_phase(const Plugin& pl) {
         gemm_case(pl, "gemm_w8a8_tiled",     "w8a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K,   256*(K/128)*2);
         gemm_case(pl, "gemm_w4a8_prefill",   "w4a8",    256, 256, K, RAD_I8, 1, 0, 0, 256*K/2, 256*(K/128)*4);
 
-        /* Block-scaled fp8. The matvec is smoked at every point of its space because `rb` is the
-         * only axis in the family and each value is a different instantiation of the K loop. The
-         * narrow W8A8 row needs K a multiple of 256 -- 512 is -- and the tiled one needs N a
-         * multiple of 128. */
+        /* Block-scaled fp8. The matvec runs at every point of its space (each `rb` is a different
+         * instantiation of the K loop). The shapes give the narrow W8A8 row K a multiple of 256
+         * and the tiled one N a multiple of 128. */
         for (const TunePoint& tp : tune_points(find(pl, "gemm_fp8a16_nt_m1"),
                                                std::vector<RadParam>{ PI("M", 1), PI("N", N),
                                                                       PI("K", K), PI("group", 128),
@@ -13674,19 +13769,16 @@ static void device_phase(const Plugin& pl) {
             const RadKernelInfo* r = find(pl, "sample_chain_f32");
             if (!r) ok("sample_chain_f32", false, "row absent");
             else {
-                /* The vocabulary is deliberately not a round number: the radix passes are over a
-                 * float's bytes and a power-of-two width would hide an off-by-one in the stride. */
+                /* Not a power-of-two vocabulary, which could hide an off-by-one in the stride. */
                 const int64_t M = 4, V = 1000;
-                /* TWO uniforms a position, and they must be IN [0,1): dalloc zeroes, and a uniform
-                 * of exactly 0 walks the inverse CDF to the first kept token every time -- which is
-                 * a valid draw, so the smoke test would pass with the walk broken. */
+                /* Two uniforms per position in [0,1). Zeros (as dalloc returns) would always select
+                 * the first kept token and pass with the walk broken. */
                 std::vector<float> uh((size_t)(2 * M));
                 for (size_t i = 0; i < uh.size(); ++i) uh[i] = 0.11f + 0.17f * (float)i;
                 RadTensor tu = T(nullptr, RAD_F32, { 2 * M });
                 tu.data = alloc_for(tu);
                 if (tu.data) st_memcpy(tu.data, uh.data(), uh.size() * 4, hipMemcpyHostToDevice);
-                /* `draw` is three 32-bit words a position. The schema names one operand, not three,
-                 * because the kernel writes a struct -- so it is sized here in words. */
+                /* `draw` is three 32-bit words per position (a struct), sized in words. */
                 std::vector<RadTensor> ts = {
                     T(nullptr, RAD_F32, { M, V }),
                     T(nullptr, RAD_U32, { M }),
@@ -13698,15 +13790,14 @@ static void device_phase(const Plugin& pl) {
                     PF("min_p", 0.0), PI("k", 40),
                 };
                 run_case(r, ts, ps);
-                /* Temperature 0 is a REAL path, not a caller special case: it must give the argmax
-                 * with the same lowest-id tie-break a greedy run uses, and a zeroed logits plane is
-                 * exactly the all-ties input that catches a tie-break that disagrees. */
+                /* Temperature 0 must give the argmax with greedy's lowest-id tie-break; a zeroed
+                 * logits plane is the all-ties input that checks it. */
                 std::vector<RadParam> ps0 = {
                     PI("M", M), PI("n_vocab", V), PF("temp", 0.0), PF("p", 1.0),
                     PF("min_p", 0.0), PI("k", 0),
                 };
                 run_case(r, ts, ps0);
-                /* ...and with no draft proposal, which is the last position of a verify block. */
+                /* And with no draft proposal, as at the last position of a verify block. */
                 absent(ts[1]);
                 run_case(r, ts, ps);
             }
@@ -13845,18 +13936,13 @@ static void device_phase(const Plugin& pl) {
         rowtopk_shard_case(pl);
     }
 
-    /* dequant_w4_bf16's case IS the round-trip: the row's only caller here is the check that the
-     * host relayout and libr4d's own dequant agree, so naming the case for the row keeps the one
-     * case-name-is-a-row-name rule that makes the coverage check below work. */
+    /* dequant_w4_bf16's case is the w4 round trip, named for the row so the coverage check sees
+     * it. */
     if (sel("dequant_w4_bf16")) {
         if (!g_case) std::printf("\nweight layout, against libr4d's own inverse\n");
         w4_roundtrip(pl);
     }
 
-    /* The 4-bit grouped MoE GEMM gets its OWN case name, which is the rule the coverage check
-     * below enforces -- a row with no case of its own is reported as a hole. Nesting it inside
-     * another row's block makes it invisible and says nothing about it: a child process is
-     * spawned per row and `sel` is false for every name but that child's own. */
     if (sel("sample_argmax_f32")) {
         if (!g_case) std::printf("\nthe greedy sampler, against a host scan\n");
         sample_argmax_case(pl);
@@ -13880,12 +13966,13 @@ static void device_phase(const Plugin& pl) {
         qsa_select_split_one(pl, "qsa_select split across chunks vs the same launch unsplit",
                              1, 4);
         qsa_select_split_one(pl, "qsa_select split, two sequences of four draft rows", 2, 4);
+        qsa_select_few_live_case(pl);
     }
 
     if (sel("qsa_score_bf16")) {
         if (!g_case) std::printf("\nthe QSA block score, against the formula it implements\n");
-        /* EVERY FORM THE ROW HAS: the launcher picks one by shape, and a form the rule does not
-         * pick for these shapes is the one another model's shape would get. */
+        /* Every form of the row: the launcher picks by shape, and another model's shape may get
+         * a form the rule does not pick here. */
         for (int f = pl.pin_qsa ? 1 : 0; f <= (pl.pin_qsa ? 2 : 0); ++f) {
             if (pl.pin_qsa) {
                 pl.pin_qsa(f);
@@ -13928,29 +14015,28 @@ static void device_phase(const Plugin& pl) {
         rope_ladder_case(pl);
     }
 
+    /* Each row needs a case under its own name: a child runs per row and `sel` matches only that
+     * name, so a case nested in another row's block would never run. */
     if (sel("moe_gemm_w4a8")) {
         if (!g_case) std::printf("\nthe 4-bit grouped MoE GEMM, against a host decode\n");
-        /* One geometry; a gate/up pair whose odd experts are half as wide; a down projection
-         * whose odd experts are half as long; and a decode-shaped routing -- a few runs over
-         * hundreds of experts, most of them empty -- which is what the decode grid's run search
-         * has to find its way through. */
+        /* One geometry; a gate/up pair whose odd experts are half as wide; a down projection whose
+         * odd experts are half as long; and a decode-shaped routing (a few runs over hundreds of
+         * mostly empty experts) for the decode grid's run search. */
         static const MoeW4Shape kShapes[] = {
             { "one class",   64, 256,  64, 256, 1, 5 },
             { "gate/up 2:1", 256, 256, 128, 256, 2, 5 },
             { "down 2:1",    64, 256,  64, 128, 1, 5 },
             { "300 experts, gate/up 2:1", 256, 128, 128, 128, 2, 300 },
-            /* Three passes of 256 along K: the decode form's two-block pass then also runs its
-             * one-ahead prefetch, which a single pass never reaches. */
+            /* Three passes of 256 along K, so the two-block pass also runs its one-ahead
+             * prefetch. */
             { "40 experts, gate/up 2:1, K 768", 256, 768, 128, 768, 2, 40 },
-            /* Past 512 experts: the decode form's chunked run search, which the one-round-trip
-             * search hands every wider expert count to. Runs land on experts on both sides of
-             * 512, and K 256 lets the two-block pass run on that search as well. */
+            /* Past 512 experts: the decode form's chunked run search. Runs land on both sides of
+             * 512, and K 256 lets the two-block pass run on that search too. */
             { "640 experts, gate/up 2:1, K 256", 256, 256, 128, 256, 2, 640 },
-            /* The down projection as a rank of four runs it: the sorted operand, one part, the
-             * classes at 256 and 128 of K -- and a width of whole 256-column tiles, which is what
-             * the aligned form's 256-column down tile takes. Then with the odd class half as wide,
-             * so that tile is padding for every odd expert's run; and at 512 experts, whose
-             * n_expert + 1 block counts the run map scans in three 256-count tiles. */
+            /* The down projection as a rank of four runs it: sorted operand, one part, classes at
+             * 256 and 128 of K, width in whole 256-column tiles (the aligned form's down tile).
+             * Then with the odd class half as wide (that tile is padding for odd experts), and at
+             * 512 experts, whose n_expert + 1 counts the run map scans in three 256-count tiles. */
             { "down, sorted rows, 512 x K 256:128", 512, 256, 512, 128, 1, 10, true },
             { "down, sorted rows, 512:256 x K 256:128", 512, 256, 256, 128, 1, 10, true },
             { "512 experts, down, sorted rows, 256 x K 128", 256, 128, 256, 128, 1, 512, true },
@@ -13970,8 +14056,8 @@ static void device_phase(const Plugin& pl) {
     if (sel("moe_gemm_w4a8_mod4")) {
         if (!g_case) std::printf("\nthe 4-bit grouped MoE GEMM over four classes, against its "
                                  "two-class form and a host decode\n");
-        /* The same shapes, read as four classes: the even table's halves are classes 0 and 2 and
-         * the odd one's 1 and 3, so the two-class launch is the reference, byte for byte. */
+        /* The same shapes read as four classes (the even table's halves are classes 0 and 2, the
+         * odd one's 1 and 3), against the two-class launch byte for byte. */
         static const MoeW4Shape kShapes4[] = {
             { "one class",   64, 256,  64, 256, 1, 5 },
             { "gate/up 2:1", 256, 256, 128, 256, 2, 10 },
@@ -13996,9 +14082,9 @@ static void device_phase(const Plugin& pl) {
             for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 })
                 for (const char* dt : { "w4a8", "w4nl64a8h", "w4nl32a8h", "w5nl64a8h" })
                     moe_q4_gemm(pl, t, sh, dt);
-        /* The sorted operand at decode, and its own kernel against the (tile, run) form: one
-         * sequence at depth 3 (T 40), five, sixteen and nineteen -- each side of both of the
-         * rule's column-tile thresholds. */
+        /* The sorted operand at decode, its own kernel against the (tile, run) form: one sequence
+         * at depth 3 (T 40), then five, sixteen and nineteen, either side of both of the rule's
+         * column-tile thresholds. */
         moe_down_dec_case(pl, kMoeDnShapes[0], "w4nl64a8h", { 40, 200, 640, 760 });
         for (const char* dt : { "w4a8", "w4nl64a8h", "w4nl32a8h", "w5nl64a8h" })
             moe_down_dec_case(pl, kMoeDnShapes[1], dt, { 40, 96 });
@@ -14016,10 +14102,10 @@ static void device_phase(const Plugin& pl) {
     if (sel("hc_read_e4m3")) {
         if (!g_case) std::printf("\nthe gated residual's read at the prefill tile, every form "
                                  "against the decode tiles'\n");
-        /* 700 and 1000 put PF2's K chunks across a stream boundary and its row tiles past the
-         * last row; 4096 is the one-chunk epilogue. */
+        /* 700 and 1000 put PF2's K chunks across a stream boundary and row tiles past the last
+         * row; 4096 is the one-chunk epilogue. */
         for (int64_t m : { 65, 300, 700, 1000, 2048, 4096 }) hc_prefill(pl, m, 0, false);
-        /* 1 to 7 rows are one up-product row group each, every instantiation below eight. */
+        /* 1 to 7 rows each hit a different up-product instantiation below eight. */
         for (int64_t m : { 1, 2, 3, 4, 5, 6, 7, 33, 65, 300, 2048 }) {
             hc_read_i8(pl, m, false, 0);
             hc_read_i8(pl, m, true, 0);
@@ -14113,10 +14199,9 @@ static void device_phase(const Plugin& pl) {
 
     if (sel("moe_gemm_bf16")) {
         if (!g_case) std::printf("\nthe bf16 grouped MoE GEMM, against an f64 host product\n");
-        /* Qwen3.8-Flash-Next's and Qwen3.6-35B-A3B's whole-expert widths at a few experts each --
-         * what fits beside a running server -- and the expert counts that exercise the run map
-         * and the decode grid's run search at small widths. A width that does not take the
-         * 128-column tile runs the 64-column one. */
+        /* Qwen3.8-Flash-Next's and Qwen3.6-35B-A3B's whole-expert widths at a few experts each, and
+         * expert counts exercising the run map and decode run search at small widths. A width
+         * without the 128-column tile runs the 64-column one. */
         static const MoeBf16Shape kShapes[] = {
             { "Flash-Next gate_up 1280x2560", 1280, 2560,   4,  2, false },
             { "Flash-Next down 2560x640",     2560,  640,   4,  2, true  },
@@ -14143,45 +14228,34 @@ static void device_phase(const Plugin& pl) {
     }
 
     if (sel("dequant_w4_bf16")) {
-        /* TWO SHAPES, and the second is the one the model actually runs: N = 256 is the k and v
-         * projections, gate_up is 17408 rows. Both wave counts run here without asking for them,
-         * because narrow_mw is a function of M and the M list inside fp8_numeric crosses its
-         * threshold -- 1 and 8 take MW = 4, 24 through 64 take MW = 8. The second shape is only
-         * reachable because the generator above wraps its exponent. */
+        /* N = 256 (the k and v projections) and 17408 (gate_up). narrow_mw depends on M, and
+         * fp8_numeric's M list crosses its threshold (1 and 8 take MW = 4, 24-64 take MW = 8). */
         fp8_numeric(pl, 256, 512);
         fp8_numeric(pl, 17408, 512);
         fp8_numeric(pl, 5120, 5120);
-        /* THE ONE PRODUCTION REGIME THE OTHERS MISS: many K tiles with split-K OFF. (256,512) and
-         * (17408,512) are two staged tiles, and (5120,5120) splits. gate_up is 17408 rows by 5120,
-         * which is twenty tiles and gx*mw over the split threshold -- so the prefetch fires
-         * nineteen times and nothing else here makes it fire more than once. */
+        /* Many K tiles with split-K off: gate_up, 17408 x 5120, is twenty tiles with gx*mw over the
+         * split threshold, so the prefetch fires nineteen times ((256,512) and (17408,512) have
+         * two tiles; (5120,5120) splits). */
         fp8_numeric(pl, 17408, 5120);
-        /* The two remaining production K values: the GDN out-projection reads K = v_dim = 1536
-         * per rank, and down_proj reads K = n_ff = 8704. Both are multiples of 256 and 64, and
-         * neither falls out of the shapes above. */
+        /* The remaining production K values: the GDN out-projection (K = v_dim = 1536 per rank)
+         * and down_proj (K = n_ff = 8704). */
         fp8_numeric(pl, 5120, 1536);
         fp8_numeric(pl, 5120, 8704);
-        /* A SHARED EXPERT SPLIT BY WHOLE SCALE BLOCKS gives each rank a width the even split never
-         * does: Qwen3.8-Flash-Next's 640 columns go 384 / 256, so the down projection runs at
-         * K = 384 -- a multiple of 128 and not of 256, which is the narrow tile's 128-wide leg --
-         * and K = 256, and the gate/up projection at N = 768 and N = 512 over K = 2560. */
+        /* A shared expert split by whole scale blocks: Qwen3.8-Flash-Next's 640 columns go 384 /
+         * 256, so the down projection runs at K = 384 (a multiple of 128, not 256: the narrow
+         * tile's 128-wide leg) and K = 256, and gate/up at N = 768 and 512 over K = 2560. */
         fp8_numeric(pl, 2560, 384);
         fp8_numeric(pl, 2560, 256);
         fp8_numeric(pl, 768, 2560);
         fp8_numeric(pl, 512, 2560);
-        /* The lm_head. 5120 rows stands in for 124160 -- the kernel walks rows with a grid-stride
-         * loop, so the row count is not what varies -- and M spans the exact instantiations, the
-         * rounded-up ones, and the cap. */
+        /* The lm_head. 5120 rows stand in for 124160 (rows are walked with a grid-stride loop);
+         * M spans the exact instantiations, the rounded-up ones and the cap. */
         for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)13, (int64_t)32, (int64_t)33,
                                  (int64_t)64 })
             fp8_logits_numeric(pl, 5120, 5120, M);
-        /* AND K = 2560, WHICH IS THE PADDED ROW. 5120's stored width is 5200 and already a
-         * multiple of 16; 2560's is 2600 and is not, so r4d_fp8_lm.h rounds it to 2608 and every
-         * odd row moves by eight bytes. That padding is invisible to any shape that does not need
-         * it, so without this case the layout, the relayout, its inverse and both kernels'
-         * strides agree on a number none of them was ever asked to derive. M = 1 takes the
-         * matvec, M = 8 the WMMA tile: the pad has to be right in both, and they index the row
-         * differently. */
+        /* And K = 2560, the padded row: its stored width 2600 is not a multiple of 16, so
+         * r4d_fp8_lm.h rounds it to 2608 (5120's 5200 needs no pad). M = 1 takes the matvec, M = 8
+         * the WMMA tile, which index the row differently. */
         for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)33 })
             fp8_logits_numeric(pl, 2560, 2560, M);
     }
@@ -14193,8 +14267,8 @@ static void device_phase(const Plugin& pl) {
             fp8_logits_numeric(pl, 2560, 2560, M, true);
     }
 
-    /* The fused quantisers are checked against the kernels they replace rather than against a host
-     * mirror, so they live outside `fp8_numeric` and are gated on their own row. */
+    /* The fused quantisers are checked against the kernels they replace, gated on their own
+     * rows. */
     if (sel("rmsnorm_quant_fp8") || sel("gated_quant_fp8") || sel("gate_quant_fp8")) {
         if (!g_case) std::printf("\nthe fp8 fusions, against the pair each one replaces\n");
         fused_quant_fp8_numeric(pl);
@@ -14212,20 +14286,15 @@ static void device_phase(const Plugin& pl) {
         rmsnorm_quant_i8_numeric(pl);
     }
 
-    /* The MTP head's fc is K=10240; the DFlash2 drafter's is 25600, the largest K any shape in
-     * the tree asks these kernels for.
-     *
-     * BOTH ROWS, because one op's band splits across both of them: an fc declared over M 1..64
-     * resolves to _m16 for the small issues and _m64 for the wide ones, and the two are separate
-     * kernels with separate split laws. Checking only the one named in the declaration tests a
-     * kernel that never runs and leaves the one that does unchecked. */
+    /* The MTP head's fc is K=10240; the DFlash2 drafter's is 25600, the largest K any shape asks
+     * these kernels for. Both rows run: an fc declared over M 1..64 resolves to _m16 for small
+     * issues and _m64 for wide ones, separate kernels with separate split laws. */
     if (sel("gemm_bf16_nt_m16") || sel("gemm_bf16_nt_m64")) {
         if (!g_case) std::printf("\nthe skinny bf16 GEMMs, against a host reference\n");
         for (const char* row : { "gemm_bf16_nt_m16", "gemm_bf16_nt_m64" }) {
             bf16_gemm_numeric(pl, row, 5, 32, 10240);
             bf16_gemm_numeric(pl, row, 5, 32, 25600);
-            /* The drafter's fc, exactly: N and K together, because the weight offset a lane
-             * computes is row * K and only the pair is large. */
+            /* The drafter's fc exactly: the weight offset row * K is large only for the pair. */
             bf16_gemm_numeric(pl, row, 5, 5120, 10240);
             bf16_gemm_numeric(pl, row, 5, 5120, 25600);
             bf16_gemm_numeric(pl, row, 16, 5120, 25600);
@@ -14237,59 +14306,78 @@ static void device_phase(const Plugin& pl) {
         bf16_tiled_identity(pl, 2048, 512, 2560);     /* the MoE router: four slices */
         bf16_tiled_identity(pl, 1000, 2560, 2560);    /* the PLE value projection: one slice */
         bf16_tiled_identity(pl, 333, 1040, 2560);     /* ragged M and N, two slices */
-        bf16_tiled_identity(pl, 77, 128, 64);         /* a slice a k step, the band's floor */
+        bf16_tiled_identity(pl, 77, 128, 64);         /* one slice per k step, the band's floor */
         bf16_gemm_numeric(pl, "gemm_bf16_nt_tiled", 300, 1040, 2560);
     }
 
     /* Every collective has a host twin (r4d_rows.cpp): the same kernel with its mailbox in pinned
      * host memory. A case is the pair's, so the twin is held to exactly the original's checks. */
+    /* The 2-rank pair keeps its own harness: its flag layout and its block ceiling are not the
+     * wide family's, and TP2 is what the fleet runs today. Everything at three and four goes
+     * through the width-parameterized functions, which take the world from the base's own name and
+     * skip themselves, named for the width they need, when the box has fewer cards. */
     for (const char* base : { "ar_oneshot_2rank_exact", "ar_gather_2rank", "ar_oneshot_3rank_exact",
-                              "ar_twoshot_3rank_exact", "ar_twoshot_3rank_ti8", "ar_gather_3rank" }) {
+                              "ar_twoshot_3rank_exact", "ar_twoshot_3rank_ti8", "ar_gather_3rank",
+                              "ar_oneshot_4rank_exact", "ar_twoshot_4rank_exact",
+                              "ar_twoshot_4rank_ti8", "ar_gather_4rank" }) {
         for (const std::string& n : { std::string(base), std::string(base) + "_host" }) {
             if (!sel(n.c_str())) continue;
-            const bool three = std::strstr(base, "3rank") != nullptr;
-            if (!g_case) std::printf(three ? "\ncross-rank, three\n" : "\ncross-rank\n");
+            const int world = std::strstr(base, "4rank") ? 4
+                            : std::strstr(base, "3rank") ? 3 : 2;
+            if (!g_case) {
+                if (world == 2) std::printf("\ncross-rank\n");
+                else std::printf("\ncross-rank, %d\n", world);
+            }
             std::printf("  %s\n", n.c_str());
-            if (!std::strcmp(base, "ar_oneshot_2rank_exact")) {
-                ar_two_rank(pl, devs, n.c_str());
-                ar_two_rank_sweep(pl, devs, n.c_str());
-            } else if (!std::strcmp(base, "ar_gather_2rank")) {
-                gather_two_rank(pl, devs, n.c_str());
-            /* The wide family at three. Its own rows, so the sweep names them (a row the sweep
-             * never mentions is reported as a coverage hole) and so `--case
-             * ar_oneshot_3rank_exact` reproduces one of them alone. */
-            } else if (three && std::strstr(base, "gather")) {
-                gather_three_rank(pl, devs, n.c_str());
-            } else if (three && std::strstr(base, "ti8")) {
-                ar_three_rank_ti8(pl, devs, n.c_str());
-            } else if (three && std::strstr(base, "twoshot")) {
-                ar_three_rank_pattern(pl, devs, n.c_str());
+            if (world == 2) {
+                if (!std::strcmp(base, "ar_oneshot_2rank_exact")) {
+                    ar_two_rank(pl, devs, n.c_str());
+                    ar_two_rank_sweep(pl, devs, n.c_str());
+                } else {
+                    gather_two_rank(pl, devs, n.c_str());
+                }
+            /* Its own rows, so the sweep names them (a row the sweep never mentions is reported as
+             * a coverage hole) and so `--case ar_oneshot_4rank_exact` reproduces one alone. */
+            } else if (std::strstr(base, "gather")) {
+                gather_wide_rank(pl, devs, n.c_str(), world);
+            } else if (std::strstr(base, "ti8")) {
+                ar_wide_ti8(pl, devs, n.c_str(), world);
+            } else if (std::strstr(base, "twoshot")) {
+                ar_wide_pattern(pl, devs, n.c_str(), world);
             } else {
-                ar_three_rank(pl, devs, n.c_str());
+                ar_wide_rank(pl, devs, n.c_str(), world);
                 /* The one-shot through the same per-element oracle: both rows of the op agree
                  * with it, so they agree with each other at every size either could be given. */
-                ar_three_rank_pattern(pl, devs, n.c_str());
+                ar_wide_pattern(pl, devs, n.c_str(), world);
             }
         }
     }
-    /* The 4- and 8-rank rows cannot be exercised on a two-card box. Reported as skipped rather
+    /* The fused write rows at both widths and both gathers. The `_host` twins take the same
+     * calls; they differ only in where the mailbox lives. */
+    for (const char* base : { "ar_hc_write", "ar_gather_hc_write",
+                              "ar_hc_write_4rank", "ar_gather_hc_write_4rank" }) {
+        for (const std::string& n : { std::string(base), std::string(base) + "_host" }) {
+            if (!sel(n.c_str())) continue;
+            if (!g_case) std::printf("\ncross-rank, fused with the gated residual write\n");
+            std::printf("  %s\n", n.c_str());
+            ar_hc_write_case(pl, devs, n.c_str(), std::strstr(base, "4rank") ? 4 : 2,
+                             std::strstr(base, "gather") != nullptr);
+        }
+    }
+    /* The 8-rank rows cannot be exercised on a four-card box. Reported as skipped rather
      * than quietly passing: a row that has never been launched is not a row that works. */
     auto skip_pair = [](const char* base, const char* why) {
         for (const std::string& n : { std::string(base), std::string(base) + "_host" })
             if (sel(n.c_str())) skip(n.c_str(), why);
     };
-    for (const char* n : { "ar_oneshot_4rank_exact", "ar_oneshot_8rank_exact",
-                           "ar_twoshot_4rank_exact", "ar_twoshot_8rank_exact",
-                           "ar_twoshot_4rank_ti8" })
-        skip_pair(n, "needs 4 or 8 cards");
+    /* Only the 8-rank rows now: the four-rank ones are dispatched above and skip themselves with
+     * the width they need. */
+    for (const char* n : { "ar_oneshot_8rank_exact", "ar_twoshot_8rank_exact", "ar_gather_8rank" })
+        skip_pair(n, "needs 8 cards");
     skip_pair("ar_oneshot_2rank_wht6", "lossy wire: needs a tolerance harness, not a smoke test");
     skip_pair("ar_ln_had_quant_i8", "two-rank fusion: needs the same harness as the wht6 wire");
-    /* Same reason, and one more: the norm half of it is rmsnorm_quant_fp8's, called through the
-     * same device function, so what a single-rank harness could check here is already checked
-     * there. What it cannot check without a peer -- the handshake and the reduced sum -- is what
-     * the two-rank harness is for. The engine covers it end to end: a decode step issues this op
-     * at every one of the 128 sites, and the generated text is compared byte for byte against a
-     * build that issues the pair instead. */
+    /* Also skipped: the norm half is rmsnorm_quant_fp8's device function, checked there, and the
+     * handshake and reduced sum need a peer rank. */
     skip_pair("ar_rmsnorm_quant_fp8", "two-rank fusion: needs a peer rank");
     skip_pair("ar_rmsnorm_quant_i8", "two-rank fusion: needs a peer rank");
 
@@ -14298,14 +14386,12 @@ static void device_phase(const Plugin& pl) {
 
 /* ------------------------------------------------------------------ the isolating driver
  *
- * The row table is the case list. Every case above is named for a row, so a row the sweep never
- * mentions comes back from its child as "no smoke case" and the coverage hole is visible without
- * a second list to keep in step with the first.
+ * The row table is the case list. Every case is named for a row, so a row no case mentions comes
+ * back from its child as "no smoke case".
  */
 
-/* The number as well as the name: a GPU page fault does not always come out of ROCr as SIGABRT,
- * and "signal" on its own tells the reader nothing about which. The fault line itself is on
- * stderr, unbuffered, immediately above this. */
+/* The signal's number and name (a GPU page fault is not always SIGABRT). The fault line itself
+ * is on stderr, unbuffered, just above. */
 static std::string signame(int sig) {
     const char* n = nullptr;
     switch (sig) {
@@ -14321,10 +14407,8 @@ static std::string signame(int sig) {
 }
 
 static void run_isolated(const Plugin& pl, const char* exe, const char* plugin) {
-    /* The inventory belongs to the parent: the children print one line each and repeating it
-     * forty times buries them. A host can present more HIP devices than it has discrete cards --
-     * an integrated part reporting tens of GiB of "VRAM" that is really system RAM -- so seeing
-     * the list once is worth the parent touching HIP at all. */
+    /* The device inventory is printed once, by the parent (an integrated part can appear beside
+     * the discrete cards). */
     int nd = 0;
     if (hipGetDeviceCount(&nd) == hipSuccess) {
         for (int d = 0; d < nd; ++d) {
@@ -14343,8 +14427,7 @@ static void run_isolated(const Plugin& pl, const char* exe, const char* plugin) 
                                const_cast<char*>("--case"), const_cast<char*>(name.c_str()),
                                nullptr };
         pid_t pid = 0;
-        /* posix_spawn, not fork: this process already has the HIP runtime and its worker threads
-         * up, and only the exec resets them in the child. */
+        /* posix_spawn, not fork: the HIP runtime's threads are up, and only exec resets them. */
         if (posix_spawn(&pid, exe, nullptr, nullptr, argv, environ) != 0) {
             ok(name.c_str(), false, "posix_spawn failed");
             continue;
@@ -14359,8 +14442,8 @@ static void run_isolated(const Plugin& pl, const char* exe, const char* plugin) 
         }
         if (!WIFEXITED(st)) { ok(name.c_str(), false, "child did not exit normally"); continue; }
         switch (WEXITSTATUS(st)) {
-            case CH_OK:   break;                       /* the child already printed its ok line */
-            case CH_FAIL: ++g_fail; break;             /* and its FAIL line, with the detail    */
+            case CH_OK:   break;                       /* the child printed its ok line */
+            case CH_FAIL: ++g_fail; break;             /* and its FAIL line, with detail  */
             case CH_SKIP: ++g_skip; break;
             default:
                 ok(name.c_str(), false,
@@ -14388,8 +14471,7 @@ static void usage(void) {
                 "             reference over the same bytes. An offset is 8 + <header length, a\n"
                 "             u64 at byte 0> + the tensor's own data_offsets[0].\n"
                 "  --perf N K M [iters]:  time the fp8 decode GEMMs at one shape and print the\n"
-                "             weight bandwidth each reaches. R4D_F8_MW and R4D_F8_SPLITTGT pin\n"
-                "             the narrow tile's launch heuristics for a sweep.\n"
+                "             weight bandwidth each reaches.\n"
                 "  --perfbf16 N K M [iters]:  the bf16 skinny GEMM at every variant it has.\n"
                 "  --perfw8 N K M [iters]:  the 8-bit trunk GEMMs -- block E4M3 W8A8 and the int8\n"
                 "             rows -- at one shape, each with its TFLOP/s.\n"
@@ -14453,9 +14535,7 @@ int main(int argc, char** argv) {
             perf_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != '-') perf_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfbf16")) {
-            /* The bf16 skinny GEMM, at every variant. Its own flag because rad-tune reaches these
-             * rows but its absolute numbers are not repeatable enough between back-to-back runs
-             * of the same command to base a default on. */
+            /* The bf16 skinny GEMM at every variant (see bf16_perf). */
             if (i + 3 >= argc) { usage(); return 2; }
             perf_bf = 1;
             perf_n = std::strtoll(argv[++i], nullptr, 0);
@@ -14470,9 +14550,7 @@ int main(int argc, char** argv) {
             perf_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != '-') perf_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfw2")) {
-            /* The int2 draft head, at every variant. Its own flag because rad-tune's declared
-             * graph never reaches a gemm_nt_q row and this is the only kernel in the drafter
-             * that is not already at bandwidth. */
+            /* The int2 draft head at every variant (see w2_perf). */
             if (i + 3 >= argc) { usage(); return 2; }
             perf_w2 = 1;
             perf_n = std::strtoll(argv[++i], nullptr, 0);
@@ -14480,7 +14558,7 @@ int main(int argc, char** argv) {
             perf_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != '-') perf_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfqsa")) {
-            /* The indexer at a REAL context length: it is the only decode op that grows with one. */
+            /* The indexer at a real context length (the only decode op that grows with it). */
             if (i + 1 >= argc) { usage(); return 2; }
             qsa_ctx = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) qsa_m = std::strtoll(argv[++i], nullptr, 0);
@@ -14510,8 +14588,7 @@ int main(int argc, char** argv) {
             hc_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) hc_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfops")) {
-            /* The elementwise ops at a decode shape. Separate from --perf because the question is
-             * about launches, not about a GEMM's bandwidth. */
+            /* The elementwise ops at a decode shape: launch cost, not GEMM bandwidth. */
             if (i + 2 >= argc) { usage(); return 2; }
             sop_m = std::strtoll(argv[++i], nullptr, 0);
             sop_k = std::strtoll(argv[++i], nullptr, 0);
@@ -14533,8 +14610,7 @@ int main(int argc, char** argv) {
 
     Plugin pl;
 
-    /* The timing mode runs alone for the same reason the real-checkpoint check does: it answers a
-     * different question from the catalogue, and it is the one a reviewer runs by itself. */
+    /* Timing modes run alone, without the catalogue. */
     if (hc_m) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
@@ -14600,8 +14676,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    /* The real-checkpoint check runs alone: it is the one case whose input is not synthetic, so it
-     * is also the one a reviewer will want to run by itself against a particular tensor. */
+    /* The real-checkpoint check runs alone, against one given tensor. */
     if (real_file) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
@@ -14614,15 +14689,10 @@ int main(int argc, char** argv) {
         return g_fail;
     }
 
-    /* THE CHILD. One row, no catalogue, no static checks -- and an exit code the parent reads,
-     * because a row that faults never gets to print anything at all. */
+    /* The child: one row, no catalogue or static checks, and an exit code for the parent, since
+     * a faulting row may print nothing. */
     if (g_case) {
         if (!load(&pl, path)) return CH_FAIL;
-        /* A case that needs its own process re-execs this one; see spawn_anchor_child. Both paths
-         * live only as long as this frame, which outlives the device phase. */
-        char me[4096];
-        const ssize_t mn = readlink("/proc/self/exe", me, sizeof(me) - 1);
-        if (mn > 0) { me[mn] = 0; g_exe = me; g_plugin = path; }
         device_phase(pl);
         if (!g_matched) skip(g_case, "no smoke case");
         std::fflush(stdout);
@@ -14637,8 +14707,7 @@ int main(int argc, char** argv) {
     dump(pl);
     cross_check(pl);
 
-    /* /proc/self/exe rather than argv[0]: the children are this binary, and argv[0] is whatever
-     * the caller's shell felt like passing. */
+    /* /proc/self/exe rather than argv[0], which the caller may set to anything. */
     char self[4096];
     const ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
     if (n <= 0) {

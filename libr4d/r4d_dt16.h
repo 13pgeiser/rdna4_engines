@@ -1,11 +1,10 @@
-// 16-bit operand traits. The QK and PV matmuls both take a 16-bit A/B pair; which 16-bit format is
-// a free choice because BOTH sources are exactly representable in either:
-//   * an fp8 e4m3 K/V has 3 mantissa bits, so widening to bf16 (7) or f16 (10) is exact;
-//   * a bf16 query has 7, so bf16->f16 is exact for |q| in [6.1e-5, 65504].
-// The formats are NOT equal in cost. gfx1201 has NO bf16 convert instruction, so every f32->bf16
-// is ~6 VALU of software RTNE, while v_cvt_pkrtz_f16_f32 does TWO f32->f16 in ONE. On the softmax
-// path that is 24 VALU per 8-element P fragment against 4. f16 also carries 3 more mantissa bits.
-// What f16 gives up is exponent range, and that is exactly what GROW below prices.
+// 16-bit operand traits. The QK and PV matmuls take a 16-bit A/B pair, and both sources are exact
+// in either format: an fp8 e4m3 K/V has 3 mantissa bits (bf16 has 7, f16 10), and a bf16 query's
+// 7 bits are exact in f16 for |q| in [6.1e-5, 65504].
+// The costs differ. gfx1201 has no bf16 convert, so each f32->bf16 is ~6 VALU of software RTNE,
+// while v_cvt_pkrtz_f16_f32 converts two f32 in one; on the softmax path that is 24 VALU per
+// 8-element P fragment against 4. f16 also has 3 more mantissa bits; it gives up exponent range,
+// which GROW below accounts for.
 #pragma once
 #include "r4d_common.h"
 
@@ -13,11 +12,10 @@ typedef __bf16   v8bf __attribute__((ext_vector_type(8)));
 typedef __fp16   v8hf __attribute__((ext_vector_type(8)));  // what the f16 WMMA builtin takes
 typedef __fp16   v2hf __attribute__((ext_vector_type(2)));  // what cvt_pkrtz returns
 
-// GROW = how many octaves the running row max may exceed the REFERENCE max before the
-// accumulator has to be rescaled. p = 2^(s - m_ref) must stay inside the format, so GROW is
-// log2(format max) with margin. This is the whole point of the lazy-rescale scheme: the eager
-// online-softmax form pays 128 multiplies EVERY m-tile; with a reference max it pays them only
-// when the max moves more than GROW, which at long context is almost never.
+// GROW = how many octaves the running row max may exceed the reference max before the accumulator
+// must be rescaled. p = 2^(s - m_ref) must stay inside the format, so GROW is log2(format max) with
+// margin. Eager online softmax pays 128 multiplies every m-tile; with a reference max they are paid
+// only when the max moves by more than GROW, which at long context is rare.
 template<int F16> struct DT16;
 
 template<> struct DT16<0> {                       // bf16: exponent range of f32

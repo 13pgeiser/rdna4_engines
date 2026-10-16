@@ -1,15 +1,13 @@
 /* quant_ggml_test.cpp -- libquant's `ggml` quantiser through the plugin registry, read back
  * through the core's decoder.
  *
- * WHAT IS PINNED AND WHY. The quantiser's claim is that its codes and scales are llama.cpp's own,
- * at the commit vendor/UPSTREAM names (06938ac12, ggml-quants.c built as its ggml-base builds it):
- * the same weights and imatrix through llama.cpp's quantize_<type> and through this port give
- * identical GGUF blocks for all nineteen types, and llama.cpp's dequantize_row_<type> of those
- * blocks equals enc_decode_rows of these planes value for value. llama.cpp's quantisers are not in
- * this build, so the hashes in bit_exact_against_llama_cpp record those planes for this file's
- * inputs, and an edit that moves a single code or scale away from llama.cpp's fails here. The
- * error bounds carry margin; they catch a wrong plane layout, which decodes to noise, and the
- * hashes catch the rest.
+ * The quantiser claims its codes and scales are llama.cpp's own, at the commit vendor/UPSTREAM
+ * names (06938ac12, ggml-quants.c built as ggml-base builds it): the same weights and imatrix
+ * through llama.cpp's quantize_<type> and through this port give identical GGUF blocks for all
+ * nineteen types, and llama.cpp's dequantize_row_<type> equals enc_decode_rows of these planes
+ * value for value. llama.cpp's quantisers are not in this build, so bit_exact_against_llama_cpp
+ * pins hashes of those planes for this file's inputs; any code or scale that moves fails there.
+ * The error bounds carry margin and catch a wrong plane layout, which decodes to noise.
  */
 #include "quant_fixture.h"
 
@@ -28,9 +26,10 @@ struct Type {
     double      bound;      /* rel_err on every_type_decodes_within_its_bound's weight */
 };
 
-/* The bounds are 1.3x the larger of the plain and imatrix errors measured on that weight, whose
- * 0.2% outliers at 10x widen every block they land in -- hence q4_0 at 0.11 rather than the 0.07
- * a clean Gaussian gives it. */
+/* Bounds are 1.3x the larger of the plain and imatrix errors on that weight (its first 8 rows for
+ * the iq1_* and iq2_* types, all 32 for the rest). Its 0.2% outliers
+ * at 10x widen every block they land in, hence q4_0's error of 0.11 rather than the 0.07 a
+ * clean Gaussian gives. */
 const Type kTypes[] = {
     { "q4_0", "i4*f16[1x32]", false, 32, 0.141 },
     { "q4_1", "affine:codes=u4[1x1],scale=f16[1x32],min=f16[1x32]", false, 32, 0.110 },
@@ -49,67 +48,33 @@ const Type kTypes[] = {
     { "iq4_xs", "affine:codes=u4[1x1],table=i8{1x16},scale=i6[1x32],scale.1=f16[1x256]", false,
       256, 0.118 },
     { "iq2_xxs", "affine:codes=u8[1x8],grid=u8{256x8},signs=u1[1x1],scale=u5[1x32],"
-                 "scale.1=f16[1x256],scale.2=f32[*x*]", true, 256, 0.560 },
+                 "scale.1=f16[1x256],scale.2=f32[*x*]", true, 256, 0.558 },
     { "iq2_xs", "affine:codes=u9[1x8],grid=u8{512x8},signs=u1[1x1],scale=u5[1x16],"
-                "scale.1=f16[1x256],scale.2=f32[*x*]", true, 256, 0.467 },
+                "scale.1=f16[1x256],scale.2=f32[*x*]", true, 256, 0.468 },
     { "iq2_s", "affine:codes=u10[1x8],grid=u8{1024x8},signs=u1[1x1],scale=u5[1x16],"
-               "scale.1=f16[1x256],scale.2=f32[*x*]", false, 256, 0.425 },
+               "scale.1=f16[1x256],scale.2=f32[*x*]", false, 256, 0.429 },
     { "iq3_xxs", "affine:codes=u8[1x4],grid=u8{256x4},signs=u1[1x1],scale=u5[1x32],"
                  "scale.1=f16[1x256],scale.2=f32[*x*]", false, 256, 0.318 },
     { "iq3_s", "affine:codes=u9[1x4],grid=u8{512x4},signs=u1[1x1],scale=u5[1x32],"
                "scale.1=f16[1x256]", false, 256, 0.242 },
     { "iq1_s", "affine:codes=u11[1x8],grid=i8{2048x8},scale=u4[1x32],scale.1=f16[1x256],"
-               "zero=bf16[1x32]", true, 256, 0.737 },
+               "zero=bf16[1x32]", true, 256, 0.751 },
     { "iq1_m", "affine:codes=u11[1x8],grid=i8{2048x8},scale=u4[1x16],scale.1=f16[1x256],"
-               "zero=bf16[1x8]", false, 256, 0.765 },
+               "zero=bf16[1x8]", false, 256, 0.770 },
 };
 
-RadQuantWeight weight_of(const char* name, int64_t rows, int64_t cols, const float* imp) {
-    RadQuantWeight qw{};
-    qw.name = name;
-    qw.rank = 2;
-    qw.shape[0] = rows;
-    qw.shape[1] = cols;
-    qw.rows = rows;
-    qw.cols = cols;
-    qw.layer = qw.expert = -1;
-    qw.importance = imp;
-    return qw;
+/* llama.cpp's iq1_* and iq2_* types, whose searches are exhaustive over a neighbour grid. */
+bool grid_search(const Type& t) {
+    return !std::strncmp(t.name, "iq1_", 4) || !std::strncmp(t.name, "iq2_", 4);
 }
 
-/* quant_fixture.h's quantise, with the imatrix's importances handed over as rad-convert hands
- * them -- to quantize, never to encoding -- and `blk` rows a call (0: the quantiser's own
- * row_block, which for `ggml` is one row). */
+/* One `ggml` type through quant_fixture.h's quantise, `blk` rows per call (0: the quantiser's
+ * own row_block, one row for `ggml`). */
 Quantised quantise_ggml(const char* type, int64_t rows, int64_t cols, const std::vector<float>& w,
                         const float* imp, int64_t blk = 0) {
-    Quantised out;
-    const RadQuantizerInfo* q = quantizer("ggml");
     Opts o;
     o.s("type", type);
-    const RadQuantWeight declared = weight_of("blk.0.ffn_down.weight", rows, cols, nullptr);
-    const RadQuantWeight qw = weight_of("blk.0.ffn_down.weight", rows, cols, imp);
-    out.status = q->encoding(o.data(), o.n(), &declared, &out.enc);
-    if (out.status != RAD_OK) return out;
-    for (int i = 0; i < out.enc.n_planes; ++i)
-        out.planes.emplace_back((size_t)rad_enc_plane_bytes(&out.enc.plane[i], rows, cols), 0);
-    if (blk <= 0) blk = q->row_block(o.data(), o.n(), &qw);
-    if (blk <= 0) blk = rows;
-    for (int64_t r0 = 0; r0 < rows; r0 += blk) {
-        const int64_t n = r0 + blk < rows ? blk : rows - r0;
-        std::vector<float> part(w.begin() + r0 * cols, w.begin() + (r0 + n) * cols);
-        std::vector<void*> pp;
-        for (int i = 0; i < out.enc.n_planes; ++i) {
-            const RadEncPlane& p = out.enc.plane[i];
-            int64_t pr = 0, pc = 0;
-            rad_enc_plane_dims(&p, rows, cols, &pr, &pc);
-            const bool banded = p.kind == RAD_PLANE_TILED && p.block[0] > 0;
-            pp.push_back(out.planes[(size_t)i].data() +
-                         (banded ? r0 / p.block[0] : 0) * rad_enc_row_bytes(p.dtype, pc));
-        }
-        out.status = q->quantize(o.data(), o.n(), &qw, part.data(), r0, n, pp.data());
-        if (out.status != RAD_OK) return out;
-    }
-    return out;
+    return quantise(quantizer("ggml"), o, "blk.0.ffn_down.weight", rows, cols, w, imp, blk);
 }
 
 /* A column importance as an imatrix holds one: positive, and uneven enough to steer a search. */
@@ -122,11 +87,7 @@ std::vector<float> importance(int64_t cols, uint64_t seed) {
 
 uint64_t fnv1a(const Quantised& q) {
     uint64_t h = 0xcbf29ce484222325ull;
-    for (const auto& p : q.planes)
-        for (uint8_t b : p) {
-            h ^= b;
-            h *= 0x100000001b3ull;
-        }
+    for (const auto& p : q.planes) h = fnv(p, h);
     return h;
 }
 
@@ -175,10 +136,14 @@ TEST(ggml_writes_each_type_as_its_affine_planes) {
 
 TEST(every_type_decodes_within_its_bound) {
     NEED_LIBQUANT();
-    const int64_t R = 32, C = 1024;
-    const std::vector<float> w = draw(R * C, 11, 10.0f);
+    const int64_t C = 1024;
+    const std::vector<float> w32 = draw(32 * C, 11, 10.0f);
     const std::vector<float> imp = importance(C, 12);
     for (const Type& t : kTypes) {
+        /* The 1- and 2-bit grid types search llama.cpp's neighbour grids exhaustively, so they are
+         * measured on the first 8 rows (8192 values) and the rest on all 32. */
+        const int64_t R = grid_search(t) ? 8 : 32;
+        const std::vector<float> w(w32.begin(), w32.begin() + R * C);
         double e[2] = { 0, 0 };
         for (int m = 0; m < 2; ++m) {
             if (m == 0 && t.needs_im) continue;
@@ -195,9 +160,9 @@ TEST(every_type_decodes_within_its_bound) {
 
 TEST(the_imatrix_reaches_the_search) {
     NEED_LIBQUANT();
-    /* With the importances the search minimises the importance-weighted error, and every type
-     * that has such a search gets measurably lower there (by 2.5-25% on this weight). q8_0 has
-     * none -- llama.cpp rounds it to nearest either way -- and must not move at all. */
+    /* With importances the search minimises the importance-weighted error, so every type that
+     * has a search must lower it measurably (2.5-25% on this weight). q8_0 has no search
+     * (llama.cpp rounds to nearest either way) and must not change at all. */
     const int64_t R = 32, C = 1024;
     const std::vector<float> w = draw(R * C, 11, 10.0f);
     const std::vector<float> imp = importance(C, 12);
@@ -219,8 +184,8 @@ TEST(the_imatrix_reaches_the_search) {
 
 TEST(q8_0_is_round_to_nearest_against_amax_over_127) {
     NEED_LIBQUANT();
-    /* One format restated from its definition rather than from the port: without an imatrix
-     * llama.cpp's q8_0 is d = amax/127, a code roundf(x * (1/d)), and d stored as f16. */
+    /* One format restated from its definition rather than from the port: without an imatrix,
+     * llama.cpp's q8_0 is d = amax/127, code roundf(x * (1/d)), d stored as f16. */
     const int64_t R = 4, C = 256;
     const std::vector<float> w = draw(R * C, 21, 6.0f);
     Quantised q = quantise_ggml("q8_0", R, C, w, nullptr);
@@ -264,8 +229,8 @@ TEST(quantisation_is_deterministic_and_rows_are_independent) {
 TEST(bit_exact_against_llama_cpp) {
     NEED_LIBQUANT();
     /* FNV-1a of every plane's bytes, in plane order, for the [8 x 512] weight below without (0)
-     * and with (1) the importances below -- each confirmed equal to llama.cpp's own blocks and
-     * dequantisation (see the head of this file). */
+     * and with (1) the importances below; each confirmed equal to llama.cpp's own blocks and
+     * dequantisation (see the file header). */
     struct Pin { const char* type; int imatrix; uint64_t fnv; };
     const Pin kPins[] = {
         { "q4_0", 0, 0xafebf0225eb23c08ull },    { "q4_0", 1, 0x249e07415953dc83ull },

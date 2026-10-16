@@ -1,21 +1,19 @@
 /* kv.h -- the KV block manager (spec §7.2).
  *
- * Paged, per KV group, each group with its OWN block geometry, its own pool and its own slot
- * mapping. Block size comes from KVGroupInfo::block_size, which the build component took off the
- * resolved attention kernel's constraints -- never a core constant. A core that picked its own
- * block size would be a core that has to be edited when a kernel changes.
+ * Paged per KV group; each group has its own block geometry, pool and slot mapping. Block size
+ * comes from KVGroupInfo::block_size, taken from the resolved attention kernel's constraints,
+ * never from a core constant, so a kernel change needs no core edit.
  *
- * Hybrid models are the normal case, not an extension. Four state kinds:
+ * Four state kinds (hybrid models are the normal case):
  *
  *   RAD_KV_FULL    paged, per-token, growing
- *   RAD_KV_WINDOW  paged, per-token, bounded by the window -- blocks below the window are recycled
- *   RAD_KV_LINEAR  per-sequence, FIXED size: the GDN recurrent state
- *   RAD_KV_CONV    per-sequence, FIXED size: a rolling window of conv_width-1 + n_spec entries
+ *   RAD_KV_WINDOW  paged, per-token, bounded by the window; blocks below the window are recycled
+ *   RAD_KV_LINEAR  per-sequence, fixed size: the GDN recurrent state
+ *   RAD_KV_CONV    per-sequence, fixed size: a rolling window of conv_width-1 + n_spec entries
  *
- * The last two are not paged the same way, and they are allocated, mapped and freed BY THIS
- * MANAGER anyway, because otherwise two allocators disagree about what a sequence owns. That
- * disagreement is not a memory leak, it is a correctness bug: the scheduler frees a sequence and
- * one of the two allocators keeps handing its state slot to the next request.
+ * The two stateful kinds are also allocated, mapped and freed here, so one allocator decides what
+ * a sequence owns. With two, a freed sequence's state slot could still be handed to the next
+ * request by the other.
  */
 #pragma once
 #include "mem/hostarena.h"
@@ -30,22 +28,14 @@
 namespace rad {
 
 /* ------------------------------------------------------------------ group sizing */
-/* vLLM slices a hybrid model's layers into equal-sized groups and PADS each bundle up to a
- * multiple of that size -- and a padding layer is allocated real memory. On a 48 linear / 16 full
- * / 5 drafter model its rule ("group size = the smallest bundle") picks 5, which divides neither
- * 48 nor 16, so it allocates 15 groups x 5 = 75 slots for 69 real layers, and rounds the
- * per-request requirement up once per group -- fifteen round-ups on every request, which is where
- * most of the loss actually is. Replacing that rule with a least-waste search recovers a
- * substantial fraction of the KV tokens at a byte-identical budget.
+/* Layer bundling compared with vLLM. vLLM splits a hybrid model's layers into equal-sized groups
+ * and pads each bundle to a multiple of that size with real memory: on a 48 linear / 16 full /
+ * 5 drafter model its rule picks size 5, giving 15 groups x 5 = 75 slots for 69 layers and a
+ * per-request round-up per group. A least-waste search recovers part of that.
  *
- * Radiance does not need the search, because it does not have the constraint the search works
- * around. A KV group here is one state kind with one geometry and ITS OWN POOL (spec §7.2), so
- * there is no uniform page size to pad up to and no reason to subdivide a bundle: every state
- * kind is exactly one group covering exactly its own layers. Padding is structurally zero and the
- * group count is structurally minimal.
- *
- * This struct exists so `--debug-placement` can print that claim next to what vLLM would have
- * done, and so the test can assert it rather than trusting the comment. */
+ * Here each state kind is one group with its own pool (spec §7.2), so there is no uniform page
+ * size to pad to: padding is zero and the group count is minimal. This struct lets
+ * `--debug-placement` print the comparison and lets a test assert it. */
 struct BundleComparison {
     std::vector<int64_t> bundles;        /* layers per state kind, as declared */
     int64_t stock_group_size = 0;        /* vLLM's rule: the smallest bundle (with the 1.5x escape) */
@@ -55,7 +45,7 @@ struct BundleComparison {
     int64_t patched_groups = 0;
     int64_t patched_slots = 0;
     int64_t our_groups = 0;              /* == bundles.size() */
-    int64_t our_slots = 0;               /* == sum(bundles); padding is zero by construction */
+    int64_t our_slots = 0;               /* == sum(bundles); no padding */
     std::string report() const;
 };
 BundleComparison compare_bundling(const std::vector<int64_t>& bundles);
@@ -68,31 +58,28 @@ struct KVGroupPlan {
     int64_t     n_layers = 0;
 
     int64_t     block_size = 0;        /* tokens per block, from the resolved kernel */
-    int64_t     bytes_per_block = 0;   /* covers EVERY layer bound to the group -- see the note
-                                        * on bundling above: one page, one bundle, no padding */
+    int64_t     bytes_per_block = 0;   /* covers every layer bound to the group */
     int64_t     bytes_per_state = 0;   /* LINEAR/CONV: per sequence, every layer */
     int64_t     conv_slots = 0;        /* CONV: conv_width - 1 + n_spec */
     int64_t     window_blocks = 0;     /* WINDOW: the per-sequence block cap */
-    /* WINDOW: a checkpoint slot carries this group's window (has_window_snapshot). Only a trunk
-     * group of a model with no linear state: a prefix hit there resumes at a checkpoint from the
-     * window behind it. A drafter's own window is recomputed by draft refill, and a model with
-     * linear state re-prefills a hit on a windowed trunk, so neither snapshot would ever be read. */
+    /* WINDOW: a checkpoint slot carries this group's window (has_window_snapshot). Set only for a
+     * trunk group of a model with no linear state. A drafter's window is recomputed by draft
+     * refill, and a model with linear state re-prefills a hit on a windowed trunk, so neither
+     * snapshot would be read. */
     bool        win_snap = false;
 
     int64_t     n_blocks = 0;          /* paged groups: blocks carved from the pool */
-    /* rad_kv_group_zero: this rank keeps no cache for the group. The plan exists for its position
-     * and its block count (one block table serves every rank), its costs are zero and nothing is
-     * carved; no op on this rank names it (issue refuses a group with no pool bound). */
+    /* rad_kv_group_zero: this rank keeps no cache for the group. The plan keeps its position and
+     * block count (one block table serves every rank); its costs are zero and nothing is carved.
+     * No op on this rank names it (issue refuses a group with no pool bound). */
     bool        zero = false;
     int64_t     n_states = 0;          /* LINEAR/CONV: n_seq_states * state_copies */
-    /* HOW MANY PHYSICAL SLOTS ONE LOGICAL STATE COSTS. One, normally: a sequence owns a state.
-     * Under speculation a linear kernel needs somewhere to put what it cannot commit yet -- it
-     * has run 1 + n_spec tokens through the recurrence before anyone knows which survive -- and
-     * the scheme libr4d uses keeps the committed state in one slot and the per-token replay
-     * factors in a second, then folds the accepted prefix in at the start of the next step. Two
-     * slots a sequence, not 1 + n_spec: the factors are a few hundred floats a head against a
-     * 128x128 state, so they fit inside a slot with room to spare and the pool grows by 2x
-     * rather than by 9x. Copy k of logical slot s is the physical slot s + k * n_seq_states. */
+    /* Physical slots per logical state: 1, or 2 under speculation. A verify runs 1 + n_spec
+     * tokens through the recurrence before acceptance is known; libr4d keeps the committed state
+     * in copy 0 and the per-token replay factors in copy 1, and folds the accepted prefix in at
+     * the next step. The factors (a few hundred floats a head, against a 128x128 state) fit in
+     * one slot, so the pool grows 2x rather than (1 + n_spec)x. Copy k of logical slot s is
+     * physical slot s + k * n_seq_states. */
     int64_t     state_copies = 1;
     int64_t n_seq_states() const { return state_copies > 0 ? n_states / state_copies : n_states; }
     int64_t     pool_offset = 0;
@@ -102,18 +89,14 @@ struct KVGroupPlan {
     bool paged() const { return kind == RAD_KV_FULL || kind == RAD_KV_WINDOW; }
     bool stateful() const { return kind == RAD_KV_LINEAR || kind == RAD_KV_CONV; }
 
-    /* THE POOL IS LAYER-MAJOR, and that is not a free choice -- the ABI already made it. A
-     * RAD_OPK_KV operand carries the LAYER as its offset and the core resolves it as
-     * `base + layer * layer_stride` (RadOperand in rad_runtime.h, KVPoolBinding in
-     * core/runtime/ctx.h), because an attention kernel takes ONE base pointer for the layer it is
-     * running and indexes inside it with the block table and the slot mapping. Interleaving the
-     * layers inside a block would mean every kernel needed the layer count and the bundle stride
-     * as well, to reach the same bytes.
+    /* The pool is layer-major, as the ABI requires: a RAD_OPK_KV operand carries the layer as its
+     * offset and resolves to `base + layer * layer_stride` (RadOperand in rad_runtime.h,
+     * KVPoolBinding in core/runtime/ctx.h), so a kernel gets one base pointer per layer and
+     * indexes it with the block table and slot mapping.
      *
-     * So layer i owns [base + i*layer_stride, + layer_stride): n_blocks blocks of
+     * Layer i owns [base + i*layer_stride, + layer_stride): n_blocks blocks of
      * `bytes_per_block / n_layers` for a paged group, n_states states of
-     * `bytes_per_state / n_layers` for a stateful one. The totals are identical either way, which
-     * is why sizing does not care and addressing does. */
+     * `bytes_per_state / n_layers` for a stateful one. */
     int64_t layer_bytes_per_block() const {
         return n_layers > 0 ? bytes_per_block / n_layers : bytes_per_block;
     }
@@ -126,28 +109,21 @@ struct KVGroupPlan {
 };
 
 /* A copy the caller must execute on its copy stream before the destination block is read. The
- * manager does not issue device copies itself: it has no stream, and a memcpy on the step path is
- * a synchronisation the engine spends its whole design avoiding (spec §5.4). */
+ * manager has no stream and issues no device copies, since a memcpy on the step path would
+ * synchronise (spec §5.4). */
 struct BlockCopy {
     int32_t group = -1;
     int32_t src_block = -1;
     int32_t dst_block = -1;
 };
 
-/* A STATE SLOT THAT STILL HOLDS THE PREVIOUS TENANT'S HISTORY. The manager names the work and the
- * engine issues it, for the same reason BlockCopy exists: no stream here, and a synchronisation on
- * the step path is what this design spends itself avoiding (spec §5.4).
+/* A state slot that still holds the previous tenant's state and must be zeroed before first use.
+ * The manager names the work and the engine issues it, as with BlockCopy.
  *
- * WHY A RECURRENT SLOT HAS TO BE CLEARED AND A PAGED ONE DOES NOT. A paged sequence reads only the
- * blocks its own block table names, so a recycled block is unreachable until it is written. A
- * recurrent sequence has no table: `gdn_chunk_scan` reads `h0` out of the slot and there is no
- * operand in its schema that says "this sequence has none". An uncleared slot IS the last
- * sequence's entire compressed history, so the second request a server answers silently continues
- * the first: the same prompt gives a different distribution on a fresh process than it does after
- * another request has run.
- *
- * The conv group carries `has_init` and does not need this. It is cleared anyway: two rules about
- * one pool is how one of them rots. */
+ * A paged sequence reads only the blocks its table names, so a recycled block is unreachable
+ * until written. A recurrent slot has no table: `gdn_chunk_scan` reads `h0` from the slot and has
+ * no operand for "no initial state", so an uncleared slot continues the previous sequence's
+ * history. Conv slots carry `has_init` but are cleared too, so one rule covers the pool. */
 struct StateClear {
     int32_t group = -1;
     int32_t slot  = -1;
@@ -156,41 +132,37 @@ struct StateClear {
 /* ------------------------------------------------------------------ manager */
 class KVManager {
 public:
-    /* Sizes every group out of one pool and refuses, by name and by how much, if the fixed costs
-     * alone do not fit. The split between the paged groups is not a policy: they are sized to
-     * exhaust at the same total token count, and any other split strands memory in whichever
-     * group outlasts the others.
+    /* Sizes every group out of one pool, refusing by name and shortfall if the fixed costs alone
+     * do not fit. The paged groups are sized to run out at the same total token count; any other
+     * split strands memory in whichever group outlasts the others.
      *
-     * The byte budget is the budget resolver's and is not re-derived here: it is whatever
-     * `kv_pool` still has (vram_kv). The linear-state snapshots take none of it -- they live
-     * in pinned host memory (set_checkpoint_store) -- so the pool is the live cache and nothing
-     * else (spec §6, §7.3). */
+     * The budget is whatever `kv_pool` has left (vram_kv), as the budget resolver set it.
+     * Linear-state snapshots live in pinned host memory (set_checkpoint_store), so the pool holds
+     * only the live cache (spec §6, §7.3). */
     int configure(const std::vector<KVGroupInfo>& groups, const Config& cfg, Pool& kv_pool);
 
-    /* configure(), split at the seam the budget resolver needs. plan_groups() sizes every group
-     * from the declaration and the run configuration -- no pool, no bytes -- and ceiling() then
-     * says what a FULL cache for `ctx` tokens on max_seqs sequences would cost. Pools are
-     * allocated before carve() runs, so the KV pool has to be decided from these two
-     * and nothing else (core/mem/vram_budget.cpp). carve() spends the pool it is given. */
+    /* configure() in two steps for the budget resolver. plan_groups() sizes every group from the
+     * declaration and run configuration (no pool), and ceiling() gives the cost of a full cache
+     * for `ctx` tokens on max_seqs sequences. Pools are allocated before carve(), so the KV pool
+     * is sized and capped from these two alone (core/mem/vram_budget.cpp); VRAM above the ceiling
+     * would never be addressed. carve() spends the pool it is given. */
     int     plan_groups(const std::vector<KVGroupInfo>& groups, const Config& cfg);
     int64_t ceiling(int64_t ctx) const;
-    /* The part of every ceiling that is not context: recurrent and conv state for max_seqs
-     * sequences, and the padding. Set by plan_groups(). */
+    /* The context-independent part of every ceiling: recurrent and conv state for max_seqs
+     * sequences, plus alignment padding. Set by plan_groups(). */
     int64_t fixed_bytes() const { return fixed_; }
-    /* THE TOKEN COUNT THE PAGED GROUPS SETTLE ON for `budget_bytes` of pool -- carve()'s split
-     * with nothing carved. One block table serves every rank, so every rank's paged groups must
-     * hold the SAME number of blocks; under an uneven tensor-parallel split the ranks' pools are
-     * not the same size (a rank with more delta-net heads holds more state and has less left for
-     * pages, and a rank with no attention weights has more). The engine asks each rank this and
-     * cap_paged_tokens() the least on all of them before carve(). 0 is no cap.
-     * kUnboundedTokens when every paged group of this rank is zero (rad_kv_group_zero): its pages
-     * cost it nothing, so it takes what the ranks holding the cache carve and limits nobody. */
+    /* The token count the paged groups settle on for `budget_bytes` of pool (carve()'s split,
+     * without carving). One block table serves every rank, so all ranks must hold the same block
+     * count, but under an uneven tensor-parallel split their pools differ. The engine asks every
+     * rank and passes the least to cap_paged_tokens() before carve(); 0 is no cap.
+     * kUnboundedTokens when every paged group on this rank is zero (rad_kv_group_zero): this rank
+     * then limits nothing. */
     static constexpr int64_t kUnboundedTokens = INT64_MAX;
     int64_t paged_tokens(int64_t budget_bytes) const { return paged_split(budget_bytes, nullptr); }
-    /* THE INVERSE OF paged_tokens: the least whole MiB of pool whose paged split reaches `tokens`,
-     * searched up to max_mib; -1 when even max_mib does not. Pure arithmetic on the plan (no pool,
-     * no cap), for Engine::plan sizing an uneven world's cheaper rank to the token count its
-     * dearest peer sets. paged_split is monotone in the budget, so the search is exact. */
+    /* Inverse of paged_tokens: the least whole MiB of pool whose paged split reaches `tokens`,
+     * searched up to max_mib; -1 if max_mib does not reach it. Pure arithmetic on the plan, used
+     * by Engine::plan to size a cheaper rank to the token count of its dearest peer. Exact,
+     * because paged_split is monotone in the budget. */
     int64_t pool_mib_for_tokens(int64_t tokens, int64_t max_mib) const;
     void    cap_paged_tokens(int64_t tokens) { tokens_cap_ = tokens > 0 ? tokens : 0; }
     int     carve(Pool& kv_pool);
@@ -198,44 +170,39 @@ public:
     const std::vector<KVGroupPlan>& plans() const { return plans_; }
     const KVGroupPlan* plan(int32_t group) const;
     int32_t n_groups() const { return (int32_t)plans_.size(); }
-    const BundleComparison& bundling() const { return bundling_; }
     std::string report() const;
 
     /* ---------------- sequences ---------------- */
     int  add_sequence(uint64_t seq);
     bool has_sequence(uint64_t seq) const;
     void free_sequence(uint64_t seq);
-    /* HOW MANY TIMES A SEQUENCE HAS LET GO OF ITS BLOCKS -- freed or preempted -- over the life of
-     * the manager. A block's reference count falls for no other reason the prefix cache cannot
-     * see, so this is what tells it a block it found shared may no longer be. */
+    /* Count of sequence frees and preemptions over the manager's life. These are the only
+     * refcount drops the prefix cache cannot see, so a change tells it a block it saw shared may
+     * no longer be. */
     uint64_t seq_frees() const { return seq_frees_; }
 
     /* Grow the sequence's mapping to cover `n_tokens` in every group. Unshares a shared partial
      * block first (copy-on-write) and appends the copy request to the pending list.
      * RAD_E_FULL when a group's free list is empty -- the caller preempts and retries.
      *
-     * `keep_from` is the position of the FIRST query the coming step runs (the scheduler's
-     * n_computed); -1 means the sequence's current end. A WINDOW group recycles only the blocks no
-     * query at or past it can read -- below keep_from - window + 1 -- and NOT the blocks below the
-     * window of the step's END: a prefill chunk longer than a block would otherwise lose the keys
-     * its first rows attend to (a chunk of C tokens from position 0 rebased the table at
-     * ceil(C/block) - window_blocks and left every position below it with no KV at all). */
+     * `keep_from` is the position of the first query the coming step runs (the scheduler's
+     * n_computed); -1 means the sequence's current end. A WINDOW group recycles only blocks below
+     * keep_from - window + 1, not below the window of the step's end, which would drop keys the
+     * first rows of a multi-block prefill chunk still read. */
     int  ensure(uint64_t seq, int64_t n_tokens, int64_t keep_from = -1);
 
-    /* A WINDOW group's caps: a sequence holds its window behind the step's first query AND the
-     * step's own tokens (window_blocks + ceil(max_tok / block) + 1 at most), and one step carries
-     * at most max_tok tokens across every sequence in it, so the pool needs max_seqs windows plus
-     * one step's worth on top. */
+    /* A WINDOW group's caps. A sequence holds the window behind the step's first query plus the
+     * step's own tokens (at most window_blocks + ceil(max_tok / block) + 1), and one step carries
+     * at most max_tok tokens in total, so the pool needs max_seqs windows plus one step. */
     int64_t window_seq_cap(const KVGroupPlan& p) const;
     int64_t window_pool_cap(const KVGroupPlan& p) const;
+    /* ceil(max_tok / block): the blocks one step's tokens can fill. */
+    int64_t step_blocks(const KVGroupPlan& p) const;
 
-    /* GIVE BACK A FINISHED CHUNK'S BLOCKS once it is committed. ensure() keeps a chunk's own blocks
-     * beside the window behind its first query, and only the sequence's NEXT ensure() recycles
-     * them -- so a prefill waiting a step for its next chunk would sit on a whole chunk of window
-     * blocks while other sequences prefill, and eight of them exhaust the pool (measured on
-     * Gemma 4: "the KV pool cannot hold 12480 tokens" with eight 16K prompts). Called by the
-     * scheduler when it advances n_computed: keep_from is the new n_computed, the first query any
-     * later step can run. */
+    /* Recycles a committed chunk's window blocks. ensure() keeps a chunk's blocks beside the
+     * window and only the next ensure() recycles them, so a prefill waiting for its next chunk
+     * would hold a whole chunk of blocks; several such prefills can exhaust the pool. The
+     * scheduler calls this when it advances n_computed, passing the new n_computed. */
     void trim_window(uint64_t seq, int64_t keep_from);
 
     /* Adopt blocks a prefix-cache hit found. `n_tokens` must be a whole multiple of the group's
@@ -243,45 +210,41 @@ public:
      * corrupt the cache entry. Bumps each block's refcount. */
     int  adopt(uint64_t seq, int32_t group, const std::vector<int32_t>& blocks, int64_t n_tokens);
 
-    /* Fork: the child shares every WHOLE block of the parent and gets its own copy of the
-     * partial one on first write (copy-on-write, spec §7.3). Stateful groups cannot be shared --
-     * a recurrent state is one object, not a chain -- so the child gets its own slot and the
-     * caller must snapshot-restore into it. */
+    /* The child shares every whole block of the parent and copies the partial one on first write
+     * (spec §7.3). A recurrent state cannot be shared, so the child gets its own slot and the
+     * caller must restore a snapshot into it. */
     int  fork(uint64_t parent, uint64_t child);
 
     std::vector<BlockCopy> take_pending_copies();
 
-    /* The prefix cache's handle on a block. It holds a reference on every block it indexes, and
-     * that reference is the invariant that makes a hit safe: a block named by the cache is never
-     * in the free list, so it can never be handed to another sequence underneath a cache entry.
-     * Nothing else in the engine may call these -- the block table is the manager's property. */
-    /* TAKE A FREE BLOCK, with no sequence attached to it yet. The idle-session tiers need this
-     * and nothing else does: a restore has bytes to put somewhere before any sequence has asked
-     * for them, and the prefix cache takes the reference afterwards. Every other caller reaches
-     * blocks through a sequence, which is why grab_block itself stays private -- this is the one
-     * documented way to hold a block that no Seq owns, and the holder is responsible for
-     * release_block if the restore then fails. */
+    /* Prefix-cache and tier access to blocks. The cache holds a reference on every block it
+     * indexes, so a cached block is never in the free list and cannot be handed to another
+     * sequence under a cache entry. Nothing else may call these. */
+    /* Takes a free block with no sequence attached, for the idle-session tiers: a restore needs
+     * somewhere to put bytes before any sequence asks for them, and the prefix cache takes the
+     * reference afterwards. The holder must release_block() if the restore fails. Does not
+     * recall the loan; it stops at what the cache keeps in hand. */
     int  reserve_block(int32_t group, int32_t* out);
-    /* THE SAME FOR A WHOLE CHAIN AT ONCE: up to `n` blocks appended to `out`, and how many. The
-     * loan is recalled for all of them before the first is taken, because a restore is sized
-     * before it starts and one recall a block would drain the slab a buffer at a time -- the
-     * reserve above stops at whatever the cache kept in hand. */
+    /* Up to `n` blocks appended to `out`; returns how many. Recalls the loan for all of them up
+     * front, since a block-at-a-time recall would drain the slab one buffer at a time. */
     int64_t reserve_blocks(int32_t group, int64_t n, std::vector<int32_t>* out);
-    /* The same, for a block another rank already chose. See the definition. */
+    /* Takes one particular block another rank already chose. Block ids are shared across ranks
+     * (RadBatch carries one table), so under tensor parallelism rank 0 picks and the others take
+     * the same id. Refuses (RAD_E_STATE) a held block or one above the live mark rather than
+     * substituting, since a rank restoring into a different block would corrupt only that rank's
+     * output. */
     int  reserve_specific_block(int32_t group, int32_t block);
     /* The cache's reference on a block a sequence already holds. The block is marked as the
      * cache's for cache_only_blocks(). */
     int  retain_block(int32_t group, int32_t block);
     /* A reserved block's reference handed to the cache as it stands: marked, not counted again. */
     void cache_reserved_block(int32_t group, int32_t block);
-    /* Lets go of the cache's reference on a marked block and of a reservation's on any other. */
+    /* Releases the cache's reference on a marked block, or a reservation's on any other. */
     void release_block(int32_t group, int32_t block);
     int32_t block_refcount(int32_t group, int32_t block) const;
-    /* BLOCKS ONLY THE CACHE HOLDS: marked, and at a reference count of one. This is what an
-     * eviction would give back, and what a dashboard reports as cache rather than as context.
-     * Kept current at every reference-count change so that reading it costs nothing: the figure
-     * is read while the scheduler's lock is held, and a walk of the cache to compute it would
-     * stall the step for as long as it ran. */
+    /* Blocks only the cache holds: marked, at refcount one. This is what an eviction would free.
+     * Maintained at every refcount change because it is read under the scheduler's lock, where a
+     * walk of the cache would stall the step. */
     int64_t cache_only_blocks(int32_t group) const;
 
     const std::vector<int32_t>& block_table(uint64_t seq, int32_t group) const;
@@ -298,168 +261,132 @@ public:
     /* ---------------- accounting ---------------- */
     int64_t free_blocks(int32_t g) const;
 
-    /* HOW MANY BLOCKS OF A GROUP ANYTHING IS HOLDING. free_blocks() is what may be handed out
-     * RIGHT NOW, which while the cache is lending is bounded by the live mark and not by the
-     * carve, so `carve - free` counts every lent block as occupied -- an idle server reading 97%
-     * full. The occupancy question wants this instead: a lent block is neither held nor
-     * unavailable, because the loan is recalled on demand up to the carve. */
+    /* Blocks of a group that something holds. Use this for occupancy, not `carve - free`:
+     * free_blocks() is bounded by the live mark while the cache lends, so that difference would
+     * count lent blocks as occupied. */
     int64_t held_blocks(int32_t g) const;
 
+    /* The carve: the range every block id is addressed against. live_blocks() is what the cache
+     * keeps unlent. */
     int64_t total_blocks(int32_t group) const;
     int64_t free_states(int32_t group) const;
 
-    /* THE POOL IN BYTES, WHICH IS THE ONLY UNIT THE GROUPS CAN BE ADDED IN. Blocks cannot be:
-     * a paged group and a stateful one count different objects, and two paged groups share ONE
-     * token axis -- a token of context takes a slot in each of them -- so summing either measure
-     * reports a pool several times the size of the one the card holds. Bytes are disjoint VRAM
-     * and add up.
+    /* Pool size in bytes, the only unit in which groups can be summed: paged and stateful groups
+     * count different objects, and paged groups share one token axis.
      *
-     * The used figure is what is HELD rather than what is reachable: a block a sequence owns and
-     * a block only the prefix cache still references both count, because both are VRAM the next
-     * request cannot be given. A block stops counting the moment it reaches the free list,
-     * whether it got there because its sequence ended, because the cache evicted it, or because
-     * the idle tiers copied it to host memory and released it. */
+     * pool_bytes() excludes lent blocks, which the expert slab reports as its own. Used bytes
+     * count held blocks, owned by a sequence or referenced only by the prefix cache; a block
+     * stops counting when it reaches the free list. */
     int64_t pool_bytes(int32_t group) const;
     int64_t pool_bytes_used(int32_t group) const;
-    /* THE CARVE, which the cache may not be keeping. pool_bytes() is what the cache keeps for
-     * itself right now; this is what the operator budget gave it to address, and the difference
-     * between them is what it has lent to the expert slab. */
+    /* Bytes the budget carved for the group; the difference from pool_bytes() is lent to the
+     * expert slab. */
     int64_t pool_bytes_carved(int32_t group) const;
     int64_t blocks_for(int32_t group, int64_t n_tokens) const;
 
-    /* Could a sequence of this length EVER fit, in an empty pool? If not, preempting the whole
-     * server would not help and the request is failed immediately rather than the engine
-     * deadlocking on it (spec §17). */
+    /* Whether a sequence of this length fits an empty pool. If not, preemption cannot help and
+     * the request is failed rather than deadlocking the engine (spec §17). */
     bool can_ever_fit(int64_t n_tokens) const;
 
     /* ---------------- the loan ----------------
      *
-     * THE PAGED GROUPS LEND THE EXPERT SLAB WHAT NOTHING HOLDS, AT THE ADDRESSES THEY ALREADY
-     * OWN. The carve decides every address once and backs all of it before anything runs, and
-     * nothing here ever unmaps it. What moves is only how many of a group's blocks the cache may
-     * hand out: the blocks above that mark, in every layer's stripe, are where the slab keeps
-     * expert units -- units the MoE GEMM would otherwise read across the link on every step that
-     * routes to them. No memory is allocated or released in either direction, so no driver call
-     * is made and what the card reports free never changes.
+     * The paged groups lend unheld blocks to the expert slab in place. The carve fixes and backs
+     * every address once and nothing here unmaps it; the loan only lowers how many of a group's
+     * blocks the cache may hand out (the live mark). The slab keeps expert units in the blocks
+     * above the mark in every layer's stripe, so the MoE GEMM need not read them across the link.
+     * No memory is allocated or freed either way, so the loan makes no driver call.
      *
-     * THE LOAN IS STATED IN TOKENS, counted down from the top of the carve. The FULL groups are
-     * sized to run out at the same total token count (carve()), so one number is the same depth
-     * in each of them: a loan of T tokens is the top floor(T / block_size) blocks of every FULL
-     * group. A WINDOW group is sized per sequence rather than on that axis and is never lent.
+     * The loan is in tokens, counted down from the top of the carve. FULL groups are sized to run
+     * out at the same token count, so a loan of T tokens is the top floor(T / block_size) blocks
+     * of every FULL group. WINDOW groups are sized per sequence and never lent.
      *
-     * A BLOCK IS NOT LENT WHILE ANYTHING HOLDS IT, and a held block is a block a sequence owns OR
-     * one the prefix cache still indexes. So a loan cannot evict anything: it is a claim on what
-     * is free. Everything that makes a block free -- a sequence ending, an eviction, an idle-tier
-     * demotion to host memory -- makes it lendable, and the min-heap free list is what
-     * keeps the free blocks at the top, where a loan can reach them.
+     * A held block (owned by a sequence or indexed by the prefix cache) is never lent, so a loan
+     * evicts nothing. The min-heap free list keeps free blocks at the top, where a loan reaches
+     * them.
      *
-     * THE BUFFER IS DERIVED AND NOT STATED. It is the free blocks the cache keeps in hand so that
-     * a request finds room without a recall, and the right size for it is a property of the
-     * workload rather than a number an operator can know: one prefill chunk -- the most KV a
-     * single step can consume -- or the largest recent shortfall, whichever is larger. The second
-     * term decays, so an idle server settles at the floor and a ramping one has the buffer
-     * leading the ramp. */
+     * The buffer is the free blocks the cache keeps in hand so a request finds room without a
+     * recall: the larger of one prefill chunk (the most one step consumes) and the largest recent
+     * shortfall. The shortfall term decays, so an idle server settles at the floor. */
     int64_t buffer_bytes() const;
 
-    /* Is this group lent from? The FULL paged groups, and only those. */
+    /* True for the FULL paged groups only. */
     bool    lendable(int32_t group) const;
 
-    /* HOW MUCH THE CACHE CAN LEND RIGHT NOW, in tokens: the smallest distance, over the lendable
-     * groups, from the top of the carve down to the highest block anything holds plus the buffer.
-     * Rank 0 only -- a follower's held history is empty. Also where the buffer's trend term
-     * decays, so it is called once per arbiter tick. */
+    /* Tokens the cache can lend now: over the lendable groups, the least distance from the top of
+     * the carve down to the highest held block plus the buffer. Rank 0 only (a follower tracks no
+     * held blocks). Also decays the buffer's shortfall term, so call it once per arbiter tick. */
     int64_t spare_tokens();
 
-    /* LEND `tokens` FROM THE TOP, or take back what a smaller number no longer covers. Lending
-     * past a held block is refused (RAD_E_STATE): the arbiter asked for more than spare_tokens()
-     * said there was. Taking back is always allowed here, and it is the caller's to make true --
-     * the slab must have left those blocks before this runs. */
+    /* Lends `tokens` from the top, or takes back what a smaller number no longer covers. Lending
+     * past a held block is refused (RAD_E_STATE). Taking back always succeeds here; the caller
+     * must have moved the slab out of those blocks first. */
     int     set_loan(int64_t tokens);
     int64_t loan_tokens() const { return loan_; }
 
-    /* WHO GIVES IT BACK WHEN A REQUEST CANNOT WAIT. A request that needs more blocks than the
-     * cache kept in hand calls this with the loan it can still afford, and the owner of the
-     * slabs drains them to it before returning -- so admission is decided against the whole
-     * carve, exactly as it would be with nothing lent. Without one, what is lent is not
-     * recalled and the request is refused (RAD_E_FULL). */
+    /* Recall hook. A request needing more blocks than the cache has in hand calls it with the
+     * loan it can still afford, and the slab owner drains to that before returning, so admission
+     * is decided against the whole carve. Without a hook, lent blocks are not recalled and the
+     * request gets RAD_E_FULL. */
     void    set_reclaim(std::function<int(int64_t tokens)> f) { reclaim_ = std::move(f); }
 
-    /* MATCH A LEADER'S LOAN, FOR A RANK THAT DOES NOT KNOW WHAT IT IS HOLDING.
-     *
-     * Block ids are SHARED ACROSS RANKS -- RadBatch carries one block table and every rank indexes
-     * its own shard of the pool with it -- and only rank 0's KVManager tracks sequences. So a
-     * follower takes its mark from the leader instead of computing one: its own slab occupies the
-     * same blocks of its own pool, and an id the leader hands out below the mark has to be one the
-     * follower's slab has left too. */
+    /* Copies the leader's loan onto a follower rank. Block ids are shared across ranks and only
+     * rank 0 tracks sequences, so a follower takes the leader's mark instead of computing one;
+     * its slab occupies the same block ids of its own pool. */
     int     follow(const KVManager& leader);
 
-    /* HOW MANY OF A GROUP'S BLOCKS THE CACHE MAY HAND OUT: the carve less what is lent. */
+    /* Blocks of a group the cache may hand out: the carve less the loan. */
     int64_t live_blocks(int32_t group) const;
-    int64_t committed_bytes() const;
 
     /* ---------------- preemption by recompute (spec §7.1, §17) ---------------- */
-    /* Free the sequence's blocks and take it back to zero tokens. Its state slots are freed too: a
-     * recurrent state that is not snapshotted cannot be resumed, so a preempted sequence replays
-     * from its last checkpoint or from zero.
-     *
-     * IT DOES NOT MARK ANYTHING, and carries no "needs re-prefill" flag. The scheduler's own
-     * `r.n_computed = 0` (preempt_back) is what drives the replay, and a second piece of state
-     * saying the same thing is a second thing to keep true. seq_tokens() == 0 is the reading, and
-     * it cannot drift. */
+    /* Frees the sequence's blocks and state slots and resets it to zero tokens. A recurrent
+     * state that was not snapshotted cannot be resumed, so the sequence replays from its last
+     * checkpoint or from zero. No "needs re-prefill" flag is kept: the scheduler's
+     * `r.n_computed = 0` (preempt_back) drives the replay, and seq_tokens() == 0 reflects it. */
     int  preempt(uint64_t seq);
 
     /* ---------------- speculative rejection (spec §10) ---------------- */
-    /* Bring the sequence back to `n_tokens` and return the paged blocks past it. A verify writes
-     * KV for 1 + n_spec positions and the sampler accepts a prefix of them, so the rest has to go
-     * back; `ensure` is monotone and cannot express it.
+    /* Shrinks the sequence to `n_tokens` and frees the paged blocks past it. A verify writes KV
+     * for 1 + n_spec positions and the sampler accepts a prefix; `ensure` is monotone and cannot
+     * undo the rest.
      *
-     * PAGED GROUPS ONLY, and that is the whole point. The linear state and the conv window have
-     * already absorbed the rejected tokens and are NOT recomputed: libr4d keeps the conv cache as
-     * a rolling window of conv_width-1 + n_spec entries and reads at the slot the last accepted
-     * token left, so a rejection there is a change of read offset that the kernels perform
-     * themselves (core/sample/accept.h). Freeing a state slot here would destroy the state that
-     * offset points into.
-     *
-     * Rolling back is not preemption: the sequence keeps its state slots and its window base.
-     * Without this the pool leaks one block per rejected block-crossing, which is a slow leak and
-     * therefore the worst kind. */
+     * Paged groups only. The linear state and conv window have already absorbed the rejected
+     * tokens: the conv cache is a rolling window of conv_width-1 + n_spec entries, and the kernels
+     * handle a rejection by moving the read offset (core/sample/accept.h). Freeing a state slot
+     * here would destroy the state that offset points into. Unlike preempt, the sequence keeps
+     * its state slots and window base. */
     int  rollback(uint64_t seq, int64_t n_tokens);
 
-    /* The absolute token position that block_table(seq, group)[0] covers. Zero for a FULL group;
-     * non-zero for a WINDOW group, whose blocks below the window have been recycled. The step
-     * batch's slot mapping is (pos - first_block_pos) / block_size, and without the offset every
-     * sliding-window sequence writes its KV to the wrong slot the moment it passes its window. */
+    /* The absolute token position block_table(seq, group)[0] covers: zero for a FULL group, the
+     * recycled prefix for a WINDOW group. The slot mapping is (pos - first_block_pos) /
+     * block_size; without the offset a sliding-window sequence writes to the wrong slot once it
+     * passes its window. */
     int64_t first_block_pos(uint64_t seq, int32_t group) const;
 
-    /* THE ENTRIES OF A SEQUENCE'S TABLE THAT CHANGED since the last call: every entry below the
-     * returned index is what it was then, and kNoDirty says none changed. The call clears the
-     * mark, so it has exactly one reader -- the batch builder, which stages only the changed tail
-     * of a table the device already holds. A sequence it has not seen answers 0. */
+    /* The first table entry changed since the last call; entries below it are unchanged, and
+     * kNoDirty means none changed. The call clears the mark, so it has one reader: the batch
+     * builder, which stages only the changed tail. An unseen sequence returns 0. */
     int64_t take_table_changes(uint64_t seq, int32_t group) const;
     static constexpr int64_t kNoDirty = INT64_MAX;
 
     /* Free victims, in the order given, until `seq` can be extended to `n_tokens`.
      *   RAD_OK        room was made; *preempted lists who paid for it
-     *   RAD_E_FULL    even an empty pool cannot serve it -- fail the request, do not retry
-     * The caller supplies the victim order because priority is the scheduler's business, not the
-     * allocator's. */
+     *   RAD_E_FULL    even an empty pool cannot serve it; fail the request, do not retry
+     * The caller supplies the victim order, since priority is the scheduler's policy. */
     int  make_room(uint64_t seq, int64_t n_tokens,
                    const std::vector<uint64_t>& victims,
                    std::vector<uint64_t>* preempted);
 
     /* ---------------- linear-state checkpoints (spec §7.3) ----------------
      *
-     * A SNAPSHOT LIVES IN PINNED HOST MEMORY, NOT ON THE CARD. It is a copy of a sequence's state
-     * that no kernel reads -- the step reads the live state slots, and a snapshot only ever goes
-     * back into one of those -- so it has no reason to hold VRAM. Saving it is one copy across the
-     * link after the step that produced the state, restoring it one copy back before the step
-     * that resumes from it, each a few milliseconds on a 50-100 MiB snapshot.
+     * Snapshots live in pinned host memory: no kernel reads them, they are only copied back into
+     * a live state slot. A save is one copy across the link after the step that produced the
+     * state, a restore one copy back before the step that resumes from it (a few ms for a
+     * 50-100 MiB snapshot).
      *
-     * THE STORE IS SHARED BY EVERY RANK and owned by the engine: a slot holds every rank's shard
-     * of one snapshot, each at its own offset (`rank_off`). The slot ids are rank 0's -- its manager hands them out and the others
-     * address the id they are given. Without a store no slot is ever handed out and a hybrid
-     * model's prefix hits replay their linear layers from zero. `checkpoint_bytes()` is THIS
-     * rank's shard. */
+     * The store is owned by the engine and shared by every rank: a slot holds each rank's shard
+     * at its own offset (`rank_off`). Rank 0 hands out slot ids and the other ranks use them.
+     * Without a store no slot is handed out and a hybrid model's prefix hits replay their linear
+     * layers from zero. `checkpoint_bytes()` is this rank's shard. */
     void    set_checkpoint_store(HostArena* store, int64_t rank_off);
     int64_t checkpoint_bytes() const { return checkpoint_bytes_; }
     int64_t checkpoint_slots() const { return ck_store_ ? ck_store_->capacity() : 0; }
@@ -470,46 +397,40 @@ public:
     /* The store holds `slot`: it was allocated and not given back since. */
     bool  checkpoint_held(int32_t slot) const;
 
-    /* SNAPSHOT AND RESUME A SEQUENCE'S WHOLE LINEAR STATE. This is what makes a prefix hit legal
-     * on a hybrid model: the attention half of a hit is carried by the adopted blocks, and the
-     * recurrent half is carried by these two calls and by nothing else. Without them a hit
-     * resumes every recurrent layer from whatever the slot last held -- which reads as fluent
-     * text, so it is not a failure anyone notices without a determinism check.
+    /* Snapshot and resume a sequence's whole linear state. On a hybrid model a prefix hit carries
+     * the attention half in adopted blocks and the recurrent half only through these calls;
+     * without them a hit resumes from whatever the slot last held, which still reads as fluent
+     * text.
      *
-     * The pool is LAYER-MAJOR and a sequence's state is therefore strided, not contiguous, so the
-     * blob is a gather: for every stateful group, in `plans()` order, for every layer, its
-     * `layer_bytes_per_state()` bytes. Both directions walk that identically, which is the whole
-     * requirement -- a checkpoint is only ever read back by this same build.
+     * The pool is layer-major, so the blob is a gather: for each stateful group in `plans()`
+     * order, for each layer, `layer_bytes_per_state()` bytes. Both directions walk it the same
+     * way; a checkpoint is only read back by the same build. Only copy 0 (the committed state) is
+     * saved; the other copies hold replay factors for unaccepted tokens.
      *
-     * COPY 0 ONLY. A speculating sequence owns `state_copies` physical slots and the committed
-     * state is copy 0 (KVGroupPlan); the replay factors in the others describe tokens that have
-     * not been accepted and mean nothing to a later reader.
-     *
-     * Enqueued on `s`, not synchronous: the save has to follow the step that produced the state
-     * and the restore has to precede the step that consumes it, and both are ordered by the
-     * stream rather than by waiting. One pitched copy a stateful group between the card and the
-     * store, at the link's rate. RAD_E_INVAL on a bad slot or an unknown sequence. */
+     * Enqueued on `s`, so stream order puts a save after the step that produced the state and a
+     * restore before the step that reads it. One pitched copy per stateful group. RAD_E_INVAL on
+     * a bad slot or an unknown sequence. */
     int checkpoint_save(const int32_t* state_slots, int n_slots, int32_t ck_slot, RadStream s,
                         const std::vector<int32_t>* win = nullptr);
     int checkpoint_restore(const int32_t* state_slots, int n_slots, int32_t ck_slot, RadStream s,
                            const std::vector<int32_t>* win = nullptr);
 
     /* ---------------- window snapshots (the sliding-window half of a prefix hit) ----------------
-     * A WINDOW group keeps only the blocks its window can still read, so no block list from the
-     * prefix cache describes it. What a later prompt that extends a cached prefix at position P
-     * needs from it is exactly the window behind P: blocks [lo, P/B) with
-     * lo = max(0, P/B - (window_blocks - 1)) -- the floor recycle_window keeps for a query at P.
-     * A checkpoint slot therefore carries, after the linear state, window_blocks pages a WINDOW
-     * group (every layer, layer-major rows), and a hit at a checkpoint restores them into fresh
-     * blocks seeded at that floor.
+     * A WINDOW group keeps only the blocks its window can still read, so the prefix cache's block
+     * lists do not describe it. A prompt extending a cached prefix at position P needs blocks
+     * [lo, P/B), lo = max(0, P/B - (window_blocks - 1)), the floor recycle_window keeps for a
+     * query at P. A checkpoint slot therefore carries, after the linear state, window_blocks pages
+     * per snapshot group (every layer, layer-major rows), restored into fresh blocks seeded at
+     * that floor.
      *
-     * has_window_snapshot(): this rank's slot carries a window section. window_rows() names, from
-     * the LEADER's table, the block ids [lo, P/B) of every non-zero snapshot group (win_snap) in
-     * plans() order, each group padded with -1 to window_blocks -- one vector every rank addresses
-     * with its own pool, because followers keep no sequence tables. False when the sequence does
-     * not hold that range (it is gone, or its floor moved past lo). seed_window() gives a sequence
-     * with an empty table in each snapshot group the blocks [lo, P/B) a restore will fill, before
-     * the ensure that extends it; any other WINDOW group starts at the floor that ensure sets. */
+     * has_window_snapshot(): this rank's slot carries a window section.
+     * window_rows(): from the leader's table, the block ids [lo, P/B) of every non-zero win_snap
+     * group in plans() order, each padded with -1 to window_blocks; every rank addresses its own
+     * pool with it, since followers keep no tables. False if the sequence no longer holds that
+     * range.
+     * seed_window(): gives a sequence with an empty table in each snapshot group the blocks
+     * [lo, P/B) a restore will fill, before the ensure that extends it. Other WINDOW groups start
+     * at the floor ensure sets. */
     bool has_window_snapshot() const { return window_ck_bytes_ > 0; }
     bool window_rows(uint64_t seq, int64_t pos, std::vector<int32_t>* out) const;
     int  seed_window(uint64_t seq, int64_t pos);
@@ -519,19 +440,18 @@ public:
         return b > 0 ? b : 0;
     }
 
-    /* Byte address of a state slot, for the slot-mapping builder. Null when the pool has no
-     * host-visible base (a device pool), which is the normal case -- the offset is what the step
-     * batch actually carries. */
+    /* Byte address of a state slot, for the slot-mapping builder. Null when the group has no
+     * base. */
     void*   state_ptr(int32_t group, int32_t layer, int32_t slot) const;
 
 private:
-    /* carve() is the wrapper and carve_into() is the work, so that a carve which returns part way
-     * through cannot leave plans_ answering guards for block state that was never sized. forget()
-     * empties both together and is what plan_groups() starts from. */
+    /* carve() wraps carve_into() and calls forget() on failure, so a carve that stops part way
+     * cannot leave plans_ passing guards for block state that was never sized. plan_groups() also
+     * starts from forget(). */
     int  carve_into(Pool& kv_pool);
-    /* THE PAGED SPLIT, as arithmetic: the token count the paged groups exhaust at together for
-     * `budget_bytes` of pool, under tokens_cap_, and each group's block count in `blocks` (by group
-     * index; a windowed group capped at its window). carve_into() spends what this says. */
+    /* The token count at which the paged groups run out together for `budget_bytes` of pool,
+     * under tokens_cap_, and each group's block count in `blocks` (by group index; a windowed
+     * group capped at its window). carve_into() spends what this returns. */
     int64_t paged_split(int64_t budget_bytes, std::vector<int64_t>* blocks) const;
     /* A zero group's share of `tokens`: the block count of the shared table, capped at the window
      * for a windowed group. 0 for kUnboundedTokens, which is not a count. */
@@ -549,15 +469,14 @@ private:
         std::vector<int64_t> first_block_pos;       /* WINDOW: token pos of blocks[0] */
         std::vector<int32_t> state;                 /* per group, -1 when not stateful */
         /* Per group, the lowest table entry written since the batch builder last staged this
-         * sequence: everything below it is unchanged. An append or a truncation lowers it to
-         * where it touched; anything that shifts or replaces entries lowers it to zero; kNoDirty
-         * is nothing. Mutable because reading it is what clears it -- take_table_changes. */
+         * sequence. An append or truncation lowers it to where it touched; a shift lowers it to
+         * zero; kNoDirty is unchanged. Mutable because take_table_changes() clears it. */
         mutable std::vector<int64_t> dirty_from;
     };
 
     int  grab_block(int32_t g, int32_t* out);
     void drop_block(int32_t g, int32_t b);
-    /* Every increment of a held block's reference count, so the cache-only count follows it. */
+    /* Increments a held block's refcount and keeps the cache-only count in step. */
     void add_ref(size_t g, int32_t b);
     int  grab_state(int32_t g, int32_t* out);
     void drop_state(int32_t g, int32_t s);
@@ -593,31 +512,23 @@ private:
     int64_t   ckpts_ = 0;      /* --checkpoint-slots, kept for the warning on a model with none */
     int64_t   tokens_cap_ = 0; /* cap_paged_tokens(): the least any rank can carve; 0 is none */
 
-    /* ---- the loan. See the public block for what this is and why a block that anything holds
-     * is never lent. ----
+    /* ---- the loan (see the public block) ----
      *
-     * `live_` is how many of a group's blocks the cache may hand out -- the carve less the loan --
-     * and it gates the free list rather than the carve: every id the carve created is in
-     * `free_blocks_`, and an id at or above live_ is simply not handed out. THAT IS WHY THE FREE
-     * LIST IS A MIN-HEAP. Handing out the lowest free id keeps the held blocks packed at the
-     * bottom of the pool, so the top is what drains and the top is the only part a loan can
-     * reach; a stack would hand back the id freed most recently, which after a busy period is
-     * exactly the high block the loan wants. The heap also makes the gate free: the smallest free
-     * id is below live_ whenever any free id is, so no scan is needed to find one.
+     * `live_` is the carve less the loan. Every carved id stays in `free_blocks_`; ids at or
+     * above live_ are just not handed out. The free list is a min-heap so the lowest free id goes
+     * out first: held blocks pack at the bottom and the top, the only part a loan reaches, drains.
+     * A stack would hand out the most recently freed id, often a high one. The heap also makes the
+     * gate a single check: if any free id is below live_, the smallest one is.
      *
-     * `held_hist_` counts held blocks per bucket, so "what is the highest bucket anything still
-     * holds" is a walk of a few thousand counters instead of a scan of every refcount. It is what
-     * decides how far a loan may reach, and it is maintained on the allocation path because a
-     * scan there is not affordable and a stale answer would lend a block out from under a live
-     * sequence. */
-    /* THE BUFFER, PER GROUP, IN BLOCKS. `chunk_blocks_` is the floor -- one prefill chunk, fixed
-     * at plan time; `short_peak_` is the largest shortfall the admission path has met recently,
-     * raised by grow_for and decayed by every spare_tokens() so it forgets a burst in a few
-     * seconds.
+     * `held_hist_` counts held blocks per bucket, so finding the highest held block is a walk of
+     * a few thousand counters, not a refcount scan. It bounds how far a loan may reach, so it is
+     * maintained on the allocation path; a stale value would lend a held block. */
+    /* The buffer per group, in blocks. `chunk_blocks_` is the floor (one prefill chunk, fixed at
+     * plan time). `short_peak_` is the largest recent admission shortfall, raised by grow_for and
+     * decayed by spare_tokens().
      *
-     * THE SHORTFALL IS THE SIGNAL AND THE RECALL IS NOT. grow_for recalls the shortfall PLUS the
-     * buffer; feeding that back would be a buffer that sizes itself from its own last value and
-     * climbs until it is the carve. What is recorded is what was asked for and not there. */
+     * Only the shortfall is recorded, never the recall: grow_for recalls shortfall plus buffer,
+     * and feeding that back would grow the buffer from its own value until it reached the carve. */
     std::vector<int64_t>  chunk_blocks_;
     std::vector<int64_t>  short_peak_;
     Pool*    pool_ = nullptr;
@@ -632,10 +543,12 @@ private:
     int64_t available_blocks(int32_t g) const;
     /* The buffer this group wants in hand, in blocks. See buffer_bytes(). */
     int64_t  buf_blocks(size_t i) const;
-    /* One past the highest block anything holds, to a bucket. */
+    /* One past the highest held block, rounded up to a bucket. */
     int64_t  held_top(size_t i) const;
     /* The blocks a loan of `tokens` takes off the top of group i. */
     int64_t  lent_blocks(size_t i, int64_t tokens) const;
+    /* Moves every lendable group's mark to a loan of `tokens`, unchecked (set_loan checks). */
+    void     apply_loan(int64_t tokens);
     int  grow_for(int32_t g, int64_t blocks);
     void note_held(int32_t g, int32_t b, int delta);
     bool      configured_ = false;

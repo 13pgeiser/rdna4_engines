@@ -1,16 +1,13 @@
-// THE LIBRARY HALF of the registered-kernel test. Built twice, at -DNK=2 and -DNK=512, and
-// dlopen'd -- because that is libr4d's actual shape: a shared object holding every template
-// instantiation of every kernel, entered through a function pointer.
-//
-// Both builds launch THE SAME kernel, k<0>, with the same arguments. The only difference is how
-// many other instantiations sit in the module beside it.
+// Library half of the registered-kernel test, built at -DNK=2 and -DNK=512 and dlopen'd, which
+// matches libr4d's shape: one shared object holding every kernel instantiation, entered through a
+// function pointer. Both builds launch the same kernel k<0> with the same arguments; only the
+// number of other instantiations in the module differs.
 #include <hip/hip_runtime.h>
 
 template <int I>
 __global__ void k(float* p) { if (threadIdx.x == 0) p[blockIdx.x] = (float)I; }
 
-/* The table exists to keep the instantiations alive. Without a use, the compiler drops every k<I>
- * that is never launched and both builds register one kernel. */
+/* Keeps the instantiations alive; without a use the compiler drops every unlaunched k<I>. */
 static const void* g_tab[NK];
 
 template <int I>
@@ -22,11 +19,9 @@ struct Reg<0> {
     static void go() { g_tab[0] = (const void*)k<0>; }
 };
 
-/* A THUNK PER INSTANTIATION. The arms above launch one kernel over and over, which is the one
- * thing a decode step never does: it issues forty-five DIFFERENT kernels, each through its own
- * shim, each with its own argument buffer and its own host stub. Everything the tight loop keeps
- * in L1 -- the code, the stub, the args -- is cold on every one of those. This makes that
- * difference, and only that difference, measurable. */
+/* One thunk per instantiation. A decode step issues ~45 different kernels, each with its
+ * own shim, argument buffer and host stub, so code, stub and args are cold on each launch; a
+ * loop over one kernel keeps them in L1. lr_launch_distinct measures that difference. */
 typedef void (*Thunk)(float*, hipStream_t);
 template <int I>
 static void thunk(float* p, hipStream_t st) {

@@ -13,8 +13,11 @@
 #   2. every kernel library declares exactly the vocabulary its in-tree twin declares;
 #   3. the search path registers the same plugins, in the same order, with the same declarations
 #      (rad-info --plugins), from the out-of-tree home alone;
-#   4. the installed rad-kbench replays the recorded fixture through the host libraries from that
-#      home, and every check passes;
+#   4. the installed rad-kbench replays part of the recorded fixture through the host libraries
+#      from that home, and every check passes. The kbench test replays all of it in tree; this
+#      replay proves the installed tools serve from the out-of-tree home, so three cheap ops that
+#      every host library implements (a norm, the fp8 activation quantiser, a gated activation)
+#      are enough;
 #   5. with HIP_COMPILER given, the device library the tree built (libr4d) is built out of tree
 #      too, for HIP_TARGETS, and compiles to the tree's device code. A replay of a device library
 #      needs a card, and this test must not touch one a server is using; the same instructions mean
@@ -123,10 +126,12 @@ for k in architectures quantizers; do [ -d "$H/$k" ] && ln -s "$H/$k" "$HH/$k"; 
 for so in "$H"/kernels/*.so; do
   is_dev "$(basename "$so" .so)" || ln -s "$so" "$HH/kernels/"
 done
+# A fixed --max-bytes, so which cases run does not depend on the memory free at the start.
 run "$W/logs/kbench.log" env HIP_VISIBLE_DEVICES=-1 RADIANCE_HOME="$HH" \
-    "$P/bin/rad-kbench" --fixture "$P/share/radiance/kernels.rkb" --max-cases 1
+    "$P/bin/rad-kbench" --fixture "$P/share/radiance/kernels.rkb" --max-cases 1 \
+    --max-bytes 2048 --op rmsnorm --op quant_act_fp8 --op silu_mul
 grep -E "passed|failed" "$W/logs/kbench.log" | tail -3
-say "4. the installed rad-kbench replays the fixture from the out-of-tree home: $(ls "$HH/kernels" | tr '\n' ' ')"
+say "4. the installed rad-kbench replays fixture ops from the out-of-tree home: $(ls "$HH/kernels" | tr '\n' ' ')"
 
 # 5. The device library's machine code, against the tree's, object by object. A code object also
 # carries its compilation unit's ID, which rad_add_plugin names from the plugin and the source's

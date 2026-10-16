@@ -1,36 +1,41 @@
-/* gemma4_vision.h -- the vision tower of Gemma 4's large dense models (31B), for gemma4_bf16.
- *
- * The same tower family embgemma2 serves (transformers' Gemma4VisionModel), at the 31B's size and
- * with the two parts that model leaves out:
+/* rad_block_gemma4_vision.h -- Gemma 4's vision tower (transformers' Gemma4VisionModel), served by
+ * gemma4_bf16 (the 31B's tower: 27 layers of width 1152) and embgemma2 (16 layers of width 768).
  *
  *   a patch is 16 x 16 x 3, staged by the core's Gemma 4 processor as 2 * (u / 255) - 1 in bf16,
  *   (y, x, channel); patch embedding a [width, 768] linear plus a learned row for the patch's
- *   column and one for its row ([2, 10240, width] table)
- *   27 layers of width 1152: sandwich norms (gain w, not 1 + w), q/k RMS-normed with a gain and v
- *   without one, a 2-D rotary over two 36-channel neox blocks a 72-wide head -- x (the column)
- *   over the first, y over the second, each block at theta^(-j / 18) (rope_type "default"; the
- *   embedding model spells the same rotary "axial") -- bidirectional attention within an image at
- *   scale 1, a gated gelu-tanh MLP
- *   pooling: the mean of each 3 x 3 window times sqrt(width) (the processor lays a window's nine
+ *   column and one for its row (a [2, npos, width] table), the two summed first
+ *   layers: sandwich norms (gain w, not 1 + w), q/k RMS-normed with a gain and v without one, a
+ *   2-D rotary over two neox blocks of a head -- x (the column) over the first, y over the second,
+ *   each block at theta^(-j / (hd / 4)) (rope_type "default"; EmbeddingGemma 2 spells the same
+ *   rotary "axial") -- bidirectional attention within an image at scale 1, a gated gelu-tanh MLP
+ *   pooling: the mean of each pool x pool window times sqrt(width) (the processor lays a window's
  *   patches out consecutively, raster order of windows, as the reference's position pooling)
- *   STANDARDISATION (vision_config.standardize): (z - std_bias) * std_scale per channel. The
- *   reference does it in f32 because a few channels carry ~5e4 with a bias that cancels them;
- *   here z is the pooler's bf16 row, so those channels keep bf16's spacing at their magnitude
- *   (about 1e-2 after the scale -- measured against the reference, see vision.md). The bias row
- *   is made on the card: fill(-1) times std_bias, added to z; then times std_scale.
+ *   standardisation (vision_config.standardize), when set: (z - std_bias) * std_scale per channel.
+ *   The reference does it in f32 because a few channels carry ~5e4 with a bias that cancels them;
+ *   here z is the pooler's bf16 row, so those channels keep bf16's spacing at that magnitude
+ *   (about 1e-2 after the scale). The bias row is made on the card: fill(-1) times std_bias, added
+ *   to z, then times std_scale.
  *   the multimodal embedder: an RMS norm with no gain and a width -> n_embd linear. Its rows
  *   replace the image's placeholder embeddings (which the text model scales by sqrt(n_embd); the
  *   image rows are not scaled).
  *
- * Every rank runs the whole tower (engine_mm.cpp), so its weights are replicated (RAD_SHARD_NONE)
- * and each rank writes the rows into its own copy of the embedding stream. */
-#pragma once
+ * One encoder pass carries RadBuildCtx::max_enc_patches patches over any number of segments (an
+ * image, or one frame of a video). Every rank runs the whole tower (engine_mm.cpp), so its weights
+ * are replicated (RAD_SHARD_NONE) and each rank writes the rows into its own copy of the embedding
+ * stream. */
+#ifndef RAD_BLOCK_GEMMA4_VISION_H
+#define RAD_BLOCK_GEMMA4_VISION_H
 
-namespace gemma4_bf16 {
+#include "rad_arch.h"
 
-using namespace rad::arch;
+#include <cmath>
+#include <cstring>
+#include <vector>
 
-struct Vision {
+namespace rad {
+namespace arch {
+
+struct Gemma4Vision {
     struct Layer {
         rad_weight in_norm = 0, qkv = 0, q_norm = 0, k_norm = 0, o = 0, post_attn = 0;
         rad_weight pre_ff = 0, gate_up = 0, down = 0, post_ff = 0;
@@ -52,8 +57,11 @@ struct Vision {
         return t && !std::strcmp(t, "gemma4_vision");
     }
 
+    /* `pre` is the checkpoint prefix of the tower and its embedder ("model." for Gemma 4's
+     * conditional-generation checkpoints, "" for EmbeddingGemma 2); `who` names the plugin in
+     * refusals. The tower's layers take weight groups from `first_group`. */
     int declare(RadBuilder* b, const RadModelMeta* m, const RadBuildCtx* ctx, Names& nm,
-                int64_t model_embd, int first_group) {
+                int64_t model_embd, int first_group, const char* pre, const char* who) {
         on = false;
         if (!present(m) || ctx->max_enc_patches <= 0) return RAD_OK;
         width = rad_meta_geti(m, "vision_config.hidden_size", 0);
@@ -73,19 +81,20 @@ struct Vision {
         if (width <= 0 || heads <= 0 || hd <= 0 || ff <= 0 || pool <= 0 || npos <= 0 ||
             depth <= 0 || patch <= 0 || !(theta > 0) || heads * hd != width || kvh != heads ||
             hd % 4) {
-            fprintf(stderr, "radiance: gemma4_bf16: the container's vision_config is incomplete or "
-                            "not the shape this plugin serves (hidden %lld, heads %lld x %lld, kv "
-                            "%lld, ff %lld, pooling %lld, layers %lld)\n", (long long)width,
+            fprintf(stderr, "radiance: %s: the container's vision_config is incomplete or not the "
+                            "shape this tower serves (hidden %lld, heads %lld x %lld, kv %lld, ff "
+                            "%lld, pooling %lld, layers %lld)\n", who, (long long)width,
                     (long long)heads, (long long)hd, (long long)kvh, (long long)ff,
                     (long long)pool, (long long)depth);
             return RAD_E_INVAL;
         }
+        /* Clipped linears (their bounds are buffers the vision checkpoint states as infinite) and
+         * any rotary or activation other than the 2-D one and gelu-tanh are refused by name. */
         if (rad_meta_geti(m, "vision_config.use_clipped_linears", 0) ||
             (std::strcmp(rt, "default") && std::strcmp(rt, "axial")) ||
             std::strcmp(act, "gelu_pytorch_tanh")) {
-            fprintf(stderr, "radiance: gemma4_bf16: this vision tower uses clipped linears, a '%s' "
-                            "rotary or a '%s' activation, which this plugin does not serve\n",
-                    rt, act);
+            fprintf(stderr, "radiance: %s: this vision tower uses clipped linears, a '%s' rotary or "
+                            "a '%s' activation, which it does not serve\n", who, rt, act);
             return RAD_E_UNSUPPORTED;
         }
         n_embd = model_embd;
@@ -95,14 +104,15 @@ struct Vision {
         if (P % kk) P -= P % kk;
         R = P / kk;
         const int A = RAD_ACCESS_PER_REQUEST, N = RAD_SHARD_NONE;
-        const char* V = "model.vision_tower";
+        char V[64];
+        std::snprintf(V, sizeof V, "%svision_tower", pre);
 
         RAD_ARCH_TRY(map_copy(b, nm.f("v.patch.weight"), nm.ckpt("%s.patch_embedder.input_proj.weight", V)));
         RAD_ARCH_TRY(map_slice(b, nm.f("v.pos_x.weight"),
                                nm.ckpt("%s.patch_embedder.position_embedding_table", V), 0));
         RAD_ARCH_TRY(map_slice(b, nm.f("v.pos_y.weight"),
                                nm.ckpt("%s.patch_embedder.position_embedding_table", V), 1));
-        RAD_ARCH_TRY(map_copy(b, nm.f("v.embed.weight"), nm.ckpt("model.embed_vision.embedding_projection.weight")));
+        RAD_ARCH_TRY(map_copy(b, nm.f("v.embed.weight"), nm.ckpt("%sembed_vision.embedding_projection.weight", pre)));
         w_in   = decl_w(b, nm.f("v.patch.weight"), RAD_BF16, {width, patch_dim}, A, N, grp_model());
         w_px   = decl_w(b, nm.f("v.pos_x.weight"), RAD_BF16, {npos, width}, A, N, grp_model());
         w_py   = decl_w(b, nm.f("v.pos_y.weight"), RAD_BF16, {npos, width}, A, N, grp_model());
@@ -318,4 +328,7 @@ struct Vision {
     }
 };
 
-}  /* namespace gemma4_bf16 */
+}  /* namespace arch */
+}  /* namespace rad */
+
+#endif /* RAD_BLOCK_GEMMA4_VISION_H */

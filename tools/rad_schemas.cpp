@@ -1,14 +1,9 @@
 /* rad-schemas -- print, and diff, the op schemas two or more kernel plugins declare.
  *
- * The first plugin in hierarchy order to declare an op FIXES its schema, and a later plugin
- * declaring the same op differently is refused AT LOAD with both plugins named (spec §2.3). That
- * rule is right -- arguments are positional, so two disagreeing schemas make the same call mean
- * different things depending on which plugin won selection, and that is silent numerical garbage
- * rather than a diagnosable failure.
- *
- * But "refused at load" is a poor place to find out, because the message names one op and the
- * plugin author has to guess the rest. This prints all of them at once, so a new kernel plugin can
- * be conformed to the vocabulary before it is ever loaded beside another.
+ * The first plugin in hierarchy order to declare an op fixes its schema; a later plugin declaring
+ * it differently is refused at load (spec §2.3), because arguments are positional. The loader names
+ * one op at a time; this prints every disagreement at once, so a new plugin can be checked against
+ * the vocabulary before it is loaded beside another.
  *
  *     rad-schemas libref.so                 print one plugin's vocabulary
  *     rad-schemas libr4d.so libref.so          diff them, in hierarchy order
@@ -87,13 +82,19 @@ int load(const char* path, Loaded* out) {
 
 }  /* namespace */
 
+static const char kUsage[] =
+    "usage: rad-schemas <plugin.so> [more.so ...]\n\n"
+    "One plugin prints its vocabulary. Two or more are diffed in hierarchy order:\n"
+    "the first to declare an op fixes its schema, and the loader refuses any plugin\n"
+    "that disagrees (spec §2.3).\n";
+
 int main(int argc, char** argv) {
+    if (argc == 2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
+        fputs(kUsage, stdout);
+        return 0;
+    }
     if (argc < 2) {
-        fprintf(stderr,
-            "usage: rad-schemas <plugin.so> [more.so ...]\n\n"
-            "One plugin prints its vocabulary. Two or more diff them IN HIERARCHY ORDER --\n"
-            "the first to declare an op fixes its schema, and any disagreement below is what\n"
-            "the loader will refuse (spec 2.3).\n");
+        fputs(kUsage, stderr);
         return 2;
     }
 
@@ -111,7 +112,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    /* Every op anyone declares, and who declares it. */
+    /* Every op any plugin declares. */
     std::set<std::string> all;
     for (auto& p : pl) for (auto& [op, s] : p.ops) all.insert(op);
 
@@ -122,30 +123,26 @@ int main(int argc, char** argv) {
         if (have.size() < 2) continue;
         ++shared;
 
-        const RadOpSchema* first = have[0]->ops.at(op);
-        const std::string fp = params_of(first), fo = operands_of(first);
+        std::vector<std::pair<std::string, std::string>> desc;   /* (params, operands) */
+        for (auto* p : have)
+            desc.emplace_back(params_of(p->ops.at(op)), operands_of(p->ops.at(op)));
         bool differs = false;
-        for (size_t i = 1; i < have.size(); ++i) {
-            const RadOpSchema* s = have[i]->ops.at(op);
-            if (params_of(s) != fp || operands_of(s) != fo) differs = true;
-        }
+        for (const auto& d : desc) differs = differs || d != desc[0];
         if (!differs) continue;
 
         ++conflicts;
         printf("%s\n", op.c_str());
-        for (auto* p : have) {
-            const RadOpSchema* s = p->ops.at(op);
-            const bool ok = params_of(s) == fp && operands_of(s) == fo;
-            printf("  %-16s %s params   %s\n", p->name.c_str(), ok ? " " : "!",
-                   params_of(s).c_str());
-            printf("  %-16s %s operands %s\n", "", ok ? " " : "!", operands_of(s).c_str());
+        for (size_t i = 0; i < have.size(); ++i) {
+            const char* mark = desc[i] == desc[0] ? " " : "!";
+            printf("  %-16s %s params   %s\n", have[i]->name.c_str(), mark, desc[i].first.c_str());
+            printf("  %-16s %s operands %s\n", "", mark, desc[i].second.c_str());
         }
         printf("\n");
     }
 
     printf("%d op(s) declared by more than one plugin, %d disagree.\n", shared, conflicts);
     if (conflicts)
-        printf("The loader refuses the WHOLE plugin on any one of these, so every row it\n"
-               "carries is unreachable until they agree. docs/OPS.md is the contract.\n");
+        printf("The loader refuses the whole plugin on any one of these, so none of its rows\n"
+               "is reachable until they agree. docs/OPS.md is the contract.\n");
     return conflicts ? 1 : 0;
 }

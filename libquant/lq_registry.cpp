@@ -1,11 +1,10 @@
 /* lq_registry.cpp -- libquant's quantiser table and plugin exports. spec.md §4.5.
  *
- * A quantiser here is an ALGORITHM over a GRID (lq_grid.h): `rtn` rounds each value to its nearest
- * grid point, `gptq` feeds each column's rounding error into the columns after it, `awq` scales the
- * input channels the activations say matter, `autoround` descends on the rounding itself and
- * `paroquant` learns a rotation of the input channels first. All of them take the same grid
- * options, so a code type, a scale structure or a transform added to the grid is available to each
- * the moment it exists. Two are not over a grid: `ggml` writes llama.cpp's own formats by
+ * Most quantisers are an algorithm over a grid (lq_grid.h): `rtn` rounds each value to its nearest
+ * grid point, `gptq` feeds each column's rounding error into later columns, `awq` scales the input
+ * channels the activations say matter, `autoround` descends on the rounding itself and `paroquant`
+ * first learns a rotation of the input channels. They share the grid options, so anything added to
+ * the grid is available to all. Two are not over a grid: `ggml` writes llama.cpp's formats by
  * llama.cpp's own searches (lq_ggml.h), and `cast` converts a weight to another float dtype.
  */
 #include "lq_ggml.h"
@@ -23,11 +22,7 @@ namespace lq {
 
 int grid_of(const RadParam* o, int n_o, const RadQuantWeight* w, Grid* g) {
     std::string why;
-    const int st = grid_parse(o, n_o, g, &why);
-    if (st != RAD_OK) {
-        std::fprintf(stderr, "libquant: %s: %s\n", w && w->name ? w->name : "?", why.c_str());
-        return st;
-    }
+    if (grid_parse(o, n_o, g, &why) != RAD_OK) return refuse(w, why.c_str());
     if (!w || w->cols <= 0 || w->rows <= 0) return RAD_E_SHAPE;
     if (g->fwht && w->cols % g->fwht) return RAD_E_SHAPE;
     return RAD_OK;
@@ -81,7 +76,7 @@ int rtn_encoding(const RadParam* o, int n_o, const RadQuantWeight* w, RadEncodin
 int64_t rtn_row_block(const RadParam* o, int n_o, const RadQuantWeight* w) {
     Grid g;
     if (grid_of(o, n_o, w, &g) != RAD_OK) return 0;
-    return grid_row_block(g, w->rows);
+    return grid_row_block(g);
 }
 
 int rtn_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* src, int64_t row0,
@@ -94,10 +89,10 @@ int rtn_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* src
 }
 
 /* ------------------------------------------------------------------ gptq */
-/* ACT ORDER IS A TRANSFORM OF THE ENCODING, not a detail of the loop: the codes are stored in the
- * order they were quantised, so the scale groups are runs of that order, and the reader is told
- * the permutation ("perm", a t.perm table of one i32 a column) to undo it. It does not compose
- * with the grid's own rotation -- an encoding carries one transform. */
+/* Act order is a transform of the encoding: codes are stored in quantisation order, so scale
+ * groups are runs of that order, and the reader gets the permutation ("perm", a t.perm table of one
+ * i32 per column) to undo it. It cannot combine with the grid's rotation, since an encoding carries
+ * one transform. */
 int gptq_encoding(const RadParam* o, int n_o, const RadQuantWeight* w, RadEncoding* out) {
     if (declines(w)) return RAD_E_UNSUPPORTED;
     Grid g;
@@ -149,7 +144,7 @@ int gptq_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* sr
         }
     }
 
-    /* The scales first, from the weight as it stands, and fixed through the loop. */
+    /* Scales come first, from the weight as it stands, and stay fixed through the loop. */
     const Scales sc = grid_scales(g, src, N, K, imp);
     const Planes p = grid_planes(g, K, planes);
     grid_store_scales(g, sc, p);
@@ -178,10 +173,9 @@ int gptq_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* sr
 }
 
 /* ------------------------------------------------------------------ cast */
-/* A FLOAT WEIGHT IN ANOTHER FLOAT DTYPE, rounded to nearest even: an f32 checkpoint served at
- * bf16, a bf16 one at f16, or plain fp8 with no scale at all. Every rank is taken, a norm's
- * included -- a cast is asked for by name, and a kernel that cannot read the result refuses it at
- * declare like any other encoding. */
+/* A float weight in another float dtype, round to nearest even: an f32 checkpoint served as bf16,
+ * bf16 as f16, or plain unscaled fp8. Every rank is accepted, norms included: a cast is requested by
+ * name, and a kernel that cannot read the result refuses it at declare like any other encoding. */
 int cast_dtype(const RadParam* o, int n_o, const RadQuantWeight* w, uint32_t* dt) {
     const char* s = rad_param_gets(o, n_o, "dtype", nullptr);
     *dt = s ? rad_dtype_parse(s) : (uint32_t)RAD_DT_INVALID;
@@ -201,25 +195,25 @@ int cast_encoding(const RadParam* o, int n_o, const RadQuantWeight* w, RadEncodi
 
 int64_t cast_row_block(const RadParam*, int, const RadQuantWeight*) { return 1; }
 
-int cast_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* src, int64_t row0,
+int cast_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* src, int64_t,
                   int64_t rows, void* const* planes) {
     uint32_t dt = 0;
     const int st = cast_dtype(o, n_o, w, &dt);
     if (st != RAD_OK) return st;
-    (void)row0;
     const int64_t n = rows * w->cols;
     uint8_t* out = (uint8_t*)planes[0];
+    auto each = [n](auto store) {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int64_t i = 0; i < n; ++i) {
-        switch (dt) {
-            case RAD_F32:    ((float*)out)[i] = src[i]; break;
-            case RAD_BF16:   ((uint16_t*)out)[i] = f32_to_bf16(src[i]); break;
-            case RAD_F16:    ((uint16_t*)out)[i] = f32_to_f16(src[i]); break;
-            case RAD_F8E4M3: out[i] = rad_f32_to_fp8e4m3(src[i]); break;
-            default:         out[i] = rad_f32_to_fp8e5m2(src[i]); break;
-        }
+        for (int64_t i = 0; i < n; ++i) store(i);
+    };
+    switch (dt) {
+        case RAD_F32:    std::memcpy(out, src, (size_t)n * sizeof(float)); break;
+        case RAD_BF16:   each([&](int64_t i) { ((uint16_t*)out)[i] = f32_to_bf16(src[i]); }); break;
+        case RAD_F16:    each([&](int64_t i) { ((uint16_t*)out)[i] = f32_to_f16(src[i]); }); break;
+        case RAD_F8E4M3: each([&](int64_t i) { out[i] = rad_f32_to_fp8e4m3(src[i]); }); break;
+        default:         each([&](int64_t i) { out[i] = rad_f32_to_fp8e5m2(src[i]); }); break;
     }
     return RAD_OK;
 }

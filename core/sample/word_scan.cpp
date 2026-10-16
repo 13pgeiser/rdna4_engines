@@ -26,8 +26,8 @@ int WordScanner::build(const std::vector<std::string>& words, std::string* err) 
                 cls_[c] = (uint8_t)ncls_++;
             }
 
-    /* The trie, with its edges held densely from the start: a missing edge is kUnset until the
-     * breadth-first pass below resolves it through the failure link. */
+    /* The trie with dense edges; a missing edge is kUnset until the breadth-first pass resolves
+     * it through the failure link. */
     constexpr uint32_t kUnset = ~0u;
     next_.assign(ncls_, kUnset);
     out_len_.assign(1, 0u);
@@ -47,9 +47,9 @@ int WordScanner::build(const std::vector<std::string>& words, std::string* err) 
         max_len_    = std::max<uint32_t>(max_len_, (uint32_t)w.size());
     }
 
-    /* Failure links in breadth-first order, so a state's link is final before any deeper state
-     * reads it. A state's longest match is its own word if it ends one, which is longer than any
-     * proper suffix, and otherwise its failure state's. */
+    /* Failure links in breadth-first order, so a state's link is final before a deeper state
+     * reads it. A state's longest match is its own word if it ends one, else its failure
+     * state's. */
     const uint32_t n_states = (uint32_t)out_len_.size();
     std::vector<uint32_t> fail(n_states, 0u);
     std::vector<uint32_t> queue;

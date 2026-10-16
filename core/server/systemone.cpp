@@ -1,19 +1,18 @@
 /* systemone.cpp -- d1's prompt and readout (systemone.h).
  *
- * EVERY STRING BELOW IS d1's OWN, from prompt.py in the model's repository: the user turn, the
- * state block, the three question blocks, the option codes and their fallback codebook, the
- * yes/no spellings. The model was trained on exactly these, so a reworded instruction or a
- * different code for an option is a different (and worse-calibrated) question.
+ * Every prompt string below is d1's own, from prompt.py in the model's repository: the user turn,
+ * the state block, the three question blocks, the option codes and their fallback codebook, and the
+ * yes/no spellings. The model was trained on exactly these; a reworded instruction or a different
+ * option code is a different, worse-calibrated question.
  *
- * THAT TEXT IS LIQUID AI'S, under the LFM Open License v1.0 (core/server/LICENSE.lfm, and NOTICE):
- * this file is a C++ rewrite of prompt.py's and api.py's logic, modified from them, with their
+ * That text is Liquid AI's, under the LFM Open License v1.0 (core/server/LICENSE.lfm, and NOTICE).
+ * This file is a C++ rewrite of prompt.py's and api.py's logic, modified from them, with their
  * strings kept as they are.
  *
- * AND SO IS THE TOKENISATION SPLIT. d1 tokenises a single question's prompt as one text, and a
- * request with several as the shared head (the state and the pictures) followed by each question's
- * tail, tokenised separately -- its runner reads the head once and branches. The two are not the
- * same ids where BPE would merge across the join, so each case is tokenised the way the model's
- * own runner does.
+ * The tokenisation split also follows d1's runner: a single question's prompt is tokenised as one
+ * text; with several, the shared head (state and pictures) and each question's tail are tokenised
+ * separately, and the runner reads the head once and branches. BPE can merge across the join, so
+ * the two give different ids.
  */
 #include "systemone.h"
 
@@ -253,7 +252,7 @@ int parse_decision_request(const std::string& body, const OaiDeps& d, const OaiL
         return RAD_E_INVAL;
     }
 
-    /* THE PICTURES, decoded here and processed when the head is tokenised. */
+    /* Pictures are decoded here and processed when the head is tokenised. */
     std::vector<std::pair<MediaKind, std::vector<uint8_t>>> media;
     if (b.contains("images")) {
         const json& im = b["images"];
@@ -302,8 +301,8 @@ int parse_decision_request(const std::string& body, const OaiDeps& d, const OaiL
         suffixes.push_back(std::move(suffix));
     }
 
-    /* runner.py, VISION_MAX_PIXELS: d1 bounds every picture at 1024 x 1024 pixels' area before
-     * its processor, so a larger one is a different input unless it is bounded here too. */
+    /* runner.py, VISION_MAX_PIXELS: d1 caps every picture at 1024 x 1024 pixels' area before its
+     * processor, so the same cap applies here. */
     MediaOpts opts;
     opts.max_pixels = 1024 * 1024;
     auto tokenize = [&](const std::string& text, std::vector<int32_t>* ids) -> int {
@@ -330,7 +329,7 @@ int parse_decision_request(const std::string& body, const OaiDeps& d, const OaiL
             out->input_tokens += (int64_t)tail.size();
         }
     }
-    /* One position stays free: the request samples a token, which nobody reads. */
+    /* One position stays free for the token the request samples and discards. */
     for (const DecisionQuestion& q : out->questions)
         if (lim.max_ctx > 0 && (int64_t)q.tokens.size() >= lim.max_ctx) {
             ApiError e = err_bad("questions." + q.name,
@@ -347,10 +346,7 @@ int parse_decision_request(const std::string& body, const OaiDeps& d, const OaiL
 int decision_answer(const DecisionQuestion& q, const std::vector<float>& logits, json* out,
                     ApiError* err) {
     if (logits.size() != q.candidates.size() || q.groups.size() != q.labels.size()) {
-        *err = ApiError{};
-        err->status = 500;
-        err->type = "internal_server_error";
-        err->message = "the engine returned no scores for question " + q.name;
+        *err = err_internal("the engine returned no scores for question " + q.name);
         return RAD_E_STATE;
     }
     std::vector<double> p;
@@ -358,10 +354,7 @@ int decision_answer(const DecisionQuestion& q, const std::vector<float>& logits,
         double best = -std::numeric_limits<double>::infinity();
         for (size_t i : g) best = std::max(best, (double)logits[i]);
         if (!std::isfinite(best)) {
-            *err = ApiError{};
-            err->status = 500;
-            err->type = "internal_server_error";
-            err->message = "question " + q.name + " scored a non-finite logit";
+            *err = err_internal("question " + q.name + " scored a non-finite logit");
             return RAD_E_STATE;
         }
         p.push_back(best);

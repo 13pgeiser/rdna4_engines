@@ -1,25 +1,22 @@
 #!/bin/sh
-# ident.sh -- is this server reproducible? One hash per (temperature, question), so a run can be
-# compared against another run of the SAME configuration.
+# ident.sh -- server reproducibility check. Prints one hash per (temperature, question) for
+# comparison against another run of the same configuration.
 #
-# WHAT IT PROVES: run-to-run determinism at a fixed configuration, across restarts. On
-# Qwen3.8-Flash-Next at tp2 with the MTP head at depth 3, two servers started from scratch give
-# the same six hashes: temperature 0, 0.7 and 1.0, both questions.
+# It tests run-to-run determinism at a fixed configuration, across restarts: on
+# Qwen3.8-Flash-Next at tp2 with the MTP head at depth 3, two fresh servers give the same six
+# hashes (temperature 0, 0.7 and 1.0, both questions).
 #
-# WHAT IT DOES NOT PROVE: that a SPECULATIVE run matches a NON-SPECULATIVE one byte for byte.
-# `narrow_ksplit` chooses the split count of the fp8 GEMM's finisher from M, so the same row
-# computed at M=1 (one token at a time) and at M=8 (a verify block) is not bit-identical, and a
-# long answer can flip a near-tie somewhere past its first few hundred characters, both
-# continuations equally good. `--deterministic` does not change that -- it pins placement and
-# never reaches a kernel.
+# It does not test that a speculative run matches a non-speculative one byte for byte.
+# `narrow_ksplit` picks the fp8 GEMM finisher's split count from M, so a row computed at M=1 and
+# at M=8 (a verify block) is not bit-identical, and a long answer can flip a near-tie past its
+# first few hundred characters. `--deterministic` pins placement only and does not affect kernels.
 #
-# BUT A SHORT COMMON PREFIX IS A DEFECT, NOT A TIE. On Qwen3.8-Flash-Next at tp2, depth 3 against
-# --num-speculative-tokens 0 gives the same six hashes here, and over longer answers the two agree
-# for hundreds of characters before any flip. A speculative run that leaves the non-speculative
-# text within the first sentence or two is computing something different after a rejected draft --
-# rolling state read from a rejected token is exactly that shape -- and is worth bisecting. If
-# byte-identity across that boundary is ever required everywhere, the work is plumbing a pinned
-# split count into the fp8 GEMM, and it costs throughput at one M or the other.
+# A short common prefix is a defect, not a tie. On Qwen3.8-Flash-Next at tp2, depth 3 and
+# --num-speculative-tokens 0 give the same six hashes, and longer answers agree for hundreds of
+# characters. A speculative run that departs within the first sentence or two is computing
+# something different after a rejected draft (e.g. rolling state read from a rejected token) and
+# is worth bisecting. Byte identity across that boundary would need a pinned split count in the
+# fp8 GEMM, at a throughput cost for one M or the other.
 #
 #   P=8100 scripts/ident.sh          # against a server already up
 P=${P:-8100}

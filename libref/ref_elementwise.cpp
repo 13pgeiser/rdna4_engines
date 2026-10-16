@@ -1,9 +1,8 @@
 /* ref_elementwise.cpp -- the norms and the elementwise ops.
  *
- * Nothing here is interesting except where the fused forms round, and those places are the whole
- * reason the ops exist: `rmsnorm_add` is one pass in every real implementation, so the reference
- * has to say exactly which of its two intermediates is rounded and which is not, or a fused kernel
- * checked against it fails on a tolerance nobody can explain.
+ * The subtle part is where fused forms round: `rmsnorm_add` is one pass in every real
+ * implementation, so the reference must state which intermediates are rounded, or a correct fused
+ * kernel fails its tolerance.
  */
 #include "ref_common.h"
 #include "ref_ops.h"
@@ -13,37 +12,20 @@
 
 using namespace ref;
 
-/* Rows of a tensor read as [rows, n]. `n` is a declared parameter and the row count is whatever
- * the operand actually carries, which is the rule this plugin follows everywhere (ref_ops.h). */
-static inline int64_t rows_of(const RadTensor* t, int64_t n) {
-    return n > 0 ? numel(t) / n : 0;
-}
-
 /* ------------------------------------------------------------------ rmsnorm */
 /* y = x * rsqrt(mean(x^2) + eps) * (w + w_add)
  *
- * The mean is over the LAST n elements of a row and is accumulated in f32 in ascending index
- * order. `w_add` is GemmaRMSNorm's `1 +`: Qwen3.5, Qwen3-Next and Gemma store a zero-centred gain
- * and use 1 + w, and forming that in the weight's dtype first loses 0.3% per channel (libr4d's
- * r4d_rmsnorm_had_quant_i8 says the same). It defaults to 0, so a plain RMS norm is the plain
- * call. */
-int ref_rmsnorm(const RadArgs* a, RadStream) {
-    if (!a || a->n_t < 3 || !a->t[0].data || !a->t[2].data) return RAD_E_INVAL;
-    const RadTensor *x = &a->t[0], *y = &a->t[2];
-    /* An absent gain is one, and `wadd` belongs to a gain, so it is refused without one. */
-    const RadTensor* w = a->t[1].data ? &a->t[1] : nullptr;
-    const int64_t n = p_int(a, "n", w && w->rank ? w->shape[w->rank - 1] : 0);
-    const float eps = p_f32(a, "eps", 1e-6f);
-    const float wadd = p_f32(a, "wadd", 0.0f);
-    /* `mult` scales the normed row before its one rounding: a residual branch weighted by a
-     * constant (Gemma 4's audio feed-forward, a half) without a second pass over the row. */
-    const float mult = p_f32(a, "mult", 1.0f);
+ * The mean is over the last n elements of a row, accumulated in f32 in ascending index order.
+ * `w_add` is GemmaRMSNorm's `1 +`: Qwen3.5, Qwen3-Next and Gemma store a zero-centred gain and use
+ * 1 + w, and forming that in the weight's dtype first loses 0.3% per channel. Default 0. An absent
+ * gain `w` is 1. */
+static int rms_rows(const RadTensor* x, const RadTensor* w, const RadTensor* y, int64_t n,
+                    float eps, float wadd, float mult) {
     if (n <= 0) return RAD_E_SHAPE;
-    if (!w && wadd != 0.0f) return RAD_E_INVAL;
     const int64_t rows = rows_of(x, n);
     if (rows <= 0 || numel(y) < rows * n || (w && numel(w) < n)) return RAD_E_SHAPE;
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t xb = rowoff(x, r, n), yb = rowoff(y, r, n);
         const int64_t xs = laststride(x), ys = laststride(y), ws = w ? laststride(w) : 0;
@@ -57,46 +39,35 @@ int ref_rmsnorm(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+int ref_rmsnorm(const RadArgs* a, RadStream) {
+    if (!a || a->n_t < 3 || !a->t[0].data || !a->t[2].data) return RAD_E_INVAL;
+    const RadTensor* w = a->t[1].data ? &a->t[1] : nullptr;
+    const float wadd = p_f32(a, "wadd", 0.0f);
+    /* `wadd` without a gain is refused. */
+    if (!w && wadd != 0.0f) return RAD_E_INVAL;
+    /* `mult` scales the normed row before its single rounding, for a residual branch weighted by
+     * a constant (Gemma 4's audio feed-forward uses 0.5). */
+    return rms_rows(&a->t[0], w, &a->t[2], p_int(a, "n", w && w->rank ? w->shape[w->rank - 1] : 0),
+                    p_f32(a, "eps", 1e-6f), wadd, p_f32(a, "mult", 1.0f));
+}
+
 /* ------------------------------------------------------------------ rmsnorm_p */
-/* y = x * rsqrt(mean(x^2) + eps) -- the SAME normalisation as rmsnorm with NO gain at all. It is
- * its own op rather than a zeroed gain on rmsnorm because the gain is a real, weightless thing:
- * Gemma's attention normalises the VALUE with a bare RMS (llama.cpp's ggml_rms_norm(V, eps), no
- * tensor) while normalising the KEY with the k_norm gain, and there is no checkpoint plane to feed
- * a `wadd`/`w` through for the value -- so an rmsnorm call would need a phantom all-zero weight to
- * express it, which is a name map to a tensor that does not exist. The mean is accumulated in f32
- * in ascending index order, exactly as rmsnorm does, so the two agree bit-for-bit where rmsnorm's
- * gain happens to be one. */
+/* y = x * rsqrt(mean(x^2) + eps): rmsnorm with no gain. A separate op because Gemma normalises the
+ * value with a bare RMS (llama.cpp's ggml_rms_norm(V, eps)) and the checkpoint has no plane for a
+ * gain; rmsnorm would need a phantom weight. */
 int ref_rmsnorm_p(const RadArgs* a, RadStream) {
     if (!have(a, 2)) return RAD_E_INVAL;
-    const RadTensor *x = &a->t[0], *y = &a->t[1];
-    const int64_t n = p_int(a, "n", 0);
-    const float eps = p_f32(a, "eps", 1e-6f);
-    if (n <= 0) return RAD_E_SHAPE;
-    const int64_t rows = rows_of(x, n);
-    if (rows <= 0 || numel(y) < rows * n) return RAD_E_SHAPE;
-
-    #pragma omp parallel for schedule(static)
-    for (int64_t r = 0; r < rows; ++r) {
-        const int64_t xb = rowoff(x, r, n), yb = rowoff(y, r, n);
-        const int64_t xs = laststride(x), ys = laststride(y);
-        float ss = 0.0f;
-        for (int64_t i = 0; i < n; ++i) { float v = ldt(x, xb + i * xs); ss += v * v; }
-        const float s = 1.0f / std::sqrt(ss / (float)n + eps);
-        for (int64_t i = 0; i < n; ++i)
-            stt(y, yb + i * ys, ldt(x, xb + i * xs) * s);
-    }
-    return RAD_OK;
+    return rms_rows(&a->t[0], nullptr, &a->t[1], p_int(a, "n", 0), p_f32(a, "eps", 1e-6f), 0.0f,
+                    1.0f);
 }
 
 /* ------------------------------------------------------------------ rmsnorm_add */
 /* residual_out = x + residual;  y = rmsnorm(residual_out) * (w + w_add)
  *
- * THE ROUNDING IS THE CONTRACT. The sum is formed in f32 and the variance is taken from the
- * UNROUNDED sum, but the multiply that produces y reads the sum back from residual_out AFTER it
- * has been narrowed to that operand's dtype. That is what vLLM's fused_add_rms_norm does and what
- * every fused kernel in this project will do, because the residual has to be stored anyway and
- * re-reading it is free. A reference that kept f32 all the way through would be half a ULP better
- * and would disagree with every kernel it certifies.
+ * The rounding is the contract: the variance comes from the unrounded f32 sum, but y reads the sum
+ * back from residual_out after it is narrowed to that dtype. vLLM's fused_add_rms_norm and every
+ * fused kernel here do the same, since the residual is stored anyway. Keeping f32 throughout would
+ * be half a ULP better and disagree with every kernel.
  */
 int ref_rmsnorm_add(const RadArgs* a, RadStream) {
     if (!have(a, 5)) return RAD_E_INVAL;
@@ -109,7 +80,7 @@ int ref_rmsnorm_add(const RadArgs* a, RadStream) {
     if (rows <= 0 || numel(y) < rows * n || numel(ro) < rows * n ||
         numel(res) < rows * n || numel(w) < n) return RAD_E_SHAPE;
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t xb = rowoff(x, r, n), rb = rowoff(res, r, n);
         const int64_t yb = rowoff(y, r, n), ob = rowoff(ro, r, n);
@@ -129,9 +100,8 @@ int ref_rmsnorm_add(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ layernorm */
-/* y = (x - mean) * rsqrt(var + eps) * w + b, with the BIASED variance (divide by n, not n-1),
- * which is what every transformer implementation means by layer norm. `b` is optional: a ViT that
- * dropped its bias passes a null operand rather than a zero tensor. */
+/* y = (x - mean) * rsqrt(var + eps) * w + b, with the biased variance (divide by n, not n-1), as
+ * transformers use. `b` is optional: a bias-free ViT passes a null operand. */
 int ref_layernorm(const RadArgs* a, RadStream) {
     if (a->n_t < 4 || !a->t[0].data || !a->t[1].data || !a->t[3].data) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *w = &a->t[1], *y = &a->t[3];
@@ -143,7 +113,7 @@ int ref_layernorm(const RadArgs* a, RadStream) {
     if (rows <= 0 || numel(y) < rows * n || numel(w) < n) return RAD_E_SHAPE;
     if (b && numel(b) < n) return RAD_E_SHAPE;
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t xb = rowoff(x, r, n), yb = rowoff(y, r, n);
         const int64_t xs = laststride(x), ys = laststride(y), ws = laststride(w);
@@ -163,19 +133,14 @@ int ref_layernorm(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ grid_embed */
-/* A learned side x side table of position rows, resampled to a grid of its own size per row of x
- * and added in: the vision tower's position embedding, which is trained at one grid and applied to
- * images of any shape.
+/* A learned side x side table of position rows, resampled per row of x to that row's grid size and
+ * added in: the vision tower's position embedding, trained at one grid and applied to any image
+ * shape.
  *
- * THE SAMPLING IS BILINEAR WITH THE CORNERS ALIGNED: grid row r of a grid of height g sits at table
- * coordinate r * (side - 1) / max(g - 1, 1), in f32, and its two taps are the floor and the floor
- * plus one, clamped to the table, weighted by distance. The four products are summed in f32 in the
- * order (top-left, top-right, bottom-left, bottom-right) and rounded to x's dtype -- the position
- * embedding as a tensor of its own -- and only then added to x, which is rounded again. */
-static float round_to(uint32_t dt, float v) {
-    return dt == RAD_BF16 ? rad_bf16_to_f32(rad_f32_to_bf16(v)) : v;
-}
-
+ * Bilinear with corners aligned: grid row r of height g sits at table coordinate
+ * r * (side - 1) / max(g - 1, 1) in f32, with taps at floor and floor + 1, clamped and weighted by
+ * distance. The four products are summed in f32 in the order (top-left, top-right, bottom-left,
+ * bottom-right), rounded to x's dtype as a tensor of its own, then added to x and rounded again. */
 int ref_grid_embed(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *tab = &a->t[1], *crd = &a->t[2];
@@ -188,7 +153,7 @@ int ref_grid_embed(const RadArgs* a, RadStream) {
     const int64_t cs = crd->stride[0], ms = crd->stride[1];
     const int64_t ts = laststride(tab);
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * n * 4)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t gr = ld_int(crd->dtype, crd->data, 0 * cs + r * ms);
         const int64_t gc = ld_int(crd->dtype, crd->data, 1 * cs + r * ms);
@@ -215,7 +180,7 @@ int ref_grid_embed(const RadArgs* a, RadStream) {
                 for (int kj = 0; kj < 2; ++kj)
                     acc += ldt(tab, rowoff(tab, th[ki] * side + tw[kj], n) + i * ts) *
                            (wh[ki] * ww[kj]);
-            const float pe = round_to(x->dtype, acc);
+            const float pe = round_dt(x->dtype, acc);
             stt(x, xb + i * xs, ldt(x, xb + i * xs) + pe);
         }
     }
@@ -223,10 +188,9 @@ int ref_grid_embed(const RadArgs* a, RadStream) {
 }
 
 /* grid_embed_aa: the table resampled as torch's F.interpolate(mode="bilinear", align_corners=False,
- * antialias=True) does it -- SigLIP2's position embedding. Per axis a triangle filter on half-pixel
- * centres, widened by the scale when shrinking, its taps inside the table normalised to sum to one.
- * Separable, f32 throughout, rounded once before the add. A coordinate outside its grid is clamped
- * into it, so every input is defined. */
+ * antialias=True), SigLIP2's position embedding. Per axis, a triangle filter on half-pixel centres,
+ * widened by the scale when shrinking, with in-table taps normalised to sum to one. Separable, f32
+ * throughout, rounded once before the add. Out-of-grid coordinates are clamped. */
 static void aa_taps(int64_t at, int64_t size, int64_t side, float* w, int64_t* lo, int64_t* cnt) {
     if (size < 1) size = 1;
     at = at < 0 ? 0 : (at >= size ? size - 1 : at);
@@ -259,7 +223,7 @@ int ref_grid_embed_aa(const RadArgs* a, RadStream) {
     const int64_t cs = crd->stride[0], ms = crd->stride[1];
     const int64_t ts = laststride(tab);
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * n * 16)
     for (int64_t r = 0; r < rows; ++r) {
         int64_t g[4];
         for (int c = 0; c < 4; ++c) g[c] = ld_int(crd->dtype, crd->data, c * cs + r * ms);
@@ -277,7 +241,7 @@ int ref_grid_embed_aa(const RadArgs* a, RadStream) {
                            ww[(size_t)c];
                 acc += row * wh[(size_t)y];
             }
-            const float pe = round_to(x->dtype, acc);
+            const float pe = round_dt(x->dtype, acc);
             stt(x, xb + i * xs, ldt(x, xb + i * xs) + pe);
         }
     }
@@ -285,10 +249,9 @@ int ref_grid_embed_aa(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ add / mul */
-/* Elementwise over the output's extent. `b` may carry one row instead of all of them, so a bias
- * add is this op rather than a second one: an operand with exactly `n` elements against an output
- * of rows*n broadcasts along rows, and nothing else broadcasts at all. Silent broadcasting of an
- * arbitrary shape is how a shape bug becomes a plausible number. */
+/* Elementwise over the output's extent. `b` may be a single row of exactly `n` elements, which
+ * broadcasts along rows (a bias add); nothing else broadcasts, so a shape bug cannot pass as a
+ * plausible number. */
 static int elementwise2(const RadArgs* a, bool mul) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *A = &a->t[0], *B = &a->t[1], *Y = &a->t[2];
@@ -299,7 +262,7 @@ static int elementwise2(const RadArgs* a, bool mul) {
     const bool bcast = numel(B) == n && rows > 1;
     if (!bcast && numel(B) < rows * n) return RAD_E_SHAPE;
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t ab = rowoff(A, r, n), yb = rowoff(Y, r, n);
         const int64_t bb = bcast ? 0 : rowoff(B, r, n);
@@ -316,11 +279,10 @@ int ref_add(const RadArgs* a, RadStream) { return elementwise2(a, false); }
 int ref_mul(const RadArgs* a, RadStream) { return elementwise2(a, true); }
 
 /* ------------------------------------------------------------------ mul_weight */
-/* y = x * w, `w` a WEIGHT of one element or of one row: a learned gain on an activation -- a
- * per-layer scalar on the residual stream (Gemma 4's layer_scalar), or a per-channel one (a
- * vision tower's layer scale). Its own op and not a form of `mul` because an op's operand is a
- * weight or an activation by its schema, and `mul`'s `b` is an activation. The product is f32,
- * rounded once to y's dtype. */
+/* y = x * w, `w` a weight of one element or one row: a learned gain such as a per-layer residual
+ * scalar (Gemma 4's layer_scalar) or a per-channel layer scale (vision towers). Separate from `mul`
+ * because the schema fixes whether an operand is a weight or an activation, and `mul`'s `b` is an
+ * activation. The f32 product is rounded once to y's dtype. */
 int ref_mul_weight(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *W = &a->t[1], *Y = &a->t[2];
@@ -332,7 +294,7 @@ int ref_mul_weight(const RadArgs* a, RadStream) {
     if (!scalar && numel(W) != n) return RAD_E_SHAPE;
     const int64_t ws = scalar ? 0 : laststride(W);
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t xb = rowoff(X, r, n), yb = rowoff(Y, r, n);
         const int64_t xs = laststride(X), ys = laststride(Y);
@@ -343,26 +305,19 @@ int ref_mul_weight(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ scale_rows */
-/* y[m, i] = x[m, i] * act(s[m]) -- one scalar per ROW, broadcast across the row.
+/* y[m, i] = x[m, i] * act(s[m]): one scalar per row, broadcast across it (a per-token gate).
+ * Separate from `mul`, which broadcasts one row down the rows; one op with both rules would be
+ * ambiguous when rows == n.
  *
- * IT IS NOT `mul`, AND THE DIFFERENCE IS WHICH AXIS BROADCASTS. `mul` lets `b` carry one ROW and
- * broadcasts it down the rows, which is a bias's shape; this carries one COLUMN and broadcasts it
- * across them, which is a per-token gate's. Giving `mul` both rules would make them ambiguous
- * exactly when rows == n, and a silent choice between two broadcasts is how a shape bug becomes a
- * plausible number -- which is the rule the comment above elementwise2 already states.
+ * The activation applies to the scalar, not the product: Qwen3.5-MoE's shared expert is scaled by
+ * `sigmoid(shared_expert_gate(x))`.
  *
- * The activation is applied to the SCALAR and not to the product, which is what a gate means:
- * Qwen3.5-MoE's shared expert is scaled by `sigmoid(shared_expert_gate(x))`. */
-/* `add` PRESENT IS THE FUSED GATE-AND-ADD FORM: y = narrow(x * act(s)) + add, and the NARROW is
- * the whole of why this is expressible as one op rather than an approximation of two. The pair it
- * stands in for writes the product into a bf16 buffer and then adds that buffer to `add`, so the
- * product is rounded BEFORE the sum sees it; an f32 product carried into the add would differ in
- * the last bit of every channel. Written here as the two stores it replaces, through `y` itself,
- * because the oracle's job is to be obviously the same rather than to be quick.
- *
- * `add` is read before `y` is written so the two may alias without the sum reading its own output. */
+ * With `add` present it is the fused gate-and-add, y = narrow(x * act(s)) + add. The unfused pair
+ * stores the product to a bf16 buffer before adding, so the product is rounded first; this writes
+ * the same two stores through `y`. `add` is read before `y` is written so the two may alias. */
 int ref_scale_rows(const RadArgs* a, RadStream) {
-    if (!have(a, 4)) return RAD_E_INVAL;
+    /* `add` (operand 2) is optional; the other three are required. */
+    if (a->n_t < 4 || !t_in(a, 0) || !t_in(a, 1) || !t_in(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *sc = &a->t[1], *y = &a->t[3];
     const RadTensor *ad = t_in(a, 2);
     const int64_t n = p_int(a, "n", numel(y));
@@ -375,7 +330,7 @@ int ref_scale_rows(const RadArgs* a, RadStream) {
     if (act && std::strcmp(act, "sigmoid") && std::strcmp(act, "none")) return RAD_E_INVAL;
 
     const int64_t ss = laststride(sc);
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
         const float v0 = ldt(sc, r * ss);
         const float v  = sig ? act_sigmoid(v0) : v0;
@@ -393,8 +348,8 @@ int ref_scale_rows(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ silu_mul */
-/* y[.., i] = silu(gate_up[.., i]) * gate_up[.., n + i]. The gate is the FIRST half, which is the
- * order rad-convert fuses gate and up into one weight in, so the two conventions cannot drift. */
+/* y[.., i] = silu(gate_up[.., i]) * gate_up[.., n + i]. The gate is the first half, the order in
+ * which rad-convert fuses gate and up. */
 int ref_silu_mul(const RadArgs* a, RadStream) {
     if (!have(a, 2)) return RAD_E_INVAL;
     const RadTensor *gu = &a->t[0], *y = &a->t[1];
@@ -403,7 +358,7 @@ int ref_silu_mul(const RadArgs* a, RadStream) {
     const int64_t rows = rows_of(y, n);
     if (rows <= 0 || numel(gu) < rows * 2 * n) return RAD_E_SHAPE;
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t gb = rowoff(gu, r, 2 * n), yb = rowoff(y, r, n);
         const int64_t gs = laststride(gu), ys = laststride(y);
@@ -414,18 +369,11 @@ int ref_silu_mul(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ act_mul */
-/* y = act(a) * b, the gated product with its two halves in two operands. `silu_mul` reads one
- * fused gate_up row; this reads the gate and the multiplier from wherever they are, which covers
- * a fused gate_up as two column slices of it AND a gate whose multiplier is some other tensor --
- * Gemma's per-layer-input block multiplies gelu(gate(x)) by a per-layer embedding.
+/* y = act(a) * b, the gated product with its halves in two operands: two column slices of a fused
+ * gate_up, or a gate whose multiplier is another tensor (Gemma's per-layer-input block multiplies
+ * gelu(gate(x)) by a per-layer embedding).
  *
- * THE ACTIVATION IS ROUNDED TO y's DTYPE BEFORE THE PRODUCT, which is what the unfused pair does:
- * `act(gate)` is a tensor, and the product reads it back. */
-static float gelu_tanh_f(float x) {
-    const float k0 = 0.7978845608028654f, k1 = 0.044715f;
-    return 0.5f * x * (1.0f + std::tanh(k0 * (x + k1 * x * x * x)));
-}
-
+ * The activation is rounded to y's dtype before the product, as the unfused pair stores it. */
 int ref_act_mul(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *A = &a->t[0], *B = &a->t[1], *Y = &a->t[2];
@@ -437,38 +385,37 @@ int ref_act_mul(const RadArgs* a, RadStream) {
     const int act = p_enum(a, "act", kActs, 4, -1);
     if (act < 0) return RAD_E_INVAL;
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t ab = rowoff(A, r, n), bb = rowoff(B, r, n), yb = rowoff(Y, r, n);
         const int64_t as = laststride(A), bs = laststride(B), ys = laststride(Y);
         for (int64_t i = 0; i < n; ++i) {
             const float g = ldt(A, ab + i * as);
             const float v = act == 0 ? act_silu(g) : act == 1 ? act_gelu(g)
-                          : act == 2 ? gelu_tanh_f(g) : act_sigmoid(g);
-            stt(Y, yb + i * ys, round_to(Y->dtype, v) * ldt(B, bb + i * bs));
+                          : act == 2 ? act_gelu_tanh(g) : act_sigmoid(g);
+            stt(Y, yb + i * ys, round_dt(Y->dtype, v) * ldt(B, bb + i * bs));
         }
     }
     return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ seg_mean */
-/* y[s, :] = the mean of x's rows [cu[s], cu[s+1]): one row a segment, which is a sentence
- * embedding's mean pooling over a ragged batch. The sum is taken in DOUBLE and divided once, so the
- * pooled row does not depend on how many rows a segment has beyond the one rounding to y's dtype.
- * An empty segment writes zeros. */
+/* y[s, :] = mean of x's rows [cu[s], cu[s+1]): sentence-embedding mean pooling over a ragged
+ * batch. Summed in double and divided once, so only the final rounding to y's dtype depends on the
+ * segment length. An empty segment writes zeros. */
 int ref_seg_mean(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *cu = &a->t[1], *Y = &a->t[2];
     const int64_t n = p_int(a, "n", 0);
     const int64_t S = numel(cu) - 1;
     if (n <= 0 || S <= 0 || numel(Y) < S * n) return RAD_E_SHAPE;
-    const int64_t total = ld_int(cu->dtype, cu->data, offlin(cu, S));
-    if (total < 0 || numel(X) < total * n) return RAD_E_SHAPE;
+    const int64_t total = cu_at(cu, S);
+    if (total <= 0 || numel(X) < total * n) return RAD_E_SHAPE;
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR((total + S) * n)
     for (int64_t s = 0; s < S; ++s) {
-        const int64_t b0 = ld_int(cu->dtype, cu->data, offlin(cu, s));
-        const int64_t b1 = ld_int(cu->dtype, cu->data, offlin(cu, s + 1));
+        const int64_t b0 = cu_at(cu, s);
+        const int64_t b1 = cu_at(cu, s + 1);
         const int64_t yb = rowoff(Y, s, n), ys = laststride(Y), xs = laststride(X);
         for (int64_t i = 0; i < n; ++i) {
             double acc = 0.0;
@@ -481,8 +428,8 @@ int ref_seg_mean(const RadArgs* a, RadStream) {
 
 /* ------------------------------------------------------------------ pool_rows */
 /* Row r of y is the mean of x's rows [r*k, r*k + k), summed in f32 and rounded to y's dtype, then
- * multiplied by `mult` and rounded again -- the unfused pair, which stores the mean. A vision
- * pooler whose processor lays each k-patch window out consecutively pools with this. */
+ * multiplied by `mult` and rounded again, as the unfused pair stores the mean. For vision poolers
+ * whose processor lays each k-patch window out consecutively. */
 int ref_pool_rows(const RadArgs* a, RadStream) {
     if (!have(a, 2)) return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *Y = &a->t[1];
@@ -495,7 +442,7 @@ int ref_pool_rows(const RadArgs* a, RadStream) {
     if (numel(Y) < rows * n) return RAD_E_SHAPE;
     const float inv = 1.0f / (float)k;
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows_in * n)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t yb = rowoff(Y, r, n), ys = laststride(Y), xs = laststride(X);
         for (int64_t i = 0; i < n; ++i) {
@@ -518,7 +465,7 @@ int ref_relu(const RadArgs* a, RadStream) {
     const int64_t rows = rows_of(Y, n);
     if (rows <= 0 || numel(X) < rows * n) return RAD_E_SHAPE;
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t xb = rowoff(X, r, n), yb = rowoff(Y, r, n);
         const int64_t xs = laststride(X), ys = laststride(Y);
@@ -531,8 +478,8 @@ int ref_relu(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ clamp */
-/* y = min(max(x, lo), hi), the bounds WEIGHTS of one element each: a clipped linear's input or
- * output range (Gemma 4's audio tower), which the checkpoint states per projection. */
+/* y = min(max(x, lo), hi), the bounds being one-element weights: a clipped linear's input or output
+ * range, stated per projection in the checkpoint (Gemma 4's audio tower). */
 int ref_clamp(const RadArgs* a, RadStream) {
     if (!have(a, 4)) return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *L = &a->t[1], *H = &a->t[2], *Y = &a->t[3];
@@ -542,7 +489,7 @@ int ref_clamp(const RadArgs* a, RadStream) {
     if (rows <= 0 || numel(X) < rows * n) return RAD_E_SHAPE;
     const float lo = ldt(L, 0), hi = ldt(H, 0);
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t xb = rowoff(X, r, n), yb = rowoff(Y, r, n);
         const int64_t xs = laststride(X), ys = laststride(Y);
@@ -560,34 +507,49 @@ int ref_clamp(const RadArgs* a, RadStream) {
 /* A 2-D convolution over (time, width) with channels innermost, segment by segment.
  *
  * x is [M, W * cin]: row t is time t, element (t, w, c) at column w * cin + c. Each cu_seqlens
- * segment [cu[s] / cu_div, cu[s+1] / cu_div) is convolved ON ITS OWN, zero-padded by `pad` at its
- * edges on both axes -- two clips in one pass must not see each other -- and its output rows start
- * at cu[s] / (cu_div * stride). `w` is PyTorch's [cout, cin, kh, kw]. With the optional `valid`
- * operand, input row t (pass-global) is read as zeros unless valid[t * valid_stride] != 0: the
- * frame mask Gemma 4's subsampler multiplies in before each convolution. f32 accumulation, one
- * rounding. */
+ * segment [cu[s] / cu_div, cu[s+1] / cu_div) is convolved separately, zero-padded by `pad` on both
+ * axes, so clips in one pass do not see each other; its output rows start at
+ * cu[s] / (cu_div * stride). `w` is PyTorch's [cout, cin, kh, kw], kh over time; with `t_last` it
+ * is [cout, cin, kw, kh], time last (a model that convolves a [mel, time] spectrogram, whose
+ * kernel's first spatial axis is the one this op calls width). With the optional `valid` operand,
+ * input row t (pass-global) reads as zeros unless valid[t * valid_stride] != 0: Gemma 4's
+ * subsampler frame mask, or the chunk boundary that keeps each second of Qwen3-ASR's audio apart.
+ * The optional `b` adds a bias per output channel before the one rounding; `act` (`none`, `gelu`)
+ * is then applied to the rounded value and rounded again, as gemm_nt_bias's epilogue does. f32
+ * accumulation. */
 int ref_conv2d(const RadArgs* a, RadStream) {
     if (!a || a->n_t < 5 || !a->t[0].data || !a->t[1].data || !a->t[2].data || !a->t[4].data)
         return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *Wt = &a->t[1], *cu = &a->t[2], *Y = &a->t[4];
     const RadTensor* V = a->t[3].data ? &a->t[3] : nullptr;
+    const RadTensor* B = a->n_t > 5 && a->t[5].data ? &a->t[5] : nullptr;
     const int64_t W = p_int(a, "width", 0), cin = p_int(a, "cin", 0), cout = p_int(a, "cout", 0);
     const int64_t kh = p_int(a, "kh", 0), kw = p_int(a, "kw", 0);
     const int64_t st = p_int(a, "stride", 1), pad = p_int(a, "pad", 0);
     const int64_t cdiv = p_int(a, "cu_div", 1), vst = p_int(a, "valid_stride", 1);
+    const bool tlast = p_int(a, "t_last", 0) != 0;
+    const char* act = p_str(a, "act", "none");
+    const bool gelu = !std::strcmp(act, "gelu");
+    if (!gelu && std::strcmp(act, "none")) return RAD_E_UNSUPPORTED;
     if (W <= 0 || cin <= 0 || cout <= 0 || kh <= 0 || kw <= 0 || st <= 0 || pad < 0 || cdiv <= 0 ||
         vst <= 0)
         return RAD_E_SHAPE;
     const int64_t Wo = (W + 2 * pad - kw) / st + 1;
     if (Wo <= 0 || numel(Wt) < cout * cin * kh * kw) return RAD_E_SHAPE;
+    if (B && numel(B) < cout) return RAD_E_SHAPE;
     const int64_t S = numel(cu) - 1;
     if (S <= 0) return RAD_E_SHAPE;
     const int64_t rin = W * cin, rout = Wo * cout;
     const int64_t Min = rows_of(X, rin), Mout = rows_of(Y, rout);
+    if (Min <= 0 || Mout <= 0 || cu_at(cu, S) <= cu_at(cu, 0)) return RAD_E_SHAPE;   /* zero rows */
+    /* Kernel tap (i over time, j over width) of channel pair (co, ci). */
+    auto widx = [&](int64_t co, int64_t ci, int64_t i, int64_t j) {
+        return tlast ? ((co * cin + ci) * kw + j) * kh + i : ((co * cin + ci) * kh + i) * kw + j;
+    };
 
     for (int64_t s = 0; s < S; ++s) {
-        const int64_t c0 = ld_int(cu->dtype, cu->data, offlin(cu, s));
-        const int64_t c1 = ld_int(cu->dtype, cu->data, offlin(cu, s + 1));
+        const int64_t c0 = cu_at(cu, s);
+        const int64_t c1 = cu_at(cu, s + 1);
         if (c0 % cdiv || c1 % cdiv || (c0 / cdiv) % st || c1 < c0) return RAD_E_SHAPE;
         const int64_t t0 = c0 / cdiv, T = c1 / cdiv - t0;
         if (T <= 0) continue;
@@ -596,7 +558,7 @@ int ref_conv2d(const RadArgs* a, RadStream) {
         if (t0 + T > Min || o0 + To > Mout) return RAD_E_SHAPE;
         if (V && numel(V) < (t0 + T - 1) * vst + 1) return RAD_E_SHAPE;
 
-        #pragma omp parallel for schedule(static)
+        REF_PAR_FOR(To * rout * cin * kh * kw)
         for (int64_t to = 0; to < To; ++to) {
             const int64_t yb = rowoff(Y, o0 + to, rout), ys = laststride(Y), xs = laststride(X);
             for (int64_t wo = 0; wo < Wo; ++wo)
@@ -612,12 +574,77 @@ int ref_conv2d(const RadArgs* a, RadStream) {
                             const int64_t wi = wo * st - pad + j;
                             if (wi < 0 || wi >= W) continue;
                             for (int64_t ci = 0; ci < cin; ++ci)
-                                acc += ldt(X, xb + (wi * cin + ci) * xs) *
-                                       ldt(Wt, ((co * cin + ci) * kh + i) * kw + j);
+                                acc += ldt(X, xb + (wi * cin + ci) * xs) * ldt(Wt, widx(co, ci, i, j));
                         }
                     }
-                    stt(Y, yb + (wo * cout + co) * ys, acc);
+                    if (B) acc += ldt(B, offlin(B, co));
+                    const int64_t yo = yb + (wo * cout + co) * ys;
+                    stt(Y, yo, acc);
+                    if (gelu) stt(Y, yo, act_gelu(ldt(Y, yo)));
                 }
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ conv2d_unfold */
+/* conv2d's receptive fields as rows, so a GEMM against the weight is the convolution: row
+ * (o0 + to) * Wo + wo of y holds, for every input channel and kernel tap, the value conv2d would
+ * multiply that tap's weight by -- zero where the tap falls in the padding or on a row `valid`
+ * masks. Its columns are in the weight's order, (ci, i, j) for PyTorch's [cout, cin, kh, kw] and
+ * (ci, j, i) with t_last, so y times the weight viewed as [cout, cin * kh * kw] is conv2d's output
+ * with no relayout of either: row (to, wo) of the product is column block wo of conv2d's row to.
+ * Segments, cu_div and valid as conv2d's; rows no segment covers are left alone. */
+int ref_conv2d_unfold(const RadArgs* a, RadStream) {
+    if (!a || a->n_t < 4 || !a->t[0].data || !a->t[1].data || !a->t[3].data) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *cu = &a->t[1], *Y = &a->t[3];
+    const RadTensor* V = a->t[2].data ? &a->t[2] : nullptr;
+    const int64_t W = p_int(a, "width", 0), cin = p_int(a, "cin", 0);
+    const int64_t kh = p_int(a, "kh", 0), kw = p_int(a, "kw", 0);
+    const int64_t st = p_int(a, "stride", 1), pad = p_int(a, "pad", 0);
+    const int64_t cdiv = p_int(a, "cu_div", 1), vst = p_int(a, "valid_stride", 1);
+    const bool tlast = p_int(a, "t_last", 0) != 0;
+    if (W <= 0 || cin <= 0 || kh <= 0 || kw <= 0 || st <= 0 || pad < 0 || cdiv <= 0 || vst <= 0)
+        return RAD_E_SHAPE;
+    const int64_t Wo = (W + 2 * pad - kw) / st + 1, K = cin * kh * kw;
+    const int64_t S = numel(cu) - 1;
+    if (Wo <= 0 || S <= 0) return RAD_E_SHAPE;
+    const int64_t rin = W * cin, Min = rows_of(X, rin), Mout = rows_of(Y, K);
+    if (Min <= 0 || Mout <= 0 || cu_at(cu, S) <= cu_at(cu, 0)) return RAD_E_SHAPE;   /* zero rows */
+
+    for (int64_t s = 0; s < S; ++s) {
+        const int64_t c0 = cu_at(cu, s);
+        const int64_t c1 = cu_at(cu, s + 1);
+        if (c0 % cdiv || c1 % cdiv || (c0 / cdiv) % st || c1 < c0) return RAD_E_SHAPE;
+        const int64_t t0 = c0 / cdiv, T = c1 / cdiv - t0;
+        if (T <= 0) continue;
+        const int64_t To = (T + 2 * pad - kh) / st + 1, o0 = t0 / st;
+        if (To <= 0) continue;
+        if (t0 + T > Min || (o0 + To) * Wo > Mout) return RAD_E_SHAPE;
+        if (V && numel(V) < (t0 + T - 1) * vst + 1) return RAD_E_SHAPE;
+
+        REF_PAR_FOR(To * Wo * K)
+        for (int64_t to = 0; to < To; ++to) {
+            const int64_t ys = laststride(Y), xs = laststride(X);
+            for (int64_t wo = 0; wo < Wo; ++wo) {
+                const int64_t yb = rowoff(Y, (o0 + to) * Wo + wo, K);
+                for (int64_t i = 0; i < kh; ++i) {
+                    const int64_t ti = to * st - pad + i;
+                    const int64_t tg = t0 + ti;
+                    const bool row_ok = ti >= 0 && ti < T &&
+                                        !(V && ld_int(V->dtype, V->data, offlin(V, tg * vst)) == 0);
+                    for (int64_t j = 0; j < kw; ++j) {
+                        const int64_t wi = wo * st - pad + j;
+                        const bool ok = row_ok && wi >= 0 && wi < W;
+                        for (int64_t ci = 0; ci < cin; ++ci) {
+                            const int64_t k = tlast ? (ci * kw + j) * kh + i : (ci * kh + i) * kw + j;
+                            const float v = ok ? ldt(X, rowoff(X, tg, rin) + (wi * cin + ci) * xs)
+                                               : 0.0f;
+                            stt(Y, yb + k * ys, v);
+                        }
+                    }
+                }
+            }
         }
     }
     return RAD_OK;
@@ -635,15 +662,16 @@ int ref_conv1d_dw(const RadArgs* a, RadStream) {
     const int64_t S = numel(cu) - 1;
     if (S <= 0) return RAD_E_SHAPE;
     const int64_t Mx = rows_of(X, C), My = rows_of(Y, C);
+    if (Mx <= 0 || My <= 0 || cu_at(cu, S) <= cu_at(cu, 0)) return RAD_E_SHAPE;   /* zero rows */
 
     for (int64_t s = 0; s < S; ++s) {
-        const int64_t c0 = ld_int(cu->dtype, cu->data, offlin(cu, s));
-        const int64_t c1 = ld_int(cu->dtype, cu->data, offlin(cu, s + 1));
+        const int64_t c0 = cu_at(cu, s);
+        const int64_t c1 = cu_at(cu, s + 1);
         if (c0 % cdiv || c1 % cdiv || c1 < c0) return RAD_E_SHAPE;
         const int64_t t0 = c0 / cdiv, t1 = c1 / cdiv;
         if (t1 > Mx || t1 > My) return RAD_E_SHAPE;
 
-        #pragma omp parallel for schedule(static)
+        REF_PAR_FOR((t1 - t0) * C * K)
         for (int64_t t = t0; t < t1; ++t) {
             const int64_t yb = rowoff(Y, t, C), ys = laststride(Y), xs = laststride(X);
             for (int64_t c = 0; c < C; ++c) {
@@ -661,9 +689,9 @@ int ref_conv1d_dw(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ rel_sinusoid */
-/* The sinusoidal relative-position table, row d for distance d: sin(d * inv[i]) in the first
- * half, cos(d * inv[i]) in the second, inv[i] = exp(i * -log(max_timescale) / max(n/2 - 1, 1)).
- * Computed in f32 step by step the way the reference's torch expressions are, then rounded. */
+/* The sinusoidal relative-position table, row d for distance d: sin(d * inv[i]) in the first half,
+ * cos(d * inv[i]) in the second, inv[i] = exp(i * -log(max_timescale) / max(n/2 - 1, 1)). Computed
+ * in f32 step by step as the upstream torch expressions are, then rounded. */
 int ref_rel_sinusoid(const RadArgs* a, RadStream) {
     if (!have(a, 1)) return RAD_E_INVAL;
     const RadTensor* Y = &a->t[0];
@@ -675,27 +703,24 @@ int ref_rel_sinusoid(const RadArgs* a, RadStream) {
     const double mt = (double)p_f32(a, "max_timescale", 10000.0f);
     const float inc = (float)(std::log(mt / 1.0) / (double)(h - 1 > 1 ? h - 1 : 1));
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * n)
     for (int64_t d = 0; d < rows; ++d) {
         const int64_t yb = rowoff(Y, d, n), ys = laststride(Y);
         for (int64_t i = 0; i < h; ++i) {
-            const float inv = std::exp((float)i * -inc);
+            const float inv = ref_exp((float)i * -inc);
             const float ang = (float)d * inv;
-            stt(Y, yb + i * ys, std::sin(ang));
-            stt(Y, yb + (h + i) * ys, std::cos(ang));
+            stt(Y, yb + i * ys, ref_sin(ang));
+            stt(Y, yb + (h + i) * ys, ref_cos(ang));
         }
     }
     return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ gelu_mul */
-/* y[.., i] = gelu_tanh(gate_up[.., i]) * gate_up[.., n + i] -- the tanh GELU, and the gate is the
- * FIRST half, for the same order-locking reason as silu_mul. This is Gemma's gated FFN
- * (down(gelu_tanh(gate(x)) * up(x)), activation gelu_pytorch_tanh in the checkpoint). It is not
- * `gemm_nt`'s "gelu_tanh" EPLOGUE, which applies the activation to a whole GEMM's output and has no
- * gate to multiply; gating needs the product of two halves of one fused plane, which is silu_mul's
- * shape. The exact-erf form is the unary `gelu` op; a GELU-gated feed-forward in this family is
- * trained with the tanh approximation, so this op is the tanh one on purpose and says so. */
+/* y[.., i] = gelu_tanh(gate_up[.., i]) * gate_up[.., n + i], gate first as in silu_mul. Gemma's
+ * gated FFN, down(gelu_tanh(gate(x)) * up(x)) (gelu_pytorch_tanh in the checkpoint). Unlike
+ * gemm_nt's "gelu_tanh" epilogue it multiplies two halves of one fused plane. Deliberately the tanh
+ * form, which GELU-gated FFNs are trained with; the exact-erf form is the unary `gelu` op. */
 int ref_gelu_mul(const RadArgs* a, RadStream) {
     if (!have(a, 2)) return RAD_E_INVAL;
     const RadTensor *gu = &a->t[0], *y = &a->t[1];
@@ -704,12 +729,49 @@ int ref_gelu_mul(const RadArgs* a, RadStream) {
     const int64_t rows = rows_of(y, n);
     if (rows <= 0 || numel(gu) < rows * 2 * n) return RAD_E_SHAPE;
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t gb = rowoff(gu, r, 2 * n), yb = rowoff(y, r, n);
         const int64_t gs = laststride(gu), ys = laststride(y);
         for (int64_t i = 0; i < n; ++i)
             stt(y, yb + i * ys, act_gelu_tanh(ldt(gu, gb + i * gs)) * ldt(gu, gb + (n + i) * gs));
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ seg_sinusoid */
+/* A Whisper-style absolute position table restarting every `period` rows of a segment: row r of
+ * segment s (rows [cu[s] / cu_div, cu[s+1] / cu_div)) takes position p = (r - cu[s] / cu_div) mod
+ * period, and is sin(p * inv[i]) then cos(p * inv[i]) over n/2 timescales, inv[i] as
+ * rel_sinusoid's, each step in f32 and rounded once. Qwen3-ASR's encoder adds it to every chunk's
+ * rows, which restart at position 0 with each second of audio. A row no segment covers is left
+ * untouched. */
+int ref_seg_sinusoid(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *cu = &a->t[0], *Y = &a->t[1];
+    const int64_t n = p_int(a, "n", 0), period = p_int(a, "period", 0), cdiv = p_int(a, "cu_div", 1);
+    if (n <= 0 || n % 2 || period <= 0 || cdiv <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(Y, n), S = numel(cu) - 1;
+    if (rows <= 0 || S <= 0 || cu_at(cu, S) <= cu_at(cu, 0)) return RAD_E_SHAPE;   /* zero rows */
+    const int64_t h = n / 2;
+    const double mt = (double)p_f32(a, "max_timescale", 10000.0f);
+    const float inc = (float)(std::log(mt / 1.0) / (double)(h - 1 > 1 ? h - 1 : 1));
+
+    for (int64_t s = 0; s < S; ++s) {
+        const int64_t c0 = cu_at(cu, s);
+        const int64_t c1 = cu_at(cu, s + 1);
+        if (c0 % cdiv || c1 % cdiv || c1 < c0 || c1 / cdiv > rows) return RAD_E_SHAPE;
+        REF_PAR_FOR((c1 / cdiv - c0 / cdiv) * n * 4)
+        for (int64_t r = c0 / cdiv; r < c1 / cdiv; ++r) {
+            const int64_t p = (r - c0 / cdiv) % period;
+            const int64_t yb = rowoff(Y, r, n), ys = laststride(Y);
+            for (int64_t i = 0; i < h; ++i) {
+                const float inv = ref_exp((float)i * -inc);
+                const float ang = (float)p * inv;
+                stt(Y, yb + i * ys, ref_sin(ang));
+                stt(Y, yb + (h + i) * ys, ref_cos(ang));
+            }
+        }
     }
     return RAD_OK;
 }
@@ -721,7 +783,7 @@ static int unary(const RadArgs* a, int which) {
     const int64_t nel = numel(y);
     if (nel <= 0 || numel(x) < nel) return RAD_E_SHAPE;
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(nel * 4)
     for (int64_t i = 0; i < nel; ++i) {
         float v = ldt(x, offlin(x, i));
         stt(y, offlin(y, i), which == 0 ? act_gelu(v) : which == 1 ? act_silu(v) : act_sigmoid(v));
@@ -733,13 +795,12 @@ int ref_gelu(const RadArgs* a, RadStream) { return unary(a, 0); }
 int ref_silu(const RadArgs* a, RadStream) { return unary(a, 1); }
 
 /* ------------------------------------------------------------------ sigmoid */
-/* Its own op rather than a `which` on gelu/silu, because a gated shared expert issues it against
- * the router's output and the selector has to be able to name it (docs/OPS.md, "New ops"). Without
- * it that expert runs ungated, which is a different model and not a slower one. */
+/* Its own op so the selector can name it: a gated shared expert issues it on the router's output
+ * (docs/OPS.md, "Elementwise and norms"). */
 int ref_sigmoid(const RadArgs* a, RadStream) { return unary(a, 2); }
 
 /* ------------------------------------------------------------------ fill */
-/* y = value over [M, n], at y's own row pitch. The value is rounded once, by the store. */
+/* y = value over [M, n] at y's row pitch, rounded once by the store. */
 int ref_fill(const RadArgs* a, RadStream) {
     if (!have(a, 1)) return RAD_E_INVAL;
     const RadTensor* y = &a->t[0];
@@ -749,7 +810,7 @@ int ref_fill(const RadArgs* a, RadStream) {
     if (rows <= 0) return RAD_E_SHAPE;
     const float v = p_f32(a, "value", 0.0f);
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t yb = rowoff(y, r, n), ys = laststride(y);
         for (int64_t i = 0; i < n; ++i) stt(y, yb + i * ys, v);
@@ -758,10 +819,8 @@ int ref_fill(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ logit_softcap */
-/* y = cap * tanh(x / cap), Gemma's final-logit softcap: the logits_gemm's output is a nearly
- * unbounded row and the sampler wants it bounded, so this is issued against the LOGITS, not the
- * hidden stream. Its own op for the same reason sigmoid is -- the selector has to be able to name
- * it -- and `cap` is a parameter of the call, which the which-switch above cannot carry. */
+/* y = cap * tanh(x / cap), Gemma's final-logit softcap, issued on the logits. Its own op so the
+ * selector can name it and so `cap` can be a call parameter. */
 int ref_logit_softcap(const RadArgs* a, RadStream) {
     if (!have(a, 2)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *y = &a->t[1];
@@ -770,51 +829,38 @@ int ref_logit_softcap(const RadArgs* a, RadStream) {
     const float cap = p_f32(a, "cap", 30.0f);
     if (!(cap > 0.0f)) return RAD_E_INVAL;
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(nel * 4)
     for (int64_t i = 0; i < nel; ++i) {
         const float v = ldt(x, offlin(x, i));
-        stt(y, offlin(y, i), cap * std::tanh(v / cap));
+        stt(y, offlin(y, i), cap * ref_tanh(v / cap));
     }
     return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ scale */
-/* y = x * s, where s is a [1] weight broadcast over every element of x.
- *
- * Gemma 4's per-layer scalar: the residual stream is scaled by a learned [1] value at the end of
- * every layer (llama.cpp `out_scale`, `cur = cur * out_scale`). It is NOT `mul`, which broadcasts
- * a single ROW down the rows (a bias's shape) -- this broadcasts a single SCALAR over the whole
- * [M, n] tensor. `scale_rows` is the per-ROW version (one scalar a row); this is the per-TENSOR
- * version (one scalar for all rows). Giving `mul` both rules would make them ambiguous exactly
- * when rows == 1, so a silent choice between two broadcasts is how a shape bug becomes a
- * plausible number -- the same reason `scale_rows` is its own op.
- *
- * `s` is a weight (a [1] tensor in the checkpoint), not a parameter: it varies per layer, so it
- * is a declared weight the name map points at, not a call constant. Read once, outside the loop:
- * a per-element reload of a [1] tensor is the same value every time and costs a load per element. */
+/* y = x * s, s a [1] weight broadcast over all of x: Gemma 4's per-layer residual scalar (llama.cpp
+ * `out_scale`). `mul` broadcasts a row and `scale_rows` one scalar per row; this is one scalar per
+ * tensor, kept separate so the broadcasts are never ambiguous. `s` is a per-layer checkpoint weight,
+ * not a call constant. */
 int ref_scale(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *s = &a->t[1], *y = &a->t[2];
     const int64_t nel = numel(y);
     if (nel <= 0 || numel(x) < nel || numel(s) < 1) return RAD_E_SHAPE;
     const float sv = ldt(s, 0);
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(nel)
     for (int64_t i = 0; i < nel; ++i)
         stt(y, offlin(y, i), ldt(x, offlin(x, i)) * sv);
     return RAD_OK;
 }
 /* ------------------------------------------------------------------ gather_rows */
-/* y[i, :] = x[idx[i], :]. The op that turns "correct" into "affordable": without it a plugin runs
- * the lm_head GEMM over every token of a prefill chunk when the sampler wants one row per
- * sequence -- n_tok/n_seq times the work, and at max_tok 8192 against a 248K vocab the logits
- * buffer alone is 8 GiB (docs/OPS.md).
+/* y[i, :] = x[idx[i], :]. Lets the lm_head GEMM run on one row per sequence instead of every
+ * prefill token: at max_tok 8192 and a 248K vocab the full logits buffer would be 8 GiB
+ * (docs/OPS.md).
  *
- * `M` is a RANGE parameter, so the number of rows actually gathered is the extent of `y` and not
- * the declared worst case; `idx` is read for exactly that many entries. A negative index writes a
- * zero row, matching embed_lookup's padding rule -- it is what a step with fewer sampled rows
- * than the buffer's extent leaves behind, and zeros are the only answer that cannot be mistaken
- * for a real logit row. An index at or past x's row count is RAD_E_INVAL: that is a caller bug,
- * and reading it would be reading another sequence's hidden state. */
+ * `M` is a range parameter, so the row count is y's extent and `idx` is read for that many entries.
+ * A negative index writes a zero row (embed_lookup's padding rule; unsampled rows of a step). An
+ * index at or past x's row count is a caller bug and returns RAD_E_INVAL. */
 int ref_gather_rows(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *idx = &a->t[1], *y = &a->t[2];
@@ -830,7 +876,7 @@ int ref_gather_rows(const RadArgs* a, RadStream) {
         if (r >= src_rows) return RAD_E_INVAL;
     }
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(M * n)
     for (int64_t m = 0; m < M; ++m) {
         const int64_t r  = ld_int(idx->dtype, idx->data, offlin(idx, m));
         const int64_t yb = rowoff(y, m, n), ys = laststride(y);
@@ -843,18 +889,14 @@ int ref_gather_rows(const RadArgs* a, RadStream) {
 
 
 /* ------------------------------------------------------------------ scatter_rows */
-/* The mirror of gather_rows, and it exists for the same reason that one does: without it the only
- * way to write M rows to M arbitrary destinations is M transfers, and at a few hundred bytes a row
- * that is dispatch cost with the data as a rounding error.
+/* The mirror of gather_rows: writes M rows to M arbitrary destinations in one launch instead of M
+ * small transfers.
  *
- * `x` IS INOUT AND THE WRITE IS PARTIAL. Rows no index names keep whatever they held -- which is
- * the whole point when the destination is a pool other sequences are also using. An op that
- * returned a fresh `x` would have to copy everything it was not asked to change.
+ * `x` is INOUT and the write is partial: unnamed rows keep their contents, since the destination
+ * is often a pool shared with other sequences.
  *
- * DUPLICATE INDICES ARE NOT LEGAL, and the schema says so with RAD_OPD_F_IDX_UNIQUE rather than
- * leaving it to prose. Two rows landing on one destination has no defined winner on a parallel
- * machine, so an op that permitted it would be one whose reference implementation and whose real
- * kernel are allowed to disagree -- which is exactly what the oracle exists to rule out. */
+ * Duplicate indices are illegal (RAD_OPD_F_IDX_UNIQUE): two rows landing on one destination have no
+ * defined winner in parallel, so reference and kernel could legitimately disagree. */
 int ref_scatter_rows(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *v = &a->t[0], *idx = &a->t[1], *x = &a->t[2];
@@ -864,15 +906,14 @@ int ref_scatter_rows(const RadArgs* a, RadStream) {
     const int64_t dst_rows = rows_of(x, n);
     if (M <= 0 || dst_rows <= 0 || numel(idx) < M) return RAD_E_SHAPE;
 
-    /* Validated before the loop, because an OpenMP body cannot return. A negative index is a
-     * skip, mirroring the zero row gather_rows writes for one: both mean "this slot has no
-     * counterpart", and on this side the honest response is to leave the destination alone. */
+    /* Validated before the loop, since an OpenMP body cannot return. A negative index is skipped,
+     * mirroring gather_rows' zero row: both mean the slot has no counterpart. */
     for (int64_t m = 0; m < M; ++m) {
         const int64_t r = ld_int(idx->dtype, idx->data, offlin(idx, m));
         if (r >= dst_rows) return RAD_E_INVAL;
     }
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(M * n)
     for (int64_t m = 0; m < M; ++m) {
         const int64_t r = ld_int(idx->dtype, idx->data, offlin(idx, m));
         if (r < 0) continue;
@@ -883,24 +924,20 @@ int ref_scatter_rows(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 /* ------------------------------------------------------------------ cast */
-/* `from` and `to` are in the schema because the SELECTOR needs them -- a kernel that converts bf16
- * to int8 is a different kernel from one that converts f32 to f16, and the constraint has to be
- * expressible. Ref does not read them: the tensors carry their own dtypes and those are what the
- * bytes actually are. A disagreement between the parameter and the tensor is a caller bug that
- * ref cannot diagnose better than the caller can. */
+/* `from` and `to` exist for the selector (each dtype pair is a different kernel). Ref ignores them
+ * and uses the tensors' own dtypes, which describe the bytes. */
 int ref_cast(const RadArgs* a, RadStream) {
     if (!have(a, 2)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *y = &a->t[1];
     const int64_t nel = numel(y);
     if (nel <= 0 || numel(x) < nel) return RAD_E_SHAPE;
 
-    /* Integer targets and sources go through the integer path, so a token id or a block index
-     * survives a cast that f32 would round. */
+    /* Integer-to-integer casts bypass f32, so ids and indices above 2^24 survive. */
     const bool int_pair = (x->dtype == RAD_I32 || x->dtype == RAD_I64 || x->dtype == RAD_U32 ||
                            x->dtype == RAD_I16) &&
                           (y->dtype == RAD_I32 || y->dtype == RAD_I64 || y->dtype == RAD_U32 ||
                            y->dtype == RAD_I16);
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(nel)
     for (int64_t i = 0; i < nel; ++i) {
         if (int_pair) st_int(y->dtype, y->data, offlin(y, i), ld_int(x->dtype, x->data, offlin(x, i)));
         else          stt(y, offlin(y, i), ldt(x, offlin(x, i)));
@@ -909,9 +946,8 @@ int ref_cast(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ softmax */
-/* Max-subtracted, f32, over the last n elements of a row. The max subtraction is not an
- * optimisation: without it a 60-nat logit range overflows, and every kernel this is an oracle for
- * does it, so the reference must too or the two differ by more than rounding. */
+/* Max-subtracted, f32, over the last n elements of a row. Every kernel subtracts the max (a 60-nat
+ * logit range would otherwise overflow), so the reference must too. */
 int ref_softmax(const RadArgs* a, RadStream) {
     if (!have(a, 2)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *y = &a->t[1];
@@ -920,7 +956,7 @@ int ref_softmax(const RadArgs* a, RadStream) {
     const int64_t rows = rows_of(y, n);
     if (rows <= 0 || numel(x) < rows * n) return RAD_E_SHAPE;
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * n * 4)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t xb = rowoff(x, r, n), yb = rowoff(y, r, n);
         const int64_t xs = laststride(x), ys = laststride(y);

@@ -12,10 +12,9 @@
 namespace rad {
 
 /* ------------------------------------------------------------------ dtype geometry */
-/* Transcribed from ggml.c `type_traits` at llama.cpp 06938ac12 by running ggml_blck_size() and
- * ggml_type_size() over the whole enum, so it is the values the producer actually used rather
- * than the values the format documentation claims. Rows 42..44 are local to that checkout and
- * are carried so a file written by it is readable; upstream stops at 41. */
+/* Produced by running ggml_blck_size() and ggml_type_size() over the whole enum at llama.cpp
+ * 06938ac12, so these are the values the producer used, not the documented ones. Rows 42..44 are
+ * local to that checkout and kept so files it wrote stay readable; upstream stops at 41. */
 static const GgufDtype k_dtypes[] = {
     {   1,   4, "f32"     }, /*  0 */
     {   1,   2, "f16"     }, /*  1 */
@@ -71,9 +70,8 @@ const GgufDtype* gguf_dtype(uint32_t t) {
 }
 
 uint32_t gguf_to_rad_dtype(uint32_t t) {
-    /* Only the types whose bytes mean the same thing on both sides. Everything block-quantised
-     * is deliberately absent: reinterpreting a q4_K block as RAD_I4 would produce a tensor that
-     * loads and computes and is wrong, which is the failure mode this project exists to remove. */
+    /* Block-quantised types are deliberately absent: a q4_K block reinterpreted as RAD_I4 would
+     * load and compute, and be wrong. */
     switch (t) {
         case 0:  return RAD_F32;
         case 1:  return RAD_F16;
@@ -87,9 +85,8 @@ uint32_t gguf_to_rad_dtype(uint32_t t) {
 }
 
 /* ------------------------------------------------------------------ cursor */
-/* A bounds-checked forward cursor over the mmap. Every read returns false at the end of the
- * file instead of faulting, because a truncated GGUF is a thing that happens to people and
- * "SIGSEGV in the loader" is not a diagnosis. */
+/* A bounds-checked forward cursor over the mmap. Reads return false at the end of the file
+ * instead of faulting, so a truncated GGUF gets an error message, not a SIGSEGV. */
 namespace {
 struct Cursor {
     const uint8_t* p = nullptr;
@@ -128,15 +125,13 @@ size_t gguf_scalar_bytes(uint32_t t) {
     }
 }
 
-/* The smallest a KV and a tensor record can be encoded in, which is what a count in the header is
- * checked against: a key or name length and a type, then one value byte, or a dimension count
- * and an offset. */
+/* Smallest encodings of a KV (key length, type, one value byte) and a tensor record (name length,
+ * dimension count, type, offset). The header's counts are checked against them. */
 constexpr uint64_t kMinKvBytes     = sizeof(uint64_t) + sizeof(uint32_t) + 1;
 constexpr uint64_t kMinTensorBytes = sizeof(uint64_t) + 2 * sizeof(uint32_t) + sizeof(uint64_t);
 
-/* A count read from the file sizes a reservation only up to a point. Past it the table grows as
- * entries are actually read, so its memory follows the file's content rather than what the file
- * claims about it. */
+/* Caps a reservation sized by a count from the file. Past the cap the table grows as entries are
+ * read, so memory follows the file's content, not its claims. */
 size_t reserve_hint(uint64_t n) { return (size_t)std::min<uint64_t>(n, 1u << 16); }
 
 /* Widen one fixed-width scalar into the KV's integer or float lane. */
@@ -202,6 +197,11 @@ int GgufFile::open(const char* path) {
     }
     base_ = static_cast<const uint8_t*>(m);
     file_bytes_ = (uint64_t)st.st_size;
+    /* Every refusal from here on unmaps the file. */
+    auto fail = [this] {
+        close();
+        return RAD_E_FORMAT;
+    };
 
     Cursor c{ base_, 0, file_bytes_ };
 
@@ -209,32 +209,28 @@ int GgufFile::open(const char* path) {
     uint64_t n_tensors = 0, n_kv = 0;
     if (!c.raw(magic, 4) || !c.pod(&version_) || !c.pod(&n_tensors) || !c.pod(&n_kv)) {
         RAD_ERR("gguf: %s is too short to hold a header", path_.c_str());
-        close();
-        return RAD_E_FORMAT;
+        return fail();
     }
     if (std::memcmp(magic, "GGUF", 4) != 0) {
         RAD_ERR("gguf: %s is not a GGUF file (magic %02x%02x%02x%02x)", path_.c_str(),
                 (unsigned)(uint8_t)magic[0], (unsigned)(uint8_t)magic[1],
                 (unsigned)(uint8_t)magic[2], (unsigned)(uint8_t)magic[3]);
-        close();
-        return RAD_E_FORMAT;
+        return fail();
     }
-    /* v1 laid its counts out as 32-bit and nothing produces it any more; v2 and v3 differ only
-     * in the sign of a tensor dimension, which we read as int64 either way. */
+    /* v1 used 32-bit counts and is no longer produced. v2 and v3 differ only in the signedness
+     * of a tensor dimension, which is read as int64 either way. */
     if (version_ < 2 || version_ > 3) {
         RAD_ERR("gguf: %s is version %u; this reader handles 2 and 3", path_.c_str(), version_);
-        close();
-        return RAD_E_FORMAT;
+        return fail();
     }
-    /* Both counts index heap tables, so a corrupt one has to be refused before it is trusted as
-     * a loop bound. What is left of the file has to hold every entry at its smallest encoding. */
+    /* Both counts bound loops that fill heap tables, so refuse them unless the rest of the file
+     * can hold every entry at its smallest encoding. */
     const uint64_t rest = c.end - c.off;
     if (n_kv > rest / kMinKvBytes || n_tensors > rest / kMinTensorBytes) {
         RAD_ERR("gguf: %s declares %llu KVs and %llu tensors in %llu bytes", path_.c_str(),
                 (unsigned long long)n_kv, (unsigned long long)n_tensors,
                 (unsigned long long)file_bytes_);
-        close();
-        return RAD_E_FORMAT;
+        return fail();
     }
 
     kv_.reserve(reserve_hint(n_kv));
@@ -243,39 +239,33 @@ int GgufFile::open(const char* path) {
         uint32_t t = 0;
         if (!c.str(&e.key) || !c.pod(&t)) {
             RAD_ERR("gguf: %s: truncated in KV %llu", path_.c_str(), (unsigned long long)k);
-            close();
-            return RAD_E_FORMAT;
+            return fail();
         }
         uint64_t n = 1;
         if (t == GGUF_ARR) {
             e.is_array = true;
             if (!c.pod(&t) || !c.pod(&n)) {
                 RAD_ERR("gguf: %s: truncated array header for '%s'", path_.c_str(), e.key.c_str());
-                close();
-                return RAD_E_FORMAT;
+                return fail();
             }
             if (t == GGUF_ARR) {
                 RAD_ERR("gguf: %s: '%s' is an array of arrays, which GGUF does not define",
                         path_.c_str(), e.key.c_str());
-                close();
-                return RAD_E_FORMAT;
+                return fail();
             }
-            /* Every element has a smallest encoding -- its width, or a string's length prefix --
-             * so a bogus count is caught here, against what is left of the file, rather than
-             * after a reserve sized by it has exhausted memory. A type with no encoding at all
-             * fails on its first element, so it is refused before anything is sized for it. */
+            /* Each element takes at least its width (a string, its length prefix), so a bogus
+             * count is refused against the remaining bytes before anything is reserved for it.
+             * An undefined element type is refused here for the same reason. */
             const size_t w = t == GGUF_STR ? sizeof(uint64_t) : gguf_scalar_bytes(t);
             if (!w) {
                 RAD_ERR("gguf: %s: '%s' is an array of type %u, which GGUF does not define",
                         path_.c_str(), e.key.c_str(), t);
-                close();
-                return RAD_E_FORMAT;
+                return fail();
             }
             if (n > (c.end - c.off) / w) {
                 RAD_ERR("gguf: %s: '%s' claims %llu elements, past the end of the file",
                         path_.c_str(), e.key.c_str(), (unsigned long long)n);
-                close();
-                return RAD_E_FORMAT;
+                return fail();
             }
         }
         e.type = t;
@@ -287,20 +277,25 @@ int GgufFile::open(const char* path) {
             if (!read_scalar(c, t, e)) {
                 RAD_ERR("gguf: %s: truncated value %llu of '%s' (type %u)", path_.c_str(),
                         (unsigned long long)j, e.key.c_str(), t);
-                close();
-                return RAD_E_FORMAT;
+                return fail();
             }
         }
-        /* Later duplicates lose. GGUF does not forbid them and a rewriter can leave one behind;
-         * the first is the one every other reader takes. */
+        /* The first of duplicate keys wins, as in other readers. GGUF does not forbid
+         * duplicates and a rewriter can leave one behind. */
         if (!kv_index_.count(e.key)) kv_index_[e.key] = kv_.size();
         kv_.push_back(std::move(e));
     }
 
-    /* The alignment KV moves the data section, so it has to be read before the directory's
-     * offsets mean anything. 32 is the format's default. */
-    int64_t al = 0;
-    if (get_i64("general.alignment", &al) && al > 0 && (al & (al - 1)) == 0) {
+    /* general.alignment moves the data section, so it is read before the directory's offsets.
+     * The format's default is 32. A value that is not one integer power of two is refused, as
+     * ggml's reader refuses it: no writer places the data section by it, and falling back to
+     * the default would read every tensor from the wrong bytes. */
+    if (const GgufKV* a = find("general.alignment")) {
+        const int64_t al = !a->is_array && a->type != GGUF_BOOL && a->i.size() == 1 ? a->i[0] : 0;
+        if (al <= 0 || (al & (al - 1)) != 0) {
+            RAD_ERR("gguf: %s: general.alignment is not a power of two", path_.c_str());
+            return fail();
+        }
         alignment_ = (uint64_t)al;
     }
 
@@ -309,47 +304,39 @@ int GgufFile::open(const char* path) {
         GgufTensor ti;
         if (!c.str(&ti.name) || !c.pod(&ti.n_dims)) {
             RAD_ERR("gguf: %s: truncated in tensor %llu", path_.c_str(), (unsigned long long)t);
-            close();
-            return RAD_E_FORMAT;
+            return fail();
         }
         if (ti.n_dims > 4) {
             RAD_ERR("gguf: %s: tensor '%s' has %u dimensions; GGUF allows 4",
                     path_.c_str(), ti.name.c_str(), ti.n_dims);
-            close();
-            return RAD_E_FORMAT;
+            return fail();
         }
         for (uint32_t d = 0; d < ti.n_dims; ++d) {
             if (!c.pod(&ti.ne[d]) || ti.ne[d] < 0) {
                 RAD_ERR("gguf: %s: tensor '%s' has a bad dimension %u", path_.c_str(),
                         ti.name.c_str(), d);
-                close();
-                return RAD_E_FORMAT;
+                return fail();
             }
         }
         if (!c.pod(&ti.ggml_type) || !c.pod(&ti.offset)) {
             RAD_ERR("gguf: %s: truncated type/offset for '%s'", path_.c_str(), ti.name.c_str());
-            close();
-            return RAD_E_FORMAT;
+            return fail();
         }
         const GgufDtype* dt = gguf_dtype(ti.ggml_type);
         if (!dt) {
-            RAD_ERR("gguf: %s: tensor '%s' has dtype %u, which this build does not know. "
-                    "Refusing rather than guessing its byte size.",
+            RAD_ERR("gguf: %s: tensor '%s' has dtype %u, which this build does not know",
                     path_.c_str(), ti.name.c_str(), ti.ggml_type);
-            close();
-            return RAD_E_FORMAT;
+            return fail();
         }
         if (ti.ne[0] % dt->blck != 0) {
             RAD_ERR("gguf: %s: tensor '%s' row is %lld elements, not a multiple of the %s block "
                     "of %d", path_.c_str(), ti.name.c_str(), (long long)ti.ne[0], dt->name,
                     dt->blck);
-            close();
-            return RAD_E_FORMAT;
+            return fail();
         }
-        /* The product of four file-supplied dimensions, and its size in bytes, can each wrap --
-         * to a small tensor that passes the bounds check below while its dimensions say it is
-         * vast. Both are checked, and the count also has to fit the signed type every consumer
-         * of `ne` computes it in. */
+        /* The product of four file-supplied dimensions and its byte size can each wrap to a
+         * small value that passes the bounds check below. Check both, and that the element
+         * count fits int64, the type consumers of `ne` compute it in. */
         uint64_t nelem = 1;
         bool     wraps = false;
         for (int d = 0; d < 4; ++d)
@@ -362,10 +349,14 @@ int GgufFile::open(const char* path) {
                     "does not fit in 64 bits", path_.c_str(), ti.name.c_str(),
                     (long long)ti.ne[0], (long long)ti.ne[1], (long long)ti.ne[2],
                     (long long)ti.ne[3]);
-            close();
-            return RAD_E_FORMAT;
+            return fail();
         }
-        if (!tensor_index_.count(ti.name)) tensor_index_[ti.name] = tensors_.size();
+        /* A second entry under one name could never be looked up. */
+        if (tensor_index_.count(ti.name)) {
+            RAD_ERR("gguf: %s: tensor '%s' is listed twice", path_.c_str(), ti.name.c_str());
+            return fail();
+        }
+        tensor_index_[ti.name] = tensors_.size();
         tensors_.push_back(std::move(ti));
     }
 
@@ -373,19 +364,24 @@ int GgufFile::open(const char* path) {
     if (data_off_ > file_bytes_) {
         RAD_ERR("gguf: %s: data section starts at %llu, past the end of a %llu-byte file",
                 path_.c_str(), (unsigned long long)data_off_, (unsigned long long)file_bytes_);
-        close();
-        return RAD_E_FORMAT;
+        return fail();
     }
-    /* Every tensor must lie inside the file. Checking it once here is what lets tensor_data()
-     * hand out a raw pointer without every caller re-deriving the bound. */
+    /* Every tensor must lie inside the file, so tensor_data() can hand out raw pointers, and
+     * start on the file's alignment, as ggml's reader requires, so those pointers are aligned
+     * for the vector loads of whatever reads them. */
     for (const GgufTensor& ti : tensors_) {
+        if (ti.offset % alignment_ != 0) {
+            RAD_ERR("gguf: %s: tensor '%s' starts at +%llu, off the file's %llu-byte alignment",
+                    path_.c_str(), ti.name.c_str(), (unsigned long long)ti.offset,
+                    (unsigned long long)alignment_);
+            return fail();
+        }
         if (ti.offset > file_bytes_ - data_off_ ||
             ti.bytes  > file_bytes_ - data_off_ - ti.offset) {
             RAD_ERR("gguf: %s: tensor '%s' (%llu bytes at +%llu) leaves the file",
                     path_.c_str(), ti.name.c_str(),
                     (unsigned long long)ti.bytes, (unsigned long long)ti.offset);
-            close();
-            return RAD_E_FORMAT;
+            return fail();
         }
     }
 

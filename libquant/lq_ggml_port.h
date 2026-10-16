@@ -17,11 +17,11 @@
  * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  *
- * ===================================================================== WHAT THIS IS
+ * ===================================================================== Overview
  *
  * The block layouts, value tables and quantisation searches of llama.cpp's ggml library at commit
- * 06938ac12, taken over so that the `ggml` quantiser (lq_ggml.cpp) chooses exactly the codes and
- * scales llama.cpp would for the same weight and the same imatrix:
+ * 06938ac12, so that the `ggml` quantiser (lq_ggml.cpp) chooses the same codes and scales as
+ * llama.cpp for the same weight and imatrix:
  *
  *   ggml/src/ggml-common.h   the block structs below, and the tables in lq_ggml_tables.cpp:
  *                            kmask_iq2xs, ksigns_iq2xs, iq2xxs_grid, iq2xs_grid, iq2s_grid,
@@ -38,26 +38,24 @@
  *   ggml/src/ggml.c          ggml_quantize_init's choice of table per type, and
  *                            ggml_quantize_requires_imatrix's list
  *
- * THE NUMERICS ARE LLAMA.CPP'S TO THE BIT: the same float operations in the same order, the same
- * f16 rounding, the same `nearest_int` magic-number round, the same qsort over the same comparators
- * -- so the bytes a quantize_<t> here writes are the bytes llama.cpp's writes, which was checked
- * against llama.cpp itself and is pinned in tests/quant_ggml_test.cpp. The port departs from the
- * original only where C++ requires it (a cast from void*), where a library inside a converter has
- * to (a failed assertion says so on stderr and aborts instead of calling ggml_abort; the Oops
- * diagnostics go to stderr, not stdout), and in the one-time table build (std::call_once in place
- * of ggml's critical section; the tables live for the life of the process and have no free).
+ * The numerics match llama.cpp bit for bit: the same float operations in the same order, the same
+ * f16 rounding, the same `nearest_int` magic-number round and the same qsort comparators, so each
+ * quantize_<t> writes the bytes llama.cpp writes (pinned in tests/quant_ggml_test.cpp). The port
+ * departs from upstream only where C++ requires it (a cast from void*), where a library inside a
+ * converter must (a failed assertion prints to stderr and aborts instead of calling ggml_abort;
+ * the Oops diagnostics go to stderr, not stdout), and in the one-time table build (std::call_once
+ * instead of ggml's critical section; the tables live for the process and are never freed).
  *
- * THE MATCH IS WITH LLAMA.CPP AS ITS OWN BUILD COMPILES ggml-quants.c: into ggml-base, with no
- * -march, so with no fused multiply-add. libquant's -ffp-contract=off holds the port there on
- * every target. A llama.cpp compiled with FMA contraction -- -march=native on x86-64, or any
- * aarch64 build, where FMA is in the base instruction set -- rounds inside the searches and writes
- * different bytes for most types.
+ * The match is with llama.cpp as its own build compiles ggml-quants.c: into ggml-base with no
+ * -march, so without fused multiply-add. libquant's -ffp-contract=off holds the port there on
+ * every target. A llama.cpp built with FMA contraction (-march=native on x86-64, or any aarch64
+ * build, where FMA is baseline) rounds inside the searches and writes different bytes for most
+ * types.
  *
- * Each quantize_<t> keeps llama.cpp's own dispatch: the legacy and K types take the _ref
- * round-to-nearest path when `quant_weights` is null and the _impl search otherwise; the I types
- * take their _impl with whatever `quant_weights` is, and three of those assert it is there
- * (ggml_quantize_requires_imatrix). `quant_weights` is the imatrix's per-column importance,
- * n_per_row of it, shared by every row.
+ * Each quantize_<t> keeps llama.cpp's dispatch: legacy and K types take the _ref round-to-nearest
+ * path when `quant_weights` is null and the _impl search otherwise; I types always take _impl,
+ * and three of them assert `quant_weights` is set (ggml_quantize_requires_imatrix).
+ * `quant_weights` is the imatrix's per-column importance, n_per_row values shared by every row.
  */
 #pragma once
 
@@ -300,9 +298,9 @@ extern const uint64_t iq1s_grid[NGRID_IQ1S];
 
 /* ================================================================== the quantisers */
 
-/* Build the search tables an I type needs -- the lattice, its index map and every off-grid
- * point's nearest neighbours -- once for the life of the process, whichever thread asks first; a
- * no-op for the other types. Every quantize_<t> below expects it to have run for its type. */
+/* Build the search tables an I type needs (the lattice, its index map and each off-grid point's
+ * nearest neighbours) once per process, on whichever thread asks first; a no-op for other types.
+ * Every quantize_<t> below requires it to have run for its type. */
 void ggml_quantize_init(enum ggml_type type);
 
 /* ggml_quantize_requires_imatrix: the types whose search has no path without `quant_weights`. */

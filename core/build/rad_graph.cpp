@@ -1,20 +1,16 @@
-/* rad_graph.cpp -- `--debug-graph` (spec §16).
+/* rad_graph.cpp -- `--debug-graph` (spec §16): the full record of what runs. Every op in declared
+ * order with its bucket table (one line per band: the resolving kernel, variant and plugin), the
+ * matched constraints, the weights it touches and the buffer it writes; then the weight manifest,
+ * buffer plan, KV groups, tuning requests and miss report.
  *
- * "It is unclear what even runs" is the complaint this project exists to answer, so this is not a
- * debug print: it is the artifact. Every op in declared order, its bucket table with one line per
- * band, the kernel and variant that resolved each band and which plugin it came from, the
- * constraints that matched, the weights it touches and the buffer it writes -- then the weight
- * manifest, the buffer plan, the KV groups, the tuning requests and the miss report.
- *
- * The bucket-table block is byte-for-byte the format in spec §2.2:
+ * The bucket-table block is exactly the format in spec §2.2:
  *
  *     gemm_w4a8_nt  N=8192 K=5120
  *         M <=   16  ->  gemm_w4a8_nt_m64        (libr4d, prio 20)
  *         M <=   64  ->  gemm_w4a8_nt_m64        (libr4d, prio 20)
  *         M <= 8192  ->  gemm_w4a8_prefill       (libr4d, prio 10)
  *
- * Everything this file adds beyond that goes on its own lines at a deeper indent, so the table
- * stays a table and stays greppable.
+ * Everything else goes on its own lines at a deeper indent, so the table stays greppable.
  */
 #include "rad_build.h"
 
@@ -29,14 +25,13 @@
 
 namespace rad {
 
-/* ordered_json, so the object reads in the order it was written -- a graph dump whose keys are
- * alphabetised is a graph dump nobody can scan. */
+/* ordered_json keeps keys in insertion order rather than alphabetical. */
 using json = nlohmann::ordered_json;
 
 namespace {
 
-/* A constraint as the kernel wrote it. constraint_why() in rad_util.cpp phrases the same thing as
- * a refusal ("M <= 16, have 8192"), which is right for the miss column and wrong here. */
+/* A constraint as the kernel wrote it. constraint_why() phrases it as a refusal
+ * ("M <= 16, have 8192") for the miss column. */
 std::string constraint_str(const RadConstraint& c) {
     switch (c.op) {
         case RAD_C_EQ:  return fmt("%s == %lld", c.key, c.ival);
@@ -48,22 +43,20 @@ std::string constraint_str(const RadConstraint& c) {
     }
 }
 
-/* "(libr4d, prio 20)" -- and the tuned point only when there was a choice to report. A kernel with no
- * declared axis has nothing to say about tuning, and printing "- (axis defaults)" for
- * every row of every table buries the ones that do (spec §15). */
+/* "(libr4d, prio 20)", plus the tuned point only for a kernel with declared axes, so rows that
+ * were tuned stand out (spec §15). */
 std::string origin(const Resolved& r) {
     const RadKernelInfo* k = r.row->info;
     if (!k || k->n_tunables <= 0) return fmt("(%s, prio %d)", r.row->plugin.c_str(),
                                              k ? k->priority : 0);
     const char* vn = r.choice.empty() ? "?" : r.choice.c_str();
-    /* Same spelling as render_band_table in core/plugin/: two dumps of one table that punctuate
-     * differently are two dumps somebody has to reconcile by eye. */
+    /* Same spelling as render_band_table in core/plugin/. */
     return fmt("(%s, prio %d, %s from %s)", r.row->plugin.c_str(), k->priority, vn,
                r.tune_source.empty() ? "axis defaults" : r.tune_source.c_str());
 }
 
-/* The left half of a band line, up to and including the arrow. Identical column positions in both
- * the ranged and the fixed case, so the two forms stack in one table. */
+/* The left half of a band line, through the arrow. Ranged and fixed forms share column positions
+ * so they stack in one table. */
 std::string band_prefix(const OpInfo& o, const Band& b) {
     if (o.ranged_key.empty()) return "    always     ->  ";
     if (b.hi == LLONG_MAX)    return fmt("    %s <=  any  ->  ", o.ranged_key.c_str());
@@ -82,8 +75,7 @@ void dump_bucket_table(std::string& s, const OpInfo& o, int d) {
             s += band_prefix(o, b) + fmt("%-24s", r.row->info ? r.row->info->name : "?")
                + origin(r) + "\n";
         } else {
-            /* The missing-kernel report is per band. A range with a hole in it is reported as that
-             * band, not as the whole op (spec §2.2). */
+            /* Misses are reported per band, not per op (spec §2.2). */
             s += band_prefix(o, b) + fmt("%-24s", "(nothing)")
                + "-- " + (b.miss[d].empty() ? "no kernel matched" : b.miss[d]) + "\n";
         }
@@ -91,8 +83,7 @@ void dump_bucket_table(std::string& s, const OpInfo& o, int d) {
 }
 
 void dump_matched(std::string& s, const OpInfo& o, int d) {
-    /* One line per distinct kernel rather than per band: sixty-four layers and three bands sharing
-     * one kernel is one fact, not a hundred and ninety-two. */
+    /* One line per distinct kernel, not per band. */
     std::vector<const RadKernelInfo*> seen;
     for (const Band& b : o.bands) {
         const Resolved& r = b.dom[d];
@@ -110,19 +101,12 @@ void dump_matched(std::string& s, const OpInfo& o, int d) {
     }
 }
 
-/* Append a table row with the trailing columns trimmed. The tier and site columns are empty at
- * declare -- the planner fills them -- and a line of trailing spaces is a diff nobody wants to
- * read twice. */
+/* Append a table row with trailing spaces trimmed; the tier and site columns are empty at declare
+ * (the planner fills them). */
 void append_row(std::string& s, std::string row) {
     while (!row.empty() && row.back() == ' ') row.pop_back();
     s += row;
     s += '\n';
-}
-
-std::string join_names(const std::vector<std::string>& v) {
-    std::string s;
-    for (size_t i = 0; i < v.size(); ++i) { if (i) s += ", "; s += v[i]; }
-    return s;
 }
 
 }  /* namespace */
@@ -144,9 +128,8 @@ std::string dump_graph_str(const Program& p, const std::vector<std::string>* err
         if (!params.empty()) { s += "  "; s += params; }
         s += "\n";
 
-        /* Device first and unlabelled, which is the §2.2 form. A host-only kernel set -- which is
-         * the primary development target here, not a fallback -- gets its table labelled instead
-         * of a table of holes. */
+        /* Device first and unlabelled, the §2.2 form. A host-only kernel set (a primary target,
+         * not a fallback) gets a labelled host table instead of a device table of holes. */
         bool dev = domain_has_any(o, RAD_DOMAIN_DEVICE);
         bool hst = domain_has_any(o, RAD_DOMAIN_HOST);
         bool printed_device = dev || !hst;
@@ -164,25 +147,24 @@ std::string dump_graph_str(const Program& p, const std::vector<std::string>* err
             std::vector<std::string> names;
             for (rad_weight h : o.weights)
                 names.push_back(h < p.weights.size() ? p.weights[h].name : fmt("<bad handle %u>", h));
-            s += fmt("      weights  %s\n", join_names(names).c_str());
+            s += fmt("      weights  %s\n", join(names).c_str());
         }
 
-        /* The buffer this op writes, read off the plan rather than off a second bookkeeping
-         * structure: a transient whose live range begins here is one this op defines. */
+        /* Buffers this op writes, read off the plan: a transient whose live range begins here is
+         * defined by this op. */
         std::vector<std::string> defs, ends;
         const int32_t nops = (int32_t)p.ops.size() - 1;
         for (size_t bi = 1; bi < p.buffers.size(); ++bi) {
             const BufferInfo& b = p.buffers[bi];
             if (b.decl.kind != RAD_BUF_TRANSIENT) continue;
-            /* A buffer whose live range is the whole program is one nothing declared a use for.
-             * Printing it against the first and last op would be inventing a fact; the buffer plan
-             * says how many of these there are, which is the honest version. */
+            /* Whole-program liveness means no declared use; attributing it to the first and last
+             * op would be wrong. The buffer plan section counts these. */
             if (b.first_def <= 0 && b.last_use >= nops) continue;
             if (b.first_def == (int32_t)i) defs.push_back(b.name);
             else if (b.last_use == (int32_t)i) ends.push_back(b.name);
         }
-        if (!defs.empty()) s += fmt("      writes   %s\n", join_names(defs).c_str());
-        if (!ends.empty()) s += fmt("      last use %s\n", join_names(ends).c_str());
+        if (!defs.empty()) s += fmt("      writes   %s\n", join(defs).c_str());
+        if (!ends.empty()) s += fmt("      last use %s\n", join(ends).c_str());
 
         s += "\n";
     }
@@ -197,10 +179,9 @@ std::string dump_graph_str(const Program& p, const std::vector<std::string>* err
                       "layout", "tier", "site"));
     for (size_t i = 1; i < p.weights.size(); ++i) {
         const WeightInfo& w = p.weights[i];
-        /* `layout` is what the resolved kernel asked its weights be stored as, and it is why the
-         * stored bytes may differ from the logical ones. tier and site are left blank on purpose:
-         * the planner fills them, after declare and before load, and printing a default here would
-         * read as a decision nobody made. */
+        /* `layout` is the storage form the resolved kernel asked for, which is why stored bytes may
+         * differ from logical ones. tier and site stay blank: the planner fills them after
+         * declare, and a default would read as a decision. */
         append_row(s, fmt("  %-40s %12s %6lld  %-12s %6d %7d %6d %6d  %-16s %-5s %-5s",
                           w.name.c_str(), humanb(w.stored_bytes).c_str(), (long long)w.align,
                           bld_access_name(w.decl.access), w.decl.group.layer, w.decl.group.expert,
@@ -238,8 +219,7 @@ std::string dump_graph_str(const Program& p, const std::vector<std::string>* err
              humanb(p.arena_bytes - persist).c_str(), humanb(sum).c_str(),
              humanb(peak).c_str(), humanb(p.arena_bytes - persist - peak).c_str());
     s += fmt("  persist     %12s\n", humanb(persist).c_str());
-    /* Two arenas, coloured separately: a host-site activation cannot index device memory, so each
-     * domain gets its own offset space and its own high-water mark. */
+    /* Two arenas, coloured separately (see plan_buffers). */
     if (p.host_arena_bytes)
         s += fmt("  host arena  %12s   (its own offset space and its own base pointer)\n",
                  humanb(p.host_arena_bytes).c_str());
@@ -308,18 +288,10 @@ std::string dump_graph_str(const Program& p, const std::vector<std::string>* err
 
     /* ---------------------------------------------------------------- fusions (spec §2.3)
      *
-     * WHICH OF THIS PROGRAM'S LAUNCHES ARE STANDING IN FOR SEVERAL OPS, AND WHAT ARE THEY.
-     *
-     * spec.md:19 lists "fusion coverage" as one of the seven patch classes this engine exists to
-     * answer, and its answer is "fused ops are ops you can select on" -- a claim that needs a
-     * number behind it, which is this section. A kernel that declares `replaces` is a kernel
-     * saying, in data rather than in prose, which conventional chain it computes. That is what
-     * makes it substitutable, it is what rad-check checks it against, and it is what this prints.
-     *
-     * Read this as coverage, not as advice to act on: an op with no fusion is not a defect, and a
-     * fusion that did not fire is usually banded on purpose. What the section is for is answering
-     * "what actually ran" without reading the kernel source, which is the complaint the whole
-     * graph dump exists to answer. */
+     * Launches that stand in for several ops. A kernel with `replaces` declares, as data, the
+     * conventional chain it computes; rad-check checks it against that chain. This section is
+     * coverage, not advice: an op with no fusion is not a defect, and a fusion that did not fire
+     * is usually banded on purpose. */
     {
         std::vector<std::string> lines;
         int n_fused = 0, n_ops_replaced = 0;
@@ -329,20 +301,15 @@ std::string dump_graph_str(const Program& p, const std::vector<std::string>* err
                 for (int d = 0; d < RAD_N_DOMAINS; ++d) {
                     const Resolved& r = o.bands[b].dom[d];
                     if (!r || !r.row || !r.row->info || !r.row->info->replaces) continue;
-                    /* Walk the chain the kernel names. The hook reports its own length by
-                     * declining the step past the end, so there is no count to disagree with it. */
+                    /* Walk the chain; the hook ends it by declining the step past the end. */
                     std::string chain;
                     int n_step = 0;
                     for (int step = 0; step < RAD_MAX_FUSE_OPD; ++step) {
                         RadFuseStep fs{};
-                        /* RAD_FUSE_PRESENT_ALL, and it is the honest answer here rather than a
-                         * shortcut. A declared graph records which OPS were declared and at what
-                         * geometry; it does not record which optional operands each issue passes,
-                         * because that is a property of a step and this dump is a property of the
-                         * program. So the kernel is asked to describe the chain for the operand set
-                         * its own description publishes, which is exactly what the constant means,
-                         * and the row below is read as "what this kernel stands in for" rather than
-                         * as "what ran on the last token". */
+                        /* RAD_FUSE_PRESENT_ALL: the declared graph records ops and geometry, not
+                         * which optional operands a given issue passes (a per-step property). So
+                         * the row means "what this kernel stands in for", described for the operand
+                         * set the kernel publishes, not "what ran on the last token". */
                         const int st = r.row->info->replaces(r.geom.params(), r.geom.n_params(),
                                                              RAD_FUSE_PRESENT_ALL,
                                                              step, &fs);
@@ -403,30 +370,22 @@ void dump_graph(const Program& p, FILE* out, const std::vector<std::string>* err
     fflush(out ? out : stderr);
 }
 
-
 /* ================================================================== the graph, as JSON
  *
- * The same content as dump_graph_str and then some, for the server's Model view. NOT a second
- * source of truth: both walk the same Program and both call origin()/constraint_str()/the fuse
- * hook, so a kernel that reads one way in the text dump cannot read another way in the browser.
+ * dump_graph_str's content and more, for the server's Model view. It walks the same Program with
+ * the same helpers (origin, constraint_str, the fuse hook), so the two views cannot disagree.
  *
- * WHY IT CARRIES MORE THAN THE TEXT DUMP. A text dump is read top to bottom and every extra
- * column costs every reader; a view with a selection has somewhere to put the detail that only
- * matters once you have pointed at something. So the flow carries the shape and the panel carries
- * everything the core knows about ONE op: what the op means (its schema doc and its operands),
- * what geometry it was declared at, which kernel won each band AND WHICH ONES LOST AND WHY, what
- * that kernel says about itself, what it stands in for, which weights it reads at what size and
- * layout, and which buffers begin and end their lives at it.
+ * The extra detail lives in the per-op panel: the schema doc and operands, declared geometry,
+ * each band's winner and the candidates that lost with their reasons, the kernel's own
+ * description, what it stands in for, the weights read (size, layout) and the buffers whose lives
+ * begin and end at the op.
  *
- * GROUPED BY (op, band table). A 64-layer model declares the same op with the same bucket table
- * sixty-four times, and sixty-four identical rows is not more information than one row saying
- * "x64" -- it is the same information, spread over enough screen that nobody reads it. The
- * grouping key is what a reader would compare by eye: the op name and every band's resolution.
- * The per-occurrence facts (which weights, which buffers, which op index) are those of the FIRST
- * declaration in the group and are labelled as such in the page. */
+ * Ops are grouped by (op name, every band's resolution), so a per-layer op is one entry with a
+ * count. Per-occurrence facts (weights, buffers, op index) are the first declaration's, and the
+ * page labels them so. */
 
-/* A RadFuseStep's own geometry, which is NOT the fused op's -- `qk_norm_rope_gate` replaces an
- * rmsnorm at M = T * n_head, and nothing in the fused op's parameter list is that product. */
+/* A RadFuseStep's own geometry, which differs from the fused op's: `qk_norm_rope_gate` replaces
+ * an rmsnorm at M = T * n_head, a product absent from the fused op's parameters. */
 static std::string params_str(const RadParam* p, int n) {
     std::string s;
     for (int i = 0; i < n; ++i) {
@@ -443,18 +402,14 @@ static std::string params_str(const RadParam* p, int n) {
     return s;
 }
 
-/* The chain this kernel declares it computes, WITH each step's geometry. The names alone are the
- * advisory; the geometries are what make it checkable, and they are the part a reader cannot
- * derive. */
+/* The chain this kernel declares it computes, with each step's geometry, which makes the claim
+ * checkable and which a reader cannot derive. */
 static json fuse_steps(const Resolved& r) {
     json out = json::array();
     if (!r || !r.row || !r.row->info || !r.row->info->replaces) return out;
     for (int step = 0; step < RAD_MAX_FUSE_OPD; ++step) {
         RadFuseStep fs{};
-        /* RAD_FUSE_PRESENT_ALL -- see the long note at the same call in dump_graph_str: a declared
-         * graph records which ops were declared and at what geometry, not which optional operands
-         * each issue passes, so the kernel is asked to describe the chain for the operand set its
-         * own description publishes. */
+        /* RAD_FUSE_PRESENT_ALL: see the same call in dump_graph_str. */
         if (r.row->info->replaces(r.geom.params(), r.geom.n_params(),
                                   RAD_FUSE_PRESENT_ALL, step, &fs) != RAD_OK) break;
         if (!fs.op) break;
@@ -467,11 +422,9 @@ static json fuse_steps(const Resolved& r) {
     return out;
 }
 
-/* WHAT THIS KERNEL CAN DESCRIBE ABOUT ITSELF. Every one of these is an optional ABI hook, and
- * which of them a row supplies decides what the tools around it can do: no `opd_shape` and
- * rad-check skips the row by name, no `unrelayout` and a dense oracle has nothing to compare
- * against, no `replaces` and a fusion's claim stays prose. A reader asking "why does rad-check
- * skip this" is asking exactly this list. */
+/* The optional ABI hooks a kernel supplies, which decide what the tools can do with it: without
+ * `opd_shape` rad-check skips the row, without `unrelayout` a dense oracle has nothing to compare,
+ * without `replaces` a fusion is unchecked. */
 static json kernel_hooks(const RadKernelInfo* k) {
     json h = json::array();
     if (k->init)       h.push_back("init");
@@ -493,8 +446,7 @@ static json resolved_json(const Resolved& r) {
     j["priority"] = k->priority;
     j["geometry"] = r.geom.str();
     j["domain"]   = bld_domain_name(k->domain);
-    /* The kernel's own prose. It is written by the person who wrote the kernel and it is the only
-     * sentence in this whole structure that a reader does not have to reconstruct. */
+    /* The kernel author's own description. */
     if (k->family   && *k->family)   j["family"]   = k->family;
     if (k->computes && *k->computes) j["computes"] = k->computes;
     if (k->shape    && *k->shape)    j["shape"]    = k->shape;
@@ -503,11 +455,8 @@ static json resolved_json(const Resolved& r) {
     if (k->n_tunables > 0) {
         j["tuned"]        = r.choice;
         j["tuned_source"] = r.tune_source.empty() ? "axis defaults" : r.tune_source;
-        /* EVERY AXIS AND ITS WHOLE RANGE, not just what was chosen: "this kernel has these axes,
-           the tuner timed the legal points of them and picked these" is the sentence rad-tune
-           exists to produce, and the ranges are what make it one. It is also how a reader sees
-           that an axis HAS no alternatives at this shape, which is the difference between a tuned
-           choice and a forced one. */
+        /* Every axis with its full range, not just the choice, so a reader can tell a tuned
+           choice from a forced one (an axis with no alternatives at this shape). */
         json ax = json::array();
         int64_t space = 1;
         for (int i = 0; i < k->n_tunables; ++i) {
@@ -525,10 +474,8 @@ static json resolved_json(const Resolved& r) {
         j["tunables"]   = std::move(ax);
         j["tune_space"] = space;
     }
-    /* WHY THIS KERNEL: the constraints it declares, which are exactly what selection matched it
-     * on. A reader asking "why did this one win" is asking three things -- what it demanded, who
-     * else wanted the row, and what beat them -- and the first is here, the second is in the
-     * band's `considered`, and the third is `priority`. */
+    /* The kernel's declared constraints, which selection matched it on. With the band's
+     * `considered` list and `priority`, they explain why it won. */
     json cons = json::array();
     for (int i = 0; i < k->n_constraints; ++i) cons.push_back(constraint_str(k->constraints[i]));
     j["constraints"] = std::move(cons);
@@ -543,20 +490,11 @@ static json resolved_json(const Resolved& r) {
     return j;
 }
 
-/* WHO ELSE WANTED THIS BAND, AND WHAT REFUSED THEM.
- *
- * The selector already builds this list -- SelectionTrace::candidates carries every row it walked
- * with the constraint that turned it away -- and build_bands keeps only the miss reason out of it.
- * Recovering it here is what makes selection legible: "gemm_nt_q M <= 64 went to
- * r4d_gemm_fp8_narrow, and r4d_gemm_fp8_tiled wanted it too and lost on priority, and the ref row
- * lost on the domain" is the whole of selection in one table.
- *
- * Recomputed rather than stored. Keeping the candidates on every Band would hold a few megabytes
- * of strings for the life of the process to answer a question nobody asks until they open a
- * browser; asking the selector again costs one pass over one op's rows, once per DISTINCT band
- * table -- which on a 64-layer model is tens of tables, not one per declared op. `record = false`
- * so the selection table's "asked" counts stay a record of what the engine asked for, not of what
- * the graph dump asked on its behalf. */
+/* Every candidate for this band and what refused it (SelectionTrace::candidates; build_bands keeps
+ * only the miss reason). Recomputed rather than stored on every Band, which would hold megabytes of
+ * strings for the process lifetime; the cost is one pass over one op's rows per distinct band
+ * table. `record = false` keeps the selection table's "asked" counts to the engine's own
+ * queries. */
 static json considered_json(Registry& reg, const OpInfo& o, const Band& b, int dom) {
     Geometry q = o.base;
     if (!o.ranged_key.empty()) q.set_i(o.ranged_key, b.hi == INT64_MAX ? o.range_hi : b.hi);
@@ -576,9 +514,8 @@ static json considered_json(Registry& reg, const OpInfo& o, const Band& b, int d
     return out;
 }
 
-/* WHAT THE OP MEANS, from the schema the plugin hierarchy agreed on. The operand list is the part
- * that pays: `RadArgs.t` is positional, and a reader looking at a fused kernel's `from` wiring
- * has no way to know which slot is which without it. */
+/* The op's schema. The operand list matters most: `RadArgs.t` is positional, so it is the only
+ * way to read a fused kernel's `from` wiring. */
 static json schema_json(const RadOpSchema* s) {
     if (!s) return nullptr;
     json j;
@@ -614,9 +551,8 @@ static std::string shape_str(const int64_t* dims, uint32_t rank) {
     return s;
 }
 
-/* The weights ONE declaration of this op reads, with the two facts a reader is actually after:
- * how big it is where it lives, and what layout the winning kernel demanded -- which is why the
- * stored bytes may not be the logical ones. */
+/* A weight one declaration of this op reads: its stored size, and the layout the winning kernel
+ * demanded (why stored bytes may differ from logical ones). */
 static json weight_json(const WeightInfo& w) {
     json j;
     j["name"]    = w.name;
@@ -663,9 +599,7 @@ std::string dump_graph_json(const Program& p) {
     counts["scratch_bytes"]    = p.scratch_bytes;
     root["counts"] = std::move(counts);
 
-    /* THE PLUGIN HIERARCHY, which is the answer to "where did this kernel come from" one level up
-     * from the kernel row: an override is a plugin ahead of the default in this list, and a reader
-     * who sees `libref` winning a row wants to know what was ahead of it. */
+    /* The plugin hierarchy: an override is a plugin ahead of the default in this list. */
     json plugs = json::array();
     for (const Plugin& pl : reg.plugins()) {
         json j;
@@ -704,9 +638,8 @@ std::string dump_graph_json(const Program& p) {
                 if (!rj.is_null()) jb[dn] = std::move(rj);
                 else if (!b.miss[d].empty())  jb[std::string(dn) + "_miss"] = b.miss[d];
             }
-            /* The grouping key is formed BEFORE the candidate lists go on, so two declarations
-             * that resolved identically stay one group: `considered` is a function of the op and
-             * the band, so it cannot differ between them, and hashing it would only cost. */
+            /* The grouping key is formed before the candidate lists are added: `considered`
+             * depends only on op and band, so hashing it would add cost and nothing else. */
             key += "|" + jb.dump();
             for (int d = 0; d < RAD_N_DOMAINS; ++d)
                 jb[std::string(bld_domain_name(d)) + "_considered"] =
@@ -731,11 +664,8 @@ std::string dump_graph_json(const Program& p) {
             if (w && w < p.weights.size()) ws.push_back(weight_json(p.weights[w]));
         j["weights"] = std::move(ws);
 
-        /* THE BUFFERS THIS OP BEGINS AND ENDS. Read off the plan rather than off a second
-         * bookkeeping structure, exactly as the text dump does: a transient whose live range
-         * begins here is one this op defines, and one whose range ends here is storage the arena
-         * hands to something else after it. A buffer live for the whole program is one nothing
-         * declared a use for, and pinning it on the first op would be inventing a fact. */
+        /* Buffers whose lives begin or end at this op, read off the plan as in the text dump.
+         * Whole-program buffers (no declared use) are skipped. */
         json writes = json::array(), frees = json::array();
         for (size_t bi = 1; bi < p.buffers.size(); ++bi) {
             const BufferInfo& bf = p.buffers[bi];
@@ -767,10 +697,8 @@ std::string dump_graph_json(const Program& p) {
         ops.push_back(std::move(j));
     }
 
-    /* THE DECLARED ORDER, as an index into `ops`. The groups above collapse the sixty-four copies
-     * of a layer into one entry; a DIAGRAM needs the sequence back, and the sequence is what the
-     * grouping threw away. One small integer per declared op -- six kilobytes against the two
-     * megabytes that emitting every op in full would cost. */
+    /* The declared order as indices into `ops`, which the grouping dropped and the diagram needs.
+     * One small integer per declared op, far smaller than emitting every op in full. */
     json ord = json::array();
     std::vector<int> first_at((size_t)ops.size(), -1), last_at((size_t)ops.size(), -1);
     for (size_t k = 0; k < seq.size(); ++k) {
@@ -779,8 +707,7 @@ std::string dump_graph_json(const Program& p) {
         if (first_at[(size_t)gi] < 0) first_at[(size_t)gi] = (int)k;
         last_at[(size_t)gi] = (int)k;
     }
-    /* Where in the flow this group's declarations sit -- one op index is a group of sixty-four
-     * telling the reader about its first copy only, and the pair says so. */
+    /* First and last position of the group's declarations in the flow. */
     for (size_t k = 0; k < ops.size(); ++k) {
         ops[k]["first_at"] = first_at[k];
         ops[k]["last_at"]  = last_at[k];

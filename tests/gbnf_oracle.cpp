@@ -1,11 +1,9 @@
 /* gbnf_oracle.cpp -- upstream's candidate walk (llama.cpp `llama_grammar_reject_candidates` and
  * `llama_grammar_apply_impl`, at the commit gbnf.h names), over the engine's own stack machinery.
- * See gbnf_oracle.h for why it exists and where it may be used.
+ * See gbnf_oracle.h.
  *
- * The closure, the character tests and the UTF-8 decoding are the engine's (gbnf_internal.h),
- * because they are the PARSE and this is a second implementation of the MASK: the thing under
- * test is how a mask is assembled from a stack set, and sharing everything below that is what
- * makes a disagreement mean a defect in the assembly.
+ * The closure, character tests and UTF-8 decoding are the engine's (gbnf_internal.h). Only mask
+ * assembly from a stack set is reimplemented, so a disagreement points at that assembly.
  */
 #include "gbnf_oracle.h"
 
@@ -28,8 +26,8 @@ struct Candidate {
 };
 using Candidates = std::vector<Candidate>;
 
-/* What carrying one candidate through one element of a character range costs, against the same
- * per-operation bound the engine is held to. */
+/* Work charged per candidate per character-range element, against the engine's per-operation
+ * bound. */
 constexpr uint64_t kCandidateCost = 4;
 
 Candidates reject_for_stack(const GbnfRuleSet& rules, const GbnfStack& stack,
@@ -108,8 +106,8 @@ int oracle_impl(const GbnfGrammar& g, uint32_t* bitmask, int64_t n_words, uint64
     const int32_t      n_tok = vocab.n_tokens();
     const bool         allow_eog = g.complete();
 
-    /* Decode every piece against the carried partial, then run the whole vocabulary through the
-     * reject walk in one pass: every candidate admitted, then the rejects cleared. */
+    /* Decode every piece against the carried partial, admit every candidate, then clear the
+     * rejects of one reject walk over the whole vocabulary. */
     std::vector<std::pair<std::vector<uint32_t>, PartialUtf8>> decoded;
     decoded.reserve((size_t)n_tok);
     Candidates cands;
@@ -124,16 +122,9 @@ int oracle_impl(const GbnfGrammar& g, uint32_t* bitmask, int64_t n_words, uint64
         }
         const std::string& piece = vocab.token_piece(id);
         if (piece.empty() || piece[0] == 0) continue;
-        decoded.push_back(decode_utf8(piece, g.partial()));
-    }
-    size_t k = 0;
-    for (int32_t id = 0; id < n_tok; ++id) {
-        if (vocab.is_eog(id)) continue;
-        const std::string& piece = vocab.token_piece(id);
-        if (piece.empty() || piece[0] == 0) continue;
-        cands.push_back({ index_to_id.size(), decoded[k].first.data(), decoded[k].second, id });
+        const auto& d = decoded.emplace_back(decode_utf8(piece, g.partial()));
+        cands.push_back({ index_to_id.size(), d.first.data(), d.second, id });
         index_to_id.push_back(id);
-        ++k;
     }
 
     for (int32_t id : index_to_id) bitmask[id >> 5] |= 1u << ((uint32_t)id & 31u);

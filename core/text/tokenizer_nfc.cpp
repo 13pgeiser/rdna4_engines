@@ -11,25 +11,25 @@ namespace {
 
 /* NFC, applied only where it can change something.
  *
- * UAX #15's quick check: a codepoint whose NFC_QC is Yes and whose combining class is 0 is a
- * BOUNDARY -- nothing before it can compose with it or reorder across it, and nothing it becomes
- * can reach back past it -- so normalising the text between two boundaries on its own gives exactly
- * the bytes normalising the whole text gives there. The text is scanned for the codepoints that
- * are not boundaries (NFC_QC No or Maybe, a mark out of canonical order, anything not strictly
- * well-formed), and only the stretch from the boundary before each one to the boundary after it
- * goes through unorm_utf8; everything else is already NFC and is copied. The properties are
- * derived from the same tables unorm_utf8 runs on -- "No" is a codepoint NFC does not leave alone
- * by itself, "Maybe" is one that can compose with what precedes it -- so the scan agrees with that
- * implementation rather than with some other one. Invalid bytes are never at a boundary, so the
- * decoder's replacement of them happens inside a normalised stretch, byte for byte as it does when
- * the whole text is normalised. */
+ * UAX #15 quick check: a codepoint with NFC_QC Yes and combining class 0 is a boundary. Nothing
+ * before it can compose with it or reorder across it, and nothing it becomes reaches back past
+ * it, so normalising the text between two boundaries alone gives the same bytes as normalising
+ * the whole text. The scan finds the non-boundary codepoints (NFC_QC No or Maybe, a mark out of
+ * canonical order, ill-formed UTF-8) and runs unorm_utf8 only from the boundary before each one
+ * to the boundary after it; the rest is copied. The properties are derived from the tables
+ * unorm_utf8 uses ("No": NFC changes the codepoint on its own; "Maybe": it can compose with what
+ * precedes it), so the scan agrees with that implementation. Invalid bytes are never boundaries,
+ * so their replacement happens inside a normalised stretch, exactly as for the whole text. */
 class NfcQuick {
 public:
     NfcQuick() : not_yes_(kWords, 0), marked_(kWords, 0) {
         for (size_t i = 0; i < k_decomp_rows_n; ++i) {
             const DecompRow& r = k_decomp_rows[i];
             if (r.len_c == 0) continue;
-            if (unorm_nfc({ r.cpt }) != std::vector<uint32_t>{ r.cpt }) set(not_yes_, r.cpt);
+            std::vector<uint32_t> v{ r.cpt };
+            unorm_decompose(v, false);
+            unorm_compose(v);
+            if (v != std::vector<uint32_t>{ r.cpt }) set(not_yes_, r.cpt);
         }
         for (size_t i = 0; i < k_compose_n; ++i) set(not_yes_, k_compose[i].b);
         for (uint32_t c = 0x1161; c <= 0x1175; ++c) set(not_yes_, c);   /* Hangul V, composes after L */

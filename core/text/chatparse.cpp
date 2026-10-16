@@ -1,14 +1,15 @@
 #include "text/chatparse.h"
 #include "text/chatfmt.h"
 
-/* Bind time only: the schema resolution that decides which arguments are strings. The same
- * function the grammar generator uses, so the parser and the grammar never disagree about a
- * type. Nothing from vendor/ runs while a reply is being read. */
+/* Bind time only: the schema resolution that decides which arguments are strings. The grammar
+ * generator uses the same function, so parser and grammar agree on every type. Nothing from
+ * vendor/ runs while a reply is read. */
 #include "llama/common/json-schema-to-grammar.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <deque>
 #include <set>
@@ -29,15 +30,14 @@ inline bool is_blank(unsigned char c) { return c == ' ' || c == '\n' || c == '\r
 
 /* ================================================================== delimiter automaton
  *
- * A deterministic Aho-Corasick automaton over a handful of delimiters. The state is the longest
- * suffix of the text scanned so far that is a prefix of some delimiter, so its depth is exactly
- * how many trailing bytes might still become one -- the bytes a streaming scan must hold -- and a
- * state whose string IS a delimiter is a match.
+ * A deterministic Aho-Corasick automaton over a few delimiters. The state is the longest suffix
+ * of the scanned text that is a prefix of some delimiter, so its depth is the number of trailing
+ * bytes a streaming scan must hold, and a state whose string is a delimiter is a match.
  *
- * That last step is exact only because chat_format_check refuses delimiter sets in which one
- * delimiter occurs inside another at a non-zero offset. Then a match ends at the first byte where
- * any delimiter completes, and no earlier-starting match can still be in progress: the automaton
- * reports matches in the order of their START, which is the order the grammar reads them in. */
+ * Reporting matches this way is exact only because chat_format_check refuses delimiter sets in
+ * which one delimiter occurs inside another at a non-zero offset. A match then ends at the first
+ * byte where any delimiter completes with no earlier-starting match in progress, so matches come
+ * out in start order, the order the grammar reads them. */
 class Dfa {
 public:
     void build(const std::vector<std::string>& pats) {
@@ -132,19 +132,18 @@ private:
  * format's grammar accepts as a JSON-typed argument, quirks included, because the answer decides
  * whether the argument is typed or text:
  *
- *   * no whitespace before the value, any whitespace after it and inside it;
- *   * a number may not be followed by a character that could have continued it -- `01`, `1.`,
- *     `1-` are not numbers -- while `true` and `null` may be followed by anything;
- *   * a raw control character fails a string, as the schema's string rule refuses one and JSON
- *     has none: a client's JSON parser rejects a raw newline in a string. Any escape but the
- *     JSON ones fails it too.
+ *   * no whitespace before the value, any whitespace after and inside it;
+ *   * a number may not be followed by a character that could have continued it (`01`, `1.`, `1-`
+ *     are not numbers), while `true` and `null` may be followed by anything;
+ *   * a raw control character or a non-JSON escape fails a string, as the schema's string rule
+ *     does (a client's JSON parser rejects a raw newline in a string).
  *
- * A value accepted here is still checked whole by a JSON parser before it is written as JSON
- * (json_value_done): the grammar admits a few spellings a client cannot read.
+ * An accepted value is still checked whole by a JSON parser before it is written as JSON
+ * (json_value_done), since the grammar admits a few spellings a client cannot read.
  *
- * push() answers More while the bytes are still a JSON value or its trailing whitespace, Fail at
- * the first byte that cannot be, and Done at the first byte after a complete value -- which is
- * NOT consumed. */
+ * push() returns More while the bytes are still a JSON value or its trailing whitespace, Fail at
+ * the first byte that cannot be, and Done at the first byte after a complete value, which is not
+ * consumed. */
 class JsonScan {
 public:
     enum Res : uint8_t { More, Fail, Done };
@@ -305,8 +304,8 @@ private:
 /* ================================================================== JSON text helpers */
 
 /* A string's JSON encoding without its quotes, byte for byte what nlohmann::json::dump writes:
- * the two-character escapes where JSON has one, \u00XX in lower-case hex for the other control
- * characters, and everything else -- DEL and UTF-8 included -- verbatim. */
+ * two-character escapes where JSON has one, \u00XX in lower-case hex for other control
+ * characters, and everything else (DEL and UTF-8 included) verbatim. */
 void json_escape_into(std::string& out, const char* p, size_t n) {
     static const char hex[] = "0123456789abcdef";
     const char* run = p;
@@ -340,8 +339,8 @@ std::string json_quote(std::string_view s) {
     return out;
 }
 
-/* How many trailing bytes of `s` from `from` on form an unfinished UTF-8 sequence. A delta
- * becomes a JSON string on the wire, and half a code point there is a malformed payload. */
+/* How many trailing bytes of `s` (from `from` on) form an unfinished UTF-8 sequence. A delta
+ * becomes a JSON string on the wire, where half a code point is malformed. */
 size_t utf8_tail(const std::string& s, size_t from) {
     const size_t n = s.size();
     for (size_t back = 1; back <= 3 && back <= n - from; ++back) {
@@ -356,8 +355,8 @@ size_t utf8_tail(const std::string& s, size_t from) {
     return 0;
 }
 
-/* The value transforms the format's grammar applies, on a whole value. Used for values short
- * enough to be held entire and for the held ends of long ones. */
+/* The grammar's value transforms, on a whole value: used for values short enough to hold entire
+ * and for the held ends of long ones. */
 std::string_view strip_leading_newline(std::string_view v) {
     if (!v.empty() && v.front() == '\n') v.remove_prefix(1);
     else if (v.size() >= 2 && v[0] == '\r' && v[1] == '\n') v.remove_prefix(2);
@@ -378,16 +377,10 @@ constexpr std::string_view kCdClose = "]]>";
 constexpr std::string_view kFenceOpen  = "```json";
 constexpr std::string_view kFenceClose = "```";
 
-/* A CDATA section is punctuation, not content, and its two ends are stripped independently. A
- * value still arriving holds back what could yet become the opener, and a trailing `]` or `]]`
- * that could be the start of the closer. */
-void unwrap_cdata(std::string_view& v, bool partial) {
-    if (v.size() < kCdOpen.size()) {
-        if (partial && !v.empty() && kCdOpen.compare(0, v.size(), v) == 0) v = std::string_view();
-        return;
-    }
-    if (v.compare(0, kCdOpen.size(), kCdOpen) != 0) return;
-    v.remove_prefix(kCdOpen.size());
+/* A CDATA section is punctuation, not content; its two ends are stripped independently. A value
+ * still arriving holds back what could become the opener, and a trailing `]` or `]]` that could
+ * start the closer. */
+void strip_cdata_close(std::string_view& v, bool partial) {
     if (v.size() >= kCdClose.size() &&
         v.compare(v.size() - kCdClose.size(), kCdClose.size(), kCdClose) == 0) {
         v.remove_suffix(kCdClose.size());
@@ -399,8 +392,18 @@ void unwrap_cdata(std::string_view& v, bool partial) {
     v.remove_suffix(hold);
 }
 
-/* The name of an argument, as the grammar reads it: one leading whitespace character and every
- * trailing one are not part of it. */
+void unwrap_cdata(std::string_view& v, bool partial) {
+    if (v.size() < kCdOpen.size()) {
+        if (partial && !v.empty() && kCdOpen.compare(0, v.size(), v) == 0) v = std::string_view();
+        return;
+    }
+    if (v.compare(0, kCdOpen.size(), kCdOpen) != 0) return;
+    v.remove_prefix(kCdOpen.size());
+    strip_cdata_close(v, partial);
+}
+
+/* An argument name as the grammar reads it: without one leading whitespace character and all
+ * trailing ones. */
 std::string_view trim_arg_name(std::string_view v) {
     if (!v.empty() && is_ws((unsigned char)v.front())) v.remove_prefix(1);
     while (!v.empty() && is_ws((unsigned char)v.back())) v.remove_suffix(1);
@@ -414,28 +417,28 @@ std::string_view trim_trailing_ws(std::string_view v) {
 
 /* ================================================================== an argument value
  *
- * The bytes of one value as the delimiters bound it, turned into its JSON encoding in the
- * arguments object. Two encodings: a STRING (quoted, escaped) and RAW JSON text, which is either
- * a value that parsed as JSON or a non-string argument that did not.
+ * One value's bytes, as the delimiters bound them, turned into its JSON encoding in the arguments
+ * object: a string (quoted, escaped), or raw JSON text (a value that parsed as JSON, or a
+ * non-string argument that did not).
  *
- * A NON-STRING ARGUMENT THAT DID NOT PARSE IS MADE JSON, never passed through: the arguments
- * object is the one thing a client parses, and a single bare token in it makes the whole call
- * unreadable -- the server then cannot report it as a call at all. The grammar admits text for a
- * typed argument, and what these models write there is Python: `True`, `False`, `None`, and
- * single-quoted containers. A scalar is held while it could still be a Python literal -- `True`
- * as true, `False`, `None` as null -- or a JSON number or literal, up to kScalar bytes, and is
- * then written as that; anything else, or anything longer, streams as a JSON string of its text.
- * An empty one is null. A CONTAINER -- its first byte after at most a few blanks is `[` or `{` --
- * is held whole, because whether it is JSON once its quotes are normalised to double ones and its
- * Python literals to JSON's is known only at its end: a trailing comma, a bare word, an escape
- * JSON has not or a missing bracket each leave it no JSON, and then it is a JSON string of its
- * text. A value the reply was cut off inside is written as it arrived: it has no end to read it
- * to, and the call it is in is not complete. A value the JSON reader ACCEPTED (json_value_done)
- * is written as it is.
+ * A non-string argument that did not parse is converted to JSON, never passed through: one bare
+ * token makes the client's arguments object unparseable, and the call cannot be reported at all.
+ * The grammar admits text for a typed argument, and models write Python there: `True`, `False`,
+ * `None` and single-quoted containers.
  *
- * The transforms touch only the ends of a value -- one newline at each end, the CDATA opener and
- * closer -- so the middle streams straight through and only a short head and tail are held: the
- * first kHead bytes until the head is decided, and the last kTail after that. */
+ *   * Scalar: held while it could still be a Python literal (`True` as true, `False`, `None` as
+ *     null) or a JSON number or literal, up to kScalar bytes, then written as that. Anything
+ *     else, or longer, streams as a JSON string of its text. An empty value is null.
+ *   * Container (first byte after at most four blanks is `[` or `{`): held whole, because only at
+ *     its end is it known whether it is JSON once its quotes and Python literals are normalised.
+ *     If it is not, it becomes a JSON string of its text.
+ *   * A value the reply was cut off inside is written as it arrived, since there is no end to
+ *     read and its call is incomplete. A value the JSON scanner accepted (json_value_done) is
+ *     written as is.
+ *
+ * The transforms touch only the ends (one newline at each end, the CDATA opener and closer), so
+ * the middle streams through and only the first kHead bytes (until the head is decided) and the
+ * last kTail are held. */
 class ValueOut {
 public:
     enum Mode : uint8_t { String, Raw };
@@ -484,18 +487,7 @@ public:
             if (cdata_) unwrap_cdata(v, partial);
         } else {
             if (trail_) v = strip_trailing_newline(v);
-            if (opened_) {
-                if (v.size() >= kCdClose.size() &&
-                    v.compare(v.size() - kCdClose.size(), kCdClose.size(), kCdClose) == 0) {
-                    v.remove_suffix(kCdClose.size());
-                } else if (partial) {
-                    size_t hold = 0;
-                    while (hold + 1 < kCdClose.size() && v.size() > hold &&
-                           v[v.size() - 1 - hold] == ']')
-                        ++hold;
-                    v.remove_suffix(hold);
-                }
-            }
+            if (opened_) strip_cdata_close(v, partial);
         }
         emit(v.data(), v.size(), out);
         if (mode_ == Raw && !json_) {
@@ -660,10 +652,10 @@ private:
 
 /* ================================================================== the answer text
  *
- * Content is trimmed at the end: trailing spaces and newlines, then one turn terminator. Trimming
- * the END of a stream means holding what might be the end -- the trailing whitespace, and a
- * terminator or the part of one that has arrived -- until something that is not whitespace
- * follows it. The terminator automaton tracks the longest suffix that could still become one. */
+ * Content is trimmed at the end: trailing spaces and newlines, then one turn terminator. On a
+ * stream that means holding the trailing whitespace and any whole or partial terminator until a
+ * non-whitespace byte follows. The terminator automaton tracks the longest suffix that could
+ * still become one. */
 class ContentOut {
 public:
     void init(const Dfa* terms, const std::vector<std::string>* list) { terms_ = terms; list_ = list; }
@@ -729,43 +721,43 @@ struct ReplyFormat::Impl {
     /* Each tag split into its core and the whitespace around it that is optional to match. */
     std::string open_core, open_trail, close_core, close_trail, ns_core, ns_trail, end_core,
                 end_trail, co_core, co_trail;
-    /* What begins a call in content. The first is the format's own opener: call_open's core, or
+    /* What begins a call in content. First the format's own opener: call_open's core, or
      * name_prefix when calls are not wrapped. A wrapped format also takes name_prefix alone,
-     * second: a model writes the call without its wrapper often enough that its calls must not
-     * be lost to it, and a wrapper written without its trailing whitespace is read too. */
+     * second, since models often write a call without its wrapper; a wrapper written without
+     * its trailing whitespace is read too. */
     std::vector<std::string> openers;
     std::string name_end;     /* what ends an argument name */
-    /* The same two, whitespace-trimmed. A loose call is one the grammar never opened, so the
-     * model wrote it unconstrained, and its argument tags are read with the whitespace around
-     * them optional -- as its name and its close are. */
+    /* The same two, whitespace-trimmed. A loose call is one the grammar never opened, so it was
+     * written unconstrained; its argument tags, like its name and close, are read with their
+     * surrounding whitespace optional. */
     std::string name_end_core, value_core;
-    /* call_close's core, when it can be told apart from what else may follow inside a call: a
-     * wrapped call whose own close is missing is ended by its wrapper's. */
+    /* call_close's core, when distinct from what else may follow inside a call, so a wrapped
+     * call missing its own close is ended by its wrapper's. */
     std::string cc_core;
     Dfa think, think_breaks, text, arg_name, value, junk, arg_name_loose, value_loose;
     size_t longest = 0;       /* the longest delimiter */
 
-    /* THE OBJECT FAMILY. `object`: a call's arguments are one object; `ns_object`: the object's
-     * own `{` is what ends the name (name_suffix empty), and ns_core is "{". */
+    /* Object family. `object`: a call's arguments are one object. `ns_object`: the object's own
+     * `{` ends the name (name_suffix empty), and ns_core is "{". */
     bool object = false, ns_object = false;
-    /* Where a key or a value may begin, besides the object's punctuation: the dialect string's
-     * opener, and the call's close and end -- a reply that leaves its object unclosed writes them
-     * there. Read anchored, by their first bytes (chat_format_check keeps them apart). */
+    /* Where a key or value may begin, besides the object's punctuation: the dialect string's
+     * opener, and the call's close and end (written there by a reply that leaves its object
+     * unclosed). Matched anchored, by first byte; chat_format_check keeps them distinct. */
     enum : uint8_t { LitString, LitClose, LitEnd };
     std::vector<std::string> obj_lits;
     std::vector<uint8_t>     obj_lit_kind;
     /* A dialect string runs to its close. A bare value ends at `,` `}` `]` and a bare key at `:`
-     * `,` `}` -- patterns 0..2 -- or at the call's close or end, which follow at the indices
-     * below (-1: none). */
+     * `,` `}` (patterns 0..2), or at the call's close or end, whose pattern indices are below
+     * (-1: none). */
     Dfa obj_str, obj_bare, obj_key;
-    /* A value the model opened with a plain `"` -- or `'` (obj_sqstr) -- in a dialect that has
-     * strings of its own: read as that dialect's strings are, verbatim, to a quote the object's
-     * syntax goes on after. Patterns: the quote, the escaped quote, the dialect's string close,
-     * the call's close (if any). */
+    /* A value opened with a plain `"` (or `'`, obj_sqstr) in a dialect with strings of its own:
+     * read verbatim, like the dialect's strings, up to a quote after which the object's syntax
+     * continues. Patterns: the quote, the escaped quote, the dialect's string close, the call's
+     * close (if any). */
     Dfa obj_qstr, obj_sqstr;
     int bare_cc = -1, bare_ce = -1, key_cc = -1, key_ce = -1;
 
-    /* REASONING ANYWHERE: content is scanned for a later block's opener and a stray close too,
+    /* reasoning_anywhere: content is also scanned for a later block's opener and a stray close,
      * after the call openers (text_think) or alone when the request has no calls (think_only). */
     Dfa text_think, think_only;
 };
@@ -931,9 +923,9 @@ ReasoningMarkers ReplyParser::reasoning() const {
     if (!F.f.has_reasoning()) return m;
     m.open  = F.open_core;
     m.close = F.close_core;
-    /* `tail` starts at the opener when the prompt holds one, and a prompt that also closed the
-     * block -- thinking turned off -- leaves the reply after it. With no opener at all the stream
-     * starts in the block (after_lead). */
+    /* `tail` starts at the opener when the prompt holds one; a prompt that also closed the block
+     * (thinking off) leaves the reply after it. With no opener the stream starts in the block
+     * (after_lead). */
     const std::string& t = impl_->tail;
     m.starts_open = F.open_core.empty() ||
                     (!t.empty() && t.find(F.close_core, F.open_core.size()) == std::string::npos);
@@ -945,9 +937,7 @@ ReasoningMarkers ReplyParser::reasoning() const {
 static int bind_tools(const ReplyFormat::Impl& F, const ojson& tools, ReplyParser::Impl* P,
                       std::string* why) {
     for (const auto& tool : tools) {
-        if (!tool.is_object() || !tool.contains("type") || tool.at("type") != "function" ||
-            !tool.contains("function"))
-            continue;
+        if (!chat_function_tool(tool)) continue;
         try {
             const auto& func = tool.at("function");
             Tool t;
@@ -961,8 +951,8 @@ static int bind_tools(const ReplyFormat::Impl& F, const ojson& tools, ReplyParse
             info.resolve_refs(params);
             std::vector<std::string> optional;
             for (const auto& [pname, pschema] : properties.items()) {
-                /* An optional argument no value satisfies has no arm in the grammar, which reads
-                 * it by the undeclared arm, as text (chatfmt.cpp); so does the parser. */
+                /* An optional argument no value satisfies has no grammar arm and is read by the
+                 * undeclared arm as text (chatfmt.cpp); the parser does the same. */
                 if (!required.count(pname) && info.unsatisfiable(pschema)) continue;
                 Param p;
                 p.typed = F.f.other_value == ChatValue::Json && !info.resolves_to_string(pschema);
@@ -973,9 +963,9 @@ static int bind_tools(const ReplyFormat::Impl& F, const ojson& tools, ReplyParse
                 } else {
                     optional.push_back(pname);
                 }
-                /* A name the argument's own delimiter could end early would be read as a
-                 * different name. An object's keys are delimited by its own punctuation, and
-                 * one that holds it is written as a string. */
+                /* A name its own delimiter could end early would be read as a different name.
+                 * Object keys are delimited by the object's punctuation instead, and a key
+                 * containing it is written as a string. */
                 const std::string probe = pname + F.name_end;
                 if (!F.object && probe.find(F.name_end) != pname.size()) {
                     *why = "parameter '" + pname + "' of tool '" + t.name + "' contains '" +
@@ -1121,8 +1111,8 @@ struct ReplyStream::Impl {
         }
     }
 
-    /* What content is scanned with: the call openers when calls are on, then -- reasoning
-     * anywhere -- a later block's opener and a stray close. Null: content is every byte. */
+    /* What content is scanned with: the call openers when calls are on, then (reasoning_anywhere)
+     * a later block's opener and a stray close. Null when every byte is content. */
     const Dfa* text_dfa = nullptr;
     size_t     n_open = 0;
 
@@ -1144,12 +1134,12 @@ struct ReplyStream::Impl {
     size_t      lpos = 0, trail = 0;
     /* a call being opened */
     St          origin = St::Text;
-    /* LOOSE: opened by what the format's grammar does not open a call with -- name_prefix alone,
-     * or call_open without its trailing whitespace. Such an opener is also ordinary text often
-     * enough ("the `<function=f>` syntax") that it becomes a call only once what follows the
-     * name tag is an argument or the call's close; until then it is held, and if it is not a
-     * call it is content, as the grammar says, and the reply is still within it. WRAPPED: the
-     * call was opened with call_open, so its close is followed by call_close. */
+    /* `loose`: opened by something the grammar does not open a call with (name_prefix alone, or
+     * call_open without its trailing whitespace). Such an opener is also ordinary text often
+     * enough ("the `<function=f>` syntax") that it becomes a call only once an argument or the
+     * call's close follows the name tag. Until then it is held; if it is not a call it is
+     * content, as the grammar says, and the reply stays strict. `wrapped`: opened with
+     * call_open, so its close is followed by call_close. */
     bool        loose = false, wrapped = false;
     size_t      tag_end = 0;            /* where a loose call's name tag ends in `att` */
     bool        name_lt = false;        /* a loose call's argument name holds a '<' */
@@ -1168,23 +1158,23 @@ struct ReplyStream::Impl {
     size_t      vs_pos = 0;
     bool        fenced = false;
 
-    /* THE ARGUMENT OBJECT being read: its open brackets, whether a key (rather than a value) is
-     * being read, a separator read but not yet written -- it is written only once the next
-     * member shows the object goes on, so a trailing one never reaches the JSON -- whether the
-     * container was just opened, and whether a key's `:` went out with no value yet. */
+    /* The argument object being read: its open brackets; whether a key (not a value) is being
+     * read; a separator read but not yet written (written only once the next member shows the
+     * object continues, so a trailing one never reaches the JSON); whether the container was
+     * just opened; and whether a key's `:` went out with no value yet. */
     std::vector<char> ostack;
     bool        okey = false, ocomma = false, ofirst = false, vpending = false;
-    /* A bare value's first bytes, to tell at its end whether it was a JSON number or literal --
-     * which the grammar admits -- or a word read as a string, which it does not. */
+    /* A bare value's first bytes, to tell at its end whether it was a JSON number or literal
+     * (which the grammar admits) or a word read as a string (which it does not). */
     std::string bare_txt;
-    /* A JSON string's escape being read -- the backslash, and a "u" escape's four hex digits,
-     * in vheld -- and a high surrogate's escape, held until the low one shows it is a pair. */
+    /* A high surrogate's escape, held until the low one shows it is a pair. The escape being
+     * read (the backslash and a "u" escape's four hex digits) is in vheld. */
     std::string jhi;
-    /* INSIDE A STRING: its trailing run of whitespace, closing brackets and quotes, held -- the
-     * brackets are the object's own if the call's close follows (srun) -- the quotes and
-     * backticks it has written (nq, nb), the bytes after a plain quote while they decide what it
-     * was (qtail), and how a plain-quoted value writes its quotes: 0 not yet seen, 1 as \" (one
-     * is unescaped), 2 as they are. */
+    /* Inside a string: `srun` holds its trailing run of whitespace, closing brackets and quotes
+     * (the brackets are the object's own if the call's close follows); `nq`, `nb`, `ns` count the
+     * double quotes, backticks and single quotes it has written; `qtail` holds the bytes after a
+     * plain quote while they decide what it was; `qmode` is how a plain-quoted value writes its
+     * quotes: 0 not yet seen, 1 as \" (one is unescaped), 2 as they are. */
     std::string srun, qtail;
     size_t      nq = 0, nb = 0, ns = 0;
     uint8_t     qmode = 0;
@@ -1194,9 +1184,9 @@ struct ReplyStream::Impl {
     size_t sent_r = 0, sent_c = 0, sent_a = 0;
     int    cur = -1;                    /* the channel last published: 0 r, 1 c, 2 args */
 
-    /* bytes to read again, ahead of the rest. Bytes read again are always the last ones read,
-     * so each segment knows where its first byte is in the stream: the generation prompt's tail,
-     * then the reply. */
+    /* Bytes to read again, ahead of the rest. They are always the last bytes read, so each
+     * segment knows its first byte's position in the stream (the generation prompt's tail, then
+     * the reply). */
     struct Seg { const char* p; size_t n; size_t at; };
     std::vector<Seg>        stack;
     const char*             seg_p = nullptr;   /* the segment being read */
@@ -1206,6 +1196,7 @@ struct ReplyStream::Impl {
     size_t here(const char* p) const { return seg_at + (size_t)(p - seg_p); }
     std::deque<std::string> owned;
     std::string             refeed;
+    size_t                  reread = 0;        /* every byte ever queued in refeed */
 
     void lenient() { strict = false; }
 
@@ -1324,7 +1315,10 @@ struct ReplyStream::Impl {
         return p;
     }
 
-    void read_again(std::string_view bytes) { refeed.append(bytes); }
+    void read_again(std::string_view bytes) {
+        refeed.append(bytes);
+        reread += bytes.size();
+    }
 
     /* ------------------------------------------------------------ calls */
 
@@ -1373,8 +1367,8 @@ struct ReplyStream::Impl {
         }
     }
 
-    /* The whitespace a loose opener may be followed by: whatever sorts at or below a space, as a
-     * model's stray control characters do. */
+    /* Whitespace after a loose opener: any byte at or below a space, which covers a model's stray
+     * control characters. */
     static bool loose_ws(unsigned char c) { return c <= ' '; }
 
     /* Not a call after all: the opener's first byte is text of the region it was found in, and
@@ -1432,14 +1426,13 @@ struct ReplyStream::Impl {
 
     /* ------------------------------------------------------------ the argument object
      *
-     * The object of the object family, read as it streams and written as JSON as it is read:
-     * brackets and separators as they come, a key as soon as its `:` shows it is one, a string
-     * as its bytes arrive, and a bare value as the tagged family writes a typed one (ValueOut,
-     * Raw): held while it could still be a literal or a number, else a string. What the dialect
-     * spells otherwise -- its string delimiters, its bare keys -- is respelled; what leaves it
-     * -- a missing separator, a trailing one, a bracket of the wrong kind, an object the call's
-     * close cuts off -- is repaired locally and said so (strict). The arguments a closed call
-     * reports are JSON whatever was written. */
+     * The object family's argument object, read as it streams and written as JSON as it is read:
+     * brackets and separators as they come, a key once its `:` shows it is one, a string as its
+     * bytes arrive, and a bare value like a typed tagged value (ValueOut, Raw): held while it
+     * could still be a literal or a number, else a string. Dialect spellings (string delimiters,
+     * bare keys) are respelled. Departures from the dialect (a missing or trailing separator, a
+     * mismatched bracket, an object cut off by the call's close) are repaired locally and clear
+     * strict(). A closed call's arguments are always JSON. */
 
     void obj_out(std::string_view s) {
         if (s.empty()) return;
@@ -1512,8 +1505,7 @@ struct ReplyStream::Impl {
 
     /* A bare value ended: one that is no JSON number or literal was read by the recovery rule. */
     void bare_done() {
-        std::string_view v(bare_txt);
-        while (!v.empty() && is_ws((unsigned char)v.back())) v.remove_suffix(1);
+        const std::string_view v = trim_trailing_ws(bare_txt);
         const bool json = bare_txt.size() < kBareKeep && !v.empty() &&
                           (v == "true" || v == "false" || v == "null" ||
                            ((v[0] == '-' || (v[0] >= '0' && v[0] <= '9')) &&
@@ -1549,9 +1541,10 @@ struct ReplyStream::Impl {
         else end_core_done();
     }
 
-    /* A JSON string's text goes out as it is, its escapes checked: one JSON has not is the
-     * backslash and the letter as text, a raw control character is escaped, and a surrogate
-     * escape that is not half of a pair is U+FFFD -- a client's JSON parser refuses all three. */
+    /* A JSON string's text goes out as is, with its escapes checked, since a client's JSON parser
+     * refuses all three of: a non-JSON escape (written as the backslash and letter as text), a
+     * raw control character (escaped), and a surrogate escape that is not half of a pair
+     * (written as U+FFFD). */
     void jstr_char(const char* q, size_t n) {
         if (n == 0) return;
         if (!jhi.empty()) { lenient(); jhi.clear(); obj_out("\\ufffd"); }
@@ -1610,9 +1603,9 @@ struct ReplyStream::Impl {
         }
     }
 
-    /* Where the held run stops being text: the closers after it close every open bracket of the
-     * object, innermost first, as the model writes them before the call's close -- read from the
-     * end, the last closes the outermost. npos: they do not. */
+    /* Where the held run stops being text: the closers after that point close every open bracket
+     * of the object, innermost first, as a model writes them before the call's close (read from
+     * the end, the last closes the outermost). npos if they do not. */
     size_t run_cut() const {
         size_t i = srun.size(), k = 0;
         while (i > 0 && k < ostack.size()) {
@@ -1625,15 +1618,11 @@ struct ReplyStream::Impl {
         return k == ostack.size() && k > 0 ? i : std::string::npos;
     }
 
-    static bool starts(std::string_view a, std::string_view b) {
-        return a.size() >= b.size() && a.compare(0, b.size(), b) == 0;
-    }
-
     /* The call's close in a string whose held run closes the whole object: the model left the
-     * string open (measured: the close delimiter at p=0.86, `}` at p=0.08), and this is where
-     * the call ends -- as vLLM's and HF's Gemma 4 parsers end it, at the first `}<tool_call|>`.
-     * The closers are the object's. A quote or backtick just before them that leaves the string
-     * with an odd count of its kind was the string's close, written in the wrong spelling. */
+     * string open (here it writes the close delimiter with p=0.86, `}` with p=0.08), and the call
+     * ends here, as vLLM's and HF's Gemma 4 parsers end it at the first `}<tool_call|>`. The
+     * closers are the object's. A quote or backtick just before them that leaves an odd count of
+     * its kind in the string was the string's close in the wrong spelling. */
     void cut_begin() {
         const size_t cut = run_cut();
         if (cut == std::string::npos) { str_flush(); str_emit(F.cc_core.data(), F.cc_core.size()); return; }
@@ -1647,7 +1636,7 @@ struct ReplyStream::Impl {
         }
         str_emit(srun.data(), keep);
         srun.clear();
-        if (!jhi.empty()) jhi.clear();
+        jhi.clear();
         obj_out(okey ? "\":null" : "\"");
         vpending = false;
         ocomma = false;
@@ -1655,9 +1644,8 @@ struct ReplyStream::Impl {
         end_call();
     }
 
-    /* After a plain quote in a plain-quoted value: 0 not yet known, 1 it closed the value -- the
-     * object goes on with a member, an element, its closers and the call's close -- 2 it was
-     * text. */
+    /* After a plain quote in a plain-quoted value: 0 not yet known; 1 it closed the value (the
+     * object goes on with a member, an element, its closers or the call's close); 2 it was text. */
     int q_verdict() const {
         const std::string& q = qtail;
         if (q.size() > kLookKeep) return 2;
@@ -1670,8 +1658,8 @@ struct ReplyStream::Impl {
         const std::string& so = F.f.object_string_open;
         std::string_view r(q.data() + i, n - i);
         if (!F.cc_core.empty()) {
-            if (starts(r, F.cc_core)) return 1;
-            if (starts(F.cc_core, r)) return 0;
+            if (r.starts_with(F.cc_core)) return 1;
+            if (std::string_view(F.cc_core).starts_with(r)) return 0;
         }
         if (top == 0 || q[i] != ',') return 2;
         ++i;
@@ -1679,8 +1667,8 @@ struct ReplyStream::Impl {
         if (i == n) return 0;
         r = std::string_view(q.data() + i, n - i);
         const unsigned char c = (unsigned char)q[i];
-        if (starts(r, so)) return 1;
-        if (starts(so, r)) return 0;
+        if (r.starts_with(so)) return 1;
+        if (std::string_view(so).starts_with(r)) return 0;
         if (ostack[top - 1] == '{') {
             if (!(std::isalpha(c) || c == '_')) return 2;
             while (i < n && (std::isalnum((unsigned char)q[i]) || q[i] == '_')) ++i;
@@ -1713,9 +1701,8 @@ struct ReplyStream::Impl {
     }
 
     /* The core of call_end has matched. The whitespace the format writes after it is part of the
-     * tag, so the call closes when that has arrived too -- a reply that ends in between leaves the
-     * call open, as the grammar does -- and a reply that goes straight on without it has closed
-     * the call all the same. */
+     * tag, so the call closes once that arrives too (a reply that ends in between leaves the call
+     * open, as the grammar does); a reply that goes straight on without it still closes the call. */
     void end_core_done() {
         trail = 0;
         if (F.end_trail.empty() || loose) end_call();
@@ -1750,9 +1737,9 @@ struct ReplyStream::Impl {
         else after_loose_call();
     }
 
-    /* The wrapper's close inside a wrapped call, whose own close is missing: it ends the call
-     * and the wrapper both. Read leniently -- the grammar requires call_end first -- but as the
-     * close it is, or the next call's arguments would be read into this one. */
+    /* The wrapper's close inside a wrapped call whose own close is missing ends both the call and
+     * the wrapper. Lenient, since the grammar requires call_end first, but it must be read as a
+     * close or the next call's arguments would be read into this one. */
     void end_call_at_close() {
         lenient();
         end_call();
@@ -1848,6 +1835,11 @@ struct ReplyStream::Impl {
         return F.f.value_newlines && (ne.empty() || ne.back() != '\n');
     }
 
+    /* `lit` continues the literal held in lhold (lpos bytes) with `c`. */
+    bool extends(const std::string& lit, char c) const {
+        return lpos < lit.size() && lit[lpos] == c && lit.compare(0, lpos, lhold) == 0;
+    }
+
     void begin_value_out(ValueOut::Mode m, bool json = false) {
         val.begin(m, cdata(), lead_newline(), F.f.value_newlines, scratch, json);
     }
@@ -1861,20 +1853,13 @@ struct ReplyStream::Impl {
         st = St::ValText;
     }
 
-    /* A JSON-typed value that parsed and then met its suffix: the value is the JSON text and the
-     * whitespace after it. What a client's JSON parser takes is a little narrower than what
-     * JsonScan reads as the grammar's JSON -- a number past a double's range (`1e400`), an
-     * unpaired UTF-16 surrogate escape, a vertical tab or form feed after the value -- and such a
-     * value is read by the grammar's other arm, as text, so the arguments stay JSON. */
+    /* A JSON-typed value that parsed and then met its suffix: the JSON text and the whitespace
+     * after it. A client's JSON parser is slightly stricter than JsonScan's reading of the
+     * grammar's JSON (a number past a double's range such as `1e400`, an unpaired UTF-16
+     * surrogate escape, a vertical tab or form feed after the value). Such a value is read by the
+     * grammar's other arm, as text, so the arguments stay JSON. */
     void json_value_done(std::string_view text) {
-        if (!nlohmann::json::accept(text)) {
-            begin_value_out(ValueOut::Raw);
-            val.add(text.data(), text.size(), scratch);
-            val.finish(false, scratch);
-            flush_scratch();
-            return;
-        }
-        begin_value_out(ValueOut::Raw, /*json=*/true);
+        begin_value_out(ValueOut::Raw, /*json=*/nlohmann::json::accept(text));
         val.add(text.data(), text.size(), scratch);
         val.finish(false, scratch);
         flush_scratch();
@@ -2035,8 +2020,8 @@ struct ReplyStream::Impl {
             att.push_back(c);
             const std::string& ap = F.f.arg_prefix;
             const std::string& fc = F.end_core;
-            const bool a_ok = lpos < ap.size() && ap[lpos] == c && ap.compare(0, lpos, lhold) == 0;
-            const bool f_ok = lpos < fc.size() && fc[lpos] == c && fc.compare(0, lpos, lhold) == 0;
+            const bool a_ok = extends(ap, c);
+            const bool f_ok = extends(fc, c);
             if (!a_ok && !f_ok) { fail_attempt(); return p + 1; }
             lhold.push_back(c);
             ++lpos;
@@ -2051,9 +2036,9 @@ struct ReplyStream::Impl {
         }
 
         case St::OpenPeekArg: {
-            /* The first argument's name, which is where prose that merely looks like a call
-             * shows itself: a name that runs into a tag is no name. On one that closes, the call
-             * is read -- the bytes after the name tag replayed through the call itself. */
+            /* The first argument's name is where prose that only looks like a call shows itself:
+             * a name that runs into a tag is no name. Once the name closes, the call is read by
+             * replaying the bytes after the name tag through it. */
             const char c = *p;
             att.push_back(c);
             lhold.push_back(c);
@@ -2084,10 +2069,9 @@ struct ReplyStream::Impl {
             const std::string& ap = F.f.arg_prefix;
             const std::string& fc = F.end_core;
             const std::string& cc = F.cc_core;
-            const bool a_ok = lpos < ap.size() && ap[lpos] == c && ap.compare(0, lpos, lhold) == 0;
-            const bool f_ok = lpos < fc.size() && fc[lpos] == c && fc.compare(0, lpos, lhold) == 0;
-            const bool c_ok = wrapped && lpos < cc.size() && cc[lpos] == c &&
-                              cc.compare(0, lpos, lhold) == 0;
+            const bool a_ok = extends(ap, c);
+            const bool f_ok = extends(fc, c);
+            const bool c_ok = wrapped && extends(cc, c);
             if (!a_ok && !f_ok && !c_ok) {
                 lenient();
                 st = St::Junk;
@@ -2251,8 +2235,7 @@ struct ReplyStream::Impl {
             p = scan(F.obj_key, p, e, &hit, [this](const char* q, size_t n) { name.append(q, n); });
             if (hit < 0) return p;
             if (hit <= 2) {
-                std::string_view k(name);
-                while (!k.empty() && is_ws((unsigned char)k.back())) k.remove_suffix(1);
+                const std::string_view k = trim_trailing_ws(name);
                 if (k.empty()) lenient();
                 obj_sep();
                 std::string out = json_quote(k);
@@ -2321,9 +2304,9 @@ struct ReplyStream::Impl {
                 return p + 1;
             }
             if ((c == '"' || c == '\'') && !F.f.object_string_open.empty()) {
-                /* Measured on Gemma 4: such a quote -- `"`, or `'` as Python and JavaScript
-                 * write strings -- is followed by the text verbatim, or with only its quotes
-                 * escaped, never JSON's other escapes. */
+                /* Gemma 4 follows such a quote (`"`, or `'` as Python and JavaScript write
+                 * strings) with the text verbatim, or with only its quotes escaped, never with
+                 * JSON's other escapes. */
                 obj_sep();
                 vpending = false;
                 lenient();
@@ -2581,12 +2564,11 @@ struct ReplyStream::Impl {
         st = St::ArgName;
     }
 
-    /* The reply ended inside an argument name. A name is only a name once it is closed -- except
-     * that where the format writes nothing between a name and its value's own prefix
-     * (arg_name_suffix empty), the grammar's opening tag for a DECLARED argument is complete as
-     * soon as the declared name is: the reply `<param name="path` already carries the key. The
-     * first declared name in the grammar's order that the text spells, followed by at most part
-     * of the value prefix, is the key. */
+    /* The reply ended inside an argument name. A name counts only once closed, except where the
+     * format writes nothing between a name and its value prefix (arg_name_suffix empty): there
+     * the grammar's opening tag for a declared argument is complete once the declared name is,
+     * so `<param name="path` already carries the key. The key is the first declared name, in
+     * grammar order, that the text spells followed by at most part of the value prefix. */
     void finish_arg_name() {
         const Tool* t = cur_tool();
         if (!t || !F.f.arg_name_suffix.empty()) return;
@@ -2668,7 +2650,7 @@ struct ReplyStream::Impl {
     }
 
     /* The reply ended inside a loose opener, so it was never a call: its bytes are content, read
-     * again from its second byte -- which may hold another opener, and so on. */
+     * again from the second byte (which may hold another opener, and so on). */
     bool in_loose_attempt() const {
         switch (st) {
         case St::OpenWs: case St::OpenPrefix: case St::OpenName: case St::OpenPeek:
@@ -2680,19 +2662,21 @@ struct ReplyStream::Impl {
     }
 
     void finish_all() {
-        /* The reply ended while a close was being decided: it was one. */
-        while (st == St::ObjQLook) {
-            q_done(true);
+        /* Reads the bytes a decision queued to be read again. */
+        auto rerun = [this] {
             std::string again = std::move(refeed);
             refeed.clear();
             run(again, fed >= again.size() ? fed - again.size() : 0);
+        };
+        /* The reply ended while a close was being decided: it was one. */
+        while (st == St::ObjQLook) {
+            q_done(true);
+            rerun();
         }
         if (st == St::ObjStr || st == St::ObjQStr) str_flush();
         while (in_loose_attempt()) {
             fail_attempt();
-            std::string again = std::move(refeed);
-            refeed.clear();
-            run(again, fed >= again.size() ? fed - again.size() : 0);
+            rerun();
         }
         switch (st) {
         case St::OpenWs: case St::OpenPrefix: case St::OpenName: case St::OpenTail:
@@ -2787,6 +2771,8 @@ std::string ReplyStream::content_with_open_call(std::string_view reply) const {
 
 bool ReplyStream::strict() const { return impl_->strict; }
 
+size_t ReplyStream::reread() const { return impl_->reread; }
+
 ReplyHeld ReplyStream::held() const {
     const Impl& m = *impl_;
     ReplyHeld h;
@@ -2795,9 +2781,9 @@ ReplyHeld ReplyStream::held() const {
     const size_t lhold = m.st == St::OpenPeekArg ? 0 : m.lhold.size();
     h.delimiter = m.hold.size() + lhold + m.val.held() + m.content.held_other() +
                   (m.msg.reasoning.size() - m.sent_r) + (m.msg.content.size() - m.sent_c) +
-                  (m.msg.calls.empty() ? 0 : m.msg.calls.back().arguments.size() - m.sent_a);
+                  (m.msg.calls.empty() ? 0 : m.msg.calls.back().arguments.size() - m.sent_a) +
+                  m.srun.size() + m.qtail.size();
     h.space = m.content.held_space() + m.think_pend.size();
-    h.delimiter += m.srun.size() + m.qtail.size();
     h.structure = m.att.size() + m.name.size() + m.vheld.size() + m.val.held_container() +
                   m.jhi.size();
     return h;

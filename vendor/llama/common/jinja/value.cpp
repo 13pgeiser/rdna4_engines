@@ -1496,13 +1496,35 @@ std::string value_to_json(const value & val, int indent, const std::string_view 
 // TODO: avoid circular references
 std::string value_to_string_repr(const value & val) {
     if (is_val<value_string>(val)) {
-        const std::string val_str = val->as_string().str();
-
-        if (val_str.find('\'') != std::string::npos) {
-            return value_to_json(val);
-        } else {
-            return "'" + val_str + "'";
+        /* RADIANCE: Python's str repr, which jinja2 prints for a string inside a list or a dict:
+         * single quotes unless the text holds one and no double quote, and backslash escapes for
+         * the backslash, the quote, \t \n \r and the other ASCII controls. Python also escapes
+         * non-printable non-ASCII code points; those pass through here. */
+        const std::string s = val->as_string().str();
+        const char q = s.find('\'') != std::string::npos && s.find('"') == std::string::npos ? '"' : '\'';
+        std::string out(1, q);
+        for (const char ch : s) {
+            const unsigned char c = (unsigned char) ch;
+            if (ch == q || ch == '\\') {
+                out += '\\';
+                out += ch;
+            } else if (ch == '\t') {
+                out += "\\t";
+            } else if (ch == '\n') {
+                out += "\\n";
+            } else if (ch == '\r') {
+                out += "\\r";
+            } else if (c < 0x20 || c == 0x7f) {
+                static const char hex[] = "0123456789abcdef";
+                out += "\\x";
+                out += hex[c >> 4];
+                out += hex[c & 15];
+            } else {
+                out += ch;
+            }
         }
+        out += q;
+        return out;
     } else {
         return val->as_repr();
     }

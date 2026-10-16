@@ -1,23 +1,20 @@
 /* word_scan.h -- find the first of a set of literal words in a byte stream that arrives in pieces.
  *
- * A lazy grammar waits for its trigger word -- `<tool_call>\n` on the Qwen templates -- and until
- * the word appears every generated token passes through here. The stream is the whole reply, so
- * anything that looks back over what has already arrived turns a long reply into quadratic host
- * work on the step path. This looks back at nothing: the scan state is one integer, each byte is
- * one table load, and what a match needs to be replayed is bounded by the longest word.
+ * A lazy grammar waits for its trigger word (`<tool_call>\n` on the Qwen templates), and every
+ * generated token passes through here until it appears. Looking back over the stream would make a
+ * long reply quadratic host work, so the scan keeps one integer of state and does one table load
+ * per byte; replaying a match needs at most the longest word.
  *
- * THE AUTOMATON is Aho-Corasick compiled to a full DFA over byte classes. The trie of the words
- * gets failure links in breadth-first order, and every missing edge is resolved through them once,
- * at build time, so the scan never follows a failure chain. Bytes that occur in no word share one
- * class, which keeps the table at (states x distinct word bytes + 1) entries -- a few hundred for
- * any real trigger set, so it stays in L1 however long the reply runs.
+ * Automaton: Aho-Corasick compiled to a full DFA over byte classes. Failure links are built
+ * breadth-first and every missing edge is resolved through them at build time, so the scan never
+ * follows a failure chain. Bytes in no word share one class, so the table has
+ * states x (distinct word bytes + 1) entries: a few hundred for a real trigger set, so it stays
+ * in L1.
  *
- * THE MATCH REPORTED is the leftmost START among the occurrences that complete inside one fed
- * piece. That is the answer a search of the whole stream so far gives after each piece: nothing
- * completed in an earlier piece (the caller would have stopped), so every complete occurrence ends
- * in this one, and of those the leftmost is the one that begins first. Each state carries the
- * length of the LONGEST word ending there, because the longest word ending at a byte is the one
- * that starts earliest.
+ * Match reported: the leftmost start among occurrences that complete inside one fed piece. Since
+ * the caller stops at the first match, nothing completed earlier, so this equals a search of the
+ * whole stream so far. Each state carries the length of the longest word ending there, which is
+ * the one that starts earliest.
  */
 #pragma once
 #include "../rad_internal.h"
@@ -33,8 +30,8 @@ class WordScanner {
 public:
     static constexpr uint64_t npos = ~(uint64_t)0;
 
-    /* Where a stream is: the automaton state and how many bytes have been fed. Plain data, so a
-     * speculative window can copy it and put it back. */
+    /* Automaton state and bytes fed so far. Plain data, so a speculative window can copy and
+     * restore it. */
     struct State {
         uint32_t s   = 0;
         uint64_t off = 0;

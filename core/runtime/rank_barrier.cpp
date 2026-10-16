@@ -9,9 +9,8 @@ void RankBarrier::arrive_and_wait() {
 
     const uint64_t my_gen = gen_;
     if (++waiting_ == n_) {
-        /* Last one in flips the generation and releases the rest. The counter is reset here rather
-         * than by the wakers, so a rank that re-enters immediately observes a generation it has
-         * not seen and blocks instead of racing through. */
+        /* Last one in resets the counter and flips the generation, so a rank that re-enters at
+         * once waits on the new generation instead of racing through. */
         waiting_ = 0;
         ++gen_;
         lk.unlock();

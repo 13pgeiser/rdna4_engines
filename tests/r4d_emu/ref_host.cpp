@@ -26,8 +26,8 @@ int host_pair_argmax(const RadArgs* a) {
     }
     const int64_t rows = p->shape[0];
     if (t->rank < 1 || t->shape[0] < rows || (v && (v->rank < 1 || v->shape[0] < rows))) return RAD_E_SHAPE;
-    const int64_t prs = p->stride[0], trs = t->rank >= 2 ? t->stride[0] : 1;
-    const int64_t vrs = v ? (v->rank >= 2 ? v->stride[0] : 1) : 0;
+    /* A row's element is stride[0] apart at any rank, as in the kernel. */
+    const int64_t prs = p->stride[0], trs = t->stride[0], vrs = v ? v->stride[0] : 0;
     for (int64_t r = 0; r < rows; ++r) {
         const float* row = (const float*)p->data + r * prs;
         int32_t bid = -1;
@@ -45,37 +45,26 @@ int host_pair_argmax(const RadArgs* a) {
     return RAD_OK;
 }
 
-/* The joins: each value the unfused chain stores is rounded to bf16 where it stores it. Summed in
- * index order, so a ULP from the device's block order. */
-static float hb2f(uint16_t h) { const uint32_t u = (uint32_t)h << 16; float f; std::memcpy(&f, &u, 4); return f; }
-static uint16_t hf2b(float f) {
-    uint32_t u; std::memcpy(&u, &f, 4);
-    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
-}
-static float hrbf(float f) { return hb2f(hf2b(f)); }
+/* The joins round each value to bf16 where the unfused chain stores it. Sums run in index order,
+ * so a result may differ from the device's block order by a ULP. */
 static float hnorm(const float* v, int64_t n, double eps) {
     float ss = 0.0f;
     for (int64_t i = 0; i < n; ++i) ss += v[i] * v[i];
     return 1.0f / std::sqrt(ss / (float)n + (float)eps);
 }
-static bool hrows(const RadTensor* t, int64_t n, int64_t* rows, int64_t* ld) {
-    if (!t || t->dtype != RAD_BF16 || t->rank < 1 || rad_tensor_lastdim(t) != n) return false;
-    if (t->stride[t->rank - 1] != 1) return false;
-    *rows = rad_tensor_rows(t);
-    *ld = rad_tensor_row_pitch(t);
-    return true;
-}
-static bool hgain(const RadTensor* w, int64_t n) {
-    return w && w->dtype == RAD_F32 && rad_tensor_numel(w) == n;
-}
-
-/* [rows..., n] of `dt`, dense last axis, for the route form's fp8 codes and f32 scales */
+/* [rows..., n] of `dt` (bf16 unless named), dense last axis */
 static bool hrows_as(const RadTensor* t, uint32_t dt, int64_t n, int64_t* rows, int64_t* ld) {
     if (!t || t->dtype != dt || t->rank < 1 || rad_tensor_lastdim(t) != n) return false;
     if (t->stride[t->rank - 1] != 1) return false;
     *rows = rad_tensor_rows(t);
     *ld = rad_tensor_row_pitch(t);
     return true;
+}
+static bool hrows(const RadTensor* t, int64_t n, int64_t* rows, int64_t* ld) {
+    return hrows_as(t, RAD_BF16, n, rows, ld);
+}
+static bool hgain(const RadTensor* w, int64_t n) {
+    return w && w->dtype == RAD_F32 && rad_tensor_numel(w) == n;
 }
 
 /* norm_add_norm, and with `route` norm_add_norm_route's three more outputs */
@@ -105,15 +94,15 @@ static int nan_host(const RadArgs* a, bool route) {
         const uint16_t* ar = (const uint16_t*)A_->data + m * la;
         uint16_t* xr = (uint16_t*)X->data + m * lx;
         uint16_t* yr = (uint16_t*)Y->data + m * ly;
-        for (int64_t i = 0; i < n; ++i) v[(size_t)i] = hb2f(ar[i]);
+        for (int64_t i = 0; i < n; ++i) v[(size_t)i] = b2f(ar[i]);
         const float sa = hnorm(v.data(), n, eps);
         for (int64_t i = 0; i < n; ++i) {
-            const float t = hrbf((v[(size_t)i] * sa) * wa[i]);
-            xv[(size_t)i] = hrbf(hb2f(xr[i]) + t);
-            xr[i] = hf2b(xv[(size_t)i]);
+            const float t = rb((v[(size_t)i] * sa) * wa[i]);
+            xv[(size_t)i] = rb(b2f(xr[i]) + t);
+            xr[i] = f2b(xv[(size_t)i]);
         }
         const float sx = hnorm(xv.data(), n, eps);
-        for (int64_t i = 0; i < n; ++i) yr[i] = hf2b((xv[(size_t)i] * sx) * wy[i]);
+        for (int64_t i = 0; i < n; ++i) yr[i] = f2b((xv[(size_t)i] * sx) * wy[i]);
         if (!route) continue;
         /* the router's row, and the experts' as rmsnorm_quant_fp8 writes it (v holds it) */
         const float *wr = (const float*)Wr->data, *we = (const float*)We->data;
@@ -121,8 +110,8 @@ static int nan_host(const RadArgs* a, bool route) {
         uint8_t* qrow = (uint8_t*)Q->data + m * lq;
         float* srow = (float*)S->data + m * ls;
         for (int64_t i = 0; i < n; ++i) {
-            rrow[i] = hf2b(((xv[(size_t)i] * sx) * wr[i]) * mult);
-            v[(size_t)i] = hrbf((xv[(size_t)i] * sx) * we[i]);
+            rrow[i] = f2b(((xv[(size_t)i] * sx) * wr[i]) * mult);
+            v[(size_t)i] = rb((xv[(size_t)i] * sx) * we[i]);
         }
         for (int64_t g = 0; g < n / 128; ++g) {
             float am = 0.0f;
@@ -161,27 +150,27 @@ int host_join_add_scale(const RadArgs* a) {
     if (Y && !hrows(Y, n, &ry, &ly)) return RAD_E_SHAPE;
     if (rd < rx || rr < rx || (Y && ry < rx)) return RAD_E_SHAPE;
     const float *wd = (const float*)Wd->data, *wr = (const float*)Wr->data, *wj = (const float*)Wj->data;
-    const float sc = hb2f(*(const uint16_t*)Sc->data);
+    const float sc = b2f(*(const uint16_t*)Sc->data);
     std::vector<float> dv((size_t)n), rv((size_t)n);
     for (int64_t m = 0; m < rx; ++m) {
         const uint16_t* dr = (const uint16_t*)D->data + m * ld;
         const uint16_t* rrw = (const uint16_t*)R->data + m * lr;
         uint16_t* xr = (uint16_t*)X->data + m * lx;
-        for (int64_t i = 0; i < n; ++i) { dv[(size_t)i] = hb2f(dr[i]); rv[(size_t)i] = hb2f(rrw[i]); }
+        for (int64_t i = 0; i < n; ++i) { dv[(size_t)i] = b2f(dr[i]); rv[(size_t)i] = b2f(rrw[i]); }
         const float sd = hnorm(dv.data(), n, eps), sr = hnorm(rv.data(), n, eps);
         for (int64_t i = 0; i < n; ++i)
-            dv[(size_t)i] = hrbf(hrbf((dv[(size_t)i] * sd) * wd[i]) + hrbf((rv[(size_t)i] * sr) * wr[i]));
+            dv[(size_t)i] = rb(rb((dv[(size_t)i] * sd) * wd[i]) + rb((rv[(size_t)i] * sr) * wr[i]));
         const float sj = hnorm(dv.data(), n, eps);
         for (int64_t i = 0; i < n; ++i) {
-            const float x1 = hrbf(hb2f(xr[i]) + hrbf((dv[(size_t)i] * sj) * wj[i]));
-            xr[i] = hf2b(x1 * sc);
-            rv[(size_t)i] = hb2f(xr[i]);
+            const float x1 = rb(b2f(xr[i]) + rb((dv[(size_t)i] * sj) * wj[i]));
+            xr[i] = f2b(x1 * sc);
+            rv[(size_t)i] = b2f(xr[i]);
         }
         if (Y) {
             const float* wn = (const float*)Wn->data;
             uint16_t* yr = (uint16_t*)Y->data + m * ly;
             const float sn = hnorm(rv.data(), n, eps);
-            for (int64_t i = 0; i < n; ++i) yr[i] = hf2b((rv[(size_t)i] * sn) * wn[i]);
+            for (int64_t i = 0; i < n; ++i) yr[i] = f2b((rv[(size_t)i] * sn) * wn[i]);
         }
     }
     return RAD_OK;
@@ -205,9 +194,9 @@ int host_expert_scale(const RadArgs* a) {
     for (int64_t r = 0; r < rows; ++r)
         for (int64_t c = 0; c < k; ++c) {
             const int32_t id = ((const int32_t*)I->data)[r * li + c];
-            const float s = (id >= 0 && id < ne) ? hb2f(sc[id]) : 0.0f;
+            const float s = (id >= 0 && id < ne) ? b2f(sc[id]) : 0.0f;
             uint16_t* w = (uint16_t*)W->data + r * lw + c;
-            *w = hf2b(hb2f(*w) * s);
+            *w = f2b(b2f(*w) * s);
         }
     return RAD_OK;
 }

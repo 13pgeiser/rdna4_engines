@@ -1,26 +1,21 @@
-/* rad_build.h -- the declare phase (spec §3.1). The architecture plugin states everything it will
- * ever do; this is what receives it.
+/* rad_build.h -- the declare phase (spec §3.1): receives everything the architecture plugin will
+ * ever do.
  *
- * Two properties are the whole point of the phase and everything here is arranged around them:
+ *   Declare always completes. A missing kernel does not stop the walk: every op, band and domain
+ *   that resolved to nothing is collected with the constraint that refused it and reported at the
+ *   end, which shows whether a plugin or a model is missing.
  *
- *   DECLARE ALWAYS COMPLETES. A missing kernel does not stop the walk. Every op, every band and
- *   every domain that resolved to nothing is accumulated with the constraint that refused it, and
- *   the full list is reported at the end. The first failure at the top tells you one thing; the
- *   whole list tells you whether you are missing a plugin or missing a model.
+ *   Nothing is decided twice. After declare the model is static (every op, its kernel, the
+ *   weights it touches, the order). The bucket table, weight manifest, buffer plan and KV block
+ *   sizes are built once here, so the step path indexes tables.
  *
- *   NOTHING IS DECIDED TWICE. Between declare and plan the model is known statically -- every op,
- *   every kernel that will service it, every weight it touches, and the order. The bucket table,
- *   the weight manifest, the buffer plan and the KV block sizes are all built once, here, so the
- *   step path indexes tables instead of asking questions.
+ * The kernel hierarchy, op schemas, constraint matching and bucket boundaries belong to
+ * core/plugin/. The Builder calls Registry::validate and Registry::build_bands rather than
+ * reimplementing them, so selector and builder cannot drift apart.
  *
- * WHAT THIS COMPONENT DOES NOT DO. The kernel hierarchy, the op schemas, the constraint match and
- * the bucket boundaries are core/plugin/'s, and the Builder asks rather than reimplements: it
- * calls Registry::validate for the schema check and Registry::build_bands for the bucket table.
- * Two answers to one question is how a selector and a builder drift apart.
- *
- * LIFETIME. Every KernelRow, Resolved and RadOpSchema in the Program points into a plugin's static
- * tables, which the Registry dlclose()s. The Program must not outlive the Registry it was built
- * against, and neither may.
+ * Lifetime: every KernelRow, Resolved and RadOpSchema in the Program points into a plugin's static
+ * tables, which the Registry dlclose()s. Neither the Builder nor the Program may outlive the
+ * Registry.
  */
 #pragma once
 #include "plugin/registry.h"
@@ -33,32 +28,27 @@
 #include <unordered_map>
 #include <vector>
 
-/* The handle the plugin holds. rad_builder.h only forward-declares it; core/build/ owns it, and
- * making it a base of rad::Builder means the C shims are a static_cast rather than a lookup. */
+/* The plugin's handle. rad_builder.h only forward-declares it; as a base of rad::Builder, the C
+ * shims reach the Builder with a static_cast. */
 struct RadBuilder { };
 
 namespace rad {
 
-/* Process-lifetime storage for declared names.
- *
- * RadNameMap and RadKernelInfo hold raw `const char*`, and the Program outlives the Builder that
- * filled it -- so a std::string member would dangle and there is nowhere in the frozen struct to
- * put one. These are interned instead: a few thousand short strings, deduplicated, never freed.
- * Freeing them would mean making RadNameMap own its storage, which is an ABI change for a few
- * kilobytes. */
+/* Process-lifetime storage for declared names. RadNameMap and RadKernelInfo hold raw
+ * `const char*` and the Program outlives the Builder, so the strings are interned: a few thousand,
+ * deduplicated, never freed. Owning them in RadNameMap would be an ABI change. */
 const char* intern(std::string_view s);
 
-/* Names for the enums the graph dump prints. `bld_` prefixed because tier_name and site_name in
- * rad_core.h belong to the planner and these are the same kind of thing for a different axis. */
+/* Names for the enums the graph dump prints; `bld_` prefixed to keep them apart from the
+ * planner's tier_name and site_name in rad_core.h. */
 const char* bld_domain_name(int domain);
 const char* bld_access_name(int access);
 const char* bld_buf_kind_name(int kind);
 const char* bld_kv_kind_name(int kind);
 
 /* ------------------------------------------------------------------ the buffer plan */
-/* What the packing produced, for the --debug-graph report. `sum_bytes` is what no sharing at all
- * would have cost and `peak_live` is what a perfect packer would reach, so the pair brackets the
- * arena and says whether the greedy pass left anything on the table. */
+/* Packing results for the --debug-graph report. `sum_bytes` (no sharing) and `peak_live` (a
+ * perfect packer) bracket the arena and show what the greedy pass left unused. */
 struct BufPlanReport {
     int64_t transient_bytes = 0;   /* the packed, shared region */
     int64_t persist_bytes   = 0;   /* PERSIST + DERIVED: their own non-overlapping region */
@@ -69,37 +59,37 @@ struct BufPlanReport {
 };
 
 /* Liveness must already be in BufferInfo::first_def / last_use; a transient with first_def < 0 is
- * treated as live for the whole program, which is the sound assumption and not a guess.
+ * treated as live for the whole program, which is sound.
  *
  * Assigns BufferInfo::arena_offset for every buffer and sets Program::arena_bytes. Returns RAD_OK,
  * or RAD_E_INVAL if a buffer could not be sized (a plugin-private dtype the core cannot measure). */
 int plan_buffers(Program& p, BufPlanReport* rep = nullptr);
 
-/* ONE SIZE OF STEP'S ARENA LAYOUT. The same buffers as the real plan, the fixed region where it
- * was, and the transients packed for a step of at most `rows` tokens -- so the arena past `end`
- * is unused by any such step and can be lent. `offset` and `decl` are indexed by buffer handle. */
+/* The arena layout for steps of at most `rows` tokens: the real plan's buffers, the fixed region
+ * unchanged, and the transients repacked, so the arena past `end` is unused by such a step and
+ * can be lent. `offset` and `decl` are indexed by buffer handle. */
 struct ArenaLevel {
     int64_t rows = 0;
     int64_t end = 0;
     std::vector<int64_t>    offset;
     std::vector<RadBufDecl> decl;
 };
-/* Lay out `probe`'s buffers -- a sizing declare at `rows` -- over `full`'s. Refused, with the
- * reason in `why`, when the two declares do not describe the same buffers with only their rows
- * smaller: anything else cannot share the real plan's fixed region and kernels. */
+/* Lay out `probe`'s buffers (a sizing declare at `rows`) over `full`'s. Refused, with the reason
+ * in `why`, unless both declares describe the same buffers with only fewer rows; otherwise they
+ * cannot share the real plan's fixed region and kernels. */
 int plan_level(const Program& full, const Program& probe, int64_t rows, ArenaLevel* out,
                std::string* why);
 
-/* Bytes a declared buffer occupies. 0 means the core cannot size it -- a plugin-private dtype,
- * which is legal for a WEIGHT (the kernel's layout hook sizes those) and not for an activation. */
+/* Bytes a declared buffer occupies. 0 means the core cannot size it: a plugin-private dtype, legal
+ * for a weight (the kernel's layout hook sizes it) but not for an activation. */
 int64_t buffer_bytes(const RadBufDecl& d);
 
 /* ------------------------------------------------------------------ the model behind a declare */
-/* WHAT THE MODEL HOLDS FOR A LOGICAL WEIGHT: its encoding and its logical extents. This is what
- * rad_weight_encoding answers and what every declaration is checked against (spec §4.3). The
- * engine answers from the container or the checkpoint it loads, rad-convert from the recipe it
- * will quantise by; `prog` is the declare so far, whose name map is how a checkpoint is searched.
- * RAD_OK, or RAD_E_NOTFOUND for a weight the model does not have. */
+/* What the model holds for a logical weight: its encoding and logical extents. rad_weight_encoding
+ * answers with it and every declaration is checked against it (spec §2.4). The engine answers from
+ * the container or checkpoint it loads, rad-convert from its recipe. `prog` is the declare so far,
+ * whose name map is used to search a checkpoint. RAD_OK, or RAD_E_NOTFOUND for a weight the model
+ * does not have. */
 struct WeightSource {
     RadEncoding enc{};
     uint32_t    rank = 0;
@@ -111,12 +101,11 @@ using WeightSourceFn = std::function<int(const std::string& name, const Program&
 /* ------------------------------------------------------------------ the builder */
 class Builder : public RadBuilder {
 public:
-    /* The Registry must outlive the Builder AND the Program it produces: every KernelRow the
-     * bands hold points into a plugin the Registry dlclose()s. */
+    /* The Registry must outlive the Builder and its Program (see the file header). */
     Builder(Registry& reg, const RadModelMeta& meta, const RadBuildCtx& ctx);
 
-    /* Where rad_weight_encoding's answers come from. Unset, every source is RAD_E_NOTFOUND and a
-     * weight is read as plain in its declared dtype -- a test, a synthetic tool. */
+    /* Where rad_weight_encoding's answers come from. Unset (tests, synthetic tools), every source
+     * is RAD_E_NOTFOUND and a weight is read as plain in its declared dtype. */
     void set_sources(WeightSourceFn f) { sources_ = std::move(f); }
 
     /* The C surface, one method per rad_builder.h entry point. */
@@ -140,15 +129,9 @@ public:
     int         declare_generator(const RadGeneratorDecl* d);
     void        note_v       (const char* f, va_list ap);
 
-    /* The buffer operands of an op.
-     *
-     * NOT in rad_builder.h, and it needs to be -- see the proposed ABI addition at the foot of this
-     * header. rad_decl_op names an op's WEIGHT operands but not its buffer operands, so declare
-     * cannot compute activation liveness from the ABI as frozen, and without liveness the arena is
-     * the sum of every transient rather than the peak of them. Until the two functions below are added to the frozen header (purely additive,
-     * no existing signature changes), a plugin cannot supply this and every transient is assumed
-     * live for the whole program: correct, and as wasteful as it sounds. The --debug-graph buffer
-     * report prints how many buffers fell into that case, so the cost is never invisible. */
+    /* An op's buffer operands (rad_op_reads/rad_op_writes in rad_builder.h), which give the
+     * buffer planner activation liveness. A transient no op names is live for the whole
+     * program; the --debug-graph buffer report counts those. */
     int op_reads (rad_op h, const rad_buf* b, int n);
     int op_writes(rad_op h, const rad_buf* b, int n);
     int buf_concurrent(rad_buf b);
@@ -158,48 +141,43 @@ public:
     int kv_group_zero(rad_kvgroup g);
 
     /* Finalise: weight first/last use, KV group geometry, buffer liveness and packing. Returns
-     * RAD_OK, or the first structural error class. Resolution MISSES are not an error here -- an
-     * op that did not resolve returns a null handle and the plugin is expected to have offered a
-     * fallback (spec §2.3); it becomes an error when the run phase issues it. */
+     * RAD_OK, or the first structural error class. Resolution misses are not errors here: an
+     * unresolved op returns a null handle and the plugin should offer a fallback (spec §2.3); it
+     * becomes an error only if the run phase issues it. */
     int finish();
 
-    /* A SIZING DECLARE (RadBuildCtx::shape_probe): every op takes the bands `ref` resolved for
-     * the op at the same position instead of resolving its own, and finish() initialises nothing.
-     * The plugin then sees exactly the answers the real declare gave -- which ops resolved, which
-     * block size a group has -- so it declares the same graph, and nothing is selected or set up
-     * a second time. An op that is not the one `ref` has at that position ends the probe with an
-     * error: the plugin declared a different graph at the smaller size, and its buffers cannot be
-     * laid over the real ones. */
+    /* A sizing declare (RadBuildCtx::shape_probe): each op takes the bands `ref` resolved at the
+     * same position, and finish() initialises nothing. The plugin sees the real declare's answers
+     * (which ops resolved, each group's block size), so it declares the same graph and nothing is
+     * selected or set up twice. An op that differs from `ref`'s at that position is an error: a
+     * different graph cannot be laid over the real buffers. */
     void set_reference(const Program* ref) { ref_ = ref; }
 
-    /* WITHOUT INSTANCES: finish() selects every kernel and initialises none. For a caller that
-     * launches nothing -- rad-convert plans a container's stored form, which is the kernels'
-     * layouts and not their setup. A kernel's init is about the process it runs in (a ring, a
-     * peer's buffers) and the conversion is often not that process: libavx's n-gram gather
-     * refuses a process that may not make an io_uring ring, and a sandbox that forbids one still
-     * has to be able to convert the model. */
+    /* Off: finish() selects every kernel and initialises none, for callers that launch nothing.
+     * rad-convert needs only the kernels' layouts; a kernel's init depends on the running process
+     * (a ring, a peer's buffers), and libavx's n-gram gather refuses a process that cannot create
+     * an io_uring ring, which must not stop a sandboxed conversion. */
     void set_instances(bool on) { instances_ = on; }
 
     Program&       program()       { return prog_; }
     const Program& program() const { return prog_; }
 
-    /* Structural failures: a bad schema, two ranged parameters, a duplicate name. Every one of
-     * them, not the first -- same rule as the miss list. */
+    /* Structural failures (a bad schema, two ranged parameters, a duplicate name), all of them,
+     * like the miss list. */
     const std::vector<std::string>& errors() const { return errors_; }
     int  status() const { return status_; }
     const BufPlanReport& buf_report() const { return bufrep_; }
 
 private:
-    /* Record a structural error and remember its class. Returns 0 so callers can `return err(...)`
-     * straight out of a decl_ function, which is what makes a failed decl_* falsy. */
+    /* Record a structural error and its class. Returns 0 so a decl_ function can
+     * `return err(...)` and yield a null handle. */
     uint32_t err(int code, const char* f, ...) __attribute__((format(printf, 3, 4)));
     std::string scoped(const char* name) const;
 
     void resolve_bands(OpInfo& oi);
     void record_tune_request(const Resolved& r);
-    /* init() for every surviving instance, run once the WHOLE graph has resolved. Running it
-     * during resolution would let a failing init abort declare before the miss report was
-     * assembled, and the miss report is the point of the phase. */
+    /* init() for every surviving instance, after the whole graph has resolved, so a failing init
+     * cannot abort declare before the miss report is assembled. */
     void finish_instances();
     int32_t find_kv_consumer(rad_kvgroup g);
     void finish_layouts();
@@ -218,32 +196,30 @@ private:
 
     std::string scope_;
 
-    /* Parallel to prog_.ops. Empty until the ABI carries buffer operands. */
+    /* Parallel to prog_.ops: the buffers each op declared it reads and writes. */
     struct OpBufUse { std::vector<rad_buf> reads, writes; };
     std::vector<OpBufUse> op_bufs_;
 
-    /* Buffers the architecture said it touches from the second lane. See rad_buf_concurrent:
-     * their declared op range does not bound when their bytes are in use, so liveness gives them
-     * the whole program instead. */
+    /* Buffers touched from the second lane (rad_buf_concurrent). Their declared op range does not
+     * bound when their bytes are in use, so they are live for the whole program. */
     std::set<rad_buf> concurrent_bufs_;
 
-    /* Parallel to prog_.kv_groups: where in the op list the group was declared, and which op was
-     * found to consume it. Declaration order is the binding, because nothing else links an op to
-     * a group -- see find_kv_consumer(). */
+    /* Parallel to prog_.kv_groups: where in the op list the group was declared, and the op found
+     * to consume it. Declaration order is the only link between an op and a group; see
+     * find_kv_consumer(). */
     std::vector<int32_t> kv_decl_at_;
     std::vector<int32_t> kv_consumer_;
 
-    /* Declared name -> the index in prog_.name_map of its FIRST entry, so a repeated declaration
-     * can be checked against it in constant time. A linear scan would be quadratic in the weight
-     * count, and a routed model declares tens of thousands of them. */
+    /* Declared name -> index of its first prog_.name_map entry, so a repeated declaration is
+     * checked in constant time; a routed model declares tens of thousands of weights. */
     std::unordered_map<std::string, size_t> name_map_first_;
 
-    /* Declared weight name -> its handle, for the same reason: Flash-Next declares about a hundred
-     * thousand weights a rank, and a scan of the ones before each made declare take seconds. */
+    /* Declared weight name -> handle, for the same reason (Flash-Next declares about 100K weights
+     * per rank). */
     std::unordered_map<std::string, rad_weight> weight_by_name_;
 
-    /* The model's answers, asked once a source: a routed model declares each expert's codes and
-     * scales as two weights over one source, and a checkpoint lookup is a name-map walk. */
+    /* The model's answers, cached per source: a routed model declares each expert's codes and
+     * scales as two weights over one source, and a checkpoint lookup walks the name map. */
     WeightSourceFn sources_;
     std::unordered_map<std::string, std::pair<int, WeightSource>> source_cache_;
     int lookup_source(const std::string& name, WeightSource* out);
@@ -252,50 +228,16 @@ private:
 };
 
 /* ------------------------------------------------------------------ --debug-graph (spec §16) */
-/* The entire declared graph: every op in declared order, its bucket table with one line per band,
- * the kernel and variant that resolved each band and which plugin it came from, the constraints
- * that matched, the weights it touches and the buffer it writes; then the weight manifest, the
- * buffer plan, the KV groups, the tuning requests and the miss report.
- *
- * This is the answer to "it is unclear what even runs", so it is a first-class artifact and not a
- * debug print: the bucket-table block is byte-for-byte the format in spec §2.2. */
+/* The entire declared graph: every op in declared order with its bucket table (one line per band:
+ * the resolving kernel, variant and plugin, the matched constraints, the weights touched and the
+ * buffer written); then the weight manifest, buffer plan, KV groups, tuning requests and miss
+ * report. The bucket-table block is exactly the format in spec §2.2. */
 std::string dump_graph_str(const Program& p, const std::vector<std::string>* errors = nullptr);
 
-/* The same walk, as JSON, for the server's Model view. Grouped by (op, band table): a 64-layer
- * model declares one op sixty-four times with one bucket table, and sixty-four identical rows are
- * not more information than one row saying x64. */
+/* The same walk as JSON, for the server's Model view, grouped by (op, band table): an op declared
+ * once per layer with one bucket table is one row with a count. */
 std::string dump_graph_json(const Program& p);
 void        dump_graph    (const Program& p, FILE* out,
                            const std::vector<std::string>* errors = nullptr);
 
 }  /* namespace rad */
-
-/* ------------------------------------------------------------------ PROPOSED ABI ADDITION */
-/* These two belong in include/rad/rad_builder.h beside rad_decl_op, and they are declared here
- * only because that header is frozen and this one is not. They are purely additive: no existing
- * signature changes and no existing plugin breaks.
- *
- * Without them, an op names its weight operands and not its buffer operands, so the declare phase
- * cannot compute activation liveness and the arena is the sum of every transient rather than the
- * peak of them -- on a 64-layer model with a per-layer residual and a per-layer FFN intermediate
- * that is the difference between one buffer and a hundred and twenty-eight. The declaration reads:
- *
- *     rad_op h = RAD_OP(b, "gemm_nt", RAD_PARAMS(...), RAD_WEIGHTS(w));
- *     rad_op_reads (b, h, RAD_BUFS(x));
- *     rad_op_writes(b, h, RAD_BUFS(y));
- *
- * Separate calls rather than more arguments to rad_decl_op, so the common declaration stays one
- * line and the buffer plan is opt-in per op. */
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-int rad_op_reads (RadBuilder* b, rad_op h, const rad_buf* bufs, int n);
-int rad_op_writes(RadBuilder* b, rad_op h, const rad_buf* bufs, int n);
-
-#define RAD_BUFS(...)  ((const rad_buf[]){ __VA_ARGS__ }), \
-                       (int)(sizeof((const rad_buf[]){ __VA_ARGS__ }) / sizeof(rad_buf))
-
-#ifdef __cplusplus
-}   /* extern "C" */
-#endif

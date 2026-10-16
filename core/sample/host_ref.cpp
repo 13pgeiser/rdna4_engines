@@ -1,9 +1,8 @@
 /* host_ref.cpp -- llama.cpp's sampling chain, ported to plain C++ over a float array.
  *
  * Source: llama.cpp `src/llama-sampler.cpp` at upstream commit 06938ac12 (MIT). Ported rather
- * than linked: this is the oracle the device samplers are checked against, and an oracle that
- * drags a second inference engine in is a dependency rather than a reference. See host_ref.h for
- * the two places this deliberately differs from upstream -- the chain order and the RNG.
+ * than linked, so the oracle carries no second engine as a dependency. host_ref.h lists the two
+ * deliberate deviations: chain order and RNG.
  */
 #include "host_ref.h"
 
@@ -29,10 +28,8 @@ void CandidateSet::from_logits(const float* logits, int64_t n_vocab) {
     selected = -1;
 }
 
-/* Upstream sorts on the logit alone and leaves equal logits in whatever order the partial sort
- * happened to produce. That is fine for a single-threaded reference and useless for one that has
- * to agree with a device kernel, where the order equal elements land in is a property of the
- * block size. The id tie-break makes the sort a total order, so the two agree. */
+/* Upstream sorts on the logit alone, leaving ties in arbitrary order; on the device that order
+ * depends on the block size. The id tie-break makes it a total order both sides share. */
 void CandidateSet::sort_desc() {
     if (sorted) return;
     std::stable_sort(c.begin(), c.end(), [](const Candidate& a, const Candidate& b) {
@@ -44,29 +41,25 @@ void CandidateSet::sort_desc() {
 
 /* ================================================================== reproducible randomness */
 
-/* The stream's key, from abi/rad_sample.h. A stream this file does not know gets a key of its
- * own rather than the pick's, so it can never silently repeat the pick's draw. */
+/* The stream's key from abi/rad_sample.h. An unknown stream gets a key of its own, never the
+ * pick's. */
 static uint64_t stream_key(uint32_t stream) {
     switch (stream) {
         case RAD_RNG_PICK:   return RAD_SAMPLE_KEY_PICK;
         case RAD_RNG_XTC:    return RAD_SAMPLE_KEY_XTC;
-        case RAD_RNG_ACCEPT: return RAD_SAMPLE_KEY_ACCEPT;
-        case RAD_RNG_RESID:  return RAD_SAMPLE_KEY_RESID;
         default:             return rad_sample_splitmix64((uint64_t)stream);
     }
 }
 
-/* rad_sample_uniform01's bits, before the float conversion: one splitmix64 round over
- * ((seed ^ key) * golden ratio + pos). The same handful of integer ops a sampler kernel runs,
- * which is what makes it affordable there where a Mersenne twister's state is not. */
+/* rad_sample_uniform01's bits before the float conversion: one splitmix64 round over
+ * ((seed ^ key) * golden ratio + pos), cheap and stateless enough for a kernel. */
 uint64_t rng_bits(uint64_t seed, uint64_t pos, uint32_t stream) {
     return rad_sample_splitmix64((seed ^ stream_key(stream)) * 0x9E3779B97F4A7C15ull + pos);
 }
 
 float rng_uniform(uint64_t seed, uint64_t pos, uint32_t stream) {
-    /* 24 bits, which is every bit a float can hold. Drawing 32 and dividing by 2^32 would round
-     * to 1.0f for the top values, and a uniform that can return 1.0 walks off the end of an
-     * inverse CDF. Written as rad_sample_uniform01 itself, so the two cannot drift apart. */
+    /* 24 bits: 32 bits divided by 2^32 can round to 1.0f, which walks off the end of an inverse
+     * CDF. Calls rad_sample_uniform01 itself so host and device cannot drift apart. */
     return rad_sample_uniform01(seed ^ stream_key(stream), pos);
 }
 
@@ -86,22 +79,27 @@ void host_softmax(CandidateSet& s, bool do_sort) {
         e.p = p;
         cum += p;
     }
-    if (cum <= 0.0) return;   /* every candidate masked out; leave p at zero and let the pick say so */
+    if (cum <= 0.0) return;   /* everything masked; p stays zero and the pick reports it */
     for (auto& e : s.c) e.p = (float)(e.p / cum);
+}
+
+/* Index of the highest logit, ties to the lowest id whatever the set's order, as the argmax
+ * kernel breaks them. The set must not be empty. */
+static size_t best_index(const CandidateSet& s) {
+    size_t best = 0;
+    for (size_t i = 1; i < s.c.size(); ++i) {
+        if (s.c[i].logit > s.c[best].logit) best = i;
+        else if (s.c[i].logit == s.c[best].logit && s.c[i].id < s.c[best].id) best = i;
+    }
+    return best;
 }
 
 void host_temp(CandidateSet& s, float temp) {
     if (s.c.empty()) return;
 
-    /* temp <= 0 is greedy and stays a real path rather than a caller's special case: the argmax
-     * it produces must use the SAME tie-break the argmax kernel uses (lowest id wins), or a
-     * temperature-0 request stops matching a greedy run. */
+    /* temp <= 0 is greedy, so a temperature-0 request matches a greedy run. */
     if (temp <= 0.0f) {
-        size_t max_i = 0;
-        for (size_t i = 1; i < s.c.size(); ++i) {
-            const Candidate& e = s.c[i];
-            if (e.logit > s.c[max_i].logit) max_i = i;
-        }
+        const size_t max_i = best_index(s);
         for (size_t i = 0; i < s.c.size(); ++i)
             if (i != max_i) s.c[i].logit = -INFINITY;
         return;
@@ -118,14 +116,14 @@ void host_top_k(CandidateSet& s, int32_t k) {
 }
 
 void host_top_p(CandidateSet& s, float p, size_t min_keep) {
-    if (p >= 1.0f || s.c.empty()) return;
+    /* p <= 0 is off, as in sample_topp; upstream would keep min_keep candidates. */
+    if (p >= 1.0f || !(p > 0.0f) || s.c.empty()) return;
 
     s.sort_desc();
     host_softmax(s, false);
 
-    /* Upstream has an adaptive partial sort that grows k until the nucleus closes; it is a
-     * performance path over a 151K vocab and produces the same set as a full sort, so the
-     * reference takes the full sort and the device kernel takes the radix threshold. */
+    /* Upstream's adaptive partial sort is a performance path that yields the same set; the
+     * reference does a full sort and the device kernel a radix threshold. */
     float  cum = 0.0f;
     size_t last_idx = s.c.size();
     for (size_t i = 0; i < s.c.size(); ++i) {
@@ -138,10 +136,8 @@ void host_top_p(CandidateSet& s, float p, size_t min_keep) {
 void host_min_p(CandidateSet& s, float p, size_t min_keep) {
     if (p <= 0.0f || s.c.empty()) return;
 
-    /* Upstream has an unsorted fast path that filters in place and falls back to the sorted one
-     * when too few survive. Both select the same SET and differ only in the order they leave it
-     * in; the reference takes the sorted path because an order that depends on which path ran is
-     * an order a device kernel cannot reproduce. */
+    /* Upstream also has an unsorted fast path. It selects the same set but leaves a different
+     * order, which a device kernel cannot reproduce, so the reference always sorts. */
     s.sort_desc();
 
     const float min_logit = s.c[0].logit + std::log(p);   /* p_i >= p * p_max */
@@ -153,7 +149,7 @@ void host_min_p(CandidateSet& s, float p, size_t min_keep) {
 }
 
 void host_typical(CandidateSet& s, float p, size_t min_keep) {
-    if (p >= 1.0f || s.c.empty()) return;
+    if (p >= 1.0f || !(p > 0.0f) || s.c.empty()) return;
 
     host_softmax(s, true);
 
@@ -161,13 +157,12 @@ void host_typical(CandidateSet& s, float p, size_t min_keep) {
     for (const auto& e : s.c)
         if (e.p > 0.0f) entropy += -e.p * std::log(e.p);
 
-    /* The distance between a candidate's surprisal and the distribution's entropy. Sorting by it
-     * is what makes typical sampling different from every other cut here: it keeps the tokens
-     * that are AS surprising as expected, not the least surprising ones. */
+    /* Distance between each candidate's surprisal and the entropy; typical sampling keeps the
+     * tokens closest to the expected surprisal. A zero-probability candidate has none. */
     std::vector<float> shifted(s.c.size());
     for (size_t i = 0; i < s.c.size(); ++i) {
         const float pi = s.c[i].p;
-        shifted[i] = std::fabs(-(pi > 0.0f ? std::log(pi) : -INFINITY) - entropy);
+        shifted[i] = pi > 0.0f ? std::fabs(-std::log(pi) - entropy) : INFINITY;
     }
 
     std::vector<size_t> idx(s.c.size());
@@ -177,18 +172,26 @@ void host_typical(CandidateSet& s, float p, size_t min_keep) {
         return s.c[a].id < s.c[b].id;      /* total order, same reason as sort_desc */
     });
 
+    /* The cut is a distance, not a count: the smallest distance whose candidates at or below it
+     * carry at least p, with every candidate at that distance kept. sample_typical keeps the tied
+     * set the same way, so the result does not depend on an order among equal distances. With no
+     * such distance (rounding leaves the whole mass below p) nothing is cut. */
     float  cum = 0.0f;
-    size_t last_idx = idx.size();
+    size_t keep = idx.size();
     for (size_t i = 0; i < idx.size(); ++i) {
+        if (!(s.c[idx[i]].p > 0.0f)) break;
         cum += s.c[idx[i]].p;
-        if (cum > p && (min_keep == 0 || i >= min_keep - 1)) { last_idx = i + 1; break; }
+        const bool tie_next = i + 1 < idx.size() && shifted[idx[i + 1]] == shifted[idx[i]];
+        if (cum >= p && !tie_next) { keep = i + 1; break; }
     }
+    keep = std::max(keep, std::min(min_keep, idx.size()));
 
     std::vector<Candidate> kept;
-    kept.reserve(last_idx);
-    for (size_t i = 0; i < last_idx; ++i) kept.push_back(s.c[idx[i]]);
+    kept.reserve(keep);
+    for (size_t i = 0; i < keep; ++i) kept.push_back(s.c[idx[i]]);
     s.c = std::move(kept);
     s.sorted = false;                       /* surprisal order is not logit order */
+    s.sort_desc();
 }
 
 void host_penalties(CandidateSet& s, const int32_t* history, int64_t n_history,
@@ -207,9 +210,8 @@ void host_penalties(CandidateSet& s, const int32_t* history, int64_t n_history,
         if (it == count.end()) continue;
         const int n = it->second;
 
-        /* The paper divides. Dividing makes a token with a negative logit MORE likely, which is
-         * obviously wrong, so everyone multiplies below zero instead. Upstream's comment says the
-         * same thing and the reference has to reproduce the fix, not the paper. */
+        /* The paper always divides, which makes a negative logit more likely; upstream
+         * multiplies below zero instead, and the reference follows upstream. */
         if (e.logit <= 0.0f) e.logit *= rep;
         else                 e.logit /= rep;
 
@@ -248,8 +250,7 @@ bool DryBreakers::is_single(int32_t t) const {
 }
 
 /* The longest prefix of `s` of at most `max` bytes that does not end inside a UTF-8 sequence.
- * Upstream truncates at the byte; cutting a character in half leaves a tail the tokeniser may
- * refuse, and a refused tail fails the whole request. */
+ * Upstream cuts at the byte, which can leave a tail the tokeniser refuses, failing the request. */
 static std::string utf8_prefix(const std::string& s, size_t max) {
     if (s.size() <= max) return s;
     size_t n = max;
@@ -270,17 +271,15 @@ int dry_prepare_breakers(const VocabView& vocab, const std::vector<std::string>&
         return RAD_E_INVAL;
     }
 
-    /* Upstream: get_overlapping_token_sequences. A full vocabulary scan per breaker string, which
-     * is why this runs once per request on admission and never on the step path. */
+    /* Upstream: get_overlapping_token_sequences. A full vocabulary scan per breaker, so this runs
+     * once per request, never on the step path. */
     const int32_t n = vocab.n_tokens();
     for (const std::string& given : breakers) {
         const std::string str = utf8_prefix(given, kDryBreakerMaxBytes);
         if (str.empty()) continue;
 
-        /* THE TAIL DEPENDS ONLY ON WHERE THE BREAKER WAS SPLIT, not on which token covered its
-         * head: every token whose suffix is the breaker's first i bytes is completed by the
-         * tokenisation of the remaining bytes. So each split point is tokenised once rather than
-         * once per matching token -- a breaker that starts with a common byte matches thousands
+        /* The tail depends only on the split point i, not on which token covered the head, so
+         * each split is tokenised once. A breaker starting with a common byte matches thousands
          * of tokens, and tokenising is the expensive half of the scan. */
         std::vector<std::vector<int32_t>> tail_at(str.size());
         std::vector<char> have(str.size(), 0);
@@ -304,9 +303,7 @@ int dry_prepare_breakers(const VocabView& vocab, const std::vector<std::string>&
                     std::vector<int32_t>& fresh = tail_at[i];
                     const int st = vocab.tokenize(str.substr(i), &fresh);
                     if (st < 0) {
-                        /* A breaker that cannot be tokenised is a breaker that silently stops
-                         * working, and a DRY request whose breakers vanished is a DRY request
-                         * that quietly changed behaviour. Say so. */
+                        /* Fail loudly rather than run DRY with a breaker missing. */
                         RAD_WARN("dry: sequence breaker \"%s\" does not tokenise (%s)",
                                  str.c_str(), rad_strerror(st));
                         out->seqs.clear();
@@ -363,26 +360,24 @@ void host_dry(CandidateSet& s, const int32_t* history, int64_t n_history,
     if (!history || n_history <= 0) return;
     if (total_context <= 0) total_context = n_history;
 
-    const int64_t effective = (p.penalty_last_n == -1) ? total_context
-                                                       : std::max(p.penalty_last_n, 0);
+    /* Any negative window is the whole context, as in sample_dry; upstream reads only -1 so. */
+    const int64_t effective = p.penalty_last_n < 0 ? total_context : (int64_t)p.penalty_last_n;
     const int n_rep = (int)std::min(std::min(n_history, effective), total_context);
     if (n_rep <= p.allowed_length) return;
 
-    /* rat(i): the i-th token counting back from the end of the window. Upstream reads it off a
-     * ring buffer; here the history is a flat array the scheduler already owns. */
+    /* rat(i): the i-th token counting back from the end of the window. Upstream reads a ring
+     * buffer; here the history is the scheduler's flat array. */
     auto rat = [&](int i) -> int32_t { return history[n_history - 1 - i]; };
 
     std::vector<int> repeat_count((size_t)n_rep, 0);
     std::unordered_map<int32_t, int> max_token_repeat;
 
-    /* Step 1: a restart sequence bounds how long a repetition may be counted. Walking back from
-     * the end, the first token that heads a complete breaker sequence caps it. */
+    /* Step 1: the most recent complete breaker sequence caps the counted repeat length. */
     const int rep_limit = dry_rep_limit(breakers, history + (n_history - n_rep), n_rep);
     if (rep_limit < p.allowed_length) return;
 
-    /* Step 2: the Z-algorithm, run in reverse, giving for every position the length of the
-     * suffix that also appears ending there. Linear despite the nested loops, because lt/rt bound
-     * each token to one visit. */
+    /* Step 2: the Z-algorithm in reverse, giving for every position the length of the suffix
+     * that also ends there. Linear: lt/rt bound each token to one visit. */
     {
         const int last = n_rep - 1;
         int rt = 0, lt = 0;
@@ -408,8 +403,8 @@ void host_dry(CandidateSet& s, const int32_t* history, int64_t n_history,
         }
     }
 
-    /* Step 3: for every position that ends a long-enough repeat, the NEXT token would extend it.
-     * That token is the one to penalise, and by the length it would reach. */
+    /* Step 3: the token after each long-enough repeat would extend it; record the longest
+     * repeat per such token. */
     for (int i = 0; i < n_rep - 1; ++i) {
         const int len = repeat_count[(size_t)i];
         if (len < p.allowed_length) continue;
@@ -418,18 +413,17 @@ void host_dry(CandidateSet& s, const int32_t* history, int64_t n_history,
         if (it == max_token_repeat.end() || it->second < len) max_token_repeat[tok] = len;
     }
 
-    /* Step 4: an exponential penalty in the excess length, clamped so pow() cannot overflow a
-     * float -- log(FLT_MAX) is 88.72, and past that the penalty is infinite anyway. */
-    const float FLOAT_MAX_LOG = 88.7228391f;
+    /* Step 4: a penalty exponential in the excess length, with the exponent clamped so pow()
+     * cannot overflow a float (log(FLT_MAX) = 88.72). */
+    const float kFloatMaxLog = 88.7228391f;
     int max_exponent = 0;
-    if (p.base > 1.000001f) max_exponent = (int)(FLOAT_MAX_LOG / std::log(p.base));
+    if (p.base > 1.000001f) max_exponent = (int)(kFloatMaxLog / std::log(p.base));
 
     for (auto& e : s.c) {
         auto it = max_token_repeat.find(e.id);
         if (it == max_token_repeat.end()) continue;
 
-        /* A token that is itself a single-token breaker is exempt: penalising it would penalise
-         * the very thing that ends the repetition. */
+        /* A single-token breaker is exempt: it is what ends the repetition. */
         if (breakers.is_single(e.id)) continue;
 
         int exp_n = it->second - p.allowed_length;
@@ -443,12 +437,13 @@ void host_dry(CandidateSet& s, const int32_t* history, int64_t n_history,
 
 void host_xtc(CandidateSet& s, float probability, float threshold, size_t min_keep,
               uint64_t seed, uint64_t pos) {
-    if (probability <= 0.0f || threshold > 0.5f || s.c.size() < 2) return;
+    /* threshold <= 0 is off, as in sample_xtc. Upstream fires and keeps only the least probable
+     * candidate, since every candidate is at or above 0. */
+    if (probability <= 0.0f || !(threshold > 0.0f) || threshold > 0.5f || s.c.size() < 2) return;
 
-    /* Its own RNG stream: XTC's coin and the pick must not be the same number, or a request
-     * whose XTC fires becomes a request whose pick is correlated with that fact. It fires when
-     * the uniform is BELOW the probability, the comparison `sample_xtc` makes, so the two agree
-     * on the draw that lands exactly on it. */
+    /* A separate RNG stream, so the pick is not correlated with XTC firing. Fires when the
+     * uniform is below the probability, the comparison `sample_xtc` makes, so a draw exactly on
+     * it agrees. */
     if (rng_uniform(seed, pos, RAD_RNG_XTC) >= probability) return;
 
     host_softmax(s, true);
@@ -459,8 +454,7 @@ void host_xtc(CandidateSet& s, float probability, float threshold, size_t min_ke
         else break;
     }
 
-    /* Drop everything above the threshold EXCEPT the least probable of them. That is the whole
-     * idea: remove the obvious continuation, not the unlikely ones. */
+    /* Drop everything above the threshold except the least probable of them. */
     if (s.c.size() - pos_last >= min_keep && pos_last > 0)
         s.c.erase(s.c.begin(), s.c.begin() + (std::ptrdiff_t)pos_last);
 }
@@ -485,17 +479,14 @@ int32_t host_pick(CandidateSet& s, uint64_t seed, uint64_t pos) {
     float max_l = -INFINITY;
     for (const auto& e : s.c) max_l = std::max(max_l, e.logit);
     if (!(max_l > -INFINITY)) {
-        /* Every candidate is -inf. That is a fully-masked distribution, which is a grammar that
-         * admits nothing -- a real failure, not a token. The caller fails the request. */
+        /* Fully masked: the grammar admits nothing. The caller fails the request. */
         s.selected = -1;
         return -1;
     }
     if (s.c.size() == 1) { s.selected = 0; s.c[0].p = 1.0f; return s.c[0].id; }
 
-    /* DESCENDING LOGIT, ties to the lower id, not the set's current order. Any fixed order
-     * samples correctly, but a total order makes the answer a property of the uniform rather than
-     * of how the previous stage happened to permute the set -- and this is the order sample_pick
-     * walks, since sample_topk leaves its candidates in it. */
+    /* Walk in descending logit, ties to the lower id, independent of the set's current order.
+     * This is the order sample_pick walks, since sample_topk leaves its candidates in it. */
     std::vector<size_t> order(s.c.size());
     std::iota(order.begin(), order.end(), (size_t)0);
     std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
@@ -509,9 +500,8 @@ int32_t host_pick(CandidateSet& s, uint64_t seed, uint64_t pos) {
 
     const double want = (double)rng_uniform(seed, pos, RAD_RNG_PICK) * total;
 
-    /* A candidate at -infinity is never chosen, and the fall-through is the last one above it: a
-     * draw at the very top of the range can walk past every comparison in floating point, and
-     * the candidates behind the last real one are the grammar-masked ones. */
+    /* A -inf candidate is never chosen. A draw at the top of the range can pass every
+     * comparison in floating point, so the fall-through is the last finite candidate. */
     double  acc = 0.0;
     size_t  chosen = order.front();
     for (size_t i : order) {
@@ -538,59 +528,52 @@ int32_t host_argmax(const float* logits, int64_t n_vocab) {
 
 /* ================================================================== the chain */
 
-static int32_t argmax_of(const CandidateSet& s) {
-    if (s.c.empty()) return -1;
-    size_t best = 0;
-    for (size_t i = 1; i < s.c.size(); ++i) {
-        if (s.c[i].logit > s.c[best].logit) best = i;
-        else if (s.c[i].logit == s.c[best].logit && s.c[i].id < s.c[best].id) best = i;
-    }
-    if (!(s.c[best].logit > -INFINITY)) return -1;   /* everything masked out */
-    return s.c[best].id;
-}
-
 int32_t host_sample_into(CandidateSet& s, const SamplingParams& sp, const HostRefInput& in,
                          ChainOrder order) {
-    /* Penalties first in both orders, because they act on raw logits and every cut below acts on
-     * probabilities derived from them. */
+    /* Penalties first in both orders: they act on raw logits, the cuts on probabilities. */
     host_penalties(s, in.history, in.n_history, sp.penalty_last_n,
                    sp.rep_penalty, sp.freq_penalty, sp.pres_penalty);
 
-    if (sp.dry_multiplier > 0.0f && in.dry_breakers) {
+    /* DRY runs without breakers, as the device chain does; breakers only cap the repeat length.
+     * An allowed length below 1 is 2, as sample_dry reads it (admission refuses one). */
+    if (sp.dry_multiplier > 0.0f) {
+        static const DryBreakers kNone;
         DryParams dp;
         dp.multiplier     = sp.dry_multiplier;
         dp.base           = sp.dry_base;
-        dp.allowed_length = sp.dry_allowed_length;
+        dp.allowed_length = sp.dry_allowed_length > 0 ? sp.dry_allowed_length : 2;
         dp.penalty_last_n = sp.dry_penalty_last_n;
-        host_dry(s, in.history, in.n_history, in.total_context, dp, *in.dry_breakers);
+        host_dry(s, in.history, in.n_history, in.total_context, dp,
+                 in.dry_breakers ? *in.dry_breakers : kNone);
     }
 
-    /* THE GREEDY PATH SKIPS THE CHAIN, and it masks BEFORE it picks. Ordering matters here in a
-     * way that is easy to get wrong: temperature 0 collapses every other logit to -inf, so a
-     * mask applied afterwards can leave nothing at all. A greedy sequence is therefore
-     * penalties -> mask -> argmax, not the chain with temp=0 threaded through it. */
+    /* Greedy skips the chain: penalties -> mask -> argmax. Temperature 0 collapses every other
+     * logit to -inf, so a mask applied after it could leave nothing. */
     if (sp.greedy()) {
         host_mask(s, in.bitmask, in.n_words);
-        const int32_t tok = argmax_of(s);
-        for (size_t i = 0; i < s.c.size(); ++i) if (s.c[i].id == tok) { s.selected = (int)i; break; }
-        return tok;
+        if (s.c.empty()) return -1;
+        const size_t best = best_index(s);
+        if (!(s.c[best].logit > -INFINITY)) return -1;   /* everything masked out */
+        s.selected = (int)best;
+        return s.c[best].id;
     }
 
     if (order == ChainOrder::Radiance) {
         /* `temp_last` moves temperature behind the cuts, as the device chain moves it onto the
-         * candidate plane (Sampler::issue); the cuts keep this order either way. */
+         * candidate plane (Sampler::run). */
         if (!sp.temp_last) host_temp(s, sp.temp);
         host_mask(s, in.bitmask, in.n_words);
-        host_top_k(s, sp.top_k);
+        /* sample_topk narrows every row to the candidate width; top_k 0 is that width. */
+        const int64_t width = in.max_candidates > 0 ? in.max_candidates : (int64_t)s.c.size();
+        host_top_k(s, (int32_t)(sp.top_k > 0 ? std::min<int64_t>(sp.top_k, width) : width));
         host_top_p(s, sp.top_p, 1);
         host_min_p(s, sp.min_p, 1);
         host_typical(s, sp.typical_p, 1);
         host_xtc(s, sp.xtc_probability, sp.xtc_threshold, 1, sp.seed, in.pos);
         if (sp.temp_last) host_temp(s, sp.temp);
     } else {
-        /* llama.cpp's default order, for checking this port against llama.cpp itself. Note the
-         * absence of top-n-sigma: it is not in SamplingParams and radiance does not ship it, so a
-         * comparison that enables it upstream will disagree here and should. */
+        /* llama.cpp's default order, for checking this port against llama.cpp. Top-n-sigma is
+         * not in SamplingParams, so a comparison that enables it upstream will disagree. */
         host_mask(s, in.bitmask, in.n_words);
         host_top_k(s, sp.top_k);
         host_typical(s, sp.typical_p, 1);

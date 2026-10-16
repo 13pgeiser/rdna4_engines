@@ -1,22 +1,19 @@
 /* chat.h -- rendering a message list to a prompt, and what the template can do.
  *
- * This is a thin face over the lifted `common_chat_*` API (vendor/llama/common/chat.*, jinja/,
- * see vendor/UPSTREAM). It does three things the lift does not:
+ * A thin layer over the lifted `common_chat_*` API (vendor/llama/common/chat.*, jinja/, see
+ * vendor/UPSTREAM). It adds three things:
  *
- *   1. ERRORS ARE VALUES. Upstream throws -- a bad template, a message the template rejects, a
- *      malformed OAI request are all std::runtime_error, and a throw crossing the server's
- *      request loop is not a failure mode this project accepts. Everything here returns a
- *      negative RAD_E_* and logs once.
- *   2. It takes the template out of the .rad instead of out of a llama_model. RadVocabHeader
- *      carries the chat template, the BOS/EOS spellings and the add_bos/add_eos flags, which is
- *      exactly the four things common_chat_templates_init() would otherwise read off a model.
- *   3. It keeps the lifted headers out of the rest of core/. Only chat.cpp, chatfmt.cpp and
- *      chatparse.cpp include them, the last only to resolve schema types when a request's tools
- *      are bound, so a vendor refresh cannot ripple into the server.
+ *   1. Errors are values. Upstream throws std::runtime_error for a bad template, a rejected
+ *      message or a malformed OAI request; a throw must not cross the server's request loop, so
+ *      everything here returns a negative RAD_E_* and logs once.
+ *   2. The template comes from the .rad, not a llama_model. RadVocabHeader carries the chat
+ *      template, the BOS/EOS spellings and the add_bos/add_eos flags, the four things
+ *      common_chat_templates_init() would otherwise read off a model.
+ *   3. The lifted headers stay out of the rest of core/. Only chat.cpp, chatfmt.cpp and
+ *      chatparse.cpp include them (the last only to resolve schema types for bound tools), so a
+ *      vendor refresh cannot ripple into the server.
  *
- * Messages and tools arrive as OpenAI-shaped JSON, because that is what the server has and the
- * lift already knows how to read it. Converting to a struct here and back inside would be a
- * translation nobody asked for.
+ * Messages and tools are OpenAI-shaped JSON, which is what the server has and what the lift reads.
  */
 #pragma once
 #include "rad_internal.h"
@@ -32,10 +29,9 @@ namespace rad {
 
 class Vocab;
 
-/* What the template supports, PROBED rather than assumed -- jinja/caps.cpp renders the template
- * against synthetic inputs and watches what it does with them (spec §12, "template capability
- * probe"). The server reports this on /props, and the message adapter uses it to decide whether
- * to hand the template a string content or a typed content array. */
+/* What the template supports, probed rather than assumed: jinja/caps.cpp renders the template
+ * against synthetic inputs and watches what it reads (spec §12, "template capability probe").
+ * Reported on /props; the message adapter uses it to choose string or typed-array content. */
 struct ChatCaps {
     bool tools = true;
     bool tool_calls = true;
@@ -45,7 +41,6 @@ struct ChatCaps {
     bool string_content = true;
     bool typed_content = false;
     bool object_arguments = false;
-
 };
 
 struct ChatOptions {
@@ -81,22 +76,16 @@ struct ChatPrompt {
     bool        supports_thinking = false;
     std::string thinking_start_tag, thinking_end_tag;
 
-    /* The auto-parser's own verdict on this render: `format` is a common_chat_format value and
-     * deliberately opaque here, `parser` the PEG grammar it derived. The engine reads replies
-     * with chatparse.h instead; these are kept for the differential tests that compare the two. */
+    /* The auto-parser's verdict on this render: `format` is an opaque common_chat_format value,
+     * `parser` the PEG grammar it derived. The engine parses replies with chatparse.h; these are
+     * kept for the differential tests that compare the two. */
     int         format = 0;
     std::string parser;
 
-    /* WHY THE TEMPLATE REFUSED, in the template's own words.
-     *
-     * A jinja `raise_exception` carries the one sentence that says what the caller got wrong --
-     * "Unexpected reasoning effort high. Supported types are xhigh (default), medium, and low."
-     * -- and it is carried out to the caller here rather than only into the log, so a 400 names
-     * the field at fault instead of saying only that the template refused the request. Filled
-     * only on a failure return; empty otherwise.
-     *
-     * It is the TEMPLATE'S text and therefore model-controlled, not attacker-controlled: it comes
-     * from the container's own jinja, which the operator chose along with the weights. */
+    /* Why the template refused, in its own words (a jinja `raise_exception` message such as
+     * "Unexpected reasoning effort high. Supported types are ..."), so a 400 names the field at
+     * fault. Set only on a failure return. The text comes from the container's jinja, so it is
+     * model-controlled, not attacker-controlled. */
     std::string error;
 };
 
@@ -105,29 +94,27 @@ public:
     ChatTemplate();
     ~ChatTemplate();
 
-    /* Compile a Jinja source. `bos`/`eos` are the token TEXTS, which templates reference as
-     * `bos_token` / `eos_token`. An empty source loads the ChatML fallback and says so at Warn:
-     * a model with no template is a model whose prompt format we are guessing, and guessing
-     * quietly is how a chat endpoint produces fluent nonsense. */
+    /* Compile a Jinja source. `bos`/`eos` are the token texts, which templates reference as
+     * `bos_token` / `eos_token`. An empty source loads the ChatML fallback with a Warn, since the
+     * prompt format is then a guess. */
     int load(const std::string& jinja_source, const std::string& bos, const std::string& eos,
              bool add_bos = false, bool add_eos = false);
-    /* The same, from a loaded vocab: template, bos text, eos text and the add flags all come off
-     * RadVocabHeader. This is the path the engine uses. */
+    /* The same, with template, bos/eos text and add flags taken from the vocab's RadVocabHeader.
+     * The engine uses this path. */
     int load_from_vocab(const Vocab& v);
 
     bool ready() const;
     const ChatCaps& caps() const;
     const std::string& source() const;
 
-    /* Render. `messages` and `tools` are OpenAI-shaped JSON (`tools` may be null or an empty
-     * array). Returns RAD_OK, or RAD_E_INVAL when the request does not parse, or
-     * RAD_E_UNSUPPORTED when the template refuses what was asked of it -- a system message to a
-     * template with no system role, tools to a template that has none. */
+    /* Render. `messages` and `tools` are OpenAI-shaped JSON (`tools` may be null or empty).
+     * Returns RAD_OK, RAD_E_INVAL when the request does not parse, or RAD_E_UNSUPPORTED when the
+     * template refuses it (e.g. a system message without a system role, or tools without tool
+     * support). */
     int apply(const nlohmann::ordered_json& messages, const nlohmann::ordered_json& tools,
               const ChatOptions& opt, ChatPrompt* out) const;
 
-    /* ChatML, the fallback. Named rather than inlined so the server can report which template it
-     * is running. */
+    /* The ChatML fallback, named so the server can report which template it runs. */
     static const char* chatml_source();
 
 private:

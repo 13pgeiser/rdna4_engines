@@ -3,13 +3,13 @@
 // flow-matching sampler over them, and the image decoder's convolution, channel norm, resampling
 // shortcuts and pixel output.
 //
-// EACH KERNEL ROUNDS WHERE ITS libref FUNCTION DOES (libref/ref_gen.cpp), and libref rounds where
-// the reference model materialises a bf16 tensor. A reduction's order differs -- a block sum here,
-// a sequential one there -- so a sum can land one bf16 step apart; nothing else does.
+// Each kernel rounds where its libref function does (libref/ref_gen.cpp), and libref rounds where
+// the reference model materialises a bf16 tensor. Only reduction order differs (a block sum here,
+// a sequential one there), so a sum can land one bf16 step apart.
 //
-// IMAGE GEOMETRY IS IN THE OPERANDS. An image operand is [height, width * channels], dense, and
-// the shims read both off its shape: a parameter is fixed at declare and an image's size is a
-// request's.
+// Image geometry comes from the operands: an image operand is a dense [height, width * channels],
+// and the shims read both off its shape, because parameters are fixed at declare and image size
+// is per request.
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_common.h"
@@ -18,6 +18,7 @@
 #include "rad_philox.h"
 
 #include <cmath>
+#include <initializer_list>
 #include <cstdlib>
 #include <cstring>
 
@@ -116,17 +117,15 @@ __global__ __launch_bounds__(kT) void gate_add_kernel(
 
 // ---------------------------------------------------------------------------- ln_mod_quant_fp8
 // gate_add, ln_mod and quant_act_fp8 in one pass over the row: the DiT block's norm in front of
-// every quantised linear, with the gated residual of the branch before it folded in. Three passes
-// over a 16384 x 4096 activation were ~0.9 GB of traffic a norm; this one reads the delta and the
-// residual and writes the residual and the E4M3 pair. The bf16 norm output is written only when
-// bound -- the fp8 linears read the codes.
+// every quantised linear, with the previous branch's gated residual folded in. Three passes over a
+// 16384 x 4096 activation are ~0.9 GB of traffic per norm; this reads the delta and the residual
+// and writes the residual and the E4M3 pair. The bf16 norm output is written only when bound.
 //
-// BIT-IDENTICAL TO THE THREE IT REPLACES, which the picture comparing equal across builds needs:
-// the residual is the gate_add arithmetic rounded to bf16 as its store rounds it, the mean and the
-// variance fold each thread's 8-wide chunks in ln_mod_kernel's order through the same block_sum,
-// the norm output is rounded to bf16 before it is quantised as quant_act_fp8 reads it, and the
-// codes are r4d_q8.h's. A 128-column group is sixteen consecutive chunks, so sixteen consecutive
-// lanes, and its amax is a half-wave reduction.
+// Bit-identical to the three kernels it replaces: the residual is gate_add's arithmetic rounded to
+// bf16 as its store rounds it, mean and variance fold each thread's 8-wide chunks in
+// ln_mod_kernel's order through the same block_sum, the norm output is rounded to bf16 before
+// quantising, and the codes are r4d_q8.h's. A 128-column group is sixteen consecutive lanes, so its
+// amax is a half-wave reduction.
 constexpr int kLnqChunks = 4;   // 8-wide chunks a thread keeps: n <= kT * 8 * 4 = 8192
 
 template <bool GATED>
@@ -224,8 +223,8 @@ __global__ __launch_bounds__(kT) void gather2_kernel(
         *(uint4*)(y + (size_t)r * y_ld + c) = src ? *(const uint4*)(src + c) : make_uint4(0, 0, 0, 0);
 }
 
-// The lane copies move WORDS: a row is `words` 32-bit words (64 bf16 latent channels are 32, an f32
-// mask value is one), so one kernel serves every dtype the lanes hold.
+// The lane copies move 32-bit words: a row is `words` words (64 bf16 latent channels are 32, an
+// f32 mask value is one), so one kernel serves every dtype the lanes hold.
 __global__ __launch_bounds__(kT) void lane_gather_kernel(
     const uint32_t* __restrict__ src, const int* __restrict__ lane, const int* __restrict__ cu,
     uint32_t* __restrict__ y, int words, int n_seq, int stride, int s_ldw, int y_ldw, int64_t total) {
@@ -317,8 +316,8 @@ __global__ __launch_bounds__(kT) void flow_euler_kernel(
 }
 
 // ---------------------------------------------------------------------------- per-channel ops
-// The two lists ride in the kernel's arguments, whose segment the backend caps at 768 bytes: 64
-// channels a list (a latent's) is 512 of them.
+// The two lists ride in the kernel arguments, whose segment the backend caps at 768 bytes; two
+// lists of 64 channels (a latent's) take 512.
 constexpr int kChanMax = 64;
 struct ChanLists { float mul[kChanMax], add[kChanMax]; };
 
@@ -424,24 +423,22 @@ __global__ __launch_bounds__(kT) void gelu_tanh_kernel(
 }
 
 // ---------------------------------------------------------------------------- conv2d_nhwc
-// AN IMPLICIT GEMM: y[pixel][cout] = sum over (tap, cin) of x_virtual[pixel's tap][cin] *
-// w[cout][tap][cin], the weight stored TAP-MAJOR (r4d_layout.cpp relayouts PyTorch's
-// [cout][cin][k][k] at load) so K runs over taps and then channels and a 64-wide K tile of the
-// image is eight 16-byte reads of NHWC rows -- the im2col never exists.
+// An implicit GEMM: y[pixel][cout] = sum over (tap, cin) of x_virtual[pixel's tap][cin] *
+// w[cout][tap][cin]. The weight is stored tap-major (r4d_layout.cpp relayouts PyTorch's
+// [cout][cin][k][k] at load), so K runs over taps then channels and a 64-wide K tile of the image
+// is eight 16-byte reads of NHWC rows; no im2col buffer.
 //
 // The block is r4d_gemm_bf16_nt_tiled's: eight waves, an activation tile of BP pixels and a weight
-// tile of BC output channels staged through LDS 64 K a time, the next tile's loads in flight under
-// the current one's WMMA. The weight is the WMMA's A operand and the pixels its B, so a lane's
-// accumulator is eight CONSECUTIVE output channels of one pixel and the store is 16 bytes.
+// tile of BC output channels staged through LDS 64 K at a time, with the next tile's loads in
+// flight under the current WMMA. The weight is the WMMA's A operand and the pixels its B, so a
+// lane's accumulator is eight consecutive output channels of one pixel and the store is 16 bytes.
 //
-// An input chunk of eight channels never straddles a tap because cin is a multiple of eight (the
-// shim sends anything else to the direct kernel below); a chunk past the image, past K or past the
-// last pixel is zeros.
+// An eight-channel input chunk never straddles a tap because cin is a multiple of eight (the shim
+// sends anything else to the direct kernel); a chunk past the image, K or the last pixel is zeros.
 //
-// THE KERNEL SIZE AND THE UPSAMPLING ARE TEMPLATE PARAMETERS (KS, UP; 0 reads the argument). A tap
-// index over a runtime k and a source row over a runtime `up` are two integer divisions per staged
-// chunk -- four chunks a thread a K tile, ~500 integer instructions beside 48 WMMA a wave -- and at
-// 3 and 2 they are a multiply-shift and a shift. The arithmetic is unchanged.
+// Kernel size and upsampling are template parameters (KS, UP; 0 reads the argument): at runtime
+// they cost two integer divisions per staged chunk (~500 integer instructions beside 48 WMMA a
+// wave), at 3 and 2 a multiply-shift and a shift.
 #define CV_BK 64
 #define CV_PITCH (CV_BK + 8)
 
@@ -826,7 +823,10 @@ extern "C" int r4d_rad_randn_lanes(const RadArgs* a, RadStream s) {
     const long long dl = r4d_rows_pitch(dst, n, &rd);
     if (dl < 0) return R4D_NO(RAD_E_STRIDE);
     const long long n_seq = r4d_numel(cu) - 1;
-    if (n <= 0 || stride <= 0 || n_seq <= 0) return R4D_NO(RAD_E_SHAPE);
+    if (n <= 0 || stride <= 0 || n_seq <= 0 || rd < stride) return R4D_NO(RAD_E_SHAPE);
+    /* One flag and lane an entry, two seed words. A lane's rows (device data) are not checked. */
+    if (r4d_numel(fl) < n_seq || r4d_numel(lane) < n_seq || r4d_numel(seed) < 2 * n_seq)
+        return R4D_NO(RAD_E_SHAPE);
     hipLaunchKernelGGL(randn_lanes_kernel, dim3(blocks_for(stride * n), (unsigned)n_seq), dim3(kT),
                        0, (hipStream_t)s, (const int*)fl->data, (const uint32_t*)seed->data,
                        (const int*)lane->data, (const int*)cu->data, (uint16_t*)dst->data, (int)n,
@@ -851,7 +851,14 @@ extern "C" int r4d_rad_flow_euler(const RadArgs* a, RadStream s) {
     const long long il = inp ? r4d_rows_pitch(inp, n, &ri) : 0;
     if (vl < 0 || sl < 0 || pl < 0 || il < 0) return R4D_NO(RAD_E_STRIDE);
     const long long n_seq = r4d_numel(cu) - 1;
-    if (n <= 0 || stride <= 0 || n_seq <= 0) return R4D_NO(RAD_E_SHAPE);
+    if (n <= 0 || stride <= 0 || n_seq <= 0 || rst < stride) return R4D_NO(RAD_E_SHAPE);
+    /* One scalar of each kind an entry, two seed words; inp, mask and preview are addressed by the
+     * state's rows. A lane's rows and a pair's entry (device data) are not checked. */
+    for (const RadTensor* e : { sg, sgn, cfg, pair, lane, fl })
+        if (r4d_numel(e) < n_seq) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(seed) < 2 * n_seq || (pv && rp < rst) || (inp && ri < rst) ||
+        (mask && r4d_numel(mask) < rst))
+        return R4D_NO(RAD_E_SHAPE);
     hipLaunchKernelGGL(flow_euler_kernel, dim3(blocks_for(stride * n), (unsigned)n_seq), dim3(kT), 0,
                        (hipStream_t)s, (const uint16_t*)v->data, (const float*)sg->data,
                        (const float*)sgn->data, (const float*)cfg->data, (const int*)pair->data,
@@ -918,11 +925,11 @@ extern "C" int r4d_rad_conv2d_nhwc(const RadArgs* a, RadStream s) {
                            (int)x->stride[0], (int)y->stride[0], (int64_t)total);
         return st_of(hipGetLastError());
     }
-    // 128 pixels a block, and the widest channel tile -- 192, 128, then 64 -- that leaves under a
-    // third of its last block idle. A wider tile does twice or three times the WMMA a K step for
-    // the same two barriers, and that pays even with the last block partly empty: on Qwen-Image's
-    // decoder the 192 tile against the 64 one is 144 channels 39.7 -> 26.3 ms, 288 125.9 -> 95.2
-    // (an upsampling layer), 576 109.9 -> 70.8, the same bytes out. 96 channels take 128.
+    // 128 pixels a block, and the widest channel tile (192, 128, then 64) that leaves under a third
+    // of its last block idle. A wider tile does two or three times the WMMA per K step for the same
+    // two barriers, which pays even with the last block partly empty: on Qwen-Image's decoder the
+    // 192 tile is 1.3-1.55x faster than the 64 tile at 144, 288 and 576 channels. 96 channels
+    // take 128.
     auto fits = [cout](long long bc) {
         const long long padded = (cout + bc - 1) / bc * bc;
         return (padded - cout) * 3 < padded;

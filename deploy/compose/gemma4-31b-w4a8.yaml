@@ -2,8 +2,8 @@
 # assistant head merged in as the MTP drafter (depth 3), and the vision tower. Sampling defaults are
 # the checkpoint's generation_config; thinking is switched per request (chat_template_kwargs).
 # For the full 262,144-token context use --max-model-len 262144 --max-num-seqs 2.
-# Prefill runs in 2048-token chunks: measured at TP2 on two R9700s, 1% faster than the 8192-token
-# default and no step long enough to hold a running decode for seconds.
+# Prefill runs in 2048-token chunks: at TP2 on two R9700s this is 1% faster than the 8192-token
+# default, and no step holds a running decode for seconds.
 name: radiance-gemma4-31b-w4a8
 services:
   radiance:

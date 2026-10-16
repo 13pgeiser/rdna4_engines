@@ -1,25 +1,21 @@
 /* ref_attn.cpp -- paged attention, dense attention, the KV write, and the two rotary forms.
  *
- * These are the ops most likely to be subtly wrong in any implementation, so they are written for
- * legibility over everything else: the mask is an explicit predicate per key, the softmax is two
- * plain passes with the max subtracted, and nothing is fused.
+ * These ops are the easiest to get subtly wrong, so they favour legibility: the mask is an explicit
+ * predicate per key, the softmax is two plain passes with the max subtracted, and nothing is fused.
  *
- * ============================== THE PAGED LAYOUT ==============================
+ * ============================== The paged layout ==============================
  *
  *     kv_cache[num_blocks, kv_heads, block_size, 2 * head_dim]      K then V inside a slot
  *
- * This is the layout every kernel in the project has to match (libr4d's `R4DArgs::kv` names the
- * same one), so it is stated in ref_ops.h and obeyed here. A flat slot index
- * s decomposes as block = s / block_size, offset = s % block_size; `block_table[seq, i]` holds the
- * block id of the sequence's i-th block and `slot_mapping[token]` holds the flat slot a token's KV
- * goes to.
+ * The layout every kernel must match (ref_ops.h; libr4d's `R4DArgs::kv`). A flat slot index s is
+ * block = s / block_size, offset = s % block_size; `block_table[seq, i]` holds the block id of the
+ * sequence's i-th block and `slot_mapping[token]` the flat slot a token's KV goes to.
  *
- * ============================== THE MASK ==============================
+ * ============================== The mask ==============================
  *
- * `seqused[s]` is the sequence's TOTAL key count INCLUDING this step's query tokens, so query row
- * i of a q_len-row step sits at absolute position seqused[s] - q_len + i. That is what makes one
- * kernel serve a decode (q_len 1), a speculative verify (q_len <= 64) and a prefill chunk
- * (q_len in the thousands) without the caller passing a second length.
+ * `seqused[s]` is the sequence's total key count including this step's query tokens, so query row
+ * i of a q_len-row step sits at absolute position seqused[s] - q_len + i. One kernel thus serves
+ * decode (q_len 1), speculative verify (q_len <= 64) and prefill chunks (q_len in the thousands).
  *
  *   causal = 1   key j is visible when j <= pos
  *   causal = 0   key j is visible when j <  seqused[s]
@@ -28,9 +24,8 @@
  */
 #include "ref_common.h"
 #include "rad_yarn.h"
-/* `row_stride`: which axis carries a row of `cols` elements, at whatever rank the operand arrived
- * in. Every q/k/v/out below goes through it rather than through `rank >= 3 ? stride[rank-3] : cols`
- * -- the comment above kv_store shows where that shortcut is wrong. */
+/* `row_stride`: every q/k/v/out row stride below goes through it rather than a rank-based
+ * shortcut; see kv_store for where the shortcut is wrong. */
 #include "ref_gemm.h"
 #include "ref_ops.h"
 
@@ -40,9 +35,9 @@ using namespace ref;
 
 namespace {
 
-/* The largest head this reference accumulates in one stack frame. The widest in circulation is an
- * image VAE's single-head mid-block attention at 1152 (Qwen-Image 2.1), so 2048 is headroom; above
- * it the op says RAD_E_UNSUPPORTED by name instead of overflowing a frame. */
+/* The largest head this reference accumulates in one stack frame. The widest in use is an image
+ * VAE's single-head mid-block attention at 1152 (Qwen-Image 2.1); above 2048 the op returns
+ * RAD_E_UNSUPPORTED instead of overflowing the frame. */
 enum { REF_HD_MAX = 2048 };
 
 struct KVView {
@@ -67,6 +62,16 @@ static inline KVView kv_view(const RadTensor* c, int64_t head_dim, int64_t block
     return v;
 }
 
+/* Cache element loaders with the dtype resolved once per launch: the same floats as ldt, and the
+ * per-element switch out of the inner loops. */
+template <uint32_t DT> struct KvFix {
+    float operator()(const void* p, int64_t i) const { return Cvt<DT>::ld(p, i); }
+};
+struct KvDyn  {
+    uint32_t dt;
+    float operator()(const void* p, int64_t i) const { return ld_dt(dt, p, i); }
+};
+
 }  /* namespace */
 
 /* ------------------------------------------------------------------ attn_paged */
@@ -80,10 +85,8 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
 
     const int64_t head_dim   = p_int(a, "head_dim", q->rank >= 3 ? q->shape[q->rank - 1] : 0);
     const int64_t gqa        = p_int(a, "gqa", 1);
-    /* `block_size` is RAD_DERIVED on this op (docs/OPS.md), so a caller who did not pin it and
-     * resolved to a kernel that declares no RAD_C_EQ for it -- ref's own row -- arrives here
-     * without the key. The cache tensor says what the block size is; ref reads it off the operand,
-     * which is this plugin's rule anyway, and cross-checks it below where the caller did name one. */
+    /* `block_size` is RAD_DERIVED here (docs/OPS.md), so a call resolved to ref's row may arrive
+     * without it. Read it off the cache tensor, and cross-check below when the caller names one. */
     const int64_t block_size = p_int(a, "block_size", kv->rank == 4 ? kv->shape[2] : 0);
     const int     causal     = (int)p_int(a, "causal", 1);
     const int64_t window     = p_int(a, "window", 0);
@@ -93,18 +96,16 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
     const int64_t kv_heads = kv->rank == 4 ? kv->shape[1] : 0;
     if (kv_heads <= 0) return RAD_E_SHAPE;
     const int64_t q_heads = gqa * kv_heads;
-    /* gqa and the cache's head count decide the query head count, so a rank-3 query that disagrees
-     * is a caller bug that would otherwise stride through the wrong rows and return plausible
-     * numbers. */
+    /* gqa and the cache's head count fix the query head count; a rank-3 query that disagrees would
+     * stride through the wrong rows. */
     if (q->rank >= 3 && q->shape[q->rank - 2] != q_heads) return RAD_E_SHAPE;
     const int64_t n_seq   = numel(su);
     const int64_t rows    = numel(q) / (q_heads * head_dim);
     if (n_seq <= 0 || rows <= 0) return RAD_E_SHAPE;
-    /* RAGGED BATCHES. cu_seqlens is optional and absent means every sequence presents the same
-     * query length, the uniform case. Present, it
-     * is [n_seq + 1] with cu[0] == 0 and cu[n_seq] == rows, and sequence s owns query rows
-     * [cu[s], cu[s+1]). A serving scheduler mixes one sequence prefill chunk with other single
-     * decode rows in the same step, so the ragged case is the ordinary one. */
+    /* Ragged batches. cu_seqlens is optional; absent, every sequence has the same query length.
+     * Present, it is [n_seq + 1] with cu[0] == 0 and cu[n_seq] == rows, and sequence s owns query
+     * rows [cu[s], cu[s+1]). Serving mixes a prefill chunk with decode rows in one step, so ragged
+     * is the ordinary case. */
     if (!cus && rows % n_seq != 0) return RAD_E_SHAPE;
     if (cus && numel(cus) != n_seq + 1) return RAD_E_SHAPE;
     const int64_t q_len = cus ? 0 : rows / n_seq;
@@ -127,96 +128,129 @@ int ref_attn_paged(const RadArgs* a, RadStream) {
 
     const float scale = p_f32(a, "scale", 1.0f / std::sqrt((float)head_dim));
     const int64_t total = rows * q_heads;
+    const int64_t jcap = max_blocks * block_size;
 
-    #pragma omp parallel for schedule(static)
-    for (int64_t idx = 0; idx < total; ++idx) {
-        const int64_t h   = idx % q_heads;
-        const int64_t tok = idx / q_heads;              /* the dense query row */
-        /* Which sequence owns it, and where inside that sequence's query it sits. Linear rather than a
-         * binary search: n_seq is a handful and this is the reference. */
-        int64_t s = 0, qlen = q_len, i = 0;
-        if (cus) {
-            while (s + 1 < n_seq && ld_int(cus->dtype, cus->data, offlin(cus, s + 1)) <= tok) ++s;
-            const int64_t beg = ld_int(cus->dtype, cus->data, offlin(cus, s));
-            qlen = ld_int(cus->dtype, cus->data, offlin(cus, s + 1)) - beg;
-            i = tok - beg;
-        } else {
-            s = tok / q_len;
-            i = tok - s * q_len;
-        }
-        if (qlen <= 0) continue;
-        const int64_t kh = h / gqa;
+    /* Every (query row, head) is one output row, computed as below in a fixed order: per visible
+     * key, dot = sum over d of q[d] * (k[d] * k_descale), score = dot * scale; then the max over the
+     * scores in key order; then sum and acc[d] accumulate exp(score - max) and
+     * exp(...) * (v[d] * v_descale) in key order. The query row is widened once, each score is kept
+     * for the second pass instead of recomputed, and four keys' dot chains run side by side; none
+     * of that changes a value. */
+    REF_PAR_REGION(total * head_dim * 64)
+    {
+        float* const sc = ws_get((size_t)std::max<int64_t>(jcap, 1));
+        REF_FOR_DYN
+        for (int64_t idx = 0; idx < total; ++idx) {
+            auto unit = [&](auto kl) {
+                const int64_t h   = idx % q_heads;
+                const int64_t tok = idx / q_heads;          /* the dense query row */
+                /* The owning sequence and the row's index within its query. */
+                int64_t s = 0, qlen = q_len, i = 0;
+                if (cus) {
+                    s = seq_of(cus, n_seq, tok);
+                    qlen = cu_at(cus, s + 1) - cu_at(cus, s);
+                    i = tok - cu_at(cus, s);
+                } else {
+                    s = tok / q_len;
+                    i = tok - s * q_len;
+                }
+                if (qlen <= 0) return;
+                const int64_t kh = h / gqa;
 
-        const int64_t ctx = ld_int(su->dtype, su->data, offlin(su, s));
-        const int64_t pos = ctx - qlen + i;
-        const int64_t qb  = tok * q_rs + h * q_hs;
-        const int64_t ob  = tok * o_rs + h * o_hs;
+                const int64_t ctx = ld_int(su->dtype, su->data, offlin(su, s));
+                const int64_t pos = ctx - qlen + i;
+                const int64_t qb  = tok * q_rs + h * q_hs;
+                const int64_t ob  = tok * o_rs + h * o_hs;
 
-        const float kds = kdes ? ldt(kdes, s * kv_heads + kh) : 1.0f;
-        const float vds = vdes ? ldt(vdes, s * kv_heads + kh) : 1.0f;
+                const float kds = kdes ? ldt(kdes, s * kv_heads + kh) : 1.0f;
+                const float vds = vdes ? ldt(vdes, s * kv_heads + kh) : 1.0f;
 
-        /* Pass one: the maximum score, so the exponent below cannot overflow. */
-        float mx = -INFINITY;
-        for (int64_t j = 0; j < ctx; ++j) {
-            if (causal ? (j > pos) : (j >= ctx)) continue;
-            if (window > 0) {
-                const int64_t d = pos - j;
-                if (causal ? (d >= window) : (d >= window || d <= -window)) continue;
+                /* Keys past the block table's width are never read. */
+                const int64_t jend = std::min(ctx, jcap);
+                /* Key j's slot in the cache, or -1 when the mask hides it or its block is
+                 * unmapped. */
+                auto key_at = [&](int64_t j) -> int64_t {
+                    if (causal && j > pos) return -1;
+                    if (window > 0) {
+                        const int64_t d = pos - j;
+                        if (causal ? (d >= window) : (d >= window || d <= -window)) return -1;
+                    }
+                    const int64_t blk =
+                        ld_int(bt->dtype, bt->data, s * bt_rs + (j / block_size) * bt_cs);
+                    return blk < 0 ? -1 : blk * kvv.sb + kh * kvv.sh + (j % block_size) * kvv.so;
+                };
+
+                float qf[REF_HD_MAX];
+                for (int64_t d = 0; d < head_dim; ++d) qf[d] = ldt(q, qb + d * q_ds);
+
+                /* Pass one: every visible key's score, four keys at a time, and the maximum. */
+                float mx = -INFINITY;
+                for (int64_t j0 = 0; j0 < jend; j0 += 4) {
+                    int64_t kb[4];
+                    float dot[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                    const int nk = (int)std::min<int64_t>(4, jend - j0);
+                    for (int u = 0; u < 4; ++u) kb[u] = u < nk ? key_at(j0 + u) : -1;
+                    if (kb[0] >= 0 && kb[1] >= 0 && kb[2] >= 0 && kb[3] >= 0) {
+                        for (int64_t d = 0; d < head_dim; ++d) {
+                            const float qd = qf[d];
+                            dot[0] += qd * (kl(kv->data, kb[0] + d * kvv.sd) * kds);
+                            dot[1] += qd * (kl(kv->data, kb[1] + d * kvv.sd) * kds);
+                            dot[2] += qd * (kl(kv->data, kb[2] + d * kvv.sd) * kds);
+                            dot[3] += qd * (kl(kv->data, kb[3] + d * kvv.sd) * kds);
+                        }
+                    } else {
+                        for (int u = 0; u < nk; ++u) {
+                            if (kb[u] < 0) continue;
+                            for (int64_t d = 0; d < head_dim; ++d)
+                                dot[u] += qf[d] * (kl(kv->data, kb[u] + d * kvv.sd) * kds);
+                        }
+                    }
+                    for (int u = 0; u < nk; ++u) {
+                        if (kb[u] < 0) continue;
+                        const float sj = dot[u] * scale;
+                        sc[j0 + u] = sj;
+                        if (sj > mx) mx = sj;
+                    }
+                }
+
+                /* No visible key (an empty sliding window) gives a zero row, not NaN, matching
+                 * every kernel in the project. */
+                if (mx == -INFINITY) {
+                    for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, 0.0f);
+                    return;
+                }
+
+                /* Pass two: exponentiate and accumulate in ascending key order. */
+                float acc[REF_HD_MAX];
+                for (int64_t d = 0; d < head_dim; ++d) acc[d] = 0.0f;
+                float sum = 0.0f;
+                for (int64_t j = 0; j < jend; ++j) {
+                    const int64_t kb = key_at(j);
+                    if (kb < 0) continue;
+                    const float w = ref_exp(sc[j] - mx);
+                    sum += w;
+                    const int64_t vb = kb + head_dim * kvv.sd;
+                    for (int64_t d = 0; d < head_dim; ++d)
+                        acc[d] += w * (kl(kv->data, vb + d * kvv.sd) * vds);
+                }
+                const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+                for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, acc[d] * inv);
+            };
+            switch (kv->dtype) {
+                case RAD_F32:    unit(KvFix<RAD_F32>{}); break;
+                case RAD_BF16:   unit(KvFix<RAD_BF16>{}); break;
+                case RAD_F8E4M3: unit(KvFix<RAD_F8E4M3>{}); break;
+                default:         unit(KvDyn{ kv->dtype }); break;
             }
-            if (j / block_size >= max_blocks) break;   /* bounds first: the table is only this wide */
-            const int64_t blk = ld_int(bt->dtype, bt->data, s * bt_rs + (j / block_size) * bt_cs);
-            if (blk < 0) continue;
-            const int64_t kb = blk * kvv.sb + kh * kvv.sh + (j % block_size) * kvv.so;
-            float dot = 0.0f;
-            for (int64_t d = 0; d < head_dim; ++d)
-                dot += ldt(q, qb + d * q_ds) * (ldt(kv, kb + d * kvv.sd) * kds);
-            dot *= scale;
-            if (dot > mx) mx = dot;
         }
-
-        float acc[REF_HD_MAX];
-        for (int64_t d = 0; d < head_dim; ++d) acc[d] = 0.0f;
-
-        /* No visible key at all -- an empty sliding window on the first token of a sequence -- is a
-         * zero row, not a NaN. A softmax over nothing has no defined answer and zero is the one
-         * every kernel in this project produces. */
-        if (mx == -INFINITY) {
-            for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, 0.0f);
-            continue;
-        }
-
-        /* Pass two: the scores again, exponentiated and accumulated in ascending key order. The
-         * dot product is recomputed rather than kept, because keeping it would need a buffer the
-         * size of the context and the reference has time it does not have memory. */
-        float sum = 0.0f;
-        for (int64_t j = 0; j < ctx; ++j) {
-            if (causal ? (j > pos) : (j >= ctx)) continue;
-            if (window > 0) {
-                const int64_t d = pos - j;
-                if (causal ? (d >= window) : (d >= window || d <= -window)) continue;
-            }
-            if (j / block_size >= max_blocks) break;   /* bounds first: the table is only this wide */
-            const int64_t blk = ld_int(bt->dtype, bt->data, s * bt_rs + (j / block_size) * bt_cs);
-            if (blk < 0) continue;
-            const int64_t kb = blk * kvv.sb + kh * kvv.sh + (j % block_size) * kvv.so;
-            float dot = 0.0f;
-            for (int64_t d = 0; d < head_dim; ++d)
-                dot += ldt(q, qb + d * q_ds) * (ldt(kv, kb + d * kvv.sd) * kds);
-            const float w = ref_exp(dot * scale - mx);
-            sum += w;
-            for (int64_t d = 0; d < head_dim; ++d)
-                acc[d] += w * (ldt(kv, kb + (head_dim + d) * kvv.sd) * vds);
-        }
-        const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
-        for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, acc[d] * inv);
     }
     return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ attn_dense */
-/* The vision tower's: nothing paged, nothing quantised, `cu_seqlens` bounding one image (or one
- * attention window) per entry so a whole batch is ONE launch rather than a per-segment loop and a
- * concatenate. Causal is a parameter because a dense decoder-only prefill wants the same kernel. */
+/* For the vision tower: unpaged, unquantised, `cu_seqlens` bounding one image (or attention window)
+ * per entry so a whole batch is one launch. Causal is a parameter so a dense decoder-only prefill
+ * can use the same kernel. */
 int ref_attn_dense(const RadArgs* a, RadStream) {
     if (!have(a, 5)) return RAD_E_INVAL;
     const RadTensor *q = &a->t[0], *k = &a->t[1], *v = &a->t[2], *cu = &a->t[3], *o = &a->t[4];
@@ -224,14 +258,19 @@ int ref_attn_dense(const RadArgs* a, RadStream) {
     const int64_t head_dim = p_int(a, "head_dim", q->rank >= 3 ? q->shape[q->rank - 1] : 0);
     const int64_t gqa      = p_int(a, "gqa", 1);
     const int     causal   = (int)p_int(a, "causal", 0);
-    /* `window` is attn_paged's rule over a segment's own positions: causal, key j is visible to
-     * query i when i - j < window; non-causal, when |i - j| < window. 0 is no window. */
+    /* `window` follows attn_paged's rule over a segment's own positions: causal, key j is visible
+     * to query i when i - j < window; non-causal, when |i - j| < window. 0 is no window. `block`
+     * cuts a segment into blocks of that many rows from its start, each attending only within
+     * itself (a chunked encoder's windows). `cu_div` reads cu_seqlens in units of that many rows:
+     * a segment is rows [cu[s] / cu_div, cu[s+1] / cu_div). */
     const int64_t window   = p_int(a, "window", 0);
-    if (head_dim <= 0 || gqa <= 0 || window < 0) return RAD_E_SHAPE;
+    const int64_t block    = p_int(a, "block", 0);
+    const int64_t cdiv     = p_int(a, "cu_div", 1);
+    if (head_dim <= 0 || gqa <= 0 || window < 0 || block < 0 || cdiv <= 0) return RAD_E_SHAPE;
     if (head_dim > REF_HD_MAX) return RAD_E_UNSUPPORTED;
 
-    /* [tokens, heads, head_dim], or [tokens, heads * head_dim] -- a column slice of a fused
-     * projection, whose row pitch is the projection's. */
+    /* [tokens, heads, head_dim], or [tokens, heads * head_dim] as a column slice of a fused
+     * projection with the projection's row pitch. */
     const int64_t q_heads = q->rank >= 3 ? q->shape[q->rank - 2]
                           : (q->rank == 2 ? q->shape[1] / head_dim : 1);
     const int64_t kv_heads = q_heads / gqa;
@@ -239,6 +278,7 @@ int ref_attn_dense(const RadArgs* a, RadStream) {
     const int64_t n_seq = numel(cu) - 1;
     if (n_seq <= 0) return RAD_E_SHAPE;
     const int64_t total_q = numel(q) / (q_heads * head_dim);
+    if (total_q <= 0 || cu_at(cu, n_seq) <= cu_at(cu, 0)) return RAD_E_SHAPE;   /* zero rows */
     if (numel(o) < total_q * q_heads * head_dim) return RAD_E_SHAPE;
     if (numel(k) < total_q * kv_heads * head_dim) return RAD_E_SHAPE;
     if (numel(v) < total_q * kv_heads * head_dim) return RAD_E_SHAPE;
@@ -258,17 +298,22 @@ int ref_attn_dense(const RadArgs* a, RadStream) {
 
     const float scale = p_f32(a, "scale", 1.0f / std::sqrt((float)head_dim));
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(total_q * q_heads * head_dim * 64)
     for (int64_t sh = 0; sh < n_seq * q_heads; ++sh) {
         const int64_t s = sh / q_heads, h = sh % q_heads, kh = h / gqa;
-        const int64_t b0 = ld_int(cu->dtype, cu->data, offlin(cu, s));
-        const int64_t b1 = ld_int(cu->dtype, cu->data, offlin(cu, s + 1));
+        const int64_t b0 = cu_at(cu, s) / cdiv;
+        const int64_t b1 = cu_at(cu, s + 1) / cdiv;
         for (int64_t i = b0; i < b1; ++i) {
             const int64_t qb = i * q_rs + h * q_hs, ob = i * o_rs + h * o_hs;
             int64_t jbeg = b0, jend = causal ? (i + 1) : b1;
             if (window > 0) {
                 jbeg = std::max<int64_t>(b0, i - window + 1);
                 if (!causal) jend = std::min<int64_t>(b1, i + window);
+            }
+            if (block > 0) {
+                const int64_t blk = b0 + (i - b0) / block * block;
+                jbeg = std::max<int64_t>(jbeg, blk);
+                jend = std::min<int64_t>(jend, blk + block);
             }
             float mx = -INFINITY;
             for (int64_t j = jbeg; j < jend; ++j) {
@@ -303,23 +348,18 @@ int ref_attn_dense(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ kv_store */
-/* Writes this step's keys and values into the paged cache at `slot_mapping`. The cache operand is
- * INOUT and not OUT: this op touches only the mapped slots and every other slot in the pool must
- * survive it, which is a liveness fact the buffer planner has to know (docs/OPS.md draws it as an
- * output; that is the one role this plugin states differently, and deliberately).
+/* Writes this step's keys and values into the paged cache at `slot_mapping`. The cache is INOUT,
+ * not OUT: only mapped slots are touched and every other slot must survive, which the buffer
+ * planner needs to know (docs/OPS.md draws it as an output; this plugin deliberately differs).
  *
- * A NEGATIVE slot is skipped. That is how a padded batch row says "this token has no cache slot",
- * and it has to be a documented value rather than an accident: libr4d treats slot <= 0 as null
- * because vLLM reserves block 0, but a generic reference must not steal a valid slot, so ref skips
- * only the strictly negative.
+ * A negative slot is skipped: it marks a padded row with no cache slot. libr4d treats slot <= 0 as
+ * null because vLLM reserves block 0, but a generic reference must not steal a valid slot.
  *
- * `k` AND `v` ARRIVE RANK 2 FROM THE ENGINE AND THEIR ROWS ARE NOT DENSE. An architecture that
- * de-interleaves the projection hands [tokens, kv_heads, head_dim]; one that does not hands a
- * COLUMN SLICE of the fused QKV plane -- [tokens, kv_heads * head_dim] whose row stride is the
- * whole projection's width, 2560 against 256 on a 16-head model with 2 kv heads. Deriving the row
- * stride from the shape instead of from the tensor puts token 0 in the right slot and every token
- * after it inside the previous token's QUERY rows, which is a cache that looks written and holds
- * the wrong keys from the second token on. `row_stride` asks the operand instead. */
+ * `k` and `v` rows are not dense. A de-interleaved projection gives [tokens, kv_heads, head_dim];
+ * otherwise they are a column slice of the fused QKV plane, [tokens, kv_heads * head_dim] with the
+ * projection's row stride (2560 vs 256 for 16 heads and 2 kv heads). Deriving the stride from the
+ * shape would write every token after the first from the wrong rows, so `row_stride` reads the
+ * operand. */
 int ref_kv_store(const RadArgs* a, RadStream) {
     if (!have(a, 4)) return RAD_E_INVAL;
     const RadTensor *k = &a->t[0], *v = &a->t[1], *sm = &a->t[2], *kv = &a->t[3];
@@ -342,8 +382,8 @@ int ref_kv_store(const RadArgs* a, RadStream) {
     const int64_t v_hs = v->rank >= 3 ? v->stride[v->rank - 2] : head_dim * v_ds;
     const int64_t v_rs = row_stride(v, kv_heads * head_dim);
     const KVView kvv = kv_view(kv, head_dim, block_size, kv_heads);
-    /* AN FP8 CACHE STORES k / k_scale: the scales are the descales the reader multiplies back by,
-     * 1.0 unless the call names them. A wider cache stores the value itself. */
+    /* An fp8 cache stores k / k_scale, where the scales are the reader's descales (default 1.0).
+     * A wider cache stores the value itself. */
     const bool  fp8 = kv->dtype == RAD_F8E4M3 || kv->dtype == RAD_F8E5M2;
     const float ks = fp8 ? 1.0f / p_f32(a, "k_scale", 1.0f) : 1.0f;
     const float vs = fp8 ? 1.0f / p_f32(a, "v_scale", 1.0f) : 1.0f;
@@ -353,7 +393,7 @@ int ref_kv_store(const RadArgs* a, RadStream) {
         if (slot >= 0 && n_blocks > 0 && slot / block_size >= n_blocks) return RAD_E_SHAPE;
     }
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(M * kv_heads * head_dim * 2)
     for (int64_t t = 0; t < M; ++t) {
         const int64_t slot = ld_int(sm->dtype, sm->data, offlin(sm, t));
         if (slot < 0) continue;
@@ -372,21 +412,20 @@ int ref_kv_store(const RadArgs* a, RadStream) {
 /* ------------------------------------------------------------------ rope */
 namespace {
 
-/* NeoX pairs element i with i + rotary_dim/2; GPT-J (the "interleaved" style) pairs 2i with 2i+1.
- * Which one a checkpoint wants is a property of the checkpoint, so it is a parameter and not a
- * guess -- and getting it wrong produces fluent text with a broken sense of position, which is the
- * hardest kind of wrong to notice (spec §12 makes the same point about token boundaries).
+/* NeoX pairs element i with i + rotary_dim/2; GPT-J ("interleaved") pairs 2i with 2i+1. The
+ * checkpoint decides, so it is a parameter: the wrong one yields fluent text with broken position
+ * sense, which is hard to notice.
  *
- * THE MULTI-COMPONENT MODES pair like NeoX and differ in which position component drives each
+ * The multi-component modes pair like NeoX and differ in which position component drives each
  * frequency (i indexes the rot/2 frequencies):
  *   mrope   contiguous sections: frequencies [0, s0) take component 0, the next s1 component 1...
  *           (Qwen2-VL), all on one ladder theta^(-2i/rot).
  *   imrope  interleaved (Qwen3-VL): component 1 where i % 3 == 1 and i < 3*s1, component 2 where
  *           i % 3 == 2 and i < 3*s2, component 0 everywhere else; one ladder.
- *   axial   contiguous sections, EACH ON ITS OWN LADDER theta^(-2j/(2*s_c)) for its j-th
- *           frequency -- a 2-D rotary embedding over (row, column), the vision tower's.
- * With one position component a token -- a rank-1 `positions` -- every component is that one and
- * mrope and imrope ARE neox. */
+ *   axial   contiguous sections, each on its own ladder theta^(-2j/(2*s_c)) for its j-th
+ *           frequency: the vision tower's 2-D rotary embedding over (row, column).
+ * With one position component per token (rank-1 `positions`) every component is the same, and
+ * mrope and imrope reduce to neox. */
 enum { ROPE_NEOX = 0, ROPE_GPTJ = 1, ROPE_MROPE = 2, ROPE_IMROPE = 3, ROPE_AXIAL = 4 };
 
 struct RopeFreq {
@@ -394,10 +433,10 @@ struct RopeFreq {
     float inv[REF_HD_MAX / 2];
 };
 
-/* Which component and inverse frequency each of the rot/2 frequencies uses. */
-/* `den` is the width the BASE ladder is measured in: `rot` for a `rotary` ladder (a partial rotary
- * is a complete rotation of its own width) and `head_dim` for `head`, the proportional variant. The
- * loop count and the NeoX/GPT-J pairing still come from `rot`; `axial` overrides `inv` below. */
+/* The component and inverse frequency of each of the rot/2 frequencies. `den` is the width the base
+ * ladder is measured in: `rot` for a `rotary` ladder (a partial rotary is a full rotation of its
+ * own width), `head_dim` for the proportional `head` variant. The loop count and pairing still come
+ * from `rot`; `axial` overrides `inv`. */
 static int rope_freqs(int mode, int64_t rot, int64_t den, float theta, const int64_t* sec,
                       int n_sec, RopeFreq* f) {
     const int64_t half = rot / 2;
@@ -407,12 +446,12 @@ static int rope_freqs(int mode, int64_t rot, int64_t den, float theta, const int
     if ((mode == ROPE_MROPE || mode == ROPE_AXIAL) && n_sec > 0 && total != half) return RAD_E_SHAPE;
     for (int64_t i = 0; i < half; ++i) {
         int c = 0;
-        float inv = 1.0f / std::pow(theta, (float)(2 * i) / (float)den);
+        float inv = 1.0f / ref_pow(theta, (float)(2 * i) / (float)den);
         if (n_sec > 0 && (mode == ROPE_MROPE || mode == ROPE_AXIAL)) {
             while (c + 1 < n_sec && i >= start[c + 1]) ++c;
             if (mode == ROPE_AXIAL) {
                 const int64_t j = i - start[c];
-                inv = 1.0f / std::pow(theta, (float)(2 * j) / (float)(2 * sec[c]));
+                inv = 1.0f / ref_pow(theta, (float)(2 * j) / (float)(2 * sec[c]));
             }
         } else if (n_sec >= 3 && mode == ROPE_IMROPE) {
             if (i % 3 == 1 && i < 3 * sec[1]) c = 1;
@@ -429,7 +468,7 @@ static void rope_head(const RadTensor* t, int64_t base, int64_t ds, int64_t rot,
     const int64_t half = rot / 2;
     for (int64_t i = 0; i < half; ++i) {
         const float ang = pos[f.comp[i]] * f.inv[i];
-        const float c = std::cos(ang) * magnitude, s = std::sin(ang) * magnitude;
+        const float c = ref_cos(ang) * magnitude, s = ref_sin(ang) * magnitude;
         const int64_t i0 = (mode == ROPE_GPTJ) ? 2 * i : i;
         const int64_t i1 = (mode == ROPE_GPTJ) ? 2 * i + 1 : i + half;
         const float x0 = ldt(t, base + i0 * ds), x1 = ldt(t, base + i1 * ds);
@@ -453,9 +492,9 @@ static int rope_sections(const RadArgs* a, int64_t* sec) {
     return n;
 }
 
-/* `ladder` names the width the base frequency ladder is measured in -- see rope_freqs. Absent and
- * `rotary` divide by `rot` (every existing model); `head` divides by `head_dim`, which it needs. An
- * unknown value is a schema error, not a silent default: a mistyped ladder is a silent wrong angle. */
+/* `ladder` names the width the base frequency ladder is measured in (see rope_freqs): absent or
+ * `rotary` divides by `rot`, `head` by `head_dim`. An unknown value is refused, since a mistyped
+ * ladder would silently give wrong angles. */
 static int rope_ladder(const RadArgs* a, int64_t rot, int64_t head_dim, int64_t* den) {
     const char* lad = p_str(a, "ladder", nullptr);
     if (!lad) { *den = rot; return RAD_OK; }
@@ -490,7 +529,7 @@ int ref_rope(const RadArgs* a, RadStream) {
     int64_t sec[8] = {};
     const int n_sec = rope_sections(a, sec);
     if (n_sec < 0) return RAD_E_SHAPE;
-    /* POSITIONS: [M] is one component a token; [C, M] is C components, component-major. */
+    /* Positions: [M] is one component per token; [C, M] is C components, component-major. */
     const bool multi = pos->rank >= 2;
     const int64_t n_comp = multi ? pos->shape[0] : 1;
     const int64_t M = multi ? pos->shape[1] : numel(pos);
@@ -499,9 +538,9 @@ int ref_rope(const RadArgs* a, RadStream) {
         const int64_t need = mode == ROPE_IMROPE ? 3 : n_sec;
         if (n_comp < need || n_comp > 8) return RAD_E_SHAPE;
     }
-    /* THE PROPORTIONAL LADDER (`head`) is HF's: the rotation spans the whole head -- pair i is
-     * (i, i + head_dim/2) -- and every frequency past rotary_dim/2 is zero, so those pairs turn by
-     * nothing. A rotary of rotary_dim's own width, pairing (i, i + rot/2), turns other channels. */
+    /* The proportional ladder (`head`) is HF's: the rotation spans the whole head, pair i being
+     * (i, i + head_dim/2), and frequencies past rotary_dim/2 are zero so those pairs do not turn.
+     * A rotary of rotary_dim's own width, pairing (i, i + rot/2), would turn other channels. */
     const int64_t nfreq = rot / 2;
     if (den == head_dim && rot < head_dim && !multi && mode == ROPE_NEOX) rot = head_dim;
     RopeFreq f;
@@ -514,14 +553,13 @@ int ref_rope(const RadArgs* a, RadStream) {
     }
     for (int64_t i = nfreq; i < rot / 2; ++i) f.inv[i] = 0.0f;
 
-
     const int64_t stride_row = (n_head + 2 * n_head_kv) * head_dim;
     if (M <= 0 || numel(qkv) < M * stride_row) return RAD_E_SHAPE;
-    const int64_t rs = qkv->rank >= 2 ? qkv->stride[qkv->rank - 2] : stride_row;
+    const int64_t rs = row_stride(qkv, stride_row);
     const int64_t ds = laststride(qkv);
     const int64_t pcs = multi ? pos->stride[0] : 0, pms = multi ? pos->stride[1] : 0;
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(M * stride_row)
     for (int64_t m = 0; m < M; ++m) {
         float p[8];
         const float div = rscale != 0.0f ? rscale : 1.0f;
@@ -533,8 +571,7 @@ int ref_rope(const RadArgs* a, RadStream) {
             for (int c = 0; c < 8; ++c) p[c] = one;
         }
         const int64_t row = m * rs;
-        /* Q heads then K heads. The V heads that follow are left alone, which is the whole reason
-         * this op takes the fused qkv rather than two tensors. */
+        /* Q heads then K heads; the V heads after them are left alone. */
         for (int64_t h = 0; h < n_head + n_head_kv; ++h)
             rope_head(qkv, row + h * head_dim * ds, ds, rot, mode, f, p, yarn.magnitude);
     }
@@ -542,16 +579,13 @@ int ref_rope(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ qk_norm_rope */
-/* The QK-norm preamble and the rotation in one op: an RMS norm over each 128-wide (or whatever
- * head_dim is) q and k head against its own gain vector, then RoPE. `v_norm` 1 also RMS-norms
- * each v head with a UNIT gain and no rotation -- Gemma 4's value norm, which has no weight. The
- * v heads are otherwise left alone.
+/* QK-norm and rotation in one op: an RMS norm over each head_dim-wide q and k head against its own
+ * gain vector, then RoPE. `v_norm` 1 also RMS-norms each v head with unit gain and no rotation
+ * (Gemma 4's weightless value norm); otherwise v heads are untouched.
  *
- * THE NORM OUTPUT IS ROUNDED TO THE TENSOR'S DTYPE BEFORE THE ROTATION. That is not an accident of
- * writing it back in place -- it is what the unfused pair does, because the norm stores a tensor
- * and the rotation reads it, and libr4d's r4d_qk_norm_rope_gate matches the unfused reference for
- * exactly this reason. A fused kernel that kept f32 across the seam would be half a ULP better and
- * would fail a comparison against this. */
+ * The norm output is rounded to the tensor's dtype before the rotation, as the unfused pair does;
+ * libr4d's r4d_qk_norm_rope_gate matches this. A fused kernel keeping f32 across the seam would be
+ * half a ULP better and fail the comparison. */
 int ref_qk_norm_rope(const RadArgs* a, RadStream) {
     if (!have(a, 4)) return RAD_E_INVAL;
     const RadTensor *qkv = &a->t[0], *pos = &a->t[1], *qw = &a->t[2], *kw = &a->t[3];
@@ -564,9 +598,9 @@ int ref_qk_norm_rope(const RadArgs* a, RadStream) {
     const float   rscale    = p_f32(a, "scale", 1.0f);
     const float   wadd      = p_f32(a, "wadd", 0.0f);
     const int     v_norm    = (int)p_int(a, "v_norm", 0);
-    /* `gptj_blocks` is `blocks` with each section's pairs ADJACENT -- (start + 2j, start + 2j + 1),
-     * the complex-number form a 3-axis image rotary takes (Qwen-Image's). `imrope` is `rope`'s
-     * interleaved M-RoPE over NeoX pairs, after the norm (Qwen3-VL's text attention). */
+    /* `gptj_blocks` is `blocks` with each section's pairs adjacent, (start + 2j, start + 2j + 1):
+     * the complex-number form of Qwen-Image's 3-axis rotary. `imrope` is `rope`'s interleaved
+     * M-RoPE over NeoX pairs, after the norm (Qwen3-VL text attention). */
     static const char* kModes[] = { "neox", "gptj", "blocks", "gptj_blocks", "imrope" };
     const int mode = p_enum(a, "mode", kModes, 5, 0);
     if (mode < 0) return RAD_E_UNSUPPORTED;
@@ -577,10 +611,10 @@ int ref_qk_norm_rope(const RadArgs* a, RadStream) {
     if (head_dim <= 0 || n_head <= 0 || rot <= 0 || rot > head_dim || (rot & 1)) return RAD_E_SHAPE;
     if (numel(qw) < head_dim || numel(kw) < head_dim) return RAD_E_SHAPE;
 
-    /* BLOCKS: section c is `sec[c]` rotary pairs over its own run of 2 * sec[c] channels, paired
+    /* Blocks: section c is `sec[c]` rotary pairs over its own run of 2 * sec[c] channels, paired
      * (start + j, start + sec[c] + j) and turned by position component comps[c] at
-     * theta^(-j / sec[c]) -- each section a complete neox rotary of its own width. The sections
-     * fill the rotated prefix exactly. Positions are [C, M], component-major. */
+     * theta^(-j / sec[c]), i.e. a complete neox rotary of its own width. The sections fill the
+     * rotated prefix exactly. Positions are [C, M], component-major. */
     int64_t sec[8] = {}, comp[8] = {};
     int n_sec = 0;
     if (im) {
@@ -616,15 +650,28 @@ int ref_qk_norm_rope(const RadArgs* a, RadStream) {
 
     const int64_t stride_row = (n_head + 2 * n_head_kv) * head_dim;
     if (M <= 0 || numel(qkv) < M * stride_row) return RAD_E_SHAPE;
-    const int64_t rs = qkv->rank >= 2 ? qkv->stride[qkv->rank - 2] : stride_row;
+    const int64_t rs = row_stride(qkv, stride_row);
     const int64_t ds = laststride(qkv);
     RopeFreq f;
-    /* No `ladder` on this row yet: the fused norm+rope measures by `rot`, as it always has. */
+    /* No `ladder` parameter here: the fused norm+rope measures by `rot`. */
     if (im) RAD_REF_TRY(rope_freqs(ROPE_IMROPE, rot, rot, theta, sec, multi ? n_sec : 0, &f));
     else    RAD_REF_TRY(rope_freqs(blocks ? 0 : mode, rot, rot, theta, nullptr, 0, &f));
 
+    /* RMS-norms one head in place, against gain `w` (+ wadd), or unit gain without one. */
+    auto norm_head = [&](int64_t base, const RadTensor* w) {
+        float ss = 0.0f;
+        for (int64_t d = 0; d < head_dim; ++d) {
+            const float x = ldt(qkv, base + d * ds);
+            ss += x * x;
+        }
+        const float sc = 1.0f / std::sqrt(ss / (float)head_dim + eps);
+        for (int64_t d = 0; d < head_dim; ++d) {
+            const float x = ldt(qkv, base + d * ds) * sc;
+            stt(qkv, base + d * ds, w ? x * (ldt(w, d * laststride(w)) + wadd) : x);
+        }
+    };
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(M * stride_row)
     for (int64_t m = 0; m < M; ++m) {
         float p[8];
         const float div = rscale != 0.0f ? rscale : 1.0f;
@@ -637,16 +684,8 @@ int ref_qk_norm_rope(const RadArgs* a, RadStream) {
         }
         const int64_t row = m * rs;
         for (int64_t h = 0; h < n_head + n_head_kv; ++h) {
-            const RadTensor* w = h < n_head ? qw : kw;
-            const int64_t base = row + h * head_dim * ds, ws = laststride(w);
-            float ss = 0.0f;
-            for (int64_t d = 0; d < head_dim; ++d) {
-                float x = ldt(qkv, base + d * ds);
-                ss += x * x;
-            }
-            const float sc = 1.0f / std::sqrt(ss / (float)head_dim + eps);
-            for (int64_t d = 0; d < head_dim; ++d)
-                stt(qkv, base + d * ds, ldt(qkv, base + d * ds) * sc * (ldt(w, d * ws) + wadd));
+            const int64_t base = row + h * head_dim * ds;
+            norm_head(base, h < n_head ? qw : kw);
             if (!blocks) {
                 rope_head(qkv, base, ds, rot, im ? ROPE_IMROPE : mode, f, p);
                 continue;
@@ -654,9 +693,9 @@ int ref_qk_norm_rope(const RadArgs* a, RadStream) {
             int64_t start = 0;
             for (int c = 0; c < n_sec; ++c) {
                 for (int64_t j = 0; j < sec[c]; ++j) {
-                    const float inv = 1.0f / std::pow(theta, (float)j / (float)sec[c]);
+                    const float inv = 1.0f / ref_pow(theta, (float)j / (float)sec[c]);
                     const float ang = p[comp[c]] * inv;
-                    const float cs = std::cos(ang), sn = std::sin(ang);
+                    const float cs = ref_cos(ang), sn = ref_sin(ang);
                     const int64_t i0 = adjacent ? start + 2 * j : start + j;
                     const int64_t i1 = adjacent ? start + 2 * j + 1 : start + sec[c] + j;
                     const float x0 = ldt(qkv, base + i0 * ds), x1 = ldt(qkv, base + i1 * ds);
@@ -666,28 +705,11 @@ int ref_qk_norm_rope(const RadArgs* a, RadStream) {
                 start += 2 * sec[c];
             }
         }
-        for (int64_t h = 0; v_norm && h < n_head_kv; ++h) {
-            const int64_t base = row + (n_head + n_head_kv + h) * head_dim * ds;
-            float ss = 0.0f;
-            for (int64_t d = 0; d < head_dim; ++d) {
-                float x = ldt(qkv, base + d * ds);
-                ss += x * x;
-            }
-            const float sc = 1.0f / std::sqrt(ss / (float)head_dim + eps);
-            for (int64_t d = 0; d < head_dim; ++d)
-                stt(qkv, base + d * ds, ldt(qkv, base + d * ds) * sc);
-        }
+        for (int64_t h = 0; v_norm && h < n_head_kv; ++h)
+            norm_head(row + (n_head + n_head_kv + h) * head_dim * ds, nullptr);
     }
     return RAD_OK;
 }
-
-/* A value as a tensor of `dt` holds it: rounded through the dtype's own store and load. */
-static inline float round_dt(uint32_t dt, float v) {
-    uint64_t buf = 0;
-    st_dt(dt, &buf, 0, v);
-    return ld_dt(dt, &buf, 0);
-}
-static inline int64_t rows_n(const RadTensor* t, int64_t n) { return n > 0 ? numel(t) / n : 0; }
 
 /* ------------------------------------------------------------------ attn_local_rel */
 /* Local attention with a relative-position term: Gemma 4's audio (USM conformer) attention.
@@ -702,11 +724,10 @@ static inline int64_t rows_n(const RadTensor* t, int64_t n) { return n > 0 ? num
  * then a softmax over those keys and the weighted sum of v, all in f32 and rounded once. `relk`
  * is [left + 1, n_head * head_dim]: row d is the projected relative position for distance d.
  *
- * The reference computes this in 12-query blocks over 24-key context windows and shifts the
- * relative term into place (Transformer-XL's rel_shift); every key outside 0 <= i - j <= left
- * carries a -1e9 logit there and a zero weight after the softmax, so the sliding form below is
- * the same function. softplus(pds) is rounded to the weight's dtype before use, as the reference
- * evaluates it on the bf16 parameter. */
+ * The upstream model computes this in 12-query blocks over 24-key windows with Transformer-XL's
+ * rel_shift; keys outside 0 <= i - j <= left get a -1e9 logit and zero weight there, so this
+ * sliding form is the same function. softplus(pds) is rounded to the weight's dtype before use,
+ * as upstream evaluates it on the bf16 parameter. */
 int ref_attn_local_rel(const RadArgs* a, RadStream) {
     if (!have(a, 7)) return RAD_E_INVAL;
     const RadTensor *q = &a->t[0], *k = &a->t[1], *v = &a->t[2], *rk = &a->t[3];
@@ -722,7 +743,8 @@ int ref_attn_local_rel(const RadArgs* a, RadStream) {
     if (numel(pds) < D || numel(rk) < (L + 1) * W) return RAD_E_SHAPE;
     const int64_t S = numel(cu) - 1;
     if (S <= 0) return RAD_E_SHAPE;
-    const int64_t Mq = rows_n(q, W), Mk = rows_n(k, W), Mv = rows_n(v, W), Mo = rows_n(o, W);
+    const int64_t Mq = rows_of(q, W), Mk = rows_of(k, W), Mv = rows_of(v, W), Mo = rows_of(o, W);
+    if (Mq <= 0 || Mo <= 0 || cu_at(cu, S) <= cu_at(cu, 0)) return RAD_E_SHAPE;   /* zero rows */
 
     const float qs = (float)(1.0 / std::sqrt((double)D) / std::log(2.0));
     const float ks = (float)(std::log(1.0 + std::exp(1.0)) / std::log(2.0));
@@ -731,13 +753,13 @@ int ref_attn_local_rel(const RadArgs* a, RadStream) {
         spd[d] = round_dt(pds->dtype, act_softplus(ldt(pds, d * laststride(pds)), 20.0f));
 
     for (int64_t s = 0; s < S; ++s) {
-        const int64_t c0 = ld_int(cu->dtype, cu->data, offlin(cu, s));
-        const int64_t c1 = ld_int(cu->dtype, cu->data, offlin(cu, s + 1));
+        const int64_t c0 = cu_at(cu, s);
+        const int64_t c1 = cu_at(cu, s + 1);
         if (c0 % cdiv || c1 % cdiv || c1 < c0) return RAD_E_SHAPE;
         const int64_t t0 = c0 / cdiv, t1 = c1 / cdiv;
         if (t1 > Mq || t1 > Mk || t1 > Mv || t1 > Mo) return RAD_E_SHAPE;
 
-        #pragma omp parallel for schedule(static)
+        REF_PAR_FOR((t1 - t0) * H * D * (L + R + 1))
         for (int64_t ih = 0; ih < (t1 - t0) * H; ++ih) {
             const int64_t i = t0 + ih / H, h = ih % H;
             float qf[REF_HD_MAX], lg[REF_HD_MAX], acc[REF_HD_MAX];
@@ -753,13 +775,13 @@ int ref_attn_local_rel(const RadArgs* a, RadStream) {
                     ac += qf[d] * (ldt(k, kb + d * laststride(k)) * ks);
                     bd += qf[d] * ldt(rk, rb + d * laststride(rk));
                 }
-                const float x = cap * std::tanh((ac + bd) / cap);
+                const float x = cap * ref_tanh((ac + bd) / cap);
                 lg[j - j0] = x;
                 mx = x > mx ? x : mx;
             }
             float sum = 0.0f;
             for (int64_t j = j0; j <= i; ++j) {
-                lg[j - j0] = std::exp(lg[j - j0] - mx);
+                lg[j - j0] = ref_exp(lg[j - j0] - mx);
                 sum += lg[j - j0];
             }
             for (int64_t d = 0; d < D; ++d) acc[d] = 0.0f;
@@ -776,14 +798,11 @@ int ref_attn_local_rel(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ rope_table */
-/* The cos/sin plane a fused prologue reads instead of theta, written at each position's OWN row of
- * a [max_ctx, rot] table: `rot` values a row, cos for the first rot/2 and sin for the second.
+/* The cos/sin plane a fused prologue reads instead of theta, written at each position's own row of
+ * a [max_ctx, rot] table: cos in the first rot/2 values of a row, sin in the second.
  *
- * THE ANGLES ARE `rope`'s, TO THE LAST OPERATION, and that is the whole contract: a fused rotation
- * that read a table built any other way would be a different model, and the difference would be a
- * fraction of a ULP per element -- fluent text, subtly wrong positions, exactly the failure class
- * this file's rope_head comment is about. Only the rows `positions` names are written; a negative
- * position is a padded row and writes nothing. */
+ * The angles must match `rope`'s to the last operation; any other construction gives subtly wrong
+ * positions. Only rows named by `positions` are written; a negative position writes nothing. */
 int ref_rope_table(const RadArgs* a, RadStream) {
     if (!have(a, 2)) return RAD_E_INVAL;
     const RadTensor *pos = &a->t[0], *cs = &a->t[1];
@@ -801,16 +820,16 @@ int ref_rope_table(const RadArgs* a, RadStream) {
 
     const RadYarn yarn = rad_yarn_args(a);
     if (!rad_yarn_valid(yarn) || (yarn.factor != 0.0f && rscale != 1.0f)) return RAD_E_INVAL;
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(M * rot)
     for (int64_t m = 0; m < M; ++m) {
         const int64_t pp = ld_int(pos->dtype, pos->data, offlin(pos, m));
         if (pp < 0 || pp >= rows) continue;
         const float p = (float)pp / (rscale != 0.0f ? rscale : 1.0f);
         for (int64_t i = 0; i < half; ++i) {
-            const float inv = yarn.frequency(1.0f / std::pow(theta, (float)(2 * i) / (float)den), (int)i);
+            const float inv = yarn.frequency(1.0f / ref_pow(theta, (float)(2 * i) / (float)den), (int)i);
             const float ang = p * inv;
-            stt(cs, offlin(cs, pp * rot + i),        std::cos(ang) * yarn.magnitude);
-            stt(cs, offlin(cs, pp * rot + half + i), std::sin(ang) * yarn.magnitude);
+            stt(cs, offlin(cs, pp * rot + i),        ref_cos(ang) * yarn.magnitude);
+            stt(cs, offlin(cs, pp * rot + half + i), ref_sin(ang) * yarn.magnitude);
         }
     }
     return RAD_OK;
@@ -819,16 +838,16 @@ int ref_rope_table(const RadArgs* a, RadStream) {
 /* ------------------------------------------------------------------ qsa_block_key */
 /* The QSA indexer's compressed key (docs/OPS.md, docs/QSA.md): for each of M blocks,
  *
- *   pooled = mean of the block's `ratio` rows of k, accumulated in f32 and ROUNDED TO k's dtype
+ *   pooled = mean of the block's `ratio` rows of k, accumulated in f32 and rounded to k's dtype
  *   normed = pooled * rsqrt(mean(pooled^2) + eps) * (wadd + w)
  *   out    = NeoX rotary of normed's first `rotary_dim` lanes at the block's position, the rest
  *            passed through, rounded once at the store
  *
- * The rounding after the mean is the reference model's (`.float().mean(dim=1).to(dtype)`) and is
- * part of the answer. The block's position is `pos[b]` (a [>= M, 1 or 3] list carries a block's
- * components side by side, read under `mode` mrope/imrope and `sections`), or `pos0 + b*ratio`
- * without one. `page[b]`, when given, is the output row, and a negative entry writes nothing. The
- * rotary is `rope`'s ladder with YaRN's blend and magnitude when the coefficients are given. */
+ * The rounding after the mean is the upstream model's (`.float().mean(dim=1).to(dtype)`). The
+ * block's position is `pos[b]` (a [>= M, 1 or 3] list holds a block's components side by side,
+ * read under `mode` mrope/imrope and `sections`), or `pos0 + b*ratio` without one. `page[b]`, when
+ * given, is the output row; a negative entry writes nothing. The rotary is `rope`'s ladder, with
+ * YaRN's blend and magnitude when its coefficients are given. */
 int ref_qsa_block_key(const RadArgs* a, RadStream) {
     const RadTensor* k = t_in(a, 0);
     const RadTensor* w = t_in(a, 1);
@@ -857,8 +876,8 @@ int ref_qsa_block_key(const RadArgs* a, RadStream) {
     int64_t sec[8] = {};
     const int n_sec = rope_sections(a, sec);
     if (n_sec < 0 || n_sec > 3) return RAD_E_SHAPE;
-    /* Several components only with a mode, its sections and three columns of `pos`; otherwise
-     * every frequency reads the block's one position, which every mode reads as NeoX. */
+    /* Multiple components need a mode, its sections and three columns of `pos`; otherwise every
+     * frequency reads the block's single position, which reduces every mode to NeoX. */
     const bool mc = mode != ROPE_NEOX && n_sec > 0 && pos2 && pos->shape[1] >= 3;
     const RadYarn yarn = rad_yarn_args(a);
     if (!rad_yarn_valid(yarn) || (yarn.factor != 0.0f && (rot <= 0 || rscale != 1.0f)))
@@ -867,7 +886,7 @@ int ref_qsa_block_key(const RadArgs* a, RadStream) {
     RAD_REF_TRY(rope_freqs(mc ? mode : ROPE_NEOX, rot, rot, theta, sec, mc ? n_sec : 0, &f));
     for (int64_t i = 0; i < rot / 2; ++i) f.inv[i] = yarn.frequency(f.inv[i], (int)i);
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(M * n * ratio)
     for (int64_t b = 0; b < M; ++b) {
         const int64_t orow = page ? ld_int(page->dtype, page->data, offlin(page, b)) : b;
         if (orow < 0) continue;
@@ -876,9 +895,7 @@ int ref_qsa_block_key(const RadArgs* a, RadStream) {
         for (int64_t t = 0; t < n; ++t) {
             float acc = 0.0f;
             for (int64_t j = 0; j < ratio; ++j) acc += ldt(k, offlin(k, (b * ratio + j) * n + t));
-            uint64_t tmp = 0;
-            st_dt(k->dtype, &tmp, 0, acc / (float)ratio);
-            x[t] = ld_dt(k->dtype, &tmp, 0);
+            x[t] = round_dt(k->dtype, acc / (float)ratio);
             ss += (double)x[t] * x[t];
         }
         const float inv = 1.0f / std::sqrt((float)(ss / (double)n) + eps);
@@ -893,7 +910,7 @@ int ref_qsa_block_key(const RadArgs* a, RadStream) {
         const int64_t half = rot / 2;
         for (int64_t i = 0; i < half; ++i) {
             const float ang = p[f.comp[i]] * f.inv[i];
-            const float c = std::cos(ang) * yarn.magnitude, s = std::sin(ang) * yarn.magnitude;
+            const float c = ref_cos(ang) * yarn.magnitude, s = ref_sin(ang) * yarn.magnitude;
             const float x0 = y[i], x1 = y[half + i];
             y[i] = x0 * c - x1 * s;
             y[half + i] = x0 * s + x1 * c;

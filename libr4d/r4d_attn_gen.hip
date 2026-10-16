@@ -1,33 +1,27 @@
 // R4D attention over a paged prefix and the pass's own rows (attn_prefix_self), and the causal
 // dense attention a text encoder's prompt pass needs (attn_dense, causal 1, head_dim 128).
 //
-// THE KERNEL IS THE DENSE ONE (r4d_attn_dense_bf16.hip) WITH A SECOND KEY SOURCE. S^T = K.Q^T, so a
-// lane owns one query row and its softmax state, the C fragment of S^T is the B fragment the P.V
-// matmul wants, and P never goes through LDS. A workgroup owns one KV head and every query head
-// that reads it. What is new:
+// The dense kernel (r4d_attn_dense_bf16.hip) with a second key source. S^T = K.Q^T, so a lane
+// owns one query row and its softmax state, the C fragment of S^T is the B fragment of P.V, and P
+// never goes through LDS. A workgroup owns one KV head and every query head reading it.
 //
-//   THE PREFIX. A sequence's first `used[s]` keys are in the paged cache -- [blocks, kv_heads, 16,
-//   2 * HD], K then V in a slot -- and its own rows' keys are dense, beside the queries. The key
-//   loop walks the prefix tiles first and then the own tiles; a tile is one source or the other,
-//   and its rows are fetched through that source's address rule. Every prefix key is visible.
+//   Prefix: a sequence's first `used[s]` keys are in the paged cache ([blocks, kv_heads, 16,
+//   2 * HD], K then V per slot); its own rows' keys are dense beside the queries. Prefix tiles are
+//   walked first, then own tiles; each tile has one source. Every prefix key is visible.
 //
-//   CAUSAL OWN KEYS. With `causal` a query sees its own rows up to itself: a text segment of a
-//   conditioning sequence, and the text encoder's prompt. A tile wholly below every query of the
-//   workgroup pays no test.
+//   Causal own keys: with `causal` a query sees its own rows up to itself (a conditioning
+//   sequence's text segment, a text encoder's prompt). Tiles wholly below every query skip the mask.
 //
-// bf16 operands (DT16<0>): a diffusion transformer's values carry outliers an f16 operand could
-// overflow, and the reference takes P to bf16 for its P.V product too (rounded there, truncated
-// here -- see the softmax).
+// bf16 operands (DT16<0>): diffusion transformer values carry outliers that could overflow f16,
+// and the reference also takes P to bf16 for P.V (rounded there, truncated here; see the softmax).
 //
-// THE INT8 Q.K FORM (`I8`, the op's `k_i8` operand present). The score product runs on
-// v_wmma_i32_16x16x16_iu8, which issues in half the cycles of the bf16 one; P.V stays bf16. Every
-// code is quant_act_i8g's: a scale per (row, head) of amax / 127 (1 for an all-zero row) and a code
-// rint(x * (1 / scale)) clamped to +-127. The own rows' keys arrive quantised that way (k_i8 and
-// k_scale, one op ahead of this one), the query is quantised here once a workgroup, and a prefix
-// tile is quantised as it is staged -- the prefix is a picture's conditioning, a few hundred rows
-// against the thousands of own rows. A score is (q . k) * qs * ks, the integer dot product exact.
-// At a DiT's 16384 rows this takes the kernel from 38 to about 32 ms; against the bf16 form the
-// picture moves by less than swapping between exact attention implementations moves it.
+// Int8 Q.K form (`I8`, op operand `k_i8` present): scores run on v_wmma_i32_16x16x16_iu8 (half the
+// cycles of bf16); P.V stays bf16. Codes follow quant_act_i8g: per (row, head) scale amax / 127
+// (1 for an all-zero row), code rint(x / scale) clamped to +-127. Own keys arrive quantised
+// (k_i8, k_scale, from the preceding op); the query is quantised here once per workgroup, and
+// prefix tiles (a few hundred conditioning rows) as they are staged. A score is (q . k) * qs * ks
+// with an exact integer dot product. At a DiT's 16384 rows this is ~38 -> ~32 ms, with image
+// error below the spread between exact attention implementations.
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_common.h"
@@ -39,7 +33,7 @@
 typedef int v2i_ps __attribute__((ext_vector_type(2)));
 typedef int v8i_ps __attribute__((ext_vector_type(8)));
 
-/* quant_act_i8g's scale and codes for eight values against `inv` = 1 / scale. */
+/* quant_act_i8g codes for four values against `inv` = 1 / scale, packed into one dword. */
 __device__ __forceinline__ uint32_t ps_q8x4(float a, float b, float c, float d, float inv) {
     auto q = [inv](float x) {
         return (uint32_t)((int)rintf(fminf(fmaxf(x * inv, -127.0f), 127.0f)) & 0xff);
@@ -91,10 +85,9 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
     constexpr float GROW = D::GROW;
     constexpr int BS     = 16;                 // the paged block, libr4d's (block_size == 16)
     static_assert(HD % 16 == 0 && TILE % 16 == 0, "geometry");
-    // THE INT8 KEY TILE: a key's row is HD bytes, padded by 8 so the sixteen rows a fragment read
-    // touches land on distinct bank pairs (34 dwords a row), and written as 8-byte halves because
-    // the padding leaves odd rows 8-byte aligned. A prefix tile's key is DG lanes of 8 dims each,
-    // which is why those lanes must sit in one half-wave for the row's absolute maximum.
+    // Int8 key tile: HD bytes per row padded by 8 (34 dwords), so a fragment read's sixteen rows
+    // hit distinct bank pairs; written as 8-byte halves since odd rows are only 8-byte aligned.
+    // A prefix key spans DG lanes of 8 dims, which must sit in one half-wave for the row absmax.
     constexpr int KSTR8  = HD + 8;
     constexpr int K8G    = HD / 16;            // 16-byte pieces of an own key's row
     constexpr int K8P    = (TILE * K8G + NTHR - 1) / NTHR;
@@ -112,9 +105,9 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
     const int kvh = blockIdx.y;
     const int hq  = kvh * GQA + g;
 
-    // THE GRID IS FLAT OVER THE SEQUENCES' QUERY BLOCKS: block b is the b-th BQ-row block counting
-    // through every sequence in order, so a pass of many equal sequences launches what it needs
-    // rather than (longest sequence) x (sequences). A handful of sequences, so a walk.
+    // Flat grid over all sequences' query blocks: block b is the b-th BQ-row block counting through
+    // the sequences in order, instead of (longest sequence) x (sequences). Few sequences, so a
+    // linear walk.
     int seq = -1, q0 = 0;
     for (int s = 0, b = blockIdx.x; s < num_seqs; ++s) {
         const int nb = (cu[s + 1] - cu[s] + BQ - 1) / BQ;
@@ -132,9 +125,9 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
     const int  qpos = q0 + qbi * 16 + c;
     const bool live = qpos < slen;
 
-    // The query: bf16 fragments pre-multiplied by the softmax scale, or int8 codes against its
-    // row's absolute maximum -- a lane holds half the head's dims, the lane 16 away the other half
-    // -- with the scale carried in `qs` and applied to the integer score.
+    // The query: bf16 fragments pre-multiplied by the softmax scale, or int8 codes against the
+    // row absmax (a lane holds half the head's dims, lane + 16 the other half) with the scale in
+    // `qs`, applied to the integer score.
     qfrag qf[NKS];
     float qs = mul;
     {
@@ -199,8 +192,8 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
         const int klim = pre ? P : ke;
         const bool mask = (k0 + TILE > klim) || (!pre && causal && k0 + TILE - 1 > q0);
 
-        // An own tile in the int8 form is K8P 16-byte pieces a thread and a scale for the first
-        // TILE threads; anything else is the bf16 rows (a prefix tile quantised below).
+        // An int8 own tile is K8P 16-byte pieces per thread plus a scale from each of the first
+        // TILE threads; otherwise bf16 rows (an int8 prefix tile is quantised below).
         const bool own8 = I8 && !pre;
         uint4 kr[KP], vr[VP];
         float ksr = 0.0f;
@@ -239,8 +232,8 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
                 vr[r] = __builtin_bit_cast(uint4, load_tr_b128(vrow(pre, kk) + dg * 8));
             }
         }
-        // A prefix key in the int8 form: its row's maximum across the DG lanes that hold it (one
-        // half-wave, so a DPP butterfly), then its eight codes a lane.
+        // Int8 prefix key: row absmax over its DG lanes (one half-wave, DPP butterfly), then eight
+        // codes per lane.
         uint2 kq[KP];
         float kqs[KP];
         if (I8 && pre) {
@@ -299,8 +292,8 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
 
         #pragma unroll 1
         for (int mt = 0; mt < MT; ++mt) {
-            // The scores of 16 keys, in log2 units once times `qs` (a no-op 1 for bf16, whose
-            // query carries the scale already).
+            // Scores of 16 keys, in log2 units once multiplied by `qs` (int8 only; the bf16 query
+            // already carries the scale).
             float sc[8];
             if constexpr (I8) {
                 v8i_ps si = (v8i_ps){0, 0, 0, 0, 0, 0, 0, 0};
@@ -356,7 +349,7 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
                 }
             }
 
-            // `qs` is positive, so the maximum of the scaled scores is the scaled maximum.
+            // qs > 0, so the max of the scaled scores is the scaled max.
             float smax = sc[0];
             #pragma unroll
             for (int e = 1; e < 8; ++e) smax = fmaxf(smax, sc[e]);
@@ -374,10 +367,10 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
                 soff  = -mnew;
             }
 
-            // P TO BF16 BY TRUNCATION: one v_perm a pair where gfx1201's software round-to-nearest
-            // is about six VALU a value, on a path where the WMMA and the VALU share the SIMD
-            // (4-7% of the kernel at a DiT's 16384 rows). Its error is the rounding's in size, and
-            // its downward bias cancels: the row sum below is taken off the same truncated values.
+            // P to bf16 by truncation: one v_perm per pair, where gfx1201's software
+            // round-to-nearest costs ~6 VALU per value on a SIMD shared with the WMMA (4-7% of the
+            // kernel at 16384 rows). The downward bias cancels because the row sum below uses the
+            // same truncated values.
             uint32_t pw[4];
             #pragma unroll
             for (int e = 0; e < 8; e += 2) {
@@ -387,7 +380,7 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
                 const uint32_t hi = __builtin_bit_cast(uint32_t, ex2(a1));
                 pw[e >> 1] = __builtin_amdgcn_perm(hi, lo, 0x07060302u);
             }
-            // The row sum off the packed P, so the denominator is the values P.V used.
+            // Row sum from the packed P, so the denominator matches the values P.V used.
             #pragma unroll
             for (int e = 0; e < 4; ++e)
                 l_i += __builtin_bit_cast(float, pw[e] << 16) +
@@ -438,7 +431,7 @@ static int r4d_attn_ps_launch(const void* q, const void* k, const void* k8, cons
                               hipStream_t s)
 {
     constexpr int BQ = NQB * 16;
-    // Every sequence's blocks: at most total / BQ, plus one partial block a sequence.
+    // At most total / BQ full blocks plus one partial block per sequence.
     dim3 grid((max_q + BQ - 1) / BQ + num_seqs, n_head_kv, 1);
     hipLaunchKernelGGL((r4d_attn_ps_kernel<HD, GQA, NQB, TILE, I8>), grid, dim3(NQB * GQA * 32), 0, s,
                        (const uint16_t*)q, (const uint16_t*)k, (const int8_t*)k8, ks,
@@ -449,10 +442,10 @@ static int r4d_attn_ps_launch(const void* q, const void* k, const void* k8, cons
     return e == hipSuccess ? 0 : -100 - (int)e;
 }
 
-/* head_dim 128 at gqa 1, 2, 4 and 8. `used`/`bt`/`kvc` null is no prefix: the dense form. `max_q`
- * is the query rows of every sequence together, which bounds the flat grid. `k8` non-null is the
- * int8 Q.K form -- the own keys as int8 codes (`k8_ld` bytes a row) with a scale per (row, head)
- * in `ks` (`ks_ld` floats a row) -- at gqa 1, the only ratio a DiT has. */
+/* head_dim 128 at gqa 1, 2, 4 and 8. Null `used`/`bt`/`kvc` means no prefix (the dense form).
+ * `max_q` is the total query rows over all sequences and bounds the flat grid. Non-null `k8`
+ * selects the int8 Q.K form (own-key codes, `k8_ld` bytes per row; a scale per (row, head) in
+ * `ks`, `ks_ld` floats per row), gqa 1 only. */
 static int r4d_attn_ps(const void* q, const void* k, const void* k8, const float* ks,
                        const void* v, void* o, const int* cu,
                        const int* used, const int* bt, int bt_pitch, const void* kvc,
@@ -470,9 +463,9 @@ static int r4d_attn_ps(const void* q, const void* k, const void* k8, const float
     return r4d_attn_ps_launch<128, G, NQB, T, I8>(q, k, k8, ks, v, o, cu, used, bt, bt_pitch, kvc, \
                                                   num_seqs, max_q, n_head_kv, scale, causal,      \
                                                   q_ld, k_ld, k8_ld, ks_ld, v_ld, o_ld, s)
-    /* SIXTEEN QUERY TILES A WORKGROUP at gqa 1: a workgroup streams its head's whole K and V once,
-     * so the rows it serves divide that traffic. At a DiT's 16384 rows a head's K and V are 8 MB
-     * and fall out of L2; 128 rows a workgroup ran at 66 TFLOP/s, 256 at 111, 512 at 102. */
+    /* Sixteen query tiles per workgroup at gqa 1: a workgroup streams its head's whole K and V
+     * once, so more rows per workgroup divide that traffic. At 16384 rows a head's K/V (8 MB) do
+     * not fit L2; 128 rows per workgroup gave 66 TFLOP/s, 256 gave 111, 512 gave 102. */
     if (k8) {
         if (gqa != 1) return -1;
         R4D_PS(1, 16, 64, true);
@@ -488,17 +481,6 @@ static int r4d_attn_ps(const void* q, const void* k, const void* k8, const float
 }
 
 // ============================================================== the plugin ABI entry points
-/* [tokens, heads * head_dim] (or rank 3) at the operand's own row pitch. */
-static bool ps_rows(const RadTensor* t, long long head_dim, long long* n_tok, long long* n_head,
-                    long long* ld) {
-    long long width = 1;
-    for (uint32_t i = 1; i < t->rank; ++i) width *= t->shape[i];
-    if (t->rank < 2 || width % head_dim) return false;
-    *n_head = width / head_dim;
-    *ld = r4d_rows_pitch(t, width, n_tok);
-    return *ld >= 0;
-}
-
 enum { PS_Q = 0, PS_K, PS_V, PS_KV, PS_BT, PS_USED, PS_CU, PS_KDES, PS_VDES, PS_K8, PS_KS,
        PS_OUT };
 
@@ -523,16 +505,18 @@ extern "C" int r4d_rad_attn_prefix_self(const RadArgs* a, RadStream s) {
     if (r4d_numel(su) < num_seqs) return R4D_NO(RAD_E_SHAPE);
     long long total = 0, nh = 0, q_ld = 0, tk = 0, hk = 0, k_ld = 0, tv = 0, hv = 0, v_ld = 0;
     long long to = 0, ho = 0, o_ld = 0;
-    if (!ps_rows(q, hd, &total, &nh, &q_ld) || !ps_rows(k, hd, &tk, &hk, &k_ld) ||
-        !ps_rows(v, hd, &tv, &hv, &v_ld) || !ps_rows(o, hd, &to, &ho, &o_ld))
+    if (!r4d_head_rows(q, hd, &total, &nh, &q_ld) ||
+        !r4d_head_rows(k, hd, &tk, &hk, &k_ld) ||
+        !r4d_head_rows(v, hd, &tv, &hv, &v_ld) ||
+        !r4d_head_rows(o, hd, &to, &ho, &o_ld))
         return R4D_NO(RAD_E_STRIDE);
     if (hk != hv || ho != nh || hk * gqa != nh || hk != kv->shape[1]) return R4D_NO(RAD_E_SHAPE);
     if (tk < total || tv < total || to < total) return R4D_NO(RAD_E_SHAPE);
     const long long bt_pitch = bt->rank >= 2 ? bt->shape[1] : r4d_numel(bt) / num_seqs;
     if (bt->rank >= 2 && bt->stride[1] != 1) return R4D_NO(RAD_E_STRIDE);
     const long long mq = total;
-    /* THE INT8 Q.K FORM (`qk` "i8"): the own keys' codes [tokens, kv_heads * head_dim] and their
-     * scales [tokens, kv_heads], as quant_act_i8g writes them at group head_dim. */
+    /* Int8 Q.K form (`qk` "i8"): own-key codes [tokens, kv_heads * head_dim] and scales
+     * [tokens, kv_heads], as quant_act_i8g writes them at group head_dim. */
     const RadTensor* k8 = r4d_opt(a, PS_K8);
     const RadTensor* ks = r4d_opt(a, PS_KS);
     const char* qk = r4d_gets(a, "qk");
@@ -543,7 +527,7 @@ extern "C" int r4d_rad_attn_prefix_self(const RadArgs* a, RadStream s) {
     if (k8) {
         if (k8->dtype != RAD_I8 || ks->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
         long long t8 = 0, h8 = 0, ts = 0;
-        if (!ps_rows(k8, hd, &t8, &h8, &k8_ld)) return R4D_NO(RAD_E_STRIDE);
+        if (!r4d_head_rows(k8, hd, &t8, &h8, &k8_ld)) return R4D_NO(RAD_E_STRIDE);
         ks_ld = r4d_rows_pitch(ks, hk, &ts);
         if (ks_ld < 0) return R4D_NO(RAD_E_STRIDE);
         if (h8 != hk || t8 < total || ts < total) return R4D_NO(RAD_E_SHAPE);
@@ -556,7 +540,8 @@ extern "C" int r4d_rad_attn_prefix_self(const RadArgs* a, RadStream s) {
                               scale, (int)r4d_geti_or(a, "causal", 0), (int)q_ld, (int)k_ld,
                               (int)k8_ld, (int)ks_ld, (int)v_ld, (int)o_ld, (hipStream_t)s);
     if (e == -1 || e == -2) return R4D_NO(RAD_E_SHAPE);
-    return e == 0 ? RAD_OK : R4D_NO(e == -3 ? RAD_E_STRIDE : RAD_E_DEVICE);
+    if (e == 0) return RAD_OK;
+    return R4D_NO(e == -3 ? RAD_E_STRIDE : e <= -100 ? RAD_E_DEVICE : RAD_E_SHAPE);
 }
 
 /* attn_dense at head_dim 128, causal or not: the same kernel with no prefix. */
@@ -570,11 +555,16 @@ extern "C" int r4d_rad_attn_dense_h128(const RadArgs* a, RadStream s) {
     if (!r4d_contig(cu) || cu->rank != 1 || cu->shape[0] < 2) return R4D_NO(RAD_E_SHAPE);
     const long long hd = r4d_geti_or(a, "head_dim", 0), gqa = r4d_geti_or(a, "gqa", 1);
     if (hd != 128 || gqa <= 0) return R4D_NO(RAD_E_SHAPE);
-    if (r4d_geti_or(a, "window", 0) != 0) return R4D_NO(RAD_E_UNSUPPORTED);
+    /* Every key of a segment, its bounds read as they stand: no window, blocks or cu_div. */
+    if (r4d_geti_or(a, "window", 0) != 0 || r4d_geti_or(a, "block", 0) != 0 ||
+        r4d_geti_or(a, "cu_div", 1) != 1)
+        return R4D_NO(RAD_E_UNSUPPORTED);
     long long total = 0, nh = 0, q_ld = 0, tk = 0, hk = 0, k_ld = 0, tv = 0, hv = 0, v_ld = 0;
     long long to = 0, ho = 0, o_ld = 0;
-    if (!ps_rows(q, hd, &total, &nh, &q_ld) || !ps_rows(k, hd, &tk, &hk, &k_ld) ||
-        !ps_rows(v, hd, &tv, &hv, &v_ld) || !ps_rows(o, hd, &to, &ho, &o_ld))
+    if (!r4d_head_rows(q, hd, &total, &nh, &q_ld) ||
+        !r4d_head_rows(k, hd, &tk, &hk, &k_ld) ||
+        !r4d_head_rows(v, hd, &tv, &hv, &v_ld) ||
+        !r4d_head_rows(o, hd, &to, &ho, &o_ld))
         return R4D_NO(RAD_E_STRIDE);
     if (hk != hv || ho != nh || hk * gqa != nh) return R4D_NO(RAD_E_SHAPE);
     if (tk < total || tv < total || to < total) return R4D_NO(RAD_E_SHAPE);
@@ -586,24 +576,24 @@ extern "C" int r4d_rad_attn_dense_h128(const RadArgs* a, RadStream s) {
                               (int)r4d_geti_or(a, "causal", 0), (int)q_ld, (int)k_ld, 0, 0,
                               (int)v_ld, (int)o_ld, (hipStream_t)s);
     if (e == -1 || e == -2) return R4D_NO(RAD_E_SHAPE);
-    return e == 0 ? RAD_OK : R4D_NO(e == -3 ? RAD_E_STRIDE : RAD_E_DEVICE);
+    if (e == 0) return RAD_OK;
+    return R4D_NO(e == -3 ? RAD_E_STRIDE : e <= -100 ? RAD_E_DEVICE : RAD_E_SHAPE);
 }
 
 // ============================================================== wide heads (attn_dense, h768 / h1152)
-// AN IMAGE DECODER'S MID-BLOCK ATTENTION: one head 1152 wide over every latent pixel -- 16384 rows
-// at 2048 x 2048. A lane cannot hold a 1152-wide output row (576 accumulator registers), so the
-// head is split across the workgroup's eight waves instead of its rows: a wave owns HD/8 of the
-// dims for the whole 16-query block.
+// Image decoder mid-block attention: one head up to 1152 wide over every latent pixel (16384 rows
+// at 2048 x 2048). A lane cannot hold a 1152-wide output row (576 accumulator VGPRs), so the head
+// is split across the workgroup's eight waves: a wave owns HD/8 dims of the 16-query block.
 //
-//   S  = Q.K^T is contracted in eight pieces, a wave's dims each, and the partial score tiles are
-//        summed through LDS in wave order -- a fixed order, so the sum is the same every run.
-//   P  is formed once, by sixteen threads (a query row each), rounded to bf16, and its row sum is
-//        taken off the rounded values, the denominator P.V uses.
-//   O  += P.V is a wave's own dims: V^T fragments straight from global with the transposing load
-//        (no LDS), P^T from LDS.
+//   S  = Q.K^T in eight partial tiles (one per wave), summed through LDS in fixed wave order so
+//        the result is run-to-run deterministic.
+//   P  formed by sixteen threads (one per query row), rounded to bf16; the row sum uses the
+//        rounded values.
+//   O  += P.V over the wave's own dims: V^T straight from global via the transposing load, P^T
+//        from LDS.
 //
-// S^T = K.Q^T as in the dense kernel above, so a partial tile's C layout is (query = lane % 16,
-// key = 8 (lane / 16) + e) and both the reduction and the P^T fragment index it the same way.
+// S^T = K.Q^T as above, so a partial tile's C layout is (query = lane % 16, key = 8 (lane / 16) + e)
+// for both the reduction and the P^T fragment.
 template<int HD>
 __global__ __launch_bounds__(256)
 void r4d_attn_wide_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restrict__ gk,
@@ -733,8 +723,8 @@ void r4d_attn_wide_kernel(const uint16_t* __restrict__ gq, const uint16_t* __res
     }
 }
 
-/* attn_dense at head_dim 768 or 1152 (an image encoder's and decoder's mid block), one query head a
- * KV head, bidirectional. */
+/* attn_dense at head_dim 768 or 1152 (image encoder/decoder mid block): one query head per KV
+ * head, bidirectional. */
 extern "C" int r4d_rad_attn_dense_wide(const RadArgs* a, RadStream s) {
     const RadTensor* q  = r4d_opt(a, 0);
     const RadTensor* k  = r4d_opt(a, 1);
@@ -745,12 +735,15 @@ extern "C" int r4d_rad_attn_dense_wide(const RadArgs* a, RadStream s) {
     if (!r4d_contig(cu) || cu->rank != 1 || cu->shape[0] < 2) return R4D_NO(RAD_E_SHAPE);
     const long long hd = r4d_geti_or(a, "head_dim", 0);
     if ((hd != 768 && hd != 1152) || r4d_geti_or(a, "gqa", 1) != 1 || r4d_geti_or(a, "causal", 0) != 0 ||
-        r4d_geti_or(a, "window", 0) != 0)
+        r4d_geti_or(a, "window", 0) != 0 || r4d_geti_or(a, "block", 0) != 0 ||
+        r4d_geti_or(a, "cu_div", 1) != 1)
         return R4D_NO(RAD_E_UNSUPPORTED);
     long long total = 0, nh = 0, q_ld = 0, tk = 0, hk = 0, k_ld = 0, tv = 0, hv = 0, v_ld = 0;
     long long to = 0, ho = 0, o_ld = 0;
-    if (!ps_rows(q, hd, &total, &nh, &q_ld) || !ps_rows(k, hd, &tk, &hk, &k_ld) ||
-        !ps_rows(v, hd, &tv, &hv, &v_ld) || !ps_rows(o, hd, &to, &ho, &o_ld))
+    if (!r4d_head_rows(q, hd, &total, &nh, &q_ld) ||
+        !r4d_head_rows(k, hd, &tk, &hk, &k_ld) ||
+        !r4d_head_rows(v, hd, &tv, &hv, &v_ld) ||
+        !r4d_head_rows(o, hd, &to, &ho, &o_ld))
         return R4D_NO(RAD_E_STRIDE);
     if (hk != nh || hv != nh || ho != nh) return R4D_NO(RAD_E_SHAPE);
     if (tk < total || tv < total || to < total) return R4D_NO(RAD_E_SHAPE);

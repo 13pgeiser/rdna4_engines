@@ -1,12 +1,11 @@
 /* ref_gdn.cpp -- the gated delta net: the conv preamble, the chunk preamble, the chunked scan, the
  * recurrent update and the gated norm.
  *
- * The algorithm is libr4d's, stated in its own comments and reproduced here without any of the
- * fusion. Where libr4d says the state lives in WMMA accumulators across a whole chunk, this keeps
- * it in a per-thread workspace and writes every intermediate out; where libr4d recomputes the gram
- * once per k head for three v heads, this recomputes it per v head. Both are the same arithmetic.
+ * libr4d's algorithm without the fusion: the state lives in a per-thread workspace instead of WMMA
+ * accumulators, every intermediate is written out, and the gram is recomputed per v head instead
+ * of once per k head. The arithmetic is the same.
  *
- * ============================== THE ALGORITHM ==============================
+ * ============================== The algorithm ==============================
  *
  * Per token, per v head, with q and k l2-normalised and the state S shaped [head_v, head_k]:
  *
@@ -14,25 +13,21 @@
  *     S   *= e^g
  *     u    = beta . (v - S k)          S += u k^T          o = S q
  *
- * That is the recurrent form, which is what DECODE runs. Prefill runs the chunked form, which is
- * the same recurrence blocked over `chunk` tokens with the intra-chunk dependencies solved in one
- * triangular inverse (`gdn_kkt_solve`) instead of sequentially:
+ * Decode runs this recurrent form. Prefill runs the chunked form: the same recurrence blocked over
+ * `chunk` tokens, with intra-chunk dependencies solved by one triangular inverse (`gdn_kkt_solve`):
  *
- *     ge[j] = e^{g_j}   gs[j] = e^{g_last - g_j}     (g is the INTRA-CHUNK CUMSUM of the gate)
+ *     ge[j] = e^{g_j}   gs[j] = e^{g_last - g_j}     (g is the intra-chunk cumsum of the gate)
  *     U  = K S^T        W  = beta . (V - ge . U)     V' = A W
  *     P  = Q K^T        sA = scale . e^{g_i - g_j} . tril(P)
  *     O  = scale . ge . (Q S^T) + sA V'
  *     S  = e^{g_last} S + V'^T (gs . K)
  *
- * EVERY DECAY FACTOR FORMED HERE IS <= 1, and that is a correctness requirement rather than a
- * style. Intra-chunk gate spans on real prefill inputs reach several hundred nats, so
- * any factorisation that puts half the exponent on its own -- e^{g_i - c} and e^{c - g_j} about
- * some per-chunk reference c -- sends one half past fp32's e^88 while the other underflows to
- * zero, whatever c is chosen. The pairs e^{g_i - g_j} (j <= i) and e^{g_last - g_j} never leave
- * (0, 1]. A reference that took the convenient factorisation would produce infinities on inputs
- * the fast kernel handles, which is the wrong way round for an oracle.
+ * Invariant: every decay factor formed is <= 1. Intra-chunk gate spans on real prefill inputs reach
+ * several hundred nats, so splitting the exponent about any reference c (e^{g_i - c}, e^{c - g_j})
+ * overflows fp32's e^88 on one side and underflows on the other. The pairs e^{g_i - g_j} (j <= i)
+ * and e^{g_last - g_j} stay in (0, 1].
  *
- * ============================== THE LAYOUTS ==============================
+ * ============================== The layouts ==============================
  *
  *     q, k     [T, head_k_count, head_k]        v, o     [T, head_v_count, head_v]
  *     g, beta  [T, head_v_count]                A        [T, head_v_count, chunk]
@@ -42,25 +37,24 @@
  *     state      [n_slots, head_v_count, head_v, head_k]
  *
  * with conv_dim = 2 * head_k_count * head_k + head_v_count * head_v, and `x` the fused projection
- * row [q | k | v | a | b] -- conv_dim convolved channels followed by one `a` and one `b` per v
- * head. gdn_conv_prep takes `a` and `b_gate` as OPTIONAL operands: present, they are the layer's
- * separate gate and beta projections; absent, they are the last 2 * head_v_count columns of `x`.
- * gdn_recurrent_update always names them separately, and a caller with a fused row passes strided
- * views of it.
+ * row [q | k | v | a | b]: conv_dim convolved channels, then one `a` and one `b` per v head.
+ * gdn_conv_prep's `a` and `b_gate` operands are optional: present, they are separate gate and beta
+ * projections; absent, they are the last 2 * head_v_count columns of `x`. gdn_recurrent_update
+ * always takes them separately (strided views of a fused row are fine).
  *
- * The speculative rollback contract for the two state caches is in ref_ops.h and is obeyed here.
+ * The speculative rollback contract for the two state caches is in ref_ops.h.
  */
 #include "ref_common.h"
 #include "ref_ops.h"
+
+#include <algorithm>
 
 using namespace ref;
 
 namespace {
 
-/* The deepest convolution history this reference holds in a stack frame. libr4d's width is 4 and
- * no linear-attention model in circulation exceeds it by much; a wider request returns
- * RAD_E_UNSUPPORTED by name rather than convolving a truncated window, which would be numerically
- * plausible and completely wrong. */
+/* The deepest convolution history held in a stack frame. libr4d's width is 4; a wider request
+ * returns RAD_E_UNSUPPORTED rather than convolving a truncated window. */
 enum { REF_CONV_HIST_MAX = 16 };
 
 struct V3 { const RadTensor* t; int64_t s0, s1, s2; };
@@ -75,10 +69,9 @@ static inline V3 v3(const RadTensor* t, int64_t d1, int64_t d2) {
     }
     return v;
 }
-/* The same [tokens, d1, d2] reading for an operand that may be a COLUMN VIEW of a wider row: the
- * fp8 delta net's output gate is the tail of a fused [q|k|v|z] projection, so its token stride is
- * its own rather than d1*d2. A rank-3 spelling already carries all three strides; a rank-2 one
- * carries the token stride in stride[0] and v3() would have guessed d1*d2 for it. */
+/* v3() for an operand that may be a column view of a wider row (the fp8 delta net's output gate is
+ * the tail of a fused [q|k|v|z] projection). A rank-2 view carries its token stride in stride[0],
+ * where v3() would assume d1*d2. */
 static inline V3 v3_rows(const RadTensor* t, int64_t d1, int64_t d2) {
     if (t->rank != 2) return v3(t, d1, d2);
     return V3{ t, t->stride[0], d2 * t->stride[1], t->stride[1] };
@@ -93,11 +86,9 @@ static inline int64_t at3(const V3& v, int64_t i, int64_t j, int64_t k) {
 }
 static inline int64_t at2(const V2& v, int64_t i, int64_t j) { return i * v.s0 + j * v.s1; }
 
-/* [N, heads, head_v, head_k] -- the shape both the chunked scan's h0/ht and the paged recurrent
- * state have. The slot and head strides are read off the tensor and NOT derived from the shape:
- * a paged state cache is padded so its page matches the attention page, and a kernel that derived
- * the stride would read every slot but the first at the wrong offset, which looks exactly like a
- * correct kernel producing noise (libr4d makes the same point about vLLM's mamba page). */
+/* [N, heads, head_v, head_k], the shape of the chunked scan's h0/ht and the paged recurrent state.
+ * Strides are read off the tensor, not derived: a paged state cache is padded to match the
+ * attention page, so a derived stride would misread every slot after the first. */
 struct V4 { const RadTensor* t; int64_t s0, s1, s2, s3; };
 static inline V4 v4(const RadTensor* t, int64_t d1, int64_t d2, int64_t d3) {
     V4 v{ t, d1 * d2 * d3, d2 * d3, d3, 1 };
@@ -113,33 +104,61 @@ static inline int64_t at4(const V4& v, int64_t i, int64_t j, int64_t k, int64_t 
     return i * v.s0 + j * v.s1 + k * v.s2 + l * v.s3;
 }
 
-static inline int64_t cu_at(const RadTensor* cu, int64_t i) {
-    return ld_int(cu->dtype, cu->data, offlin(cu, i));
-}
-
-/* The conv state is [n_slots, conv_dim, state_len]; a rank the caller flattened is read as the
- * tight layout that shape implies. */
+/* The conv state is [n_slots, conv_dim, state_len]; a flattened one is read as the tight layout. */
 static inline V3 conv_state_view(const RadTensor* cs, int64_t conv_dim, int64_t width,
                                  int64_t* state_len) {
     *state_len = cs->rank >= 3 ? cs->shape[cs->rank - 1] : (width > 1 ? width - 1 : 1);
     return v3(cs, conv_dim, *state_len);
 }
 
+/* What gdn_conv_prep and gdn_conv_update share: the fused row `x`, the conv weight and bias, and
+ * the q, k and v outputs the channels split into. */
+struct ConvIO {
+    const RadTensor *x, *w, *bias, *q, *k, *v;
+    int64_t xrow, xcol, Hg, H, K, V, width;
+};
+
+/* Channel `c` of the depthwise causal convolution with silu over one sequence's `slen` tokens
+ * from row `bos`, `hist` holding its width - 1 entries of history. Channels are grouped in whole
+ * heads, so a group never straddles the q/k/v boundaries at any tensor-parallel width. */
+static void conv_channel(const ConvIO& io, int64_t c, int64_t bos, int64_t slen, const float* hist) {
+    const int64_t Hg = io.Hg, K = io.K, V = io.V, width = io.width;
+    const RadTensor* out;
+    V3 ov;
+    int64_t oh, od;
+    if (c < Hg * K) {
+        out = io.q; ov = v3(out, Hg, K); oh = c / K; od = c % K;
+    } else if (c < 2 * Hg * K) {
+        out = io.k; ov = v3(out, Hg, K); oh = (c - Hg * K) / K; od = (c - Hg * K) % K;
+    } else {
+        out = io.v; ov = v3(out, io.H, V); oh = (c - 2 * Hg * K) / V; od = (c - 2 * Hg * K) % V;
+    }
+    const V2 wv = v2(io.w, width);
+    const float bs = io.bias ? ldt(io.bias, c * laststride(io.bias)) : 0.0f;
+    for (int64_t t = 0; t < slen; ++t) {
+        float acc = bs;
+        for (int64_t j = 0; j < width; ++j) {
+            const int64_t src = t - (width - 1) + j;
+            const float val = src >= 0 ? ldt(io.x, (bos + src) * io.xrow + c * io.xcol)
+                                       : hist[src + width - 1];
+            acc += val * ldt(io.w, at2(wv, c, j));
+        }
+        stt(out, at3(ov, bos + t, oh, od), act_silu(acc));
+    }
+}
+
 }  /* namespace */
 
 /* ------------------------------------------------------------------ gdn_conv_prep */
 /* Everything between the qkv projection and the chunked scan: the width-`conv_width` depthwise
- * causal convolution with silu and its state cache, the q/k/v split, the l2 norm over each q and k
+ * causal convolution with silu and its state cache, the q/k/v split, the l2 norm of each q and k
  * head, the gate with its per-chunk cumsum, and beta.
  *
- * THE CONV OUTPUT IS ROUNDED BEFORE THE NORM. A fused kernel rounds to bf16 there because the pair
- * of kernels it replaces does -- the conv writes a bf16 tensor and the prep reads it back -- and
- * matching that is what lets the fused form stand in for the unfused pair on real weights. The
- * reference does the same by writing the conv result into its output tensor and reading it back
- * for the norm.
+ * The conv output is rounded before the norm, as the unfused pair does (the conv writes bf16, the
+ * prep reads it back); the reference writes it to its output tensor and reads it back.
  *
- * The l2 norm is rsqrt(sum(x^2) + l2_eps) with NO division by the head width -- it is a norm, not
- * an RMS -- and l2_eps is 1e-6, which is FLA's and libr4d's L2NORM_EPS. */
+ * The l2 norm is rsqrt(sum(x^2) + l2_eps) with no division by head width (a norm, not an RMS);
+ * l2_eps defaults to 1e-6, FLA's and libr4d's L2NORM_EPS. */
 int ref_gdn_conv_prep(const RadArgs* a, RadStream) {
     if (a->n_t < 16) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *w = &a->t[1], *cs = &a->t[5], *cu = &a->t[6];
@@ -148,27 +167,20 @@ int ref_gdn_conv_prep(const RadArgs* a, RadStream) {
     const RadTensor* bias = t_in(a, 2);
     const RadTensor* A_log = t_in(a, 3);
     const RadTensor* dt_bias = t_in(a, 4);
-    /* The gate and beta projections, when the layer hands them separately from the qkv slice.
-     * Absent, they are the last 2*H columns of the fused `x` row, which is what a caller holding
-     * a single fused projection passes. */
+    /* Separate gate and beta projections; absent, they are the last 2*H columns of `x`. */
     const RadTensor* ta = t_in(a, 7);
     const RadTensor* tb = t_in(a, 8);
     const RadTensor* sidx = t_in(a, 9);
     const RadTensor* hini = t_in(a, 10);
     if (!x->data || !w->data || !cu->data || !q->data || !k->data || !v->data ||
         !g->data || !beta->data) return RAD_E_INVAL;
-    /* One of the two, not one of each: a caller that names the gate has to name beta as well, or
-     * the second read silently falls back into a fused row that may not be there. */
+    /* Both or neither, or one read would fall back into a fused row that may not exist. */
     if ((ta != nullptr) != (tb != nullptr)) return RAD_E_INVAL;
 
     const int64_t K = p_int(a, "head_k", 0), V = p_int(a, "head_v", 0);
-    /* `chunk` is RAD_DERIVED on this op, and NOTHING HERE CARRIES IT: the gate cumsum is cut at
-     * the chunk boundary and no operand's shape records where that is. Ref declares no RAD_C_EQ
-     * for it, so a caller who both omitted it and resolved to ref arrives with the key unset and
-     * gets RAD_E_SHAPE by name. The alternative -- treating the sequence as one chunk -- is a
-     * decay summed over the wrong span, which is numerically plausible and completely wrong. A
-     * caller pins `chunk` here (which is what the architecture plugins do) or resolves to a kernel
-     * that declares one. */
+    /* `chunk` is RAD_DERIVED and no operand's shape records it, yet the gate cumsum is cut at the
+     * chunk boundary. A call that omits it gets RAD_E_SHAPE rather than a cumsum over the wrong
+     * span; the architecture plugins pin it. */
     const int64_t chunk = p_int(a, "chunk", 0), width = p_int(a, "conv_width", 0);
     const float l2eps = p_f32(a, "l2_eps", 1e-6f);
     const float spthr = p_f32(a, "softplus_thr", 20.0f);
@@ -178,7 +190,7 @@ int ref_gdn_conv_prep(const RadArgs* a, RadStream) {
     const int64_t N = numel(cu) - 1;
     if (N <= 0) return RAD_E_SHAPE;
     const int64_t T = cu_at(cu, N);
-    if (T <= 0) return RAD_OK;                       /* an empty step is not an error */
+    if (T <= 0) return RAD_E_SHAPE;                  /* zero rows (docs/OPS.md, Conventions) */
     const int64_t Hg = numel(q) / (T * K);
     const int64_t H  = numel(v) / (T * V);
     if (Hg <= 0 || H <= 0 || H % Hg != 0) return RAD_E_SHAPE;
@@ -188,11 +200,9 @@ int ref_gdn_conv_prep(const RadArgs* a, RadStream) {
 
     const int64_t xrow = x->rank >= 2 ? x->stride[x->rank - 2] : (conv_dim + (ta ? 0 : 2 * H));
     const int64_t xcol = laststride(x);
-    /* THE BOUND IS THE VIEW'S AND NOT THE BUFFER'S. `x` may be a column slice of a wider row --
-     * the fp8 block hands the convolution the left-hand `conv_dim` of a fused [q|k|v|z]
-     * projection -- and a slice's numel counts only the elements it names, so the flat product
-     * refuses a call that is perfectly in range. Rank 2 or more spells the extent in the shape;
-     * only a flattened operand has to be bounded by numel. */
+    /* Bound by the view, not the buffer: `x` may be a column slice of a wider row (the fp8 block
+     * passes the left `conv_dim` of a fused [q|k|v|z] projection), whose numel undercounts the
+     * span. Rank >= 2 is checked by shape; only a flattened operand is bounded by numel. */
     const int64_t xneed = conv_dim + (ta ? 0 : 2 * H);
     if (x->rank >= 2) {
         if (x->shape[x->rank - 1] < xneed || x->shape[x->rank - 2] < T) return RAD_E_SHAPE;
@@ -205,52 +215,30 @@ int ref_gdn_conv_prep(const RadArgs* a, RadStream) {
     const V3 cvs = conv_state_view(cs, conv_dim, width, &state_len);
     if (cs->data && state_len < width - 1) return RAD_E_SHAPE;
 
-    const V3 qv = v3(q, Hg, K), kv = v3(k, Hg, K), vv = v3(v, H, V);
-    const V2 wv = v2(w, width);
+    const V3 qv = v3(q, Hg, K), kv = v3(k, Hg, K);
     const V2 gv = v2(g, H), bv = v2(beta, H);
     const V2 av = ta ? v2(ta, H) : V2{ nullptr, 0, 0 };
     const V2 bgv = tb ? v2(tb, H) : V2{ nullptr, 0, 0 };
+    const ConvIO io{ x, w, bias, q, k, v, xrow, xcol, Hg, H, K, V, width };
 
     /* ---- phase 1: the convolution, straight into q / k / v ---------------------------------- */
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(T * conv_dim * width)
     for (int64_t nc = 0; nc < N * conv_dim; ++nc) {
         const int64_t n = nc / conv_dim, c = nc % conv_dim;
         const int64_t bos = cu_at(cu, n), slen = cu_at(cu, n + 1) - bos;
         if (slen <= 0) continue;
         const int64_t slot = sidx ? ld_int(sidx->dtype, sidx->data, offlin(sidx, n)) : n;
-        /* A zero `has_init` means the slot holds no history: the window in front of the sequence's
-         * first token is ZEROS, not whatever the slot last held. Without it a fresh sequence
-         * landing on a recycled slot convolves the previous sequence's tail into its first
-         * conv_width-1 tokens, which is fluent output with the wrong prefix. */
+        /* A zero `has_init` means the slot holds no history: the window before the first token is
+         * zeros, not a recycled slot's previous contents. */
         const bool warm = !hini || ld_int(hini->dtype, hini->data, offlin(hini, n)) != 0;
-
-        /* Which of the three outputs this channel belongs to. Channel groups are counted in HEADS,
-         * so a group never straddles the q/k/v boundaries at any tensor-parallel width. */
-        const RadTensor* out;
-        V3 ov;
-        int64_t oh, od;
-        if (c < Hg * K)            { out = q; ov = qv; oh = c / K; od = c % K; }
-        else if (c < 2 * Hg * K)   { out = k; ov = kv; oh = (c - Hg * K) / K; od = (c - Hg * K) % K; }
-        else                       { out = v; ov = vv; oh = (c - 2 * Hg * K) / V;
-                                     od = (c - 2 * Hg * K) % V; }
-
-        const float bs = bias ? ldt(bias, c * laststride(bias)) : 0.0f;
-        for (int64_t t = 0; t < slen; ++t) {
-            float acc = bs;
-            for (int64_t j = 0; j < width; ++j) {
-                const int64_t src = t - (width - 1) + j;
-                float val = 0.0f;
-                if (src >= 0) val = ldt(x, (bos + src) * xrow + c * xcol);
-                else if (warm && cs->data && slot >= 0)
-                    val = ldt(cs, at3(cvs, slot, c, src + width - 1));
-                acc += val * ldt(w, at2(wv, c, j));
-            }
-            stt(out, at3(ov, bos + t, oh, od), act_silu(acc));
-        }
+        float hist[REF_CONV_HIST_MAX];
+        for (int64_t i = 0; i < width - 1; ++i)
+            hist[i] = warm && cs->data && slot >= 0 ? ldt(cs, at3(cvs, slot, c, i)) : 0.0f;
+        conv_channel(io, c, bos, slen, hist);
     }
 
-    /* ---- phase 2: the l2 norm over each q and k head, reading the ROUNDED conv output -------- */
-    #pragma omp parallel for schedule(static)
+    /* ---- phase 2: the l2 norm over each q and k head, reading the rounded conv output -------- */
+    REF_PAR_FOR(T * Hg * K * 2)
     for (int64_t th = 0; th < T * Hg * 2; ++th) {
         const int64_t which = th / (T * Hg);
         const int64_t rest = th % (T * Hg);
@@ -265,9 +253,9 @@ int ref_gdn_conv_prep(const RadArgs* a, RadStream) {
     }
 
     /* ---- phase 3: the gate, its per-chunk cumsum, and beta ----------------------------------- */
-    /* The cumsum is per CHUNK and per sequence, because that is what the scan consumes: g[j] is
-     * the decay from the start of j's chunk up to and including j. */
-    #pragma omp parallel for schedule(static)
+    /* The cumsum restarts per chunk and per sequence, as the scan consumes it: g[j] is the decay
+     * from the start of j's chunk through j. */
+    REF_PAR_FOR(T * H * 4)
     for (int64_t nh = 0; nh < N * H; ++nh) {
         const int64_t n = nh / H, h = nh % H;
         const int64_t bos = cu_at(cu, n), slen = cu_at(cu, n + 1) - bos;
@@ -287,11 +275,11 @@ int ref_gdn_conv_prep(const RadArgs* a, RadStream) {
     }
 
     /* ---- phase 4: rewrite the conv state from the sequence's last width-1 tokens -------------- */
-    /* After phase 1, so the history it overwrites has already been read. A sequence shorter than
-     * width-1 keeps what the old state held in front of its tokens, which is what makes chunked
-     * prefill work: the second chunk of a sequence continues from the first. */
+    /* After phase 1, which has read the history this overwrites. A sequence shorter than width-1
+     * keeps the old state in front of its tokens, so a later prefill chunk continues from the
+     * earlier one. */
     if (cs->data && width > 1) {
-        #pragma omp parallel for schedule(static)
+        REF_PAR_FOR(N * conv_dim * width)
         for (int64_t nc = 0; nc < N * conv_dim; ++nc) {
             const int64_t n = nc / conv_dim, c = nc % conv_dim;
             const int64_t bos = cu_at(cu, n), slen = cu_at(cu, n + 1) - bos;
@@ -312,14 +300,11 @@ int ref_gdn_conv_prep(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ gdn_conv_update */
-/* The same convolution for a decode step, against the rolling window. See ref_ops.h for the
- * contract; the two things that matter are that the READ starts at num_accepted-1 and that the
- * rewrite shifts the buffer down by one so the next step can do the same. A rejection is a change
- * of read offset, not a recompute (spec §10), and that is the whole reason this is a separate
- * entry point rather than a flag on the prefill one.
+/* The same convolution for a decode step, against the rolling window (contract in ref_ops.h): the
+ * read starts at num_accepted-1, and the rewrite shifts the buffer down by one. A rejection changes
+ * the read offset instead of recomputing (spec §10).
  *
- * No l2 norm here: on the decode path the recurrent update does it, which is where libr4d puts it
- * too. */
+ * No l2 norm: on the decode path the recurrent update does it, as in libr4d. */
 int ref_gdn_conv_update(const RadArgs* a, RadStream) {
     if (a->n_t < 10) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *w = &a->t[1], *cs = &a->t[3], *cu = &a->t[6];
@@ -338,7 +323,7 @@ int ref_gdn_conv_update(const RadArgs* a, RadStream) {
     const int64_t N = numel(cu) - 1;
     if (N <= 0) return RAD_E_SHAPE;
     const int64_t T = cu_at(cu, N);
-    if (T <= 0) return RAD_OK;
+    if (T <= 0) return RAD_E_SHAPE;
     const int64_t Hg = numel(q) / (T * K);
     const int64_t H  = numel(v) / (T * V);
     if (Hg <= 0 || H <= 0 || H % Hg != 0) return RAD_E_SHAPE;
@@ -350,9 +335,8 @@ int ref_gdn_conv_update(const RadArgs* a, RadStream) {
     int64_t state_len = 0;
     const V3 cvs = conv_state_view(cs, conv_dim, width, &state_len);
 
-    /* The window this step needs: the largest read offset plus the history, and the largest write
-     * slot. Both are checked here rather than clamped, because a cache that is too shallow is a
-     * caller bug whose symptom would otherwise be a silently truncated history. */
+    /* Check (not clamp) the read window and the last write slot against the state depth; a too
+     * shallow cache is a caller bug that would otherwise silently truncate history. */
     for (int64_t n = 0; n < N; ++n) {
         const int64_t slen = cu_at(cu, n + 1) - cu_at(cu, n);
         const int64_t off = nacc ? ld_int(nacc->dtype, nacc->data, offlin(nacc, n)) - 1 : 0;
@@ -361,10 +345,9 @@ int ref_gdn_conv_update(const RadArgs* a, RadStream) {
         if (width > 1 && (width - 2) + slen > state_len) return RAD_E_SHAPE;
     }
 
-    const V3 qv = v3(q, Hg, K), kv = v3(k, Hg, K), vv = v3(v, H, V);
-    const V2 wv = v2(w, width);
+    const ConvIO io{ x, w, bias, q, k, v, xrow, xcol, Hg, H, K, V, width };
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(T * conv_dim * width)
     for (int64_t nc = 0; nc < N * conv_dim; ++nc) {
         const int64_t n = nc / conv_dim, c = nc % conv_dim;
         const int64_t bos = cu_at(cu, n), slen = cu_at(cu, n + 1) - bos;
@@ -374,31 +357,11 @@ int ref_gdn_conv_update(const RadArgs* a, RadStream) {
         const int64_t off = nacc ? ld_int(nacc->dtype, nacc->data, offlin(nacc, n)) - 1 : 0;
 
         float hist[REF_CONV_HIST_MAX];
-        const int64_t st = width - 1;
-        for (int64_t i = 0; i < st; ++i) hist[i] = ldt(cs, at3(cvs, slot, c, off + i));
+        for (int64_t i = 0; i < width - 1; ++i) hist[i] = ldt(cs, at3(cvs, slot, c, off + i));
+        conv_channel(io, c, bos, slen, hist);
 
-        const RadTensor* out;
-        V3 ov;
-        int64_t oh, od;
-        if (c < Hg * K)          { out = q; ov = qv; oh = c / K; od = c % K; }
-        else if (c < 2 * Hg * K) { out = k; ov = kv; oh = (c - Hg * K) / K; od = (c - Hg * K) % K; }
-        else                     { out = v; ov = vv; oh = (c - 2 * Hg * K) / V;
-                                   od = (c - 2 * Hg * K) % V; }
-
-        const float bs = bias ? ldt(bias, c * laststride(bias)) : 0.0f;
-        for (int64_t t = 0; t < slen; ++t) {
-            float acc = bs;
-            for (int64_t j = 0; j < width; ++j) {
-                const int64_t src = t - (width - 1) + j;
-                const float val = src >= 0 ? ldt(x, (bos + src) * xrow + c * xcol)
-                                           : hist[src + width - 1];
-                acc += val * ldt(w, at2(wv, c, j));
-            }
-            stt(out, at3(ov, bos + t, oh, od), act_silu(acc));
-        }
-
-        /* Shift down by one: the tail of the old history, then this step's tokens. Reading before
-         * writing is what makes the in-place update safe, and the history is already in registers. */
+        /* Shift down by one: the tail of the old history, then this step's tokens. Safe in place
+         * because the history was read into `hist` first. */
         if (width > 1) {
             for (int64_t i = 0; i + 1 < width - 1; ++i)
                 stt(cs, at3(cvs, slot, c, i), hist[i + 1]);
@@ -413,29 +376,25 @@ int ref_gdn_conv_update(const RadArgs* a, RadStream) {
 /* ------------------------------------------------------------------ gdn_kkt_solve */
 /* A = (I + strict_lower(diag(beta) . K K^T . e^{g_i - g_j}))^{-1}, per chunk, per v head.
  *
- * The decay is applied PER ELEMENT as e^{g_i - g_j} rather than split about a per-chunk reference.
- * Only i > j is kept and g decreases along the chunk, so the difference is always <= 0 and the
- * direct form cannot overflow at any span -- which the split form can, on its own, at spans this
- * model actually reaches (libr4d's r4d_gdn_kkt_solve says the same at length).
+ * The decay is applied per element as e^{g_i - g_j}, not split about a per-chunk reference: only
+ * i > j is kept and g decreases along the chunk, so the exponent is <= 0 and cannot overflow (see
+ * the file header and libr4d's r4d_gdn_kkt_solve).
  *
- * The inverse is a forward substitution rather than libr4d's blocked 16 -> 32 -> 64 WMMA merge.
- * The two agree exactly: I + M is unit lower triangular, so its inverse is unique and the
- * substitution computes it in fp32, which is what libr4d's diagonal blocks do too. */
+ * The inverse is a forward substitution instead of libr4d's blocked 16 -> 32 -> 64 WMMA merge. I + M
+ * is unit lower triangular, so its inverse is unique; both compute it in fp32. */
 int ref_gdn_kkt_solve(const RadArgs* a, RadStream) {
     if (!have(a, 5)) return RAD_E_INVAL;
     const RadTensor *k = &a->t[0], *beta = &a->t[1], *g = &a->t[2], *cu = &a->t[3], *A = &a->t[4];
 
     const int64_t K = p_int(a, "head_k", 0);
-    /* `chunk` is RAD_DERIVED, so a caller who did not pin it and resolved to ref (which declares
-     * no RAD_C_EQ for it) arrives without the key. Here the operand says: A is [T, heads, chunk]
-     * and the caller sized it, which is this plugin's rule for every other extent too. */
+    /* `chunk` is RAD_DERIVED and may be absent; here A's shape [T, heads, chunk] carries it. */
     const int64_t chunk = p_int(a, "chunk", A->rank >= 3 ? A->shape[A->rank - 1] : 0);
     if (K <= 0 || chunk <= 0) return RAD_E_SHAPE;
 
     const int64_t N = numel(cu) - 1;
     if (N <= 0) return RAD_E_SHAPE;
     const int64_t T = cu_at(cu, N);
-    if (T <= 0) return RAD_OK;
+    if (T <= 0) return RAD_E_SHAPE;
     const int64_t H = numel(beta) / T;
     const int64_t Hg = numel(k) / (T * K);
     if (H <= 0 || Hg <= 0 || H % Hg != 0) return RAD_E_SHAPE;
@@ -445,33 +404,49 @@ int ref_gdn_kkt_solve(const RadArgs* a, RadStream) {
     const V3 kv = v3(k, Hg, K), Av = v3(A, H, chunk);
     const V2 gv = v2(g, H), bv = v2(beta, H);
 
-    #pragma omp parallel for schedule(static)
+    /* The chunk's keys are widened and transposed first, so the dot products and the
+     * substitution run across j in vector lanes; each element's chain keeps its order. */
+    REF_PAR_FOR(T * H * chunk * K)
     for (int64_t nh = 0; nh < N * H; ++nh) {
         const int64_t n = nh / H, h = nh % H, hk = h / grp;
         const int64_t bos = cu_at(cu, n), slen = cu_at(cu, n + 1) - bos;
-        float* wsp = ws_get((size_t)(chunk * chunk + chunk));
-        float* Am = wsp;                 /* [chunk, chunk] the inverse, in fp32 */
-        float* row = wsp + chunk * chunk;
+        float* wsp = ws_get((size_t)(chunk * chunk + 3 * chunk + 2 * chunk * K));
+        float* Am  = wsp;                 /* [chunk, chunk] the inverse, in fp32 */
+        float* row = Am + chunk * chunk;  /* [chunk] */
+        float* s   = row + chunk;         /* [chunk] */
+        float* gc  = s + chunk;           /* [chunk] */
+        float* kc  = gc + chunk;          /* [chunk, K] */
+        float* kT  = kc + chunk * K;      /* [K, chunk] */
 
         for (int64_t c0 = 0; c0 < slen; c0 += chunk) {
             const int64_t L = (c0 + chunk < slen) ? chunk : slen - c0;
+            for (int64_t j = 0; j < L; ++j) {
+                const int64_t tj = bos + c0 + j;
+                gc[j] = ldt(g, at2(gv, tj, h));
+                for (int64_t d = 0; d < K; ++d) {
+                    kc[j * K + d] = ldt(k, at3(kv, tj, hk, d));
+                    kT[d * chunk + j] = kc[j * K + d];
+                }
+            }
             for (int64_t i = 0; i < L; ++i) {
                 const int64_t ti = bos + c0 + i;
                 const float bi = ldt(beta, at2(bv, ti, h));
-                const float gi = ldt(g, at2(gv, ti, h));
-                for (int64_t j = 0; j < i; ++j) {
-                    const int64_t tj = bos + c0 + j;
-                    float dot = 0.0f;
-                    for (int64_t d = 0; d < K; ++d)
-                        dot += ldt(k, at3(kv, ti, hk, d)) * ldt(k, at3(kv, tj, hk, d));
-                    row[j] = bi * dot * ref_exp(gi - ldt(g, at2(gv, tj, h)));
+                const float gi = gc[i];
+                for (int64_t j = 0; j < i; ++j) row[j] = 0.0f;
+                for (int64_t d = 0; d < K; ++d) {
+                    const float kd = kc[i * K + d];
+                    const float* kr = kT + d * chunk;
+                    for (int64_t j = 0; j < i; ++j) row[j] += kd * kr[j];
                 }
+                for (int64_t j = 0; j < i; ++j) row[j] = bi * row[j] * ref_exp(gi - gc[j]);
                 /* (I + M) A = I, row by row: A[i][j] = delta - sum_{j<=l<i} M[i][l] A[l][j]. */
-                for (int64_t j = 0; j <= i; ++j) {
-                    float s = (i == j) ? 1.0f : 0.0f;
-                    for (int64_t l = j; l < i; ++l) s -= row[l] * Am[l * chunk + j];
-                    Am[i * chunk + j] = s;
+                for (int64_t j = 0; j <= i; ++j) s[j] = (i == j) ? 1.0f : 0.0f;
+                for (int64_t l = 0; l < i; ++l) {
+                    const float rl = row[l];
+                    const float* al = Am + l * chunk;
+                    for (int64_t j = 0; j <= l; ++j) s[j] -= rl * al[j];
                 }
+                for (int64_t j = 0; j <= i; ++j) Am[i * chunk + j] = s[j];
                 for (int64_t j = i + 1; j < chunk; ++j) Am[i * chunk + j] = 0.0f;
                 for (int64_t j = 0; j < chunk; ++j)
                     stt(A, at3(Av, ti, h, j), Am[i * chunk + j]);
@@ -488,15 +463,13 @@ int ref_gdn_chunk_scan(const RadArgs* a, RadStream) {
     const RadTensor *g = &a->t[4], *beta = &a->t[5], *cu = &a->t[7];
     const RadTensor *o = &a->t[8], *ht = &a->t[9];
     const RadTensor* h0 = t_in(a, 6);
-    /* THE STATE SLOT, when the caller keeps its recurrent states in a pool the batch does not
-     * index positionally. Absent, a row owns slot n, which is correct only where slots are handed
-     * out in batch order. */
+    /* The state slot, for a state pool not indexed in batch order. Absent, row n owns slot n. */
     const RadTensor* sidx = t_in(a, 10);
     if (!q->data || !k->data || !v->data || !A->data || !g->data || !beta->data ||
         !cu->data || !o->data) return RAD_E_INVAL;
 
     const int64_t K = p_int(a, "head_k", 0), V = p_int(a, "head_v", 0);
-    /* RAD_DERIVED, and A is [T, heads, chunk] -- see gdn_kkt_solve, which writes the same tensor. */
+    /* RAD_DERIVED; A is [T, heads, chunk], as gdn_kkt_solve writes it. */
     const int64_t chunk = p_int(a, "chunk", A->rank >= 3 ? A->shape[A->rank - 1] : 0);
     const float scale = p_f32(a, "scale", 1.0f);
     if (K <= 0 || V <= 0 || chunk <= 0) return RAD_E_SHAPE;
@@ -504,7 +477,7 @@ int ref_gdn_chunk_scan(const RadArgs* a, RadStream) {
     const int64_t N = numel(cu) - 1;
     if (N <= 0) return RAD_E_SHAPE;
     const int64_t T = cu_at(cu, N);
-    if (T <= 0) return RAD_OK;
+    if (T <= 0) return RAD_E_SHAPE;
     const int64_t H = numel(beta) / T;
     const int64_t Hg = numel(q) / (T * K);
     if (H <= 0 || Hg <= 0 || H % Hg != 0) return RAD_E_SHAPE;
@@ -523,103 +496,173 @@ int ref_gdn_chunk_scan(const RadArgs* a, RadStream) {
     const V4 h0v = h0 ? v4(h0, H, V, K) : V4{ nullptr, 0, 0, 0, 0 };
     const V4 htv = ht->data ? v4(ht, H, V, K) : V4{ nullptr, 0, 0, 0, 0 };
 
-    #pragma omp parallel for schedule(static)
+    /* The state is held transposed, St[d][e], and the chunk's operands widened to f32 first, so
+     * every chain below runs across the V value columns in vector lanes. Each output element is
+     * still the same chain in the same order: the u, Vp, o and S sums over d or j ascending, and
+     * the products parenthesised as the formulas above write them. */
+    REF_PAR_FOR(T * H * (K + chunk) * V)
     for (int64_t nh = 0; nh < N * H; ++nh) {
         const int64_t n = nh / H, h = nh % H, hk = h / grp;
         const int64_t bos = cu_at(cu, n), slen = cu_at(cu, n + 1) - bos;
-        /* COLUMN 0 IS THE STATE. A row may be wider -- a decode kernel serving speculation asks
-         * for scratch beside it -- and the scan writes the state and nothing else. */
+        /* Column 0 of a state_idx row is the state slot. Rows may be wider (speculative decode
+         * keeps extra slots beside it); the scan writes only column 0's. */
         const int64_t sw = sidx && sidx->rank >= 1 ? sidx->stride[0] : 1;
         const int64_t sn = sidx ? ld_int(sidx->dtype, sidx->data, n * sw) : n;
         if (sn < 0) continue;                  /* a padded row owns no state */
 
-        /* One workspace request, carved up by hand -- a second ws_get() may reallocate and
-         * invalidate the first pointer (ref_common.h). */
-        const size_t need = (size_t)(V * K + chunk * V + chunk * V + chunk);
+        /* One workspace request, carved up by hand (see ws_get in ref_common.h). */
+        const size_t need = (size_t)(K * V + 3 * chunk * V + 3 * chunk * K + chunk * chunk +
+                                     3 * chunk + 2 * V);
         float* wsp = ws_get(need);
-        float* S  = wsp;                       /* [V, K] the recurrent state */
-        float* Wm = S + V * K;                 /* [chunk, V] */
-        float* Vp = Wm + chunk * V;            /* [chunk, V] */
-        float* row = Vp + chunk * V;           /* [chunk] one row of sA */
+        float* St  = wsp;                      /* [K, V] the recurrent state, transposed */
+        float* Wm  = St + K * V;               /* [chunk, V] */
+        float* Vp  = Wm + chunk * V;           /* [chunk, V] */
+        float* vc  = Vp + chunk * V;           /* [chunk, V] v, widened */
+        float* kc  = vc + chunk * V;           /* [chunk, K] k, widened */
+        float* qc  = kc + chunk * K;           /* [chunk, K] q, widened */
+        float* kT  = qc + chunk * K;           /* [K, chunk] k, transposed */
+        float* Ac  = kT + chunk * K;           /* [chunk, chunk] A, widened */
+        float* gc  = Ac + chunk * chunk;       /* [chunk] g */
+        float* bc  = gc + chunk;               /* [chunk] beta */
+        float* row = bc + chunk;               /* [chunk] one row of sA */
+        float* acc = row + chunk;              /* [V] */
+        float* inr = acc + V;                  /* [V] */
 
         for (int64_t e = 0; e < V; ++e)
             for (int64_t d = 0; d < K; ++d)
-                S[e * K + d] = h0 ? ldt(h0, at4(h0v, sn, h, e, d)) : 0.0f;
+                St[d * V + e] = h0 ? ldt(h0, at4(h0v, sn, h, e, d)) : 0.0f;
 
         for (int64_t c0 = 0; c0 < slen; c0 += chunk) {
             const int64_t L = (c0 + chunk < slen) ? chunk : slen - c0;
-            const float glast = ldt(g, at2(gv, bos + c0 + L - 1, h));
+            for (int64_t j = 0; j < L; ++j) {
+                const int64_t tj = bos + c0 + j;
+                gc[j] = ldt(g, at2(gv, tj, h));
+                bc[j] = ldt(beta, at2(bv, tj, h));
+                for (int64_t d = 0; d < K; ++d) {
+                    kc[j * K + d] = ldt(k, at3(kv, tj, hk, d));
+                    qc[j * K + d] = ldt(q, at3(qv, tj, hk, d));
+                    kT[d * chunk + j] = kc[j * K + d];
+                }
+                for (int64_t e = 0; e < V; ++e) vc[j * V + e] = ldt(v, at3(vv, tj, h, e));
+                for (int64_t i = 0; i <= j; ++i) Ac[j * chunk + i] = ldt(A, at3(Av, tj, h, i));
+            }
+            const float glast = gc[L - 1];
 
             /* W = beta . (V - e^{g_j} . (K S^T)) */
             for (int64_t j = 0; j < L; ++j) {
-                const int64_t tj = bos + c0 + j;
-                const float ge = ref_exp(ldt(g, at2(gv, tj, h)));
-                const float bt = ldt(beta, at2(bv, tj, h));
-                for (int64_t e = 0; e < V; ++e) {
-                    float u = 0.0f;
-                    for (int64_t d = 0; d < K; ++d)
-                        u += ldt(k, at3(kv, tj, hk, d)) * S[e * K + d];
-                    Wm[j * V + e] = bt * (ldt(v, at3(vv, tj, h, e)) - ge * u);
+                const float ge = ref_exp(gc[j]);
+                for (int64_t e = 0; e < V; ++e) acc[e] = 0.0f;
+                for (int64_t d = 0; d < K; ++d) {
+                    const float kd = kc[j * K + d];
+                    const float* sr = St + d * V;
+                    for (int64_t e = 0; e < V; ++e) acc[e] += kd * sr[e];
                 }
+                for (int64_t e = 0; e < V; ++e)
+                    Wm[j * V + e] = bc[j] * (vc[j * V + e] - ge * acc[e]);
             }
             /* V' = A W, with A unit lower triangular so only j <= i contributes. */
             for (int64_t i = 0; i < L; ++i) {
-                const int64_t ti = bos + c0 + i;
-                for (int64_t e = 0; e < V; ++e) {
-                    float s = 0.0f;
-                    for (int64_t j = 0; j <= i; ++j)
-                        s += ldt(A, at3(Av, ti, h, j)) * Wm[j * V + e];
-                    Vp[i * V + e] = s;
+                float* vp = Vp + i * V;
+                for (int64_t e = 0; e < V; ++e) vp[e] = 0.0f;
+                for (int64_t j = 0; j <= i; ++j) {
+                    const float aij = Ac[i * chunk + j];
+                    const float* wr = Wm + j * V;
+                    for (int64_t e = 0; e < V; ++e) vp[e] += aij * wr[e];
                 }
             }
             /* O = scale . e^{g_i} . (Q S^T) + sA V' */
             for (int64_t i = 0; i < L; ++i) {
                 const int64_t ti = bos + c0 + i;
-                const float gi = ldt(g, at2(gv, ti, h));
+                const float gi = gc[i];
                 const float ge = ref_exp(gi);
+                for (int64_t j = 0; j <= i; ++j) row[j] = 0.0f;
+                for (int64_t d = 0; d < K; ++d) {
+                    const float qd = qc[i * K + d];
+                    const float* kr = kT + d * chunk;
+                    for (int64_t j = 0; j <= i; ++j) row[j] += qd * kr[j];
+                }
+                for (int64_t j = 0; j <= i; ++j) row[j] = scale * ref_exp(gi - gc[j]) * row[j];
+                for (int64_t e = 0; e < V; ++e) inr[e] = 0.0f;
+                for (int64_t d = 0; d < K; ++d) {
+                    const float qd = qc[i * K + d];
+                    const float* sr = St + d * V;
+                    for (int64_t e = 0; e < V; ++e) inr[e] += qd * sr[e];
+                }
+                const float sg = scale * ge;
+                for (int64_t e = 0; e < V; ++e) acc[e] = sg * inr[e];
                 for (int64_t j = 0; j <= i; ++j) {
-                    const int64_t tj = bos + c0 + j;
-                    float p = 0.0f;
-                    for (int64_t d = 0; d < K; ++d)
-                        p += ldt(q, at3(qv, ti, hk, d)) * ldt(k, at3(kv, tj, hk, d));
-                    row[j] = scale * ref_exp(gi - ldt(g, at2(gv, tj, h))) * p;
+                    const float rj = row[j];
+                    const float* vp = Vp + j * V;
+                    for (int64_t e = 0; e < V; ++e) acc[e] += rj * vp[e];
                 }
-                for (int64_t e = 0; e < V; ++e) {
-                    float inter = 0.0f;
-                    for (int64_t d = 0; d < K; ++d)
-                        inter += ldt(q, at3(qv, ti, hk, d)) * S[e * K + d];
-                    float s = scale * ge * inter;
-                    for (int64_t j = 0; j <= i; ++j) s += row[j] * Vp[j * V + e];
-                    stt(o, at3(ov, ti, h, e), s);
-                }
+                for (int64_t e = 0; e < V; ++e) stt(o, at3(ov, ti, h, e), acc[e]);
             }
             /* S = e^{g_last} S + V'^T (e^{g_last - g_j} . K) */
-            for (int64_t e = 0; e < V; ++e)
-                for (int64_t d = 0; d < K; ++d) {
-                    float s = ref_exp(glast) * S[e * K + d];
-                    for (int64_t j = 0; j < L; ++j) {
-                        const int64_t tj = bos + c0 + j;
-                        const float gs = ref_exp(glast - ldt(g, at2(gv, tj, h)));
-                        s += Vp[j * V + e] * (gs * ldt(k, at3(kv, tj, hk, d)));
-                    }
-                    S[e * K + d] = s;
+            const float el = ref_exp(glast);
+            for (int64_t j = 0; j < L; ++j) {
+                const float gs = ref_exp(glast - gc[j]);
+                for (int64_t d = 0; d < K; ++d) kc[j * K + d] = gs * kc[j * K + d];
+            }
+            for (int64_t d = 0; d < K; ++d) {
+                float* sr = St + d * V;
+                for (int64_t e = 0; e < V; ++e) sr[e] = el * sr[e];
+                for (int64_t j = 0; j < L; ++j) {
+                    const float gk = kc[j * K + d];
+                    const float* vp = Vp + j * V;
+                    for (int64_t e = 0; e < V; ++e) sr[e] += vp[e] * gk;
                 }
+            }
         }
 
         if (ht->data)
             for (int64_t e = 0; e < V; ++e)
                 for (int64_t d = 0; d < K; ++d)
-                    stt(ht, at4(htv, sn, h, e, d), S[e * K + d]);
+                    stt(ht, at4(htv, sn, h, e, d), St[d * V + e]);
     }
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ the anchor state form
+ *
+ * docs/OPS.md `state_form`: under `anchor` a sequence keeps one committed state, and each step
+ * records its tokens' rank-1 update factors beside it; the next step replays the first
+ * `num_accepted` of them onto the state before running its own tokens. The cache layout is
+ * libr4d's (r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip), so either library can continue
+ * a cache the other wrote and an oracle can compare them:
+ *
+ *   state_idx  six columns: 0..2 the anchor, 3..5 the factor block. A paged caller's window can
+ *              shift by -1, 0 or +1 pages a step; the anchor is published at column 2 and each
+ *              factor copy is stamped with its column (1, 2, 3), so the next step finds the shift
+ *              m - 1 from the stamp m at column 4 and reads the anchor at column 3 - m. A zeroed
+ *              block reads as no shift. A non-paged caller names one slot in columns 0..2 and
+ *              another in 3..5.
+ *   factors    per token, from the head's [V, K] block of the factor slot: the normalised k once per
+ *              32-row group of V, then v, then (g, beta) once per group, each group's rows
+ *              replaying from their own copy; room for `tmax` tokens, the stamp just past them.
+ *
+ * libr4d's kernel is K = V = 128, where the block holds kTmax = 16 tokens and the stamp sits at
+ * 16 * fstr. Square heads from 64 up hold 16 too, so the layout is libr4d's wherever both serve
+ * it. A smaller head's block holds fewer tokens' factors (a 16 x 16 head: 7), so `tmax` is as many
+ * as fit before the stamp; a step, or an accepted prefix, longer than that is refused. */
+struct AnchorLayout {
+    static constexpr int64_t kTmax = 16;
+    int64_t groups, fstr, vb, gb, tmax, mark;
+    AnchorLayout(int64_t K, int64_t V)
+        : groups((V + 31) / 32), fstr(groups * K + V + 2 * groups), vb(groups * K),
+          gb(groups * K + V), tmax(std::min<int64_t>(kTmax, (V * K - 1) / fstr)),
+          mark(tmax * fstr) {}
+    /* The anchor's column, from the stamp at the factor block's `mark`. */
+    int anchor_col(const RadTensor* st, int64_t fb) const {
+        const int m = (int)(ldt(st, fb + mark) + 0.5f) - 1;
+        return 3 - ((m >= 0 && m <= 2) ? m : 1);
+    }
+};
+
 /* ------------------------------------------------------------------ gdn_recurrent_update */
-/* What decode runs where prefill runs the chunked scan, against the PAGED state cache: the initial
- * state comes from the slot the last accepted token wrote and every candidate token writes its own
- * slot, because which of them survives verification is not known until after this layer has run
- * (ref_ops.h). The gated RMS norm is folded into the epilogue, which is where libr4d puts it too --
- * its workgroup owns the whole row. */
+/* Decode's counterpart of the chunked scan, against the paged state cache: the initial state comes
+ * from the slot the last accepted token wrote, and every candidate token writes its own slot since
+ * survivors are unknown until verification (ref_ops.h). The gated RMS norm is folded into the
+ * epilogue, as in libr4d, whose workgroup owns the whole row. */
 int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
     if (a->n_t < 14) return RAD_E_INVAL;
     const RadTensor *q = &a->t[0], *k = &a->t[1], *v = &a->t[2], *av = &a->t[3], *bvt = &a->t[4];
@@ -631,26 +674,19 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
     const RadTensor* cu = t_in(a, 10);
     const RadTensor* z = t_in(a, 11);
     const RadTensor* nw = t_in(a, 12);
-    /* The out projection's quantiser, folded in. Optional and all-or-nothing; see the
-     * operand list in r4d_rows.cpp for why the group is the row. */
+    /* The out projection's quantiser, folded in. Optional, all-or-nothing; see the operand list in
+     * r4d_rows.cpp for why the group is the row. */
     const RadTensor* oq  = (a->n_t > 14 && a->t[14].data) ? &a->t[14] : nullptr;
     const RadTensor* osc = (a->n_t > 15 && a->t[15].data) ? &a->t[15] : nullptr;
     if (!q->data || !k->data || !v->data || !av->data || !bvt->data || !state->data || !o->data ||
         !cu) return RAD_E_INVAL;
 
-    /* `cu` BOUNDS THE SEQUENCES, exactly as it does on the sibling gdn_conv_update, which runs off
-     * the same tensor on the same step. Carrying the sequence count in the state index instead
-     * works only for a rectangular batch, and leaves a fast kernel -- which reads `cu[n]` before
-     * any null test -- with a null pointer. Ref reads the token spans from cu and falls back to
-     * the rectangular reading only for a caller whose cu is degenerate. */
-    /* THE OTHER STATE CONTRACT IS DECLINED, NOT APPROXIMATED. Under "anchor" the cache holds one
-     * committed state a sequence plus a block of replay factors, and the accepted prefix is
-     * replayed onto it next step -- two slots whatever the draft depth. The `o` it produces is the
-     * same, so a comparison against this reference AGREES on every output and disagrees on the
-     * whole state, which reads as a broken kernel and is not one. A named refusal is the honest
-     * answer: RAD_E_UNSUPPORTED says "not this contract", where a number would say "wrong". */
+    /* `cu` bounds the sequences, as on gdn_conv_update, which reads the same tensor on the same
+     * step. A sequence count carried in the state index only works for rectangular batches, and the
+     * fast kernels read `cu[n]` before any null test. */
     const char* sf = p_str(a, "state_form", "per_candidate");
-    if (sf && std::strcmp(sf, "per_candidate") != 0) return RAD_E_UNSUPPORTED;
+    const bool anchor = sf && std::strcmp(sf, "anchor") == 0;
+    if (!anchor && sf && std::strcmp(sf, "per_candidate") != 0) return RAD_E_UNSUPPORTED;
 
     const int64_t K = p_int(a, "head_k", 0), V = p_int(a, "head_v", 0);
     const float scale = p_f32(a, "scale", 1.0f);
@@ -659,11 +695,11 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
     const float spthr = p_f32(a, "softplus_thr", 20.0f);
     static const char* kActs[] = { "silu", "sigmoid" };
     const int nact = p_enum(a, "act", kActs, 2, 0);
+    if (nact != 0 && nact != 1) return RAD_E_INVAL;
     if (K <= 0 || V <= 0) return RAD_E_SHAPE;
 
-    /* The head count and the token count come off the operands: v is [T, head_v_count, head_v],
-     * so a rank-3 value tensor names both. `n_head_v` overrides it for a caller that hands a
-     * flattened view. */
+    /* Head and token counts come from v, [T, head_v_count, head_v]; `n_head_v` overrides the head
+     * count for a flattened view. */
     int64_t Hv = p_int(a, "n_head_v", 0);
     if (Hv <= 0) Hv = v->rank >= 3 ? v->shape[v->rank - 2] : 0;
     if (Hv <= 0) return RAD_E_SHAPE;
@@ -673,9 +709,7 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
     if (Hg <= 0 || Hv % Hg != 0) return RAD_E_SHAPE;
     const int64_t grp = Hv / Hg;
 
-    /* N comes from cu and nothing else: cu is [N+1] and its length minus one IS the sequence
-     * count. Deriving N from state_idx and trusting cu to be at least as long is an off-by-one
-     * waiting to happen, because a state index may be wider than one column per sequence. */
+    /* N comes only from cu ([N+1]); state_idx may have several columns per sequence. */
     const int64_t n_seq = numel(cu) - 1;
     if (n_seq <= 0) return RAD_E_SHAPE;
     if (cu_at(cu, n_seq) != Tk) return RAD_E_SHAPE;
@@ -688,38 +722,108 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
     const V3 zv = z ? v3_rows(z, Hv, V) : vv;
     const V2 a2 = v2(av, Hv), b2 = v2(bvt, Hv);
     const V2 si = sidx ? v2(sidx, sw) : V2{ nullptr, 0, 0 };
+    const V4 stv = v4(state, Hv, V, K);
 
-    #pragma omp parallel for schedule(static)
+    /* The anchor form keeps its replay factors inside a head's [V, K] block of a state slot, at
+     * libr4d's offsets (AnchorLayout), so the block must be dense and hold every token's factors. */
+    const AnchorLayout al(K, V);
+    if (anchor) {
+        if (!sidx || sw < 6) return RAD_E_SHAPE;
+        if (stv.s3 != 1 || stv.s2 != K) return RAD_E_STRIDE;
+        if (al.tmax < 1) return RAD_E_SHAPE;
+        for (int64_t n = 0; n < n_seq; ++n) {
+            const int64_t na = nacc ? ld_int(nacc->dtype, nacc->data, offlin(nacc, n)) : 1;
+            if (cu_at(cu, n + 1) - cu_at(cu, n) > al.tmax || na > al.tmax) return RAD_E_SHAPE;
+        }
+    }
+
+    /* The state is held transposed, St[d][e], so the two state passes run across the V value
+     * columns in vector lanes; every chain over d keeps its order. */
+    REF_PAR_FOR(Tk * Hv * K * V)
     for (int64_t nh = 0; nh < n_seq * Hv; ++nh) {
         const int64_t n = nh / Hv, h = nh % Hv, hk = h / grp;
         const int64_t bos = cu_at(cu, n), q_len = cu_at(cu, n + 1) - bos;
-        if (q_len <= 0) continue;
+        /* Under `anchor` a sequence with no rows this step still folds its accepted prefix in. */
+        if (q_len <= 0 && !anchor) continue;
         const int64_t na = nacc ? ld_int(nacc->dtype, nacc->data, offlin(nacc, n)) : 1;
         const int64_t rd = na > 0 ? na - 1 : 0;
-        const int64_t slot_in = sidx ? ld_int(sidx->dtype, sidx->data, at2(si, n, rd < sw ? rd : sw - 1))
-                                     : n;
-        if (slot_in < 0) continue;
+        int64_t col[6] = { 0, 0, 0, 0, 0, 0 };
+        int64_t slot_in = 0;
+        if (anchor) {
+            for (int c = 0; c < 6; ++c) col[c] = ld_int(sidx->dtype, sidx->data, at2(si, n, c));
+            bool pad = false;
+            for (int c = 0; c < 6; ++c) pad = pad || col[c] < 0;
+            if (pad) continue;
+            slot_in = col[al.anchor_col(state, at4(stv, col[4], h, 0, 0))];
+        } else {
+            slot_in = sidx ? ld_int(sidx->dtype, sidx->data, at2(si, n, rd < sw ? rd : sw - 1)) : n;
+            if (slot_in < 0) continue;
+        }
+        /* The factor blocks: column 4's is read, and 3, 4 and 5 are written (each a page the
+         * window can shift onto). */
+        const int64_t fb  = anchor ? at4(stv, col[4], h, 0, 0) : 0;
+        const int64_t fbs[3] = { anchor ? at4(stv, col[3], h, 0, 0) : 0, fb,
+                                 anchor ? at4(stv, col[5], h, 0, 0) : 0 };
+        const bool dup_f = anchor && (col[3] != col[4] || col[5] != col[4]);
 
-        const size_t need = (size_t)(V * K + 2 * K + 2 * V);
+        const size_t need = (size_t)(V * K + 2 * K + 3 * V);
         float* wsp = ws_get(need);
-        float* S  = wsp;
-        float* qn = S + V * K;
+        float* St = wsp;                       /* [K, V] */
+        float* qn = St + V * K;
         float* kn = qn + K;
         float* uu = kn + K;
         float* orow = uu + V;
-
-        const int64_t sstride = state->rank >= 4 ? state->stride[0] : (int64_t)Hv * V * K;
-        const int64_t hstride = state->rank >= 4 ? state->stride[1] : (int64_t)V * K;
-        const int64_t vstride = state->rank >= 4 ? state->stride[2] : K;
-        const int64_t dstride = state->rank >= 4 ? state->stride[3] : 1;
+        float* sk2 = orow + V;
 
         for (int64_t e = 0; e < V; ++e)
-            for (int64_t d = 0; d < K; ++d)
-                S[e * K + d] = ldt(state, slot_in * sstride + h * hstride + e * vstride +
-                                          d * dstride);
+            for (int64_t d = 0; d < K; ++d) St[d * V + e] = ldt(state, at4(stv, slot_in, h, e, d));
 
         const float alog = A_log ? ldt(A_log, h * laststride(A_log)) : 0.0f;
         const float dtb  = dt_bias ? ldt(dt_bias, h * laststride(dt_bias)) : 0.0f;
+
+        /* The delta rule's state update for one token over the state rows [e0, e1): decay by
+         * exp(g), then S += beta (v - S k) k^T, `vrow(e)` reading v. A row's update reads only
+         * that row, k, g and beta. Shared by the token loop and the replay, so a replayed token
+         * updates the state exactly as the step that ran it did. */
+        auto update = [&](float g, float bt, auto vrow, int64_t e0, int64_t e1) {
+            const float dec = ref_exp(g);
+            for (int64_t e = e0; e < e1; ++e) sk2[e] = 0.0f;
+            for (int64_t d = 0; d < K; ++d) {
+                float* sr = St + d * V;
+                const float kd = kn[d];
+                for (int64_t e = e0; e < e1; ++e) {
+                    sr[e] *= dec;
+                    sk2[e] += sr[e] * kd;
+                }
+            }
+            for (int64_t e = e0; e < e1; ++e) uu[e] = bt * (vrow(e) - sk2[e]);
+            for (int64_t d = 0; d < K; ++d) {
+                float* sr = St + d * V;
+                const float kd = kn[d];
+                for (int64_t e = e0; e < e1; ++e) sr[e] += uu[e] * kd;
+            }
+        };
+
+        if (anchor) {
+            /* Replay the previous step's accepted tokens from their factors, publish the advanced
+             * anchor at column 2, and stamp each factor copy with the column it sits in. */
+            for (int64_t t = 0; t < na; ++t) {
+                const int64_t f = fb + t * al.fstr;
+                /* Each 32-row group of V replays from its own copy of k and its own (g, beta),
+                 * as libr4d's kernel reads them. Every writer stores equal copies, so on a block
+                 * a step wrote this is the same as reading one copy for all rows. */
+                for (int64_t gi = 0; gi < al.groups; ++gi) {
+                    for (int64_t d = 0; d < K; ++d) kn[d] = ldt(state, f + gi * K + d);
+                    update(ldt(state, f + al.gb + 2 * gi), ldt(state, f + al.gb + 2 * gi + 1),
+                           [&](int64_t e) { return ldt(state, f + al.vb + e); },
+                           32 * gi, std::min<int64_t>(V, 32 * gi + 32));
+                }
+            }
+            for (int64_t e = 0; e < V; ++e)
+                for (int64_t d = 0; d < K; ++d)
+                    stt(state, at4(stv, col[2], h, e, d), St[d * V + e]);
+            for (int c = 0; c < 3; ++c) stt(state, fbs[c] + al.mark, (float)(c + 1));
+        }
 
         for (int64_t t = 0; t < q_len; ++t) {
             const int64_t tok = bos + t;
@@ -740,23 +844,28 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
                 kn[d] = ldt(k, at3(kv, tok, hk, d)) * ks;
             }
 
-            const float dec = ref_exp(gv);
-            for (int64_t e = 0; e < V; ++e) {
-                float sk2 = 0.0f;
-                for (int64_t d = 0; d < K; ++d) {
-                    S[e * K + d] *= dec;
-                    sk2 += S[e * K + d] * kn[d];
-                }
-                uu[e] = bt * (ldt(v, at3(vv, tok, h, e)) - sk2);
+            update(gv, bt, [&](int64_t e) { return ldt(v, at3(vv, tok, h, e)); }, 0, V);
+            for (int64_t e = 0; e < V; ++e) orow[e] = 0.0f;
+            for (int64_t d = 0; d < K; ++d) {
+                const float* sr = St + d * V;
+                const float qd = qn[d];
+                for (int64_t e = 0; e < V; ++e) orow[e] += sr[e] * qd;
             }
-            for (int64_t e = 0; e < V; ++e) {
-                float ss = 0.0f;
-                for (int64_t d = 0; d < K; ++d) {
-                    S[e * K + d] += uu[e] * kn[d];
-                    ss += S[e * K + d] * qn[d];
+
+            /* This token's factors, for the next step to replay: the normalised k once per
+             * 32-row group, v, then the decay exponent and beta once per group. */
+            if (anchor)
+                for (int c = 0; c < 3; ++c) {
+                    if (c != 1 && !dup_f) continue;
+                    const int64_t f = fbs[c] + t * al.fstr;
+                    for (int64_t gi = 0; gi < al.groups; ++gi) {
+                        for (int64_t d = 0; d < K; ++d) stt(state, f + gi * K + d, kn[d]);
+                        stt(state, f + al.gb + 2 * gi, gv);
+                        stt(state, f + al.gb + 2 * gi + 1, bt);
+                    }
+                    for (int64_t e = 0; e < V; ++e)
+                        stt(state, f + al.vb + e, ldt(v, at3(vv, tok, h, e)));
                 }
-                orow[e] = ss;
-            }
 
             /* The gated RMS norm, over the head's V channels. */
             float sq2 = 0.0f;
@@ -772,47 +881,32 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
                 stt(o, at3(ov, tok, h, e), r);
             }
 
-            /* QUANTISE WHAT WAS WRITTEN, not what produced it: the standalone quant_act_fp8 this
-             * replaces read `o` back out of memory, so it saw the rounded store and not the f32.
-             * One group per (token, head), because head_v is the fp8 block width. */
+            /* Quantise the stored `o`, not the f32 value, as the standalone quant_act_fp8 read it
+             * back from memory. One group per (token, head), since head_v is the fp8 block width. */
             if (oq && osc) {
-                float amax = 0.0f;
-                for (int64_t e = 0; e < V; ++e) {
-                    const float m = std::fabs(ldt(o, at3(ov, tok, h, e)));
-                    if (m > amax) amax = m;
-                }
-                const float qsc = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
-                const float inv = 1.0f / qsc;
                 const int64_t qb = rowoff(oq, tok, Hv * V), qs = laststride(oq);
-                for (int64_t e = 0; e < V; ++e) {
-                    float u = ldt(o, at3(ov, tok, h, e)) * inv;
-                    if (u > 448.0f) u = 448.0f;
-                    if (u < -448.0f) u = -448.0f;
-                    st_dt(oq->dtype, oq->data, qb + (h * V + e) * qs, u);
-                }
+                const float qsc = q8_group([&](int64_t e) { return ldt(o, at3(ov, tok, h, e)); },
+                                            V, 448.0f, oq, qb + h * V * qs, qs);
                 stt(osc, rowoff(osc, tok, Hv) + h * laststride(osc), qsc);
             }
 
+            if (anchor) continue;
             const int64_t so = sidx ? ld_int(sidx->dtype, sidx->data, at2(si, n, t < sw ? t : sw - 1))
                                     : n;
             if (so >= 0)
                 for (int64_t e = 0; e < V; ++e)
-                    for (int64_t d = 0; d < K; ++d)
-                        stt(state, so * sstride + h * hstride + e * vstride + d * dstride,
-                            S[e * K + d]);
+                    for (int64_t d = 0; d < K; ++d) stt(state, at4(stv, so, h, e, d), St[d * V + e]);
         }
     }
     return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ gdn_gated_rmsnorm */
-/* out = x * rsqrt(mean_channels(x^2) + eps) * w * act(z), one row per (token, head). The prefill
- * path's form of the epilogue the recurrent update folds in. */
-/* The gate has a third spelling the shared rowoff() cannot see. [tokens, heads, ch] it walks, and
- * a flat [rows, ch] projection is its product; but a COLUMN SLICE of a wider projection row -- the
- * fp8 delta net fuses [q|k|v|z] into one GEMM -- has heads*ch as its last axis, so rowoff reads it
- * as a dense row and lands in the next token. Spelled out here rather than generalised there,
- * because it is a property of THIS operand and not of every one. */
+/* out = x * rsqrt(mean_channels(x^2) + eps) * w * act(z), one row per (token, head): the prefill
+ * form of the epilogue the recurrent update folds in. */
+/* Row offset of the gate. rowoff() handles [tokens, heads, ch] and flat [rows, ch], but not a
+ * column slice of a wider row (the fp8 delta net fuses [q|k|v|z] into one GEMM), whose last axis is
+ * heads*ch; rowoff would read it as a dense row. */
 static inline int64_t gate_rowoff(const RadTensor* t, int64_t r, int64_t ch) {
     if (t->rank == 2 && ch > 0 && t->shape[1] != ch && t->shape[1] % ch == 0) {
         const int64_t heads = t->shape[1] / ch;
@@ -828,12 +922,13 @@ int ref_gdn_gated_rmsnorm(const RadArgs* a, RadStream) {
     const float eps = p_f32(a, "eps", 1e-6f);
     static const char* kActs[] = { "silu", "sigmoid" };
     const int act = p_enum(a, "act", kActs, 2, 0);
+    if (act != 0 && act != 1) return RAD_E_INVAL;
     if (ch <= 0) return RAD_E_SHAPE;
     const int64_t rows = numel(x) / ch;
     if (rows <= 0 || numel(o) < rows * ch || numel(z) < rows * ch || numel(w) < ch)
         return RAD_E_SHAPE;
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * ch)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t xb = rowoff(x, r, ch), zb = gate_rowoff(z, r, ch), ob = rowoff(o, r, ch);
         const int64_t xs = laststride(x), zs = laststride(z), os = laststride(o);
@@ -851,9 +946,9 @@ int ref_gdn_gated_rmsnorm(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ gdn_conv_recurrent_update */
-/* gdn_conv_update into a staging q, k and v, then gdn_recurrent_update over them: the fused op is
- * DEFINED as the pair, so the reference is the pair and nothing is restated. The head geometry the
- * staging needs comes off `o` ([T, Hv, head_v]) and `x` (2 Hg head_k + Hv head_v columns). */
+/* gdn_conv_update into staging q, k and v, then gdn_recurrent_update over them; the fused op is
+ * defined as the pair. Head geometry comes from `o` ([T, Hv, head_v]) and `x`
+ * (2 Hg head_k + Hv head_v columns). */
 int ref_gdn_conv_recurrent_update(const RadArgs* a, RadStream st) {
     if (a->n_t < 16) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *o = &a->t[15];
@@ -865,8 +960,10 @@ int ref_gdn_conv_recurrent_update(const RadArgs* a, RadStream st) {
     if (conv_dim <= Hv * V || (conv_dim - Hv * V) % (2 * K)) return RAD_E_SHAPE;
     const int64_t Hg = (conv_dim - Hv * V) / (2 * K);
 
-    std::vector<uint16_t> qb((size_t)(T * Hg * K)), kb((size_t)(T * Hg * K)), vb((size_t)(T * Hv * V));
-    auto stage = [&](uint16_t* d, int64_t h, int64_t w) {
+    /* The staging takes x's dtype, so q, k and v round as the unfused pair's stores do. */
+    const auto bytes = [&](int64_t n) { return (size_t)rad_dtype_bytes(x->dtype, n); };
+    std::vector<uint8_t> qb(bytes(T * Hg * K)), kb(bytes(T * Hg * K)), vb(bytes(T * Hv * V));
+    auto stage = [&](uint8_t* d, int64_t h, int64_t w) {
         RadTensor t{};
         t.data = d; t.dtype = x->dtype; t.rank = 3;
         t.shape[0] = T; t.shape[1] = h; t.shape[2] = w;
@@ -891,15 +988,12 @@ int ref_gdn_conv_recurrent_update(const RadArgs* a, RadStream st) {
     int rc = ref_gdn_conv_update(&ca, st);
     if (rc != RAD_OK) return rc;
 
-    std::vector<RadParam> rp;
-    for (int i = 0; i < a->n_p; ++i)
-        if (std::strcmp(a->p[i].key, "conv_width")) rp.push_back(a->p[i]);
     /* q, k, v, a, b, A_log, dt_bias, state, state_idx, num_accepted, cu, z, norm_w, o, o_q,
-     * o_scale */
+     * o_scale. The parameters pass as they are: the recurrence reads its own by name. */
     RadTensor rt[16] = { tq, tk, tv, a->t[5], a->t[6], a->t[7], a->t[8], a->t[9], a->t[10],
                          a->t[11], a->t[12], a->t[13], a->t[14], a->t[15],
                          a->n_t > 16 ? a->t[16] : RadTensor{}, a->n_t > 17 ? a->t[17] : RadTensor{} };
     RadArgs ra = *a;
-    ra.t = rt; ra.n_t = 16; ra.p = rp.data(); ra.n_p = (int)rp.size();
+    ra.t = rt; ra.n_t = 16;
     return ref_gdn_recurrent_update(&ra, st);
 }

@@ -1,8 +1,8 @@
-/* tests/r4d_emu: expert_scale (r4d_expert_scale_bf16.hip) on the host SIMT emulator, against the chain it
- * replaces -- embed_lookup of the [n_expert, 1] scale table by the ids, then mul into the weights --
- * and against ref_host.cpp, bit for bit: one product rounded once has no other answer. Ids outside
- * the table (a negative pad, one past the end) read a zero scale; rows past M and the pitch's
- * padding stay untouched. */
+/* tests/r4d_emu: expert_scale (r4d_expert_scale_bf16.hip) on the host SIMT emulator, checked bit
+ * for bit against the chain it replaces (embed_lookup of the [n_expert, 1] scale table by the
+ * ids, then mul into the weights) and against ref_host.cpp; one product rounded once has a single
+ * correct result. Ids outside the table (a negative pad, one past the end) read a zero scale;
+ * rows past M and the pitch's padding stay untouched. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
@@ -12,9 +12,6 @@
 #include <cstring>
 #include <random>
 #include <vector>
-
-static float b2f(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f; std::memcpy(&f, &u, 4); return f; }
-static uint16_t f2b(float f) { uint32_t u; std::memcpy(&u, &f, 4); return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16); }
 
 int main() {
     std::mt19937 rng(5);

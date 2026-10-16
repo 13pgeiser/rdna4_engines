@@ -1,6 +1,5 @@
-/* ctx.cpp -- everything the run phase does that is not the hot path: bringing the arena and the
- * plans up, driving a step, the routing handoff, and the opt-in per-op timing. The hot path itself
- * is issue.cpp, kept in its own translation unit so it stays readable at the size it has to be.
+/* ctx.cpp -- the run phase outside the hot path: arena and plan bring-up, the step driver, the
+ * routing handoff and opt-in per-op timing. The hot path is issue.cpp.
  */
 #include <vector>
 #include "ctx.h"
@@ -27,6 +26,7 @@ int Ctx::init(const CtxDesc& d) {
     device_    = d.device;
     record_passes_ = d.record_passes;
     residency_ = d.residency;
+    registry_ = d.registry;
     kv_        = d.kv;
     arch_step_ = d.arch_step;
     profiling_ = d.profile_ops;
@@ -39,14 +39,13 @@ int Ctx::init(const CtxDesc& d) {
         stream_     = d.stream;
         own_stream_ = false;
     } else {
-        /* Ordinary priority. The mover runs on its own stream and the compute stream waits on its
-         * events (spec §5.4); making compute high-priority would let it preempt the transfers it
-         * is about to wait for, which is exactly backwards. */
+        /* Ordinary priority: compute waits on the mover's events (spec §5.4), so a high-priority
+         * compute stream would preempt the transfers it is about to wait for. */
         RAD_TRY(rad_stream_create(&stream_, 0));
         own_stream_ = true;
     }
 
-    /* The second lane is NOT created here. See lane_init(). */
+    /* The second lane is created lazily; see lane_init(). */
 
     int s = prepare();
     if (s < 0) { shutdown(); return s; }
@@ -56,11 +55,8 @@ int Ctx::init(const CtxDesc& d) {
 void Ctx::shutdown() {
     oracle_close();
     xp_close();
-    /* The one host synchronisation in the whole component, and it is at teardown rather than on
-     * the step path. Everything below frees memory the stream may still be reading or writing --
-     * the routing staging is the destination of a copy nobody waited on by design (spec §5.5), and
-     * the arena is every kernel's operands. Freeing either out from under an in-flight stream is a
-     * use-after-free that reproduces once a week and never under a debugger. */
+    /* Teardown sync, before freeing memory the streams may still use: the routing staging is the
+     * destination of unwaited copies (spec §5.5) and the arena holds every kernel's operands. */
     if (stream_) rad_stream_sync(stream_);
     if (lane1_) rad_stream_sync(lane1_);
 
@@ -80,9 +76,7 @@ void Ctx::shutdown() {
     if (route_pool_) { rad_dev_free(route_pool_, RAD_MEM_HOST_PINNED); route_pool_ = nullptr; }
     if (route_dev_)  { rad_dev_free(route_dev_, RAD_MEM_DEVICE);        route_dev_  = nullptr; }
 
-    /* The expert pointer tables. Freed after the stream syncs above for exactly the reason those
-     * syncs exist: the device half is the source operand of a grouped GEMM and the host half is
-     * the source of a copy on that stream. */
+    /* After the syncs: the device half is a grouped GEMM operand, the host half a copy source. */
     free_weight_tables();
 
     arena_.release();
@@ -113,29 +107,23 @@ int Ctx::prepare() {
     oracle_open();
     RAD_TRY(bind_arena());
     RAD_TRY(bind_buffers());
-    RAD_TRY(bind_weights(/*refresh_only=*/false));
+    RAD_TRY(bind_weights());
     RAD_TRY(bind_weight_tables());
     RAD_TRY(bind_ops());
     RAD_TRY(bind_routing());
     RAD_TRY(bind_profiling());
-    /* Recorded passes need a backend that records, and are off for everything that has to see
-     * each issue: the per-op profile, the oracle, and the argument digest. */
-    tape_on_ = record_passes_ && tape_supported() && !profiling_ && !oracle_ &&
-               std::getenv("RADIANCE_DEBUG_ARGSHA") == nullptr;
+    /* Recorded passes need a recording backend, and are off whenever every issue must be seen:
+     * per-op profile, oracle. */
+    tape_on_ = record_passes_ && tape_supported() && !profiling_ && !oracle_;
     return RAD_OK;
 }
 
 int Ctx::bind_arena() {
     Program& P = *program_;
 
-    /* The buffer plan hands us one offset per buffer, and arena_plan_bytes() turns those into the
-     * two numbers Arena::init wants. THE WALK LIVES THERE AND NOT HERE because the VRAM budget
-     * resolver has to subtract this allocation from the card before any of it exists -- see
-     * core/mem/vram_budget.cpp. What stays here is the part that can only be done at bind time:
-     * refusing a plan that did not run, and filling in a size the plan left at zero.
-     *
-     * Where a program has RAD_DOMAIN_HOST buffers -- host-site execution, spec §5.1 -- those
-     * offsets cannot index the same block, so there are two arenas. */
+    /* Sizing is arena_plan_bytes(), shared with the VRAM budget (core/mem/vram_budget.cpp). Here:
+     * refuse a plan that did not run, and fill in sizes the plan left at zero. RAD_DOMAIN_HOST
+     * buffers (host-site execution, spec §5.1) get a second arena. */
     int64_t host_hw = 0;
     for (size_t i = 1; i < P.buffers.size(); ++i) {
         BufferInfo& bi = P.buffers[i];
@@ -159,40 +147,23 @@ int Ctx::bind_arena() {
     arena_plan_bytes(P, &dev_bytes, &total);
 
     RAD_TRY(arena_.init(dev_bytes, P.scratch_bytes, RAD_MEM_DEVICE, std::max(P.scratch_regions, 1)));
-    /* SAY WHAT THIS COSTS, BECAUSE NOTHING ELSE DOES. The allocation is in no pool, and it is not
-     * something --gpu-headroom-mib can cover: it scales with max_tok, so any round number an
-     * operator picks either under-reserves or wastes VRAM. On a part whose experts do not fit,
-     * waste is not free -- a GiB of headroom nothing uses is about 1.4 ms a decode step, because
-     * that GiB is experts that would otherwise be resident. So it is computed and charged by name:
-     * core/mem/vram_budget.cpp does the charging, this line is the receipt, and the two numbers
-     * must agree. */
+    /* The arena is in no pool and scales with max_tok, so core/mem/vram_budget.cpp charges it by
+     * name rather than leaving it to --gpu-headroom-mib. This log line must agree with that
+     * charge. */
     RAD_INFO("arena: %s device + %d x %s scratch = %s, charged to the VRAM budget before it was "
              "split", humanb(dev_bytes).c_str(), arena_.scratch_regions(),
              humanb(P.scratch_bytes).c_str(), humanb(total).c_str());
 
     if (host_hw > 0) {
-        /* RAD_MEM_HOST_MAPPED AND NOT RAD_MEM_HOST, AND THAT IS THE WHOLE OF HOW A HOST RUN
-         * REACHES THE DEVICE GRAPH.
-         *
-         * A host-site op writes a host-domain buffer and something downstream reads it on the
-         * device. NOTHING IN THIS RUNTIME COPIES BETWEEN THE TWO ARENAS -- there is no transfer op
-         * and no implicit staging in rad_issue, and the planner's `link_crossings` is an objective
-         * it minimises, not a mechanism it provides. With plain RAD_MEM_HOST the host arena is
-         * "ordinary malloc'd pages the GPU has never been shown" (core/device/hip.cpp), so the
-         * device side of that hand-off had no way to read it and host-site execution could not
-         * complete a step. Mapped, the same allocation is addressable from a kernel over the link
-         * and the crossing IS the read -- which is row three of spec 5.1 applied to an activation
-         * rather than to a weight.
-         *
-         * The cost is that every device access to a host-domain buffer is a link read, so this is
-         * for the narrow hand-off at a host run's edge and not for a hot activation. A buffer's
-         * domain is declared by the ARCHITECTURE, so that judgement stays where it belongs. */
+        /* RAD_MEM_HOST_MAPPED, not RAD_MEM_HOST: nothing copies between the two arenas, so device
+         * kernels must read host-domain buffers directly over the link (spec §5.1, row three,
+         * applied to activations). Plain RAD_MEM_HOST pages are not device-visible
+         * (core/device/hip.cpp). Every device access is a link read, so host-domain buffers suit
+         * only the hand-off at a host run's edge; the architecture declares the domain. */
         RAD_TRY(host_arena_.init(host_hw, 0, RAD_MEM_HOST_MAPPED));
-        /* ONE POINTER SERVES BOTH SIDES, AND THAT IS CHECKED RATHER THAN ASSUMED. bind_buffers
-         * stores a single base per buffer, which is correct exactly while the mapped allocation's
-         * host and device views share an address -- true under HIP's unified addressing and true
-         * by construction on the host backend. A backend where they differ gets a refusal here
-         * instead of handing one of the two sides a pointer into nothing. */
+        /* bind_buffers stores one pointer per buffer, valid only while the mapped allocation's
+         * host and device views share an address (true under HIP unified addressing and on the
+         * host backend). Checked, not assumed. */
         void* hb = host_arena_.base();
         void* db = rad_dev_device_ptr(hb);
         if (!db || db != hb) {
@@ -235,8 +206,7 @@ int Ctx::bind_buffers() {
             return RAD_E_FULL;
         }
 
-        /* rad_buf_ptr is arena_base + BufferInfo::arena_offset, and nothing else -- there is no
-         * table walk and no allocator between a handle and its bytes. */
+        /* rad_buf_ptr is arena_base + BufferInfo::arena_offset. */
         t.data  = a.base() + bi.arena_offset;
         bi.ptr  = t.data;
         buf_bits_[i] = rad_dtype_bits(bi.decl.dtype);
@@ -255,7 +225,7 @@ int Ctx::add_level(int64_t rows, const std::vector<int64_t>& offset,
     std::vector<RadTensor> t = level_tmpl_[0];
     for (size_t i = 1; i < P.buffers.size(); ++i) {
         const BufferInfo& bi = P.buffers[i];
-        /* THE HOST ARENA AND THE FIXED REGION ARE NOT LEVELLED: their template is level 0's. */
+        /* The host arena and the fixed region are not levelled: level 0's template. */
         if (bi.decl.domain == RAD_DOMAIN_HOST || bi.decl.kind != RAD_BUF_TRANSIENT) {
             if (offset[i] != bi.arena_offset) return RAD_E_STATE;
             continue;
@@ -288,50 +258,33 @@ int Ctx::set_level(int level) {
     return RAD_OK;
 }
 
-int Ctx::bind_weights(bool refresh_only) {
+/* The weights' addresses as the load phase left them. A weight the mover relocates afterwards is
+ * read through the ResidencyTable (sync_residency), never through its template. */
+int Ctx::bind_weights() {
     Program& P = *program_;
-    ++w_tmpl_epoch_;
-    if (!refresh_only) {
-        w_tmpl_.assign(P.weights.size(), RadTensor{});
-        w_bits_.assign(P.weights.size(), 0);
-        w_gen_.assign(P.weights.size(), 0);
-        waited_gen_.assign(P.weights.size(), UINT32_MAX);
-        w_direct_.assign(P.weights.size(), 0);
-    }
+    w_tmpl_.assign(P.weights.size(), RadTensor{});
+    w_bits_.assign(P.weights.size(), 0);
+    waited_gen_.assign(P.weights.size(), UINT32_MAX);
+    w_direct_.assign(P.weights.size(), 0);
 
     for (size_t i = 1; i < P.weights.size(); ++i) {
-        WeightInfo& wi = P.weights[i];
-        const uint32_t gen = wi.generation.load(std::memory_order_acquire);
-        if (refresh_only && w_gen_[i] == gen) continue;
-
+        const WeightInfo& wi = P.weights[i];
         RadTensor& t = w_tmpl_[i];
-        /* The stored dtype is what the resolved kernel's layout hook asked for; the logical dtype
-         * is what the plugin declared. The kernel reads the layout it chose, so the stored one
-         * wins where the layout pass filled it in.
+        /* Stored dtype (from the resolved kernel's layout hook) wins over the declared one, since
+         * the kernel reads the layout it chose.
          *
-         * THE SHAPE IS THE DECLARED ONE and the dtype is the stored one, which is a seam worth
-         * naming rather than a symmetry. WeightInfo DOES carry stored_shape -- the layout pass
-         * fills it beside stored_dtype -- and this deliberately does not use it, because a kernel
-         * whose layout reshapes has to keep working out its own stride from the geometry either
-         * way: a row-sharded weight's stored shape is the whole tensor's, not this rank's.
-         *
-         * So a layout that changes the WIDTH (libr4d's fp8 lm_head appends each row's scales to
-         * its own row) is invisible here, and its kernel derives the stride from the same rule its
-         * layout hook used. What keeps the two honest is the layout TAG the engine checks at load,
-         * not a shape it could compare. The declared shape is already divided by world_size,
-         * because the plugin declares dimensions per rank (spec §9). */
+         * The shape is deliberately the declared one, not WeightInfo::stored_shape: a row-sharded
+         * weight's stored shape is the whole tensor's, not this rank's, so a re-laying kernel
+         * derives its own stride anyway (e.g. libr4d's fp8 lm_head appends row scales to each
+         * row). Consistency is enforced by the layout tag checked at load. The declared shape is
+         * per rank (spec §9). */
         t.dtype = wi.stored_dtype != RAD_DT_INVALID ? wi.stored_dtype : wi.decl.dtype;
         t.rank  = wi.decl.rank;
         for (uint32_t d = 0; d < wi.decl.rank && d < RAD_MAX_RANK; ++d) t.shape[d] = wi.decl.shape[d];
         rad_tensor_pack(&t);
         t.data  = wi.ptr;
         w_bits_[i] = rad_dtype_bits(t.dtype);
-        w_gen_[i]  = gen;
     }
-    /* A rebinding can move any template, and a table entry the residency table has no slot for
-     * reads its template: every table resolves every entry at its next issue. */
-    if (refresh_only)
-        for (WeightTable& t : wtabs_) if (t.checked) { t.full = true; t.pend.clear(); }
     return RAD_OK;
 }
 
@@ -347,11 +300,10 @@ int Ctx::bind_ops() {
     issue_table_.clear();
     gate_params_.clear();
 
-    int64_t n_bands_total = 0, n_plans = 0;
-    for (auto& o : P.ops) { n_bands_total += (int64_t)o.bands.size(); }
-    n_plans = n_bands_total * RAD_N_DOMAINS;
+    int64_t n_bands_total = 0;
+    for (auto& o : P.ops) n_bands_total += (int64_t)o.bands.size();
     band_table_.reserve((size_t)n_bands_total);
-    issue_table_.reserve((size_t)n_plans);
+    issue_table_.reserve((size_t)(n_bands_total * RAD_N_DOMAINS));
 
     for (size_t i = 1; i < P.ops.size(); ++i) {
         OpInfo& oi = P.ops[i];
@@ -361,7 +313,7 @@ int Ctx::bind_ops() {
         p.n_bands  = (int32_t)oi.bands.size();
         p.plan_off = (int32_t)issue_table_.size();
         p.n_opd_schema = oi.schema ? (int32_t)oi.schema->n_operands : -1;
-        /* Matched by name once, here, rather than on the issue path -- see OpPlan::billed. */
+        /* Matched by name once here, not on the issue path; see OpPlan::billed. */
         p.billed     = (oi.op == "all_reduce");
         p.collective = p.billed;
 
@@ -374,11 +326,11 @@ int Ctx::bind_ops() {
                 if (r && r.row && r.row->info && r.row->info->launch) {
                     ip.row     = r.row;
                     ip.launch  = r.row->info->launch;
+                    ip.ranged_div = r.ranged_div;
                     if (r.row->collective) p.collective = true;
 
-                    /* Bound once. args.p views the frozen geometry inside Program::ops, which is
-                     * why declare must not touch a Resolved after this point: the vector would
-                     * reallocate and every one of these would dangle. */
+                    /* args.p views the frozen geometry inside Program::ops; declare must not
+                     * touch a Resolved after this, or these pointers dangle. */
                     ip.args.t             = tbuf_;
                     ip.args.n_t           = 0;
                     ip.args.p             = r.geom.params();
@@ -388,8 +340,8 @@ int Ctx::bind_ops() {
                     ip.args.instance      = r.instance;
                     ip.args.rank          = rank_;
                     ip.args.world_size    = world_size_;
-                    /* A launch that ends its own hold on the link is handed the word the hold is
-                     * kept in, as one parameter more after the geometry's -- when it holds one. */
+                    /* A launch that ends its own link hold gets the hold word as an extra
+                     * `link_gate` parameter after the geometry's. */
                     if (r.row->releases_link)
                         if (void* g = rad_link_gate(stream_)) {
                             std::vector<RadParam>& v =
@@ -417,15 +369,12 @@ int Ctx::bind_ops() {
             }
         }
 
-        /* Execution site. Site is a property of the weights (spec §5.1), so an op whose every
-         * weight operand was placed on the host runs its host kernel and everything else runs on
-         * the device. An op with no weights stays on the device; the planner overrides through
-         * set_op_domain, which is where the "contiguous host runs" objective actually lands.
+        /* Execution site follows the weights (spec §5.1): an op whose every weight is on the host
+         * runs its host kernel, everything else the device. An op with no weights stays on the
+         * device; the planner overrides through set_op_domain.
          *
-         * ON THE HOST BACKEND (no card visible: CPU-only serving) the device domain is the host's
-         * own memory and an op with no device kernel in any band runs its host kernel -- the
-         * whole model on libavx (or libref) with no switch to set. An op that does carry device
-         * rows there is a test registering fakes, and keeps them. */
+         * On the host backend (CPU-only), an op with no device kernel in any band runs its host
+         * kernel (libavx or libref). Device rows there come from tests registering fakes. */
         int dom = RAD_DOMAIN_DEVICE;
         if (device_is_host()) {
             bool any_device = false;
@@ -440,9 +389,8 @@ int Ctx::bind_ops() {
                 const WeightInfo* wi = P.weight(w);
                 if (!wi || wi->site != Site::Host) { all_host = false; break; }
             }
-            /* ...and whether that host kernel can READ the weights, which is a separate question
-             * from whether one exists. The planner asked for the host; the device is always a
-             * correct answer, so this is a fallback and a warning rather than a refusal. */
+            /* The host kernel must also read the stored layout. The device is always correct,
+             * so this falls back with a warning rather than refusing. */
             std::string why;
             if (all_host && check_domain_layout((rad_op)i, RAD_DOMAIN_HOST, &why) < 0) {
                 RAD_WARN("op '%s' was placed on the host and runs on the device instead: %s",
@@ -461,27 +409,16 @@ int Ctx::bind_ops() {
     return RAD_OK;
 }
 
-/* CAN THE KERNEL THAT WOULD SERVE THIS OP ON `domain` READ THE BYTES THE CONTAINER HOLDS?
+/* Whether the kernel serving this op on `domain` can read the bytes the container holds.
  *
- * A weight is stored ONCE, in whatever arrangement the kernel that claimed it at declare asked
- * for (spec 4.2), and that claimant is always a DEVICE row: rad_builder.cpp exempts the host
- * domain from the layout claim deliberately, because libref declares no layout for anything and
- * every re-laying device kernel would otherwise collide with its own reference fallback and no
- * model would declare at all.
+ * A weight is stored once, in the arrangement its claiming kernel asked for (spec 4.3), and the
+ * claimant is a device row wherever one reads the weight: rad_builder.cpp lets a host row claim
+ * only what no device row did. A host kernel reading as declared would see e.g. libr4d's fp8a8
+ * WMMA fragment order -- same N*K bytes, so every shape check passes -- and compute plausible
+ * wrong answers. The load-time tag check in engine_bringup only checks the claiming row.
  *
- * So moving an op to a domain whose kernel reads its weights AS DECLARED hands that kernel a
- * plane it cannot read. libr4d stores an fp8a8 weight in WMMA fragment order -- the same N*K
- * bytes in a different arrangement -- so the byte count matches, every shape check passes, and
- * the op computes a plausible wrong answer for the life of the process. Two readings of one
- * permuted plane are uncorrelated tensors, which is a model that serves and lies.
- *
- * The load-time tag check in engine_bringup cannot see this: it compares the container against
- * the tag the claimant recorded, and both of those are the device row's. This asks the same
- * question of the kernel that will actually run.
- *
- * `why` gets the sentence; the caller decides whether it is a warning or a refusal, because the
- * two callers differ. The planner ASKED for the host and can be given the device instead, which
- * is always a correct answer; an explicit set_op_domain has no such fallback. */
+ * `why` gets the message. The caller picks the severity: the planner's host request falls back
+ * to the device, an explicit set_op_domain has no fallback. */
 int Ctx::check_domain_layout(rad_op h, int domain, std::string* why) const {
     if (h == RAD_NULL_HANDLE || h >= plans_.size()) return RAD_E_INVAL;
     if (domain < 0 || domain >= RAD_N_DOMAINS)      return RAD_E_INVAL;
@@ -504,9 +441,9 @@ int Ctx::check_domain_layout(rad_op h, int domain, std::string* why) const {
             RadLayout L{};
             RadTensor t[RAD_ENC_MAX_PLANES];
             weight_planes(w, t);
-            /* A row with no hook, or one that declines this operand, is asserting that it reads
-             * the selected plane AS IT IS -- the same reading rad_builder.cpp gives the same code.
-             * One that does not read the encoding at all cannot take the op either. */
+            /* A row with no hook, or one that declines this operand, reads the selected plane as
+             * stored (as rad_builder.cpp interprets it). One that cannot read the encoding at all
+             * cannot take the op. */
             const int st = ki->layout ? ki->layout(ip.args.p, ip.args.n_p, opd, &w.enc, w.sel, t,
                                                    w.n_sel, &L)
                                       : RAD_E_UNSUPPORTED;
@@ -548,7 +485,7 @@ int Ctx::check_domain(rad_op h, int domain) const {
         return RAD_E_NOKERNEL;
     }
 
-    /* A kernel existing for the band is not the same as a kernel that can READ THE WEIGHT. */
+    /* A kernel existing for every band does not mean it can read the stored weight. */
     std::string why;
     if (check_domain_layout(h, domain, &why) < 0) {
         RAD_ERR("op '%s' cannot run on the %s domain: %s", p.info->op.c_str(),
@@ -576,20 +513,10 @@ int Ctx::op_domain(rad_op h) const {
 
 int Ctx::bind_routing() {
     const Program& P = *program_;
-    /* THE ROUTED LAYER COUNT IS NOT meta.n_layers, AND A DRAFTER IS WHY.
-     *
-     * `meta.n_layers` counts TRUNK layers. An MTP head is a further block with its own expert
-     * plane, and it reports itself as the layer one past that count. Sized from `meta.n_layers`
-     * this vector is one short, so every one of that head's route reports is refused with an error
-     * and the heat engine never sees a single count for it. The placement plan still knows about
-     * the units but has no measurement to promote on, so they stay wherever the warm start left
-     * them -- and the head's experts stream over the link on EVERY draft round of every step,
-     * which is worth several percent of the decode step on a model that has one.
-     *
-     * The weights know the answer and the header does not, so ask them. A drafter, a shared
-     * expert plane, anything a plugin declares past the trunk lands here by construction rather
-     * than by the core being told about it.
-     */
+    /* The routed layer count comes from the expert weights, not meta.n_layers, which counts only
+     * trunk layers. An MTP head (or any expert block declared past the trunk) reports as a layer
+     * beyond that count; without a slot its reports are refused and the heat engine never places
+     * its experts. */
     int64_t n_layer = P.meta.n_layers;
     for (const WeightInfo& w : P.weights)
         if (w.decl.group.expert >= 0)
@@ -600,15 +527,13 @@ int Ctx::bind_routing() {
     route_n_expert_ = n_expert;
     route_.assign((size_t)n_layer, RouteSlot{});
 
-    /* One pinned block for every bank, and ONE ROW A LAYER on the card. Pinned because the copy
-     * has to be a real asynchronous DMA: a pageable destination makes the driver stage it through
-     * its own buffer and, on some paths, synchronise -- which would put a host sync on the compute
-     * stream, which is the one thing §5.5 says routing must never do.
+    /* One pinned host block for all banks, and one row per layer on the card. Pinned so the copy
+     * is a true async DMA; a pageable destination can make the driver synchronise, and routing
+     * must never host-sync (spec §5.5).
      *
-     * The card's rows are not banked: a pass's reports land in them and the pass's flush carries
-     * them to the step's bank on the host, both on the compute stream, so the next pass's reports
-     * queue behind the flush that reads them. A report's copy then names the same address every
-     * step, which is what lets a recorded pass be replayed without rewriting it. */
+     * The card rows are not banked: reports and the end-of-pass flush are both on the compute
+     * stream, so the next pass's reports queue behind the flush. A report's copy then targets the
+     * same address every step, so recorded passes replay unchanged. */
     const int64_t elems = n_layer * kRouteBanks * n_expert;
     const int64_t bytes = elems * (int64_t)sizeof(int32_t);
     const int64_t dbytes = n_layer * n_expert * (int64_t)sizeof(int32_t);
@@ -629,17 +554,17 @@ int Ctx::bind_routing() {
         RouteSlot& r = route_[(size_t)l];
         for (int i = 0; i < kRouteBanks; ++i) {
             r.staging[i] = route_pool_ + ((int64_t)i * n_layer + l) * n_expert;
-            r.step[i]    = -1;          /* never written, as against written at step 0 */
+            r.step[i]    = -1;          /* never written (distinct from step 0) */
         }
     }
-    /* Local: the host reads the bank on the strength of this event, but the bytes it reads were
-     * put in host memory by the copy in front of it, whose own packets carry the system scope. */
+    /* Local scope is enough: the preceding copy's own packets carry the system-scope release that
+     * makes the bank visible to the host. */
     for (RadEvent& e : route_done_) RAD_TRY(rad_event_create_local(&e));
     return RAD_OK;
 }
 
-/* THE PASS'S HISTOGRAMS GO TO THE HOST IN ONE TRANSFER: the layers it reported, which are
- * contiguous rows of the bank, and then the bank's event. Called at the end of every pass. */
+/* Copies the pass's reported rows [route_lo_, route_hi_] to the step's host bank in one transfer
+ * and records the bank's event. Called at the end of every pass. */
 int Ctx::route_flush() {
     if (route_bank_ < 0 || route_lo_ > route_hi_) return RAD_OK;
     const int64_t n_layer = (int64_t)route_.size();
@@ -677,9 +602,8 @@ int Ctx::route_report_impl(int layer, const RadRouting* r, bool copy) {
     const int step = batch_ ? batch_->step : 0;
     const int bank = ((step % kRouteBanks) + kRouteBanks) % kRouteBanks;
 
-    /* The plugin computed these with ordinary declared ops. This is the handoff, not a
-     * computation: we record the device buffers so the mover can be told what was wanted, and
-     * nothing here reads them. */
+    /* A handoff only: records the plugin's device buffers for the mover; nothing here reads
+     * them. */
     s.routing  = *r;
     s.reported = step;
 
@@ -691,37 +615,23 @@ int Ctx::route_report_impl(int layer, const RadRouting* r, bool copy) {
             n = route_n_expert_;
         }
         if (n > 0) {
-            /* Asynchronous, on the compute stream, and nothing waits on it. The heat engine reads
-             * it on the NEXT step, so placement decisions are always one step stale -- which for
-             * heat-based promotion is irrelevant, because a hot expert is hot across many steps
-             * (spec §5.5).
+            /* Async on the compute stream; the host never waits. The heat engine reads it a step
+             * later, which is fine since hot experts stay hot (spec §5.5).
              *
-             * "NOTHING WAITS ON IT" IS TRUE OF THE HOST AND NOT OF THE STREAM. A copy is a blit
-             * kernel, so it sits in the compute stream's order and every later kernel queues
-             * behind it -- and a copy INTO HOST MEMORY must also make its writes visible to the
-             * host before it completes, which waits out every write still crossing the link. With
-             * the link carrying streamed experts, that release and the event record after it would
-             * cost a routed layer several microseconds of an otherwise idle compute stream.
-             *
-             * So the layer's counts are copied WITHIN THE CARD, into its row of the step's bank,
-             * and the rows this pass wrote cross to the host once, at the end of the pass
-             * (route_flush). One card-local blit a routed layer is the whole cost -- and none when
-             * the router wrote the row itself (rad_route_counts), which is the report naming it.
-             *
-             * MOVING IT OFF THE COMPUTE STREAM IS WORTH LESS THAN IT LOOKS. The second lane would
-             * have to wait on this stream first, or the copy races the routing kernel that writes
-             * `expert_count`. That is a lane_join a routed layer and an event record back on the
-             * compute stream, which costs more than the blit it moves. */
-            /* RECYCLING A BANK NOBODY READ IS THE RING BEING TOO SHALLOW FOR THIS RUN-AHEAD, and
-             * it is the only way evidence is lost, since the drain takes every landed bank. It
-             * is counted here, at the one place it can happen, rather than inferred from a total
-             * that came up short. A second report of the SAME step is not a recycle: the drain
-             * does not take a bank before its step is over, and `reports` carries the pass. */
+             * The copy still sits in stream order, and a copy into host memory must wait out
+             * every in-flight link write before completing. So each layer's counts are copied
+             * within the card into its row, and the pass's rows cross to the host once at the
+             * end (route_flush). No copy at all when the router wrote the row itself
+             * (rad_route_counts). Moving the blit to the second lane would need a lane_join per
+             * layer to avoid racing the routing kernel, which costs more than the blit. */
+            /* Recycling an uncredited bank means the ring is shallower than the host's run-ahead;
+             * it is the only way evidence is lost, so it is counted here. A second report of the
+             * same step is not a recycle (`reports` counts it). */
             const bool again = s.step[bank] == step;
             if (s.step[bank] >= 0 && !again && !s.credited[bank]) ++route_dropped_;
             s.credited[bank] = false;
             if (route_bank_ != bank) {
-                /* Empty: every pass flushes at its end. Not recorded if it were not. */
+                /* Normally a no-op, since every pass flushes at its end; kept out of the tape. */
                 if (rec_) tape_pause(true);
                 const int rf = route_flush();
                 if (rec_) tape_pause(false);
@@ -741,34 +651,19 @@ int Ctx::route_report_impl(int layer, const RadRouting* r, bool copy) {
             s.reports[bank] = again ? s.reports[bank] + 1 : 1;
             s.step[bank] = step;
 
-            /* ==================== WHAT A FAULT LOOKS LIKE IN THIS HISTOGRAM ====================
+            /* RADIANCE_DEBUG_ROUTING=<layer>: prints that layer's histogram for the first steps.
+             * It synchronises the stream, so it is off by default.
              *
-             * The sum of a layer's counts is the number of placements, which cannot exceed
-             * n_tok * top_k. Negative counts, or totals orders of magnitude above that bound, say
-             * something OUTSIDE this path wrote over the buffer rather than that the routing
-             * kernel is wrong.
-             *
-             * The shape such an overrun takes is worth knowing, because it hides. A routed expert
-             * plane is one row per (token, slot), so a buffer declared at max_tok rows is written
-             * `rows * top_k` deep and runs past its declaration -- and the overrun only EXISTS
-             * once rows * top_k exceeds the declared extent. A short prefill chunk and a decode
-             * step are therefore clean while a full batch is not, and the discriminator is not
-             * `n_tok == max_tok` but how far past the end the write reaches and what the arena
-             * put there. core/runtime/issue.cpp carries the guard that refuses an operand reaching
-             * past its declaration.
-             *
-             * RADIANCE_DEBUG_ROUTING: a composition fault in a routed model shows up here first.
-             * It SYNCHRONISES THE STREAM, which is exactly what the copy above exists to avoid --
-             * so it is an environment variable, off, and costs nothing when it is not set. The
-             * value is the layer to print. */
+             * A layer's counts sum to at most n_tok * top_k. Negative counts or far larger totals
+             * mean something outside this path overwrote the buffer, e.g. an expert plane declared
+             * at max_tok rows but written rows * top_k deep (refused by the operand guard in
+             * issue.cpp). */
             static const char* dbg = std::getenv("RADIANCE_DEBUG_ROUTING");
             if (copy && dbg && layer == (int)std::strtol(dbg, nullptr, 10) && step < 3) {
                 RAD_TRY(route_flush());
                 rad_stream_sync(stream_);
-                /* READ THE DEVICE BUFFER AGAIN, SYNCHRONOUSLY, and print both totals. The staging
-                 * copy is asynchronous and this print is the only reader of it, so a disagreement
-                 * here says the copy raced and an agreement says the histogram itself is what it
-                 * is. Debug-only, so the extra transfer costs nothing when the variable is off. */
+                /* Also read the device buffer directly: a mismatch with the staged copy means the
+                 * copy raced. */
                 std::vector<int32_t> direct((size_t)n, 0);
                 int64_t dtot = 0;
                 if (rad_memcpy_async(direct.data(), r->expert_count,
@@ -795,28 +690,19 @@ int Ctx::route_report_impl(int layer, const RadRouting* r, bool copy) {
     return RAD_OK;
 }
 
-/* THE OLDEST LANDED BANK THIS LAYER HAS NOT BEEN CREDITED FOR, or -1 when there is none.
- *
- * OLDEST AND NOT NEWEST, because the caller drains in a loop and the heat engine decays a layer's
- * plane on every observation. Fed newest-first, a burst would apply the most recent decay to the
- * oldest evidence and rank the plane by an order the device never produced.
- *
- * A BANK IS SKIPPED UNTIL ITS COPY HAS COMPLETED. `step[b]` is stamped when the copy is ISSUED,
- * which on a long prefill chunk is many steps before the device reaches it; reading the staging
- * then would hand back whatever the bank's previous occupant left in it, which is a histogram from
- * kRouteBanks steps ago wearing this step's number. The event is the only thing that separates
- * the two, so it is queried rather than assumed -- and that also excludes a half-written bank,
- * which a mid-step reader would otherwise see.
- *
- * A BANK OF A STEP STILL BEING ISSUED IS SKIPPED TOO, landed or not: a later pass of that step can
- * still report into it. See `before_step` in ctx.h.
- */
 void Ctx::mark_credited(int layer, int bank) {
     if (layer < 0 || (size_t)layer >= route_.size()) return;
     if (bank < 0 || bank >= kRouteBanks) return;
     route_[(size_t)layer].credited[bank] = true;
 }
 
+/* The oldest landed bank in (after_step, before_step) for this layer, or -1.
+ *
+ * Oldest first, because the heat engine decays a layer's plane on every observation and must see
+ * them in device order. A bank is skipped until its event says the copy completed: `step[b]` is
+ * stamped at issue, and the staging would otherwise still hold the previous occupant's histogram.
+ * A bank of a step still being issued is skipped too (see `before_step` in ctx.h).
+ */
 int Ctx::next_histogram(int layer, int after_step, int before_step, int8_t* landed) const {
     if (layer < 0 || (size_t)layer >= route_.size()) return -1;
     const RouteSlot& s = route_[(size_t)layer];
@@ -869,23 +755,16 @@ int Ctx::bind_profiling() {
     prof_wait_ms_.assign(program_->ops.size(), 0.0);
     if (!profiling_) return RAD_OK;
 
-    /* Printed, not buried in a doc. Anyone reading a profiled run's numbers has to see this on the
-     * same terminal that produced them. */
-    RAD_WARN("per-op timing is ON. It restores synchronisations that change the mover's slot "
-             "supply, so THIS RUN IS NOT COMPARABLE against an unprofiled one (spec §16). "
-             "Anything being measured across builds runs without it.");
+    RAD_WARN("per-op timing is on; it adds synchronisations that change the mover's slot supply, "
+             "so this run is not comparable with an unprofiled one (spec §16)");
 
-    /* A fixed ring, allocated here, because the step path does not allocate. 8192 pairs covers a
-     * 64-layer model at ~20 ops a layer with room for speculation; past that we stop timing and
-     * say so, rather than growing a vector inside a step.
+    /* A fixed ring, since the step path does not allocate. 8192 pairs covers a 64-layer model at
+     * ~20 ops a layer with room for speculation; overflow stops timing with a warning.
      *
-     * CARD-LOCAL EVENTS, NOT HOST-WAIT ONES. A host-wait record takes an interrupt signal, of which
-     * a process has a few thousand, and every pair recorded in a step holds two until the pair is
-     * recorded again a step later: a prefill step on a large model records more pairs than that
-     * across the ranks, and the engine's own staging event then has no signal left to take. The
-     * host never waits on these one at a time -- profile_collect waits for the stream once -- and
-     * a card-scope release keeps the records from waiting out writes still on their way to the
-     * host, which would be charged to the op they bracket. */
+     * Card-local events: a host-wait event takes one of a process's few thousand interrupt
+     * signals, and a large prefill step would exhaust them. The host only waits on the stream
+     * (profile_collect), and a card-scope release does not wait out in-flight host writes that
+     * would be charged to the bracketed op. */
     const size_t cap = 8192;
     prof_ring_.resize(cap);
     for (size_t i = 0; i < cap; ++i) {
@@ -899,18 +778,15 @@ int Ctx::bind_profiling() {
 }
 
 void Ctx::profile_collect() {
-    /* This is the synchronisation the caveat above is about. It is here, at the end of the step,
-     * rather than per launch, so at least the ordering inside a step is undisturbed -- but the
-     * mover's slot supply still sees a step boundary it would not otherwise see. */
+    /* The profiling sync, once at the end of the step so ordering within the step is
+     * undisturbed. */
     if (prof_n_ > 0) {
-        /* Lane 1 is already joined into the compute stream (end of step), so that stream finishing
-         * is every bracketed launch finishing. */
-        ++n_host_syncs_;                     /* counted, so the caveat is a number and not a claim */
+        /* Lane 1 is already joined into the compute stream, so this covers every launch. */
+        ++n_host_syncs_;
         if (rad_stream_sync(stream_) < 0) prof_n_ = 0;
     }
-    /* The idle time before each op, per lane: the first op a lane runs in the step has nothing
-     * before it on that lane, and the gap from the last step is mostly this collection's own
-     * synchronisation, so it is not charged. */
+    /* Idle time before each op, per lane. A lane's first op in the step is not charged: its gap
+     * is mostly this collection's own sync. */
     const ProfSlot* prev[2] = { nullptr, nullptr };
     for (size_t i = 0; i < prof_n_; ++i) {
         ProfSlot& s = prof_ring_[i];
@@ -937,16 +813,16 @@ void Ctx::dump_profile() const {
     if (!program_)   { RAD_WARN("per-op timing: the context has already been shut down"); return; }
 
     fprintf(stderr,
-            "\nper-op timing, rank %d. NOT COMPARABLE against an unprofiled run:\n"
+            "\nper-op timing, rank %d. Not comparable with an unprofiled run:\n"
             "enabling this restores synchronisations that change the mover's slot supply.\n"
-            "A row marked `host` was timed on the HOST CLOCK around a host-site launch and\n"
+            "A row marked `host` was timed on the host clock around a host-site launch and\n"
             "includes everything that call waited on -- page faults, link reads. The rest are\n"
             "device event pairs around a kernel. `wait us` is how long, a call, the op's lane\n"
             "sat idle before it started -- stream waits and issue delays, in no op's time.\n\n"
             "  %10s %12s %10s %5s %10s %10s  %s\n", rank_, "calls", "total ms", "us/call", "site",
             "join us", "wait us", "op / geometry");
 
-    /* Slowest first: the only ordering anybody reads this table in. */
+    /* Slowest first. */
     std::vector<size_t> order;
     for (size_t i = 1; i < prof_calls_.size(); ++i) if (prof_calls_[i]) order.push_back(i);
     std::sort(order.begin(), order.end(),
@@ -960,10 +836,8 @@ void Ctx::dump_profile() const {
         if (ho && i < prof_join_ms_.size())
             std::snprintf(jbuf, sizeof jbuf, "%10.2f",
                           prof_join_ms_[i] * 1000.0 / (double)prof_calls_[i]);
-        /* The op's position and its first weight name the LAYER: every layer's instance of an
-         * op declares the same geometry, so without them sixty rows read alike and a per-layer
-         * cost -- residency, a pooled expert streamed by one layer and not the next -- cannot be
-         * tied to anything. */
+        /* The op index and first weight identify the layer, since every layer's instance has
+         * the same geometry. */
         const char* wname = !o.weights.empty() && o.weights[0] < program_->weights.size()
                                 ? program_->weights[o.weights[0]].name.c_str() : "-";
         const double wait = i < prof_wait_ms_.size() ? prof_wait_ms_[i] : 0.0;
@@ -980,26 +854,19 @@ void Ctx::dump_profile() const {
 
 /* ================================================================== the step driver */
 
-/* LAZY, AND THAT IS THE POINT: an architecture that never asks for a second lane must take the
- * same code path an architecture with one lane would take if this feature did not exist, so that
- * "the lane costs nothing when unused" is a property of the source rather than a claim about a
- * measurement. Building the stream eagerly would make it one -- and one that is hard to establish,
- * because a second stream's cost is small enough to sit inside the run-to-run spread a warming
- * part produces. */
+/* Lazy, so an architecture that never asks for a second lane runs exactly the single-lane code
+ * path. */
 int Ctx::lane_init() {
     if (lane1_) return RAD_OK;
     RAD_TRY(rad_dev_set(device_));
     RAD_TRY(rad_stream_create(&lane1_, 0));
     own_lane1_ = true;
-    /* Local: a lane join orders one card's two queues and nothing else reads through it. */
+    /* Local scope: a lane join only orders this card's two queues. */
     for (int i = 0; i < 2; ++i)
         if (!lane_ev_[i]) RAD_TRY(rad_event_create_local(&lane_ev_[i]));
-    /* A NEW LANE STARTS BEHIND EVERYTHING LANE 0 HAS ISSUED. Its first use is mid-step, and the
-     * join an architecture puts in front of it -- rad_lane_join(0, 1), then rad_lane(1) -- found no
-     * lane 1 to order and returned without doing anything. Unordered, the first op on the new
-     * stream reads lane 0's output before lane 0 has written it: on Qwen-Image's two-rank pass
-     * the first picture after startup took its first all-reduce of stale rows and came out a
-     * different picture, every later one the right one. */
+    /* A new lane starts behind everything lane 0 has issued. Its first use is mid-step, where a
+     * preceding rad_lane_join(0, 1) found no lane 1 and did nothing, so without this the first op
+     * on the new stream could read lane 0's output before it is written. */
     RAD_TRY(rad_event_record(lane_ev_[0], stream_));
     RAD_TRY(rad_event_wait(lane1_, lane_ev_[0]));
     return RAD_OK;
@@ -1016,9 +883,8 @@ int Ctx::set_lane(int lane) {
 int Ctx::lane_join(int from, int to) {
     if (from == to) return RAD_OK;
     if (from < 0 || from > 1 || to < 0 || to > 1) return RAD_E_INVAL;
-    /* Nothing was ever issued on lane 1, so there is nothing to order against -- and a lane 1
-     * built later starts behind lane 0 (lane_init). This is the arm every unpipelined step takes
-     * at the end of run_step, and it must not build a stream. */
+    /* No lane 1 yet: nothing to order, and a later lane 1 starts behind lane 0 (lane_init). Every
+     * single-lane step takes this at the end of run_step; it must not build a stream. */
     if (!lane1_) return RAD_OK;
     RadStream fs = from ? lane1_ : stream_, ts = to ? lane1_ : stream_;
     RAD_TRY(rad_event_record(lane_ev_[from], fs));
@@ -1030,9 +896,17 @@ int Ctx::lane_join(int from, int to) {
 /* ================================================================== recorded passes */
 /* See "recorded passes" in ctx.h. */
 
+/* The key below reads every RadBatch field a pass's shape or arguments can depend on, by hand. A
+ * field added to RadBatch changes its size: decide whether the key must read it, then update the
+ * size here. */
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 312,
+              "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
+static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 72,
+              "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
+
 uint64_t Ctx::pass_key(const RadBatch* b) const {
-    /* An encoder pass is shaped by its media, and a pass that carries encoder rows issues the
-     * scatter that puts them in place only when it has some: neither repeats as a tape would. */
+    /* Not recordable: encoder passes are shaped by their media, and passes carrying encoder rows
+     * issue the scatter only when they have some. */
     if (b->enc || b->n_mm_rows > 0) return 0;
     /* A generator pass is shaped by what RadBatch::gen_b carries, which no key below reads. */
     if (b->gen) return 0;
@@ -1059,7 +933,6 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
         mix((uint64_t)k.state_index_pitch); mix((uint64_t)k.block_size); mix((uint64_t)k.max_blocks);
     }
     mix((uint64_t)level_);
-    mix(w_tmpl_epoch_);
     mix(dense_epoch_);
     mix(domain_epoch_.load(std::memory_order_relaxed));
     ptr(arena_.base());
@@ -1142,18 +1015,18 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
     return 1;
 }
 
-/* WHICH DISPATCHES OF A RECORDED PASS CAN START BEFORE THE ONES IN FRONT OF THEM FINISH.
+/* Marks which dispatches of a recorded pass may start before the ones ahead of them finish.
  *
- * Walked once, in queue order, per queue: the ops launched since the queue last ordered a packet
- * are in flight together, and the next op may join them when it reads nothing they write and
- * writes nothing they read or write. Anything the walk cannot see into orders its packet: the
- * dispatch after an event, every dispatch after an op's first (an op's own dispatches depend on
- * each other), a dispatch no op owns (a routing copy), and an opaque op on either side. A run is
- * cut at kTapeOverlapRun, the bound the backend reclaims its argument slots on.
+ * One walk per queue, in order. The ops since the queue's last ordered packet are in flight
+ * together; the next op may join them if it reads nothing they write and writes nothing they
+ * read or write. Ordered regardless: the dispatch after an event, every dispatch after an op's
+ * first (an op's dispatches depend on each other), a dispatch no op owns (e.g. a routing copy),
+ * and opaque ops on either side. A run is cut at kTapeOverlapRun, the bound on which the backend
+ * reclaims argument slots.
  *
- * The host work between played stretches needs nothing here. A host op joins the device work it
- * depends on before it runs, and whatever a stretch of host work puts on a queue -- a table patch,
- * a mover wait -- makes the backend order the next played packet on that queue itself. */
+ * Host work between played stretches needs nothing here: a host op joins its dependencies, and
+ * anything host work puts on a queue (table patch, mover wait) makes the backend order the next
+ * played packet on that queue. */
 int Ctx::haz_mark(PassTape& t) {
     const int n = tape_len(t.dev);
     if (n < 0) return n;
@@ -1187,8 +1060,8 @@ int Ctx::haz_mark(PassTape& t) {
         Q* q = nullptr;
         for (Q& x : qs) if (x.id == qid) { q = &x; break; }
         if (!q) { qs.push_back(Q{}); q = &qs.back(); q->id = qid; }
-        /* An event's packet, and the dispatch after it is ordered too: a wait is complete only
-         * once the event it names is, and nothing after it may start before that. */
+        /* An event packet: the next dispatch is ordered, since nothing after a wait may start
+         * before its event completes. */
         if (kind != 0) { q->infl.clear(); q->opaque = true; q->run = 0; continue; }
         ++t.dispatches;
 
@@ -1210,7 +1083,7 @@ int Ctx::haz_mark(PassTape& t) {
             ++t.unordered;
             continue;
         }
-        /* Ordered: everything before it has finished, and it is what is in flight now. */
+        /* Ordered: everything before it has finished; it starts a new in-flight set. */
         const int32_t own = part_of[(size_t)i];
         q->infl.clear();
         if (own >= 0) q->infl.push_back(own);
@@ -1220,7 +1093,7 @@ int Ctx::haz_mark(PassTape& t) {
     return RAD_OK;
 }
 
-/* Two recordings of one key, compared: the backend's records, and the host work between them. */
+/* Compares two recordings of one key: the backend's records and the host work between them. */
 bool Ctx::tapes_agree(const PassTape& a, const PassTape& b, std::string* why) {
     if (a.steps.size() != b.steps.size()) {
         *why = fmt("%zu stretches against %zu", a.steps.size(), b.steps.size());
@@ -1234,6 +1107,11 @@ bool Ctx::tapes_agree(const PassTape& a, const PassTape& b, std::string* why) {
                        x.kind, x.a, x.b, x.lane, y.kind, y.a, y.b, y.lane);
             return false;
         }
+    }
+    if (a.host.size() != b.host.size() || a.route.size() != b.route.size()) {
+        *why = fmt("%zu host ops and %zu routing reports against %zu and %zu", a.host.size(),
+                   a.route.size(), b.host.size(), b.route.size());
+        return false;
     }
     for (size_t i = 0; i < a.host.size(); ++i) {
         const TapeHost& x = a.host[i];
@@ -1343,7 +1221,7 @@ int Ctx::play_pass(PassTape& t) {
     return RAD_OK;
 }
 
-/* THE PASS: played from its tape, or issued -- and recorded, or checked against its tape. */
+/* Runs one pass: played from its tape, or issued live (and possibly recorded or audited). */
 int Ctx::run_pass(const RadBatch* b) {
     const auto bump = [](std::atomic<int64_t>& c) { c.fetch_add(1, std::memory_order_relaxed); };
     scratch_cur_[0] = scratch_cur_[1] = 0;
@@ -1368,8 +1246,8 @@ int Ctx::run_pass(const RadBatch* b) {
 
     if (t) {
         bump(pc_audited_);
-        /* The check: issue the pass for real, recording it, and compare. The first comparison
-         * comes before the tape is ever played, and then one every kAuditPlays plays. */
+        /* Audit: issue the pass live, recording it, and compare. Runs before the first play and
+         * then every kAuditPlays plays. */
         PassTape fresh;
         if (!record_pass(b, key, &fresh)) return RAD_OK;
         std::string why;
@@ -1391,13 +1269,9 @@ int Ctx::run_pass(const RadBatch* b) {
         return RAD_OK;
     }
 
-    /* A KEY IS RECORDED THE SECOND TIME IT IS SEEN, so a pass that never recurs -- a prefill
-     * chunk, whose token count and positions are its own -- costs no recording and does not push
-     * a tape that will be played out of the least-recently-used set. A DECODE pass recurs by
-     * construction: the same shape runs every step until a sequence's context crosses its bound's
-     * bucket, and then the new key runs every step after that. Seen-once is a whole live issue
-     * spent learning that, at every crossing, so a decode pass is recorded the first time. The
-     * audit before its first play is unchanged. */
+    /* Non-decode keys are recorded on their second sighting, so one-off passes (prefill chunks)
+     * cost no recording and do not evict useful tapes. Decode passes recur every step until a
+     * bound crosses its bucket, so they are recorded on first sight. */
     if (b->phase != RAD_PHASE_DECODE && !tape_seen(key)) {
         bump(pc_first_);
         arch_step_(this, b);
@@ -1427,36 +1301,31 @@ int Ctx::run_step(const RadBatch* b) {
         return RAD_E_STATE;
     }
 
-    /* BEFORE THE RESIDENCY SYNC: a stager may give back weights it published for this pass when
-     * it turns the pass down (runtime/stager.h), and the sync is what carries that into the
-     * tables the pass resolves. */
+    /* Before the residency sync, which carries any weights a declining stager gave back into the
+     * tables (runtime/stager.h). */
     staging_ = stager_ != nullptr && stager_->begin_pass(b);
 
-    /* The mover relocates between steps, never during one. Honouring WeightInfo::generation here
-     * costs one relaxed atomic load per step instead of one per weight per issue. */
-    if (weights_dirty_.exchange(false, std::memory_order_acq_rel))
-        bind_weights(/*refresh_only=*/true);
     sync_residency();
 
     batch_       = b;
     step_status_ = RAD_OK;
     step_fail_.clear();
     prof_n_      = 0;
-    in_step_     = true;
     {
         const int rc = run_pass(b);
         if (rc < 0 && step_status_ >= 0) step_status_ = rc;
     }
 
-    /* EVERY LANE JOINS BACK BEFORE THE STEP ENDS, whatever the architecture did or forgot to do.
-     * The engine synchronises the COMPUTE stream to know a step is finished; work still queued on
-     * lane 1 would be read by the sampler, or freed under, while it was in flight. Ordering lane 0
-     * behind lane 1 here costs one event record and one wait on a step that never used lane 1 --
-     * and it means a plugin cannot leave the runtime in a state where that is possible. */
+    /* Always join lane 1 back into lane 0 before the step ends: the engine syncs only the
+     * compute stream, so work left on lane 1 could be read by the sampler or freed while in
+     * flight. */
     lane_ = 0;
-    lane_join(1, 0);                    /* a no-op, and allocates nothing, when lane 1 is unbuilt */;
-    /* Behind the join, so the compute stream is behind every reader of what the stager published;
-     * and whatever the pass's status, because a staged weight must never outlive its pass. */
+    {
+        const int lj = lane_join(1, 0);   /* no-op when lane 1 is unbuilt */
+        if (lj < 0 && step_status_ >= 0) step_status_ = lj;
+    }
+    /* After the join, so the compute stream is behind every reader of staged weights; regardless
+     * of status, because a staged weight must never outlive its pass. */
     if (staging_) {
         const int se = stager_->end_pass(stream_);
         if (se < 0 && step_status_ >= 0) step_status_ = se;
@@ -1467,17 +1336,13 @@ int Ctx::run_step(const RadBatch* b) {
         if (rf < 0 && step_status_ >= 0) step_status_ = rf;
     }
 
-    in_step_ = false;
     if (profiling_) profile_collect();
     flush_issued();
     return step_status_;
 }
 
-/* WHICH DECLARED OPS THE RUN PHASE HAS ACTUALLY ISSUED, copied out of the per-step plans into the
- * Program the graph dump reads. Walks only the ops not yet seen issued and drops each one as it
- * fires, so the cost falls away within a few steps to the ops that have never fired -- and those
- * are exactly what a reader of this field is looking for. Shrinking in place, so no allocation on
- * the step path. */
+/* Copies OpPlan::issued into the Program for the graph dump. Walks only ops not yet seen issued
+ * and compacts the list in place (no allocation). */
 void Ctx::flush_issued() {
     size_t w = 0;
     for (size_t r = 0; r < unflushed_.size(); ++r) {

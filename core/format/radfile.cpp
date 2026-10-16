@@ -1,8 +1,6 @@
-/* radfile.cpp -- the .rad reader and writer.
- *
- * Two halves of one decision. Everything the reader assumes on the hot path, the writer proves
- * while writing and the reader re-proves at open. The pair is in one file so a change to the
- * layout cannot land on only one side.
+/* radfile.cpp -- the .rad reader and writer. Everything the reader assumes on the hot path, the
+ * writer checks while writing and the reader re-checks at open; one file, so a layout change
+ * touches both.
  */
 #include "radfile.h"
 
@@ -73,28 +71,22 @@ int RadFile::read_at(void* dst, int64_t bytes, int64_t off) const {
 }
 
 void RadFile::drop_blob_cache() const {
-
     if (!base_ || !hdr_ || fd_ < 0) return;
     const int64_t tables = (int64_t)hdr_->data_off < size_ ? (int64_t)hdr_->data_off : size_;
     if (tables >= size_) return;
-    /* The process's mapping first, then the cache behind it: a page still mapped here is one the
-     * kernel has to unmap before it can drop it, and doing it in the other order leaves the
-     * fadvise with nothing to free. */
+    /* Unmap first, then drop the cache: the kernel cannot drop a page still mapped here. */
     ::madvise(base_ + tables, (size_t)(size_ - tables), MADV_DONTNEED);
     ::posix_fadvise(fd_, (off_t)tables, (off_t)(size_ - tables), POSIX_FADV_DONTNEED);
 }
 
-/* Advisory, and deliberately NOT paired with an madvise: the load reads with pread and never
- * maps these pages, so there is nothing of ours to unmap -- and the one region that IS read
- * through the mapping, the n-gram table on Tier::Mapped, is never handed to this. */
+/* Advisory, with no madvise: the load reads with pread and never maps these pages. The one region
+ * read through the mapping (a Tier::Mapped table) is never passed here. */
 void RadFile::drop_range(int64_t off, int64_t bytes) const {
-
     if (fd_ < 0 || bytes <= 0) return;
     ::posix_fadvise(fd_, (off_t)off, (off_t)bytes, POSIX_FADV_DONTNEED);
 }
 
 int RadFile::open(const char* path) {
-
     close();
     if (!path || !*path) return RAD_E_INVAL;
     path_ = path;
@@ -119,31 +111,15 @@ int RadFile::open(const char* path) {
     int s = validate();
     if (s < 0) { close(); return s; }
 
-    /* THE TABLES ARE WANTED NOW; THE BLOB IS READ ONCE, FRONT TO BACK.
-     *
-     * THE ADVICE IS DELIBERATELY ASYMMETRIC AND MUST STAY THAT WAY.
-     *
-     * MADV_WILLNEED over the whole file asks the kernel to pull every byte into the page cache.
-     * That is right for a container that fits in RAM and ruinous for one that does not: it becomes
-     * a readahead storm that evicts the pages it just read and never settles, and the weight load
-     * collapses to a small fraction of disk bandwidth with the host thread spinning inside
-     * hipMemcpyAsync waiting on a copy engine starved for source pages. The tables are small and
-     * read immediately and in full, so they keep WILLNEED; the blob gets NO advice at all.
-     *
-     * MADV_SEQUENTIAL is the obvious replacement for the blob and is worse than silence: it widens
-     * the readahead window and drops pages behind the read pointer, and the load is not one
-     * stream. It reads a layer's gate_up experts, then that layer's down experts, then the
-     * scales -- three cursors over three regions -- so "behind" for one of them is "just about to
-     * be read" for another, and every page is fetched, dropped, and fetched again. Default
-     * readahead is what this copy loop is fastest under.
-     *
-     * The Tier::Mapped weights re-advise their own range MADV_RANDOM once the planner has spoken
-     * (engine_bringup.cpp); a later madvise over a sub-range wins for that sub-range, so leaving
-     * the blob unadvised here does not take that away. */
+    /* The advice is deliberately asymmetric; keep it so. The tables are small and read at once,
+     * so they get MADV_WILLNEED. The blob gets no advice: WILLNEED on a container larger than RAM
+     * becomes a readahead storm that evicts what it just read and starves the load, and
+     * MADV_SEQUENTIAL drops pages behind the pointer, which hurts when several cursors read
+     * different regions. Tier::Mapped weights later advise their own range MADV_RANDOM
+     * (engine_bringup.cpp), which wins for that sub-range. */
     const int64_t tables = (int64_t)hdr_->data_off < size_ ? (int64_t)hdr_->data_off : size_;
     ::madvise(base_, (size_t)tables, MADV_WILLNEED);
-    /* A container extended in place (RadWriter::begin_append) keeps its tables PAST the blob;
-     * they are wanted now just the same. */
+    /* A container extended in place (RadWriter::begin_append) keeps its tables past the blob. */
     const int64_t blob_end = (int64_t)(hdr_->data_off + hdr_->data_bytes);
     if ((int64_t)hdr_->str_off >= blob_end && blob_end < size_)
         ::madvise(base_ + (blob_end & ~(int64_t)(RAD_ALIGN_UNIT - 1)),
@@ -153,13 +129,18 @@ int RadFile::open(const char* path) {
 
     by_name_.reserve((size_t)hdr_->dir_count * 2);
     for (int64_t i = 0; i < (int64_t)hdr_->dir_count; ++i)
-        by_name_.emplace(std::string_view(str(dir_[i].name)), i);
+        if (!by_name_.emplace(std::string_view(str(dir_[i].name)), i).second) {
+            RAD_ERR("%s: '%s' is in the directory twice (rows %lld and %lld); a lookup by name "
+                    "would serve only the first", path, str(dir_[i].name),
+                    (long long)by_name_[std::string_view(str(dir_[i].name))], (long long)i);
+            close();
+            return RAD_E_FORMAT;
+        }
 
     return RAD_OK;
 }
 
-/* Every offset and count in the header is attacker-shaped input until this function has run.
- * Nothing below this point re-checks, so nothing below this point may be reached without it. */
+/* Every header offset and count is untrusted until this has run; nothing later re-checks. */
 int RadFile::validate() {
     hdr_ = (const RadFileHeader*)base_;
 
@@ -184,11 +165,9 @@ int RadFile::validate() {
     auto span_ok = [&](uint64_t off, uint64_t bytes) {
         return bytes == 0 ? off <= n : (off <= n && bytes <= n - off);
     };
-    /* A TABLE IS CHECKED BY ITS COUNT, NEVER BY count * sizeof. Every count in the header is
-     * uint64 and attacker-shaped, so the product wraps: meta_count = 0x0AAAAAAAAAAAAAAB times
-     * 24 bytes is 8, span_ok passes, and the loop below -- which iterates meta_count, not the
-     * byte span -- walks 7.6e17 rows off the end of the mapping. Divide into the space that is
-     * left instead, where nothing can wrap. */
+    /* Check tables by count, never by count * sizeof: an untrusted uint64 count can wrap the
+     * product (0x0AAAAAAAAAAAAAAB * 24 == 8) while the loops iterate the count. Divide into the
+     * remaining space instead. */
     auto span_n = [&](uint64_t off, uint64_t count, uint64_t elem) {
         if (count == 0) return off <= n;
         return off <= n && count <= (n - off) / elem;
@@ -251,9 +230,8 @@ int RadFile::validate() {
         }
     }
 
-    /* An encoding the core cannot read is refused here, by its index, rather than handed to a
-     * kernel's layout hook as if it meant something: rad_enc_valid() is the whole contract of the
-     * struct -- roles, chains, plane kinds and core dtypes. */
+    /* Refuse an encoding the core cannot read here, by index, rather than pass it to a layout
+     * hook. rad_enc_valid() checks the whole struct: roles, chains, plane kinds, core dtypes. */
     for (uint64_t i = 0; i < hdr_->enc_count; ++i) {
         RadEncoding e;
         std::memcpy(&e, &encs_[i], sizeof e);
@@ -313,8 +291,8 @@ int RadFile::validate() {
                     (unsigned long long)hdr_->plane_count, enc.n_planes);
             return RAD_E_FORMAT;
         }
-        /* EVERY PLANE IS EXACTLY ITS ENCODING'S SIZE AND INSIDE ITS ENTRY. That is what lets a
-         * reader slice a plane by arithmetic and a mover treat the entry as one span. */
+        /* Every plane is exactly its encoding's size and inside its entry, so readers slice planes
+         * by arithmetic and the mover treats the entry as one span. */
         int64_t rows = 0, cols = 0;
         rad_enc_view(e.rank, e.shape, &rows, &cols);
         for (uint32_t k = 0; k < e.n_planes; ++k) {
@@ -335,18 +313,16 @@ int RadFile::validate() {
 
     /* ---------------------------------------------------------------- vocab */
     if (hdr_->vocab_bytes >= sizeof(RadVocabHeader)) {
-        /* THE SECTION IS READ IN PLACE through typed pointers, so the header and every array have
-         * to sit on their element's alignment, which is where the writer puts them. A file that
-         * does not is damaged, and reading it anyway is a misaligned load for every field. */
+        /* The section is read in place through typed pointers, so the header and every array must
+         * be aligned to their element (the writer guarantees it). */
         if (hdr_->vocab_off % alignof(RadVocabHeader) != 0) {
             RAD_ERR("%s: the vocab section starts at %llu, which is not %zu-aligned", path_.c_str(),
                     (unsigned long long)hdr_->vocab_off, alignof(RadVocabHeader));
             return RAD_E_FORMAT;
         }
         const RadVocabHeader* v = (const RadVocabHeader*)(base_ + hdr_->vocab_off);
-        /* Offset 0 means the array is absent -- an optional one (scores are unigram-only, types
-         * default to normal) simply is not written. Nothing real can live at file offset 0, so
-         * the sentinel is unambiguous. */
+        /* Offset 0 means an optional array is absent (scores are unigram-only; types default to
+         * normal). Nothing real lives at file offset 0. */
         auto arr_ok = [&](uint64_t off, uint64_t bytes, size_t align) {
             return bytes == 0 || off == 0 ||
                    (off >= hdr_->vocab_off &&
@@ -405,13 +381,9 @@ int RadFile::validate() {
     return RAD_OK;
 }
 
-/* Re-derive the fixed stride and refuse a container that does not have one.
- *
- * This is where the format's central claim is checked. `base + id * stride` is what the mover and
- * the expert kernels do on the critical path, and they do it without a bounds test, so the claim
- * has to be true before anything is handed a pointer. A file whose experts within a layer differ
- * in shape or format is REFUSED here rather than read with a table walk: reading it slowly would
- * quietly return exactly the property the format exists to provide. */
+/* Re-derive each layer's fixed expert stride and refuse a container without one. The mover and
+ * expert kernels compute `base + id * stride` with no bounds test, so this must hold before any
+ * pointer is handed out. */
 int RadFile::index_experts() {
     const int64_t n = (int64_t)hdr_->dir_count;
     int64_t i = 0;
@@ -432,7 +404,7 @@ int RadFile::index_experts() {
         g.layer       = layer;
         g.first_index = i;
 
-        /* Expert 0 establishes the shape of every expert in this layer. */
+        /* Expert 0 defines the layout of every expert in this layer. */
         int64_t j = i;
         while (j < n && dir_[j].layer == layer && dir_[j].expert == 0) ++j;
         g.n_slot = (int32_t)(j - i);
@@ -462,8 +434,8 @@ int RadFile::index_experts() {
         }
         g.unit_bytes = unit_end - g.base;
 
-        /* Every further expert must agree, byte for byte, with expert 0's internal layout, and
-         * must sit exactly one stride further along. */
+        /* Every further expert must match expert 0's internal layout exactly and sit one stride
+         * further along. */
         int32_t e_id = 1;
         while (j < n && dir_[j].layer == layer && dir_[j].expert >= 0) {
             if (dir_[j].expert != e_id) {
@@ -559,9 +531,9 @@ int RadWriter::begin(const char* path) {
     fd_out_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd_out_ < 0) { RAD_ERR("%s: %s", path_.c_str(), std::strerror(errno)); return RAD_E_IO; }
 
-    /* The data blob is spilled beside the target and spliced in at finish(). The tables in front
-     * of it cannot be sized until every weight has been added, and the blob is the model -- a
-     * 1.5 GB checkpoint is not going to be staged in RAM so the header can be back-patched. */
+    /* The blob is spilled beside the target and spliced in at finish() (unless sealed): the
+     * tables in front cannot be sized until every weight is added, and the blob is not held in
+     * RAM. */
     fd_spill_ = ::open(spill_path_.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     spill_base_ = 0;
     if (fd_spill_ < 0) {
@@ -576,8 +548,8 @@ int RadWriter::begin(const char* path) {
 
 void RadWriter::abort() {
     if (append_) {
-        /* The file is the caller's container, not ours to unlink: put its header back -- a no-op
-         * unless finish_append() failed inside that last write -- and cut the tail off. */
+        /* The file is the caller's container: restore its header (a no-op unless finish_append()
+         * failed in that write) and truncate the tail. */
         if (fd_out_ >= 0) {
             (void)!::pwrite(fd_out_, &old_hdr_, sizeof old_hdr_, 0);
             (void)!::ftruncate(fd_out_, (off_t)old_size_);
@@ -598,9 +570,8 @@ void RadWriter::abort() {
 
 /* ------------------------------------------------------------------ append in place */
 
-/* The processes other than this one that hold the file open or mapped. /proc/<pid>/fd for an open
- * descriptor and /proc/<pid>/maps for a mapping whose descriptor was closed; a process this user
- * cannot inspect is not counted, which is the same reach the caller has over that process. */
+/* Other processes holding the file open (/proc/<pid>/fd) or mapped (/proc/<pid>/maps). Processes
+ * this user cannot inspect are not counted. */
 static std::vector<long> other_users(dev_t dev, ino_t ino) {
     std::vector<long> who;
     DIR* d = ::opendir("/proc");
@@ -661,8 +632,8 @@ int RadWriter::begin_append(const char* path, const RadFile& old) {
         ::close(fd_out_); fd_out_ = -1;
         return RAD_E_IO;
     }
-    /* The file `old` describes, unchanged since it was read: its header, byte for byte, and its
-     * length. Anything else and the directory being carried over names somebody else's bytes. */
+    /* The file must be unchanged since `old` read it (header bytes and length), or the carried-over
+     * directory would name the wrong bytes. */
     if (::pread(fd_out_, &old_hdr_, sizeof old_hdr_, 0) != (ssize_t)sizeof old_hdr_ ||
         std::memcmp(&old_hdr_, &old.header(), sizeof old_hdr_) != 0 ||
         (int64_t)st.st_size != old.size()) {
@@ -686,7 +657,6 @@ int RadWriter::begin_append(const char* path, const RadFile& old) {
     spill_base_ = append_base_;
     if (fd_spill_ < 0) {
         RAD_ERR("%s: %s", path, std::strerror(errno));
-        if (fd_spill_ >= 0) ::close(fd_spill_);
         ::close(fd_out_);
         fd_out_ = fd_spill_ = -1;
         return RAD_E_IO;
@@ -698,8 +668,11 @@ int RadWriter::begin_append(const char* path, const RadFile& old) {
 
 int64_t RadWriter::add_existing(const Weight& w, const RadFile& old, const RadFileEntry& e) {
     if (!began_ || !append_) return RAD_E_STATE;
-    /* The bytes and the encoding are the old entry's; what the entry SAYS about where it came from
-     * and which unit it moves with is the caller's, as a fresh write would record it. */
+    if (w.name.empty() || names_.count(w.name)) {
+        RAD_ERR("'%s': the container already holds a weight of this name", w.name.c_str());
+        return RAD_E_INVAL;
+    }
+    /* Bytes and encoding are the old entry's; provenance and movement group are the caller's. */
     RadFileEntry n = e;
     n.name        = intern(w.name);
     n.quantizer   = intern(w.quantizer);
@@ -715,13 +688,13 @@ int64_t RadWriter::add_existing(const Weight& w, const RadFile& old, const RadFi
     }
     dir_.push_back(n);
     dir_abs_.push_back(1);
+    names_.insert(w.name);
     return (int64_t)dir_.size() - 1;
 }
 
 uint32_t RadWriter::intern_encoding(const RadEncoding& e) {
-    /* Zeroed before it is copied in, so the padding and the unused plane slots of a table row
-     * are zeros and two converts of one checkpoint compare equal byte for byte -- and compared
-     * in that form, so stray bytes in a caller's unused slots do not make a second row. */
+    /* Zero first so padding and unused plane slots are zeros: two converts of one checkpoint are
+     * byte-identical, and stray bytes in a caller's unused slots do not create a second row. */
     RadEncoding c;
     std::memset(&c, 0, sizeof c);
     std::memcpy(c.scheme, e.scheme, sizeof c.scheme);
@@ -766,9 +739,8 @@ void RadWriter::add_profile(int32_t layer, int32_t expert, float share) {
     prof_.push_back(p);
 }
 
-/* Movement-unit bookkeeping. A unit is one (layer, expert) pair for a routed expert -- its
- * gate/up/down are adjacent because the unit of transfer is an expert, not a tensor -- and one
- * weight for everything else. */
+/* Movement-unit bookkeeping. A unit is a (layer, expert) pair for a routed expert (its gate/up/down
+ * slots adjacent, since an expert is the unit of transfer) and one weight for everything else. */
 int RadWriter::check_unit_invariant(const Weight& w, uint64_t off, uint64_t bytes) {
     const bool new_unit = (w.layer != cur_layer_ || w.expert != cur_expert_);
     if (new_unit) { cur_layer_ = w.layer; cur_expert_ = w.expert; }
@@ -823,13 +795,16 @@ int RadWriter::check_unit_invariant(const Weight& w, uint64_t off, uint64_t byte
                 w.name.c_str(), w.layer, w.expert, w.slot, grp_slot_seen_ - 1);
         return RAD_E_INVAL;
     }
+    /* The reader addresses at most this many slots an expert (RadFile::ExpertGroup::slot_off). */
+    constexpr int32_t kMaxSlots = (int32_t)(sizeof RadFile::ExpertGroup{}.slot_off /
+                                            sizeof RadFile::ExpertGroup{}.slot_off[0]);
+    if (w.slot >= kMaxSlots) {
+        RAD_ERR("'%s': layer %d expert %d has more than %d slots, which the directory cannot "
+                "address", w.name.c_str(), w.layer, w.expert, kMaxSlots);
+        return RAD_E_INVAL;
+    }
 
-    /* Expert 0 defines the shape of a unit; every later expert must match it slot for slot. The
-     * offset arithmetic above cannot catch a size mismatch on its own: an oversized expert still
-     * lands at the right base, and only the NEXT one is displaced -- so an oversized LAST expert
-     * passes every offset check and leaves a container whose base + id*stride runs off the end of
-     * the group. Refusing here means the writer stops while the operator still has the checkpoint
-     * open and can fix the manifest. */
+    /* Every later expert must match expert 0 slot for slot (see grp_slot_bytes_ in radfile.h). */
     if (grp_n_expert_ == 1) {
         grp_slot_bytes_.push_back(bytes);
     } else if ((size_t)w.slot < grp_slot_bytes_.size() && grp_slot_bytes_[(size_t)w.slot] != bytes) {
@@ -847,6 +822,10 @@ int RadWriter::check_unit_invariant(const Weight& w, uint64_t off, uint64_t byte
 int64_t RadWriter::add_weight(const Weight& w) {
     if (!began_ || sealed_) return RAD_E_STATE;
     if (w.name.empty() || w.rank == 0 || w.rank > RAD_MAX_RANK) return RAD_E_INVAL;
+    if (names_.count(w.name)) {
+        RAD_ERR("'%s': the container already holds a weight of this name", w.name.c_str());
+        return RAD_E_INVAL;
+    }
     if (!rad_enc_valid(&w.enc)) {
         RAD_ERR("'%s': its encoding is not one the core can read", w.name.c_str());
         return RAD_E_INVAL;
@@ -864,10 +843,9 @@ int64_t RadWriter::add_weight(const Weight& w) {
         return RAD_E_INVAL;
     }
 
-    /* Every entry starts on a movement-unit boundary. That costs up to 4 KiB of padding per
-     * matrix -- tens of megabytes on a large MoE -- and buys a transfer that never straddles a
-     * page needlessly. Its planes follow at RAD_ALIGN_SUB, a cacheline on the architectures in
-     * scope: SoA, so a code plane stays dense and a scale plane is its own stream. */
+    /* Every entry starts on a movement-unit boundary (up to 4 KiB padding per matrix, tens of MB on
+     * a large MoE) so a transfer never straddles a page needlessly. Planes follow at RAD_ALIGN_SUB
+     * (a cacheline here), structure-of-arrays: codes stay dense and scales are their own stream. */
     int64_t rows = 0, cols = 0;
     rad_enc_view(w.rank, w.shape, &rows, &cols);
     const uint64_t off = (uint64_t)align_up(blob_bytes_, RAD_ALIGN_UNIT);
@@ -913,6 +891,7 @@ int64_t RadWriter::add_weight(const Weight& w) {
 
     dir_.push_back(e);
     dir_abs_.push_back(0);
+    names_.insert(w.name);
     return (int64_t)dir_.size() - 1;
 }
 
@@ -958,10 +937,9 @@ int RadWriter::write_plane(int64_t idx, int k, int64_t off, const void* data, in
     return RAD_OK;
 }
 
-/* EVERY RESERVED BYTE WAS WRITTEN. A plane left short is a hole of zeros the reader cannot tell
- * from codes -- a quantiser that returned early, a block loop with an off-by-one -- so the file is
- * refused here, naming the weight, rather than written. Counted, not tracked by range: writes that
- * overlapped would pass, and no producer here writes a byte twice. */
+/* Every reserved byte must have been written; a short plane would be zeros indistinguishable from
+ * codes. Counted, not range-tracked: overlapping writes would pass, but no producer writes a byte
+ * twice. */
 int RadWriter::check_complete() const {
     for (size_t i = 0; i < dir_.size(); ++i) {
         if (dir_abs_[i]) continue;
@@ -985,8 +963,7 @@ int RadWriter::set_vocab_section(const void* blob, int64_t bytes) {
                 (long long)bytes, sizeof(RadVocabHeader));
         return RAD_E_INVAL;
     }
-    /* Sanity, here rather than at open: the reader would refuse this file, and a converter that
-     * writes a file its own reader refuses has wasted an hour of somebody's time. */
+    /* Check now what the reader would refuse at open, before a long convert is wasted. */
     const RadVocabHeader* h = (const RadVocabHeader*)blob;
     auto fits = [&](uint64_t off, uint64_t n) {
         return n == 0 || (off <= (uint64_t)bytes && n <= (uint64_t)bytes - off);
@@ -1114,9 +1091,8 @@ int RadWriter::finish() {
     if (sealed_) h = hdr_;
     else layout(&h);
 
-    /* Blob-relative to absolute. Both tables were built with offsets into the spill file, which
-     * is exactly the blob, so one add each. data_off is 2 MiB-aligned and every entry was already
-     * 4 KiB-aligned inside the blob, so the alignments survive the shift. */
+    /* Blob-relative to absolute: one add each. data_off is 2 MiB-aligned and entries are 4 KiB-
+     * aligned within the blob, so alignment is preserved. */
     for (auto& e : dir_) e.offset += h.data_off;
     for (auto& p : planes_) p.offset += h.data_off;
     if (have_vocab_) {
@@ -1153,42 +1129,36 @@ int RadWriter::finish() {
         at = (int64_t)h.data_off;
     }
 
-    /* SEALED, THE BLOB IS ALREADY HERE: every plane went to its final offset. The length is set
-     * explicitly because the blob's tail may be alignment the planes never wrote. */
+    /* Sealed: every plane is already at its final offset. Set the length explicitly, since the
+     * blob's tail may be unwritten alignment. A failure of either leaves a file that is short or
+     * not durable, so it fails the write rather than report a container that is not there. */
     if (sealed_) {
-        if (::ftruncate(fd_out_, (off_t)h.file_bytes) != 0 || ::fsync(fd_out_) != 0)
+        if (::ftruncate(fd_out_, (off_t)h.file_bytes) != 0 || ::fsync(fd_out_) != 0) {
             RAD_ERR("%s: %s", path_.c_str(), std::strerror(errno));
+            abort();
+            return RAD_E_IO;
+        }
         ::close(fd_out_);   fd_out_ = -1;
         ::close(fd_spill_); fd_spill_ = -1;
         began_ = false;
         return RAD_OK;
     }
 
-    /* Splice the spill in. copy_file_range stays in the kernel and reflinks on a filesystem that
-     * can, which on btrfs/xfs makes a 1.5 GB blob nearly free; the read/write fallback is there
-     * because tmpfs and older kernels cannot. The spill is exactly the blob's length: every
-     * reserved byte was written, and the last of them is the last plane's last byte. */
+    /* Splice the spill in with copy_file_range (in-kernel, reflinked on btrfs/xfs), falling back
+     * to read/write where unsupported (tmpfs, older kernels). The spill is exactly the blob's
+     * length. */
     if (::lseek(fd_spill_, 0, SEEK_SET) < 0) {
         RAD_ERR("%s: %s", spill_path_.c_str(), std::strerror(errno)); abort(); return RAD_E_IO;
     }
-    /* ============================== THE SPILL IS FREED AS IT IS COPIED ==============================
-     *
-     * A naive splice needs TWICE THE CONTAINER free, because the spill stays whole until the copy
-     * finishes and is only then unlinked. At container sizes in the hundreds of gigabytes that is
-     * the difference between a convert that fits on the disk and one that runs for half an hour,
-     * writes every weight, and then dies on the splice with ENOSPC.
-     *
-     * Punching a hole in the spill behind the copy gives the blocks back to the filesystem
-     * IMMEDIATELY, so the peak is one container plus a grain rather than two containers. ext4,
-     * xfs and btrfs all support it; where it is not supported fallocate fails and the copy
-     * proceeds exactly as it would without this. It is not an optimisation of the copy -- the
-     * bytes still move -- it is a bound on peak disk use. */
+    /* The spill is freed as it is copied. Otherwise the splice needs twice the container's size
+     * free (hundreds of GB) until the spill is unlinked. Punching holes behind the copy (ext4, xfs,
+     * btrfs) returns blocks immediately, bounding peak disk use to one container plus a grain;
+     * where unsupported, fallocate fails and the copy proceeds unchanged. */
     int64_t left = blob_bytes_;
     int64_t done = 0, punched = 0;
     auto punch_behind = [&](bool final_grain) {
 #if defined(__linux__) && defined(FALLOC_FL_PUNCH_HOLE)
-        /* 256 MiB at a time: enough that the syscall is noise against the copy, small enough that
-         * the residual peak overhead is negligible beside the container itself. */
+        /* 256 MiB grains: the syscall is negligible against the copy, as is the residual peak. */
         const int64_t grain = 256ll << 20;
         const int64_t len = done - punched;
         if (len <= 0 || (!final_grain && len < grain)) return;
@@ -1201,8 +1171,8 @@ int RadWriter::finish() {
 
 #if defined(__linux__) && defined(SYS_copy_file_range)
     while (left > 0) {
-        /* AN EXPLICIT INPUT OFFSET, so the punch below knows where the copy has reached and the
-         * read() fallback can pick up from the same place. */
+        /* An explicit input offset, so the punch and the read() fallback know where the copy
+         * reached. */
         loff_t oi = (loff_t)done;
         ssize_t n = (ssize_t)syscall(SYS_copy_file_range, fd_spill_, &oi,
                                      fd_out_, (loff_t*)nullptr, (size_t)left, 0u);
@@ -1232,7 +1202,11 @@ int RadWriter::finish() {
     }
     punch_behind(true);
 
-    if (::fsync(fd_out_) != 0) { RAD_ERR("%s: fsync: %s", path_.c_str(), std::strerror(errno)); }
+    if (::fsync(fd_out_) != 0) {
+        RAD_ERR("%s: fsync: %s", path_.c_str(), std::strerror(errno));
+        abort();
+        return RAD_E_IO;
+    }
     ::close(fd_out_);   fd_out_ = -1;
     ::close(fd_spill_); fd_spill_ = -1;
     ::unlink(spill_path_.c_str());
@@ -1240,8 +1214,8 @@ int RadWriter::finish() {
     return RAD_OK;
 }
 
-/* The new weights are already past the old end (write_plane() put them there); what is left is the
- * tables and, last, the header. */
+/* The new weights are already past the old end (write_plane()); write the tables, then the
+ * header last. */
 int RadWriter::finish_append() {
     blob_bytes_ = align_up(blob_bytes_, RAD_ALIGN_UNIT);
     const int64_t blob_end = append_base_ + blob_bytes_;
@@ -1278,8 +1252,8 @@ int RadWriter::finish_append() {
     h.prof_off   = (uint64_t)place8((int64_t)(prof_.size() * sizeof(RadFileProfile)));
     h.prof_count = prof_.size();
 
-    /* The blob is the old one and the new weights after it: one span, still pool-aligned at its
-     * start, with the old tail's padding inside it. */
+    /* The blob spans the old blob and the new weights, still pool-aligned at its start, with the
+     * old tail's padding inside. */
     h.data_off   = old_data_off_;
     h.data_bytes = (uint64_t)(blob_end - (int64_t)old_data_off_);
     h.file_bytes = (uint64_t)off;
@@ -1311,12 +1285,12 @@ int RadWriter::finish_append() {
     if (have_vocab_) put(vocab_blob_.data(), (int64_t)vocab_blob_.size(), h.vocab_off);
     put(prof_.data(), (int64_t)(prof_.size() * sizeof(RadFileProfile)), h.prof_off);
     if (st >= 0 && ::ftruncate(fd_out_, (off_t)off) != 0) st = RAD_E_IO;
-    /* Everything the new header names is durable before the header names it. */
+    /* Make everything durable before the new header names it. */
     if (st >= 0 && ::fsync(fd_out_) != 0) st = RAD_E_IO;
     if (st < 0) { RAD_ERR("%s: %s", path_.c_str(), std::strerror(errno)); abort(); return st; }
 
-    /* The way back: the old header and the old length. The old tables are still where that
-     * header points, so writing it back and truncating restores the file byte for byte. */
+    /* The way back: the old header and length. The old tables are still where that header
+     * points, so restoring it and truncating recovers the file byte for byte. */
     {
         const std::string bak = path_ + ".pre-append";
         const std::string tmp = bak + ".tmp";

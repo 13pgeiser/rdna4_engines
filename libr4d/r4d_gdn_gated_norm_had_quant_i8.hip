@@ -1,22 +1,20 @@
-// r4d_gdn_gated_norm_had_quant_i8.hip - r4d_gdn_gated_norm_had_quant_i8: the GDN block's gated
-// RMS norm, the block Hadamard and the per-row int8 quantiser in one pass.  This is out_proj's
-// input on the 48 linear-attention layers -- the fourth and last rotated site in a W4A8 layer.
+// r4d_gdn_gated_norm_had_quant_i8.hip -- the GDN block's gated RMS norm, block Hadamard and
+// per-row int8 quantiser in one pass: out_proj's input on the 48 linear-attention layers (the
+// fourth rotated site in a W4A8 layer).
 //
 //     out = x * rsqrt(mean_head(x^2) + eps) * w * silu(z)
 //
-// TWO DIFFERENT EXTENTS IN ONE KERNEL, which is the whole reason it cannot reuse
-// r4d_gdn_gated_rmsnorm_h128_bf16.  The RMS is per HEAD (head_v_dim = 128), while the rotation and
-// the int8 scale are per TOKEN, over the flattened H*128 that out_proj consumes.  So the reduction
-// is segmented: a head is 128/VPL consecutive lanes, and an xor exchange with masks below that stays
-// inside one head by construction.
+// Two extents, which is why r4d_gdn_gated_rmsnorm_h128_bf16 cannot be reused: the RMS is per head
+// (head_v_dim = 128), while the rotation and int8 scale are per token over the flattened H*128.
+// The reduction is segmented: a head is 128/VPL consecutive lanes, and xor masks below that stay
+// inside one head.
 //
 //     HAD=128  VPL=4   32 lanes/head   one head per rotation block
 //     HAD=256  VPL=8   16 lanes/head   two heads per block
 //     HAD=512  VPL=16   8 lanes/head   four heads per block
 //
-// At width 128 the rotation lines up exactly with head boundaries and mixes only within a head;
-// wider widths mix across heads.  That is not in itself a reason to prefer one: on this layout the
-// activation error is 0.00679 at width 128 against 0.00521 at 512, so the trade is already priced.
+// At width 128 the rotation mixes only within a head; wider widths mix across heads. Activation
+// error is 0.00679 at width 128 vs 0.00521 at 512.
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_common.h"
@@ -25,11 +23,6 @@
 #include <cstdint>
 #include <cmath>
 
-// 0 = choose the workgroup width from M at launch (see r4d_act_threads in r4d_common.h); a
-// non-zero build-time value pins one width instead.
-#ifndef R4D_GNHQ_THREADS
-#define R4D_GNHQ_THREADS 0
-#endif
 #define R4D_GNHQ_HEAD    128
 
 template <int HAD, int THR>
@@ -44,12 +37,9 @@ __global__ __launch_bounds__(THR) void r4d_gdn_gated_norm_had_quant_i8_kernel(
   const int row = blockIdx.x;
   const __hip_bfloat16* x = X + (size_t)row * xrow;
   const __hip_bfloat16* z = Z + (size_t)row * zrow;
-  // zgrp != 0: Z is the INTERLEAVED qkvz projection rather than a compacted copy of the gate, so
-  // element i of the flattened row lives at (i / zblk) * zgrp + (i % zblk).  vLLM materialises that
-  // copy with `z_out[:] = z` inside _forward_core_rocm; a single-sequence decode step pays it 48
-  // times -- 94.5 us of kernel and as much again in launch gap -- for 65 KiB a layer this kernel
-  // can read where it already is.  `zblk` is a multiple of the rotation width, so a HAD-block never straddles
-  // a group boundary and the offset is constant across the block.
+  // zgrp != 0: Z is read in place from the interleaved qkvz projection (avoiding vLLM's
+  // `z_out[:] = z` copy per layer): element i is at (i / zblk) * zgrp + (i % zblk). zblk is a
+  // multiple of HAD, so a rotation block never straddles a group.
   const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
 
   float m = 0.f;
@@ -98,7 +88,7 @@ __global__ __launch_bounds__(THR) void r4d_gdn_gated_norm_had_quant_i8_kernel(
   }
 }
 
-// The launch, as the plugin ABI's RadLaunchFn. See the note at the head of r4d_quant_act_i8.hip.
+// The plugin ABI launch (RadLaunchFn); see the note at the head of r4d_quant_act_i8.hip.
 enum { GG_X = 0, GG_Z, GG_W, GG_Q, GG_S };
 
 extern "C" int r4d_rad_gdn_gated_norm_hq_i8(const RadArgs* args, RadStream stream) {
@@ -127,14 +117,13 @@ extern "C" int r4d_rad_gdn_gated_norm_hq_i8(const RadArgs* args, RadStream strea
   const long long zrow = r4d_row_pitch(z);
   if (xrow < 0 || zrow < 0) return R4D_NO(RAD_E_STRIDE);
 
-  // Z may be the INTERLEAVED qkvz projection rather than a compacted gate: element i of the
-  // flattened row lives at (i / zblk) * zgrp + (i % zblk). 0 means contiguous.
+  // Interleaved-gate layout (see the kernel); zgrp 0 means contiguous.
   const long long zgrp = r4d_geti_or(args, "zgrp", 0);
   const long long zblk = r4d_geti_or(args, "zblk", 0);
   if (zgrp && (zblk % had || zblk < had || zgrp < zblk)) return R4D_NO(RAD_E_INVAL);
 
   const float eps = (float)r4d_getf(args, "eps", 1e-6);
-  const int thr = R4D_GNHQ_THREADS ? R4D_GNHQ_THREADS : r4d_act_threads((int)M, (int)K);
+  const int thr = r4d_act_threads((int)M, (int)K);
   const size_t shmem = (size_t)K * sizeof(float) + (thr / 32) * sizeof(float);
   if (shmem > 65536) return R4D_NO(RAD_E_SCRATCH);
   const float rn = 1.f / sqrtf((float)had);
@@ -144,7 +133,6 @@ extern "C" int r4d_rad_gdn_gated_norm_hq_i8(const RadArgs* args, RadStream strea
     (const __hip_bfloat16*)r4d_p(z), (const float*)r4d_p(w), (signed char*)r4d_wp(q), \
     (float*)r4d_wp(sc), (int)K, xr, zr, (int)zgrp, (int)zblk, eps, rn)
 #define R4D_GNHQ_T(H) switch (thr) { \
-    case 128: R4D_GNHQ_LAUNCH(H, 128); break; \
     case 256: R4D_GNHQ_LAUNCH(H, 256); break; \
     case 512: R4D_GNHQ_LAUNCH(H, 512); break; \
     case 1024: R4D_GNHQ_LAUNCH(H, 1024); break; \
@@ -156,5 +144,5 @@ extern "C" int r4d_rad_gdn_gated_norm_hq_i8(const RadArgs* args, RadStream strea
   }
 #undef R4D_GNHQ_T
 #undef R4D_GNHQ_LAUNCH
-  return RAD_OK;
+  return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
 }

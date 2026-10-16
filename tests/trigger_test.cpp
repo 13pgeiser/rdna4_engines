@@ -1,15 +1,17 @@
 /* trigger_test.cpp -- the lazy grammar's trigger: the word scanner, and the grammar around it.
  *
- * The scanner is checked against the plain definition of what it computes -- after each piece,
- * search everything fed so far for every word and take the leftmost start -- over enough random
- * streams, with a small alphabet so that words overlap, prefix one another and repeat inside
- * themselves, that the failure-link construction is exercised rather than trusted. The grammar is
- * checked the same way one level up: a lazy grammar that has fired must be in exactly the state an
- * eager grammar reaches when it is handed the text from the word onward, which the two masks
- * show. The costs are checked as costs: waiting on a trigger has to be as cheap on the last token
- * of a long reply as on the first, because it runs on the scheduler thread for every one.
+ * The scanner is checked against its plain definition (after each piece, search everything fed
+ * so far for every word and take the leftmost start) over many random streams. A small alphabet
+ * makes words overlap, prefix one another and repeat inside themselves, so the failure-link
+ * construction is exercised. The grammar is checked the same way one level up: a lazy grammar
+ * that has fired must reach exactly the state (compared by mask) an eager grammar reaches when
+ * handed the text from the word onward. Waiting on a trigger runs on the scheduler thread for
+ * every token, so it must cost as much on the last token of a long reply as on the first; that is
+ * counted in work (tests/work_counter.h). Cases named perf_ hold wall-time floors for the serial
+ * performance tier.
  */
 #include "rad_test.h"
+#include "work_counter.h"
 
 #include "sample/gbnf.h"
 #include "sample/grammar.h"
@@ -163,29 +165,62 @@ TEST(scanner_agrees_with_the_definition_on_random_streams) {
     CHECK(matched > 5000);   /* the generator reaches matches, not only misses */
 }
 
-/* One table load a byte, at any length: the second half of a stream costs what the first did. */
-TEST(scanner_cost_is_linear_in_the_stream) {
+namespace {
+
+/* 8 MiB of pseudo-random printable text. */
+const std::string& scan_text() {
+    static const std::string t = [] {
+        std::mt19937 rng(7u);
+        std::string text(size_t(8) << 20, ' ');
+        for (char& c : text) c = (char)(' ' + (int)(rng() % 90));
+        return text;
+    }();
+    return t;
+}
+
+/* Scans the first `n` bytes of scan_text() in 4-byte pieces, as tokens arrive. */
+uint64_t scan_prefix(const WordScanner& sc, size_t n) {
+    const std::string& text = scan_text();
+    WordScanner::State st;
+    uint64_t sink = 0;
+    for (size_t i = 0; i + 4 <= n; i += 4) sink += sc.feed(st, text.data() + i, 4);
+    return sink;
+}
+
+}  /* namespace */
+
+/* One table load a byte, at any length: the whole stream is twice the work of its first half. */
+TEST(scanner_work_is_linear_in_the_stream) {
     const WordScanner sc = built({ "<tool_call>\n", "<function=" });
-    std::mt19937 rng(7u);
-    std::string text(size_t(32) << 20, ' ');
-    for (char& c : text) c = (char)(' ' + (int)(rng() % 90));
-    auto run = [&](size_t n) {
-        WordScanner::State st;
-        uint64_t sink = 0;
+    const size_t n = scan_text().size();
+    uint64_t sink = 0;
+    const uint64_t half = radtest::work().of([&] { sink += scan_prefix(sc, n / 2); });
+    const uint64_t full = radtest::work().of([&] { sink += scan_prefix(sc, n); });
+    CHECK(sink != 1);
+    std::printf("  scanner: full/half %.3f in %s\n", (double)full / (double)half,
+                radtest::work().unit());
+    CHECK((double)full / (double)half > 1.8);
+    CHECK((double)full / (double)half < 2.2);
+}
+
+/* The scan's throughput floor in wall time, best of three. 40 MB/s is 100 ns for a four-byte
+ * token. Not held under a sanitizer, which slows the loop by an order of magnitude. */
+TEST(perf_scanner_throughput_has_a_floor) {
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+    std::printf("  SKIP: the floor is for an unsanitised build\n");
+    return;
+#endif
+    const WordScanner sc = built({ "<tool_call>\n", "<function=" });
+    const size_t n = scan_text().size();
+    double best = 1e30;
+    for (int i = 0; i < 3; ++i) {
         const auto t0 = std::chrono::steady_clock::now();
-        for (size_t i = 0; i + 4 <= n; i += 4) sink += sc.feed(st, text.data() + i, 4);
-        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        CHECK(sink != 1);
-        return s;
-    };
-    /* Best of three, since ctest runs this beside other suites: the question is what the scan
-     * costs, not what the machine was doing. 40 MB/s is 100 ns for a four-byte token. */
-    auto best = [&](size_t n) { return std::min({ run(n), run(n), run(n) }); };
-    const double half = best(text.size() / 2), full = best(text.size());
-    const double mb_s = (double)text.size() / (1 << 20) / full;
-    std::printf("  scanner: %.0f MB/s in 4-byte pieces, full/half %.2f\n", mb_s, full / half);
+        CHECK(scan_prefix(sc, n) != 1);
+        best = std::min(best, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
+    const double mb_s = (double)n / (1 << 20) / best;
+    std::printf("  scanner: %.0f MB/s in 4-byte pieces\n", mb_s);
     CHECK(mb_s > 40.0);
-    CHECK(full / half < 2.6);
 }
 
 /* ================================================================== the lazy grammar */
@@ -306,11 +341,11 @@ TEST(lazy_grammar_rollback_forgets_a_partial_word) {
     CHECK(!g->awaiting_trigger());
 }
 
-/* THE GRAMMAR-LEVEL DIFFERENTIAL. Random prose from pieces that spell the word in several splits,
- * with speculative windows walked and rewound in between the way the sampler does, until the
- * word appears; from there tokens are drawn from the lazy grammar's own mask. At every position
- * after the trigger the lazy grammar must admit exactly what an eager grammar admits after being
- * handed the same text from the word onward. */
+/* Grammar-level differential. Random prose from pieces that spell the word in several splits,
+ * with speculative windows walked and rewound as the sampler does, until the word appears; then
+ * tokens are drawn from the lazy grammar's own mask. At every position after the trigger the
+ * lazy grammar must admit exactly what an eager grammar admits after the same text from the word
+ * onward. */
 TEST(lazy_grammar_agrees_with_an_eager_grammar_on_random_streams) {
     Vocab vb;
     std::mt19937 rng(424242u);
@@ -336,7 +371,7 @@ TEST(lazy_grammar_agrees_with_an_eager_grammar_on_random_streams) {
         REQUIRE(at != std::string::npos);
         auto eager = make(vb, false, {}, {});
         /* The token that completed the word may carry bytes past it that the grammar refuses
-         * ("<tool_call>" then "\n\n"): the lazy grammar must refuse exactly when the eager one
+         * ("<tool_call>" then "\n\n"); the lazy grammar must refuse exactly when the eager one
          * refuses the same text. */
         const int est = eager->accept_str(text.substr(at));
         CHECK_EQ(last < 0, est < 0);
@@ -361,27 +396,52 @@ TEST(lazy_grammar_agrees_with_an_eager_grammar_on_random_streams) {
     CHECK(fired - refused > 100);
 }
 
-/* WAITING COSTS THE SAME AT ANY LENGTH. A lazy grammar sees every token of the reply until its
- * word appears, and each speculative window copies its state twice; a reply of 200k tokens must
- * cost its last ten thousand what it cost its first. */
-TEST(lazy_grammar_waiting_cost_does_not_grow_with_the_reply) {
+namespace {
+
+/* `n` speculative windows over a waiting lazy grammar: push, three drafts, rewind, one token. */
+void wait_windows(GbnfGrammar& g, const Vocab& vb, int n) {
+    const int32_t w = vb.letters[22], sp = vb.prose[26];
+    for (int i = 0; i < n; ++i) {
+        g.push_state();
+        g.accept_token(w);
+        g.accept_token(sp);
+        g.accept_token(w);
+        g.rollback();
+        g.accept_token(i % 3 ? w : sp);
+    }
+}
+
+}  /* namespace */
+
+/* Waiting costs the same at any length. A lazy grammar sees every token of the reply until its
+ * word appears, and each speculative window copies its state twice; the last tokens of a long
+ * reply must cost what the first did. Counted in work, 20,000 windows at the start and again after
+ * 200,000 more. */
+TEST(lazy_grammar_waiting_work_does_not_grow_with_the_reply) {
     Vocab vb;
     auto g = make(vb, true, { "<tool_call>\n" }, {});
-    const int32_t w = vb.letters[22], sp = vb.prose[26];
+    const uint64_t first = radtest::work().of([&] { wait_windows(*g, vb, 20000); });
+    wait_windows(*g, vb, 200000);
+    const uint64_t last = radtest::work().of([&] { wait_windows(*g, vb, 20000); });
+    CHECK(g->awaiting_trigger());
+    std::printf("  lazy wait: %llu then %llu %s per 20k windows\n", (unsigned long long)first,
+                (unsigned long long)last, radtest::work().unit());
+    CHECK((double)last < (double)first * 1.25);
+}
+
+/* The wait's cost in wall time, for the serial performance tier: flat, and under 5 us a token. */
+TEST(perf_lazy_grammar_waiting_cost_has_a_ceiling) {
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+    std::printf("  SKIP: the ceiling is for an unsanitised build\n");
+    return;
+#endif
+    Vocab vb;
+    auto g = make(vb, true, { "<tool_call>\n" }, {});
     auto window = [&](int n) {
         const auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < n; ++i) {
-            g->push_state();
-            g->accept_token(w);
-            g->accept_token(sp);
-            g->accept_token(w);
-            g->rollback();
-            g->accept_token(i % 3 ? w : sp);
-        }
+        wait_windows(*g, vb, n);
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     };
-    /* Best of three windows at each end, since ctest runs this beside other suites and one
-     * preemption is longer than a window. */
     auto best = [&]() { return std::min({ window(20000), window(20000), window(20000) }); };
     const double first = best();
     window(200000);

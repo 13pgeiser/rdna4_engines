@@ -1,43 +1,29 @@
-/* avx_elementwise.cpp -- the elementwise vocabulary: add, mul, the activations, the gated product,
- * the row gather and scatter, cast, softmax and the per-row scale.
+/* avx_elementwise.cpp -- add, mul, activations, gated products, row gather/scatter, cast, softmax
+ * and per-row scaling.
  *
- * ============================== THESE ARE MEMORY-BOUND, NOT COMPUTE-BOUND ==============================
+ * These ops are memory-bound: a constant number of touches and a few flops per element.
  *
- * Every op in this file touches each element a constant number of times and does a handful of
- * flops with it, so the ceiling is the load/store units and then the cache hierarchy. That decides
- * the shape of the code twice over:
+ *   The dtype switch is per row. `in_row`/`out_row` (avx_support.cpp) convert a whole row once
+ *   (returning the operand's own pointer for f32), instead of libref's per-element ld_dt(), whose
+ *   branch blocks vectorisation.
  *
- *   THE DTYPE SWITCH IS HOISTED TO THE ROW. libref calls ld_dt() per element, which is a switch on
- *   every load and the reason it is slow -- it is not the scalar arithmetic, it is that no
- *   vectoriser can cross that branch. `in_row`/`out_row` (avx_support.cpp) convert a whole row
- *   once and hand back f32. For an f32 operand they hand back the caller's own pointer and copy
- *   nothing.
+ *   Fused forms round where libref rounds. E.g. `softmax` writes the unnormalised exponentials to
+ *   `y`, reads them back through the output dtype and multiplies by 1/sum, so a bf16 result has
+ *   two roundings; `rmsnorm_add` does the same with `residual_out`. Staying in f32 would be half an
+ *   ulp more accurate and disagree with the oracle and the device kernels. The round trip uses a
+ *   hot scratch buffer instead of the output operand.
  *
- *   THE FUSED FORMS ROUND EXACTLY WHERE libref ROUNDS. This is the part that is not a performance
- *   decision and cannot be traded: `softmax` writes the un-normalised exponentials to `y`, reads
- *   them BACK through the output dtype, and multiplies by 1/sum -- so at bf16 the answer carries
- *   two roundings and not one. `rmsnorm_add` does the same with `residual_out`. A faster
- *   implementation that kept f32 all the way through would be half an ulp BETTER and would
- *   disagree with the oracle and with every device kernel this is checked beside. The round trip
- *   is done in a hot scratch buffer rather than through the output operand, which is the same
- *   arithmetic at cache-resident cost.
- *
- * ============================== THE BROADCAST RULES ARE TWO DIFFERENT OPS ==============================
- *
- * `mul` broadcasts a single ROW down the rows -- a bias's shape. `scale_rows` broadcasts a single
- * COLUMN across them -- a per-token gate's. They are separate ops precisely so that neither has to
- * guess, and the guess would be ambiguous exactly when rows == n. libref's header makes the same
- * point; it is repeated here because the temptation to merge them is real and the failure is a
- * plausible number rather than an error.
+ * Broadcasting: `mul` broadcasts one row down the rows (a bias's shape); `scale_rows` broadcasts one
+ * column across them (a per-token gate). They are separate ops because the two readings are
+ * ambiguous when rows == n, and a wrong guess gives plausible numbers.
  */
 #include "avx_vec.h"
 #include "avx_common.h"
 
 using namespace avx;
 
-/* Round a row of f32 through an operand's storage dtype and back, which is what a fused op that
- * writes an intermediate and reads it again computes. A no-op for f32, which is why the f32
- * tolerance for these ops is as tight as it is. */
+/* Round a row through an operand's storage dtype and back, as an unfused store-and-reload would.
+ * A no-op for f32. */
 static inline void roundtrip(uint32_t dt, float* v, int64_t n, void* tmp) {
     if (dt == RAD_F32) return;
     row_from_f32(dt, v, tmp, n);
@@ -45,9 +31,8 @@ static inline void roundtrip(uint32_t dt, float* v, int64_t n, void* tmp) {
 }
 
 /* ------------------------------------------------------------------ add / mul */
-/* y = a op b over the output's extent. `b` may carry exactly one row and is then broadcast down
- * the rows; nothing else broadcasts, because silent broadcasting of an arbitrary shape is how a
- * shape bug becomes a plausible number. */
+/* y = a op b over the output's extent. A one-row `b` is broadcast down the rows; nothing else
+ * broadcasts, so a shape bug fails instead of producing plausible numbers. */
 template <bool MUL>
 static int elementwise2(const RadArgs* a) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
@@ -90,7 +75,7 @@ AVX_KERNEL(mul_weight) {
     if (rows <= 0 || numel(X) < rows * n) return RAD_E_SHAPE;
     const bool scalar = numel(W) == 1;
     if (!scalar && numel(W) != n) return RAD_E_SHAPE;
-    /* The gain, widened once: it is the same row for every row of x. */
+    /* Widened once; the same row applies to every row of x. */
     float* wrow = (float*)scratch_raw((size_t)n * sizeof(float) + 64);
     if (scalar) { const float v = ldt(W, 0); for (int64_t i = 0; i < n; ++i) wrow[i] = v; }
     else for (int64_t i = 0; i < n; ++i) wrow[i] = ldt(W, i * laststride(W));
@@ -110,26 +95,24 @@ AVX_KERNEL(mul_weight) {
 }
 
 /* ------------------------------------------------------------------ act_mul */
-/* y = act(a) * b over two operands, libref's contract: the activation is rounded to y's dtype
- * before the product, because the unfused pair stores it.
+/* y = act(a) * b. As in libref, the activation is rounded to y's dtype before the product,
+ * because the unfused pair stores it.
  *
- * silu and gelu_tanh are VECTORISED on vf_exp. An encoder's gated FFN puts this op on every token
- * of every layer, and the scalar libm form was 9% of an EmbeddingGemma 2 step on a 9950X3D -- a
- * per-element tanhf behind 2048 columns. gelu_tanh keeps the reference's own structure,
+ * silu and gelu_tanh are vectorised on vf_exp: in an encoder's gated FFN this op runs on every
+ * token of every layer, and scalar libm made it about 9% of an EmbeddingGemma 2 step. gelu_tanh
+ * keeps torch's structure,
  *
  *     0.5 g (1 + tanh z),   z = sqrt(2/pi) (g + 0.044715 g^3),   tanh z = (1 - e^(-2z)) / (1 + e^(-2z))
  *
- * and not the algebraically equal g / (1 + e^(-2z)): the two differ by an ulp or two of f32, and
- * after the bf16 rounding the rearranged form moved an EmbeddingGemma 2 embedding measurably
- * further from transformers' (cosine 0.999919 -> 0.999894 on one input; torch computes this same
- * 0.5 g (1 + tanh) in f32). vf_exp saturates rather than overflowing, so the large-|g| limits come
- * out as g and 0. erf has no vector form in this plugin, so gelu stays scalar. */
+ * rather than the algebraically equal g / (1 + e^(-2z)), which differs by an ulp or two and after
+ * bf16 rounding measurably moves embeddings away from transformers'. vf_exp saturates, so the
+ * large-|g| limits come out as g and 0. erf has no vector form here, so gelu stays scalar. */
 static inline float act_of(int act, float g) {
-    if (act == 0) return g / (1.0f + std::exp(-g));
-    if (act == 1) return 0.5f * g * (1.0f + std::erf(g * 0.70710678118654752f));
-    if (act == 3) return 1.0f / (1.0f + std::exp(-g));
+    if (act == 0) return g / (1.0f + sc_exp(-g));
+    if (act == 1) return 0.5f * g * (1.0f + sc_erf(g * 0.70710678118654752f));
+    if (act == 3) return 1.0f / (1.0f + sc_exp(-g));
     const float k0 = 0.7978845608028654f, k1 = 0.044715f;
-    return 0.5f * g * (1.0f + std::tanh(k0 * (g + k1 * g * g * g)));
+    return 0.5f * g * (1.0f + sc_tanh(k0 * (g + k1 * g * g * g)));
 }
 
 /* sy[0..n) = act(g[0..n)) for silu (0) and gelu_tanh (2); the tail is the scalar form. */
@@ -174,8 +157,8 @@ AVX_KERNEL(act_mul) {
         const float* g = in_row(A, rowoff(A, r, n), n, sa);
         const float* u = in_row(B, rowoff(B, r, n), n, sb);
         act_row(act, g, sy, n);
-        /* sa is free once the activation is taken (g is either sa or the tensor itself); sb may
-         * hold u, which the product still reads. */
+        /* sa is free once the activation is taken (g is sa or the tensor); sb may hold u, which
+         * is still needed. */
         roundtrip(Y->dtype, sy, n, sa);
         for (int64_t i = 0; i < n; ++i) sy[i] *= u[i];
         out_row(Y, rowoff(Y, r, n), n, sy);
@@ -184,8 +167,8 @@ AVX_KERNEL(act_mul) {
 }
 
 /* ------------------------------------------------------------------ relu / clamp */
-/* y = max(x, 0), and y = min(max(x, lo), hi) with lo and hi WEIGHTS of one element each (a
- * clipped linear's range). Row-wise at each operand's own pitch, like the libref forms. */
+/* y = max(x, 0), and y = min(max(x, lo), hi) with lo and hi one-element weights (a clipped
+ * linear's range). Row-wise at each operand's own pitch, as in libref. */
 AVX_KERNEL(relu) {
     if (!rad_args_have(a, 2)) return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *Y = &a->t[1];
@@ -231,15 +214,21 @@ AVX_KERNEL(clamp) {
 }
 
 /* ------------------------------------------------------------------ conv2d */
-/* libref's segment-wise convolution over (time, width), channels innermost. The weight is turned
- * once a launch from PyTorch's [cout, cin, kh, kw] into [kh][kw][cin][cout], so each input value is
- * broadcast against a contiguous run of output channels: the inner loop is a vector FMA over cout
- * rather than a dot product over cin. Same sum (in a different order), one rounding. */
+/* libref's segment-wise convolution over (time, width), channels innermost. The weight is
+ * transposed once per launch from PyTorch's [cout, cin, kh, kw] (or [cout, cin, kw, kh] with
+ * t_last) to [kh][kw][cin][cout], so the inner loop is a vector FMA over cout rather than a dot
+ * product over cin. Same sum in a different order plus the optional bias, one rounding; then
+ * `act` and a second rounding, as libref does. */
 AVX_KERNEL(conv2d) {
     if (!a || a->n_t < 5 || !a->t[0].data || !a->t[1].data || !a->t[2].data || !a->t[4].data)
         return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *Wt = &a->t[1], *cu = &a->t[2], *Y = &a->t[4];
     const RadTensor* V = a->t[3].data ? &a->t[3] : nullptr;
+    const RadTensor* B = a->n_t > 5 && a->t[5].data ? &a->t[5] : nullptr;
+    const bool tlast = p_int(a, "t_last", 0) != 0;
+    const char* act = p_str(a, "act", "none");
+    const bool gelu = !std::strcmp(act, "gelu");
+    if (!gelu && std::strcmp(act, "none")) return RAD_E_UNSUPPORTED;
     const int64_t W = p_int(a, "width", 0), cin = p_int(a, "cin", 0), cout = p_int(a, "cout", 0);
     const int64_t kh = p_int(a, "kh", 0), kw = p_int(a, "kw", 0);
     const int64_t st = p_int(a, "stride", 1), pad = p_int(a, "pad", 0);
@@ -249,19 +238,25 @@ AVX_KERNEL(conv2d) {
         return RAD_E_SHAPE;
     const int64_t Wo = (W + 2 * pad - kw) / st + 1;
     if (Wo <= 0 || numel(Wt) < cout * cin * kh * kw) return RAD_E_SHAPE;
+    if (B && numel(B) < cout) return RAD_E_SHAPE;
     const int64_t S = numel(cu) - 1;
     if (S <= 0) return RAD_E_SHAPE;
     const int64_t rin = W * cin, rout = Wo * cout;
     const int64_t Min = rows_of(X, rin), Mout = rows_of(Y, rout);
+    if (Min <= 0 || Mout <= 0 || ldi(cu, offlin(cu, S)) <= ldi(cu, offlin(cu, 0)))
+        return RAD_E_SHAPE;                         /* zero rows is not a call (docs/OPS.md) */
 
-    float* wt = (float*)scratch_raw((size_t)(kh * kw * cin * cout) * sizeof(float) + 64);
+    float* wt = (float*)scratch_raw((size_t)(kh * kw * cin * cout + cout) * sizeof(float) + 64);
+    float* bias = wt + kh * kw * cin * cout;
+    for (int64_t co = 0; co < cout; ++co) bias[co] = B ? ldt(B, offlin(B, co)) : 0.0f;
     const int64_t ws = laststride(Wt);
     for (int64_t co = 0; co < cout; ++co)
         for (int64_t ci = 0; ci < cin; ++ci)
             for (int64_t i = 0; i < kh; ++i)
                 for (int64_t j = 0; j < kw; ++j)
                     wt[((i * kw + j) * cin + ci) * cout + co] =
-                        ldt(Wt, (((co * cin + ci) * kh + i) * kw + j) * ws);
+                        ldt(Wt, (tlast ? ((co * cin + ci) * kw + j) * kh + i
+                                       : ((co * cin + ci) * kh + i) * kw + j) * ws);
 
     for (int64_t s = 0; s < S; ++s) {
         const int64_t c0 = ldi(cu, offlin(cu, s)), c1 = ldi(cu, offlin(cu, s + 1));
@@ -302,15 +297,82 @@ AVX_KERNEL(conv2d) {
                     }
                 }
             }
+            if (B)
+                for (int64_t wo = 0; wo < Wo; ++wo)
+                    for (int64_t co = 0; co < cout; ++co) acc[wo * cout + co] += bias[co];
             out_row(Y, rowoff(Y, o0 + to, rout), rout, acc);
+            if (gelu) {
+                /* The biased sum as y's dtype holds it, then the activation of the rounded value. */
+                const float* yr = in_row(Y, rowoff(Y, o0 + to, rout), rout, acc);
+                for (int64_t e = 0; e < rout; ++e) acc[e] = act_of(1, yr[e]);
+                out_row(Y, rowoff(Y, o0 + to, rout), rout, acc);
+            }
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ conv2d_unfold */
+/* libref's receptive fields as rows, a copy: each input row is widened once and the taps are
+ * gathered from it. */
+AVX_KERNEL(conv2d_unfold) {
+    if (!a || a->n_t < 4 || !a->t[0].data || !a->t[1].data || !a->t[3].data) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *cu = &a->t[1], *Y = &a->t[3];
+    const RadTensor* V = a->t[2].data ? &a->t[2] : nullptr;
+    const int64_t W = p_int(a, "width", 0), cin = p_int(a, "cin", 0);
+    const int64_t kh = p_int(a, "kh", 0), kw = p_int(a, "kw", 0);
+    const int64_t st = p_int(a, "stride", 1), pad = p_int(a, "pad", 0);
+    const int64_t cdiv = p_int(a, "cu_div", 1), vst = p_int(a, "valid_stride", 1);
+    const bool tlast = p_int(a, "t_last", 0) != 0;
+    if (W <= 0 || cin <= 0 || kh <= 0 || kw <= 0 || st <= 0 || pad < 0 || cdiv <= 0 || vst <= 0)
+        return RAD_E_SHAPE;
+    const int64_t Wo = (W + 2 * pad - kw) / st + 1, K = cin * kh * kw;
+    const int64_t S = numel(cu) - 1;
+    if (Wo <= 0 || S <= 0) return RAD_E_SHAPE;
+    const int64_t rin = W * cin, Min = rows_of(X, rin), Mout = rows_of(Y, K);
+    if (Min <= 0 || Mout <= 0 || ldi(cu, offlin(cu, S)) <= ldi(cu, offlin(cu, 0)))
+        return RAD_E_SHAPE;                         /* zero rows is not a call (docs/OPS.md) */
+
+    for (int64_t s = 0; s < S; ++s) {
+        const int64_t c0 = ldi(cu, offlin(cu, s)), c1 = ldi(cu, offlin(cu, s + 1));
+        if (c0 % cdiv || c1 % cdiv || (c0 / cdiv) % st || c1 < c0) return RAD_E_SHAPE;
+        const int64_t t0 = c0 / cdiv, T = c1 / cdiv - t0;
+        if (T <= 0) continue;
+        const int64_t To = (T + 2 * pad - kh) / st + 1, o0 = t0 / st;
+        if (To <= 0) continue;
+        if (t0 + T > Min || (o0 + To) * Wo > Mout) return RAD_E_SHAPE;
+        if (V && numel(V) < (t0 + T - 1) * vst + 1) return RAD_E_SHAPE;
+
+        AVX_PARALLEL_FOR_IF(To * Wo * K >= AVX_PAR_MIN)
+        for (int64_t to = 0; to < To; ++to) {
+            float* row = scratch_f32((size_t)K);
+            float* sx = scratch_f32_b((size_t)(kh * rin));
+            const float** xr = (const float**)scratch_raw((size_t)kh * sizeof(const float*));
+            for (int64_t i = 0; i < kh; ++i) {
+                const int64_t ti = to * st - pad + i, tg = t0 + ti;
+                const bool ok = ti >= 0 && ti < T && !(V && ldi(V, offlin(V, tg * vst)) == 0);
+                xr[i] = ok ? in_row(X, rowoff(X, tg, rin), rin, sx + i * rin) : nullptr;
+            }
+            for (int64_t wo = 0; wo < Wo; ++wo) {
+                for (int64_t i = 0; i < kh; ++i)
+                    for (int64_t j = 0; j < kw; ++j) {
+                        const int64_t wi = wo * st - pad + j;
+                        const float* xv = xr[i] && wi >= 0 && wi < W ? xr[i] + wi * cin : nullptr;
+                        for (int64_t ci = 0; ci < cin; ++ci) {
+                            const int64_t k = tlast ? (ci * kw + j) * kh + i : (ci * kh + i) * kw + j;
+                            row[k] = xv ? xv[ci] : 0.0f;
+                        }
+                    }
+                out_row(Y, rowoff(Y, (o0 + to) * Wo + wo, K), K, row);
+            }
         }
     }
     return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ conv1d_dw */
-/* libref's causal depthwise convolution over time, the weight turned to [k][C] once a launch so
- * a row is a vector FMA per tap. */
+/* libref's causal depthwise convolution over time. The weight is transposed to [k][C] once per
+ * launch so each tap is a vector FMA over the row. */
 AVX_KERNEL(conv1d_dw) {
     if (!rad_args_have(a, 4)) return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *Wt = &a->t[1], *cu = &a->t[2], *Y = &a->t[3];
@@ -319,6 +381,8 @@ AVX_KERNEL(conv1d_dw) {
     const int64_t S = numel(cu) - 1;
     if (S <= 0) return RAD_E_SHAPE;
     const int64_t Mx = rows_of(X, C), My = rows_of(Y, C);
+    if (Mx <= 0 || My <= 0 || ldi(cu, offlin(cu, S)) <= ldi(cu, offlin(cu, 0)))
+        return RAD_E_SHAPE;                         /* zero rows is not a call (docs/OPS.md) */
 
     float* wt = (float*)scratch_raw((size_t)(K * C) * sizeof(float) + 64);
     for (int64_t c = 0; c < C; ++c)
@@ -352,7 +416,7 @@ AVX_KERNEL(conv1d_dw) {
 }
 
 /* ------------------------------------------------------------------ rel_sinusoid */
-/* libref's table, to the operation: the same f32 steps and the same libm calls. */
+/* libref's table, with the same f32 steps and libm calls. */
 AVX_KERNEL(rel_sinusoid) {
     if (!rad_args_have(a, 1)) return RAD_E_INVAL;
     const RadTensor* Y = &a->t[0];
@@ -368,19 +432,53 @@ AVX_KERNEL(rel_sinusoid) {
     for (int64_t d = 0; d < rows; ++d) {
         float* sy = scratch_f32((size_t)n);
         for (int64_t i = 0; i < h; ++i) {
-            const float inv = std::exp((float)i * -inc);
+            const float inv = sc_exp((float)i * -inc);
             const float ang = (float)d * inv;
-            sy[i] = std::sin(ang);
-            sy[h + i] = std::cos(ang);
+            sy[i] = sc_sin(ang);
+            sy[h + i] = sc_cos(ang);
         }
         out_row(Y, rowoff(Y, d, n), n, sy);
     }
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ seg_sinusoid */
+/* libref's per-segment table, to the operation: position (r - start) mod period. */
+AVX_KERNEL(seg_sinusoid) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *cu = &a->t[0], *Y = &a->t[1];
+    const int64_t n = p_int(a, "n", 0), period = p_int(a, "period", 0), cdiv = p_int(a, "cu_div", 1);
+    if (n <= 0 || n % 2 || period <= 0 || cdiv <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(Y, n), S = numel(cu) - 1;
+    if (rows <= 0 || S <= 0 || ldi(cu, offlin(cu, S)) <= ldi(cu, offlin(cu, 0)))
+        return RAD_E_SHAPE;                         /* zero rows is not a call (docs/OPS.md) */
+    const int64_t h = n / 2;
+    const double mt = (double)p_f32(a, "max_timescale", 10000.0f);
+    const float inc = (float)(std::log(mt / 1.0) / (double)(h - 1 > 1 ? h - 1 : 1));
+
+    for (int64_t s = 0; s < S; ++s) {
+        const int64_t c0 = ldi(cu, offlin(cu, s)), c1 = ldi(cu, offlin(cu, s + 1));
+        if (c0 % cdiv || c1 % cdiv || c1 < c0 || c1 / cdiv > rows) return RAD_E_SHAPE;
+        const int64_t r0 = c0 / cdiv, r1 = c1 / cdiv;
+        AVX_PARALLEL_FOR_IF((r1 - r0) * n >= AVX_PAR_MIN)
+        for (int64_t r = r0; r < r1; ++r) {
+            float* sy = scratch_f32((size_t)n);
+            const int64_t p = (r - r0) % period;
+            for (int64_t i = 0; i < h; ++i) {
+                const float inv = sc_exp((float)i * -inc);
+                const float ang = (float)p * inv;
+                sy[i] = sc_sin(ang);
+                sy[h + i] = sc_cos(ang);
+            }
+            out_row(Y, rowoff(Y, r, n), n, sy);
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ seg_mean */
-/* One row a cu_seqlens segment: the mean of its rows, summed in double and rounded once, which is
- * libref's arithmetic -- a pooled embedding should not depend on which host kernel pooled it. */
+/* One output row per cu_seqlens segment: the mean of its rows, summed in double and rounded once,
+ * as in libref. */
 AVX_KERNEL(seg_mean) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *cu = &a->t[1], *Y = &a->t[2];
@@ -388,7 +486,7 @@ AVX_KERNEL(seg_mean) {
     const int64_t S = numel(cu) - 1;
     if (n <= 0 || S <= 0 || numel(Y) < S * n) return RAD_E_SHAPE;
     const int64_t total = ldi(cu, offlin(cu, S));
-    if (total < 0 || numel(X) < total * n) return RAD_E_SHAPE;
+    if (total <= 0 || numel(X) < total * n) return RAD_E_SHAPE;   /* zero rows is not a call */
 
     AVX_PARALLEL_FOR_IF(S >= 2)
     for (int64_t s = 0; s < S; ++s) {
@@ -409,8 +507,8 @@ AVX_KERNEL(seg_mean) {
 }
 
 /* ------------------------------------------------------------------ pool_rows */
-/* libref's: the mean of each k consecutive rows summed in f32 and rounded to y's dtype, then the
- * multiplier and a second rounding -- the unfused pair. Parallel over output rows. */
+/* As libref: the mean of each k consecutive rows, summed in f32 and rounded to y's dtype, then the
+ * multiplier and a second rounding (the unfused pair). Parallel over output rows. */
 AVX_KERNEL(pool_rows) {
     if (!rad_args_have(a, 2)) return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *Y = &a->t[1];
@@ -441,18 +539,17 @@ AVX_KERNEL(pool_rows) {
 }
 
 /* ------------------------------------------------------------------ scale_rows */
-/* y[m, i] = x[m, i] * act(s[m]), then + add[m, i] if the optional residual is passed.
+/* y[m, i] = x[m, i] * act(s[m]), plus add[m, i] when the optional residual is passed.
  *
- * The activation is applied to the SCALAR and not to the product, which is what a gate means --
- * Qwen3.5-MoE's shared expert is scaled by sigmoid(shared_expert_gate(x)).
+ * The activation applies to the per-row scalar, as a gate does (Qwen3.5-MoE scales its shared
+ * expert by sigmoid(shared_expert_gate(x))).
  *
- * THE RESIDUAL ADD IS A ROUND TRIP AND THAT IS THE CONTRACT. libref stores the product into `y`,
- * READS IT BACK, and stores the sum -- so at bf16 the product is narrowed before the add sees it.
- * That is not an artefact of writing it as two statements: it is what a fused kernel does, because
- * the product has to be stored anyway. Reproduced here in a hot buffer rather than through the
- * operand, which is the same arithmetic without the second pass over memory. */
+ * With a residual, the product is narrowed to y's dtype before the add, as libref (and a fused
+ * kernel) does by storing the product and reading it back. Done here in a scratch buffer. */
 AVX_KERNEL(scale_rows) {
-    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
+    /* `add` (operand 2) is optional; the other three are required. */
+    if (a->n_t < 4 || !rad_arg_in(a, 0) || !rad_arg_in(a, 1) || !rad_arg_in(a, 3))
+        return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *sc = &a->t[1], *y = &a->t[3];
     const RadTensor* ad = rad_arg_in(a, 2);
     const int64_t n = p_int(a, "n", numel(y));
@@ -469,10 +566,8 @@ AVX_KERNEL(scale_rows) {
     AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
     for (int64_t r = 0; r < rows; ++r) {
         const float v0 = ldt(sc, r * ss);
-        /* The SCALAR sigmoid, through the ABI's arithmetic and not the vector polynomial: one
-         * value per row, so there is nothing to vectorise, and going through the same expf the
-         * oracle does removes a source of disagreement for free. */
-        const float v = sig ? 1.0f / (1.0f + std::exp(-v0)) : v0;
+        /* One value per row, so use libm's expf as the oracle does, not the vector polynomial. */
+        const float v = sig ? 1.0f / (1.0f + sc_exp(-v0)) : v0;
         float* sx = scratch_f32((size_t)n);
         float* sy = scratch_f32_b((size_t)n);
         const float* xr = in_row(x, rowoff(x, r, n), n, sx);
@@ -496,16 +591,12 @@ AVX_KERNEL(scale_rows) {
 }
 
 /* ------------------------------------------------------------------ silu_mul */
-/* y[.., i] = silu(gate_up[.., i]) * gate_up[.., n + i]. The gate is the FIRST half, which is the
- * order rad-convert fuses gate and up into one weight in, so the two conventions cannot drift.
+/* y[.., i] = silu(gate_up[.., i]) * gate_up[.., n + i]. The gate is the first half, the order in
+ * which rad-convert fuses gate and up into one weight.
  *
- * THE bf16 OUTPUT TAKES A CHEAPER SILU, and that is a precision argument rather than a
- * punt: vf_silu's degree-5 minimax exp plus a full division is ~0.6 ulp, while a bf16 store
- * rounds at 3e-3 -- the output cannot carry what the exact path computes. The fast form is
- * vf_silu_fast (avx_vec.h -- shared with the conv kernels since, same rule: keyed on the
- * OUTPUT dtype, twentyfold inside the bf16 bucket), and f32 outputs keep the exact path.
- * Local to ops whose product is consumed once -- shared vf_sigmoid feeds gate chains whose
- * errors accumulate. */
+ * A bf16 output uses vf_silu_fast (avx_vec.h): the exact path's ~0.6 ulp is wasted on a store that
+ * rounds at 3e-3. f32 outputs keep the exact path. Only for ops whose product is consumed once;
+ * vf_sigmoid feeds gate chains whose errors accumulate. */
 
 AVX_KERNEL(silu_mul) {
     if (!rad_args_have(a, 2)) return RAD_E_INVAL;
@@ -517,23 +608,21 @@ AVX_KERNEL(silu_mul) {
 
     AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
     for (int64_t r = 0; r < rows; ++r) {
-        /* One in_row over the WHOLE 2n row rather than two over its halves: the two halves are
-         * adjacent in memory and one conversion of 2n beats two of n by the call overhead and by
-         * keeping the hardware prefetcher on a single stream. */
+        /* One in_row over the whole 2n row: the halves are adjacent, and one conversion saves a
+         * call and keeps the prefetcher on one stream. */
         float* s = scratch_f32((size_t)(2 * n));
         float* sy = scratch_f32_b((size_t)n);
         const float* g = in_row(gu, rowoff(gu, r, 2 * n), 2 * n, s);
         const float* u = g + n;
 #if AVX_LEVEL >= 2
-        /* The fast silu is a precision decision keyed on the OUTPUT dtype (see above): a bf16
-         * store cannot carry 6e-5, an f32 one is held at 1e-6. */
+        /* Keyed on the output dtype (see above). */
         if (y->dtype == RAD_BF16) {
             int64_t i = 0;
             for (; i + VF_N <= n; i += VF_N)
                 vf_storeu(sy + i, vf_mul(vf_silu_fast(vf_loadu(g + i)), vf_loadu(u + i)));
             for (; i < n; ++i) {
                 const float gi = g[i];
-                sy[i] = (gi / (1.0f + std::exp(-gi))) * u[i];
+                sy[i] = (gi / (1.0f + sc_exp(-gi))) * u[i];
             }
             out_row(y, rowoff(y, r, n), n, sy);
             continue;
@@ -544,7 +633,7 @@ AVX_KERNEL(silu_mul) {
             vf_storeu(sy + i, vf_mul(vf_silu(vf_loadu(g + i)), vf_loadu(u + i)));
         for (; i < n; ++i) {
             const float gi = g[i];
-            sy[i] = (gi / (1.0f + std::exp(-gi))) * u[i];
+            sy[i] = (gi / (1.0f + sc_exp(-gi))) * u[i];
         }
         out_row(y, rowoff(y, r, n), n, sy);
     }
@@ -553,11 +642,8 @@ AVX_KERNEL(silu_mul) {
 
 /* ------------------------------------------------------------------ gelu_mul
  *
- * y[i] = gelu_tanh(gate_up[i]) * gate_up[n + i], the gate the FIRST half exactly as in silu_mul.
- * The activation keeps libref's ONE definition of gelu_tanh (act_gelu_tanh, std::tanh): the tree's
- * rule for a non-polynomial activation is a single source of truth, so this runs libref's scalar
- * formula into the f32 scratch rather than a second vectorised tanh whose agreement with the first
- * would be a property of its coefficients -- the same decision the unary gelu above makes. */
+ * y[i] = gelu_tanh(gate_up[i]) * gate_up[n + i], gate first as in silu_mul. Uses libref's scalar
+ * gelu_tanh formula (act_gelu_tanh, std::tanh) rather than a second, vectorised definition. */
 AVX_KERNEL(gelu_mul) {
     if (!rad_args_have(a, 2)) return RAD_E_INVAL;
     const RadTensor *gu = &a->t[0], *y = &a->t[1];
@@ -568,15 +654,14 @@ AVX_KERNEL(gelu_mul) {
 
     AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
     for (int64_t r = 0; r < rows; ++r) {
-        /* One in_row over the whole 2n row, as silu_mul does: the halves are adjacent and one
-         * conversion of 2n beats two of n. */
+        /* One in_row over the whole 2n row, as in silu_mul. */
         float* s = scratch_f32((size_t)(2 * n));
         float* sy = scratch_f32_b((size_t)n);
         const float* g = in_row(gu, rowoff(gu, r, 2 * n), 2 * n, s);
         const float* u = g + n;
         for (int64_t i = 0; i < n; ++i) {
             const float x = g[i];
-            const float t = std::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x));
+            const float t = sc_tanh(0.7978845608028654f * (x + 0.044715f * x * x * x));
             sy[i] = 0.5f * x * (1.0f + t) * u[i];
         }
         out_row(y, rowoff(y, r, n), n, sy);
@@ -586,18 +671,12 @@ AVX_KERNEL(gelu_mul) {
 
 /* ------------------------------------------------------------------ gelu / silu / sigmoid
  *
- * These run over the whole tensor rather than row by row -- libref's `unary` does the same -- so
- * the blocking is over a fixed tile that stays in L1 rather than over a row whose length the op
- * does not know.
+ * These run over the whole tensor, as libref's `unary` does, in fixed L1-sized tiles (the op has
+ * no row length).
  *
- * GELU IS THE ONE OP HERE WITH A SCALAR INNER LOOP AND IT IS DELIBERATE. libref computes
- * 0.5*x*(1 + erf(x/sqrt2)) with libm's erff, and the kbench tolerance for a `*`/f32 op is 1e-5 --
- * which a minimax erf polynomial can meet, and which is not the point: the polynomial would put a
- * second definition of gelu in the tree whose agreement with the first is a property of the
- * coefficients. The dtype switch is still hoisted, so this is far from libref's speed even
- * scalar; if gelu ever appears on a hot path in a model this project serves, the polynomial is
- * the obvious next step and --bench gelu is where it would be justified. Qwen and Gemma are silu
- * throughout, so today it does not. */
+ * gelu stays scalar on purpose: libref uses libm's erff, and a minimax erf polynomial would be a
+ * second definition of gelu. The dtype switch is still hoisted. If gelu lands on a hot path, a
+ * polynomial is the next step (--bench gelu); Qwen and Gemma use silu. */
 enum { UN_GELU = 0, UN_SILU = 1, UN_SIGMOID = 2 };
 
 template <int WHICH>
@@ -607,17 +686,16 @@ static int unary(const RadArgs* a) {
     const int64_t nel = numel(y);
     if (nel <= 0 || numel(x) < nel) return RAD_E_SHAPE;
 
-    /* The strided case falls back to element-at-a-time, as libref does: `offlin` has to be
-     * evaluated per element there and no amount of vectorisation survives it. */
+    /* Strided: element at a time through `offlin`, as libref does. */
     if (!dense_row(x) || !dense_row(y) || !rad_tensor_is_contiguous(x) ||
         !rad_tensor_is_contiguous(y)) {
         AVX_PARALLEL_FOR_IF(nel >= AVX_PAR_MIN)
         for (int64_t i = 0; i < nel; ++i) {
             const float v = ldt(x, offlin(x, i));
             float o;
-            if (WHICH == UN_GELU)         o = 0.5f * v * (1.0f + std::erf(v * 0.70710678118654752f));
-            else if (WHICH == UN_SILU)    o = v / (1.0f + std::exp(-v));
-            else                          o = 1.0f / (1.0f + std::exp(-v));
+            if (WHICH == UN_GELU)         o = 0.5f * v * (1.0f + sc_erf(v * 0.70710678118654752f));
+            else if (WHICH == UN_SILU)    o = v / (1.0f + sc_exp(-v));
+            else                          o = 1.0f / (1.0f + sc_exp(-v));
             stt(y, offlin(y, i), o);
         }
         return RAD_OK;
@@ -641,9 +719,9 @@ static int unary(const RadArgs* a) {
         }
         for (; i < m; ++i) {
             const float u = v[i];
-            if (WHICH == UN_GELU)      so[i] = 0.5f * u * (1.0f + std::erf(u * 0.70710678118654752f));
-            else if (WHICH == UN_SILU) so[i] = u / (1.0f + std::exp(-u));
-            else                       so[i] = 1.0f / (1.0f + std::exp(-u));
+            if (WHICH == UN_GELU)      so[i] = 0.5f * u * (1.0f + sc_erf(u * 0.70710678118654752f));
+            else if (WHICH == UN_SILU) so[i] = u / (1.0f + sc_exp(-u));
+            else                       so[i] = 1.0f / (1.0f + sc_exp(-u));
         }
         out_row(y, off, m, so);
     }
@@ -655,8 +733,7 @@ AVX_KERNEL(silu)    { return unary<UN_SILU>(a); }
 AVX_KERNEL(sigmoid) { return unary<UN_SIGMOID>(a); }
 
 /* ------------------------------------------------------------------ fill */
-/* y = value over [M, n] at y's own row pitch, the value rounded once by the store. Nothing to
- * vectorise that the store does not already do: it is a write of one number. */
+/* y = value over [M, n] at y's own row pitch, rounded once by the store. */
 AVX_KERNEL(fill) {
     if (!rad_args_have(a, 1)) return RAD_E_INVAL;
     const RadTensor* y = &a->t[0];
@@ -674,11 +751,9 @@ AVX_KERNEL(fill) {
 }
 
 /* ------------------------------------------------------------------ logit_softcap */
-/* y = cap * tanh(x / cap). Its own list entry rather than another unary<WHICH>, because WHICH is
- * a compile-time choice and `cap` is a runtime parameter -- the template has nowhere to put it.
- * The vector path keeps the tree's one definition of the non-polynomial part: tanh(z) is
- * 2*sigmoid(2z) - 1, so the work is vf_sigmoid's existing minimax exp plus two multiplies. The
- * scalar fallback is libm's tanhf, which is what libref's oracle computes. */
+/* y = cap * tanh(x / cap). Not a unary<WHICH> because `cap` is a runtime parameter. The vector
+ * path uses tanh(z) = 2*sigmoid(2z) - 1 on vf_sigmoid; the scalar tail uses libm's tanhf, as
+ * libref does. */
 AVX_KERNEL(logit_softcap) {
     if (!rad_args_have(a, 2)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *y = &a->t[1];
@@ -692,7 +767,7 @@ AVX_KERNEL(logit_softcap) {
         AVX_PARALLEL_FOR_IF(nel >= AVX_PAR_MIN)
         for (int64_t i = 0; i < nel; ++i) {
             const float v = ldt(x, offlin(x, i));
-            stt(y, offlin(y, i), cap * std::tanh(v / cap));
+            stt(y, offlin(y, i), cap * sc_tanh(v / cap));
         }
         return RAD_OK;
     }
@@ -706,27 +781,22 @@ AVX_KERNEL(logit_softcap) {
         float* s  = scratch_f32((size_t)TILE);
         float* so = scratch_f32_b((size_t)TILE);
         const float* v = in_row(x, off, m, s);
-        const vf z = vf_set1(2.0f / cap);   /* x / cap, doubled: the argument of the sigmoid */
+        const vf z = vf_set1(2.0f / cap);   /* sigmoid argument: 2x / cap */
         const vf c2 = vf_set1(2.0f * cap);  /* 2*cap * sigmoid(...)      */
         const vf c1 = vf_set1(-cap);        /* ... - cap                 */
         int64_t i = 0;
         for (; i + VF_N <= m; i += VF_N)
             vf_storeu(so + i, vf_fma(c2, vf_sigmoid(vf_mul(vf_loadu(v + i), z)), c1));
         for (; i < m; ++i)
-            so[i] = cap * std::tanh(v[i] / cap);
+            so[i] = cap * sc_tanh(v[i] / cap);
         out_row(y, off, m, so);
     }
     return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ scale */
-/* y = x * s, s a [1] weight broadcast over every element. A plain multiply by a scalar: the
- * vector path is vf_mul against a broadcast, and the scalar fallback is a plain multiply. There is
- * no non-polynomial part, so nothing is reused from the sigmoid path; it is its own list entry
- * (rather than a `mul` with a [1] operand) for the same reason `mul` refuses a scalar broadcast --
- * a silent choice between a row-broadcast and a scalar-broadcast is how a shape bug becomes a
- * plausible number. The scalar is read once, outside the loop: a per-element reload of a [1]
- * tensor is the same value every time and costs a load per element. */
+/* y = x * s, with s a [1] weight broadcast over every element. A separate op rather than `mul`
+ * with a [1] operand, for the reason `mul` refuses a scalar broadcast (see the file header). */
 AVX_KERNEL(scale) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *s = &a->t[1], *y = &a->t[2];
@@ -763,10 +833,9 @@ AVX_KERNEL(scale) {
 }
 
 /* ------------------------------------------------------------------ gather_rows */
-/* y[i, :] = x[idx[i], :]. A negative index writes a ZERO ROW -- the padding rule embed_lookup
- * follows, and what a step with fewer sampled rows than the buffer's extent leaves behind. An
- * index at or past x's row count is RAD_E_INVAL and is checked BEFORE the loop, because an OpenMP
- * body cannot return. */
+/* y[i, :] = x[idx[i], :]. A negative index writes a zero row (embed_lookup's padding rule, used
+ * when a step has fewer rows than the buffer). An index >= x's row count is RAD_E_INVAL, checked
+ * before the loop because an OpenMP body cannot return. */
 AVX_KERNEL(gather_rows) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *idx = &a->t[1], *y = &a->t[2];
@@ -779,10 +848,10 @@ AVX_KERNEL(gather_rows) {
     for (int64_t m = 0; m < M; ++m)
         if (ldi(idx, offlin(idx, m)) >= src_rows) return RAD_E_INVAL;
 
-    /* A ROW COPY, NOT A CONVERSION, when the dtypes match -- which they always do for a gather.
-     * memcpy on a whole row beats a widen/narrow round trip by the width of the dtype, and a
-     * gather that changed the bits of what it moved would be a cast wearing a gather's name. */
-    const bool same = x->dtype == y->dtype && dense_row(x) && dense_row(y);
+    /* Matching whole-byte dtypes (the normal case) copy rows bytewise, which is faster than a
+     * widen/narrow round trip and cannot change the bits. A sub-byte row can start mid-byte. */
+    const bool same = x->dtype == y->dtype && dense_row(x) && dense_row(y) &&
+                      rad_dtype_bits(x->dtype) % 8 == 0;
     const size_t rowb = same ? (size_t)((rad_dtype_bits(x->dtype) * n) / 8) : 0;
 
     AVX_PARALLEL_FOR_IF(M * n >= AVX_PAR_MIN)
@@ -807,10 +876,9 @@ AVX_KERNEL(gather_rows) {
 }
 
 /* ------------------------------------------------------------------ scatter_rows */
-/* x[idx[i], :] = v[i, :], the mirror of gather_rows. `x` is INOUT and the write is PARTIAL: a row
- * no index names keeps what it held, and a NEGATIVE index writes nothing, as a negative one reads
- * a zero row on the gather side. Indices are distinct by contract (RAD_OPD_F_IDX_UNIQUE), which is
- * what lets the rows go to the threads in any order. */
+/* x[idx[i], :] = v[i, :], the mirror of gather_rows. `x` is INOUT and partially written: rows no
+ * index names keep their contents, and a negative index writes nothing. Indices are distinct by
+ * contract (RAD_OPD_F_IDX_UNIQUE), so rows can be written by threads in any order. */
 AVX_KERNEL(scatter_rows) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const RadTensor *v = &a->t[0], *idx = &a->t[1], *x = &a->t[2];
@@ -823,8 +891,9 @@ AVX_KERNEL(scatter_rows) {
     for (int64_t m = 0; m < M; ++m)
         if (ldi(idx, offlin(idx, m)) >= dst_rows) return RAD_E_INVAL;
 
-    /* A row copy when the dtypes match, for gather_rows' reason. */
-    const bool same = v->dtype == x->dtype && dense_row(v) && dense_row(x);
+    /* Bytewise row copy when the dtypes match, as in gather_rows. */
+    const bool same = v->dtype == x->dtype && dense_row(v) && dense_row(x) &&
+                      rad_dtype_bits(x->dtype) % 8 == 0;
     const size_t rowb = same ? (size_t)((rad_dtype_bits(x->dtype) * n) / 8) : 0;
 
     AVX_PARALLEL_FOR_IF(M * n >= AVX_PAR_MIN)
@@ -844,13 +913,11 @@ AVX_KERNEL(scatter_rows) {
 }
 
 /* ------------------------------------------------------------------ cast */
-/* The tensors carry their own dtypes and those are what the bytes actually are; `from`/`to` are in
- * the schema because the SELECTOR needs them, and a disagreement between the parameter and the
- * tensor is a caller bug this cannot diagnose better than the caller can. libref says the same.
+/* Reads the tensors' own dtypes. `from`/`to` exist in the schema for the selector; a mismatch with
+ * the tensors is a caller bug (as in libref).
  *
- * Integer pairs go through the INTEGER path, so a token id or a block index above 2^24 survives a
- * cast that f32 would round. That is not a tolerance question -- it is the difference between a
- * token id and a different token id. */
+ * Integer-to-integer casts take an integer path, so token ids and block indices above 2^24 are not
+ * rounded through f32. */
 AVX_KERNEL(cast) {
     if (!rad_args_have(a, 2)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *y = &a->t[1];
@@ -884,14 +951,11 @@ AVX_KERNEL(cast) {
 }
 
 /* ------------------------------------------------------------------ softmax */
-/* Max-subtracted, f32, over the last n elements of a row. The max subtraction is not an
- * optimisation: without it a 60-nat logit range overflows, and every kernel this is checked beside
- * does it, so doing it differently would be a difference larger than rounding.
+/* Max-subtracted softmax in f32 over the last n elements of a row. The max subtraction is needed
+ * (a 60-nat logit range overflows) and every kernel this is checked against does it.
  *
- * THE ROUND TRIP IS THE CONTRACT. libref writes the exponentials to `y`, reads them back, and
- * multiplies by 1/sum -- so a bf16 output carries two roundings. This does the same arithmetic in
- * a hot scratch buffer instead of through the output operand: identical result, one pass over
- * memory instead of three. */
+ * As in libref, the exponentials are rounded through y's dtype before the 1/sum multiply, so a
+ * bf16 output has two roundings; done here in a scratch buffer instead of through `y`. */
 AVX_KERNEL(softmax) {
     if (!rad_args_have(a, 2)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *y = &a->t[1];
@@ -918,7 +982,7 @@ AVX_KERNEL(softmax) {
             acc = vf_add(acc, t);
         }
         float sum = vf_hsum(acc);
-        for (; i < n; ++i) { e[i] = std::exp(v[i] - mx); sum += e[i]; }
+        for (; i < n; ++i) { e[i] = sc_exp(v[i] - mx); sum += e[i]; }
 
         roundtrip(y->dtype, e, n, tp);
         const vf inv = vf_set1(1.0f / sum);

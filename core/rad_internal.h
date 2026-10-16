@@ -1,5 +1,5 @@
-/* rad_internal.h -- shared by everything under core/, tools/ and tests/. NOT installed and NOT
- * visible to plugins: plugins see abi/ and nothing else. C++20 is fine here.
+/* rad_internal.h -- shared by everything under core/, tools/ and tests/. Not installed and not
+ * visible to plugins, which see only abi/. C++20 is fine here.
  */
 #pragma once
 #include "rad_abi.h"
@@ -25,20 +25,14 @@ void log_set_level(Log l);
 Log  log_level();
 void log_emit(Log l, const char* file, int line, const char* fmt, ...)
      __attribute__((format(printf, 4, 5)));
-/* When the last line was written (rad_mono_ns), whatever its level: what StallWatch reads as
- * progress. 0 before the first. */
+/* rad_mono_ns of the last line written at any level; StallWatch reads it as progress. 0 before
+ * the first. */
 uint64_t log_last_line_ns();
 
-/* WHICH RANK IS SPEAKING.
- *
- * Every per-rank component -- the pools, the planner, the mover, the sampler -- prints the same
- * sentence once per rank, so with nothing to distinguish them a tp2 startup prints each of those
- * lines twice with no way to tell which card it is about. The tag is a SCOPE rather than
- * an argument because the components doing the printing are three layers down, and a rank
- * threaded through every log call is a rank that will be missing from the next one.
- *
- * Off unless log_rank_tags(true) is called: at tp 1 there is nothing to disambiguate, and every
- * tool that is not the engine has one rank by construction. */
+/* Rank tags on log lines. Per-rank components (pools, planner, mover, sampler) print the same
+ * line once per rank, so under TP each line needs its rank. LogRank sets the tag as a scope
+ * because the printers are several layers down, where threading a rank argument through every
+ * call is error-prone. Off unless log_rank_tags(true): at tp 1, and in tools, there is one rank. */
 void log_rank_tags(bool on);
 
 class LogRank {
@@ -61,8 +55,8 @@ private:
 #define RAD_DEBUG(...) RAD_LOG(Debug, __VA_ARGS__)
 #define RAD_TRACE(...) RAD_LOG(Trace, __VA_ARGS__)
 
-/* The same with the level as a VALUE rather than an enumerator name, for the sites where whether
- * something is a warning depends on what was found. */
+/* RAD_LOG with the level as a runtime value, for sites where the level depends on what was
+ * found. */
 #define RAD_LOG_AT(lvl, ...)                                                     \
     do { ::rad::Log _l = (lvl);                                                  \
          if ((int)_l <= (int)::rad::log_level())                                 \
@@ -85,16 +79,20 @@ inline int64_t align_up(int64_t v, int64_t a) { return (v + a - 1) / a * a; }
 /* Human-readable byte counts, for every report that prints a size. */
 std::string humanb(int64_t bytes);
 
-/* ONE MONOTONIC CLOCK, so that everything reasoning about elapsed time is reasoning about the
- * same elapsed time. The idle-session tiers write a timestamp when an entry is used and read
- * one when deciding what has gone cold; those two calls live in different translation units,
- * and two clocks there would make the thresholds mean nothing in particular. Monotonic and
- * not wall time: a tier that demoted an hour of sessions because NTP stepped the clock would
- * be correct by its own arithmetic and wrong by any other measure. */
+/* The one monotonic clock for all elapsed-time logic. The idle-session tiers stamp an entry on
+ * use and compare against the stamp in another translation unit, so both sides must use the same
+ * clock. Monotonic so an NTP step cannot age entries. */
 uint64_t rad_mono_ns();
 
-/* Split on whitespace -- what RAD_C_IN's set is encoded as. */
+/* Split on spaces, tabs and commas: the encoding of RAD_C_IN's set. */
 std::vector<std::string_view> split_ws(std::string_view s);
+
+/* The strings joined with `sep` between them. */
+inline std::string join(const std::vector<std::string>& v, const char* sep = ", ") {
+    std::string s;
+    for (size_t i = 0; i < v.size(); ++i) { if (i) s += sep; s += v[i]; }
+    return s;
+}
 
 /* ------------------------------------------------------------------ geometry */
 /* A resolved parameter set: the geometry after ranges are collapsed to a band's upper bound.
@@ -103,18 +101,14 @@ class Geometry {
 public:
     Geometry() = default;
 
-    /* THE RadParam VIEW IS KEPT CURRENT BY EVERY WRITE, never built on first read. It holds char*
-     * into this object's own strings, and a view rebuilt lazily from a const reader is a write
-     * that two readers can make at once: the sizing declares of one rank all read the real
-     * program's geometries side by side (Engine::probe_arena_levels), and one clearing the view
-     * while another filled it is the heap corruption that crashed startup. So params() writes
-     * nothing, and a Geometry nobody is writing can be read from any number of threads.
+    /* Every write keeps the RadParam view current; it is never built lazily on read. A lazy
+     * rebuild from a const reader is a write, and concurrent readers exist (the sizing declares
+     * in Engine::probe_arena_levels read the same geometries in parallel). So params() writes
+     * nothing, and an unwritten Geometry is safe to read from any number of threads.
      *
-     * A copy takes the storage and builds its own view, because the source's points into the
-     * source. A move takes the view along with the storage: the vectors hand over their arrays,
-     * so every string stays where it was and every pointer stays good. The moved-from object is
-     * emptied, view included, so it is a valid empty geometry rather than one whose view names
-     * strings it no longer owns. */
+     * The view holds char* into this object's strings. A copy rebuilds its own view. A move
+     * takes the view too, since the vectors hand over their arrays and the pointers stay valid;
+     * the source is cleared, view included, leaving a valid empty geometry. */
     Geometry(const Geometry& o)
         : keys_(o.keys_), svals_(o.svals_), ivals_(o.ivals_), dvals_(o.dvals_), kinds_(o.kinds_) {
         rebuild();
@@ -149,9 +143,8 @@ public:
 
     void set_i(std::string_view k, long long v);
     void set_s(std::string_view k, std::string_view v);
-    /* eps, rope theta, an attention scale. Carried so they reach RadArgs.p, and NOT matched on:
-     * constraint_holds() never sees a float, because a tolerance is not a predicate and a kernel
-     * that discriminates on eps to that precision has a bug. */
+    /* Floats (eps, rope theta, an attention scale) reach RadArgs.p but are never matched on; see
+     * constraint_holds(). */
     void set_f(std::string_view k, double v);
     bool get_i(std::string_view k, long long* out) const;
     bool get_f(std::string_view k, double* out) const;
@@ -167,6 +160,7 @@ public:
 private:
     std::vector<std::string> keys_, svals_;
     std::vector<RadParam>    view_;
+    size_t slot(std::string_view k, int kind);   /* find or append k, set its kind */
     void rebuild();
     void clear() noexcept {
         keys_.clear(); svals_.clear(); view_.clear(); ivals_.clear(); dvals_.clear();
@@ -177,13 +171,11 @@ private:
     std::vector<int>         kinds_;
 };
 
-/* Does this geometry satisfy this constraint? The one place the matching rule lives.
- *
- * A float parameter can never satisfy one: get_i and get_s both miss a RAD_P_F64 slot, so a
- * constraint naming a float key does not hold, which is the correct answer. A tolerance is not a
- * predicate, and a kernel that discriminates on eps to that precision has a bug. */
+/* Whether the geometry satisfies the constraint; the one place the matching rule lives. A
+ * constraint on a float key never holds (get_i and get_s miss RAD_P_F64 slots): a tolerance is
+ * not a predicate, and a kernel that discriminates on eps that precisely has a bug. */
 bool constraint_holds(const RadConstraint& c, const Geometry& g);
-/* Why not -- for the selection table's miss column (spec §16). */
+/* Why not, for the selection table's miss column (spec §16). */
 std::string constraint_why(const RadConstraint& c, const Geometry& g);
 
 }  /* namespace rad */

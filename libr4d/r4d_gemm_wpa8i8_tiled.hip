@@ -1,37 +1,35 @@
-// r4d_gemm_wpa8i8_tiled.hip - r4d_gemm_w4a8i8_tiled / r4d_gemm_w5a8i8_tiled: the 4- and 5-bit ASYMMETRIC
-// weight x int8 activation GEMM for PREFILL row counts, gfx1201.  C[M,N] = A[M,K] @ dequant(Wq)[N,K]^T with
+// r4d_gemm_wpa8i8_tiled.hip - r4d_gemm_w4a8i8_tiled / r4d_gemm_w5a8i8_tiled: the 4- and 5-bit asymmetric
+// weight x int8 activation GEMM for prefill row counts, gfx1201.  C[M,N] = A[M,K] @ dequant(Wq)[N,K]^T with
 //
 //     dequant(Wq)[n][k] = scale[n][k/128] * (code[n][k] - zero[n][k/128]),   code in 0..15 or 0..31
 //
-// -- ParoQuant's int4 (z-lab) and int5 once the activation has been rotated (givens_dense_quant) -- in
-// 16x16x16 int8 WMMA, which issues at the fp8 instruction's rate.  The f16 skinny kernel these weights
-// also serve (r4d_gemm_w5a16_nt_m64) is capped by the f16 matrix instruction at about 75 TF/s; this is the
-// tall-tile form with no such ceiling, built on r4d_gemm_mxfp4a8_tiled.hip's arrangement:
+// (ParoQuant's int4 (z-lab) and int5, after the activation is rotated by givens_dense_quant) in
+// 16x16x16 int8 WMMA, which issues at the fp8 rate. The f16 skinny kernel for these weights
+// (r4d_gemm_w5a16_nt_m64) is capped by the f16 matrix instruction at about 75 TF/s. Arrangement as in
+// r4d_gemm_mxfp4a8_tiled.hip:
 //
 //   * a 256 x 64 tile (4 x 2 waves, 4 x 2 fragments each); the activation is re-tiled by
 //     r4d_mxfp4a8_tile_a into fragment order (one 16 x 16 fragment = 256 bytes) in the op's scratch and
 //     read straight into registers; the weight slab is staged through LDS;
-//   * a slab is one scale group (128 of K = 8 WMMA steps): the int32 accumulators start at zero each slab and
-//     are folded into the running float total as slab * (a_scale[row][g] * w_scale[col][g]), because the
-//     weight's f16 scale varies by column and so cannot ride inside the matrix instruction;
+//   * a slab is one scale group (128 of K = 8 WMMA steps): the int32 accumulators restart each slab and
+//     are folded into the float total as slab * (a_scale[row][g] * w_scale[col][g]), since the weight
+//     scale varies by column;
 //   * a partitioned weight (pb1/pb2) is one launch per part over windows of the planes.
 //
-// WHY INT8 AND NOT FP8.  (code - zero) is -15..15 (int4) or -31..31 (int5); both are exact in an int8,
-// so the weight needs no conversion at all -- the staging is a byte-wise subtract -- whereas e4m3's three
-// mantissa bits stop at 16 and int5 would need two matrix issues a step.  The activation is quantised to
-// int8 with one scale a (row, 128 of K): after the rotation a group is flat, so 127 uniform levels of its
-// maximum are finer than e4m3's relative 2^-4 for nearly every element (measured: ppl equal to the f16
-// path's, slightly better than the fp8 band's).  The accumulators are int32 and exact: a slab is 128
+// Why int8, not fp8: (code - zero) is -15..15 (int4) or -31..31 (int5), exact in int8, so staging is a
+// byte-wise subtract; e4m3's three mantissa bits stop at 16. The activation is int8 with one scale per
+// (row, 128 of K): after rotation a group is flat, so 127 uniform levels beat e4m3's relative 2^-4 for
+// nearly every element (perplexity equals the f16 path's). Accumulators are exact int32: a slab is 128
 // products of at most 31 * 127.
 //
-// STAGING.  A code byte c (0..31) minus the zero z (0..31): (c | 0x80) - z is 128 + (c - z), never below
-// 97 and never carrying into the next byte, and XOR 0x80 turns it into the two's complement byte of
-// (c - z).  Three ALU ops a dword of four weights.
+// Staging: for a code byte c (0..31) and zero z (0..31), (c | 0x80) - z = 128 + (c - z) never drops
+// below 97 or borrows across bytes, and XOR 0x80 gives the two's complement byte of (c - z). Three ALU
+// ops per dword of four weights.
 //
-// THE WEIGHT BLOB is r4d_gemm_w5a16_nt_m64's (BITS 5): the nibble plane (w4's fragment order), then the
-// fifth bits, one dword a (n-tile, 64 of K, lane): byte s = k step s of the block, bit e = element e.  For
-// BITS 4 it is the nibble plane alone.  The scale operand is the f16 kernel's dword plane
-// [N/16][K/128][16]: the f16 scale in the low half, -(1024 + zero) in the high.
+// Weight blob as r4d_gemm_w5a16_nt_m64's (BITS 5): the nibble plane (w4's fragment order), then the
+// fifth bits, one dword per (n-tile, 64 of K, lane): byte s = k step s, bit e = element e. BITS 4 is the
+// nibble plane alone. The scale operand is the f16 kernel's dword plane [N/16][K/128][16]: f16 scale
+// low, -(1024 + zero) high.
 #include "r4d.h"
 #include "r4d_gemm_args.h"
 #include "r4d_common.h"
@@ -73,9 +71,8 @@ __global__ __launch_bounds__(R4D_WPT_NTHR) void r4d_gemm_wpa8i8_tiled_kernel(
   constexpr int TM = R4D_WPT_TM, TN = R4D_WPT_TN, WN = R4D_WPT_WN, NTHR = R4D_WPT_NTHR, BMF = R4D_WPT_BMF;
   constexpr int LBK = R4D_WPT_LBK, NS = LBK / 16, STR = LBK + R4D_WPT_PAD, BNF = WN * TN * 16;
   constexpr int NTILES_T = BNF / 16, TOT_SLOTS = NTILES_T * NS * 32;
-  // A thread stages one lane's 16 bytes of a 64-wide k block -- four k steps of one weight row, which
-  // is how the fragment-order plane is laid out (dword (t, kb, lane, s)) -- so a slab of two blocks
-  // over the block's tiles is TOT_SLOTS / 4 reads.
+  // A thread stages one lane's 16 bytes of a 64-wide k block (four k steps of one weight row, as the
+  // plane is laid out: dword (t, kb, lane, s)), so a slab of two blocks is TOT_SLOTS / 4 reads.
   constexpr int NW = TOT_SLOTS / 4 / NTHR;
   static_assert(NW * NTHR * 4 == TOT_SLOTS, "the W tile must split evenly over the block");
   __shared__ unsigned char sW[BNF * STR];
@@ -239,9 +236,8 @@ static void wpa8i8_launch(long at, long ascale, long wq, long whi, long wsz, lon
 }
 
 // ============================================================== the plugin ABI entry points
-// The row-major int8 activation is re-tiled into the op's scratch (one slab, the parts in turn), then the GEMM
-// reads it from there -- mxfp4a8_tiled's arrangement exactly, including a partitioned weight as
-// one launch per part over windows of the planes.
+// The row-major int8 activation is re-tiled into the op's scratch (one part at a time) and the GEMM
+// reads it there, as in mxfp4a8_tiled, including one launch per part of a partitioned weight.
 template <int BITS>
 static int wpa8i8_dispatch(const RadArgs* a, RadStream s) {
     GemmOps g;

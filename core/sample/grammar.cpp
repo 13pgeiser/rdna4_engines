@@ -1,4 +1,4 @@
-/* grammar.cpp -- the GBNF backend that ships, and the schema seam onto it.
+/* grammar.cpp -- the GBNF grammar backend and the JSON Schema entry point onto it.
  */
 #include "grammar.h"
 #include "gbnf.h"
@@ -7,23 +7,20 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <exception>
 #include <new>
-#include <stdexcept>
 
 namespace rad {
 
 int64_t grammar_mask_words(int64_t n_vocab) { return bitmask_words(n_vocab); }
 
-/* HOW DEEPLY A SCHEMA MAY NEST, in objects and arrays. The converter recurses once per level and
- * names each rule after its whole path, so its output grows with the square of the depth: a
- * 72 KB schema 3,000 levels deep compiles to 67 MB of grammar, and deeper ones exhaust the
- * memory or the stack of the thread that admits the request. A schema nested as deep as this one
- * allows converts in tens of milliseconds to a couple of megabytes, and a schema written to
- * describe data nests far less. */
+/* Maximum schema nesting, in objects and arrays. The converter recurses once per level and names
+ * each rule after its full path, so output grows with the square of the depth (a 72 KB schema
+ * 3,000 levels deep gives 67 MB of grammar) and deeper ones exhaust the admitting thread's memory
+ * or stack. At this depth a schema converts in tens of milliseconds to a couple of megabytes. */
 static constexpr size_t kMaxSchemaDepth = 512;
 
-/* Walked with an explicit stack, because the values it exists to catch are the ones too deep to
- * recurse over. */
+/* Iterative, because the values it must catch are too deep to recurse over. */
 static size_t json_depth(const nlohmann::ordered_json& root) {
     std::vector<std::pair<const nlohmann::ordered_json*, size_t>> todo{ { &root, 1 } };
     size_t deepest = 0;
@@ -37,26 +34,16 @@ static size_t json_depth(const nlohmann::ordered_json& root) {
     return deepest;
 }
 
-/* ONE JSON-SCHEMA COMPILER, AND IT IS THE VENDORED ONE.
- *
- * `response_format` on /v1/chat/completions goes to the chat template, which compiles it with the
- * vendored converter; on /v1/completions it is refused by the accept-list (kAcceptedCompletion)
- * before parse_output_format runs, and that is the only path to this seam. A second, separately
- * maintained copy of the same upstream compiler would therefore be the copy no request reaches,
- * while the vendored one serves every schema. The hardening that belongs on a schema compiler
- * fed client data -- vendor/patches 0003 and 0004, which close a hang and two out-of-bounds
- * reads and refuse three constructs upstream accepts and then gets wrong -- lives in the
- * vendored copy, which is the copy that runs.
- *
- * This function is the seam response_format would go through if /v1/completions accepted it.
- * No request reaches it.
- *
- * The vendored entry point throws; errors are values by the time a caller sees them. */
+/* Uses the vendored converter, the only JSON Schema compiler in the tree; its hardening for
+ * client data is in vendor/patches 0003 and 0004. Client schemas reach it from /v1/completions
+ * (`json_schema`, `response_format`) through the server's grammar bridge; on
+ * /v1/chat/completions the chat template compiles them instead. The converter throws; errors
+ * are returned as statuses. */
 int grammar_from_json_schema(const std::string& schema_json, const std::string& root,
                              std::string* out_gbnf, std::string* err) {
     if (!out_gbnf) return RAD_E_INVAL;
-    /* The converter names its top rule "root" and takes no say in it. Every caller in the tree
-     * asks for "root"; anything else would silently get that instead, so it is refused. */
+    /* The converter always names its top rule "root"; any other name is refused rather than
+     * silently ignored. */
     if (!root.empty() && root != "root") {
         if (err) *err = "this converter always names the top rule 'root'";
         return RAD_E_UNSUPPORTED;
@@ -88,16 +75,14 @@ class GbnfBackend : public GrammarBackend {
 public:
     explicit GbnfBackend(std::unique_ptr<GbnfGrammar> g) : g_(std::move(g)) {}
 
-    const char* name() const override { return "gbnf"; }
     int  accept_token(int32_t token) override { return g_->accept_token(token); }
     int  fill_mask(uint32_t* m, int64_t n) const override { return g_->fill_mask(m, n); }
     bool complete() const override { return g_->complete(); }
     bool constrains() const override { return !g_->awaiting_trigger(); }
     uint64_t masks_walked() const override { return g_->masks_walked(); }
 
-    /* The GBNF machine's state is a stack set and a carried UTF-8 partial, both copyable, so a
-     * rewind is a copy back -- there is nothing to reconstruct and no cost that scales with how
-     * far the window went. */
+    /* The state is a stack set and a carried UTF-8 partial, both copyable, so a rewind is a copy
+     * whose cost does not depend on how far the window went. */
     bool can_speculate() const override { return true; }
     int  push_state() override { g_->push_state(); return RAD_OK; }
     int  rollback() override   { return g_->rollback(); }
@@ -110,9 +95,7 @@ int gbnf_ctor(const GrammarSpec& spec, const VocabView& vocab,
               std::unique_ptr<GrammarBackend>* out, std::string* err) {
     std::string text = spec.text;
 
-    /* A JSON Schema is compiled to GBNF here rather than being a second backend, because it is
-     * not a different state machine -- it is the same one fed different text. Carrying it as a
-     * backend would mean two places that can disagree about what a schema admits. */
+    /* A JSON Schema is compiled to GBNF and run on the same machine, not a second backend. */
     if (spec.kind == GrammarKind::JsonSchema) {
         std::string gbnf;
         const int st = grammar_from_json_schema(spec.text, spec.root, &gbnf, err);
@@ -129,9 +112,8 @@ int gbnf_ctor(const GrammarSpec& spec, const VocabView& vocab,
     if (!spec.prefix.empty()) {
         const int ps = g->accept_str(spec.prefix);
         if (ps < 0) {
-            /* The grammar does not admit the prompt it was supposed to have been generating.
-             * Constraining from here would mask against a state that does not describe this
-             * request, so it is refused rather than run in the wrong place. */
+            /* The grammar rejects the generation prompt; masking from here would use a state
+             * that does not describe this request, so refuse. */
             if (err) *err = "the grammar does not admit this template's generation prompt, so it "
                             "cannot be positioned at the start of the reply";
             return ps;
@@ -152,9 +134,8 @@ int grammar_create(const GrammarSpec& spec, const VocabView& vocab,
         return RAD_E_INVAL;
     }
 
-    /* The compiler below turns its own failures into statuses; what is left is running out of
-     * memory on the way, and this is called on the admission thread and the scheduler thread,
-     * where an escaping exception ends every request on the server rather than this one. */
+    /* The compiler returns its own failures as statuses; only bad_alloc can escape. This runs on
+     * the admission and scheduler threads, where an escaping exception would end every request. */
     try {
         return gbnf_ctor(spec, vocab, out, err);
     } catch (const std::bad_alloc&) {

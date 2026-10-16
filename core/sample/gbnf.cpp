@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <new>
@@ -138,14 +137,10 @@ PartialUtf8 decode_utf8(const std::string& src, PartialUtf8 partial_start,
 
 /* ================================================================== the per-vocabulary cache
  *
- * EVERYTHING GBNF DERIVES FROM A VOCABULARY, IN ONE OBJECT WHOSE LIFETIME IS THE VOCABULARY'S.
- * The vocabulary index (gbnf_mask.cpp) and the programs compiled against it are kept on the
- * VocabView itself rather than in a process-global table keyed on its POINTER. A pointer is not
- * an identity: a view destroyed and another constructed in the same storage answers to the same
- * key, and the second one is served the first one's work -- a mask over a vocabulary it is not
- * sampling from, which admits the wrong token set or none at all with nothing anywhere reporting
- * it. Hanging it off the view makes that unaskable, and it makes the program cap mean thirty-two
- * schemas PER VOCABULARY rather than thirty-two shared between every vocabulary a process holds.
+ * Everything GBNF derives from a vocabulary (the vocabulary index and the programs compiled
+ * against it) lives on the VocabView itself, with the vocabulary's lifetime. A global table keyed
+ * on the view's pointer would serve a stale index or program to a new view allocated at the same
+ * address, silently admitting the wrong token set. It also makes the program cap per vocabulary.
  */
 struct GbnfProgram;
 
@@ -154,13 +149,10 @@ struct VocabGbnf {
     std::shared_ptr<const gbnf::VocabIndex> index;
     double index_ms = 0.0;
 
-    /* One program per (text, root). The cache PINS the most recently used ones -- capped, because
-     * the key comes from client requests and a caller sending a thousand distinct schemas must
-     * not be able to grow it without bound -- and REMEMBERS every other one that is still alive.
-     * A program is kept alive by every request compiled against it (SamplingParams holds it from
-     * admission on), so a request is always served the program it was admitted with, however
-     * many other grammars were compiled in between, and the scheduler thread never recompiles
-     * one. */
+    /* One program per (text, root). The cache pins the most recently used ones (capped, since
+     * keys come from clients) and remembers every other one still alive. Each request holds its
+     * program from admission on (SamplingParams), so it always runs the program it was admitted
+     * with and the scheduler thread never recompiles. */
     struct Cached {
         std::shared_ptr<const GbnfProgram> pinned;
         std::weak_ptr<const GbnfProgram>   alive;
@@ -170,10 +162,8 @@ struct VocabGbnf {
     uint64_t clock = 0;
 };
 
-/* Created on first use under one process-wide lock; read under the cache's own. Two locks rather
- * than one because the outer one is taken once per grammar and the inner one is taken for the
- * duration of a vocabulary index build, which on a quarter-million-piece vocabulary is not
- * brief. */
+/* Created on first use under a process-wide lock; contents are guarded by the cache's own lock,
+ * which is held for a whole vocabulary index build (slow on a quarter-million-piece vocabulary). */
 static VocabGbnf& gbnf_cache_for(const VocabView* v) {
     static std::mutex m;
     std::lock_guard<std::mutex> lk(m);
@@ -211,6 +201,20 @@ int gbnf_prepare_vocab(const VocabView* vocab, GbnfVocabInfo* info) {
 
 /* ================================================================== lexing helpers */
 
+/* Where a parse error is, for its message: the rest of the line, at most 40 bytes. Not the rest
+ * of the grammar, which can be megabytes for a generated one. The cut backs up to a character
+ * boundary: the message reaches a JSON error body, whose encoder refuses broken UTF-8. */
+static std::string where(const char* p) {
+    size_t n = 0;
+    while (p[n] && p[n] != '\n' && p[n] != '\r' && n < 40) ++n;
+    const bool cut = p[n] && p[n] != '\n' && p[n] != '\r';
+    if (cut)
+        while (n > 0 && ((unsigned char)p[n] & 0xC0u) == 0x80u) --n;
+    std::string s(p, n);
+    if (cut) s += "...";
+    return s;
+}
+
 static bool is_digit_char(char c) { return '0' <= c && c <= '9'; }
 static bool is_word_char(char c) {
     return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') || c == '-' || is_digit_char(c);
@@ -229,7 +233,7 @@ static std::pair<uint32_t, const char*> parse_hex(const char* src, int size) {
         else break;
     }
     if (pos != end)
-        throw std::runtime_error("expecting " + std::to_string(size) + " hex chars at " + src);
+        throw std::runtime_error("expecting " + std::to_string(size) + " hex chars at " + where(src));
     return { value, pos };
 }
 
@@ -246,20 +250,20 @@ static const char* parse_space(const char* src, bool newline_ok) {
 static const char* parse_name(const char* src) {
     const char* pos = src;
     while (is_word_char(*pos)) pos++;
-    if (pos == src) throw std::runtime_error(std::string("expecting name at ") + src);
+    if (pos == src) throw std::runtime_error(std::string("expecting name at ") + where(src));
     return pos;
 }
 
 static const char* parse_int(const char* src) {
     const char* pos = src;
     while (is_digit_char(*pos)) pos++;
-    if (pos == src) throw std::runtime_error(std::string("expecting integer at ") + src);
+    if (pos == src) throw std::runtime_error(std::string("expecting integer at ") + where(src));
     return pos;
 }
 
-/* The repetition count written in [src, end), which parse_int has checked is digits. A count past
- * 2^64 - 2 is refused here; any smaller one is the compile budget's to judge, by what it expands
- * to (handle_repetitions). UINT64_MAX itself is reserved for "no maximum". */
+/* The repetition count in [src, end), already checked to be digits. A count past 2^64 - 2 is
+ * refused here (UINT64_MAX means "no maximum"); smaller ones are judged by the compile budget in
+ * handle_repetitions. */
 static uint64_t parse_count(const char* src, const char* end) {
     uint64_t v = 0;
     for (const char* p = src; p < end; ++p)
@@ -282,7 +286,7 @@ static std::pair<uint32_t, const char*> parse_char(const char* src) {
             case '\\': case '"': case '[': case ']':
                 return { (uint32_t)(uint8_t)src[1], src + 2 };
             default:
-                throw std::runtime_error(std::string("unknown escape at ") + src);
+                throw std::runtime_error(std::string("unknown escape at ") + where(src));
         }
     } else if (*src) {
         return decode_utf8(src);
@@ -291,10 +295,10 @@ static std::pair<uint32_t, const char*> parse_char(const char* src) {
 }
 
 /* `<[id]>` is a literal token id; `<text>` resolves through the vocabulary and must tokenise to
- * exactly one token, because a rule element is one terminal. */
+ * exactly one token, since a rule element is one terminal. */
 static std::pair<uint32_t, const char*> parse_token(const VocabView* vocab, const char* src) {
     const char* pos = src;
-    if (*pos != '<') throw std::runtime_error(std::string("expecting '<' at ") + pos);
+    if (*pos != '<') throw std::runtime_error(std::string("expecting '<' at ") + where(pos));
     pos++;
 
     if (*pos == '[') {
@@ -302,17 +306,17 @@ static std::pair<uint32_t, const char*> parse_token(const VocabView* vocab, cons
         const char* int_end = parse_int(pos);
         const uint32_t id = (uint32_t)std::stoul(std::string(pos, (size_t)(int_end - pos)));
         pos = int_end;
-        if (*pos != ']') throw std::runtime_error(std::string("expecting ']' at ") + pos);
+        if (*pos != ']') throw std::runtime_error(std::string("expecting ']' at ") + where(pos));
         pos++;
-        if (*pos != '>') throw std::runtime_error(std::string("expecting '>' at ") + pos);
+        if (*pos != '>') throw std::runtime_error(std::string("expecting '>' at ") + where(pos));
         pos++;
         return { id, pos };
     }
 
-    if (!vocab) throw std::runtime_error(std::string("no vocabulary to parse token at ") + src);
+    if (!vocab) throw std::runtime_error(std::string("no vocabulary to parse token at ") + where(src));
 
     while (*pos != 0 && *pos != '>') pos++;
-    if (*pos != '>') throw std::runtime_error(std::string("expecting '>' at ") + pos);
+    if (*pos != '>') throw std::runtime_error(std::string("expecting '>' at ") + where(pos));
     pos++;
 
     std::vector<int32_t> toks;
@@ -324,11 +328,11 @@ static std::pair<uint32_t, const char*> parse_token(const VocabView* vocab, cons
 
 /* ================================================================== the parser */
 
-/* What a symbol costs beyond its name: the map node that holds it and the rule slot it owns. */
+/* Bytes a symbol costs beyond its name: its map node and its rule slot. */
 static constexpr uint64_t kSymbolOverhead = 64 + sizeof(GbnfRule);
 
-/* Saturating: `bytes` may be a count from the grammar text times a size, and a sum that wrapped
- * would pass. budget_used_ never exceeds the budget, so the comparison cannot overflow. */
+/* Written as a subtraction so a huge `bytes` (a client count times a size) cannot wrap the sum;
+ * budget_used_ never exceeds the budget, so the subtraction cannot underflow. */
 void GbnfParser::charge(uint64_t bytes) {
     if (bytes > kMaxCompileBytes - budget_used_)
         throw std::runtime_error("the grammar expands past " +
@@ -344,8 +348,8 @@ uint32_t GbnfParser::get_symbol_id(const char* src, size_t len) {
     return r.first->second;
 }
 
-/* A generated name repeats its base, so a long rule name times many generated rules is an
- * amplification the text does not pay for; it is charged like any other. */
+/* A generated name repeats its base, so many generated rules under a long name amplify the text;
+ * charged accordingly. */
 uint32_t GbnfParser::generate_symbol_id(const std::string& base) {
     charge(base.size() + 12 + kSymbolOverhead);
     const uint32_t next_id = (uint32_t)symbol_ids_.size();
@@ -377,26 +381,23 @@ const char* GbnfParser::parse_sequence(const char* src, const std::string& rule_
     size_t last_sym_start = rule.size();
     const char* pos = src;
 
-    /* S{m,n} is rewritten into rules rather than counted at match time, which is what keeps the
-     * state machine a pushdown automaton with no counters in it:
+    /* S{m,n} is rewritten into rules rather than counted at match time, so the machine stays a
+     * pushdown automaton without counters:
      *   S{m,n} -> S S ... (m times) S'(n-m),  S'(x) ::= S S'(x-1) |
      *   S{m,}  -> S S ... (m times) S',       S'    ::= S S' |
      *   S*     -> S{0,}     S+ -> S{1,}       S? -> S{0,1}
      *
-     * WHAT BOUNDS THE EXPANSION IS ITS SIZE, charged to the compile budget before any of it is
-     * made, and not a count of repetitions. Upstream refuses any count past 2000, and a JSON
-     * schema's `maxLength: 8000` -- an ordinary bound on a tool's free-text argument -- failed
-     * every request carrying the tool. The expansion is linear in the count: each optional link
-     * is a rule of a few elements and a generated name, and nothing after the parse is worse than
-     * linear in the rules (find_left_recursion, and the mask plan, which gives every link past
-     * the longest token one class). So `[^"]{0,8000}` costs about a megabyte and compiles to the
-     * plan `[^"]{0,1999}` does, and a count the budget cannot hold is refused naming its rule. */
+     * The expansion is bounded by its size, charged to the compile budget before it is built, not
+     * by a repetition count (upstream's cap of 2000 rejects ordinary schemas such as
+     * `maxLength: 8000`). It is linear in the count, and nothing after the parse is worse than
+     * linear in the rules; the mask plan gives every link past the longest token one class. So
+     * `[^"]{0,8000}` costs about a megabyte and yields the same plan as `[^"]{0,1999}`. */
     auto handle_repetitions = [&](uint64_t min_times, uint64_t max_times) {
         const bool no_max = max_times == UINT64_MAX;
         if (last_sym_start == rule.size())
-            throw std::runtime_error(std::string("expecting preceding item to */+/?/{ at ") + pos);
+            throw std::runtime_error(std::string("expecting preceding item to */+/?/{ at ") + where(pos));
 
-        /* `n_opt` below is max - min, which a reversed range would wrap to about 1.8e19 rules. */
+        /* `n_opt` below is max - min, which a reversed range would wrap to ~1.8e19 rules. */
         if (!no_max && max_times < min_times)
             throw std::runtime_error("repetition {" + std::to_string(min_times) + "," +
                                      std::to_string(max_times) + "} has its minimum above its "
@@ -404,14 +405,12 @@ const char* GbnfParser::parse_sequence(const char* src, const std::string& rule_
 
         const GbnfRule prev_rule(rule.begin() + (std::ptrdiff_t)last_sym_start, rule.end());
 
-        /* A refusal names the repetition: the count is what a client wrote. */
+        /* A refusal names the repetition the client wrote. */
         try {
-            /* The copies about to be made: the operand once per required count beyond the
-             * first, and once more in each optional rule with its reference, ALT and END. The
-             * counts are the grammar's own, up to 2^64 - 2, so the arithmetic saturates where it
-             * would wrap: a count past the budget is refused here, before the loops below start.
-             * Each generated rule's name and slot are charged again as it is made
-             * (generate_symbol_id). */
+            /* Charge the copies up front: the operand once per required count beyond the first,
+             * and once per optional rule plus its reference, ALT and END. Counts reach 2^64 - 2,
+             * so overflow saturates and is refused before the loops run. Each generated rule's
+             * name and slot are charged again in generate_symbol_id. */
             {
                 const uint64_t w      = prev_rule.size();
                 const uint64_t n_rest = no_max ? 1 : max_times - min_times;
@@ -506,7 +505,7 @@ const char* GbnfParser::parse_sequence(const char* src, const std::string& rule_
             --depth_;
             last_sym_start = rule.size();
             rule.push_back({ GRE_RULE_REF, sub_rule_id });
-            if (*pos != ')') throw std::runtime_error(std::string("expecting ')' at ") + pos);
+            if (*pos != ')') throw std::runtime_error(std::string("expecting ')' at ") + where(pos));
             pos = parse_space(pos + 1, is_nested);
         } else if (*pos == '.') {                            /* any char */
             last_sym_start = rule.size();
@@ -524,7 +523,7 @@ const char* GbnfParser::parse_sequence(const char* src, const std::string& rule_
         } else if (*pos == '{') {
             pos = parse_space(pos + 1, is_nested);
             if (!is_digit_char(*pos))
-                throw std::runtime_error(std::string("expecting an int at ") + pos);
+                throw std::runtime_error(std::string("expecting an int at ") + where(pos));
             const char* int_end = parse_int(pos);
             const uint64_t min_times = parse_count(pos, int_end);
             pos = parse_space(int_end, is_nested);
@@ -540,10 +539,10 @@ const char* GbnfParser::parse_sequence(const char* src, const std::string& rule_
                     max_times = parse_count(pos, e);
                     pos = parse_space(e, is_nested);
                 }
-                if (*pos != '}') throw std::runtime_error(std::string("expecting '}' at ") + pos);
+                if (*pos != '}') throw std::runtime_error(std::string("expecting '}' at ") + where(pos));
                 pos = parse_space(pos + 1, is_nested);
             } else {
-                throw std::runtime_error(std::string("expecting ',' at ") + pos);
+                throw std::runtime_error(std::string("expecting ',' at ") + where(pos));
             }
             handle_repetitions(min_times, max_times);
         } else {
@@ -561,12 +560,11 @@ const char* GbnfParser::parse_rule(const char* src) {
     const std::string name(src, name_len);
 
     if (!(pos[0] == ':' && pos[1] == ':' && pos[2] == '='))
-        throw std::runtime_error(std::string("expecting ::= at ") + pos);
+        throw std::runtime_error(std::string("expecting ::= at ") + where(pos));
     pos = parse_space(pos + 3, true);
 
-    /* An error inside a rule names the rule. A grammar written from a JSON schema or a tool list
-     * names its rules after the tool and the property, so this is what tells a client which part
-     * of its request the grammar could not hold. */
+    /* An error inside a rule names the rule. Grammars generated from a schema or tool list name
+     * rules after the tool and property, so this points the client at the failing part. */
     try {
         pos = parse_alternates(pos, name, rule_id, false);
     } catch (const std::runtime_error& ex) {
@@ -575,7 +573,7 @@ const char* GbnfParser::parse_rule(const char* src) {
 
     if (*pos == '\r')      pos += pos[1] == '\n' ? 2 : 1;
     else if (*pos == '\n') pos++;
-    else if (*pos)         throw std::runtime_error(std::string("expecting newline or end at ") + pos);
+    else if (*pos)         throw std::runtime_error(std::string("expecting newline or end at ") + where(pos));
     return parse_space(pos, true);
 }
 
@@ -587,8 +585,7 @@ int GbnfParser::parse(const char* src, std::string* err) {
         const char* pos = parse_space(src, true);
         while (*pos) pos = parse_rule(pos);
 
-        /* Every referenced rule must exist. Upstream reports the missing NAME rather than the
-         * index, which is the difference between a diagnostic and a number. */
+        /* Every referenced rule must exist; report the missing rule by name, as upstream does. */
         for (const auto& rule : rules_) {
             if (rule.empty()) throw std::runtime_error("undefined rule");
             for (const auto& e : rule) {
@@ -601,8 +598,8 @@ int GbnfParser::parse(const char* src, std::string* err) {
             }
         }
     } catch (const std::exception& ex) {
-        /* The parser is recursive descent and throws, as upstream's does. Nothing escapes: a
-         * parse failure is a status and a message, because errors are values here. */
+        /* The parser throws internally, as upstream's does; a failure leaves as a status and
+         * message. */
         if (err) *err = ex.what();
         rules_.clear();
         return RAD_E_FORMAT;
@@ -614,8 +611,8 @@ int GbnfParser::parse(const char* src, std::string* err) {
 
 namespace gbnf {
 
-/* Every bound is an O(1) check on the path each stack already takes, and a grammar that reaches
- * one throws GbnfLimit (see "what a grammar may cost" in gbnf_internal.h). */
+/* Each bound is an O(1) check on the existing path; a grammar that reaches one throws GbnfLimit
+ * ("what a grammar may cost", gbnf_internal.h). */
 void advance_stack(const GbnfRuleSet& rules, const GbnfStack& stack, GbnfStacks& out,
                    SetBuild& build) {
     auto too_wide = [] {
@@ -663,9 +660,8 @@ void advance_stack(const GbnfRuleSet& rules, const GbnfStack& stack, GbnfStacks&
                 build.insert(out, std::move(curr));
                 break;
             default:
-                /* END, ALT, CHAR_ALT and CHAR_RNG_UPPER can never be the top of a stack. Reaching
-                 * one is a broken invariant in this file, not a runtime condition, so it aborts
-                 * rather than returning a status nobody could act on. */
+                /* END, ALT, CHAR_ALT and CHAR_RNG_UPPER are never a stack top; reaching one is a
+                 * broken invariant, so abort. */
                 fatal("gbnf: stack left on element type %d, which cannot be a stack top",
                       (int)pos->type);
         }
@@ -674,29 +670,24 @@ void advance_stack(const GbnfRuleSet& rules, const GbnfStack& stack, GbnfStacks&
 
 }  /* namespace gbnf */
 
-/* LEFT RECURSION MAKES advance_stack GROW A STACK FOREVER, so it is found up front rather than
- * run into. Returns the index of a rule on such a cycle, or -1.
+/* Left recursion makes advance_stack grow a stack forever, so it is detected up front. Returns
+ * the index of a rule on such a cycle, or -1.
  *
- * The epsilon closure expands the rule reference on top of a stack into the first element of
- * each alternative, and when that first element can match nothing it moves on to the second --
- * so a reference is in a rule's LEFT CORNER if everything before it in its alternative is
- * NULLABLE. Expanding a reference also pushes whatever follows it in the alternative, unless it
- * is the last element; so following a left-corner reference grows the stack by one exactly when
- * it is not in TAIL position. A cycle of left-corner references therefore grows the stack without
- * end iff one of its references is not in tail position. A cycle of tail references only revisits
- * stacks it has already seen, which the closure's `seen` set stops -- `S ::= ("a"?)*` is such a
- * cycle, and runs.
+ * A reference is in a rule's left corner if everything before it in its alternative is nullable.
+ * Expanding it also pushes what follows it, so it grows the stack exactly when it is not in tail
+ * position. A cycle of left-corner references therefore diverges iff one of its references is not
+ * in tail position; a cycle of tail references only revisits stacks the closure's `seen` set
+ * already stops (`S ::= ("a"?)*` runs).
  *
- * NULLABILITY IS A FIXED POINT, not a property of one rule read on its own: `e ::= f` is nullable
- * because `f ::= "b" |` is, and a check that only recognises an empty alternative misses
- * `root ::= e root "c" | "a"` and hangs on it. It is computed with a worklist, and the cycle
- * search is an iterative strongly-connected-components pass, so both are linear in the grammar
- * and neither recurses: a 100,000-rule chain is a 100,000-frame recursion otherwise. */
+ * Nullability is a fixed point (`e ::= f` is nullable because `f ::= "b" |` is; checking only for
+ * an empty alternative misses `root ::= e root "c" | "a"`). It uses a worklist and the cycle search
+ * an iterative SCC pass, so both are linear and non-recursive (a 100,000-rule chain would
+ * otherwise recurse 100,000 frames deep). */
 static int64_t find_left_recursion(const GbnfRules& rules) {
     const size_t n = rules.size();
 
-    /* 1. Which rules can match the empty string. An alternative with a terminal in it never can;
-     *    one made only of rule references can once each of them can, so it waits on a count. */
+    /* 1. Which rules can match the empty string. An alternative with a terminal never can; one of
+     *    only rule references can once all of them can, tracked by a pending count. */
     std::vector<char>     nullable(n, 0);
     std::vector<uint32_t> alt_owner, alt_pending, work;
     std::vector<std::vector<uint32_t>> waiting(n);     /* rule -> alternatives it holds up */
@@ -735,8 +726,8 @@ static int64_t find_left_recursion(const GbnfRules& rules) {
     }
     waiting = {};
 
-    /* 2. The left-corner graph, one edge per reference that can come first, marked by whether it
-     *    is in tail position. */
+    /* 2. The left-corner graph: one edge per reference that can come first, marked `grows` when
+     *    not in tail position. */
     struct Edge { uint32_t to; bool grows; };
     std::vector<size_t> edge_off(n + 1, 0);
     std::vector<Edge>   edges;
@@ -754,8 +745,8 @@ static int64_t find_left_recursion(const GbnfRules& rules) {
         edge_off[r + 1] = edges.size();
     }
 
-    /* 3. Strongly connected components (Tarjan's, with an explicit call stack). A growing edge
-     *    between two rules of one component -- a self-loop included -- is the cycle. */
+    /* 3. Strongly connected components (Tarjan's, explicit call stack). A growing edge within one
+     *    component, self-loops included, is the cycle. */
     std::vector<int32_t>  idx(n, -1), low(n, 0), comp(n, -1);
     std::vector<char>     on_stack(n, 0);
     std::vector<uint32_t> scc;
@@ -805,26 +796,17 @@ static int64_t find_left_recursion(const GbnfRules& rules) {
 
 /* ================================================================== the compiled program */
 
-/* THE COMPILED GRAMMAR IS NOT PER-REQUEST.
+/* The compiled program is shared, not per request. Its rules, initial stack set, mask plan and
+ * the mask of each reachable state are a pure function of (text, root, vocabulary). A
+ * GbnfGrammar per request holds only the position in it. Sharing means:
+ *   - repeated calls with the same grammar parse and plan it once;
+ *   - tensor-parallel ranks share one plan and mask cache, so every rank past the first hits;
+ *   - a state one request reached is never recomputed by a later one;
+ *   - the plan is built on the admitting thread, never the scheduler thread.
  *
- * Everything here is a pure function of (grammar text, root, vocabulary): the rules, the initial
- * stack set, the mask plan, and the token mask each reachable state admits. None of it depends on
- * which request is asking. A GbnfGrammar is created per request all the same, because the
- * POSITION in the program is per-request; what a grammar must NOT carry is a private copy of the
- * program, or an agent that calls the same tool twenty times parses the same grammar twenty times
- * and builds the same plan twenty times over.
- *
- * So the program is shared, and three things fall out of that beyond the obvious one: every
- * TENSOR-PARALLEL RANK shares one plan and one mask cache (the ranks hold separate grammars over
- * the same program and ask for the same full-vocabulary mask, so every rank past the first is a
- * hit); a state one request reached is a state no later request recomputes; and the plan -- the
- * expensive part, built once per grammar -- is built on the thread that ADMITS the first request
- * for it, which is never the scheduler thread.
- *
- * The stacks hold pointers into `rules`, so `rules` is immutable after publication and the
- * program is held by shared_ptr: a live grammar keeps its program alive even after the cache has
- * stopped pinning it, and those pointers are what makes a state comparable across requests at
- * all. */
+ * Stacks point into `rules`, so `rules` is immutable after publication and the program is held by
+ * shared_ptr: a live grammar keeps it alive after the cache unpins it. Those pointers are also
+ * what makes a state comparable across requests. */
 struct GbnfState {
     GbnfStacks  stacks;      /* sorted, so the key does not depend on the order a walk produced */
     PartialUtf8 partial;
@@ -838,10 +820,9 @@ struct GbnfState {
     }
 };
 
-/* A STATE AS fill_mask HOLDS IT, NOT COPIED: the stacks through pointers, in the order the key
- * sorts them into. It hashes and compares as the GbnfState it would become, so the cache is
- * probed without building a key -- a copy of every stack, per mask -- and one is built only for a
- * mask that is stored. */
+/* A state as fill_mask holds it, uncopied: the stacks through pointers, in the key's sorted
+ * order. It hashes and compares like the GbnfState it would become, so a probe copies no stacks;
+ * a key is built only to store a mask. */
 struct GbnfStateView {
     const std::vector<const GbnfStack*>* stacks;
     PartialUtf8                          partial;
@@ -911,25 +892,21 @@ struct GbnfProgram {
     gbnf::MaskPlanPtr  plan;                 /* see gbnf_mask.cpp */
     GbnfProgramInfo    info;
 
-    /* Masks computed rather than served from the memo below, for the sampler's instrument.
-     * Atomic because it is read and written off the lock; relaxed because it is a counter and
-     * nothing is ordered against it. */
+    /* Masks computed rather than served from the memo below (the sampler's instrument). Atomic
+     * because it is used outside the lock; relaxed because nothing is ordered against it. */
     mutable std::atomic<uint64_t>   computed{0};
 
-    /* THE MASK CACHE IS SHARED BETWEEN THREADS: every rank reaches it. A mask is a few kilobytes,
-     * so entries are handed out by value under the lock and computed OUTSIDE it -- two threads
-     * racing the same state both compute it and agree, which wastes a plan lookup and cannot
-     * produce a wrong mask. It saves every rank past the first the plan work for a state, and a
-     * speculative window revisiting a state the work again. */
+    /* The mask cache is shared by every rank's thread. Masks are a few KiB, copied out under the
+     * lock and computed outside it; two threads racing on one state both compute the same mask,
+     * which only wastes work. */
     mutable std::mutex mu;
     struct Entry { std::vector<uint32_t> mask; uint64_t used = 0; };
     mutable std::unordered_map<GbnfState, Entry, GbnfStateHash, GbnfStateEq> masks;
     mutable uint64_t clock = 0;
 
-    /* A tool-calling schema's working set is on the order of a hundred states; 512 is room for a
-     * schema several times larger, at a few megabytes of host memory for a large vocabulary. Past
-     * it, evict the least recently used -- a linear scan, on a path that only runs behind a mask
-     * that was computed. */
+    /* A tool-calling schema's working set is about a hundred states; 512 leaves room for one
+     * several times larger, at a few MB of host memory for a large vocabulary. Past it, the least
+     * recently used entry is evicted by a linear scan, which runs only after a computed mask. */
     static constexpr size_t kMaxMasks = 512;
 
     bool lookup(const GbnfStateView& k, uint32_t* dst, int64_t n_words) const {
@@ -961,12 +938,12 @@ GbnfProgramInfo gbnf_program_info(const GbnfProgram& p) { return p.info; }
 
 namespace {
 
-/* Thirty-two schemas PINNED PER VOCABULARY. Capped because the key comes from client requests: a
- * caller sending a thousand distinct schemas must not be able to grow this without bound. */
+/* Programs pinned per vocabulary. Capped because keys come from clients, who must not be able to
+ * grow the cache without bound. */
 constexpr size_t kMaxPrograms = 32;
 
-/* Unpin the least recently used past either cap, and forget what nothing holds any more. The
- * caller holds C.mu. */
+/* Unpin least recently used programs past either cap, and forget those nothing holds. Caller
+ * holds C.mu. */
 void cache_trim(VocabGbnf& C) {
     for (;;) {
         size_t pinned = 0, bytes = 0;
@@ -986,8 +963,8 @@ void cache_trim(VocabGbnf& C) {
     }
 }
 
-/* The program for (text, root) if one is pinned or still alive, re-pinned as the most recently
- * used. The caller holds C.mu. */
+/* The program for (text, root) if pinned or still alive, re-pinned as most recently used. Caller
+ * holds C.mu. */
 std::shared_ptr<const GbnfProgram> cache_find(VocabGbnf& C,
                                               const std::pair<std::string, std::string>& key) {
     auto it = C.programs.find(key);
@@ -1010,11 +987,8 @@ std::shared_ptr<const GbnfProgram> cache_find(VocabGbnf& C,
 static int program_for_impl(const std::string& text, const std::string& root,
                             const VocabView* vocab, std::shared_ptr<const GbnfProgram>* out,
                             std::string* err) {
-    /* KEYED ON (text, root) INSIDE THE VOCABULARY'S OWN CACHE, and not on (text, root, address)
-     * in a table outside it. A compiled program embeds the vocabulary index and a plan over it,
-     * so a table keyed on an address serves one vocabulary's whole compiled grammar to whichever
-     * later view lands in the same storage -- and the mask that comes out is over a vocabulary
-     * the request is not sampling from. */
+    /* Keyed on (text, root) inside the vocabulary's own cache; see "the per-vocabulary cache"
+     * for why not on the view's address. */
     VocabGbnf& C = gbnf_cache_for(vocab);
     const std::pair<std::string, std::string> key{ text, root };
     {
@@ -1025,8 +999,8 @@ static int program_for_impl(const std::string& text, const std::string& root,
         }
     }
 
-    /* Compiled outside the lock: two callers racing the same new grammar would otherwise
-     * serialise behind the plan build. The loser's copy is dropped on insert. */
+    /* Compiled outside the lock so callers do not serialise behind a plan build. If two race on
+     * the same grammar, the loser's copy is dropped on insert. */
     const auto t0 = std::chrono::steady_clock::now();
     GbnfParser parser(vocab);
     std::string perr;
@@ -1062,8 +1036,8 @@ static int program_for_impl(const std::string& text, const std::string& root,
         return RAD_E_UNSUPPORTED;
     }
 
-    /* `rules` is final from here: the stacks hold pointers INTO it, so any later reallocation
-     * would dangle every one of them. Upstream makes the same point with a move. */
+    /* `rules` is final from here: stacks point into it, so a later reallocation would dangle
+     * them. */
     auto p = std::make_shared<GbnfProgram>();
     for (const GbnfRule& r : parser.rules()) {
         p->rules.start.push_back((uint32_t)p->rules.elems.size());
@@ -1116,10 +1090,9 @@ static int program_for_impl(const std::string& text, const std::string& root,
     return RAD_OK;
 }
 
-/* NOTHING THROWN WHILE COMPILING LEAVES HERE. The parser catches its own errors, but the stack
- * machinery after it throws GbnfLimit on a grammar that outgrows its bounds, and any step can run
- * out of memory -- and this runs on the thread that admits the request, where an escaping
- * exception is std::terminate for every request on the server. */
+/* No exception escapes compiling. The stack machinery throws GbnfLimit and any step can throw
+ * bad_alloc; this runs on the admitting thread, where an escaping exception would terminate the
+ * server. */
 static int program_for(const std::string& text, const std::string& root, const VocabView* vocab,
                        std::shared_ptr<const GbnfProgram>* out, std::string* err) {
     try {
@@ -1150,10 +1123,15 @@ int GbnfGrammar::create(const std::string& text, const std::string& root, const 
                         const std::vector<int32_t>& trigger_tokens,
                         std::unique_ptr<GbnfGrammar>* out, std::string* err) {
     if (!out) return RAD_E_INVAL;
+    /* A lazy grammar constrains nothing until a trigger fires, so without one it never would. */
+    if (lazy && trigger_words.empty() && trigger_tokens.empty()) {
+        if (err) *err = "a lazy grammar needs at least one word or token trigger; without one it "
+                        "never constrains";
+        return RAD_E_INVAL;
+    }
 
-    /* The parse, the left-recursion check and the initial stack set are all shared, and so is the
-     * mask cache behind them: this is a lookup on the second request that asks for the same
-     * schema. What stays per-request is the position in the program and the triggers. */
+    /* The compiled program is shared, so a repeated grammar is a cache lookup. Only the position
+     * in the program and the triggers are per request. */
     std::shared_ptr<const GbnfProgram> prog;
     const int st = program_for(text, root, vocab, &prog, err);
     if (st < 0) return st;
@@ -1205,10 +1183,9 @@ static void accept_chr(const GbnfRuleSet& rules, const GbnfStack& stack, uint32_
     advance_stack(rules, next, out, build);
 }
 
-/* A grammar that outgrew its bounds while accepting cannot be continued: the state it would be
- * in was never built. It is left with no live stack, so the next mask reports it and the request
- * is failed there, and the status says which of the two this was. A speculative walk rewinds
- * over it like any other refusal. */
+/* A grammar that outgrows its bounds while accepting cannot continue, since its next state was
+ * never built. It is left with no live stack, so the next mask fails the request; the status says
+ * which bound was hit. A speculative walk rewinds over it like any other refusal. */
 int GbnfGrammar::accept_token_piece(int32_t token, const std::string& piece) {
     try {
         return accept_token_piece_impl(token, piece);
@@ -1234,23 +1211,18 @@ int GbnfGrammar::accept_token_piece_impl(int32_t token, const std::string& piece
     GbnfStacks new_stacks;
     SetBuild   new_set(work);
 
-    /* THE STACKS THAT MATCH CODE POINTS ARE ADVANCED TOGETHER, one code point at a time, as
-     * accept_str does. Advancing each through the whole piece on its own gives the same set --
-     * the union of the parts is the part of the union -- but when many stacks converge on one
-     * continuation, as every alternative of a wide rule does once it matches, each of them
-     * re-expands that continuation, and the token costs the square of the width.
+    /* Code-point stacks advance together, one code point at a time, as in accept_str. Advancing
+     * each through the whole piece alone gives the same set, but stacks converging on one
+     * continuation (e.g. the alternatives of a wide rule) would each re-expand it, quadratic in
+     * the width.
      *
-     * AND THEY ARE ADVANCED THROUGH THE MASK PLAN'S AUTOMATON (plan_step), which holds each stack
-     * set as a state with its successors memoised per interval of code points. The set is the
-     * one accept_chr builds; what changes is that a state seen before -- the same free-text
-     * value, token after token -- is a lookup per code point rather than every closure rebuilt,
-     * allocated and de-duplicated again. The set comes back sorted, which nothing reads: the
-     * mask cache sorts its key, and a mask is a union over the stacks.
+     * They step through the mask plan's automaton (plan_step), which memoises each state's
+     * successors per code-point interval, so a seen state costs a lookup per code point instead
+     * of rebuilding closures. The result equals what accept_chr builds; its sorted order is
+     * incidental (the mask cache sorts its own key).
      *
-     * The new set is written over the one the previous token left (`spare_`) and the two are
-     * swapped, so a set of the same shape, token after token, allocates nothing; and when the
-     * automaton says the token left the set the state it was -- the steady state of a free-text
-     * value -- the set is not touched at all. */
+     * The new set overwrites the previous token's (`spare_`) and the two are swapped, so a
+     * steady-state set allocates nothing; when the state is unchanged the set is not touched. */
     current_.clear();
     for (const auto& stack : stacks_) {
         if (stack.empty()) continue;
@@ -1267,7 +1239,7 @@ int GbnfGrammar::accept_token_piece_impl(int32_t token, const std::string& piece
     }
     GbnfStacks& out = spare_;
     if (n_cps > 0 && !current_.empty()) {
-        /* `at_` names a state only when every stack steps over code points, so with it known no
+        /* `at_` names a state only when every stack steps over code points, so when it is known no
          * stack matched a token terminal above and the set is the stepped stacks alone. */
         gbnf::PlanState at{ at_.gen, at_.id };
         const bool same = gbnf::plan_step(*prog_->plan, current_, &at, cps_.data(), n_cps, &out,
@@ -1283,9 +1255,9 @@ int GbnfGrammar::accept_token_piece_impl(int32_t token, const std::string& piece
                                                                    current_[i]->end());
         at_ = At{};
     }
-    /* What a token terminal matched goes first, then the rest without the ones it already holds;
-     * with nothing matched by token, `out` is the set as it stands -- a state of the automaton,
-     * or a subset of the set before, and either way without duplicates. */
+    /* Stacks from token terminals go first, then the rest, de-duplicated against them. With no
+     * token match, `out` is already duplicate-free (an automaton state, or a subset of the
+     * previous set). */
     if (!new_stacks.empty()) {
         for (auto& s : out) new_set.insert(new_stacks, std::move(s));
         out.swap(new_stacks);
@@ -1295,18 +1267,10 @@ int GbnfGrammar::accept_token_piece_impl(int32_t token, const std::string& piece
     partial_utf8_ = partial;
 
     if (stacks_.empty()) {
-        /* NOT AN ERROR HERE, WHICH IS WHY IT LOGS AT DEBUG. This is reached as a matter of course
-         * by the SPECULATIVE WALK: Sampler::build_step advances the grammar over each PROPOSAL to
-         * mask the position behind it, and a drafter is free to propose a token the grammar
-         * forbids -- that is precisely what verification is for, and build_step handles it by
-         * setting `dead` and masking no further. A speculative window on a constrained request
-         * reaches this many times a second while behaving perfectly, producing correct, closed
-         * JSON and stopping cleanly. At error level it reads as a defect and is not one.
-         *
-         * A token that is genuinely EMITTED against the mask IS a defect, and only the engine can
-         * tell the two apart -- it alone knows the token was verified and is leaving. Engine::step
-         * checks this status on the post-verification accept and reports it there, which is why
-         * that status must not be dropped. */
+        /* Debug level: the speculative walk (Sampler::build_step) reaches this routinely when a
+         * drafter proposes a forbidden token, and handles it by setting `dead`. An emitted token
+         * that is forbidden is a defect, but only Engine::step can tell, so it reports this
+         * status on the post-verification accept; the status must not be dropped. */
         RAD_DEBUG("gbnf: token %d (\"%s\") left no live stack", token, piece.c_str());
         return RAD_E_STATE;
     }
@@ -1329,8 +1293,8 @@ int GbnfGrammar::accept_token(int32_t token) {
         recent_.push_back(Recent{ token, scan_.off });
         const uint64_t start = scanner_->feed(scan_, piece.data(), piece.size());
         if (start == WordScanner::npos) {
-            /* Keep only the tokens a word completing later could begin in: one that ends at or
-             * before (fed - longest + 1) cannot hold the first byte of any word still to come. */
+            /* Keep only tokens a later word could begin in: one ending at or before
+             * (fed - longest + 1) cannot hold the first byte of a word still to come. */
             const uint64_t reach = scanner_->max_len() - 1;
             const uint64_t keep  = scan_.off > reach ? scan_.off - reach : 0;
             size_t drop = 0;
@@ -1343,8 +1307,8 @@ int GbnfGrammar::accept_token(int32_t token) {
             return RAD_OK;
         }
 
-        /* Replay from the first byte of the word, splitting the token it begins inside: the bytes
-         * in front of it were free-form output and the grammar never claimed them. */
+        /* Replay from the word's first byte, splitting the token it begins in; the bytes before it
+         * are free-form output outside the grammar. */
         awaiting_trigger_ = false;
         std::vector<Recent> replay;
         replay.swap(recent_);
@@ -1364,12 +1328,10 @@ int GbnfGrammar::accept_token(int32_t token) {
 
     if (vocab_->is_eog(token)) {
         if (complete()) return RAD_OK;
-        /* DEBUG FOR THE SAME REASON AS "left no live stack" in accept_token_piece. The mask admits
-         * an end-of-generation token only once a stack has completed, so an emitted one does not
-         * land here; what does is the speculative walk over a drafter's PROPOSAL, and a drafter
-         * proposes the end of the turn whenever the text looks finished -- often, on a reply that
-         * its token limit cuts off mid-structure. The emitted case is the defect, and
-         * Engine::step reports it from this status. */
+        /* Debug level, as for "left no live stack" in accept_token_piece. The mask admits EOG
+         * only once a stack has completed, so this is normally a drafter's proposal in the
+         * speculative walk; an emitted one is a defect that Engine::step reports from this
+         * status. */
         RAD_DEBUG("gbnf: end-of-generation token %d offered while no stack had completed", token);
         return RAD_E_STATE;
     }
@@ -1407,7 +1369,6 @@ int GbnfGrammar::accept_str(const std::string& piece) {
     return RAD_OK;
 }
 
-
 void GbnfGrammar::push_state() {
     saved_.push_back(Snapshot{ stacks_, partial_utf8_, awaiting_trigger_, scan_, recent_, at_ });
 }
@@ -1432,17 +1393,15 @@ int GbnfGrammar::rollback() {
 int GbnfGrammar::mask_compute(uint32_t* bitmask, int64_t n_words) const {
     std::fill(bitmask, bitmask + n_words, 0u);
 
-    /* A DEAD STACK SET ADMITS NOTHING. It is reachable: accept_token_piece assigns the empty set
-     * on the paths where it reports a failure, so anything that keeps asking for masks after that
-     * arrives here, and the answer is the status the state deserves -- not a mask. */
+    /* A dead (empty) stack set admits nothing. accept_token_piece leaves one after a failure, so
+     * a later mask request gets a status here, not a mask. */
     if (stacks_.empty()) {
         RAD_ERR("gbnf: the grammar has no live parse left; the request cannot be continued");
         return RAD_E_STATE;
     }
 
-    /* A mask that outgrows the bounds in "what a grammar may cost" throws from deep inside the
-     * stack machinery, and this is on the scheduler thread: it becomes a status that fails the
-     * request, never an exception that ends the process. */
+    /* On the scheduler thread, so a mask past the bounds in "what a grammar may cost" becomes a
+     * status that fails the request, never an escaping exception. */
     try {
         return gbnf::plan_fill(*prog_->plan, stacks_, partial_utf8_, complete(), bitmask, n_words);
     } catch (const GbnfLimit& e) {
@@ -1459,21 +1418,17 @@ int GbnfGrammar::fill_mask(uint32_t* bitmask, int64_t n_words) const {
     const int64_t n_tok = vocab_->n_tokens();
     if (n_words < bitmask_words(n_tok)) return RAD_E_SHAPE;
 
-    /* A lazy grammar that has not triggered constrains nothing, so every token is admissible and
-     * the sampler skips the mask op entirely for this sequence. Saying "all ones" rather than
-     * "no mask" keeps one code path in the driver. */
+    /* An untriggered lazy grammar admits every token. The sampler skips the mask op for it anyway;
+     * all ones keeps the driver to one code path. */
     if (awaiting_trigger_) {
         std::fill(bitmask, bitmask + n_words, 0xFFFFFFFFu);
         return RAD_OK;
     }
 
-    /* THE STATE CACHE, ahead of the plan. Keyed on everything fill_mask reads that can change --
-     * the stack set, the carried partial and allow_eog -- and hashed but then compared EXACTLY,
-     * because a collision accepted on the hash alone would hand back a mask for a state the
-     * sequence is not in and admit the wrong token set. The key sorts the stacks: two requests
-     * that reach the same state by the same path produce the same order anyway, but the sort is
-     * what makes that a guarantee rather than an observation. The probe sorts pointers to the
-     * stacks, in storage of the calling thread's own, and copies them only to store. */
+    /* The state cache, ahead of the plan. Keyed on everything fill_mask reads that can change
+     * (stack set, carried partial, allow_eog) and compared exactly after hashing, since a hash
+     * collision would return the wrong mask. Stacks are sorted so equal sets give equal keys. The
+     * probe sorts pointers in thread-local storage and copies stacks only to store. */
     thread_local std::vector<const GbnfStack*> sorted;
     sorted.clear();
     for (const GbnfStack& s : stacks_) sorted.push_back(&s);
@@ -1486,7 +1441,7 @@ int GbnfGrammar::fill_mask(uint32_t* bitmask, int64_t n_words) const {
     const int st = mask_compute(bitmask, n_words);
     if (st < 0) return st;
 
-    /* Store only a mask that stands: a dead state is not worth an entry and returns above. */
+    /* A failed state returned above and is not cached. */
     prog_->store(state_of(key), bitmask, n_words);
     return RAD_OK;
 }

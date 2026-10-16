@@ -1,32 +1,43 @@
 /* mm_test.cpp -- the multimodal processor against the reference, number for number.
  *
- * Every expected value in mm_golden.h came out of transformers' own code (tests/mkgolden.py says
- * which function made which table), and in lfm2_golden.h out of its LFM2-VL processor
- * (tests/mklfm2golden.py): smart_resize in both forms, the frames a video keeps, the
- * patches of a picture and of a clip, the timestamps between a clip's groups, and get_rope_index's
- * positions over a prompt carrying both. A model reads its prompt through all of these at once, so
- * a mistake in any one is a model that still answers -- about a slightly different picture, or
- * with its positions a row off -- and nothing downstream of this file can tell.
+ * Every expected value in mm_golden.h comes from transformers' own code (tests/mkgolden.py names
+ * the function behind each table), in lfm2_golden.h from its LFM2-VL processor
+ * (tests/mklfm2golden.py) and in gemma4_golden.h from its Gemma 4 processors
+ * (tests/mkgemma4golden.py): smart_resize in both forms, the frames a video keeps, the patches of a
+ * picture and a clip, the timestamps between a clip's groups, and get_rope_index's positions over
+ * a prompt carrying both. A mistake in any of these still yields a model that answers, about a
+ * slightly different picture or with positions a row off, so only this file can catch it.
+ * imaging_golden.h holds Pillow's Lanczos resize and alpha paste (tests/mkimggolden.py).
  *
- * The pixel inputs are a splitmix hash of their coordinates rather than a ramp: a patch taken with
- * the wrong stride from a ramp is often another plausible ramp, and from this it is not.
+ * The decoder is checked on fixtures from tests/data/media (README.md there) and on files built
+ * here: the refusals a hostile request reaches first, orientation, alpha, and audio downmixing.
+ *
+ * Pixel inputs are a splitmix hash of their coordinates rather than a ramp: a patch taken with the
+ * wrong stride from a ramp is often another plausible ramp.
  */
 #include "rad_test.h"
 #include "rad_types.h"
+#include "mm/imaging.h"
 #include "mm/media.h"
 #include "mm/processor.h"
-#include "mm_golden.h"
+#include "gemma4_golden.h"
+#include "imaging_golden.h"
 #include "lfm2_golden.h"
+#include "mm/resample.h"
+#include "mm_golden.h"
 #include "rad_plugin.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <memory>
+#include <cstring>
 #include <fstream>
-#include <malloc.h>
 #include <iterator>
+#include <malloc.h>
+#include <memory>
+#include <random>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 using namespace rad;
@@ -54,14 +65,17 @@ Frame frame(int f, int h, int w) {
     return fr;
 }
 
-uint64_t fnv(const std::vector<uint16_t>& v) {
+/* FNV-1a over each element's bytes, least significant first. */
+template <class T> uint64_t fnv(const std::vector<T>& v) {
     uint64_t h = 0xcbf29ce484222325ull;
-    for (uint16_t u : v)
-        for (int b = 0; b < 2; ++b) h = (h ^ (uint8_t)(u >> (8 * b))) * 0x100000001b3ull;
+    for (T x : v) {
+        const auto u = (std::make_unsigned_t<T>)x;
+        for (size_t b = 0; b < sizeof(T); ++b) h = (h ^ (uint8_t)(u >> (8 * b))) * 0x100000001b3ull;
+    }
     return h;
 }
 
-/* The Qwen3.8 processor configuration, as a container converted from the checkpoint states it. */
+/* The Qwen3.8 processor configuration, as a converted container states it. */
 VisionConfig qwen_cfg() {
     VisionConfig c;
     c.patch = 16;
@@ -139,8 +153,8 @@ TEST(a_picture_patchifies_as_the_reference_does) {
     for (int i = 0; i < 16; ++i) CHECK_EQ(it->pixels[(size_t)i], kGoldImageHead[i]);
     CHECK_EQ(fnv(it->pixels), kGoldImageFnv);
 
-    /* <|vision_start|>, a pad a merged row, <|vision_end|>: the template's triple with the pad run
-     * at its real length, which is what transformers substitutes. */
+    /* <|vision_start|>, one pad per merged row, <|vision_end|>: the template's triple with the pad
+     * run at its real length, as transformers substitutes it. */
     const int32_t rows = (kGoldImageGrid[1] / 2) * (kGoldImageGrid[2] / 2);
     REQUIRE_EQ(it->expand.size(), (size_t)rows + 2);
     CHECK_EQ(it->expand.front(), 248053);
@@ -156,7 +170,7 @@ TEST(a_clip_patchifies_and_is_stamped_as_the_reference_does) {
     Processor p;
     REQUIRE(p.init(qwen_cfg(), [&](const std::string& s) {
                 stamps.push_back(s);
-                return std::vector<int32_t>(s.size(), 7);   /* one token a byte: the length shows */
+                return std::vector<int32_t>(s.size(), 7);   /* one token per byte, so length shows */
             }) >= 0);
     Video v;
     v.info.n_frames = 6;
@@ -176,12 +190,12 @@ TEST(a_clip_patchifies_and_is_stamped_as_the_reference_does) {
     for (int i = 0; i < 16; ++i) CHECK_EQ(it->pixels[(size_t)i], kGoldVideoHead[i]);
     CHECK_EQ(fnv(it->pixels), kGoldVideoFnv);
 
-    /* One stamp a group, in the reference's words and rounding: 0.25 s is "<0.2 seconds>". */
+    /* One stamp per group, in the reference's wording and rounding: 0.25 s is "<0.2 seconds>". */
     const size_t n_stamps = sizeof(kGoldVideoStamps) / sizeof(kGoldVideoStamps[0]);
     REQUIRE_EQ(stamps.size(), n_stamps);
     for (size_t i = 0; i < n_stamps; ++i) CHECK_EQ(stamps[i], std::string(kGoldVideoStamps[i]));
 
-    /* <stamp> <|vision_start|> pads <|vision_end|>, a group at a time, and nothing around them. */
+    /* <stamp> <|vision_start|> pads <|vision_end|> per group, and nothing else. */
     const int32_t rows = (kGoldVideoGrid[1] / 2) * (kGoldVideoGrid[2] / 2);
     size_t at = 0;
     REQUIRE_EQ(it->seg_at.size(), (size_t)kGoldVideoGrid[0]);
@@ -198,9 +212,9 @@ TEST(a_clip_patchifies_and_is_stamped_as_the_reference_does) {
 }
 
 TEST(the_rotary_layout_is_get_rope_index) {
-    /* The prompt mkgolden.py built: an image of 2 x 3 merged rows in its vision pair, then a clip of
-     * two groups of 2 x 4 rows, each group behind five tokens of timestamp. Only the placement and
-     * the grids reach the layout, so the items carry nothing else. */
+    /* mkgolden.py's prompt: an image of 2 x 3 merged rows in its vision pair, then a clip of two
+     * groups of 2 x 4 rows, each after five timestamp tokens. Only placement and grids reach the
+     * layout, so the items carry nothing else. */
     auto img = std::make_shared<Item>();
     img->kind = Kind::Image;
     img->grid_t = 1; img->grid_h = 4; img->grid_w = 6;
@@ -233,7 +247,6 @@ TEST(the_rotary_layout_is_get_rope_index) {
     CHECK_EQ(off, 0);
 
     /* Generation continues from the reference's delta: position = index + delta, in all three. */
-    CHECK_EQ(pm.rope.shift_at(kGoldRopeN), kGoldRopeDelta);
     int32_t p[3];
     pm.rope.at(kGoldRopeN + 5, p);
     CHECK_EQ(p[0], kGoldRopeN + 5 + kGoldRopeDelta);
@@ -241,11 +254,12 @@ TEST(the_rotary_layout_is_get_rope_index) {
     CHECK_EQ(p[2], p[0]);
 }
 
-/* THE DECODER ON EVERY FORMAT A REQUEST MAY CARRY. tests/data/media holds a solid red picture in
- * each still format media.cpp admits and a short solid red clip in each container and codec
- * (its README has the commands that made them); each must decode, at its size, to red. That is
- * also what holds a reduced FFmpeg build -- the container image's -- to the formats the server
- * accepts. A build without libavformat has no decoder, and the cases say so. */
+/* The decoder on the formats a request may carry. tests/data/media holds a solid red picture in
+ * eleven still formats and a short solid red clip in nine container and codec pairs (its README
+ * lists them, the commands, and the admitted formats without a fixture); each must decode, at its
+ * size, to red. This also holds a reduced
+ * FFmpeg build, such as the container image's, to the accepted formats. Without libavformat
+ * there is no decoder and the cases skip. */
 namespace {
 
 std::vector<uint8_t> media_file(const char* name) {
@@ -269,7 +283,7 @@ std::vector<int64_t> first_and_last(const VideoInfo& info, const void*) {
 }  /* namespace */
 
 TEST(every_admitted_picture_format_decodes) {
-    if (!decoder_available()) { std::printf("  SKIP no media decoder in this build\n"); return; }
+    if (!decoder_available()) SKIP("no media decoder in this build");
     for (const char* name : { "red.png", "red.apng", "red.jpg", "red.webp", "red.gif", "red.bmp",
                               "red.tiff", "red.qoi", "red.ppm", "red.jls", "red.avif" }) {
         const std::vector<uint8_t> b = media_file(name);
@@ -286,13 +300,12 @@ TEST(every_admitted_picture_format_decodes) {
     }
 }
 
-/* A PICTURE WIDER THAN A WHOLE NUMBER OF THE SCALER'S VECTORS: 4:2:0 at 1788 wide is converted to
- * RGB 12 bytes past 1788 x 3. Into a buffer of exactly that size those bytes were the next heap
- * chunk's header, and the server aborted at a later allocation (Codeberg #57). The mmap threshold
- * is raised so the RGB comes from the heap proper, as it does in a server that has freed large
- * buffers before; glibc then checks the neighbouring headers on every free below. */
+/* A width that is not a whole number of the scaler's vectors: converting 4:2:0 at 1788 wide to
+ * RGB, the scaler writes 12 bytes past 1788 x 3, which in an exact-size buffer corrupts the next
+ * heap chunk's header. The mmap threshold is raised so the RGB comes from the heap, as in a
+ * long-running server, and glibc checks neighbouring headers on every free below. */
 TEST(a_picture_of_an_awkward_width_converts_inside_its_buffer) {
-    if (!decoder_available()) { std::printf("  SKIP no media decoder in this build\n"); return; }
+    if (!decoder_available()) SKIP("no media decoder in this build");
     const std::vector<uint8_t> b = media_file("red-1788x282.jpg");
     REQUIRE(!b.empty());
     mallopt(M_MMAP_THRESHOLD, 64 << 20);
@@ -305,6 +318,8 @@ TEST(a_picture_of_an_awkward_width_converts_inside_its_buffer) {
         CHECK_EQ(f.w, 1788);
         CHECK_EQ(f.h, 282);
         CHECK(is_red(f));
+        /* The next chunk on the heap: glibc's checks abort here if the conversion wrote past its
+         * buffer. */
         std::vector<uint8_t> behind(4096, 1);
         CHECK_EQ(behind[0], 1);
     }
@@ -312,7 +327,7 @@ TEST(a_picture_of_an_awkward_width_converts_inside_its_buffer) {
 }
 
 TEST(every_admitted_video_format_decodes) {
-    if (!decoder_available()) { std::printf("  SKIP no media decoder in this build\n"); return; }
+    if (!decoder_available()) SKIP("no media decoder in this build");
     for (const char* name : { "red-h264.mp4", "red-hevc.mp4", "red-av1.mp4", "red-vp8.webm",
                               "red-vp9.webm", "red-h264.mkv", "red-h264.ts", "red-mpeg4.avi",
                               "red-theora.ogv" }) {
@@ -335,8 +350,8 @@ TEST(every_admitted_video_format_decodes) {
     }
 }
 
-/* THE BANDS ARE CHECKED AS A WHOLE, because the command line can replace one end of a band and
- * leave the other to the container: a minimum stated alone can land above the container's maximum. */
+/* Bands are checked as a whole: the command line can replace one end of a band and leave the
+ * other to the container, so a minimum alone can exceed the container's maximum. */
 TEST(a_media_configuration_with_an_empty_band_names_it) {
     mm::VisionConfig c;
     c.image_min_pixels = 65536;
@@ -364,9 +379,9 @@ TEST(a_media_configuration_with_an_empty_band_names_it) {
     CHECK(why.find("max_frames") != std::string::npos);
 }
 
-/* THE AUDIO FRONT END IS THE REFERENCE'S. Gemma4AudioFeatureExtractor (transformers 5.18) on a
- * 16037-sample tone (0.5 sin 440 Hz + 0.25 sin 3 kHz at 16 kHz): 100 real frames, and these
- * log-mel values. The front end stores bf16, so each is checked to bf16's resolution. */
+/* The audio front end matches Gemma4AudioFeatureExtractor (transformers 5.18) on a 16037-sample
+ * tone (0.5 sin 440 Hz + 0.25 sin 3 kHz at 16 kHz): 100 real frames and these log-mel values,
+ * checked to bf16 resolution since the front end stores bf16. */
 TEST(the_audio_front_end_is_the_references) {
     mm::AudioConfig c;
     c.rate = 16000; c.frame_length = 320; c.hop = 160; c.fft = 512; c.n_mels = 128;
@@ -413,7 +428,7 @@ TEST(the_audio_front_end_is_the_references) {
 
 namespace {
 
-/* LiquidAI d1-3B's processor_config.json, as a container converted from it states it. */
+/* LiquidAI d1-3B's processor_config.json, as a converted container states it. */
 VisionConfig lfm2_cfg() {
     VisionConfig c;
     c.family = Family::Lfm2;
@@ -464,10 +479,9 @@ TEST(lfm2_sizes_and_tiles_are_the_references) {
     }
 }
 
-/* Whole pictures, small to tiled, one area-capped first as d1's runner caps it: every segment's
- * size and patches, and the tokens that replace the picture. The processor keeps a segment's
- * patches in merge-block order; the reference's are row-major, so they are put back in that order
- * (Item::coords) before the hash. */
+/* Whole pictures, small to tiled, one area-capped first as d1's runner does: every segment's size
+ * and patches, and the tokens that replace the picture. The processor keeps patches in merge-block
+ * order and the reference row-major, so they are reordered (Item::coords) before hashing. */
 TEST(lfm2_pictures_are_the_references) {
     Processor p;
     REQUIRE_EQ(p.init(lfm2_cfg(), [](const std::string&) { return std::vector<int32_t>{}; },
@@ -504,18 +518,795 @@ TEST(lfm2_pictures_are_the_references) {
                              g.h, g.w, s, it->n_seg, gs.h, gs.w);
             CHECK_EQ(fnv(rowmajor), gs.fnv);
         }
-        uint64_t h = 0xcbf29ce484222325ull;
-        for (int32_t id : it->expand)
-            for (int b = 0; b < 4; ++b) h = (h ^ (uint8_t)((uint32_t)id >> (8 * b))) * 0x100000001b3ull;
         CHECK_EQ((int32_t)it->expand.size(), g.n_ids);
-        CHECK_EQ(h, g.ids_fnv);
-        /* Each run of placeholders starts where Item::seg_at says, one merged row a token. */
+        CHECK_EQ(fnv(it->expand), g.ids_fnv);
+        /* Each placeholder run starts at Item::seg_at, one token per merged row. */
         REQUIRE_EQ(it->seg_at.size(), (size_t)it->n_seg);
         for (int32_t s = 0; s < it->n_seg; ++s) {
             const int64_t at = it->seg_at[(size_t)s], n = it->row_at(s + 1) - it->row_at(s);
             for (int64_t k = 0; k < n; ++k) CHECK_EQ(it->expand[(size_t)(at + k)], kLfm2ImageToken);
         }
     }
+}
+
+/* ================================================================== Gemma 4's processor
+ *
+ * gemma4_golden.h: the processors AutoProcessor loads for these checkpoints, which transformers
+ * and vLLM users run (Gemma4ImageProcessor, torchvision backend, and
+ * EmbeddingGemma2VideoProcessor): sizes, patches as the tower reads them, soft-token counts and the
+ * frames a clip keeps. The processor keeps patches in pooling-block order and the reference
+ * row-major, so they are reordered (Item::coords) before comparing. */
+namespace {
+
+VisionConfig gemma4_cfg(int32_t image_soft, int32_t video_soft) {
+    VisionConfig c;
+    c.family = Family::Gemma4;
+    c.patch = kGemma4Patch;
+    c.merge = kGemma4Pool;
+    c.temporal = 1;
+    c.image_soft_tokens = image_soft;
+    c.video_soft_tokens = video_soft;
+    c.fps = 1.0;
+    c.min_frames = 1;
+    c.max_frames = 32;
+    c.max_frame_rows = 0;
+    const int64_t f2 = (int64_t)c.factor() * c.factor();
+    c.image_min_pixels = c.video_min_pixels = f2;
+    c.image_max_pixels = (int64_t)image_soft * f2;
+    c.video_max_pixels = (int64_t)video_soft * f2 * c.max_frames;
+    c.tok_image = 258880;
+    c.tok_video = 258884;
+    c.tok_start = 255999;
+    c.tok_end = 258882;
+    c.max_patches = 1120 * 9;
+    return c;
+}
+
+/* Segment s's patches row-major, as the reference lays them out. */
+std::vector<uint16_t> raster(const Item& it, int32_t s) {
+    const int64_t pd = it.patch_dim, p0 = it.patch_at(s), np = it.patch_at(s + 1) - p0;
+    std::vector<int32_t> planes((size_t)(4 * np));
+    it.coords(p0, np, planes.data());
+    std::vector<uint16_t> out((size_t)(np * pd));
+    for (int64_t k = 0; k < np; ++k) {
+        const int64_t at = (int64_t)planes[(size_t)k] * it.seg_w(s) + planes[(size_t)(np + k)];
+        std::copy_n(it.pixels.data() + (p0 + k) * pd, pd, out.data() + at * pd);
+    }
+    return out;
+}
+
+}  /* namespace */
+
+TEST(gemma4_sizes_are_the_references) {
+    for (const GoldGemma4Size& g : kGoldGemma4Size) {
+        int64_t oh = 0, ow = 0;
+        std::string why;
+        const int rc = gemma4_size(g.h, g.w, kGemma4Patch, kGemma4Pool,
+                                   (int64_t)g.budget * kGemma4Pool * kGemma4Pool, &oh, &ow, &why);
+        if (g.oh == 0) {
+            /* The reference refuses: nothing to resize to. */
+            CHECK(rc < 0);
+            continue;
+        }
+        if (rc != RAD_OK || oh != g.oh || ow != g.ow)
+            std::fprintf(stderr, "    %lld x %lld at %d soft tokens: %lld x %lld (%d), reference "
+                         "%lld x %lld\n", (long long)g.h, (long long)g.w, g.budget, (long long)oh,
+                         (long long)ow, rc, (long long)g.oh, (long long)g.ow);
+        CHECK_EQ(rc, RAD_OK);
+        CHECK_EQ(oh, g.oh);
+        CHECK_EQ(ow, g.ow);
+    }
+}
+
+/* Pictures already at their size: the grid, the soft tokens and <boi> placeholders <eoi>, and
+ * every patch value, exactly. */
+TEST(gemma4_pictures_patchify_as_the_reference_does) {
+    for (const GoldGemma4Pic& g : kGoldGemma4Pics) {
+        Processor p;
+        REQUIRE_EQ(p.init(gemma4_cfg(g.budget, 70), [](const std::string&) {
+                              return std::vector<int32_t>{};
+                          }), RAD_OK);
+        std::shared_ptr<Item> it;
+        std::string why;
+        CHECK_OK(p.image_from(frame(g.f, g.h, g.w), &it, &why));
+        REQUIRE(it != nullptr);
+        CHECK_EQ(it->grid_h, g.grid_h);
+        CHECK_EQ(it->grid_w, g.grid_w);
+        REQUIRE_EQ(it->n_seg, 1);
+        CHECK_EQ(it->n_rows(), (int64_t)g.soft);
+        REQUIRE_EQ(it->patch_dim, (int64_t)3 * kGemma4Patch * kGemma4Patch);
+        const std::vector<uint16_t> r = raster(*it, 0);
+        for (int i = 0; i < 8; ++i) CHECK_EQ(r[(size_t)i], g.head[i]);
+        if (fnv(r) != g.fnv)
+            std::fprintf(stderr, "    picture %d x %d at %d soft tokens: patches differ\n", g.h, g.w,
+                         g.budget);
+        CHECK_EQ(fnv(r), g.fnv);
+        REQUIRE_EQ(it->expand.size(), (size_t)g.soft + 2);
+        CHECK_EQ(it->expand.front(), 255999);
+        CHECK_EQ(it->expand.back(), 258882);
+        CHECK_EQ((int64_t)std::count(it->expand.begin(), it->expand.end(), 258880), (int64_t)g.soft);
+    }
+}
+
+/* Resized pictures, one grown and one thin enough for the one-side rule. This processor resizes
+ * with Pillow's bicubic and the reference with torchvision's, which differ by a pixel level or two
+ * on a few values (0.3-0.7% on these noise pictures, at most 2 levels). Every 400th-odd value is
+ * compared: each within 3 levels, at most 2% not equal. A wrong patch order, orientation or size
+ * moves most of them by tens of levels. */
+TEST(gemma4_resized_pictures_are_the_references_to_a_resampling_tolerance) {
+    for (const GoldGemma4Resized& g : kGoldGemma4Resized) {
+        Processor p;
+        REQUIRE_EQ(p.init(gemma4_cfg(g.budget, 70), [](const std::string&) {
+                              return std::vector<int32_t>{};
+                          }), RAD_OK);
+        std::shared_ptr<Item> it;
+        std::string why;
+        CHECK_OK(p.image_from(frame(g.f, g.h, g.w), &it, &why));
+        REQUIRE(it != nullptr);
+        CHECK_EQ(it->grid_h, g.grid_h);
+        CHECK_EQ(it->grid_w, g.grid_w);
+        CHECK_EQ(it->n_rows(), (int64_t)g.soft);
+        const std::vector<uint16_t> r = raster(*it, 0);
+        REQUIRE_EQ(r.size(), (size_t)g.grid_h * g.grid_w * it->patch_dim);
+        int unequal = 0, far = 0;
+        for (int32_t k = 0; k < g.n; ++k) {
+            const size_t at = (size_t)k * (size_t)g.stride;
+            REQUIRE(at < r.size());
+            const float ours = rad_bf16_to_f32(r[at]);
+            const float ref = rad_bf16_to_f32(kGoldGemma4ResizedValues[g.first + k]);
+            unequal += ours != ref;
+            far += std::fabs(ours - ref) > 3.0f * (2.0f / 255.0f);
+        }
+        if (far || unequal * 50 > g.n)
+            std::fprintf(stderr, "    %d x %d at %d soft tokens: %d of %d values unequal, %d past "
+                         "3 levels\n", g.h, g.w, g.budget, unequal, g.n, far);
+        CHECK_EQ(far, 0);
+        CHECK(unequal * 50 <= g.n);
+    }
+}
+
+/* A clip at a size its budget keeps: one segment per frame, each spelled <boi> placeholders <eoi>
+ * back to back, and every patch value, exactly. The video processor rescales in double where the
+ * image processor rescales in float, which differ for byte 127; the clip holds that byte. */
+TEST(a_gemma4_clip_patchifies_as_the_reference_does) {
+    Processor p;
+    REQUIRE_EQ(p.init(gemma4_cfg(280, 70), [](const std::string&) {
+                          return std::vector<int32_t>{};
+                      }), RAD_OK);
+    Video v;
+    v.info.n_frames = 8;
+    v.info.fps = 1.0;
+    v.info.w = kGoldGemma4ClipW;
+    v.info.h = kGoldGemma4ClipH;
+    for (int32_t f : kGoldGemma4ClipFrames) {
+        v.index.push_back(f);
+        v.frames.push_back(frame(f, kGoldGemma4ClipH, kGoldGemma4ClipW));
+    }
+    std::shared_ptr<Item> it;
+    std::string why;
+    CHECK_OK(p.video_from(v, &it, &why));
+    REQUIRE(it != nullptr);
+    const int32_t n = (int32_t)v.frames.size();
+    REQUIRE_EQ(it->n_seg, n);
+    CHECK_EQ(it->grid_h, kGoldGemma4ClipGridH);
+    CHECK_EQ(it->grid_w, kGoldGemma4ClipGridW);
+    CHECK_EQ(it->seg_rows, kGoldGemma4ClipSoft);
+    std::vector<uint16_t> all;
+    for (int32_t s = 0; s < n; ++s) {
+        const std::vector<uint16_t> r = raster(*it, s);
+        all.insert(all.end(), r.begin(), r.end());
+    }
+    if (fnv(all) != kGoldGemma4ClipFnv)
+        std::fprintf(stderr, "    clip of %d frames of %d x %d: patches differ\n", n,
+                     kGoldGemma4ClipH, kGoldGemma4ClipW);
+    CHECK_EQ(fnv(all), kGoldGemma4ClipFnv);
+    REQUIRE_EQ(it->expand.size(), (size_t)n * (kGoldGemma4ClipSoft + 2));
+    for (int32_t s = 0; s < n; ++s) {
+        const size_t at = (size_t)s * (kGoldGemma4ClipSoft + 2);
+        CHECK_EQ(it->expand[at], 255999);
+        CHECK_EQ(it->seg_at[(size_t)s], (int32_t)at + 1);
+        CHECK_EQ(it->expand[at + 1 + (size_t)kGoldGemma4ClipSoft], 258882);
+    }
+}
+
+TEST(gemma4_frames_are_sampled_as_the_reference_does) {
+    for (const GoldGemma4Sample& g : kGoldGemma4Sample) {
+        VideoInfo info;
+        info.n_frames = g.total;
+        info.fps = g.fps;
+        const std::vector<int64_t> idx = sample_frames_gemma4(info, 1.0, g.max_frames);
+        CHECK_EQ((int32_t)idx.size(), g.n);
+        int off = 0;
+        for (int32_t i = 0; i < std::min(g.n, (int32_t)idx.size()); ++i)
+            off += idx[(size_t)i] != kGoldGemma4SampleIdx[g.first + i];
+        if (off)
+            std::fprintf(stderr, "    %lld frames at %g fps, at most %d: %d indices differ\n",
+                         (long long)g.total, g.fps, g.max_frames, off);
+        CHECK_EQ(off, 0);
+    }
+}
+
+/* ================================================================== Pillow's arithmetic
+ *
+ * imaging_golden.h: Image.resize(LANCZOS) of an RGBA splitmix picture at sizes that shrink, grow,
+ * keep one axis or both, and end at one pixel, and the picture pasted on white through its alpha.
+ * The images endpoint conditions an edit on these pixels. */
+namespace {
+
+FrameRGBA rgba_frame(int f, int h, int w) {
+    FrameRGBA fr;
+    fr.w = w;
+    fr.h = h;
+    fr.rgba.resize((size_t)w * h * 4);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            for (int c = 0; c < 4; ++c)
+                fr.rgba[((size_t)y * w + x) * 4 + c] =
+                    pix((uint64_t)f, (uint64_t)y, (uint64_t)x, (uint64_t)c);
+    return fr;
+}
+
+}  /* namespace */
+
+TEST(the_lanczos_resize_is_pillows_bit_for_bit) {
+    const FrameRGBA src = rgba_frame(0, kGoldLanczosSrcH, kGoldLanczosSrcW);
+    for (const GoldLanczos& g : kGoldLanczos) {
+        FrameRGBA out;
+        resize_lanczos_rgba(src, g.w, g.h, &out);
+        REQUIRE_EQ(out.rgba.size(), (size_t)g.w * g.h * 4);
+        CHECK_EQ(out.w, g.w);
+        CHECK_EQ(out.h, g.h);
+        if (fnv(out.rgba) != g.fnv)
+            std::fprintf(stderr, "    %d x %d -> %d x %d differs from Pillow\n", src.w, src.h, g.w,
+                         g.h);
+        CHECK_EQ(fnv(out.rgba), g.fnv);
+    }
+}
+
+TEST(the_white_composite_is_pillows_paste) {
+    const FrameRGBA src = rgba_frame(0, kGoldLanczosSrcH, kGoldLanczosSrcW);
+    Frame out;
+    composite_white(src, &out);
+    CHECK_EQ(out.w, src.w);
+    CHECK_EQ(out.h, src.h);
+    CHECK_EQ(fnv(out.rgb), kGoldCompositeFnv);
+}
+
+/* ================================================================== the decoder's edges */
+namespace {
+
+std::vector<uint8_t> pixels(int f, int h, int w, int ch) {
+    std::vector<uint8_t> v((size_t)w * h * ch);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            for (int c = 0; c < ch; ++c)
+                v[((size_t)y * w + x) * ch + c] =
+                    pix((uint64_t)f, (uint64_t)y, (uint64_t)x, (uint64_t)c);
+    return v;
+}
+
+/* PNG's chunk CRC (ISO 3309), bit by bit. */
+uint32_t crc32(const uint8_t* p, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; ++i) {
+        c ^= p[i];
+        for (int k = 0; k < 8; ++k) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+    }
+    return c ^ 0xFFFFFFFFu;
+}
+
+void be32(std::vector<uint8_t>* b, uint32_t v) {
+    for (int s = 24; s >= 0; s -= 8) b->push_back((uint8_t)(v >> s));
+}
+
+void png_chunk(std::vector<uint8_t>* b, const char* type, const std::vector<uint8_t>& data) {
+    be32(b, (uint32_t)data.size());
+    const size_t at = b->size();
+    b->insert(b->end(), type, type + 4);
+    b->insert(b->end(), data.begin(), data.end());
+    be32(b, crc32(b->data() + at, b->size() - at));
+}
+
+/* A well-formed PNG header stating w x h, then one compressed byte of picture: how a request
+ * claims a vast picture in a few dozen bytes. */
+std::vector<uint8_t> png_claiming(uint32_t w, uint32_t h) {
+    std::vector<uint8_t> b = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+    std::vector<uint8_t> ihdr;
+    be32(&ihdr, w);
+    be32(&ihdr, h);
+    ihdr.insert(ihdr.end(), { 8, 2, 0, 0, 0 });   /* 8-bit RGB, deflate, no filter or interlace */
+    png_chunk(&b, "IHDR", ihdr);
+    png_chunk(&b, "IDAT", { 0x78, 0x9c, 0x63, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01 });
+    png_chunk(&b, "IEND", {});
+    return b;
+}
+
+/* A PCM16 WAV: `ch` interleaved channels at `rate`. */
+std::vector<uint8_t> wav(const std::vector<int16_t>& s, int ch, int rate) {
+    std::vector<uint8_t> b;
+    auto le = [&](uint32_t v, int n) {
+        for (int i = 0; i < n; ++i) b.push_back((uint8_t)(v >> (8 * i)));
+    };
+    const uint32_t data = (uint32_t)(s.size() * 2);
+    b.insert(b.end(), { 'R', 'I', 'F', 'F' });
+    le(36 + data, 4);
+    b.insert(b.end(), { 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ' });
+    le(16, 4);
+    le(1, 2);                                  /* PCM */
+    le((uint32_t)ch, 2);
+    le((uint32_t)rate, 4);
+    le((uint32_t)(rate * ch * 2), 4);          /* bytes per second */
+    le((uint32_t)(ch * 2), 2);                 /* bytes per frame */
+    le(16, 2);
+    b.insert(b.end(), { 'd', 'a', 't', 'a' });
+    le(data, 4);
+    for (int16_t v : s) le((uint16_t)v, 2);
+    return b;
+}
+
+/* `seconds` of a sine at `hz` and amplitude `amp`, PCM16. */
+std::vector<int16_t> tone(int rate, double seconds, double hz, double amp) {
+    std::vector<int16_t> s((size_t)(rate * seconds));
+    for (size_t i = 0; i < s.size(); ++i)
+        s[i] = (int16_t)std::lround(amp * 32767.0 * std::sin(2.0 * M_PI * hz * (double)i / rate));
+    return s;
+}
+
+std::vector<int16_t> interleave(const std::vector<int16_t>& l, const std::vector<int16_t>& r) {
+    std::vector<int16_t> s;
+    for (size_t i = 0; i < l.size(); ++i) {
+        s.push_back(l[i]);
+        s.push_back(r[i]);
+    }
+    return s;
+}
+
+/* A sine's amplitude from its RMS, and its rising zero crossings, over [a, b). */
+double amplitude(const std::vector<float>& x, size_t a, size_t b) {
+    double e = 0.0;
+    for (size_t i = a; i < b; ++i) e += (double)x[i] * x[i];
+    return std::sqrt(2.0 * e / (double)(b - a));
+}
+
+int rising(const std::vector<float>& x, size_t a, size_t b) {
+    int n = 0;
+    for (size_t i = a + 1; i < b; ++i) n += x[i - 1] < 0.0f && x[i] >= 0.0f;
+    return n;
+}
+
+}  /* namespace */
+
+/* The pixel limit bounds what a request makes the server allocate, so it is applied to the size
+ * the header states, before a frame is decoded, and the limit itself is admitted. */
+TEST(a_picture_over_the_pixel_limit_is_refused_from_its_header) {
+    if (!decoder_available()) SKIP("no media decoder in this build");
+    const std::vector<uint8_t> px = pixels(1, 48, 64, 3);
+    std::vector<uint8_t> png;
+    std::string why;
+    REQUIRE_EQ(encode_image(px.data(), 64, 48, 3, "png", 0, &png, &why), RAD_OK);
+    Frame f;
+    CHECK_EQ(decode_image(png.data(), png.size(), 64 * 48, &f, &why), RAD_OK);
+    CHECK_EQ(decode_image(png.data(), png.size(), 64 * 48 - 1, &f, &why), RAD_E_INVAL);
+    CHECK(has(why, "64x48, over the server's 3071-pixel limit"));
+    FrameRGBA fa;
+    why.clear();
+    CHECK_EQ(decode_image_rgba(png.data(), png.size(), 64 * 48 - 1, &fa, &why), RAD_E_INVAL);
+    CHECK(has(why, "3071-pixel limit"));
+
+    /* 81 million pixels claimed in 66 bytes: refused on the header, so nothing is allocated for
+     * them. A side past what FFmpeg can hold (60000) is refused by its own size check. */
+    std::vector<uint8_t> huge = png_claiming(9000, 9000);
+    why.clear();
+    CHECK_EQ(decode_image(huge.data(), huge.size(), int64_t(1) << 26, &f, &why), RAD_E_INVAL);
+    CHECK(has(why, "9000x9000, over the server's 67108864-pixel limit"));
+    huge = png_claiming(60000, 60000);
+    why.clear();
+    CHECK_EQ(decode_image(huge.data(), huge.size(), int64_t(1) << 26, &f, &why), RAD_E_INVAL);
+    CHECK(!why.empty());
+}
+
+TEST(a_video_over_the_pixel_limit_is_refused_before_a_frame_is_decoded) {
+    if (!decoder_available()) SKIP("no media decoder in this build");
+    const std::vector<uint8_t> b = media_file("red-h264.mp4");
+    REQUIRE(!b.empty());
+    Video v;
+    std::string why;
+    CHECK_EQ(decode_video(b.data(), b.size(), first_and_last, nullptr, 64 * 64 - 1, &v, &why),
+             RAD_E_INVAL);
+    CHECK(has(why, "64x64, over the server's 4095-pixel limit for a frame"));
+    CHECK(v.frames.empty());
+    CHECK_EQ(decode_video(b.data(), b.size(), first_and_last, nullptr, 64 * 64, &v, &why), RAD_OK);
+}
+
+/* Bytes cut short or not media at all come back as a refusal with a reason, or, from a decoder
+ * that conceals damage, as a picture of the size its header states; never as a crash or a frame
+ * whose buffer disagrees with its size. Under ASan an over-read fails here. */
+TEST(damaged_and_foreign_bytes_are_refused_with_a_reason) {
+    if (!decoder_available()) SKIP("no media decoder in this build");
+    for (const char* name : { "red.png", "red.jpg", "red.webp", "red.gif", "red.bmp", "red.tiff" }) {
+        const std::vector<uint8_t> b = media_file(name);
+        REQUIRE(b.size() > 64);
+        for (size_t n : { (size_t)1, (size_t)8, (size_t)33, b.size() / 4, b.size() / 2,
+                          b.size() * 3 / 4, b.size() - 1 }) {
+            Frame f;
+            std::string why;
+            const int rc = decode_image(b.data(), n, int64_t(1) << 24, &f, &why);
+            const bool ok = rc == RAD_OK ? f.w == 32 && f.h == 32 && f.rgb.size() == 32 * 32 * 3
+                                         : rc < 0 && !why.empty();
+            if (!ok)
+                ::radtest::fail(__FILE__, __LINE__, std::string(name) + " cut to " +
+                                std::to_string(n) + " bytes: status " + std::to_string(rc) +
+                                ", " + std::to_string(f.w) + " x " + std::to_string(f.h));
+        }
+    }
+    const std::vector<uint8_t> mp4 = media_file("red-h264.mp4");
+    REQUIRE(mp4.size() > 64);
+    for (size_t n : { (size_t)64, mp4.size() / 4, mp4.size() / 2, mp4.size() * 3 / 4,
+                      mp4.size() - 1 }) {
+        Video v;
+        std::string why;
+        const int rc = decode_video(mp4.data(), n, first_and_last, nullptr, int64_t(1) << 24, &v,
+                                    &why);
+        bool ok = rc == RAD_OK ? !v.frames.empty() && v.frames.size() == v.index.size()
+                               : rc < 0 && !why.empty();
+        for (const Frame& f : v.frames) ok = ok && f.rgb.size() == (size_t)f.w * f.h * 3;
+        if (!ok)
+            ::radtest::fail(__FILE__, __LINE__, "red-h264.mp4 cut to " + std::to_string(n) +
+                            " bytes: status " + std::to_string(rc));
+    }
+
+    std::mt19937 rng(7);
+    std::vector<uint8_t> noise(1024);
+    for (uint8_t& c : noise) c = (uint8_t)rng();
+    const std::vector<uint8_t> sound = wav(tone(16000, 0.1, 440.0, 0.5), 1, 16000);
+    const std::vector<uint8_t> png = media_file("red.png");
+    Frame f;
+    Video v;
+    std::vector<float> a;
+    std::string why;
+    CHECK(decode_image(noise.data(), noise.size(), int64_t(1) << 24, &f, &why) < 0 && !why.empty());
+    why.clear();
+    CHECK(decode_video(noise.data(), noise.size(), first_and_last, nullptr, int64_t(1) << 24, &v,
+                       &why) < 0 && !why.empty());
+    why.clear();
+    CHECK(decode_audio(noise.data(), noise.size(), 16000, 1 << 20, &a, &why) < 0 && !why.empty());
+    why.clear();
+    CHECK_EQ(decode_image(png.data(), 0, int64_t(1) << 24, &f, &why), RAD_E_INVAL);
+    CHECK(!why.empty());
+    /* Each decoder admits only its own kind. */
+    why.clear();
+    CHECK(decode_image(sound.data(), sound.size(), int64_t(1) << 24, &f, &why) < 0 && !why.empty());
+    why.clear();
+    CHECK(decode_audio(png.data(), png.size(), 16000, 1 << 20, &a, &why) < 0 && !why.empty());
+}
+
+/* tests/data/media/quad.*: 33 x 17, red top left, green top right, blue bottom left, white bottom
+ * right, split at x = 16 and y = 8, written by Pillow (tests/mkimggolden.py). A decoder that
+ * flips the rows (BMP stores them bottom up), mirrors them, or takes the wrong stride on an odd
+ * width puts a wrong colour in some quadrant. JPEG is checked away from the edges, to a
+ * tolerance. */
+namespace {
+
+const uint8_t* quad_colour(int y, int x) {
+    static const uint8_t c[4][3] = { { 255, 0, 0 }, { 0, 255, 0 }, { 0, 0, 255 }, { 255, 255, 255 } };
+    return c[(y < 8 ? 0 : 2) + (x < 16 ? 0 : 1)];
+}
+
+}  /* namespace */
+
+TEST(pictures_decode_the_right_way_up_and_the_right_way_round) {
+    if (!decoder_available()) SKIP("no media decoder in this build");
+    struct F { const char* name; int tol, margin; };
+    for (const F& fx : { F{ "quad.png", 0, 0 }, F{ "quad.bmp", 0, 0 }, F{ "quad.webp", 0, 0 },
+                         F{ "quad.jpg", 12, 2 } }) {
+        const std::vector<uint8_t> b = media_file(fx.name);
+        REQUIRE(!b.empty());
+        Frame f;
+        std::string why;
+        CHECK_EQ(decode_image(b.data(), b.size(), int64_t(1) << 24, &f, &why), RAD_OK);
+        REQUIRE_EQ(f.rgb.size(), (size_t)33 * 17 * 3);
+        CHECK_EQ(f.w, 33);
+        CHECK_EQ(f.h, 17);
+        int bad = 0;
+        for (int y = 0; y < 17; ++y)
+            for (int x = 0; x < 33; ++x) {
+                if (std::abs(x - 16) < fx.margin || std::abs(y - 8) < fx.margin) continue;
+                const uint8_t* want = quad_colour(y, x);
+                const uint8_t* got = &f.rgb[((size_t)y * 33 + x) * 3];
+                for (int c = 0; c < 3; ++c) bad += std::abs((int)got[c] - (int)want[c]) > fx.tol;
+            }
+        if (bad) std::fprintf(stderr, "    %s: %d channel values off\n", fx.name, bad);
+        CHECK_EQ(bad, 0);
+    }
+}
+
+/* quad-alpha.png: the quadrants with alpha rising across columns as round(255 x / 32). The RGBA
+ * decode keeps it; the RGB decode drops it without compositing, as PIL's convert("RGB") does, so
+ * even a fully transparent column keeps its colour. */
+TEST(the_rgba_decode_keeps_alpha_and_the_rgb_decode_drops_it_uncomposited) {
+    if (!decoder_available()) SKIP("no media decoder in this build");
+    const std::vector<uint8_t> b = media_file("quad-alpha.png");
+    REQUIRE(!b.empty());
+    FrameRGBA fa;
+    Frame f;
+    std::string why;
+    CHECK_EQ(decode_image_rgba(b.data(), b.size(), int64_t(1) << 24, &fa, &why), RAD_OK);
+    CHECK_EQ(decode_image(b.data(), b.size(), int64_t(1) << 24, &f, &why), RAD_OK);
+    REQUIRE_EQ(fa.rgba.size(), (size_t)33 * 17 * 4);
+    REQUIRE_EQ(f.rgb.size(), (size_t)33 * 17 * 3);
+    int bad = 0;
+    for (int y = 0; y < 17; ++y)
+        for (int x = 0; x < 33; ++x) {
+            const uint8_t* want = quad_colour(y, x);
+            const size_t i = (size_t)y * 33 + x;
+            for (int c = 0; c < 3; ++c) {
+                bad += fa.rgba[i * 4 + c] != want[c];
+                bad += f.rgb[i * 3 + c] != want[c];
+            }
+            bad += fa.rgba[i * 4 + 3] != (uint8_t)std::lround(255.0 * x / 32.0);
+        }
+    CHECK_EQ(bad, 0);
+}
+
+/* What the images endpoint writes: png and lossless webp decode back to the same pixels; jpeg
+ * refuses alpha, and a format it does not write is refused by name. */
+TEST(lossless_encodes_decode_back_to_the_same_pixels) {
+    if (!decoder_available()) SKIP("no media decoder in this build");
+    const std::vector<uint8_t> rgb = pixels(2, 17, 33, 3), rgba = pixels(3, 17, 33, 4);
+    std::vector<uint8_t> file;
+    std::string why;
+    Frame f;
+    FrameRGBA fa;
+    REQUIRE_EQ(encode_image(rgb.data(), 33, 17, 3, "png", 0, &file, &why), RAD_OK);
+    CHECK_EQ(decode_image(file.data(), file.size(), int64_t(1) << 24, &f, &why), RAD_OK);
+    CHECK(f.rgb == rgb);
+    REQUIRE_EQ(encode_image(rgba.data(), 33, 17, 4, "png", 0, &file, &why), RAD_OK);
+    CHECK_EQ(decode_image_rgba(file.data(), file.size(), int64_t(1) << 24, &fa, &why), RAD_OK);
+    CHECK(fa.rgba == rgba);
+    REQUIRE_EQ(encode_image(rgb.data(), 33, 17, 3, "webp", 100, &file, &why), RAD_OK);
+    CHECK_EQ(decode_image(file.data(), file.size(), int64_t(1) << 24, &f, &why), RAD_OK);
+    CHECK(f.rgb == rgb);
+    REQUIRE_EQ(encode_image(rgb.data(), 33, 17, 3, "jpeg", 90, &file, &why), RAD_OK);
+    CHECK_EQ(decode_image(file.data(), file.size(), int64_t(1) << 24, &f, &why), RAD_OK);
+    CHECK_EQ(f.w, 33);
+    CHECK_EQ(f.h, 17);
+    CHECK_EQ(encode_image(rgba.data(), 33, 17, 4, "jpeg", 90, &file, &why), RAD_E_INVAL);
+    CHECK(has(why, "alpha"));
+    CHECK_EQ(encode_image(rgb.data(), 33, 17, 3, "gif", 0, &file, &why), RAD_E_INVAL);
+    CHECK(has(why, "png, jpeg, webp"));
+}
+
+/* Channels are averaged, not downmixed: media.h's choice, matching the reference loaders, where
+ * swresample's own downmix weights a stereo pair by 0.707. A 440 Hz tone at 0.5 in the left
+ * channel only is 0.25 in mono (0.354 downmixed), and the same tone in both channels stays 0.5
+ * (1.0 if summed). The rate conversion keeps the pitch and the length. */
+TEST(stereo_audio_is_averaged_to_mono_and_resampled) {
+    if (!decoder_available()) SKIP("no media decoder in this build");
+    const std::vector<int16_t> left = tone(44100, 1.0, 440.0, 0.5), silent(left.size(), 0);
+    for (const bool both : { false, true }) {
+        const std::vector<uint8_t> b = wav(interleave(left, both ? left : silent), 2, 44100);
+        std::vector<float> m;
+        std::string why;
+        REQUIRE_EQ(decode_audio(b.data(), b.size(), 16000, 1 << 20, &m, &why), RAD_OK);
+        CHECK(m.size() >= 15990 && m.size() <= 16010);
+        REQUIRE(m.size() >= 14000);
+        CHECK_NEAR(amplitude(m, 2000, 14000), both ? 0.5 : 0.25, both ? 0.005 : 0.0025);
+        /* 0.75 s of 440 Hz */
+        CHECK(std::abs(rising(m, 2000, 14000) - 330) <= 1);
+    }
+}
+
+/* Mono at the target rate is a format conversion only: every sample is the PCM value over 32768.
+ * max_samples cuts the clip there exactly, as the reference extractor truncates. */
+TEST(mono_audio_at_the_rate_passes_through_and_truncates_exactly) {
+    if (!decoder_available()) SKIP("no media decoder in this build");
+    std::vector<int16_t> s(4000);
+    for (size_t i = 0; i < s.size(); ++i)
+        s[i] = (int16_t)(uint16_t)(pix(9, 0, i, 0) | (pix(9, 0, i, 1) << 8));
+    const std::vector<uint8_t> b = wav(s, 1, 16000);
+    std::vector<float> m;
+    std::string why;
+    REQUIRE_EQ(decode_audio(b.data(), b.size(), 16000, 1 << 20, &m, &why), RAD_OK);
+    REQUIRE_EQ(m.size(), s.size());
+    int off = 0;
+    for (size_t i = 0; i < s.size(); ++i) off += m[i] != (float)s[i] / 32768.0f;
+    CHECK_EQ(off, 0);
+    std::vector<float> cut;
+    REQUIRE_EQ(decode_audio(b.data(), b.size(), 16000, 1000, &cut, &why), RAD_OK);
+    CHECK_EQ(cut.size(), (size_t)1000);
+    CHECK(std::equal(cut.begin(), cut.end(), m.begin()));
+}
+
+/* Qwen3-ASR's front end is the reference's, and its chunks are staged apart. Qwen3ASRFeatureExtractor
+ * (transformers 5.18) on the same two-tone signal: 23456 samples are 146 real frames, one whole
+ * chunk of 100 and one of 46, which the encoder keeps 13 and 6 rows of -- so 19 placeholders and
+ * 104 + 48 staged frames, the whole chunk's last four read as zero. 3000 samples are zero-padded to
+ * the extractor's 8000 first: 50 frames, 7 rows, and the padding's frames sit at the clip's floor
+ * (its maximum less 8, then (x + 4) / 4). */
+TEST(the_qwen3_asr_front_end_is_the_references) {
+    mm::AudioConfig c;
+    c.family = mm::AudioFamily::Qwen3ASR;
+    c.rate = 16000; c.frame_length = 400; c.hop = 160; c.fft = 400; c.n_mels = 128;
+    c.min_freq = 0.0; c.max_freq = 8000.0; c.min_samples = 8000; c.chunk = 100;
+    c.tok_audio = 151676; c.tok_start = 151669; c.tok_end = 151670;
+    c.merge = 8; c.max_frames = 3120;
+    mm::Processor p;
+    CHECK_EQ(p.init_audio(c), RAD_OK);
+    CHECK_EQ(p.audio_config().max_samples, (int64_t)480000);
+    auto tone = [](int n) {
+        std::vector<float> x((size_t)n);
+        for (int i = 0; i < n; ++i) {
+            const float t = (float)i / 16000.0f;
+            x[(size_t)i] = 0.5f * std::sin(2.0f * 3.14159265358979f * 440.0f * t) +
+                           0.25f * std::sin(2.0f * 3.14159265358979f * 3000.0f * t);
+        }
+        return x;
+    };
+    struct Want { int frame, bin; float v; };
+    auto staged_at = [](int frame) { return (frame / 100) * 104 + frame % 100; };
+    std::shared_ptr<mm::Item> it;
+    std::string why;
+
+    CHECK_EQ(p.audio_from(tone(23456), &it, &why), RAD_OK);
+    CHECK(it != nullptr);
+    if (!it) return;
+    CHECK_EQ(it->valid, 146);
+    CHECK_EQ(it->seg_rows, 19);
+    CHECK_EQ(it->grid_h, 152);
+    CHECK_EQ(it->n_seg, 1);
+    CHECK_EQ(it->expand.size(), (size_t)21);
+    CHECK_EQ(it->expand.front(), 151669);
+    CHECK_EQ(it->expand[1], 151676);
+    CHECK_EQ(it->expand.back(), 151670);
+    const Want want[] = { { 0, 18, 0.7657754421234131f }, { 1, 18, 1.4826123714447021f },
+                          { 50, 17, 1.3374924659729004f }, { 50, 18, 1.4853556156158447f },
+                          { 50, 88, 1.16568124294281f }, { 99, 88, 1.1656821966171265f },
+                          { 100, 18, 1.485356092453003f }, { 145, 18, 1.485353708267212f },
+                          { 145, 89, -0.5146430730819702f }, { 144, 19, 1.2752504348754883f },
+                          { 70, 0, -0.5146430730819702f } };
+    for (const Want& w : want) {
+        const float got = rad_bf16_to_f32(it->pixels[(size_t)(staged_at(w.frame) * 128 + w.bin)]);
+        CHECK_NEAR(got, w.v, 0.008f * std::max(1.0f, std::fabs(w.v)));
+    }
+    /* The whole chunk's alignment frames are zeros and read as zero; the next chunk reads from its
+     * first frame; the last chunk's padding past its 46 real frames is the reference's zeros. */
+    for (int f = 100; f < 104; ++f)
+        for (int b = 0; b < 128; ++b) CHECK_EQ(it->pixels[(size_t)(f * 128 + b)], 0);
+    std::vector<int32_t> planes(4 * 152);
+    it->coords(0, 152, planes.data());
+    for (int f = 0; f < 152; ++f) {
+        CHECK_EQ(planes[(size_t)f], f);
+        CHECK_EQ(planes[(size_t)(152 + f)], (f >= 100 && f < 104) ? 0 : 1);
+        CHECK_EQ(planes[(size_t)(2 * 152 + f)], 146);
+        CHECK_EQ(planes[(size_t)(3 * 152 + f)], 152);
+    }
+    for (int f = 104 + 46; f < 152; ++f) CHECK_EQ(it->pixels[(size_t)(f * 128 + 18)], 0);
+
+    CHECK_EQ(p.audio_from(tone(3000), &it, &why), RAD_OK);
+    CHECK_EQ(it->valid, 50);
+    CHECK_EQ(it->seg_rows, 7);
+    CHECK_EQ(it->grid_h, 56);
+    const Want short_want[] = { { 0, 18, 0.7657754421234131f }, { 1, 18, 1.4826123714447021f },
+                                { 49, 18, -0.5146448612213135f }, { 49, 89, -0.5146448612213135f },
+                                { 48, 19, -0.5146448612213135f } };
+    for (const Want& w : short_want) {
+        const float got = rad_bf16_to_f32(it->pixels[(size_t)(w.frame * 128 + w.bin)]);
+        CHECK_NEAR(got, w.v, 0.008f * std::max(1.0f, std::fabs(w.v)));
+    }
+    /* Longer than one pass is refused, not cut: the reference does not truncate. */
+    CHECK_EQ(p.audio_from(std::vector<float>(480001, 0.0f), &it, &why), RAD_E_INVAL);
+    CHECK(why.find("longer than one audio encoder pass") != std::string::npos);
+}
+
+/* The FFT a front end runs is one it has: Qwen3-ASR's mixed radix takes any length, a power of
+ * two included, and puts a tone in the same mel bin at 512 points as at 400; Gemma 4's radix-2
+ * transform refuses a length that is not a power of two, by name. */
+TEST(each_audio_front_end_runs_its_fft_at_any_length_it_takes) {
+    auto qwen = [](int32_t fft) {
+        mm::AudioConfig c;
+        c.family = mm::AudioFamily::Qwen3ASR;
+        c.rate = 16000; c.frame_length = fft; c.hop = 160; c.fft = fft; c.n_mels = 128;
+        c.min_freq = 0.0; c.max_freq = 8000.0; c.min_samples = 8000; c.chunk = 100;
+        c.tok_audio = 151676; c.tok_start = 151669; c.tok_end = 151670;
+        c.merge = 8; c.max_frames = 3120;
+        return c;
+    };
+    std::vector<float> x(16000);
+    for (size_t i = 0; i < x.size(); ++i)
+        x[i] = 0.5f * std::sin(2.0f * 3.14159265358979f * 440.0f * (float)i / 16000.0f);
+    int peak[2] = { -1, -1 };
+    for (int k = 0; k < 2; ++k) {
+        mm::Processor p;
+        std::string why;
+        REQUIRE_EQ(p.init_audio(qwen(k ? 512 : 400), &why), RAD_OK);
+        std::shared_ptr<mm::Item> it;
+        REQUIRE_EQ(p.audio_from(x, &it, &why), RAD_OK);
+        REQUIRE(it != nullptr);
+        /* Frame 50, away from both ends of the clip. */
+        float best = -1e30f;
+        for (int b = 0; b < 128; ++b) {
+            const float v = rad_bf16_to_f32(it->pixels[(size_t)(50 * 128 + b)]);
+            CHECK(std::isfinite(v));
+            if (v > best) { best = v; peak[k] = b; }
+        }
+    }
+    CHECK(peak[0] > 0);
+    CHECK_EQ(peak[1], peak[0]);
+
+    mm::AudioConfig g;
+    g.rate = 16000; g.frame_length = 320; g.hop = 160; g.fft = 400; g.n_mels = 128;
+    g.min_freq = 0.0; g.max_freq = 8000.0; g.mel_floor = 1e-3; g.max_samples = 480000;
+    g.tok_audio = 258881; g.tok_start = 256000; g.tok_end = 258883;
+    g.merge = 4; g.max_frames = 3000;
+    mm::Processor p;
+    std::string why;
+    CHECK_EQ(p.init_audio(g, &why), RAD_E_UNSUPPORTED);
+    CHECK(why.find("not a power of two") != std::string::npos);
+    CHECK(!p.has_audio());
+}
+
+/* A whole chunk keeps 13 rows: three convolutions of kernel 3, stride 2, padding 1 -- and the
+ * chunk shorter than that keeps what the reference's _post_cnn_length gives it. */
+TEST(a_chunk_keeps_the_rows_three_convolutions_leave) {
+    CHECK_EQ(mm::AudioConfig::chunk_rows(100), 13);
+    CHECK_EQ(mm::AudioConfig::chunk_rows(97), 13);
+    CHECK_EQ(mm::AudioConfig::chunk_rows(96), 12);
+    CHECK_EQ(mm::AudioConfig::chunk_rows(46), 6);
+    CHECK_EQ(mm::AudioConfig::chunk_rows(1), 1);
+    CHECK_EQ(mm::AudioConfig::chunk_rows(0), 0);
+}
+
+/* A stream resamples as one piece would, and cleanly: a tone under the lower Nyquist frequency
+ * comes through at its frequency and level, one over it is taken out rather than folded back, a
+ * constant stays that constant, and pushing the stream in pieces changes no sample. */
+TEST(a_resampled_stream_is_its_tone_whether_pushed_whole_or_in_pieces) {
+    auto tone = [](double hz, int32_t rate, size_t n) {
+        std::vector<float> x(n);
+        for (size_t i = 0; i < n; ++i)
+            x[i] = (float)(0.5 * std::sin(2.0 * M_PI * hz * (double)i / rate));
+        return x;
+    };
+    const std::vector<float> in = tone(1000.0, 24000, 24000);
+    mm::Resampler whole(24000, 16000), parts(24000, 16000);
+    std::vector<float> a, b;
+    whole.push(in.data(), in.size(), &a);
+    whole.flush(&a);
+    for (size_t i = 0, k = 1; i < in.size(); i += k, k = k % 997 + 13)
+        parts.push(in.data() + i, std::min(k, in.size() - i), &b);
+    parts.flush(&b);
+    CHECK_EQ(a.size(), (size_t)16000);
+    CHECK(a == b);
+    const std::vector<float> want = tone(1000.0, 16000, 16000);
+    double err = 0.0;
+    for (size_t i = 200; i < 15800; ++i) err = std::max(err, (double)std::fabs(a[i] - want[i]));
+    CHECK(err < 2e-3);
+
+    /* 10 kHz is past 16 kHz's Nyquist frequency: gone, not folded back to 6 kHz. */
+    const std::vector<float> high = tone(10000.0, 24000, 24000);
+    mm::Resampler down(24000, 16000);
+    std::vector<float> c;
+    down.push(high.data(), high.size(), &c);
+    down.flush(&c);
+    double rms = 0.0;
+    for (size_t i = 200; i + 200 < c.size(); ++i) rms += (double)c[i] * c[i];
+    rms = std::sqrt(rms / (double)(c.size() - 400));
+    CHECK(rms < 0.005);   /* it went in at 0.35 */
+
+    /* Up from 8 kHz: a constant is that constant, and the length doubles. */
+    const std::vector<float> dc(4000, 0.25f);
+    mm::Resampler up(8000, 16000);
+    std::vector<float> u;
+    up.push(dc.data(), dc.size(), &u);
+    up.flush(&u);
+    CHECK_EQ(u.size(), (size_t)8000);
+    for (size_t i = 100; i < 7900; ++i) CHECK_NEAR(u[i], 0.25f, 1e-4f);
+
+    mm::Resampler same(16000, 16000);
+    std::vector<float> p;
+    same.push(in.data(), 100, &p);
+    CHECK(std::equal(p.begin(), p.end(), in.begin()) && p.size() == 100);
+    CHECK(mm::Resampler::takes(24000) && mm::Resampler::takes(44100));
+    CHECK(!mm::Resampler::takes(23999));
 }
 
 RAD_TEST_MAIN()

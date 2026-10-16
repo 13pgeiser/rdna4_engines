@@ -2,11 +2,10 @@
  *
  * ============================== WHAT IT IS ==============================
  *
- * rad_block_dflash2.h WITHOUT THE TWO THINGS DFLASH2 ADDED: the per-layer dynamic convolutions
- * around attention and the feed-forward, and the candidate selector that walks a path through the
- * block. What is left is the original DFlash: a small Qwen3-shaped transformer that denoises one
- * anchor token plus `block - 1` mask tokens in ONE forward and reads every position's argmax off
- * the TARGET's lm_head.
+ * rad_block_dflash2.h without DFlash2's additions (the per-layer dynamic convolutions around
+ * attention and the feed-forward, and the candidate selector). The original DFlash is a small
+ * Qwen3-shaped transformer that denoises one anchor token plus `block - 1` mask tokens in one
+ * forward and takes every position's argmax from the target's lm_head.
  *
  *     context pass, one row a committed token:
  *         c = hidden_norm(fc(concat of the trunk's residual stream at target_layer_ids)))
@@ -17,57 +16,55 @@
  *         for each layer:
  *             h = input_layernorm(x)
  *             q, k, v = q_proj(h), k_proj(h), v_proj(h);  q_norm, k_norm;  rope;  kv_store
- *             x += o_proj(attention(q, cache))        sliding layers CAUSAL over a 2048 window,
- *                                                     the full layer NON-causal over everything
+ *             x += o_proj(attention(q, cache))        sliding layers causal over a 2048 window,
+ *                                                     the full layer non-causal over everything
  *             x += down(silu(gate(h')) * up(h')),  h' = post_attention_layernorm(x)
  *         x = norm(x)
- *         over the mask rows: logits = lm_head(x) [the TARGET's];  draft = argmax
+ *         over the mask rows: logits = lm_head(x) [the target's];  draft = argmax
  *
  * ============================== THE THREE GEMMA-SPECIFIC FACTS ==============================
  *
- * They are vLLM PR #41703's, and each one costs acceptance and nothing else when it is wrong --
- * every draft is verified against the trunk, so the model's output never depends on any of them.
+ * From vLLM PR #41703. Getting any of them wrong costs only acceptance, since every draft is
+ * verified against the trunk.
  *
- *   THE EMBEDDING IS SCALED. Gemma multiplies its token embedding by sqrt(hidden_size), stored as a
- *   bf16 (53.0 at 2816), and the drafter was trained reading the target's embedding module, which
+ *   The embedding is scaled. Gemma multiplies its token embedding by sqrt(hidden_size), stored as
+ *   bf16 (53.0 at 2816), and the drafter was trained through the target's embedding module, which
  *   applies it. `embed_lookup`'s `mult` carries it.
  *
- *   THE SLIDING LAYERS ARE CAUSAL AND THE FULL LAYER IS NOT. The checkpoint's `layer_types` names
- *   four sliding layers and one full one; the PR's own test pins `causal True` on the sliding
- *   layers and `False` on the full one. So this block declares TWO attention ops and issues the
- *   one each layer's type names.
+ *   The sliding layers are causal and the full layer is not. The checkpoint's `layer_types` names
+ *   four sliding layers and one full one, and the PR's test pins `causal True` on the sliding
+ *   layers and `False` on the full one, so this block declares two attention ops and issues the one
+ *   each layer's type names.
  *
- *   THE LOGITS ARE SOFT-CAPPED, and that is ignored on purpose: the draft is an argmax, and
- *   cap * tanh(x / cap) is strictly increasing, so it cannot move one.
+ *   The logits are soft-capped, which is deliberately ignored: the draft is an argmax, and
+ *   cap * tanh(x / cap) is strictly increasing.
  *
  * ============================== THE HEAD ==============================
  *
  * The target's own head, read in bf16 by an ordinary `gemm_nt` over the gathered mask rows. Gemma
- * ties it to the embedding, so it is the same weight the trunk's `embed_lookup` and `logits_gemm`
- * read: no extra bytes are stored. It is vocab-sharded with the trunk, so the top-1 runs over this
- * rank's slice and the ranks' candidates are merged exactly (`row_topk` at R = 2 -> `all_gather` ->
+ * ties it to the embedding, so it is the weight the trunk's `embed_lookup` and `logits_gemm` read
+ * and costs no extra bytes. It is vocab-sharded with the trunk: the top-1 runs over this rank's
+ * slice and the ranks' candidates merge exactly (`row_topk` at R = 2 -> `all_gather` ->
  * `pair_argmax`; R = 2 because the gather moves 16-byte rows, see kTopR).
  *
- * Reading the bf16 head every draft pass is the expensive way to do it -- 262144 x 2816 x 2 bytes
- * over the ranks, 566 us of a 26B-A4B decode step at tp 4 (--profile-ops, 4x R9700), the widest
- * read on the draft path. So where the CONTAINER holds a block-fp8 copy of the table under a name
- * of its own -- `dflash.draft_head.weight`, one checkpoint tensor and two logical weights, as
- * rad_block_dflash2.h does it, made by a recipe line
+ * The bf16 head (262144 x 2816 x 2 bytes) is the widest read on the draft path, about 566 us of a
+ * 26B-A4B decode step at tp 4 on 4x R9700. So where the container holds a block-fp8 copy of the
+ * table under its own name, `dflash.draft_head.weight` (one checkpoint tensor, two logical
+ * weights, as in rad_block_dflash2.h), made by the recipe line
  *
  *     dflash.draft_head.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16
  *
- * -- the head is `gemm_nt_q` over that copy at fp8a8, half the bytes, and the argmax is taken over
- * its coarser logits. Every draft is still verified, so the copy can change what is proposed and
- * never what is accepted; draft_n_accepted is what says whether it proposes worse. A container
- * without it, or with it in any other encoding, reads the bf16 table as before. The copy costs
- * half the table's bytes again, 176 MiB a rank at tp 4. No rerank against the bf16 table yet:
- * DFlash2's needs the target's head in fp8 or int8, which a tied Gemma head is not.
+ * the head is `gemm_nt_q` over that copy at fp8a8, half the bytes, with the argmax over its
+ * coarser logits. Drafts are still verified, so the copy can change proposals but never accepted
+ * text. Without the copy, or in another encoding, the bf16 table is read. The copy costs half the
+ * table's bytes again (176 MiB per rank at tp 4). There is no rerank against the bf16 table:
+ * DFlash2's rerank needs the target's head in fp8 or int8, which a tied Gemma head is not.
  *
  * ============================== THE LINEARS ARE FP8 ==============================
  *
- * The same as DFlash2 and for the same reason -- the drafter is read whole on every decode step --
- * so the container must be converted with a recipe that makes the six linears block fp8 (or
- * MXFP4). declare() refuses a bf16 one by name rather than letting the loader fail on a view.
+ * As in DFlash2, since the drafter is read whole on every decode step: the container must be
+ * converted with a recipe that makes the six linears block fp8 (or MXFP4). declare() refuses a bf16
+ * one by name rather than letting the loader fail on a view.
  */
 #ifndef GEMMA4_DFLASH_H
 #define GEMMA4_DFLASH_H
@@ -82,8 +79,8 @@ namespace gemma4 {
 
 using namespace rad::arch;
 
-/* Block fp8 as libr4d's fp8a8 GEMMs read it: fp8_e4m3 codes, a bf16 scale a 128x128 block, no
- * transform -- a recipe's `rtn codes=fp8_e4m3 block=128x128 scale=bf16`. */
+/* Block fp8 as libr4d's fp8a8 GEMMs read it: fp8_e4m3 codes, a bf16 scale per 128x128 block, no
+ * transform (a recipe's `rtn codes=fp8_e4m3 block=128x128 scale=bf16`). */
 inline bool block_fp8_128(const RadEncoding& e) {
     const RadEncPlane* sc = rad_enc_plane(&e, "scale");
     return rad_enc_is(&e, "affine") && e.n_planes == 2 && !e.transform[0] &&
@@ -96,7 +93,7 @@ struct Dflash1 {
 
     struct Config {
         int64_t n_taps = 0;      /* how many trunk layers `fc` concatenates */
-        int64_t block  = 0;      /* query rows a sequence: the anchor plus block - 1 masks */
+        int64_t block  = 0;      /* query rows per sequence: the anchor plus block - 1 masks */
         int64_t window = 0;      /* the sliding layers' window; 0 for none */
         int     full[MAX_LAYERS] = {};   /* 1: a full-attention (non-causal, unwindowed) layer */
         double  escale = 1.0;    /* the target's embedding scale, rounded as the target holds it */
@@ -114,13 +111,13 @@ struct Dflash1 {
         rad_buf attn = 0, atq = 0, ats = 0;    /* [qrows, q_dim] */
         rad_buf gate_up = 0;                   /* [qrows, 2 * n_ff] */
         rad_buf ffn = 0, ffq = 0, ffs = 0;     /* [qrows, n_ff] */
-        /* the head, one row a draft position */
+        /* the head, one row per draft position */
         rad_buf sel_h = 0;                     /* [srows, n_embd] */
         rad_buf selq = 0, sels = 0;            /* [srows, n_embd] e4m3 | f32, the fp8 head's */
         rad_buf dlog = 0;                      /* [srows, n_vocab on this rank] bf16 */
         rad_buf cand = 0, unary = 0;           /* [srows, kTopR] i32 | f32 -- this rank's best */
         rad_buf dpair = 0, dgath = 0;          /* [srows, kTopR, 2] | [srows, world * kTopR, 2] f32 */
-        rad_buf tokens = 0;                    /* [srows, 1] i32: THE DRAFT, pitch `steps` */
+        rad_buf tokens = 0;                    /* [srows, 1] i32: the draft, pitch `steps` */
     };
 
     Geom    g{};          /* the drafter's geometry */
@@ -133,7 +130,7 @@ struct Dflash1 {
 
     DenseFP8   w_fc{};
     rad_weight w_hnorm = 0, w_norm = 0;
-    rad_weight w_tok = 0;                     /* the TARGET's table: embedding AND head */
+    rad_weight w_tok = 0;                     /* the target's table: embedding and head */
     DenseFP8   w_dh{};                        /* its block-fp8 copy, the head where it is stored */
     bool       fp8_head = false;
     rad_weight w_anorm[MAX_LAYERS] = {}, w_fnorm[MAX_LAYERS] = {};
@@ -146,10 +143,10 @@ struct Dflash1 {
 
     rad_op op_embed = 0, op_embed_ar = 0, op_qh = 0, op_qat = 0, op_qff = 0;
     rad_op op_anorm[MAX_LAYERS] = {}, op_fnorm[MAX_LAYERS] = {};
-    /* THE RESIDUAL ADD, THE NORM AND THE QUANTISER IN ONE LAUNCH where `rmsnorm_quant_fp8` is
-     * served (libr4d): op_anq[i] the attention input's -- layer 0's with no add, x as the
-     * embedding left it -- and op_fnq[i] the feed-forward input's. Zero where it is not, and the
-     * `add` / `rmsnorm` / `quant_act_fp8` chain is issued instead. */
+    /* The residual add, norm and quantiser in one launch where `rmsnorm_quant_fp8` is served
+     * (libr4d): op_anq[i] for the attention input (layer 0's without the add) and op_fnq[i] for
+     * the feed-forward input. Zero where not served; the `add` / `rmsnorm` / `quant_act_fp8` chain
+     * is issued instead. */
     rad_op op_anq[MAX_LAYERS] = {}, op_fnq[MAX_LAYERS] = {};
     rad_op op_qp[MAX_LAYERS] = {}, op_kp[MAX_LAYERS] = {}, op_vp[MAX_LAYERS] = {};
     rad_op op_op[MAX_LAYERS] = {}, op_qn[MAX_LAYERS] = {}, op_kn[MAX_LAYERS] = {};
@@ -158,10 +155,10 @@ struct Dflash1 {
     rad_op op_act = 0, op_ar = 0, op_add = 0, op_final = 0;
     rad_op op_gather = 0, op_qsel = 0, op_head = 0, op_topk = 0, op_dgather = 0, op_pick = 0;
 
-    /* CANDIDATES A RANK CONTRIBUTES under a sharded head. The draft needs one, but the gather moves
-     * whole 16-byte words a row and an (int32 id, f32 value) pair is 8 bytes, so R = 1 is refused at
-     * launch ("shape this kernel does not serve") -- the bound rad_block_mtp_hc.h states. Two pairs
-     * are one word; `pair_argmax` reduces the world * 2 of them to the global top-1. */
+    /* Candidates each rank contributes under a sharded head. The draft needs one, but the gather
+     * moves whole 16-byte words per row and an (int32 id, f32 value) pair is 8 bytes, so R = 1 is
+     * refused at launch (as rad_block_mtp_hc.h states). Two pairs make one word; `pair_argmax`
+     * reduces the world * 2 of them to the global top-1. */
     static constexpr int64_t kTopR = 2;
 
     static bool head_sharded(const Geom& g) { return vocab_head_sharded(g); }
@@ -175,9 +172,9 @@ struct Dflash1 {
 private:
     int64_t q_dim()  const { return g.n_head * g.head_dim; }
     int64_t kv_dim() const { return g.n_head_kv * g.head_dim; }
-    /* The six linears must be what the recipe made them. DenseFP8 declares E4M3 (or MXFP4) views
-     * whatever the container holds, and the loader's complaint about a bf16 weight read through an
-     * fp8 view names the view, not the missing recipe. */
+    /* The six linears must be quantised by the recipe. DenseFP8 declares E4M3 (or MXFP4) views
+     * whatever the container holds, and the loader's error for a bf16 weight read through an fp8
+     * view would name the view, not the missing recipe. */
     static int need_quantised(RadBuilder* b, const char* wn) {
         RadEncoding e{};
         if (!weight_enc(b, wn, &e) || e.n_planes <= 0) return RAD_OK;   /* nothing to ask yet */
@@ -246,8 +243,8 @@ inline int Dflash1::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                             RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, gl);
         w_kn[i]    = decl_w(b, nm.f("dflash.blk.%d.attn_k_norm.weight", i), RAD_F32, {g.head_dim},
                             RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, gl);
-        /* The declared names are rad_block_dflash2.h's, deliberately: the recipe that quantises a
-         * DFlash2 drafter's linears names exactly these, so one recipe serves both drafters. */
+        /* The declared names match rad_block_dflash2.h's, so one recipe quantises both
+         * drafters. */
         RAD_ARCH_TRY(w_q[i].declare(b, nm, nm.f("dflash.blk.%d.attn_q", i), qd, g.n_embd,
                                     RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW, gl,
                                     { nm.ckpt("%s.layers.%d.self_attn.q_proj.weight", ck, i) }));
@@ -274,8 +271,8 @@ inline int Dflash1::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
     }
 
     /* ---------------------------------------------------------------- attention: two kinds
-     * Declared before either kv_store: `block_size` is read back off the resolved kernel. Both
-     * read the one KV group, so whichever resolves first answers for it. */
+     * Declared before either kv_store, which reads `block_size` back from the resolved kernel.
+     * Both read the one KV group, so whichever resolves first answers for it. */
     auto attn = [&](int causal, int64_t window) {
         return rw(b, RAD_OP(b, "attn_paged",
                      RAD_PARAMS(RAD_RANGE("q_len", 1, cfg.block), RAD_INT("head_dim", g.head_dim),
@@ -366,10 +363,9 @@ inline int Dflash1::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                    RAD_NOWEIGHTS),
                {w.ffn}, {w.ffq, w.ffs});
 
-    /* x's norm under `gain`, quantised into hq|hs, in one launch; with `add` the fused_add_rms_norm
-     * form, x += h first. The row is the chain's function exactly -- the norm of the bf16-rounded
-     * sum, the codes of the bf16-rounded norm (libr4d/r4d_rows.cpp) -- and a draft is verified
-     * whatever it is. */
+    /* x's norm under `gain`, quantised into hq|hs, in one launch; with `add`, the
+     * fused_add_rms_norm form (x += h first). It computes exactly the chain's result: the norm of
+     * the bf16-rounded sum and the codes of the bf16-rounded norm (libr4d/r4d_rows.cpp). */
     auto norm_quant = [&](rad_weight gain, bool add) -> rad_op {
         const rad_op h = RAD_OP(b, "rmsnorm_quant_fp8",
                                 RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", g.n_embd),
@@ -412,8 +408,8 @@ inline int Dflash1::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                         {w.x}, {w.h});
         op_fnq[i] = norm_quant(w_fnorm[i], true);
         op_gu[i] = w_gu[i].gemm(b, qrows, 2 * g.n_ff, g.n_embd, {w.hq, w.hs}, {w.gate_up});
-        /* The gate_up|silu|quant fold where it resolves, the pair where it does not --
-         * rad_block_dflash2.h's rule, band included. */
+        /* The gate_up|silu|quant fold where it resolves, else the pair (rad_block_dflash2.h's
+         * rule, band included). */
         {
             const int64_t hi = qrows < 64 ? qrows : 64;
             if (hi > 0 && !w_gu[i].mx) {
@@ -476,20 +472,20 @@ inline int Dflash1::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                  {w.x}, {w.h});
 
     /* ---------------------------------------------------------------- the head
-     * The MASK rows -- offsets 1..block-1 of each block; the core names them through out_ids --
-     * gathered contiguous, projected onto THIS RANK's slice of the target's vocabulary, and the
-     * argmax taken. Sharded, each rank's best kTopR are reported as global ids with their logits,
-     * all-gathered, and reduced to the global top-1 by `pair_argmax`, ties to the lower id -- exact,
-     * since the global winner is its own shard's first. */
+     * The mask rows (offsets 1..block-1 of each block, named by out_ids) are gathered contiguous,
+     * projected onto this rank's slice of the target's vocabulary, and the argmax taken. Sharded,
+     * each rank reports its best kTopR as global ids with logits; these are all-gathered and
+     * reduced to the global top-1 by `pair_argmax` (ties to the lower id), which is exact since the
+     * global winner is its own shard's first. */
     op_gather = rw(b, RAD_OP(b, "gather_rows",
                       RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("n", g.n_embd),
                                  RAD_STR("dtype", g.dtype)),
                       RAD_NOWEIGHTS),
                   {w.h}, {w.sel_h});
-    /* THE FP8 COPY, where the container holds one (see the top of this file). The name map comes
-     * first -- it is how the encoding is looked up -- and a map whose weight is never declared is
-     * written by nothing: rad-convert walks the declared weights. The copy is row-sharded exactly
-     * as the table is, so this rank's rows are the same vocabulary slice and `vocab_off` holds. */
+    /* The fp8 copy, where the container holds one (see the file header). The name map comes first
+     * since it is how the encoding is looked up; rad-convert writes only declared weights. The
+     * copy is row-sharded like the table, so this rank's rows are the same vocabulary slice and
+     * `vocab_off` holds. */
     const char* dhn = nm.f("dflash.draft_head.weight");
     RAD_ARCH_TRY(map_copy(b, dhn, tok_src));
     RadEncoding he{};
@@ -530,7 +526,7 @@ inline int Dflash1::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                    RAD_STR("dtype", g.dtype)),
                         RAD_NOWEIGHTS),
                     {w.dlog}, {w.cand, w.unary, w.dpair});
-        /* ROW-INTERLEAVED, so one draft position's pairs from every rank land side by side. */
+        /* Row-interleaved, so one draft position's pairs from every rank land side by side. */
         op_dgather = rw(b, RAD_OP(b, "all_gather",
                            RAD_PARAMS(RAD_INT("world_size", g.world),
                                       RAD_INT("numel", srows * kTopR * 2), RAD_STR("dtype", "f32"),

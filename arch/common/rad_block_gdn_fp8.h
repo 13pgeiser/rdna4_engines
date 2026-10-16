@@ -1,46 +1,35 @@
 /* rad_block_gdn_fp8.h -- the gated-delta-net block with block-scaled FP8 projections.
  *
- * THE ARCHITECTURE IS rad_block_gdn.h's AND IS DOCUMENTED THERE: that `A_log` is a log and the
- * kernels take the exponent themselves, that q and k are L2-normalised rather than RMS-normalised
- * and that this happens inside the conv/recurrent kernels, why the prefill and decode paths are two
- * declared sequences and why that is not the branch spec §2.4 forbids, and why both take
- * `num_accepted`. None of it changes with the weight format.
+ * The architecture (A_log convention, in-kernel L2 norm of q and k, the two declared paths,
+ * `num_accepted`) is documented in rad_block_gdn.h and does not change with the weight format.
  *
- * ============================== a AND b SPLIT OUT; z DOES NOT ==============================
+ * ============================== a AND b SPLIT OUT; z FUSED ==============================
  *
- * rad_block_gdn.h fuses in_proj_qkv, in_proj_a and in_proj_b into ONE weight and one GEMM, because
- * [q|k|v|a|b] is the row gdn_conv_prep reads. THAT FUSION IS NOT AVAILABLE HERE, and the reason is
- * the checkpoint rather than a limitation:
+ * rad_block_gdn.h fuses in_proj_qkv, in_proj_a and in_proj_b into one weight. Here the
+ * checkpoint prevents it:
  *
  *   in_proj_qkv.weight   F8_E4M3 [10240, 5120]   with weight_scale_inv [80, 40]
  *   in_proj_z.weight     F8_E4M3 [ 6144, 5120]   with weight_scale_inv [48, 40]
  *   in_proj_a.weight     BF16    [48, 5120]      -- no scale plane
  *   in_proj_b.weight     BF16    [48, 5120]      -- no scale plane
  *
- * a and b emit ONE COLUMN PER VALUE HEAD, 48 of them, and 48 is not a whole 128-row scale block --
- * so the quantiser that produced this checkpoint left them in bf16, and no concatenation of an
- * E4M3 tensor with a BF16 one is a tensor. They become a second, tiny bf16 `gemm_nt`: [96, 5120],
- * 0.5% of the layer's projection bytes, and the price of it is one extra launch.
+ * a and b have one row per value head (48, not a whole 128-row block), so the quantiser left them
+ * bf16 and they cannot be concatenated with E4M3 tensors. They become a separate small bf16
+ * `gemm_nt` ([96, 5120], 0.5% of the layer's projection bytes). gdn_conv_prep and
+ * gdn_recurrent_update take a and b as separate operands in both blocks (column views of the
+ * fused row there, of their own buffer here); libref sizes its `x` read as
+ * `conv_dim + (a present ? 0 : 2*H)` for this case.
  *
- * a and b are separate operands of gdn_conv_prep and gdn_recurrent_update in both blocks -- the
- * bf16 block passes them as column views of the fused row, this one as column views of their own
- * buffer -- so nothing downstream changes shape. Ref sizes its `x` read as
- * `conv_dim + (a present ? 0 : 2*H)` for precisely this case.
- *
- * THE OUTPUT GATE IS THE OPPOSITE CASE and it IS fused, into `ssm_inz`: in_proj_z is E4M3 with its
- * own scale plane, its rows are a whole number of blocks, and it reads the same normed activation.
- * So [q|k|v|z] is one weight, one launch and the same bytes -- see declare() for why one call is
- * cheaper than two. What that costs is that `w.in.x` is conv_dim + v_dim wide, and the convolution
- * and the gate are COLUMN VIEWS of it rather than buffers of their own: gdn_conv_prep,
- * gdn_conv_update and gdn_recurrent_update all take a row pitch on the operand concerned.
+ * The output gate is fused instead, into `ssm_inz`: in_proj_z is E4M3 with whole scale blocks and
+ * reads the same normed activation, so [q|k|v|z] is one weight and one launch. `w.in.x` is then
+ * conv_dim + v_dim wide, and the convolution input and the gate are column views of it; the
+ * consuming kernels all take a row pitch.
  *
  * ============================== THE OUT-PROJECTION'S INPUT IS RANK 3 ==============================
  *
- * `o` is [tokens, value heads, head width] because libr4d's chunk-scan and recurrent kernels
- * require rank 3 there, and it is the out-projection's activation -- so the quantiser has to accept
- * it. It does: rows are dim 0 and everything after is the row, which is the reading r4d_row_pitch
- * already takes and which the consuming GEMM's K forces. Reading it as one row per HEAD would put a
- * scale on a grid the GEMM does not read.
+ * `o` is [tokens, value heads, head width] because libr4d's chunk-scan and recurrent kernels need
+ * rank 3. The quantiser reads dim 0 as rows and the rest as the row (as r4d_row_pitch does and
+ * the GEMM's K requires); one row per head would put scales on a grid the GEMM does not read.
  */
 #ifndef RAD_BLOCK_GDN_FP8_H
 #define RAD_BLOCK_GDN_FP8_H
@@ -48,15 +37,14 @@
 #include "rad_fp8.h"
 
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
 
 namespace rad {
 namespace arch {
 
 struct GdnFP8 {
-    /* The same geometry the bf16 block takes, with one addition: `ab_dim` is what the split costs
-     * in declared width, and it is 2 * n_head_v. */
+    /* The bf16 block's geometry plus the gate activation, uneven head splits, and `ab_dim`
+     * (2 * n_head_v), the width of the separate a|b projection. */
     struct Config {
         int64_t n_head_k   = 0;
         int64_t head_k     = 0;
@@ -64,19 +52,15 @@ struct GdnFP8 {
         int64_t head_v     = 0;
         int64_t conv_width = 4;
         int64_t chunk      = 64;
-        /* THE OUTPUT GATE'S ACTIVATION, and it is a CHECKPOINT PROPERTY rather than a family
-         * one. `RMSNormGated` defaults to silu and every Qwen3.5/3.6 release leaves it there,
-         * but Qwen4-Exp states `output_gate_type: "sigmoid"` and means it -- a gate of
-         * sigmoid(z) where this said silu(z) scales every value head's output by roughly z
-         * again. libr4d has compiled both arms all along (r4d_gdn_gated_rmsnorm's `gn_act`) and
-         * `gdn_recurrent_update` composes the same parameter, so this is a string to pass and
-         * not a kernel to write. "silu" or "sigmoid"; anything else is refused below. */
+        /* The output gate's activation, a per-checkpoint property: `RMSNormGated` defaults to
+         * silu (every Qwen3.5/3.6 release), while Qwen4-Exp sets `output_gate_type: "sigmoid"`.
+         * libr4d's r4d_gdn_gated_rmsnorm (`gn_act`) and `gdn_recurrent_update` implement both.
+         * "silu" or "sigmoid"; anything else is refused. */
         const char* act    = "silu";
-        /* AN UNEVEN SPLIT OF THE HEADS (rad_weight_shard_span_parts). n_head_k / n_head_v are
-         * this rank's; k_first / v_first its first head of the container's n_head_k_all /
-         * n_head_v_all. k_first < 0 is the even split the plain row shard gives, as before.
-         * Three ranks over 16 K heads take 6, 5 and 5 (and 18, 15, 15 of the 48 V heads) --
-         * every rank real heads, nothing padded, every kernel at its own head count. */
+        /* Uneven head split (rad_weight_shard_span_parts). n_head_k / n_head_v are this rank's;
+         * k_first / v_first are its first heads within the container's n_head_k_all /
+         * n_head_v_all. k_first < 0 means the plain even row shard. Three ranks over 16 K heads
+         * take 6, 5 and 5 (18, 15, 15 of 48 V heads), with no padding. */
         int64_t k_first = -1, v_first = -1;
         int64_t n_head_k_all = 0, n_head_v_all = 0;
         bool    uneven() const { return k_first >= 0; }
@@ -90,10 +74,8 @@ struct GdnFP8 {
     struct Wire {
         rad_buf x    = 0;   /* [max_tok, n_embd]           the residual stream */
         ActFP8  h{};        /* [max_tok, n_embd]           normed input, then the out projection */
-        /* ONE BUFFER, TWO PROJECTIONS: [q|k|v] and the output gate come out of one GEMM (see
-         * ssm_inz in declare()), so the gate is this buffer's right-hand `v_dim` columns and the
-         * convolution reads the left-hand `conv_dim`. Both are `bcol` views, which is why every
-         * consumer of either takes a row pitch. */
+        /* [q|k|v] and the output gate from one GEMM (ssm_inz): the convolution reads the left
+         * `conv_dim` columns and the gate is the right `v_dim`, both as `bcol` views. */
         ActFP8  in{};       /* [max_tok, conv_dim+v_dim]   [q|k|v] then the output gate */
         rad_buf ab   = 0;   /* [max_tok, 2*n_head_v]       the decay and beta inputs, bf16 */
         rad_buf q    = 0;   /* [max_tok, n_head_k, head_k] post-convolution, l2-normed */
@@ -102,7 +84,7 @@ struct GdnFP8 {
         rad_buf gdec = 0;   /* [max_tok, n_head_v] */
         rad_buf beta = 0;   /* [max_tok, n_head_v] */
         rad_buf kkt  = 0;   /* [max_tok, n_head_v, chunk] */
-        ActFP8  o{};        /* [max_tok, n_head_v, head_v] -- RANK 3, see the header */
+        ActFP8  o{};        /* [max_tok, n_head_v, head_v] rank 3, see the header */
     };
 
     struct Src {
@@ -135,33 +117,38 @@ struct GdnFP8 {
     rad_op op_ab = 0;
     rad_op op_conv_prep = 0, op_kkt = 0, op_scan = 0, op_gnorm = 0;   /* prefill */
     rad_op op_conv_update = 0, op_recur = 0;                          /* decode */
-    /* `gdn_conv_recurrent_update`, if it resolves: the pair above as one launch, the convolution
-     * computed in the recurrent update's prologue. 0 leaves the pair, which is declared either
-     * way; cr_rows is the widest decode window the fold serves. */
+    /* `gdn_conv_recurrent_update`, if it resolves: the pair above in one launch, with the
+     * convolution in the recurrent update's prologue. The pair is declared either way; cr_rows is
+     * the widest decode window the fold serves. */
     rad_op  op_cr = 0;
     int64_t cr_rows = 0;
     rad_op op_ar = 0, op_add = 0;
-    /* ...AND WHETHER THE COLLECTIVE AT THE END OF THIS BLOCK IS THE NEXT BLOCK'S FIRST PASS.
-     * `ar_in` says this block's own norm absorbs its PREDECESSOR's all-reduce; `ar_out` says the
-     * block after it absorbs THIS one's, so this one must not issue it. They are the residual
-     * fold's two flags again, one boundary later, and they are separate for the same reason: a
-     * block is declared without knowing what follows it. On EITHER wire -- the fused kernel
-     * carries both payloads -- and both sides ask ar_fused_ok(g, T), so the two cannot disagree
-     * about whether the collective has already been issued. */
+    /* The next block absorbs this block's closing all-reduce (see rad_block_attn_gated_fp8.h). */
     bool ar_out = false;
-    /* ...and WHICH WIRES that consumer takes (ArOut, rad_fp8.h): the norm's by default, and a gated
-     * residual's write says its own (HyperConn::ar_take). Set before declare; both sides then ask
-     * ar_taken(g, T, ar_out, ar_out_take). */
+    /* Which wires that consumer takes (ArOut, rad_fp8.h); set before declare. */
     int  ar_out_take = kArOutNorm;
 
-
-    /* `fold` says the PREVIOUS block left its delta in `w.h.x` for this norm to add; `add_out`
-     * says the NEXT one will not, so this block issues the trailing add itself. See rad_fp8.h. */
+    /* `fold`: the previous block left its delta in `w.h.x` for this norm to add. `add_out`: the
+     * next block will not add, so this one issues the trailing add. See rad_fp8.h. */
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, const Config& c, int l,
                  rad_kvgroup state, rad_kvgroup conv, const Wire& wire, const Src& s,
                  bool fold = false, bool add_out = true,
                  int ar_in = kArNone, bool ar_out_ = false);
-    void step(RadCtx* c, const RadBatch* batch) const;
+    /* `own_ar` false: the caller issues this step's all-reduce itself, a row slice at a time
+     * (issue_ar), to overlap it with other work (a pipelined prefill). Only on a block without a
+     * trailing add, which would read the delta before the reduction. */
+    void step(RadCtx* c, const RadBatch* batch, bool own_ar = true,
+              ArPieces* pieces = nullptr) const;
+    /* Whether a step of T rows issues the all-reduce itself, asked by a caller before taking it
+     * over; and that all-reduce over rows [r0, r0 + rows) of the output. */
+    bool issues_ar(int64_t T) const { return op_ar && !ar_taken(g, T, ar_out, ar_out_take); }
+    void issue_ar(RadCtx* c, int64_t r0, int64_t rows) const {
+        RAD_ISSUE_N(c, op_ar_ov ? op_ar_ov : op_ar, rows * g.n_embd,
+                    brow_slice(w.h.x, r0, rows, g.n_embd), RAD_NONE);
+    }
+    /* Set before declare: the `overlap` issue_ar's collective is declared at, 0 for none. */
+    int    ar_overlap = 0;
+    rad_op op_ar_ov = 0;
 };
 
 inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Config& c, int l,
@@ -179,22 +166,8 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
         return RAD_E_INVAL;
     }
 
-    /* THE QUERY SCALE, AND IT IS NOT OPTIONAL. `gdn_chunk_scan` and `gdn_recurrent_update` both
-     * carry a `scale` that multiplies the output -- o = scale * e^g Q S^T + ... -- and it defaults to
-     * 1. FLA's chunk_gated_delta_rule defaults it to head_k^-0.5 and vllm-radiance passes exactly
-     * that; llama.cpp's fused GDN does the same.
-     *
-     * IT LOOKS LIKE IT CANCELS AND IT DOES NOT. The scan's output goes straight into the gated RMS
-     * norm, and an RMS norm divides a constant factor back out -- so scaling `o` by c should change
-     * nothing. That argument is wrong here for one reason: the scan output of this model is around
-     * 1e-6, `mean(o^2)` is then around 1e-12, and the norm's eps is 1e-6. eps DOMINATES the variance,
-     * the norm degenerates into a fixed division by sqrt(eps), and the factor passes straight through
-     * to the residual stream.
-     *
-     * Leaving it at 1 is visible end to end: the scan output comes out larger than the reference
-     * implementations' by exactly sqrt(head_k), and with forty-eight of this model's sixty-four
-     * layers delta net the residual stream then carries a delta-net contribution that many times
-     * too large -- fluent grammar with no content. */
+    /* The query scale is required; rad_block_gdn.h explains why the gated norm does not cancel
+     * it. */
     const double q_scale = 1.0 / std::sqrt((double)cfg.head_k);
 
     if (!cfg.act || (std::strcmp(cfg.act, "silu") != 0 && std::strcmp(cfg.act, "sigmoid") != 0)) {
@@ -206,18 +179,10 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
     const int64_t conv_dim = cfg.conv_dim();
     const int64_t ab_dim   = cfg.ab_dim();
 
-    /* THE INPUT MAY BE PREPARED BY THE ARCHITECTURE, and `src.norm == nullptr` is how it says so.
-     *
-     * A pre-norm model's block owns its own norm: one op that adds the previous block's delta into
-     * the residual stream, normalises it and quantises it (rad_fp8.h's NormQuantFP8). A GATED
-     * RESIDUAL model's does not -- arch/common/rad_block_hc.h's `hc_read` produces the block input
-     * from a stream four times as wide, with a data-dependent mix the block has no way to compute,
-     * and there is nothing left for a norm here to do. So this block takes `wire.h` as ALREADY
-     * normed and quantised and declares no norm weight at all.
-     *
-     * `ar_in` is refused in that mode rather than ignored: the fused all-reduce lives INSIDE the
-     * norm, so with no norm there is nowhere to fold it and a caller that asked would silently get
-     * an unreduced input. It emits a standalone collective instead (`add_out`/`ar_out`). */
+    /* `s.norm == nullptr`: the architecture prepares the input (a gated-residual model's
+     * rad_block_hc.h `hc_read`), so `wire.h` is already normed and quantised and no norm weight is
+     * declared. `ar_in` is then refused, since the fused all-reduce lives inside the norm. See
+     * rad_block_attn_gated_fp8.h. */
     ext_in = (s.norm == nullptr);
     if (ext_in) {
         if (!w.h.x || (!g.w_bf16 && (!w.h.q || !w.h.s)) || ar_in != kArNone) return RAD_E_INVAL;
@@ -226,22 +191,19 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
         w_norm = decl_w(b, nm.f("blk.%d.attn_norm.weight", l), RAD_F32, {g.n_embd},
                         RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
     }
-    /* The name maps ahead of the weights they name: a checkpoint is asked what a weight is
-     * through its map, at the declaration. */
+    /* Maps before weights: weight encodings are looked up through the map. */
     RAD_ARCH_TRY(map_concat(b, nm.f("blk.%d.ssm_ab.weight", l),     { s.in_a, s.in_b }, 0));
     RAD_ARCH_TRY(map_copy  (b, nm.f("blk.%d.ssm_conv1d.weight", l), s.conv1d));
     RAD_ARCH_TRY(map_copy  (b, nm.f("blk.%d.ssm_a_log", l),         s.a_log));
     RAD_ARCH_TRY(map_copy  (b, nm.f("blk.%d.ssm_dt.bias", l),       s.dt_bias));
     RAD_ARCH_TRY(map_copy  (b, nm.f("blk.%d.ssm_norm.weight", l),   s.out_norm));
-    /* The decay and beta projections, kept bf16 because the checkpoint kept them bf16 -- see the
-     * header. Row-sharded with the value heads they belong to: a and b are concatenated along dim 0
-     * so rank r owns rows [r*n_head_v, (r+1)*n_head_v) of EACH half, which is what the two-part
-     * row split says and what a contiguous slice of the concatenation would not give. */
+    /* The decay and beta projections, bf16 as in the checkpoint. Row-sharded with their value
+     * heads: the two-part split gives rank r rows [r*n_head_v, (r+1)*n_head_v) of each of a and
+     * b, which a contiguous slice of the concatenation would not. */
     w_ab       = decl_w(b, nm.f("blk.%d.ssm_ab.weight", l),     RAD_BF16, {ab_dim, g.n_embd},
                         RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW, grp_layer(l), 0,
                         {cfg.n_head_v, cfg.n_head_v});
-    /* The depthwise convolution is per channel, so it shards with the channels it convolves --
-     * and those channels are [q|k|v], three groups in one stored tensor, so the split is theirs. */
+    /* The depthwise convolution shards with its channels, [q|k|v] (three parts). */
     w_conv     = decl_w(b, nm.f("blk.%d.ssm_conv1d.weight", l), RAD_BF16,
                         {conv_dim, cfg.conv_width},
                         RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW, grp_layer(l), 0,
@@ -253,34 +215,26 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
     w_out_norm = decl_w(b, nm.f("blk.%d.ssm_norm.weight", l),   RAD_F32, {cfg.head_v},
                         RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
 
-
-    /* One norm and one quantise of the normed hidden state, in one op; the qkv and z
-     * projections both read it. rad_fp8.h's NormQuantFP8 says why they are not two. */
+    /* Norm and quantise in one op (rad_fp8.h: NormQuantFP8); the qkv|z and a|b projections read
+     * it. */
     if (!ext_in)
         RAD_ARCH_TRY(nq_h.declare(b, g, w_norm, fold ? w.h.x : w.x, w.h, g.n_embd,
                                   fold ? w.x : 0, 0, ar_in));
-    /* TWO CHECKPOINT TENSORS, FOUR PROJECTIONS, ONE GEMM. in_proj_qkv is [q|k|v] stacked along
-     * dim 0 and in_proj_z is the output gate; both read the SAME normed, quantised hidden state
-     * and differ only in their rows, so they are one weight here and one launch at step time.
+    /* Two checkpoint tensors (in_proj_qkv = [q|k|v], in_proj_z = the gate), four projections, one
+     * GEMM. At decode two calls at 5120 and 3072 rows cost more than one at 8192, since each pays
+     * its own ramp and tail. Bit-identical: row arithmetic is unchanged and both extents are past
+     * the split-K threshold.
      *
-     * WHY ONE CALL AND NOT TWO. The decode GEMM is bandwidth-bound but not at small N: two calls
-     * at 5120 and 3072 rows cost more between them than one call at 8192, because each pays its
-     * own ramp and tail on top of its launch. Over this model's delta-net layers that adds up to a
-     * measurable share of a decode step. It is bit-identical: nothing about a row's arithmetic
-     * changes, and both extents are already past the split-K threshold so the summation order does
-     * not move either.
-     *
-     * THE ROW PARTS ARE THE WHOLE POINT. Rank r must own its slice of EACH of q, k, v and z, so
-     * the shard is declared as four parts and not as one contiguous cut -- which would give rank 0
-     * all of q, all of k and a third of v, a well-formed wrong model. */
+     * The four row parts are required so rank r owns its slice of each of q, k, v and z; one
+     * contiguous cut would give rank 0 all of q and k. */
     RAD_ARCH_TRY(in.declare(b, nm, g, nm.f("blk.%d.ssm_inz", l), conv_dim + v_dim, g.n_embd,
                             RAD_SHARD_ROW, grp_layer(l), { s.in_qkv, s.in_z }, w.h, w.in.x, 0,
                             { cfg.k_dim(), cfg.k_dim(), cfg.v_dim(), cfg.v_dim() }, 0, 0,
-                            /* a rotated weight was rotated per CHECKPOINT tensor: q|k|v, then z */
+                            /* a rotated weight was rotated per checkpoint tensor: q|k|v, then z */
                             { 2 * cfg.k_dim() + cfg.v_dim(), cfg.v_dim() }));
     if (cfg.uneven()) {
-        /* THIS RANK'S HEADS OF EACH PART, in the container's rows: q and k by K head, v and z by
-         * V head. The scale plane of a row shard has the same rows (its blocks run along K). */
+        /* This rank's heads of each part, in container rows: q and k by K head, v and z by V head.
+         * The scale plane of a row shard has the same rows (its blocks run along K). */
         const int64_t kl = cfg.k_first * cfg.head_k, vl = cfg.v_first * cfg.head_v;
         const int64_t ka = cfg.n_head_k_all * cfg.head_k, va = cfg.n_head_v_all * cfg.head_v;
         const int64_t lo[4] = { kl, kl, vl, vl };
@@ -297,31 +251,21 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
         RAD_ARCH_TRY(rad_weight_shard_span(b, w_a_log,   cfg.v_first, cfg.v_first + cfg.n_head_v));
         RAD_ARCH_TRY(rad_weight_shard_span(b, w_dt_bias, cfg.v_first, cfg.v_first + cfg.n_head_v));
     }
-    /* NOT SLICED, and why it could need to be is worth keeping. This is a 96-column bf16 GEMM --
-     * half a percent of the layer's projection bytes -- and a bf16 kernel for this shape that
-     * stopped at M = 64 would leave a hole in its bucket table above 64. Since every op in a step
-     * is issued at the same token count, that one hole would cap the prefill chunk of the entire
-     * 27B model at 64 tokens, and the workaround is a launch per 64 rows in every GDN layer. The
-     * cap was a launcher guard the kernel does not need: MT row tiles live in a block and grid.y
-     * covers the rest, so M is general, and with the guard raised this is one launch.
+    /* One launch over all rows: libr4d's bf16 kernel for this 96-column shape is general in M
+     * (MT row tiles per block, grid.y covers the rest). A kernel capped at M = 64 would cap every
+     * op in the step, and so the prefill chunk, at 64 tokens (see brow_slice in rad_arch.h).
      *
-     * AT DECODE THE COST IS THE LAUNCH COUNT, not the arithmetic. `gemm_nt` is the most-dispatched
-     * kernel in a decode step and it is almost entirely fixed cost, spread over three separate
-     * small per-layer projections that all read the same activation: the MoE router (one a layer),
-     * the shared expert's gate (one a layer, RANK 0 ONLY, so on the rank the all-reduce is already
-     * waiting for) and this a|b (one a GDN layer).
-     *
-     * Fusing them is the lever and it is not a small one: they read the same activation but hold
-     * different weights, so a merge wants either contiguous weights -- a re-convert, which is
-     * ruled out -- or a GROUPED gemm_nt taking a table of weight pointers the way moe_gemm_q
-     * does. */
+     * At decode the cost is launch count: `gemm_nt` is the most-dispatched decode kernel, nearly
+     * all fixed cost, across three small per-layer projections of the same activation (the MoE
+     * router, the shared expert's gate on rank 0 only, and this a|b). Merging them would need
+     * contiguous weights (a re-convert) or a grouped gemm_nt over a weight-pointer table, as
+     * moe_gemm_q does. */
     op_ab = rw(b, RAD_OP(b, "gemm_nt",
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", ab_dim),
                               RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
                    RAD_WEIGHTS(w_ab)), {w.h.x}, {w.ab});
 
-    /* ---- the chunked path. Unchanged from the bf16 block except that `a` and `b_gate` are views
-     * of `ab` rather than of the projection row's tail. */
+    /* ---- the chunked path. As in the bf16 block, except `a` and `b_gate` are views of `ab`. */
     op_conv_prep = rw(b, RAD_OP(b, "gdn_conv_prep",
                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_k", cfg.head_k),
                                      RAD_INT("head_v", cfg.head_v), RAD_INT("chunk", cfg.chunk),
@@ -351,17 +295,7 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
                                        RAD_INT("conv_width", cfg.conv_width)),
                             RAD_WEIGHTS(w_conv)),
                         {w.in.x}, {w.q, w.k, w.v});
-    /* WHAT THE STATE CACHE MEANS, and it is not derivable from the operands. libr4d's recurrent
-     * update has two state contracts. PER-CANDIDATE writes one full state per candidate token and
-     * needs `1 + n_spec` distinct slots; ANCHOR keeps one committed state a sequence and replays
-     * the accepted prefix onto it out of a scratch slot, which is two slots whatever the depth.
-     * Same `o` either way, and a completely different `state` -- so a reference that implements one
-     * of them and is handed the other computes a correct answer to the other question.
-     *
-     * The engine already chooses: KVGroupPlan::state_copies is 2 when the deployment speculates
-     * and 1 when it does not, which is exactly this condition. Saying it here is what lets a
-     * reference DECLINE the form it does not implement instead of disagreeing with it, and what
-     * lets the kernel refuse a caller whose pool was sized for the other one. */
+    /* `state_form`: anchor when speculating, else per_candidate (rad_block_gdn.h explains). */
     op_recur = rw(b, RAD_OP(b, "gdn_recurrent_update",
                       RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_k", cfg.head_k),
                                  RAD_INT("head_v", cfg.head_v),
@@ -372,16 +306,14 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
                                          g.max_spec > 0 ? "anchor" : "per_candidate")),
                       RAD_WEIGHTS(w_a_log, w_dt_bias, w_out_norm)),
                   {w.q, w.k, w.v, w.ab, w.in.x}, {w.o.x});
-    /* The epilogue's codes, for an fp8 or int8 out-projection -- the int8 pair when the model feeds
-     * it (ActFP8::q8_fed), whose dtype picks the kernel's quantiser; a bf16 one reads `o.x` and
-     * nothing else, and the operands are left absent. */
+    /* The epilogue's codes for an fp8 or int8 out-projection (int8 when ActFP8::q8_fed; the codes
+     * dtype picks the quantiser). A bf16 out-projection reads only `o.x` and these stay absent. */
     if (op_recur && w.o.cq()) {
         const rad_buf oq[2] = { w.o.cq(), w.o.cs() };
         RAD_ARCH_TRY(rad_op_writes(b, op_recur, oq, 2));
     }
-    /* THE FOLD, over the same weights and caches. Its window is a register preload, so the band
-     * stops at eight tokens a sequence; not RAD_ARCH_TRY, since a plugin without the row is the
-     * ordinary case and the pair runs. */
+    /* The conv + recurrent fold. Its window is a register preload, so the band stops at eight
+     * tokens per sequence. Optional (no RAD_ARCH_TRY): without it the pair runs. */
     {
         const int64_t hi = g.max_tok < 8 ? g.max_tok : 8;
         op_cr = rw(b, RAD_OP(b, "gdn_conv_recurrent_update",
@@ -415,7 +347,18 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
                                   RAD_INT("min_bytes", g.wire_min_bytes)),
                        RAD_NOWEIGHTS),
                    {w.h.x}, {w.h.x});
-    /* Only where the NEXT block's norm will not do it; see rad_fp8.h's NormQuantFP8. */
+    /* The same collective for a caller that runs it beside other work (issue_ar, a pipelined
+     * prefill): at `overlap` 1 it gets the rows that hold fewer CUs while waiting on the link. */
+    if (g.world > 1 && ar_overlap > 0)
+        op_ar_ov = rw(b, RAD_OP(b, "all_reduce",
+                          RAD_PARAMS(RAD_INT("world_size", g.world),
+                                     RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
+                                     RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
+                                     RAD_INT("min_bytes", g.wire_min_bytes),
+                                     RAD_INT("overlap", ar_overlap)),
+                          RAD_NOWEIGHTS),
+                      {w.h.x}, {w.h.x});
+    /* Only when the next block's norm will not add (rad_fp8.h: NormQuantFP8). */
     if (add_out)
         op_add = rw(b, RAD_OP(b, "add",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
@@ -425,53 +368,87 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
     return RAD_OK;
 }
 
-inline void GdnFP8::step(RadCtx* c, const RadBatch* batch) const {
+inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
+                         ArPieces* pieces) const {
     const RadKVGroupBatch* st = kv_batch(batch, kv_state);
     const RadKVGroupBatch* cv = kv_batch(batch, kv_conv);
     const int32_t* st_idx = st ? st->state_index : nullptr;
-    /* HOW MANY SLOTS THE ROW NAMES. One is the state; a linear kernel serving speculation
-     * asks for scratch beside it and the manager sizes the row to suit (RadKVGroupBatch).
-     * The block passes the row through and does not read it. */
+    /* Slots per state_index row: the state, plus scratch when a kernel serving speculation asks
+     * for it (RadKVGroupBatch). Passed through unread. */
     const int64_t st_w = st && st->state_index_pitch > 0 ? st->state_index_pitch : 1;
     const int32_t* cv_idx = cv ? cv->state_index : nullptr;
 
     const int64_t T = batch->n_tok;
     const int64_t S = batch->n_seq;
     const int64_t H = cfg.n_head_v;
-    /* The two halves of `w.in.x`: the convolution's [q|k|v] and the output gate behind it. */
+    /* The two parts of `w.in.x`: the convolution's [q|k|v], then the output gate. */
     const int64_t conv_dim = cfg.conv_dim();
     const int64_t v_dim    = cfg.v_dim();
+
+    /* One prefill sequence in two pieces (ArPieces::cu): the whole block a piece at a time, each
+     * piece the chunk a span of 1 makes (the projection over its rows; the convolution, solve and
+     * scan over its bounds, with the state handed on through the cache; the gated norm, quantiser
+     * and out projection), so the first piece's reduction runs beside all of the second piece's
+     * work. The second piece reads the history the first left in the convolution slot: a spanned
+     * step is past the prompt's first interval, so its context length is never zero. */
+    if (!own_ar && pieces && pieces->cu && pieces->cuts(T) && T <= 2 * pieces->rows && ext_in &&
+        !op_add && S == 1 && batch->phase == RAD_PHASE_PREFILL) {
+        const int64_t in_w = conv_dim + v_dim;
+        for (int64_t p = 0; p < 2; ++p) {
+            const int64_t r0 = p * pieces->rows;
+            const int64_t n  = p == 0 ? pieces->rows : T - pieces->rows;
+            const int32_t* cu = pieces->cu + p;
+            in.step(c, w.h, w.in.x, T, r0, n);
+            RAD_ISSUE_N(c, op_ab, n, brow_slice(w.h.x, r0, n, g.n_embd), RAD_W(w_ab),
+                        brow_slice(w.ab, r0, n, 2 * H));
+            RAD_ISSUE_N(c, op_conv_prep, n,
+                        bcol(w.in.x, 0, conv_dim, T), RAD_W(w_conv), RAD_NONE, RAD_W(w_a_log),
+                        RAD_W(w_dt_bias), kv_cache(kv_conv, layer), praw(cu, RAD_I32, 2),
+                        bcol(w.ab, 0, H, T), bcol(w.ab, H, H, T),
+                        praw(cv_idx, RAD_I32, 1), praw(batch->ctx_lens, RAD_I32, 1),
+                        brows(w.q, T), brows(w.k, T), brows(w.v, T),
+                        brows(w.gdec, T), brows(w.beta, T));
+            RAD_ISSUE_N(c, op_kkt, n,
+                        brows(w.k, T), brows(w.beta, T), brows(w.gdec, T),
+                        praw(cu, RAD_I32, 2), brows(w.kkt, T));
+            RAD_ISSUE_N(c, op_scan, n,
+                        brows(w.q, T), brows(w.k, T), brows(w.v, T), brows(w.kkt, T),
+                        brows(w.gdec, T), brows(w.beta, T),
+                        kv_cache(kv_state, layer), praw(cu, RAD_I32, 2),
+                        brows(w.o.x, T), kv_cache(kv_state, layer),
+                        praw2(st_idx, RAD_I32, 1, st_w));
+            RAD_ISSUE_N(c, op_gnorm, n,
+                        brow_slice(w.o.x, r0, n, v_dim),
+                        bcol_at(w.in.x, r0, in_w, conv_dim, v_dim, n),
+                        RAD_W(w_out_norm), brow_slice(w.o.x, r0, n, v_dim));
+            q_o.step(c, T, r0, n);
+            out.step(c, w.o, w.h.x, T, r0, n);
+            if (p == 0) pieces->hand(r0, n);
+        }
+        return;
+    }
 
     if (!ext_in) nq_h.step(c, T);
     in.step(c, w.h, w.in.x, T);
     RAD_ISSUE_N(c, op_ab, T, brows(w.h.x, T), RAD_W(w_ab), brows(w.ab, T));
 
-    /* THE TWO PATHS, EACH OVER ITS OWN RUN OF SEQUENCES.
+    /* Each path runs over its own run of sequences. The step is sorted decode-first: decode rows
+     * are sequences [0, D) with tokens [0, DT), prefill chunks are [D, S) with the rest. A pure
+     * step issues one path.
      *
-     * The step is sorted decode-first, so the decode rows are sequences [0, D) holding tokens
-     * [0, DT) and the prefill chunks are sequences [D, S) holding the rest. Each path is issued
-     * over its own half and a pure step issues exactly one of them.
+     * Per-sequence arrays are offset, token operands are not. Every kernel here derives its grid
+     * and rows from cu_seqlens (N = len(cu) - 1, a sequence's first row is the absolute cu[n]), so
+     * the prefill half gets `cu + D` with q, k, v at their base; offsetting those too would count
+     * the displacement twice. The decode half is the prefix: cu ends at DT and its token operands
+     * are cut to DT rows. The gated norm and the standalone quantiser take no cu and are per
+     * token, so they take row slices at DT.
      *
-     * THE PER-SEQUENCE ARRAYS MOVE AND THE TOKEN OPERANDS DO NOT. Every kernel here takes
-     * cu_seqlens and derives both its grid and its rows from it -- N is cu's own length minus one
-     * and row zero of a sequence is the ABSOLUTE cu[n] -- so the prefill half is addressed by
-     * handing it `cu + D` while leaving q, k, v and the rest at their base. Offsetting those too
-     * would count the displacement twice. The decode half is the prefix, so it narrows instead:
-     * its cu ends at DT and its token operands are cut to DT rows, which agree because they are
-     * the same number.
-     *
-     * The two ops that take no cu -- the gated norm and the standalone quantiser -- are per TOKEN,
-     * so they take a row slice and are the only place DT appears as an offset.
-     *
-     * What this buys is that a mixed step does not run the chunked path over a sequence that is
-     * only decoding. That path commits the state directly and has no num_accepted operand, so a
-     * draft verified on it could not be rolled back and the scheduler would have to refuse one in
-     * every mixed step -- on an agentic load, a large share of all decode rows. */
+     * This keeps decode-only sequences in a mixed step off the chunked path, which commits state
+     * directly and has no num_accepted, so drafts verified there could not be rolled back. */
     int64_t D = 0, DT = 0;
     batch_split(batch, &D, &DT);
-    /* And the band the decode half selects on. max_q_len over a mixed step is the prefill chunk;
-     * over a pure decode step it is already the right number, so a batch that leaves
-     * max_q_len_decode zero still selects correctly there. */
+    /* The decode half's band. In a mixed step max_q_len is the prefill chunk's; in a pure decode
+     * step it is already right, so a batch leaving max_q_len_decode zero still works there. */
     const int32_t qd = batch->phase == RAD_PHASE_MIXED ? batch->max_q_len_decode : batch->max_q_len;
     const int64_t P  = S - D;
     const int64_t PT = T - DT;
@@ -505,6 +482,10 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch) const {
                     w.o.cq() ? brows(w.o.cs(), DT) : RAD_NONE);
     }
 
+    /* The output a piece at a time where the caller takes the all-reduce that way (ArPieces): the
+     * gated norm, quantiser and out projection are per row, so a pure prefill step can finish them
+     * a piece at a time and hand off each piece's reduction behind it. */
+    const bool cut = !own_ar && pieces && pieces->cuts(T) && D == 0 && P > 0 && !op_add;
     if (P > 0) {
         RAD_ISSUE(c, op_conv_prep,
                   bcol(w.in.x, 0, conv_dim, T), RAD_W(w_conv), RAD_NONE, RAD_W(w_a_log), RAD_W(w_dt_bias),
@@ -523,23 +504,33 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch) const {
                   kv_cache(kv_state, layer), praw(batch->cu_seqlens + D, RAD_I32, P + 1),
                   brows(w.o.x, T), kv_cache(kv_state, layer),
                   praw2(st_idx ? st_idx + D * st_w : nullptr, RAD_I32, P, st_w));
-        /* PER TOKEN, so this one is a row slice and not a sequence sub-array. Over the decode
-         * rows the recurrent kernel has already applied the gate in its own epilogue. */
+        if (cut) {
+            for (int64_t r0 = 0; r0 < T; r0 += pieces->rows) {
+                const int64_t n = T - r0 < pieces->rows ? T - r0 : pieces->rows;
+                RAD_ISSUE_N(c, op_gnorm, n,
+                            brow_slice(w.o.x, r0, n, v_dim),
+                            bcol_at(w.in.x, r0, in_w, conv_dim, v_dim, n),
+                            RAD_W(w_out_norm), brow_slice(w.o.x, r0, n, v_dim));
+                q_o.step(c, T, r0, n);
+                out.step(c, w.o, w.h.x, T, r0, n);
+                if (r0 + n < T) pieces->hand(r0, n);
+            }
+            return;
+        }
+        /* Per token, so a row slice over the prefill rows only; the recurrent kernel already
+         * gated the decode rows. */
         RAD_ISSUE_N(c, op_gnorm, PT,
                     brow_slice(w.o.x, DT, PT, v_dim),
                     bcol_at(w.in.x, DT, in_w, conv_dim, v_dim, PT),
                     RAD_W(w_out_norm), brow_slice(w.o.x, DT, PT, v_dim));
-        /* PREFILL STILL QUANTISES SEPARATELY, and only prefill. The decode kernel folds the
-         * quantiser into its own epilogue -- see the operand list on gdn_recurrent_update -- so
-         * issuing this over those rows would overwrite the same bytes with the same values for a
-         * launch a layer, in every delta-net layer, for nothing. The chunked
-         * scan has no such epilogue: its workgroup is a chunk, not a row, and the group's amax is
-         * not a reduction it can do. */
+        /* Only the prefill rows are quantised here; the decode kernel quantises in its epilogue.
+         * The chunked scan cannot: its workgroup is a chunk, not a row, so it cannot reduce a
+         * row group's amax. */
         q_o.step(c, T, DT, PT);
     }
 
     out.step(c, w.o, w.h.x, T);
-    if (op_ar && !ar_taken(g, T, ar_out, ar_out_take))
+    if (own_ar && op_ar && !ar_taken(g, T, ar_out, ar_out_take))
         RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h.x, T), RAD_NONE);
     if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h.x, T), brows(w.x, T));
 }

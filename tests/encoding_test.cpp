@@ -1,21 +1,48 @@
 /* encoding_test.cpp -- weight encodings: the struct, its spelling, its geometry, the core's decoder
  * and the plane cuts tensor parallelism takes. spec.md §4.1.
  *
- * The decoder is checked against values worked by hand rather than against a second
- * implementation of itself: a scale that lands on the wrong block, a zero point subtracted after
- * the multiply instead of before, a nibble read from the wrong half of a byte -- each gives a
- * plausible number, and only an expected value that did not come from the code can tell.
+ * The decoder is checked against hand-worked values, not a second implementation: a scale on the
+ * wrong block, a zero point subtracted after the multiply, or a nibble read from the wrong half of
+ * a byte all give plausible numbers.
  */
 #include "rad_test.h"
 #include "rad_types.h"
 #include "rad_plugin.h"
+#include "rad_planes.h"
 #include "format/encoding.h"
 
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
 
 using namespace rad;
+
+namespace {
+
+/* Plain f32 values under one f32 scale for the whole weight: the base the transform cases add
+ * their tables to. */
+RadEncoding unit_affine() {
+    RadEncoding e = rad_enc_plain(RAD_F32);
+    rad_enc_copy_str(e.scheme, "affine");
+    rad_enc_add_plane(&e, "scale", RAD_F32, 0, 0);
+    return e;
+}
+
+/* A quantiser's forward Givens rotation of K values, in place: each of `stages` stages rotates
+ * its K/2 pairs, (pairs[s][2p], pairs[s][2p+1]) by angle[s][p]. */
+void givens_forward(double* x, int K, int stages, const int32_t* pairs, const float* angle) {
+    for (int s = 0; s < stages; ++s)
+        for (int p = 0; p < K / 2; ++p) {
+            const int a = pairs[s * K + 2 * p], b = pairs[s * K + 2 * p + 1];
+            const double t = angle[s * (K / 2) + p], c = std::cos(t), sn = std::sin(t);
+            const double xa = x[a], xb = x[b];
+            x[a] = xa * c + xb * sn;
+            x[b] = xb * c - xa * sn;
+        }
+}
+
+}  /* namespace */
 
 TEST(encodings_spell_themselves_canonically) {
     CHECK_EQ(enc_name(rad_enc_plain(RAD_BF16)), std::string("bf16"));
@@ -41,7 +68,7 @@ TEST(encodings_spell_themselves_canonically) {
     rad_enc_add_plane(&own, "book", RAD_F16, 0, 0);
     CHECK_EQ(enc_name(own), std::string("lattice:codes=u8[1x1],book=f16[*x*]"));
 
-    /* NVFP4: an e4m3 scale a 16 and an f32 a tensor, read in the order they multiply */
+    /* NVFP4: an e4m3 scale per 16 values and an f32 per tensor, in multiplication order */
     RadEncoding nv = rad_enc_affine(RAD_FP4E2M1, RAD_F8E4M3, 1, 16);
     rad_enc_add_plane(&nv, "scale.1", RAD_F32, 0, 0);
     CHECK(rad_enc_valid(&nv));
@@ -56,7 +83,7 @@ TEST(encodings_spell_themselves_canonically) {
     CHECK_EQ(enc_name(qk), std::string("affine:codes=u4[1x1],scale=u6[1x32],scale.1=f16[1x256],"
                                        "min=u6[1x32],min.1=f16[1x256]"));
 
-    /* a TABLE plane is written with its own extents */
+    /* a table plane is written with its own extents */
     RadEncoding nl = rad_enc_affine(RAD_U4, RAD_F16, 1, 32);
     rad_enc_add_table(&nl, "table", RAD_I8, 1, 16);
     CHECK(rad_enc_valid(&nl));
@@ -122,7 +149,7 @@ TEST(plane_geometry_rounds_blocks_up_and_rows_to_a_byte) {
     CHECK_EQ(pc, 3);                                  /* 128 + 128 + a short last block */
     CHECK_EQ(rad_enc_plane_bytes(&e.plane[1], 10, 300), 10 * 3 * 2);
 
-    /* 2-bit codes, 7 a row: two bytes a row, not seven quarter-bytes run together */
+    /* 2-bit codes, 7 per row: each row pads to two bytes */
     const RadEncoding u2 = rad_enc_plain(RAD_U2);
     CHECK_EQ(rad_enc_plane_bytes(&u2.plane[0], 3, 7), 3 * 2);
 
@@ -182,7 +209,7 @@ TEST(odd_widths_are_a_bit_stream_that_straddles_bytes) {
     CHECK_EQ(rad_load_f32(b, RAD_I3, 7), -1.0f);
     CHECK_EQ(rad_load_f32(b, RAD_I3, 4), -4.0f);
 
-    /* every width, a pattern that cannot pass by accident */
+    /* every width, with a pattern that cannot pass by accident */
     const uint32_t widths[] = { RAD_U1, RAD_U2, RAD_U3, RAD_U4, RAD_U5, RAD_U6, RAD_U7,
                                 RAD_U9, RAD_U10, RAD_U11, RAD_U12 };
     for (uint32_t dt : widths) {
@@ -246,17 +273,15 @@ TEST(affine_decodes_through_the_right_block_and_subtracts_the_zero_first) {
 }
 
 TEST(a_rotation_decodes_back_to_the_weight) {
-    /* Store v = H w / 4 for a 4-wide group; decoding applies H once more, H H = 4 I, so the
-     * weight comes back exactly -- the convention docs/MOE-W4.md folds into the stored scale. */
+    /* Store v = H w / 4 for a 4-wide group; decoding applies H again and H H = 4 I, so the
+     * weight comes back exactly. docs/MOE-W4.md folds the 1/4 into the stored scale. */
     const float w[8] = { 1, -2, 3, 0.5f, 0, 0, 2, -1 };
     float v[8];
     std::memcpy(v, w, sizeof v);
     fwht_inplace(v, 4);
     fwht_inplace(v + 4, 4);
     for (float& x : v) x /= 4.0f;
-    RadEncoding e = rad_enc_plain(RAD_F32);
-    rad_enc_copy_str(e.scheme, "affine");
-    rad_enc_add_plane(&e, "scale", RAD_F32, 0, 0);
+    RadEncoding e = unit_affine();
     rad_enc_copy_str(e.transform, "fwht4");
     CHECK(rad_enc_valid(&e));
     const float one = 1.0f;
@@ -343,7 +368,7 @@ TEST(a_scalar_codebook_maps_each_code_before_the_scale) {
 }
 
 TEST(a_vector_codebook_expands_a_code_into_its_grid_row_and_signs) {
-    /* IQ2-shaped: a u8 code per 4 values into a grid of 4-vectors, a sign bit a value, a u4
+    /* IQ2-shaped: a u8 code per 4 values into a grid of 4-vectors, a sign bit per value, a u4
      * scale per [1 x 8] and an f16 per row. */
     static const uint8_t grid[3][4] = { { 8, 8, 8, 8 }, { 8, 25, 43, 8 }, { 43, 43, 25, 8 } };
     RadEncoding e = rad_enc_affine(RAD_U8, RAD_U4, 1, 8);
@@ -367,7 +392,7 @@ TEST(a_vector_codebook_expands_a_code_into_its_grid_row_and_signs) {
         if (i == 0 || i == 7) g = -g;
         CHECK_EQ(out[i], g * 3.0f * 0.125f);
     }
-    /* a code past the grid's end is a corrupt file, said so */
+    /* a code past the grid's end is reported as a corrupt file */
     const uint8_t bad[2] = { 1, 9 };
     const void* bp[5] = { bad, sc, &d, grid, signs };
     enc_view(e, 1, 8, bp, &v);
@@ -376,9 +401,7 @@ TEST(a_vector_codebook_expands_a_code_into_its_grid_row_and_signs) {
 }
 
 TEST(an_act_order_permutation_puts_columns_back) {
-    RadEncoding e = rad_enc_plain(RAD_F32);
-    rad_enc_copy_str(e.scheme, "affine");
-    rad_enc_add_plane(&e, "scale", RAD_F32, 0, 0);
+    RadEncoding e = unit_affine();
     rad_enc_add_table(&e, "t.perm", RAD_I32, 1, 4);
     rad_enc_copy_str(e.transform, "perm");
     REQUIRE(rad_enc_valid(&e));
@@ -405,20 +428,11 @@ TEST(a_givens_transform_with_channel_scales_inverts) {
     const float ang[2][2] = { { 0.3f, -1.1f }, { 0.7f, 2.0f } };
     double x[4];
     for (int k = 0; k < K; ++k) x[k] = (double)w[k] * dsc[k];
-    for (int s = 0; s < 2; ++s)
-        for (int p = 0; p < 2; ++p) {
-            const int a = pairs[s][2 * p], b = pairs[s][2 * p + 1];
-            const double c = std::cos((double)ang[s][p]), sn = std::sin((double)ang[s][p]);
-            const double xa = x[a], xb = x[b];
-            x[a] = xa * c + xb * sn;
-            x[b] = xb * c - xa * sn;
-        }
+    givens_forward(x, K, 2, pairs[0], ang[0]);
     float vq[4];
     for (int k = 0; k < K; ++k) vq[k] = (float)x[k];
 
-    RadEncoding e = rad_enc_plain(RAD_F32);
-    rad_enc_copy_str(e.scheme, "affine");
-    rad_enc_add_plane(&e, "scale", RAD_F32, 0, 0);
+    RadEncoding e = unit_affine();
     rad_enc_add_table(&e, "t.pairs", RAD_I32, 2, 4);
     rad_enc_add_table(&e, "t.angle", RAD_F32, 2, 2);
     rad_enc_add_table(&e, "t.scale", RAD_F32, 1, 4);
@@ -434,30 +448,22 @@ TEST(a_givens_transform_with_channel_scales_inverts) {
 }
 
 TEST(a_givens_weight_with_two_parts_undoes_each_rows_own_rotation) {
-    /* Two rows over 4 columns, each its own PART (row 0 ends part 0, row 1 ends part 1): the
-     * tables stack part-major, t.scale has a row a part, and decoding row r reads its part's. */
+    /* Two rows over 4 columns, each its own part (row 0 ends part 0, row 1 ends part 1). The
+     * tables stack part-major, t.scale has one row per part, and row r decodes with its part's. */
     const int K = 4;
     const float w[2][4] = { { 1.0f, -2.0f, 0.5f, 3.0f }, { -0.25f, 1.5f, 2.0f, -1.0f } };
     const float dsc[2][4] = { { 2.0f, 0.5f, 1.0f, 4.0f }, { 1.0f, 3.0f, 0.25f, 2.0f } };
-    const int32_t pairs[2][4] = { { 0, 1, 2, 3 }, { 0, 3, 1, 2 } };       /* one stage a part */
+    const int32_t pairs[2][4] = { { 0, 1, 2, 3 }, { 0, 3, 1, 2 } };       /* one stage per part */
     const float ang[2][2] = { { 0.3f, -1.1f }, { 0.9f, 2.2f } };
     const int32_t end[2] = { 1, 2 };
     float vq[2][4];
     for (int r = 0; r < 2; ++r) {
         double x[4];
         for (int k = 0; k < K; ++k) x[k] = (double)w[r][k] * dsc[r][k];
-        for (int p = 0; p < 2; ++p) {
-            const int a = pairs[r][2 * p], b = pairs[r][2 * p + 1];
-            const double c = std::cos((double)ang[r][p]), sn = std::sin((double)ang[r][p]);
-            const double xa = x[a], xb = x[b];
-            x[a] = xa * c + xb * sn;
-            x[b] = xb * c - xa * sn;
-        }
+        givens_forward(x, K, 1, pairs[r], ang[r]);
         for (int k = 0; k < K; ++k) vq[r][k] = (float)x[k];
     }
-    RadEncoding e = rad_enc_plain(RAD_F32);
-    rad_enc_copy_str(e.scheme, "affine");
-    rad_enc_add_plane(&e, "scale", RAD_F32, 0, 0);
+    RadEncoding e = unit_affine();
     rad_enc_add_table(&e, "t.pairs", RAD_I32, 2, 4);
     rad_enc_add_table(&e, "t.angle", RAD_F32, 2, 2);
     rad_enc_add_table(&e, "t.scale", RAD_F32, 2, 4);
@@ -535,6 +541,332 @@ TEST(a_plane_is_cut_on_its_own_blocks) {
     const RadEncoding w4 = rad_enc_affine(RAD_I4, RAD_BF16, 1, 1);
     CHECK_EQ(enc_plane_rect(w4.plane[0], 2, 10, 0, 2, 3, 10, &r, &why), RAD_E_SHAPE);
     CHECK_EQ(enc_plane_rect(w4.plane[0], 2, 10, 0, 2, 4, 10, &r, &why), RAD_OK);
+}
+
+/* ================================================== the ABI's narrowing conversions
+ *
+ * rad_plugin.h's f32 -> bf16 / f16 / fp8 conversions define what every kernel library's result
+ * is, and libref and libavx both call them, so comparing the two libraries cannot find an error
+ * in them. Here each is checked against a brute-force reference written from the formats'
+ * definitions: every finite code decoded to a double, and an input's expected code the nearest
+ * one, ties to the even code, overflowing to infinity (or saturating, for e4m3fn) past the top
+ * code by half a step. The inputs are every midpoint between adjacent codes and the floats one
+ * and two ulps either side of it, both signs, where a rounding error shows. */
+
+namespace {
+
+struct NarrowFmt {
+    const char* name;
+    int  ebits, mbits, bias;
+    bool ieee;                    /* infinities and NaNs as IEEE; else e4m3fn: no inf, one NaN */
+    uint32_t (*narrow)(float);
+    float (*widen)(uint32_t);
+};
+
+uint32_t n_bf16(float f) { return rad_f32_to_bf16(f); }
+uint32_t n_f16(float f)  { return rad_f32_to_f16(f); }
+uint32_t n_e4m3(float f) { return rad_f32_to_fp8e4m3(f); }
+uint32_t n_e5m2(float f) { return rad_f32_to_fp8e5m2(f); }
+float w_bf16(uint32_t c) { return rad_bf16_to_f32((uint16_t)c); }
+float w_f16(uint32_t c)  { return rad_f16_to_f32((uint16_t)c); }
+float w_e4m3(uint32_t c) { return rad_fp8e4m3_to_f32((uint8_t)c); }
+float w_e5m2(uint32_t c) { return rad_fp8e5m2_to_f32((uint8_t)c); }
+
+const NarrowFmt kNarrow[] = {
+    { "bf16",     8, 7, 127, true,  n_bf16, w_bf16 },
+    { "f16",      5, 10, 15, true,  n_f16,  w_f16 },
+    { "fp8_e4m3", 4, 3, 7,   false, n_e4m3, w_e4m3 },
+    { "fp8_e5m2", 5, 2, 15,  true,  n_e5m2, w_e5m2 },
+};
+
+uint32_t sign_bit(const NarrowFmt& f) { return 1u << (f.ebits + f.mbits); }
+bool is_nan(const NarrowFmt& f, uint32_t c) {
+    const uint32_t e = (c >> f.mbits) & ((1u << f.ebits) - 1), m = c & ((1u << f.mbits) - 1);
+    if (f.ieee) return e == (1u << f.ebits) - 1 && m != 0;
+    return e == (1u << f.ebits) - 1 && m == (1u << f.mbits) - 1;
+}
+bool is_inf(const NarrowFmt& f, uint32_t c) {
+    const uint32_t e = (c >> f.mbits) & ((1u << f.ebits) - 1), m = c & ((1u << f.mbits) - 1);
+    return f.ieee && e == (1u << f.ebits) - 1 && m == 0;
+}
+/* A code's value from the format's definition alone. */
+double decode(const NarrowFmt& f, uint32_t c) {
+    const uint32_t e = (c >> f.mbits) & ((1u << f.ebits) - 1), m = c & ((1u << f.mbits) - 1);
+    const double s = (c & sign_bit(f)) ? -1.0 : 1.0;
+    if (is_nan(f, c)) return std::nan("");
+    if (is_inf(f, c)) return s * INFINITY;
+    if (e == 0) return s * std::ldexp((double)m, 1 - f.bias - f.mbits);
+    return s * std::ldexp(1.0 + std::ldexp((double)m, -f.mbits), (int)e - f.bias);
+}
+/* The non-negative finite codes, in increasing value (code order is value order for them). */
+std::vector<uint32_t> finite_codes(const NarrowFmt& f) {
+    std::vector<uint32_t> v;
+    for (uint32_t c = 0; c < sign_bit(f); ++c)
+        if (!is_nan(f, c) && !is_inf(f, c)) v.push_back(c);
+    return v;
+}
+/* The non-negative finite codes with their values, for expected(). */
+struct Codes {
+    std::vector<uint32_t> code;
+    std::vector<double>   value;
+};
+Codes codes_of(const NarrowFmt& f) {
+    Codes c;
+    c.code = finite_codes(f);
+    for (uint32_t x : c.code) c.value.push_back(decode(f, x));
+    return c;
+}
+
+/* The code `x` must narrow to: nearest, ties to the even code, |x| at or past the top code plus
+ * half a step to infinity (IEEE) or saturated to the top code (e4m3fn). */
+uint32_t expected(const NarrowFmt& f, const Codes& c, double x) {
+    const uint32_t sgn = std::signbit(x) ? sign_bit(f) : 0;
+    const double a = std::fabs(x);
+    const size_t n = c.value.size();
+    const double vtop = c.value[n - 1], step = vtop - c.value[n - 2];
+    if (a >= vtop) {
+        if (f.ieee && a >= vtop + step / 2) return sgn | ((1u << f.ebits) - 1) << f.mbits;
+        return sgn | c.code[n - 1];
+    }
+    /* value[hi - 1] <= a < value[hi] */
+    const size_t hi =
+        (size_t)(std::upper_bound(c.value.begin(), c.value.end(), a) - c.value.begin());
+    const size_t lo = hi - 1;
+    const double dl = a - c.value[lo], dh = c.value[hi] - a;
+    if (dl < dh) return sgn | c.code[lo];
+    if (dh < dl) return sgn | c.code[hi];
+    return sgn | ((c.code[lo] & 1u) ? c.code[hi] : c.code[lo]);
+}
+
+}  /* namespace */
+
+/* The joined form of abi/rad_planes.h, over a 2-bit asymmetric weight's three planes and a
+ * codebook: each plane comes back byte for byte, at an offset a launch finds by role alone, with
+ * its geometry, and every plane starts on RAD_PLANES_ALIGN. 2-bit rows of 130 codes are 33 bytes,
+ * so a size computed from the element count instead of the row would be short. One plane is not
+ * joined; a truncated destination or a missing plane is refused. */
+TEST(the_joined_planes_form_round_trips_and_finds_each_plane_by_role) {
+    RadEncoding e;
+    rad_enc_clear(&e);
+    rad_enc_copy_str(e.scheme, "affine");
+    rad_enc_add_plane(&e, "codes", RAD_U2, 1, 1);
+    rad_enc_add_plane(&e, "scale", RAD_F16, 1, 64);
+    rad_enc_add_plane(&e, "zero", RAD_U8, 1, 64);
+    rad_enc_add_table(&e, "table", RAD_F32, 1, 4);
+    const int sel[3] = { 0, 3, 2 };                 /* codes, table, zero: not encoding order */
+    const int64_t rows = 3, cols = 130;
+    std::vector<uint8_t> codes((size_t)(rows * 33)), table(16), zero((size_t)(rows * 3));
+    for (size_t i = 0; i < codes.size(); ++i) codes[i] = (uint8_t)(i * 37 + 11);
+    for (size_t i = 0; i < table.size(); ++i) table[i] = (uint8_t)(200 - i);
+    for (size_t i = 0; i < zero.size(); ++i) zero[i] = (uint8_t)(i + 1);
+    RadTensor t[3] = {};
+    const int64_t ext[3][2] = { { rows, cols }, { 1, 4 }, { rows, 3 } };
+    const uint32_t dt[3] = { RAD_U2, RAD_F32, RAD_U8 };
+    uint8_t* src[3] = { codes.data(), table.data(), zero.data() };
+    for (int k = 0; k < 3; ++k) {
+        t[k].dtype = dt[k];
+        t[k].rank = 2;
+        t[k].shape[0] = ext[k][0];
+        t[k].shape[1] = ext[k][1];
+        t[k].stride[0] = ext[k][1];
+        t[k].stride[1] = 1;
+        t[k].data = src[k];
+    }
+
+    RadLayout L{};
+    REQUIRE_EQ(rad_planes_layout(&e, sel, t, 3, &L), RAD_OK);
+    CHECK_EQ(std::string(L.tag), std::string(RAD_PLANES_TAG));
+    CHECK_EQ(L.dtype, (uint32_t)RAD_U2);
+    CHECK_EQ((long long)L.align, (long long)RAD_PLANES_ALIGN);
+    CHECK_EQ(L.bytes % RAD_PLANES_ALIGN, 0);
+    CHECK_EQ(rad_planes_layout(&e, sel, t, 1, &L), RAD_E_UNSUPPORTED);
+    REQUIRE_EQ(rad_planes_layout(&e, sel, t, 3, &L), RAD_OK);
+
+    std::vector<uint8_t> joined((size_t)L.bytes, 0xAA);
+    CHECK_EQ(rad_planes_relayout(&e, sel, t, 3, joined.data(), L.bytes - 1), RAD_E_SHAPE);
+    REQUIRE_EQ(rad_planes_relayout(&e, sel, t, 3, joined.data(), L.bytes), RAD_OK);
+
+    const RadPlanesHeader* hd = rad_planes_header(joined.data());
+    REQUIRE(hd != nullptr);
+    CHECK_EQ(hd->n_planes, 3);
+    CHECK_EQ((long long)hd->bytes, (long long)L.bytes);
+    const char* roles[3] = { "codes", "table", "zero" };
+    for (int k = 0; k < 3; ++k) {
+        const RadPlanesEntry* en = nullptr;
+        const uint8_t* got = (const uint8_t*)rad_planes_find(joined.data(), roles[k], &en);
+        REQUIRE(got != nullptr && en != nullptr);
+        CHECK_EQ(en->dtype, dt[k]);
+        CHECK_EQ((long long)en->rows, (long long)ext[k][0]);
+        CHECK_EQ((long long)en->cols, (long long)ext[k][1]);
+        CHECK_EQ(en->offset % RAD_PLANES_ALIGN, 0);
+        CHECK_EQ((long long)en->row_bytes, (long long)rad_dtype_bytes(dt[k], ext[k][1]));
+        CHECK(std::memcmp(got, src[k], (size_t)(en->rows * en->row_bytes)) == 0);
+    }
+    const RadPlanesEntry* tab = nullptr;
+    rad_planes_find(joined.data(), "table", &tab);
+    CHECK_EQ(tab->kind, (uint32_t)RAD_PLANE_TABLE);
+    CHECK_EQ((long long)tab->block[1], 4LL);
+    const RadPlanesEntry* zr = nullptr;
+    rad_planes_find(joined.data(), "zero", &zr);
+    CHECK_EQ((long long)zr->block[1], 64LL);
+    CHECK(rad_planes_find(joined.data(), "scale", nullptr) == nullptr);
+    CHECK(rad_planes_header(codes.data()) == nullptr);
+
+    /* The inverse writes the planes back where `planes` points. */
+    std::vector<uint8_t> c2(codes.size()), t2(table.size()), z2(zero.size());
+    RadTensor back[3] = { t[0], t[1], t[2] };
+    back[0].data = c2.data();
+    back[1].data = t2.data();
+    back[2].data = z2.data();
+    REQUIRE_EQ(rad_planes_unrelayout(&e, sel, joined.data(), L.bytes, back, 3), RAD_OK);
+    CHECK(c2 == codes && t2 == table && z2 == zero);
+
+    back[1].data = nullptr;
+    CHECK_EQ(rad_planes_unrelayout(&e, sel, joined.data(), L.bytes, back, 3), RAD_E_INVAL);
+    const int bad[3] = { 0, 9, 2 };
+    CHECK_EQ(rad_planes_layout(&e, bad, t, 3, &L), RAD_E_SHAPE);
+}
+
+/* Every finite midpoint between adjacent codes, and one and two floats either side, both signs:
+ * one RTNE, with subnormals kept and the overflow edge exact. */
+TEST(the_abi_narrowings_round_to_nearest_even_at_every_midpoint) {
+    for (const NarrowFmt& f : kNarrow) {
+        const Codes c = codes_of(f);
+        std::vector<double> pts;
+        for (size_t i = 0; i + 1 < c.value.size(); ++i) {
+            pts.push_back(c.value[i]);
+            pts.push_back((c.value[i] + c.value[i + 1]) / 2);
+        }
+        const double vtop = c.value.back(), step = vtop - c.value[c.value.size() - 2];
+        pts.push_back(vtop);
+        pts.push_back(vtop + step / 2);      /* the overflow edge */
+        pts.push_back(vtop + step);
+        pts.push_back(vtop * 4);
+        int64_t n = 0, bad = 0;
+        for (double p : pts) {
+            const float m = (float)p;
+            if (!std::isfinite(m)) continue;              /* past f32's range: nothing to narrow */
+            if ((double)m != p) { ++bad; continue; }      /* every midpoint here is a float */
+            float around[5] = { m, std::nextafter(m, 0.0f), std::nextafter(m, INFINITY), 0, 0 };
+            around[3] = std::nextafter(around[1], 0.0f);
+            around[4] = std::nextafter(around[2], INFINITY);
+            for (float x : around)
+                for (float s : { x, -x }) {
+                    ++n;
+                    const uint32_t got = f.narrow(s), want = expected(f, c, s);
+                    if (got != want && bad++ < 8)
+                        fprintf(stderr, "    %s(%a) = 0x%x, want 0x%x\n", f.name, (double)s, got,
+                                want);
+                }
+        }
+        CHECK(n > 1000);
+        CHECK_EQ(bad, 0);
+    }
+}
+
+/* Widening is exact for every code, NaN codes give NaN, and narrowing an f32 infinity gives the
+ * format's infinity, or its top finite code where it has none. */
+TEST(the_abi_widenings_are_exact_and_infinities_narrow_to_infinity_or_the_top_code) {
+    for (const NarrowFmt& f : kNarrow) {
+        int bad = 0;
+        for (uint32_t c = 0; c < 2 * sign_bit(f); ++c) {
+            const double want = decode(f, c), got = f.widen(c);
+            if (std::isnan(want) ? !std::isnan(got) : got != want) ++bad;
+        }
+        CHECK_EQ(bad, 0);
+        const uint32_t top = finite_codes(f).back();
+        const uint32_t inf = ((1u << f.ebits) - 1) << f.mbits;
+        CHECK_EQ(f.narrow(INFINITY), f.ieee ? inf : top);
+        CHECK_EQ(f.narrow(-INFINITY), (f.ieee ? inf : top) | sign_bit(f));
+    }
+    /* e4m3fn saturates at 448 from its own top up: 464 is the midpoint to an absent 480. */
+    for (float x : { 448.0f, 463.9f, 464.0f, 480.0f, 1e30f })
+        CHECK_EQ(rad_f32_to_fp8e4m3(x), 0x7e);
+    /* f16 and e5m2 share the top 57344 / 65504 edges: 61440 is e5m2's overflow tie, 65520
+     * f16's. */
+    CHECK_EQ(rad_f32_to_fp8e5m2(57344.0f), 0x7b);
+    CHECK_EQ(rad_f32_to_fp8e5m2(61439.0f), 0x7b);
+    CHECK_EQ(rad_f32_to_fp8e5m2(61440.0f), 0x7c);
+    CHECK_EQ(rad_f32_to_f16(65504.0f), 0x7bff);
+    CHECK_EQ(rad_f32_to_f16(65519.0f), 0x7bff);
+    CHECK_EQ(rad_f32_to_f16(65520.0f), 0x7c00);
+}
+
+/* Every class of f32 NaN narrows to a NaN of each format: quiet and signalling, high and low
+ * payload, both signs. A NaN that rounds to a number would let one bad activation pass for a
+ * plausible value. */
+TEST(every_nan_narrows_to_a_nan) {
+    const uint32_t nans[] = { 0x7fc00000u, 0xffc00000u, 0x7fffffffu, 0xffffffffu, 0x7ff00000u,
+                              0xfff00000u, 0x7f800001u, 0xff800001u, 0x7fbfffffu, 0x7f8000ffu };
+    for (const NarrowFmt& f : kNarrow)
+        for (uint32_t u : nans) {
+            float x;
+            std::memcpy(&x, &u, 4);
+            const uint32_t c = f.narrow(x);
+            if (!is_nan(f, c))
+                fprintf(stderr, "    %s(0x%08x) = 0x%x, not a NaN\n", f.name, u, c);
+            CHECK(is_nan(f, c));
+        }
+}
+
+/* rad_store_f32 into an integer plane rounds to nearest with ties to even and saturates, NaN
+ * storing 0, whatever the rounding mode: what a host kernel writes into an integer output and a
+ * converter into an integer plane. Hand-worked values at every tie, bound and overflow. */
+TEST(rad_store_f32_rounds_integers_to_nearest_even_and_saturates) {
+    const float in[] = { 2.5f, 3.5f, -2.5f, 127.5f, -128.5f, 300.0f, 1e10f, -1e10f, NAN, 0.5f,
+                         -0.5f, 1.5f, 3e9f };
+    const int64_t i8[]  = { 2, 4, -2, 127, -128, 127, 127, -128, 0, 0, 0, 2, 127 };
+    const int64_t u8[]  = { 2, 4, 0, 128, 0, 255, 255, 0, 0, 0, 0, 2, 255 };
+    const int64_t i16[] = { 2, 4, -2, 128, -128, 300, 32767, -32768, 0, 0, 0, 2, 32767 };
+    const int64_t u16[] = { 2, 4, 0, 128, 0, 300, 65535, 0, 0, 0, 0, 2, 65535 };
+    const int64_t i32[] = { 2, 4, -2, 128, -128, 300, 2147483647, -2147483648LL, 0, 0, 0, 2,
+                            2147483647 };
+    const int64_t u32[] = { 2, 4, 0, 128, 0, 300, 4294967295LL, 0, 0, 0, 0, 2, 3000000000LL };
+    const int64_t i64[] = { 2, 4, -2, 128, -128, 300, 10000000000LL, -10000000000LL, 0, 0, 0, 2,
+                            3000000000LL };
+    const struct { uint32_t dt; const int64_t* want; } cases[] = {
+        { RAD_I8, i8 }, { RAD_U8, u8 }, { RAD_I16, i16 }, { RAD_U16, u16 },
+        { RAD_I32, i32 }, { RAD_U32, u32 }, { RAD_I64, i64 } };
+    for (const auto& k : cases)
+        for (size_t j = 0; j < sizeof in / sizeof in[0]; ++j) {
+            uint64_t raw = 0;
+            rad_store_f32(&raw, k.dt, 0, in[j]);
+            int64_t got = 0;
+            switch (k.dt) {
+                case RAD_I8:  got = (int8_t)raw; break;
+                case RAD_U8:  got = (uint8_t)raw; break;
+                case RAD_I16: got = (int16_t)raw; break;
+                case RAD_U16: got = (uint16_t)raw; break;
+                case RAD_I32: got = (int32_t)raw; break;
+                case RAD_U32: got = (uint32_t)raw; break;
+                default:      got = (int64_t)raw; break;
+            }
+            if (got != k.want[j])
+                fprintf(stderr, "    %s(%g) = %lld, want %lld\n", rad_dtype_name(k.dt),
+                        (double)in[j], (long long)got, (long long)k.want[j]);
+            CHECK_EQ(got, k.want[j]);
+        }
+    /* The int64 edges: 2^63 and beyond saturate, as do their negatives. */
+    int64_t r = 0;
+    rad_store_f32(&r, RAD_I64, 0, 1e19f);
+    CHECK_EQ(r, INT64_MAX);
+    rad_store_f32(&r, RAD_I64, 0, -1e19f);
+    CHECK_EQ(r, INT64_MIN);
+    rad_store_f32(&r, RAD_I64, 0, 9223372036854775808.0f);
+    CHECK_EQ(r, INT64_MAX);
+    /* Integral values in range, the only ones the converter and quantisers store, are exact. */
+    int bad = 0;
+    for (int v = -128; v <= 127; ++v) {
+        int8_t b = 0;
+        rad_store_f32(&b, RAD_I8, 0, (float)v);
+        bad += b != v;
+    }
+    for (int v = -4096; v <= 4096; ++v) {
+        int32_t b = 0;
+        rad_store_f32(&b, RAD_I32, 0, (float)v);
+        bad += b != v;
+    }
+    CHECK_EQ(bad, 0);
 }
 
 RAD_TEST_MAIN()

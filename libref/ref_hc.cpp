@@ -1,14 +1,12 @@
-/* ref_hc.cpp -- the GATED RESIDUAL, which is Qwen4-Exp's replacement for a pre-norm and a
- * residual add.
+/* ref_hc.cpp -- the gated residual, Qwen4-Exp's replacement for a pre-norm and a residual add.
  *
- * ============================== WHAT IT IS ==============================
+ * ============================== What it is ==============================
  *
  * The residual stream is `hc` times as wide as the model: hidden_size 2560 at hc_count 4 is a
- * 10240-wide stream carried through every layer, entered as four identical copies of the
- * embedding and collapsed once at the end. Every block reads a 2560 mix of the four and writes
- * its output back into all four, and BOTH the read's mix and the write's per-stream gain are
- * data-dependent -- which is what "gated" means here and what makes this a pair of ops rather
- * than a norm.
+ * 10240-wide stream through every layer, entered as four identical copies of the embedding and
+ * collapsed once at the end. Each block reads a 2560 mix of the four and writes its output back
+ * into all four; both the read's mix and the write's per-stream gain are data-dependent ("gated"),
+ * so this is a pair of ops rather than a norm.
  *
  *   hc_read    N       = grouped_rmsnorm(h)              one rsqrt per 2560 stream, one gain of
  *                                                        10240 over all four, `1 + w`
@@ -17,67 +15,40 @@
  *              inj[s]  = 2 * sigmoid(W_inj[s] . N / hc)  four scalars in (0, 2)
  *   hc_write   h[s]   += inj[s] * y                      for each stream s
  *
- * THE WRITE READS THE UNNORMED `h`, NOT `N`. The reference is `hyper_input + injection` where
- * `hyper_input` is the argument the read received, so the normalisation is consumed entirely by
- * the block input and the gate and never enters the stream. Writing back into `N` instead would
- * re-normalise the residual on every one of the 96 connections, which diverges within a few
- * layers and is the one mistake this pair can make that still produces fluent text.
+ * The write reads the unnormed `h`, not `N`: upstream computes `hyper_input + injection` with
+ * `hyper_input` the read's argument, so the normalisation feeds only the block input and the gates.
+ * Writing into `N` would re-normalise the residual at each of the 96 connections and diverge within
+ * a few layers while still producing fluent text.
  *
- * THE MIX IS A MEAN, NOT A SUM. `.mean(dim=-2)` over the hc dimension -- so the divide by hc
- * happens here AND, separately, inside both gate arguments (`/ self.hc_count` before the silu and
- * before the inject sigmoid). Three divisions by 4, all of them in the reference, none of them
- * derivable from the others.
+ * The mix is a mean (`.mean(dim=-2)` over hc), and both gate arguments are separately divided by
+ * hc (`/ self.hc_count` before the silu and before the inject sigmoid): three independent
+ * divisions, all upstream's.
  *
- * ============================== WHY THE QUANTISER IS IN THE READ ==============================
+ * ============================== Why the quantiser is in the read ==============================
  *
- * `q` and `s` are OPTIONAL outputs. Present, the read also emits the fp8 block-scaled form of `x`
- * that the following projection's GEMM wants, which is what keeps a gated-residual model at the
- * same launch count as a pre-norm one: every launch costs a fixed floor whatever it computes, and a
- * model with 96 connections cannot afford a separate quantise op at each. Absent, `x` is bf16 and the
- * caller quantises it itself -- which is what the final mixer does, because its consumer is the
- * lm_head and that is bf16.
+ * `q` and `s` are optional outputs. Present, the read also emits the fp8 block-scaled `x` the next
+ * projection's GEMM wants, keeping the launch count equal to a pre-norm model's (each launch has a
+ * fixed cost, and there are 96 connections). Absent, `x` is bf16 and the caller quantises it: the
+ * final mixer feeds the bf16 lm_head.
  *
- * IT QUANTISES WHAT WAS WRITTEN. `x` is narrowed to its own dtype first and the codes are taken
- * from the narrowed value, not from the f32 accumulator, because that is what a fused kernel
- * necessarily does and the two have to agree bit for bit -- the same epilogue-fold rule the GDN
- * out-projection's quantiser follows (libref/ref_gdn.cpp).
+ * Codes are taken from `x` narrowed to its dtype, not from the f32 accumulator, as a fused kernel
+ * must (the GDN out-projection quantiser follows the same rule, libref/ref_gdn.cpp).
  *
- * `rq` and `rs` are the same argument one consumer further: had_quant_act_fp8 of the stored `x`,
- * for an expert plane stored with a 128-wide Hadamard, whose block would otherwise run that
- * quantiser as a launch of its own.
+ * `rq` and `rs` extend this one consumer further: had_quant_act_fp8 of the stored `x`, for expert
+ * planes stored with a 128-wide Hadamard.
  */
 #include "ref_common.h"
 #include "ref_ops.h"
+#include "ref_planes.h"
 
 #include <cmath>
 
 using namespace ref;
 
-namespace {
-
-/* A value narrowed to a tensor's own dtype and read back. The reference's arithmetic is f32
- * throughout, but the REFERENCE MODEL's is not: torch's grouped norm returns `.type_as(x)`, so the
- * two matrix products and the final multiply all read a bf16 `N`. Rounding once here is what makes
- * a fused kernel able to match this to a tolerance that means something. */
-inline float narrow(uint32_t dtype, float v) {
-    uint32_t buf[2] = {0, 0};
-    st_dt(dtype, buf, 0, v);
-    return ld_dt(dtype, buf, 0);
-}
-
-inline float sigmoidf(float v) { return 1.0f / (1.0f + std::exp(-v)); }
-inline float siluf(float v)    { return v * sigmoidf(v); }
-
-}  /* namespace */
-
 /* ------------------------------------------------------------------ hc_enter */
-/* THE WIDE STREAM'S FIRST VALUE: hc identical copies of the embedding.
- *
- * It is one launch for the whole step and it exists rather than being folded into the embedding
- * lookup because the lookup's weight is [vocab, n] and its output width is n -- a wide output
- * would be a different op with a different weight shape. The four streams are identical here and
- * diverge at the first connection, because each block writes into all four with a DIFFERENT
- * per-branch gain. */
+/* The wide stream's initial value: hc identical copies of the embedding. Separate from the
+ * embedding lookup, whose output width is n. The streams diverge at the first connection, since
+ * each block writes into them with different per-stream gains. */
 int ref_hc_enter(const RadArgs* a, RadStream) {
     if (!have(a, 2)) return RAD_E_INVAL;
     const RadTensor* x = &a->t[0];
@@ -87,7 +58,7 @@ int ref_hc_enter(const RadArgs* a, RadStream) {
     if (n <= 0 || hc <= 1) return RAD_E_SHAPE;
     const int64_t rows = numel(x) / n;
     if (rows <= 0 || numel(h) < rows * hc * n) return RAD_E_SHAPE;
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * hc * n)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t xb = rowoff(x, r, n), hb = rowoff(h, r, hc * n);
         const int64_t xs = laststride(x), hs = laststride(h);
@@ -101,8 +72,8 @@ int ref_hc_enter(const RadArgs* a, RadStream) {
 
 /* ------------------------------------------------------------------ hc_read */
 int ref_hc_read(const RadArgs* a, RadStream) {
-    /* NOT `have(a, 6)`: operand 4 is the OPTIONAL inject weight, and a prefix test would refuse
-     * the final mixer -- the one connection that has none. The required ones are 0..3 and 5. */
+    /* Not `have(a, 6)`: operand 4, the inject weight, is optional (the final mixer has none).
+     * Operands 0..3 and 5 are required. */
     if (a->n_t < 6) return RAD_E_INVAL;
     if (!rad_arg_in(a, 0) || !rad_arg_in(a, 1) || !rad_arg_in(a, 2) || !rad_arg_in(a, 3) ||
         !rad_arg_in(a, 5)) return RAD_E_INVAL;
@@ -112,10 +83,10 @@ int ref_hc_read(const RadArgs* a, RadStream) {
     const RadTensor* up   = &a->t[3];
     const RadTensor* injw = t_in(a, 4);          /* absent on the final mixer */
     const RadTensor* x    = &a->t[5];
-    const RadTensor* inj  = rad_arg_in(a, 6);    /* an OUT, but the optional test is the same */
+    const RadTensor* inj  = rad_arg_in(a, 6);    /* an OUT; same optional test */
     const RadTensor* q    = rad_arg_in(a, 7);
     const RadTensor* s    = rad_arg_in(a, 8);
-    const RadTensor* rq   = rad_arg_in(a, 9);    /* the ROTATED fp8 form, for a w4a8h consumer */
+    const RadTensor* rq   = rad_arg_in(a, 9);    /* the rotated fp8 form, for a w4a8h consumer */
     const RadTensor* rs   = rad_arg_in(a, 10);
 
     const int64_t n  = p_int(a, "n", 0);
@@ -127,11 +98,19 @@ int ref_hc_read(const RadArgs* a, RadStream) {
     const int64_t hn = hc * n;
 
     const int64_t rows = numel(h) / hn;
-    if (rows <= 0 || numel(x) < rows * n || numel(w) < hn ||
-        numel(down) < lr * hn || numel(up) < hn * lr) return RAD_E_SHAPE;
+    if (rows <= 0 || numel(x) < rows * n || numel(w) < hn) return RAD_E_SHAPE;
+    /* The mixing matrices are plain, or codes and a scale plane joined (ref_planes.h; `mix`
+     * e4m3), read element by element as the core's decoder gives them. A plain matrix's dtype is
+     * what the gate it feeds is rounded to; a joined one's gates are rounded to h's. */
+    ScaledRows jd, ju;
+    const bool jdown = is_joined(down), jup = is_joined(up);
+    if (jdown) RAD_REF_TRY(scaled_rows(down, lr, hn, &jd));
+    else if (numel(down) < lr * hn) return RAD_E_SHAPE;
+    if (jup) RAD_REF_TRY(scaled_rows(up, hn, lr, &ju));
+    else if (numel(up) < hn * lr) return RAD_E_SHAPE;
+    const uint32_t ddt = jdown ? h->dtype : down->dtype, udt = jup ? h->dtype : up->dtype;
     if (injw && numel(injw) < hc * hn) return RAD_E_SHAPE;
-    /* `inj` is what the paired hc_write consumes, so an inject WEIGHT with no inject OUTPUT is a
-     * caller that computed four scalars and threw them away -- refused rather than ignored. */
+    /* An inject weight without an inject output would compute scalars nobody reads; refused. */
     if (injw && (!inj || !inj->data || numel(inj) < rows * hc)) return RAD_E_SHAPE;
 
     int64_t g = 0;
@@ -142,10 +121,9 @@ int ref_hc_read(const RadArgs* a, RadStream) {
         ngrp = (n + g - 1) / g;
         if (numel(q) < rows * n || !s || !s->data || numel(s) < rows * ngrp) return RAD_E_SHAPE;
     }
-    /* The rotated form rotates each scale group whole, so the group must tile the row exactly and
-     * be a power of two: a block that straddled the end of the row would mix real values with
-     * padding, and no weight block was rotated that way. It is had_quant_act_fp8 of the stored `x`
-     * -- the operand's consumer cannot tell which op wrote it. */
+    /* The rotated form rotates each scale group whole, so the group must be a power of two that
+     * tiles the row; no weight block was rotated across padding. The result equals
+     * had_quant_act_fp8 of the stored `x`. */
     int64_t rg = 0;
     if (rq) {
         rg = p_int(a, "group", 0);
@@ -154,12 +132,14 @@ int ref_hc_read(const RadArgs* a, RadStream) {
         if (rg > REF_HAD_MAX) return RAD_E_UNSUPPORTED;
     }
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * hn * (2 * lr + hc))
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t hb = rowoff(h, r, hn), xb = rowoff(x, r, n);
         const int64_t hs = laststride(h), xs = laststride(x), ws = laststride(w);
 
-        /* ---- the grouped norm. One rsqrt per stream over its own n, then the full-width gain. */
+        /* ---- grouped norm: one rsqrt per stream over its n, then the full-width gain. N is
+         * rounded to h's dtype: upstream's norm returns `.type_as(x)`, so every product reads it
+         * rounded. */
         std::vector<float> N((size_t)hn);
         for (int64_t c = 0; c < hc; ++c) {
             double ss = 0.0;
@@ -170,69 +150,60 @@ int ref_hc_read(const RadArgs* a, RadStream) {
             const float sc = 1.0f / std::sqrt((float)(ss / (double)n) + eps);
             for (int64_t i = 0; i < n; ++i) {
                 const int64_t j = c * n + i;
-                N[(size_t)j] = narrow(h->dtype,
-                                      ldt(h, hb + j * hs) * sc * (ldt(w, j * ws) + wadd));
+                N[(size_t)j] = round_dt(h->dtype,
+                                        ldt(h, hb + j * hs) * sc * (ldt(w, j * ws) + wadd));
             }
         }
 
-        /* ---- the read gate: 10240 -> lowrank -> 10240, silu between and sigmoid after. */
+        /* ---- read gate: hc*n -> lowrank -> hc*n, silu between and sigmoid after. */
         std::vector<float> d((size_t)lr);
         for (int64_t j = 0; j < lr; ++j) {
             float acc = 0.0f;
-            const int64_t db = rowoff(down, j, hn);
+            const int64_t db = jdown ? 0 : rowoff(down, j, hn);
             const int64_t ds = laststride(down);
-            for (int64_t i = 0; i < hn; ++i) acc += N[(size_t)i] * ldt(down, db + i * ds);
-            d[(size_t)j] = narrow(down->dtype, siluf(acc / (float)hc));
+            for (int64_t i = 0; i < hn; ++i)
+                acc += N[(size_t)i] * (jdown ? jd.at(j, i) : ldt(down, db + i * ds));
+            d[(size_t)j] = round_dt(ddt, act_silu(acc / (float)hc));
         }
 
-        /* ---- the mix, and the mean over the streams. */
+        /* ---- the gated mix, averaged over the streams. */
         for (int64_t i = 0; i < n; ++i) {
             float acc = 0.0f;
             for (int64_t c = 0; c < hc; ++c) {
                 const int64_t row = c * n + i;
-                const int64_t ub = rowoff(up, row, lr);
+                const int64_t ub = jup ? 0 : rowoff(up, row, lr);
                 const int64_t us = laststride(up);
                 float gv = 0.0f;
-                for (int64_t j = 0; j < lr; ++j) gv += d[(size_t)j] * ldt(up, ub + j * us);
-                acc += narrow(up->dtype, sigmoidf(gv)) * N[(size_t)row];
+                for (int64_t j = 0; j < lr; ++j)
+                    gv += d[(size_t)j] * (jup ? ju.at(row, j) : ldt(up, ub + j * us));
+                acc += round_dt(udt, act_sigmoid(gv)) * N[(size_t)row];
             }
             stt(x, xb + i * xs, acc / (float)hc);
         }
 
-        /* ---- the per-branch write gates. */
+        /* ---- per-stream write gates. */
         if (injw && inj) {
             const int64_t ib = rowoff(inj, r, hc), is = laststride(inj);
             for (int64_t c = 0; c < hc; ++c) {
                 float acc = 0.0f;
                 const int64_t jb = rowoff(injw, c, hn), js = laststride(injw);
                 for (int64_t i = 0; i < hn; ++i) acc += N[(size_t)i] * ldt(injw, jb + i * js);
-                stt(inj, ib + c * is, 2.0f * sigmoidf(acc / (float)hc));
+                stt(inj, ib + c * is, 2.0f * act_sigmoid(acc / (float)hc));
             }
         }
 
-        /* ---- the optional fp8 form of x, read back from what was stored. */
+        /* ---- optional fp8 form of x, from the stored values. */
         if (q && q->data) {
             const int64_t qb = rowoff(q, r, n), qs = laststride(q);
             for (int64_t gi = 0; gi < ngrp; ++gi) {
                 const int64_t k0 = gi * g, k1 = (k0 + g < n) ? k0 + g : n;
-                float amax = 0.0f;
-                for (int64_t i = k0; i < k1; ++i) {
-                    const float m = std::fabs(ldt(x, xb + i * xs));
-                    if (m > amax) amax = m;
-                }
-                const float sc  = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
-                const float invs = 1.0f / sc;
-                for (int64_t i = k0; i < k1; ++i) {
-                    float v = ldt(x, xb + i * xs) * invs;
-                    if (v >  448.0f) v =  448.0f;
-                    if (v < -448.0f) v = -448.0f;
-                    st_dt(q->dtype, q->data, qb + i * qs, v);
-                }
+                const float sc = q8_group([&](int64_t i) { return ldt(x, xb + (k0 + i) * xs); },
+                                           k1 - k0, 448.0f, q, qb + k0 * qs, qs);
                 stt(s, rowoff(s, r, ngrp) + gi * laststride(s), sc);
             }
         }
 
-        /* ---- the optional ROTATED fp8 form of x, from the same stored values. */
+        /* ---- optional rotated fp8 form of x, from the same stored values. */
         if (rq) {
             float buf[REF_HAD_MAX];
             const int64_t qb = rowoff(rq, r, n), qs = laststride(rq), rgrp = n / rg;
@@ -240,19 +211,8 @@ int ref_hc_read(const RadArgs* a, RadStream) {
                 const int64_t k0 = gi * rg;
                 for (int64_t i = 0; i < rg; ++i) buf[i] = ldt(x, xb + (k0 + i) * xs);
                 fwht(buf, rg);
-                float amax = 0.0f;
-                for (int64_t i = 0; i < rg; ++i) {
-                    const float m = std::fabs(buf[i]);
-                    if (m > amax) amax = m;
-                }
-                const float sc   = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
-                const float invs = 1.0f / sc;
-                for (int64_t i = 0; i < rg; ++i) {
-                    float v = buf[i] * invs;
-                    if (v >  448.0f) v =  448.0f;
-                    if (v < -448.0f) v = -448.0f;
-                    st_dt(rq->dtype, rq->data, qb + (k0 + i) * qs, v);
-                }
+                const float sc = q8_group([&](int64_t i) { return buf[i]; }, rg, 448.0f, rq,
+                                           qb + k0 * qs, qs);
                 stt(rs, rowoff(rs, r, rgrp) + gi * laststride(rs), sc);
             }
         }
@@ -261,8 +221,8 @@ int ref_hc_read(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ hc_write */
-/* `h[s] += inj[s] * y` for each of the hc streams. In place: `h` is the only output and it is the
- * stream the paired read was handed, unchanged by it. */
+/* h[s] += inj[s] * y for each of the hc streams, in place on the stream the paired read was given
+ * (which the read left unchanged). */
 int ref_hc_write(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor* y   = &a->t[0];
@@ -277,7 +237,7 @@ int ref_hc_write(const RadArgs* a, RadStream) {
     const int64_t rows = numel(y) / n;
     if (rows <= 0 || numel(h) < rows * hn || numel(inj) < rows * hc) return RAD_E_SHAPE;
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * hn)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t yb = rowoff(y, r, n), hb = rowoff(h, r, hn), ib = rowoff(inj, r, hc);
         const int64_t ys = laststride(y), hs = laststride(h), is = laststride(inj);
@@ -294,20 +254,19 @@ int ref_hc_write(const RadArgs* a, RadStream) {
 
 /* ================================================================== mtp_enter
  *
- * THE MULTI-TOKEN-PREDICTION HEAD'S ENTRY, for a model whose residual stream is `hc` wide.
+ * The multi-token-prediction head's entry for a model whose residual stream is `hc` wide.
  *
  * A pre-norm MTP head (Qwen3.5, Qwen3-Next, DeepSeek-V3) joins the trunk's hidden state and the
- * next token's embedding with ONE `fc` over their concatenation, and arch/common/rad_block_mtp_fp8.h
- * runs that as two rmsnorms into the two halves of one buffer and a single gemm_nt. Qwen4-Exp's
- * head cannot: its hidden state is the WIDE stream and the checkpoint carries TWO square matrices,
+ * next token's embedding with one `fc` over their concatenation (arch/common/rad_block_mtp_fp8.h:
+ * two rmsnorms into one buffer, one gemm_nt). Qwen4-Exp's hidden state is the wide stream and the
+ * checkpoint carries two square matrices,
  *
  *     mtp.fc_hidden.weight        [n, n]        mtp.pre_fc_norm_hidden.weight       [hc * n]
  *     mtp.fc_embedding.weight     [n, n]        mtp.pre_fc_norm_embedding.weight    [n]
  *
- * so the hidden half is `fc_h` applied to EACH of the hc sub-streams -- the reference's own
- * `.unflatten(-1, (hc_count, hidden_size))` idiom, which is how every other 10240-wide tensor in
- * this architecture is handled -- and the embedding half is one 2560-wide product added into all
- * hc of them, which is the same broadcast the trunk enters the stream with (`hidden_states.repeat`).
+ * so the hidden half is `fc_h` applied to each of the hc sub-streams (upstream's
+ * `.unflatten(-1, (hc_count, hidden_size))` idiom) and the embedding half is one n-wide product
+ * added into all of them, the broadcast the trunk enters the stream with (`hidden_states.repeat`).
  *
  *     rs_e      = rsqrt(mean(e^2) + eps)
  *     ne[j]     = e[j] * rs_e * (w_e[j] + wadd)
@@ -316,19 +275,15 @@ int ref_hc_write(const RadArgs* a, RadStream) {
  *     nh[k][j]  = h[k*n+j] * rs[k] * (w_h[k*n+j] + wadd)
  *     x[k*n+i]  = sum_j fc_h[i][j] * nh[k][j] + fe[i]
  *
- * IT IS ONE OP AND NOT SIX because every intermediate above is a DIFFERENT VIEW of the same bytes
- * and this ABI has no reinterpreting view: `nh` is [M*hc, n] to the GEMM and [M, hc*n] to the norm,
- * and core/runtime/issue.cpp narrows dim 0 or the last dimension with every stride left alone --
- * which is the right rule and makes a row-pitch change inexpressible. Spelling the entry as one op
- * is what lets the wide buffers stay wide. It is also six launches off a draft round, and a draft
- * round is the latency this head exists to hide.
+ * One op rather than six because the intermediates are different views of the same bytes and the
+ * ABI has no reinterpreting view: `nh` is [M*hc, n] to the GEMM and [M, hc*n] to the norm, while
+ * core/runtime/issue.cpp only narrows dim 0 or the last dimension with strides unchanged, so a
+ * row-pitch change is inexpressible. It also saves launches in the latency-critical draft round.
  *
- * `ngroup` IS THE ONE THING THE CHECKPOINT DOES NOT SAY. A [hc * n] gain fits both a grouped norm
- * (hc rsqrts, one per sub-stream -- what Qwen4ExpTextGatedResidual does at every one of its 97
- * connections) and a flat one (a single rsqrt over the whole wide row). Both are self-consistent
- * and no per-op oracle can tell them apart, exactly as rad_block_mtp_fp8.h's concat order cannot
- * be told apart -- and it has the same cheap empirical answer, the draft acceptance rate. `ngroup`
- * carries the choice so it is asked once, at declare, instead of being compiled in.
+ * `ngroup` is the one thing the checkpoint does not say: a [hc * n] gain fits both a grouped norm
+ * (hc rsqrts, one per sub-stream, as Qwen4ExpTextGatedResidual does) and a flat one (one rsqrt over
+ * the wide row). No per-op oracle can tell them apart; the draft acceptance rate can. `ngroup`
+ * makes it a declare-time choice.
  */
 int ref_mtp_enter(const RadArgs* a, RadStream) {
     if (!have(a, 7)) return RAD_E_INVAL;
@@ -352,15 +307,21 @@ int ref_mtp_enter(const RadArgs* a, RadStream) {
     const int64_t rows = numel(h) / hn;
     if (rows <= 0 || numel(e) < rows * n || numel(x) < rows * hn) return RAD_E_SHAPE;
     if (numel(w_h) < hn || numel(w_e) < n) return RAD_E_SHAPE;
-    if (numel(fc_h) < n * n || numel(fc_e) < n * n) return RAD_E_SHAPE;
+    /* The fc matrices are plain, or codes and a scale plane joined (`fc` e4m3), as hc_read's. */
+    ScaledRows jh, je;
+    const bool jfh = is_joined(fc_h), jfe = is_joined(fc_e);
+    if (jfh) RAD_REF_TRY(scaled_rows(fc_h, n, n, &jh));
+    else if (numel(fc_h) < n * n) return RAD_E_SHAPE;
+    if (jfe) RAD_REF_TRY(scaled_rows(fc_e, n, n, &je));
+    else if (numel(fc_e) < n * n) return RAD_E_SHAPE;
 
-    #pragma omp parallel for schedule(static)
+    REF_PAR_FOR(rows * hn * n)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t hb = rowoff(h, r, hn), eb = rowoff(e, r, n), xb = rowoff(x, r, hn);
         const int64_t hs = laststride(h), es = laststride(e), xs = laststride(x);
         const int64_t whs = laststride(w_h), wes = laststride(w_e);
 
-        /* ---- the embedding half: one norm and one 2560-wide product, shared by every stream. */
+        /* ---- embedding half: one norm and one n-wide product, shared by every stream. */
         double ss = 0.0;
         for (int64_t i = 0; i < n; ++i) {
             const float v = ldt(e, eb + i * es);
@@ -369,19 +330,21 @@ int ref_mtp_enter(const RadArgs* a, RadStream) {
         const float rse = 1.0f / std::sqrt((float)(ss / (double)n) + eps);
         std::vector<float> ne((size_t)n);
         for (int64_t i = 0; i < n; ++i)
-            ne[(size_t)i] = narrow(e->dtype, ldt(e, eb + i * es) * rse * (ldt(w_e, i * wes) + wadd));
+            ne[(size_t)i] = round_dt(e->dtype,
+                                     ldt(e, eb + i * es) * rse * (ldt(w_e, i * wes) + wadd));
 
         std::vector<float> fe((size_t)n);
         for (int64_t i = 0; i < n; ++i) {
             float acc = 0.0f;
-            const int64_t fb = rowoff(fc_e, i, n);
+            const int64_t fb = jfe ? 0 : rowoff(fc_e, i, n);
             const int64_t fs = laststride(fc_e);
-            for (int64_t j = 0; j < n; ++j) acc += ne[(size_t)j] * ldt(fc_e, fb + j * fs);
+            for (int64_t j = 0; j < n; ++j)
+                acc += ne[(size_t)j] * (jfe ? je.at(i, j) : ldt(fc_e, fb + j * fs));
             fe[(size_t)i] = acc;
         }
 
-        /* ---- the hidden half: the grouped norm, then the SAME square matrix over each stream.
-         * The flat reading is one rsqrt over the whole wide row; `ngroup` says which. */
+        /* ---- hidden half: the norm (grouped, or flat per `ngroup`), then the same square matrix
+         * over each stream. */
         float flat = 0.0f;
         if (ngroup == 1) {
             double sw = 0.0;
@@ -405,14 +368,15 @@ int ref_mtp_enter(const RadArgs* a, RadStream) {
             }
             for (int64_t i = 0; i < n; ++i) {
                 const int64_t j = c * n + i;
-                nh[(size_t)i] = narrow(h->dtype,
-                                       ldt(h, hb + j * hs) * sc * (ldt(w_h, j * whs) + wadd));
+                nh[(size_t)i] = round_dt(h->dtype,
+                                         ldt(h, hb + j * hs) * sc * (ldt(w_h, j * whs) + wadd));
             }
             for (int64_t i = 0; i < n; ++i) {
                 float acc = 0.0f;
-                const int64_t fb = rowoff(fc_h, i, n);
+                const int64_t fb = jfh ? 0 : rowoff(fc_h, i, n);
                 const int64_t fs = laststride(fc_h);
-                for (int64_t j = 0; j < n; ++j) acc += nh[(size_t)j] * ldt(fc_h, fb + j * fs);
+                for (int64_t j = 0; j < n; ++j)
+                    acc += nh[(size_t)j] * (jfh ? jh.at(i, j) : ldt(fc_h, fb + j * fs));
                 stt(x, xb + (c * n + i) * xs, acc + fe[(size_t)i]);
             }
         }

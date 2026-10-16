@@ -1,19 +1,21 @@
 #!/bin/sh
-# MiniCPM5-2B decode under rocprofv3 kernel tracing. The BLOCKS column is what this is for:
-# a 2B dense model at tp2 has tiny N per rank, so every decode GEMM is a candidate for grid
-# collapse -- 2048/tile_n workgroups on a 64-CU card leave most of it idle.
+# MiniCPM5-2B decode under rocprofv3 kernel tracing, mainly for the BLOCKS column: a 2B dense
+# model at tp2 has small N per rank, so a decode GEMM may launch too few workgroups (2048/tile_n
+# on a 64-CU card leaves most of it idle).
 #   N=<decode tokens> OUT=<trace dir> scripts/mctrace.sh
 P=8102
 M="${M:-$HOME/models/rad/minicpm5-2b-dspark.v2.rad}"
 N="${N:-140}"
 OUT="${OUT:-$HOME/traces/mc}"
-cd "$HOME/workspace/radiance/build" || exit 1
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BUILD="${BUILD:-$ROOT/build}"
+cd "$BUILD" || exit 1
 pkill -f "bin/radianc[e]"; while pgrep -f "bin/radianc[e]" >/dev/null; do sleep 1; done; sleep 2
 rm -rf "$OUT"; mkdir -p "$OUT"
 env GPU_MAX_ALLOC_PERCENT=100 GPU_MAX_HEAP_SIZE=100 $EXTRA_ENV \
-  "$HOME/workspace/radiance/libr4d/isa/trace.sh" "$OUT" -- \
+  "$ROOT/libr4d/isa/trace.sh" "$OUT" -- \
   ./bin/radiance --model "$M" \
-    --radiance-home "$HOME/workspace/radiance/build/radiance_home" \
+    --radiance-home radiance_home \
     --max-num-seqs 8 --max-model-len 16384 --tp 2 \
     --gpu-headroom-mib 160 --kv-cache-dtype fp8 --max-num-batched-tokens 512 \
     $EXTRA --port $P > "$HOME/mctrace.log" 2>&1 &

@@ -1,39 +1,24 @@
 # libavx -- the conventional op vocabulary in hand-written x86 SIMD, dispatched by CPU feature.
 #
-# ============================ THE BUILD IS THE DISPATCH ============================
+# This build is what makes runtime dispatch safe:
 #
-# This file is not a list of sources. It is the mechanism that makes runtime dispatch SAFE, and
-# every decision in it is load-bearing:
+#   The kernels are compiled four times, once per ISA level, into OBJECT libraries with different
+#   -m flags and AVX_LEVEL=0..3. avx_vec.h wraps each level in its own inline namespace; without
+#   that the linker would keep one definition (e.g. of avx::row_to_f32) for all four tables, and
+#   the scalar path could execute AVX-512 and fault.
 #
-#   THE KERNELS ARE COMPILED FOUR TIMES, once per ISA level, into four OBJECT libraries with
-#   different -m flags and AVX_LEVEL defined to 0/1/2/3. Same sources, four instruction streams.
-#   avx_vec.h wraps each level in its own inline namespace so the four sets of symbols do not
-#   collide -- which is not a nicety: without it the linker would pick one definition of
-#   avx::row_to_f32 for all four tables, and on a machine without AVX-512 the SCALAR path would
-#   execute AVX-512 and fault.
+#   The dispatcher and registry are compiled at baseline with no -m flags, because they decide
+#   which levels may run. This depends on the flags, not the source: with -mavx512f the compiler
+#   may auto-vectorise code that has no intrinsics.
 #
-#   THE DISPATCHER AND THE REGISTRY ARE COMPILED BASELINE, with no -m flags at all. They are what
-#   decides whether the other levels may run, so an instruction above the baseline in either of
-#   them faults before the decision is made. Note that this is a property of the FLAGS and not of
-#   the source: a compiler given -mavx512f may auto-vectorise anything, so "contains no intrinsics"
-#   is not the same claim.
+#   No -march=native: the .so is copied to other machines and dlopened by an engine that does not
+#   know its target, so it would SIGILL on older CPUs before main.
 #
-#   -march=native APPEARS NOWHERE. It is the obvious thing and it is wrong for a plugin: the .so is
-#   built on one machine, copied to others, and dlopened by an engine that has no idea what it was
-#   compiled for. A binary built with -march=native on a Zen 5 host SIGILLs on the first
-#   AVX-512 instruction anywhere older, before main, with no diagnostic.
-#
-# ============================ IN THE TREE, AND ALONE ============================
-#
-# The root CMakeLists adds this directory on every x86-64 build: these are the production host
-# kernels, and a model whose placement puts an op on the host -- the n-gram embedding's gather,
-# every step -- has no other kernel for it that the engine will serve on.
-#
-# It also builds ON ITS OWN, as any third party's plugin does: against an installed radiance,
-# through find_package and the same rad_add_plugin -- `cmake -S libavx -B build-avx
-# -DCMAKE_PREFIX_PATH=<radiance prefix>`. A box with no ROCm builds and checks it that way without
-# the HIP probe and the whole core; the oracle the checker compares against is the installed
-# reference library.
+# The root CMakeLists adds this directory on every x86-64 build; these are the production host
+# kernels (e.g. the n-gram embedding gather when placed on the host). It also builds standalone
+# against an installed radiance, like any third-party plugin:
+# `cmake -S libavx -B build-avx -DCMAKE_PREFIX_PATH=<radiance prefix>`. That needs no ROCm, and
+# the checker's oracle is then the installed reference library.
 if(NOT COMMAND rad_add_plugin)
   cmake_minimum_required(VERSION 3.21)
   project(libavx LANGUAGES CXX)
@@ -41,13 +26,11 @@ if(NOT COMMAND rad_add_plugin)
   rad_plugin_defaults()
 endif()
 
-# The harnesses land beside the plugin, in the build's $RADIANCE_HOME, where the loader ignores
-# anything that is not a .so.
+# The harnesses go beside the plugin in the build's $RADIANCE_HOME; the loader ignores non-.so files.
 set(AVX_OUT_DIR ${RAD_PLUGIN_OUT}/kernels)
 
 # ============================ the four ISA levels ============================
-# Every kernel translation unit. avx_dispatch.cpp and avx_registry.cpp are NOT here -- they are
-# baseline and belong to the plugin target itself.
+# Every kernel translation unit. The baseline sources belong to the plugin target below.
 set(AVX_KERNEL_SRC
   avx_support.cpp
   avx_table.cpp
@@ -56,26 +39,27 @@ set(AVX_KERNEL_SRC
   avx_hc.cpp
   avx_quant.cpp
   avx_gemm.cpp
+  avx_gemm_tile.cpp
+  avx_planes.cpp
   avx_attn.cpp
+  avx_qsa.cpp
   avx_moe.cpp
   avx_gdn.cpp
   avx_sample.cpp
   avx_misc.cpp
+  avx_gen.cpp
+  avx_gen_attn.cpp
 )
 
-# The flag sets, one per level. Written out rather than derived, because each one is a claim about
-# what instructions the object may contain and a derived list hides that claim.
+# The flag sets, written out because each states which instructions the object may contain.
 #
-#   0 scalar  nothing. x86-64 baseline, which is SSE2 -- the compiler will use it for scalar float
-#             and that is fine: SSE2 is in the base ISA and exists on every x86-64 that boots.
-#   1 avx     -mavx alone. NOT -mf16c and NOT -mfma: both are separate CPUID bits that arrived
-#             after AVX (Ivy Bridge and Haswell), and a level called `avx` that required them would
-#             fault on exactly the Sandy Bridge machines it exists for.
-#   2 avx2    -mavx2 -mfma -mf16c. These three ship together on every part that has any of them.
-#   3 avx512  F + BW + DQ + VL, which is what avx_dispatch.cpp checks for as a conjunction, plus
-#             the AVX2 set beneath it. Deliberately NOT avx512bf16 / avx512vnni: many AVX-512
-#             parts have neither, and neither is used (see avx_vec.h on why the bf16 convert is
-#             done with integer ops rather than vcvtneps2bf16).
+#   0 scalar  x86-64 baseline (SSE2).
+#   1 avx     -mavx only. F16C and FMA are separate CPUID bits (Ivy Bridge, Haswell); requiring them
+#             would fault on the Sandy Bridge parts this level exists for.
+#   2 avx2    -mavx2 -mfma -mf16c, which ship together.
+#   3 avx512  F + BW + DQ + VL (the conjunction avx_dispatch.cpp checks) plus the AVX2 set. No
+#             avx512bf16 / avx512vnni: many AVX-512 parts lack them (avx_vec.h converts bf16 with
+#             integer ops instead of vcvtneps2bf16).
 set(AVX_FLAGS_0 "")
 set(AVX_FLAGS_1 -mavx)
 set(AVX_FLAGS_2 -mavx2 -mfma -mf16c)
@@ -89,18 +73,12 @@ foreach(lvl RANGE 0 3)
   target_link_libraries(avx_lvl${lvl} PRIVATE radiance::abi)
   target_include_directories(avx_lvl${lvl} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_compile_options(avx_lvl${lvl} PRIVATE ${AVX_FLAGS_${lvl}}
-    # CONTRACTION IS ALLOWED HERE AND THAT IS THE OPPOSITE OF libref'S RULE, stated so the
-    # difference is deliberate rather than inherited. libref passes -ffp-contract=off because it is
-    # the ORACLE: a reference that contracts disagrees with itself between compilers. libavx is a
-    # fast kernel checked against that oracle to a tolerance, and refusing FMA would throw away
-    # half the machine's floating-point throughput to chase a bit-exactness it already gives up by
-    # vectorising the reduction at all.
+    # Contraction is allowed, unlike libref (the oracle, which must not contract). libavx is checked
+    # against it to a tolerance, and vectorised reductions are not bit-exact anyway, so FMA is kept.
     -ffp-contract=fast
-    # NO -ffast-math, and it is worth saying why given the above. Contraction changes the last ulp;
-    # -ffast-math changes what the code MEANS -- it lets the compiler assume no NaN and no signed
-    # zero, and this vocabulary is full of both (a masked logit is -inf, an attention row with no
-    # valid keys is a NaN the online softmax has to carry). The checker compares the finiteness
-    # pattern before it compares any number, exactly so that this cannot be smuggled in.
+    # No -ffast-math: it assumes no NaN/Inf and no signed zero, and these ops rely on them (a masked
+    # logit is -inf; an attention row with no valid keys carries a NaN through the online softmax).
+    # The checker compares the finiteness pattern before any value.
     -fno-math-errno)
   set_property(TARGET avx_lvl${lvl} PROPERTY POSITION_INDEPENDENT_CODE ON)
   if(OpenMP_CXX_FOUND)
@@ -109,9 +87,8 @@ foreach(lvl RANGE 0 3)
 endforeach()
 
 # ============================ the plugin ============================
-# avx_ngram.cpp is baseline for the same reason as the other two, and for one more: it holds the
-# embedding gather's row cache and its reader thread, and there must be ONE of each in the process
-# whatever level runs -- compiled per level, each level would keep its own.
+# Baseline sources. avx_ngram.cpp is also here because it holds the embedding gather's row cache
+# and reader thread, which must exist once per process, not once per level.
 set(AVX_BASELINE_SRC avx_dispatch.cpp avx_registry.cpp avx_ngram.cpp)
 
 rad_add_plugin(libavx kernels SOURCES ${AVX_BASELINE_SRC} INCLUDES ${CMAKE_CURRENT_SOURCE_DIR})
@@ -128,13 +105,18 @@ else()
 endif()
 
 # ============================ the harnesses ============================
-# They dlopen both plugins by path and link NEITHER. That is deliberate and it is what makes them
-# usable in both builds and against a plugin built somewhere else entirely: the checker's whole
-# claim is that it exercises the .so the engine would load, and a checker that statically linked
-# the kernels would be exercising a different binary.
-add_executable(rad-avx-check avx_check.cpp avx_check_rows.cpp avx_cases.cpp)
+# The harnesses dlopen both plugins by path and link neither, so they exercise the exact .so the
+# engine would load, in either build or against a plugin built elsewhere.
+add_executable(rad-avx-check avx_check.cpp avx_check_hand.cpp avx_check_rows.cpp avx_cases.cpp)
 target_include_directories(rad-avx-check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(rad-avx-check PRIVATE radiance::abi ${CMAKE_DL_LIBS} Threads::Threads)
+# In the source tree the checker also decodes weights with the core's own decoder, an oracle
+# independent of both plugins (avx_check_hand.cpp). One source file, not the core library.
+if(TARGET rad_core)
+  target_sources(rad-avx-check PRIVATE ${CMAKE_SOURCE_DIR}/core/format/encoding.cpp)
+  target_include_directories(rad-avx-check PRIVATE ${CMAKE_SOURCE_DIR}/core)
+  target_compile_definitions(rad-avx-check PRIVATE AVX_CHECK_CORE_DECODER=1)
+endif()
 set_target_properties(rad-avx-check PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${AVX_OUT_DIR})
 
 add_executable(rad-avx-bench avx_bench.cpp avx_cases.cpp)

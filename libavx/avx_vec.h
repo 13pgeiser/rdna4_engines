@@ -1,40 +1,24 @@
-/* avx_vec.h -- the vector abstraction every kernel in this plugin is written against, and the
- * dtype conversions that feed it.
+/* avx_vec.h -- the vector abstraction every kernel is written against, and the dtype conversions
+ * that feed it.
  *
- * THIS HEADER IS COMPILED FOUR TIMES, once per ISA level, with AVX_LEVEL defined on the command
- * line and the matching -m flags on the object. Nothing in here is selected at runtime: by the
- * time this is preprocessed the level is a constant, so `vf` is one concrete type and every
- * operation below is one instruction or a short fixed sequence. The runtime choice happens once,
- * in avx_dispatch.cpp, between whole tables of already-compiled functions.
+ * Compiled four times, once per ISA level, with AVX_LEVEL defined on the command line and matching
+ * -m flags. The level is a compile-time constant here, so `vf` is one concrete type and each
+ * operation is one instruction or a short fixed sequence. The runtime choice is made once, in
+ * avx_dispatch.cpp, between tables of compiled functions.
  *
- * ============================== WHY AN ABSTRACTION AND NOT FOUR COPIES ==============================
+ * One source per kernel instead of four copies: the AVX-512 path is the same algorithm as the
+ * scalar path, and the checker only has to prove the arithmetic agrees. The abstraction cannot
+ * express what differs in kind between levels (AVX-512 write masks, 32 registers,
+ * compress/expand), so where that matters a kernel has an `#if AVX_LEVEL >= 3` block with a
+ * comment (e.g. the GEMM microkernel's register blocking, top-k's compress).
  *
- * Four hand-written copies of seventy-five kernels is three hundred implementations
- * to keep in agreement, and they would not stay in agreement -- the levels whatever machine you
- * develop on cannot execute are the ones that rot, and they are the levels the plugin exists for.
- * Written once against `vf`, the AVX-512 path is THE SAME ALGORITHM as the scalar path and the
- * checker's job is to prove the arithmetic agrees, not to re-derive the op.
+ * Everything computes in f32, as libref does (f32 accumulation, IEEE RTNE narrowing;
+ * libref/ref_common.h). A whole row is converted to f32 scratch once, computed, and converted
+ * back, instead of libref's per-element dtype switch, which blocks vectorisation.
  *
- * The cost is real and is stated rather than hidden: an abstraction cannot express the things that
- * differ in KIND between levels -- AVX-512's write masks, its 32 registers, its compress/expand.
- * So where one of those is the whole point, the kernel writes an `#if AVX_LEVEL >= 3` block and
- * says why in a comment next to it. That is a handful of places (the GEMM microkernel's register
- * blocking, top-k's compress), not the general case.
- *
- * ============================== EVERYTHING COMPUTES IN f32 ==============================
- *
- * libref's contract is f32 accumulation with IEEE RTNE narrowing (libref/ref_common.h) and this
- * plugin is checked against it, so f32 is the working type here too. Operands arrive as bf16, f16,
- * fp8 or i8; the rule is CONVERT A WHOLE ROW ONCE into an f32 scratch, compute, convert back. Not
- * per element, which is what libref does and what makes it slow: a per-element dtype switch inside
- * the inner loop is a branch the vectoriser cannot cross. The size of that effect is measured per
- * op by rad-avx-bench and recorded in each kernel's own header, not guessed at here.
- *
- * WHAT THIS PLUGIN DOES NOT PROMISE, and libref does: no reassociation and no FMA. Both are given
- * up deliberately and both are why the tolerances in avx_check.cpp are the kbench ones rather than
- * zero. A vector reduction sums in a different order by construction -- that IS the vectorisation
- * -- and refusing FMA would throw away half the machine's flops. The narrowing conversions are the
- * part that must be bit-exact, because they define what a result IS, and they are (see below).
+ * Unlike libref, this plugin reassociates reductions and uses FMA, so avx_check.cpp uses the kbench
+ * tolerances rather than zero. The narrowing conversions are bit-exact, since they define the
+ * stored result.
  */
 #ifndef RAD_AVX_VEC_H
 #define RAD_AVX_VEC_H
@@ -76,19 +60,15 @@
 /* avx_rmsnorm -> avx_rmsnorm_v2 at AVX_LEVEL 2. */
 #define AVX_FN(name)   AVX_CAT(name, AVX_SUFFIX)
 
-/* The header of every kernel in this plugin. `a` is the RadArgs and `stream` the RadStream, which
- * a host kernel ignores -- the house rule is that every entry point is (const RadArgs*, RadStream)
- * whatever domain it runs in (libr4d/r4d_plugin.h), and a host plugin that dropped the second
- * parameter would not be substitutable for a device one. */
+/* Signature of every kernel. A host kernel ignores `stream`, but every entry point is
+ * (const RadArgs*, RadStream) in every domain (libr4d/r4d_plugin.h). */
 #define AVX_KERNEL(nm) \
     extern "C" int AVX_FN(avx_##nm)(const RadArgs* a, [[maybe_unused]] RadStream stream)
 
 namespace avx {
-/* EVERY LEVEL GETS ITS OWN NAMESPACE, and it is an `inline` one so that a kernel writes `avx::vf`
- * without knowing which level it is being compiled at. Without this the four objects would define
- * four `avx::row_to_f32` symbols and the link would pick one of them for all four tables -- which
- * is not a link error, it is an AVX-512 helper silently running inside the scalar path, and on a
- * machine without AVX-512 that is a SIGILL from the fallback that exists to prevent SIGILLs. */
+/* One inline namespace per level, so kernels write `avx::vf` without naming the level. Without it
+ * the four objects would define the same `avx::row_to_f32` symbol and the linker would silently
+ * pick one (e.g. the AVX-512 one) for all four tables. */
 inline namespace AVX_SUFFIX {
 
 /* ================================================================== the vector type */
@@ -131,9 +111,8 @@ static inline vf vf_min(vf a, vf b)           { return _mm256_min_ps(a, b); }
 #if AVX_LEVEL >= 2
 static inline vf vf_fma(vf a, vf b, vf c)     { return _mm256_fmadd_ps(a, b, c); }
 #else
-/* AVX HAS NO FMA -- it is a separate feature that arrived with Haswell, and Sandy Bridge is the
- * whole reason this level exists. Two roundings here, which makes this level numerically CLOSER
- * to libref than AVX2 is, not further. */
+/* AVX has no FMA (it arrived with Haswell). Two roundings, which is closer to libref than AVX2's
+ * fused form. */
 static inline vf vf_fma(vf a, vf b, vf c)     { return _mm256_add_ps(_mm256_mul_ps(a, b), c); }
 #endif
 static inline vf vf_sqrt(vf a)                { return _mm256_sqrt_ps(a); }
@@ -141,8 +120,8 @@ static inline vf vf_abs(vf a) {
     return _mm256_and_ps(a, _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff)));
 }
 static inline float vf_hsum(vf a) {
-    /* Lane-crossing first, then within the 128. Fixed order, so the answer does not depend on
-     * which of two equally valid trees the compiler picks. */
+    /* Fixed order (cross-lane, then within 128 bits) so the result does not depend on the
+     * compiler's choice of tree. */
     __m128 lo = _mm256_castps256_ps128(a);
     __m128 hi = _mm256_extractf128_ps(a, 1);
     __m128 s  = _mm_add_ps(lo, hi);
@@ -181,47 +160,15 @@ static inline float vf_hsum(vf a)             { return _mm512_reduce_add_ps(a); 
 static inline float vf_hmax(vf a)             { return _mm512_reduce_max_ps(a); }
 #endif
 
-/* Tail handling. A masked load is the right instruction at AVX-512 and there is no such thing
- * below it, so `vf_load_n` is a mask at level 3 and a small stack copy elsewhere. Kernels use it
- * only for the RAGGED END of a row: a model width is a multiple of 128 and the tail almost never
- * runs, so this is about correctness at odd shapes, not about speed. */
-static inline vf vf_load_n(const float* p, int n) {
-#if AVX_LEVEL == 3
-    return _mm512_maskz_loadu_ps((__mmask16)((1u << n) - 1u), p);
-#elif AVX_LEVEL == 0
-    return n > 0 ? *p : 0.0f;
-#else
-    float tmp[VF_N] = { 0 };
-    for (int i = 0; i < n; ++i) tmp[i] = p[i];
-    return _mm256_loadu_ps(tmp);
-#endif
-}
-
-static inline void vf_store_n(float* p, vf v, int n) {
-#if AVX_LEVEL == 3
-    _mm512_mask_storeu_ps(p, (__mmask16)((1u << n) - 1u), v);
-#elif AVX_LEVEL == 0
-    if (n > 0) *p = v;
-#else
-    float tmp[VF_N];
-    _mm256_storeu_ps(tmp, v);
-    for (int i = 0; i < n; ++i) p[i] = tmp[i];
-#endif
-}
-
 /* ================================================================== narrowing conversions
  *
- * THE BIT-EXACTNESS RULE. rad_plugin.h defines f32->bf16 as RTNE with the tie broken on the
- * surviving bit's parity, NaN forced quiet, and overflow allowed to carry into the bf16 infinity.
- * That definition IS the result (rad_plugin.h says so at length), and the kbench tolerance for
- * `cast` is 1e-6 -- which is to say: exact. So the vector forms below are the SAME INTEGER
- * ARITHMETIC, lane for lane, not an approximation of it, and avx_check.cpp checks `cast` over
- * every dtype pair against libref at that tolerance to hold them there.
+ * Bit-exact. rad_plugin.h defines f32->bf16 as RTNE with ties to the even surviving bit, NaN
+ * forced quiet, and overflow carrying into the bf16 infinity. The vector forms below are the same
+ * integer arithmetic lane for lane; avx_check.cpp checks `cast` over every dtype pair against
+ * libref at 1e-6, i.e. exactly.
  *
- * NOT `_mm512_cvtneps_pbh`. Zen 5 has AVX512-BF16 and its convert is also RTNE, but its NaN
- * handling is the hardware's rather than the ABI's, and the ABI's is what libref computes. One
- * instruction saved against a conversion that is a mask and two integer ops is not worth a
- * divergence the checker would have to be loosened to accept.
+ * Not `_mm512_cvtneps_pbh`: AVX512-BF16 (e.g. Zen 5) also rounds RTNE, but its NaN handling is the
+ * hardware's, not the ABI's.
  */
 static inline void cvt_bf16_to_f32(const uint16_t* src, float* dst, int64_t n) {
     int64_t i = 0;
@@ -238,9 +185,8 @@ static inline void cvt_bf16_to_f32(const uint16_t* src, float* dst, int64_t n) {
         _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(w));
     }
 #elif AVX_LEVEL == 1
-    /* AVX has no 256-bit integer ALU: the shift has to happen in two 128-bit halves and the
-     * result is glued with vinsertf128, which is a FLOAT-domain instruction and therefore legal
-     * here. This is the shape every integer helper at this level takes. */
+    /* AVX has no 256-bit integer ALU: shift in two 128-bit halves and join with vinsertf128, a
+     * float-domain instruction. Every integer helper at this level has this shape. */
     for (; i + 8 <= n; i += 8) {
         __m128i h  = _mm_loadu_si128((const __m128i*)(src + i));
         __m128i lo = _mm_slli_epi32(_mm_cvtepu16_epi32(h), 16);
@@ -254,8 +200,8 @@ static inline void cvt_bf16_to_f32(const uint16_t* src, float* dst, int64_t n) {
 }
 
 #if AVX_LEVEL >= 1
-/* The RTNE core, on a vector of f32 bit patterns, leaving 16-bit results in the low half of each
- * lane. Shared by the three vector levels; the pack differs and the arithmetic does not. */
+/* RTNE core on f32 bit patterns, leaving the 16-bit result in the low half of each lane. Same
+ * arithmetic at all three vector levels; only the pack differs. */
 #if AVX_LEVEL == 3
 static inline __m512i bf16_round_bits(__m512 f) {
     __m512i u    = _mm512_castps_si512(f);
@@ -303,7 +249,7 @@ static inline void cvt_f32_to_bf16(const float* src, uint16_t* dst, int64_t n) {
         __m256i w  = bf16_round_bits(_mm256_loadu_ps(src + i));
         __m128i lo = _mm256_castsi256_si128(w);
         __m128i hi = _mm256_extracti128_si256(w, 1);
-        /* Every lane is already <= 0xffff, so packus is exact rather than saturating. */
+        /* Every lane is <= 0xffff, so packus does not saturate. */
         _mm_storeu_si128((__m128i*)(dst + i), _mm_packus_epi32(lo, hi));
     }
 #elif AVX_LEVEL == 1
@@ -317,11 +263,9 @@ static inline void cvt_f32_to_bf16(const float* src, uint16_t* dst, int64_t n) {
     for (; i < n; ++i) dst[i] = rad_f32_to_bf16(src[i]);
 }
 
-/* f16 IS HARDWARE FROM AVX2 UP AND SOFTWARE BELOW IT. F16C is its own CPUID bit and arrived one
- * generation after AVX, so the level-1 path cannot use vcvtph2ps and falls through to the ABI's
- * software convert. That is the honest thing: a level named `avx` that quietly required F16C
- * would fault on the only machines it exists for. F16C's rounding is IEEE RTNE, which is what
- * rad_f32_to_f16 computes, so the two agree bit for bit -- checked by `cast` at 1e-6. */
+/* f16 is hardware (F16C) from the AVX2 level up and the ABI's software convert below. F16C is a
+ * separate CPUID bit that arrived a generation after AVX, so the `avx` level cannot assume it.
+ * F16C rounds RTNE, as rad_f32_to_f16 does, so the two agree bit for bit (`cast` at 1e-6). */
 static inline void cvt_f16_to_f32(const uint16_t* src, float* dst, int64_t n) {
     int64_t i = 0;
 #if AVX_LEVEL == 3
@@ -348,67 +292,38 @@ static inline void cvt_f32_to_f16(const float* src, uint16_t* dst, int64_t n) {
     for (; i < n; ++i) dst[i] = rad_f32_to_f16(src[i]);
 }
 
-/* ---- fp8. THE DECODE IS A 256-ENTRY TABLE AT THE SCALAR LEVEL and a bit reconstruction above it;
- * the encode is a masked fast path.
+/* ---- fp8. Decode: a 256-entry table at the scalar level and for tails, built at load from the
+ * ABI's converters (avx_dispatch.cpp: fp8_tables_init); e4m3 is a bit reconstruction on the vector
+ * levels (see cvt_fp8e4m3_to_f32), e5m2 a table gather.
  *
- * DECODE: every possible byte is one of 256 floats, so the exact answer is a lookup and there is
- * nothing to round. The table is built by the ABI's own converter at load (avx_fp8_table_init), so
- * it cannot drift from rad_fp8e4m3_to_f32, and it is what the scalar path and every tail element
- * read. The vector e4m3 path reconstructs the bits instead, for the reason set out above
- * cvt_fp8e4m3_to_f32; e5m2 still gathers from its table.
- *
- * ENCODE: the bit-exact algorithm has three branches (subnormal, normal, saturate) and vectorising
- * all three costs more than it saves. Instead the normal case -- |x| in [2^-6, 448), which is
- * every element of a normalised activation -- is done with vector integer arithmetic, and a mask
- * of the elements that are NOT in that range drives a scalar fixup through the ABI's converter. On
- * real activations the mask is empty and the fixup loop does not run; when it does run the answer
- * is the ABI's, which is the definition. */
-}  /* the tables are at GLOBAL scope with C linkage, deliberately: they are defined once in the
-   baseline-compiled avx_dispatch.cpp and read by all four levels, so they must NOT pick up the
-   per-level inline namespace the rest of this header is wrapped in. */
+ * Encode: the bit-exact algorithm has three branches (subnormal, normal, saturate). Only the normal
+ * case, |x| in [2^-6, 448), which covers a normalised activation, is vectorised; a mask of the
+ * other elements drives a scalar fixup through the ABI's converter. */
+}  /* The tables have C linkage at global scope: defined once in the baseline avx_dispatch.cpp and
+   read by all four levels, so they must stay outside the per-level inline namespace. */
 }
 extern "C" {
-/* NOT `const`, and that is forced: the tables are filled at load by rad_plugin_open from the
-   ABI's own converters (a typed-out table would be a second definition of the format that can
-   drift), so the object has to be writable. A const declaration here against a non-const
-   definition would link -- C linkage does not mangle the type -- and would be a quiet type
-   mismatch that no tool reports. */
+/* Not const: rad_plugin_open fills them at load. A const declaration against the non-const
+   definition would still link (C linkage does not mangle the type), unreported. */
 extern float avx_fp8e4m3_tab[256];
 extern float avx_fp8e5m2_tab[256];
 }
 namespace avx {
 inline namespace AVX_SUFFIX {
 
-/* THE DECODE IS A BIT RECONSTRUCTION, AND THE TABLE GATHER IS THE NULL RESULT.
+/* e4m3 decode by bit reconstruction rather than a vpgatherdd table lookup. A gather issues one L1
+ * access per lane even for a 1 KiB table, and `rad-avx-bench --cvt` shows it no faster than the
+ * scalar lookup; the reconstruction is about 2.5x faster at AVX2 and 3.3x at AVX-512.
  *
- * The obvious implementation is a 256-entry table -- every byte is one of 256 floats, so the answer
- * is a lookup and there is nothing to round -- gathered with vpgatherdd. `rad-avx-bench --cvt` says
- * that form LOSES TO THE SCALAR TABLE LOOKUP at both vector levels. A gather issues one cache line
- * per lane however small the table is; a 1 KiB table resident in L1 does not make that cheap, it
- * just makes it not slower than DRAM. Sixteen lanes of vpgatherdd is sixteen L1 accesses in
- * sequence.
- *
- * The reconstruction below is pure integer arithmetic and no memory at all:
- *
- *   u = (b & 0x7f) << 20  +  120 << 23    puts e in the f32 exponent field (bias 7 -> 127) and m
- *                                         in the top three mantissa bits, in one add
- *   e == 0                                is an fp8 SUBNORMAL, where the implicit 1 that f32 just
- *                                         supplied is wrong: (f - 2^-7) * 2 removes it and
- *                                         rescales, which is exact -- both operands are powers of
- *                                         two times a 3-bit mantissa
- *   mag == 0x7f                           is the format's ONLY NaN (S1111111); blended in
+ *   u = (b & 0x7f) << 20  +  120 << 23    e into the f32 exponent field (bias 7 -> 127), m into
+ *                                         the top three mantissa bits, in one add
+ *   e == 0                                fp8 subnormal: (f - 2^-7) * 2 removes the implicit 1
+ *                                         and rescales, exactly
+ *   mag == 0x7f                           the format's only NaN (S1111111); blended in
  *   sign                                  (b & 0x80) << 24
  *
- * The reconstruction is worth roughly 2.5x the gather at AVX2 and 3.3x at AVX-512 on that bench,
- * and the gather and the scalar table are within a few percent of each other.
- *
- * The table stays for the scalar path, where it is exact, has no branch, and is what the level is
- * for. It also stays because rad_plugin_open builds it from the ABI's own converter, so it remains
- * the definition the reconstruction above is checked against.
- *
- * WHAT IS NOT CLAIMED: that avoiding memory is obviously faster. Both forms are measured rather
- * than argued, and the checker proves the answer is identical over all 256 input bytes, NaN and
- * subnormals included, which a draw of normals never would. */
+ * The table remains for the scalar level and tails. The checker compares all 256 input bytes,
+ * NaN and subnormals included. */
 static inline void cvt_fp8e4m3_to_f32(const uint8_t* src, float* dst, int64_t n) {
     int64_t i = 0;
 #if AVX_LEVEL == 3
@@ -470,15 +385,12 @@ static inline void cvt_fp8e5m2_to_f32(const uint8_t* src, float* dst, int64_t n)
 static inline void cvt_f32_to_fp8e4m3(const float* src, uint8_t* dst, int64_t n) {
     int64_t i = 0;
 #if AVX_LEVEL == 3
-    /* q = ((e+7) << 3) | rtne(mantissa >> 20), valid while 2^-6 <= |x| < 448 and x is finite.
-     * Anything else takes the scalar fixup below.
+    /* q = ((e+7) << 3) | rtne(mantissa >> 20), valid for finite 2^-6 <= |x| < 448; anything
+     * else takes the scalar fixup.
      *
-     * THE LOWER BOUND IS 2^-6 AND NOTHING ELSE. e4m3's smallest NORMAL is 2^-6; below it the
-     * format is subnormal and the mantissa has to be renormalised with a variable shift, which is
-     * the branch this fast path exists to avoid. A bound set any lower lets fp8-subnormal
-     * magnitudes through the normal path, where they produce an exponent field of zero or below
-     * and an answer that is wrong by orders of magnitude. The bound is written as its float bit
-     * pattern with the value beside it so the next reader can check it rather than trust it. */
+     * The lower bound must be exactly 2^-6, e4m3's smallest normal. Below it the format is
+     * subnormal and needs a variable renormalising shift; a lower bound would send subnormals
+     * through this path with an exponent field <= 0, wrong by orders of magnitude. */
     const __m512i c_lo  = _mm512_set1_epi32(0x3c800000);  /* 2^-6, the smallest e4m3 normal */
     const __m512i c_hi  = _mm512_set1_epi32(0x43e00000);  /* 448,  the largest e4m3 finite  */
     for (; i + 16 <= n; i += 16) {
@@ -488,31 +400,23 @@ static inline void cvt_f32_to_fp8e4m3(const float* src, uint8_t* dst, int64_t n)
         __mmask16 fast = _kand_mask16(_mm512_cmpge_epi32_mask(mag, c_lo),
                                       _mm512_cmplt_epi32_mask(mag, c_hi));
         __m512i sign = _mm512_srli_epi32(_mm512_and_si512(u, _mm512_set1_epi32(0x80000000u)), 24);
-        /* RTNE on the 20 bits below the kept mantissa: add half, plus one more when the surviving
-         * bit is odd -- the same tie rule as bf16, one field down. The exponent field rides along
-         * in the same add, so a mantissa carry increments it for free. */
+        /* RTNE on the 20 dropped bits: add half, plus one when the surviving bit is odd (bf16's
+         * tie rule). A mantissa carry propagates into the exponent in the same add. */
         __m512i lsb  = _mm512_and_si512(_mm512_srli_epi32(mag, 20), _mm512_set1_epi32(1));
         __m512i r    = _mm512_add_epi32(_mm512_add_epi32(mag, _mm512_set1_epi32(0x7ffff)), lsb);
         __m512i e    = _mm512_sub_epi32(_mm512_srli_epi32(r, 23), _mm512_set1_epi32(127 - 7));
         __m512i m    = _mm512_and_si512(_mm512_srli_epi32(r, 20), _mm512_set1_epi32(7));
         __m512i q    = _mm512_or_si512(sign, _mm512_or_si512(_mm512_slli_epi32(e, 3), m));
-        /* A carry out of the top mantissa bit can push e past 15, and (e, m) = (15, 7) is the
-         * format's only NaN encoding rather than a number. Neither can be produced by an input
-         * strictly below 448, but the guard costs one compare and the alternative is a silent NaN
-         * in a weight: elements that reach either drop into the fixup, which saturates. */
+        /* A carry can push e past 15, and (e, m) = (15, 7) is the NaN encoding. Neither occurs
+         * for inputs below 448, but such lanes are sent to the saturating fixup rather than risk
+         * a silent NaN. */
         __mmask16 ovf = _kor_mask16(
             _mm512_cmpgt_epi32_mask(e, _mm512_set1_epi32(15)),
             _kand_mask16(_mm512_cmpeq_epi32_mask(e, _mm512_set1_epi32(15)),
                          _mm512_cmpeq_epi32_mask(m, _mm512_set1_epi32(7))));
         fast = _kandn_mask16(ovf, fast);
-        /* THE ALL-FAST CASE IS THE WHOLE POINT AND IT GETS ITS OWN EXIT. Every element of a
-         * normalised activation is in [2^-6, 448), so `fast` is 0xffff on essentially every vector
-         * a model produces, and the answer is one narrowing store of sixteen bytes.
-         *
-         * Without this exit the sixteen lanes spill to a stack array and a scalar loop tests one
-         * mask bit per element -- a loop that then runs on exactly the path the vector arithmetic
-         * was written to avoid, and dominates the op. A "fast path" whose epilogue is a
-         * per-element branch is not a fast path. */
+        /* All lanes fast (the normal case for activations): one narrowing store. Without this
+         * exit, the per-lane fixup loop below would run on every vector and dominate the op. */
         if (fast == (__mmask16)0xffff) {
             _mm_storeu_si128((__m128i*)(dst + i), _mm512_cvtepi32_epi8(q));
             continue;
@@ -523,21 +427,17 @@ static inline void cvt_f32_to_fp8e4m3(const float* src, uint8_t* dst, int64_t n)
             dst[i + k] = (fast >> k) & 1 ? (uint8_t)tmp[k] : rad_f32_to_fp8e4m3(src[i + k]);
     }
 #elif AVX_LEVEL == 2
-    /* THE SAME ARITHMETIC AT 256 BITS, and it exists because without it AVX2 falls all the way
-     * through to the ABI's scalar converter: an order of magnitude slower than the AVX-512 body,
-     * not the 2x its width would suggest. AVX2 is the level most machines in the world run, so a
-     * gap there is not a rounding error in the coverage.
-     *
-     * The mask is a movemask rather than a k-register, and the all-fast exit is the same: eight
-     * lanes narrowed to eight bytes with two packs. */
+    /* The same arithmetic at 256 bits (the scalar converter is an order of magnitude slower).
+     * The mask is a movemask instead of a k-register; the all-fast exit narrows eight lanes to
+     * eight bytes with two packs. */
     for (; i + 8 <= n; i += 8) {
         __m256  f   = _mm256_loadu_ps(src + i);
         __m256i u   = _mm256_castps_si256(f);
         __m256i mag = _mm256_and_si256(u, _mm256_set1_epi32(0x7fffffff));
         const __m256i c_lo = _mm256_set1_epi32(0x3c800000);   /* 2^-6 */
         const __m256i c_hi = _mm256_set1_epi32(0x43e00000);   /* 448  */
-        /* cmpgt is the only signed compare AVX2 has, so `mag >= c_lo` is written as
-         * `!(c_lo > mag)` and `mag < c_hi` as `c_hi > mag`. Both operands are non-negative. */
+        /* AVX2 has only signed cmpgt: `mag >= c_lo` is `!(c_lo > mag)`, `mag < c_hi` is
+         * `c_hi > mag`. Both operands are non-negative. */
         __m256i ge = _mm256_andnot_si256(_mm256_cmpgt_epi32(c_lo, mag),
                                          _mm256_cmpgt_epi32(c_hi, mag));
         __m256i sign = _mm256_srli_epi32(_mm256_and_si256(u, _mm256_set1_epi32(0x80000000u)), 24);
@@ -572,15 +472,13 @@ static inline void cvt_f32_to_fp8e5m2(const float* src, uint8_t* dst, int64_t n)
     for (int64_t i = 0; i < n; ++i) dst[i] = rad_f32_to_fp8e5m2(src[i]);
 }
 
-/* ---- int8. `_mm*_cvtps_epi32` rounds under MXCSR, which is round-to-nearest-even unless a
- * caller has changed it -- the same rule `std::nearbyintf` follows, which is what libref uses.
+/* ---- int8. `_mm*_cvtps_epi32` rounds under MXCSR (round-to-nearest-even by default), the same
+ * rule as libref's `std::nearbyintf`.
  *
- * THE CLAMP IS TAKEN IN FLOAT, BEFORE THE CONVERSION, and the saturating packs are not a
- * substitute for it: a value past the int32 range and +inf both convert to 0x80000000, the
- * "integer indefinite", which the packs then saturate to -128 -- the opposite end of the range.
- * Clamping to [-128, 127] first and rounding second lands where libref's round-then-clamp does for
- * every input, the .5 ties at the ends included, so this stays bit-exact against the reference and
- * `quant_act` can be held at 1e-6. A NaN stores 0, which is also what the scalar tail does. */
+ * The clamp is applied in float before conversion. The saturating packs are not enough: +inf and
+ * values beyond int32 convert to 0x80000000 ("integer indefinite"), which packs to -128.
+ * Clamp-then-round matches libref's round-then-clamp for every input, including .5 ties at the
+ * ends, so `quant_act` holds at 1e-6. NaN stores 0, as in the scalar tail. */
 #if AVX_LEVEL == 3
 static inline __m512 i8_range_ps(__m512 x) {
     const __mmask16 ord = _mm512_cmp_ps_mask(x, x, _CMP_ORD_Q);
@@ -619,13 +517,9 @@ static inline void cvt_f32_to_i8(const float* src, int8_t* dst, int64_t n) {
     for (; i < n; ++i) dst[i] = i8_round_sat(src[i]);
 }
 
-/* Fused scale + int8-encode for the quant_act_i8 family: t = src*inv computed in a register
- * feeds the same cvtps/packs sequence the split form uses (MXCSR round-to-nearest-even,
- * saturating packs -- exactly libref's nearbyintf-and-clamp, bit for bit), so the bytes match
- * the scale-then-store form while a full f32 write + read of the row disappears. Kept to the
- * int8 family: the fp8 encode's bit-twiddle is a long integer chain and folding the scale into
- * it measures slower, where this one measures a few percent faster -- the same traffic saved,
- * the opposite instruction-level trade. */
+/* Fused scale + int8 encode for the quant_act_i8 family: src * inv in a register feeds the same
+ * clamp/cvtps/packs sequence, so the bytes match scale-then-encode without an f32 round trip
+ * through memory. Not done for fp8: folding the scale into its longer integer chain is slower. */
 static inline void cvt_scaled_f32_to_i8(const float* src, float inv, int8_t* dst, int64_t n) {
     int64_t i = 0;
 #if AVX_LEVEL == 3
@@ -666,27 +560,18 @@ static inline void cvt_i8_to_f32(const int8_t* src, float* dst, int64_t n) {
 
 /* ================================================================== the dtype-generic row
  *
- * ONE SWITCH PER ROW, NOT PER ELEMENT. This is the single most valuable thing in this header:
- * libref's inner loops call ld_dt(), which is a switch on every element, and hoisting it to the
- * row is most of the speedup on every memory-bound op before a single vector instruction is
- * issued. The f32 case is a memcpy the caller can skip entirely -- see row_f32_in below.
+ * One dtype switch per row instead of libref's per-element ld_dt(); for memory-bound ops this
+ * accounts for most of the speedup. The f32 case can be skipped entirely (row_f32_in).
  *
- * W4 / W2 / MXFP4 are the packed WEIGHT codes and are decoded here too, because `dequant` and the
- * quantised GEMMs both need them and the unpack is the same nibble arithmetic in both. They are
- * raw CODES: the group scale belongs to the caller, which is the only component that knows where
- * the scale stream is (libref/ref_common.h makes the same split). */
+ * The packed weight codes W4 / W2 / MXFP4 decode here too (for `dequant` and the quantised GEMMs),
+ * as raw codes: the caller applies the group scale (the same split as libref/ref_common.h). */
 void row_to_f32  (uint32_t dt, const void* src, float* dst, int64_t n);
 void row_from_f32(uint32_t dt, const float* src, void* dst, int64_t n);
 
-/* The strided form: element i of the row is at src[i * stride]. A separate function because the
- * contiguous one is the case that matters and a stride parameter in it would cost a multiply per
- * element on the path that does not need one. */
+/* Element i at src[i * stride]. Separate so the contiguous path carries no stride multiply. */
 void row_to_f32_strided(uint32_t dt, const void* src, int64_t stride, float* dst, int64_t n);
 
-/* When the source is already f32, hand back the pointer instead of copying. Returns `src` for
- * RAD_F32 and `scratch` (filled) otherwise, so a kernel reads:
- *     const float* x = avx::row_f32_in(dt, p, scratch, n);
- * and pays nothing at all on the f32 path. */
+/* Returns `src` itself for RAD_F32, otherwise `scratch` filled with the converted row. */
 static inline const float* row_f32_in(uint32_t dt, const void* src, float* scratch, int64_t n) {
     if (dt == RAD_F32) return (const float*)src;
     row_to_f32(dt, src, scratch, n);
@@ -695,30 +580,23 @@ static inline const float* row_f32_in(uint32_t dt, const void* src, float* scrat
 
 /* ================================================================== math
  *
- * exp AND THE SIGMOID IT FEEDS. Every softmax, every gate and every attention row goes through
- * this, so a call to libm's expf per element is most of the cost of those ops. How much is
- * measured per op by rad-avx-bench.
+ * exp and sigmoid. Softmax, gates and attention rows all go through these, and a per-element libm
+ * expf would dominate those ops.
  *
- * THE POLYNOMIAL IS MINIMAX DEGREE 5 ON [-ln2/2, ln2/2] after range reduction, which is ~0.6 ulp
- * and comfortably inside every tolerance in this project -- softmax's 1e-6 included, because the
- * softmax NORMALISES: a relative error common to every term cancels in the quotient, and what
- * survives is the DIFFERENCE between lanes' errors, an order smaller again.
+ * Minimax degree 5 on [-ln2/2, ln2/2] after range reduction, ~0.6 ulp. That fits softmax's 1e-6
+ * because normalisation cancels the relative error common to all terms.
  *
- * NULL RESULT, on the two ways of not writing this: the _mm512_exp_ps SVML form is not available
- * without Intel's runtime, and GCC's libmvec vectorises expf only when it can prove the loop is
- * safe to call `_ZGVeN16v_expf` from, which it cannot do inside a kernel that also does integer
- * work. Hand-writing the polynomial is not a micro-optimisation here, it is the only way to get a
- * vector exp at all. */
+ * Hand-written because SVML's _mm512_exp_ps needs Intel's runtime, and GCC's libmvec only
+ * vectorises expf where it can prove the call safe, which fails in kernels that mix integer work. */
 static inline vf vf_exp(vf x) {
 #if AVX_LEVEL == 0
     return std::exp(x);
 #else
-    /* Clamp first: the reduction below overflows the integer exponent construction outside this
-     * range. The TOP saturates, which every consumer here wants rather than an infinity. The
-     * BOTTOM and a NaN are put right after the polynomial, because the clamp alone answers
-     * wrongly for both: e^-inf would come out as e^lo, a tiny positive number, and a NaN would be
-     * clamped to lo and vanish -- so a fully masked softmax row would read 1/n instead of the NaN
-     * libref gives. Below lo e^x is under the smallest normal float and is taken as zero. */
+    /* Clamp first: outside this range the integer exponent construction overflows. The top
+     * saturates, which every consumer here prefers to an infinity. Below lo (under the smallest
+     * normal float) the result is set to zero, and NaN is passed through, after the polynomial;
+     * the clamp alone would turn e^-inf into e^lo and lose a NaN, so a fully masked softmax row
+     * would give 1/n instead of libref's NaN. */
     const vf hi = vf_set1(88.3762626647949f), lo = vf_set1(-87.3365447504f);
     const vf x0 = x;
     x = vf_min(vf_max(x, lo), hi);
@@ -733,8 +611,7 @@ static inline vf vf_exp(vf x) {
     vf r = vf_fma(n, c1, x);
     r = vf_fma(n, c2, r);
     vf r2 = vf_mul(r, r);
-    /* exp(r) on [-ln2/2, ln2/2]. Horner, so the dependency chain is the depth of the polynomial
-     * and not of a wider evaluation tree. */
+    /* exp(r) on [-ln2/2, ln2/2], Horner form. */
     vf p = vf_set1(1.9875691500e-4f);
     p = vf_fma(p, r, vf_set1(1.3981999507e-3f));
     p = vf_fma(p, r, vf_set1(8.3334519073e-3f));
@@ -768,22 +645,18 @@ static inline vf vf_exp(vf x) {
 }
 
 static inline vf vf_sigmoid(vf x) {
-    /* 1 / (1 + e^-x). Not the tanh form: this is what libref computes and the two differ in the
-     * last ulp, which `sigmoid`'s 1e-5 f32 tolerance would pass but `hc_read`'s gate chain -- a
-     * sigmoid of a dot product of a sigmoid -- accumulates. */
+    /* 1 / (1 + e^-x), as libref computes it. The tanh form differs in the last ulp, which
+     * `hc_read`'s chained sigmoid gates accumulate. */
     return vf_div(vf_set1(1.0f), vf_add(vf_set1(1.0f), vf_exp(vf_sub(vf_zero(), x))));
 }
 
 static inline vf vf_silu(vf x) { return vf_mul(x, vf_sigmoid(x)); }
 
 #if AVX_LEVEL >= 2
-/* The CHEAP silu, for consumers that round to bf16 on the next store: a Taylor-4 exp head
- * (truncation ~6e-5) and a raw reciprocal seed (2^-14 avx512, 2^-12 avx2, no Newton step)
- * instead of the minimax tail and the division. ~3e-4 worst lane against the 6e-3 bf16
- * bucket: twentyfold of margin -- but NOT for f32 consumers, where 3e-4 does not fit 1e-5.
- * Declared here rather than inside one kernel so every bf16-store consumer can reach it;
- * silu_mul is the only caller today, because in a frontend-bound token loop -- the conv
- * kernels -- the difference is unmeasurable. Callers key on their OUTPUT dtype. */
+/* Cheap silu, only for consumers whose output is bf16: a Taylor-4 exp (truncation ~6e-5) and a
+ * raw reciprocal seed (2^-14 avx512, 2^-12 avx2, no Newton step). Worst lane ~3e-4, well inside the
+ * bf16 tolerance of 6e-3 but not f32's 1e-5, so callers key on their output dtype. silu_mul uses
+ * it; in the frontend-bound conv kernels it makes no measurable difference. */
 static inline vf vf_exp_t4(vf x) {
     const vf hi = vf_set1(88.3762626647949f), lo = vf_set1(-87.3365447504f);
     x = vf_min(vf_max(x, lo), hi);
@@ -796,9 +669,8 @@ static inline vf vf_exp_t4(vf x) {
 #endif
     vf r = vf_fma(n, c1, x);
     r = vf_fma(n, c2, r);
-    /* Taylor-4 head: 1 + r(1 + r(1/2 + r(1/6 + r/24))). Four FMAs against the exact path's
-     * seven-op minimax tail -- the reduction above is unchanged, so the exponent build below
-     * is too. */
+    /* Taylor-4: 1 + r(1 + r(1/2 + r(1/6 + r/24))). Same range reduction and exponent build as
+     * vf_exp. */
     vf p = vf_fma(r, vf_set1(1.0f / 24.0f), vf_set1(1.0f / 6.0f));
     p = vf_fma(p, r, vf_set1(0.5f));
     p = vf_fma(p, r, vf_set1(1.0f));
@@ -822,36 +694,45 @@ static inline vf vf_silu_fast(vf x) {
     vf d = vf_add(vf_set1(1.0f), e);
     vf r = _mm256_rcp_ps(d);
 #endif
-    /* No Newton step: d lies in [1, emax] so the seed is in range and nothing overflows. */
+    /* No Newton step: d is in [1, emax], so the seed is in range and nothing overflows. */
     return vf_mul(x, r);
 }
 #endif
 
-/* Sum of squares of a row, vectorised, with a FIXED reduction tree so the answer does not depend
- * on the compiler's unrolling. Used by every norm. */
-/* ================================================================== an operand's row, as f32
- *
- * THE TWO FUNCTIONS EVERY KERNEL OPENS WITH. `in_row` hands back a pointer to `n` floats holding
- * element (base + i * laststride) of the operand -- which is `t->data` itself when the operand is
- * already dense f32, so the common case copies nothing at all. `out_row` is the inverse.
- *
- * They are where the DENSE/STRIDED split lives, and it lives in one place on purpose: every op in
- * this vocabulary has to accept a strided view (libref/ref_ops.h: "no geometry constraints" has to
- * mean strides too), and seventy-five kernels each writing their own stride test is seventy-five
- * chances to write `t->stride[0]` where `laststride(t)` was meant. */
-/* ONE STEP OF AN EXACT TOP-R SELECTION over a row of f32: descending by value and, ON A TIE, by
- * the LOWER index. That tie rule is libr4d's and it has to be stated rather than left to a sort's
- * stability -- a router that breaks ties differently from the kernel it is checked against routes a
- * token to a different expert, and the diff is a whole layer wide.
- *
- * `pv`/`pi` carry the previously selected (value, index); seed them with +infinity and -1. Returns
- * false when nothing is left to select. Shared by row_topk, router_topk and sample_topk, which is
- * why it is here rather than in one of them. */
+/* ================================================================== exact top-R
+ * One step of an exact top-R selection over an f32 row: descending by value, ties to the lower
+ * index (libr4d's rule; a router that broke ties differently would pick a different expert).
+ * `pv`/`pi` carry the previous pick; seed them with +infinity and -1. Returns false when nothing
+ * is left. Shared by row_topk, router_topk and sample_topk. */
 bool topk_next_f32(const float* v, int64_t n, float* pv, int64_t* pi);
 
+/* ================================================================== an operand's row, as f32
+ * `in_row` returns `n` floats holding elements (base + i * laststride) of the operand: `t->data`
+ * itself when it is dense f32, otherwise `scr` filled. `out_row` is the inverse. Every op must
+ * accept strided views (libref/ref_ops.h), and this is the one place the dense/strided split is
+ * made. */
 const float* in_row (const struct RadTensor* t, int64_t base, int64_t n, float* scr);
 void         out_row(const struct RadTensor* t, int64_t base, int64_t n, const float* src);
 
+/* A dot product with four accumulators to cover FMA latency, combined (a0 + a1) + (a2 + a3) before
+ * the scalar tail: a fixed summation tree. Inline, since the attention and GEMM edges call it per
+ * element. */
+static inline float dotf(const float* a, const float* b, int64_t n) {
+    vf a0 = vf_zero(), a1 = vf_zero(), a2 = vf_zero(), a3 = vf_zero();
+    int64_t i = 0;
+    for (; i + 4 * VF_N <= n; i += 4 * VF_N) {
+        a0 = vf_fma(vf_loadu(a + i), vf_loadu(b + i), a0);
+        a1 = vf_fma(vf_loadu(a + i + VF_N), vf_loadu(b + i + VF_N), a1);
+        a2 = vf_fma(vf_loadu(a + i + 2 * VF_N), vf_loadu(b + i + 2 * VF_N), a2);
+        a3 = vf_fma(vf_loadu(a + i + 3 * VF_N), vf_loadu(b + i + 3 * VF_N), a3);
+    }
+    for (; i + VF_N <= n; i += VF_N) a0 = vf_fma(vf_loadu(a + i), vf_loadu(b + i), a0);
+    float s = vf_hsum(vf_add(vf_add(a0, a1), vf_add(a2, a3)));
+    for (; i < n; ++i) s += a[i] * b[i];
+    return s;
+}
+
+/* Row reductions with a fixed summation tree, independent of compiler unrolling. */
 float row_sumsq(const float* x, int64_t n);
 float row_sum  (const float* x, int64_t n);
 float row_amax (const float* x, int64_t n);

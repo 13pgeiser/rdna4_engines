@@ -1,27 +1,24 @@
 /* chatparse_test.cpp -- the streaming reply parser, against the legacy parser in tests/legacy/.
  *
  * core/text/chatparse.h reads a reply once, as it streams, from a format description. The legacy
- * path re-parses the whole reply on every chunk with the PEG parser llama.cpp's auto-parser
- * generates from the chat template, then trims and lifts calls in a second pass. It is kept in
- * tests/legacy/ as the ORACLE, and every case here runs both on the same request rendered through
- * the real template of each model this engine serves (tests/data/chat).
+ * path re-parses the whole reply on every chunk with the PEG parser llama.cpp's auto-parser builds
+ * from the chat template, then trims and lifts calls in a second pass. It is the oracle: every
+ * case runs both on the same request rendered through each served model's real template
+ * (tests/data/chat).
  *
- * THE RULE THE COMPARISON ENFORCES (chatdiff::judge). Where both parsers read a reply within the
- * format's grammar, their answers are IDENTICAL -- content, reasoning, every call's name and
- * arguments byte for byte. Where the legacy grammar rejects the reply, its answer is the whole
- * reply as content with calls lifted out by hand, decided only once the reply is complete; a
- * streaming parser cannot take back what it already sent, and reads such a reply by local
- * recovery instead (strict() says so). The one other difference: the legacy path also lifts a
- * call written without the format's call opener out of content (`bare_lift`); the streaming
- * parser leaves it as the content the grammar says it is.
+ * Comparison rule (chatdiff::judge): where both read a reply within the format's grammar, the
+ * answers are identical byte for byte (content, reasoning, every call's name and arguments).
+ * Where the legacy grammar rejects the reply, it returns the whole reply as content with calls
+ * lifted by hand once complete; a streaming parser cannot retract what it sent, so it recovers
+ * locally instead (strict() reports this). The legacy path also lifts a call written without the
+ * format's opener out of content (`bare_lift`); the streaming parser leaves it as content.
  *
- * THE STREAMING CONTRACT, checked on every reply cut every way: one piece, every two-way split,
- * byte by byte and in token-sized pieces. Every delta is a prefix of the finished value, the
- * deltas add up to it, it equals the one-shot parse, and the bytes held back never exceed the
- * format's bound.
+ * Streaming contract, checked at every cut (whole, every two-way split, byte by byte, token-sized):
+ * each delta is a prefix of the final value, the deltas sum to it, it equals the one-shot parse,
+ * and held bytes never exceed the format's bound.
  *
- * And the cost: a long reply streamed a byte at a time costs a constant factor of parsing it
- * once, and twice the reply costs twice the time.
+ * Cost: streaming a long reply byte by byte is a constant factor of parsing it once, and cost is
+ * linear in reply length.
  */
 #include "rad_test.h"
 
@@ -64,8 +61,8 @@ static std::string fixture(const std::string& dir) {
     return ss.str();
 }
 
-/* One bench per (model, request), built once. A fixture that does not load is a failure, not a
- * skip: the templates are in the repository. */
+/* One bench per (model, request), built once. A fixture that does not load fails rather than
+ * skips, since the templates are in the repository. */
 static Bench* bench(const Model& m, const ChatRequest& rq, const json& tools = agent_tools()) {
     static std::map<std::string, std::unique_ptr<Bench>> cache;
     const std::string key = m.name + "|" + describe(rq) + "|" + rq.schema + "|" + tools.dump();
@@ -80,14 +77,24 @@ static Bench* bench(const Model& m, const ChatRequest& rq, const json& tools = a
     return (cache[key] = std::move(b)).get();
 }
 
+/* The parser for format `f` under `ro`, as the server builds it: the format compiled, then
+ * bound to the request. Null after a failed check when either step refuses. */
+static std::shared_ptr<const ReplyParser> parser_of(const ChatFormat& f, const ReplyOptions& ro) {
+    std::string why;
+    std::shared_ptr<const ReplyFormat> rf;
+    std::shared_ptr<const ReplyParser> rp;
+    CHECK_OK(ReplyFormat::compile(f, &rf, &why));
+    if (rf) CHECK_OK(ReplyParser::create(rf, ro, &rp, &why));
+    return rp;
+}
 
 /* A reply quoted for a failure message. Mutated replies need not be UTF-8. */
 static std::string quote(const std::string& s) {
     return json(s).dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
-/* The requests every corpus is read under: what an agent sends, and each switch that changes
- * what a reply means. */
+/* The requests every corpus is read under: an agent's request, and each switch that changes what
+ * a reply means. */
 static std::vector<ChatRequest> requests() {
     std::vector<ChatRequest> v;
     v.push_back(ChatRequest{});
@@ -120,8 +127,8 @@ static std::vector<size_t> tokenish(const std::string& s, uint32_t seed) {
     return c;
 }
 
-/* Every way of cutting the reply that matters, against its one-shot parse. Two-way splits are
- * exhaustive for replies up to `split_cap` bytes. */
+/* Every relevant cut of the reply, against its one-shot parse. Two-way splits are exhaustive for
+ * replies up to `split_cap` bytes. */
 static std::string stream_all(const ReplyParser& p, const std::string& text, size_t split_cap = 4096) {
     const ReplyMessage expect = reply_parse(p, text);
     std::string err = check_stream(p, text, {}, expect);
@@ -134,8 +141,8 @@ static std::string stream_all(const ReplyParser& p, const std::string& text, siz
     return err;
 }
 
-/* Read `text` under bench `b`: the differential verdict must be allowed, and every cut of it
- * must stream to the same answer. Returns the verdict for the caller's own expectations. */
+/* Read `text` under bench `b`: the differential verdict must be allowed and every cut must stream
+ * to the same answer. Returns the verdict for further checks. */
 static Verdict run(Bench* b, const std::string& text, const char* what, size_t split_cap = 4096) {
     Verdict v;
     if (!b) return v;
@@ -155,17 +162,13 @@ static Verdict run(Bench* b, const std::string& text, const char* what, size_t s
 
 /* ================================================================== corpus 1: rendered replies
  *
- * An assistant message rendered through the model's own template is exactly the text the model
- * is trained to write. Each is read back by both parsers, which must agree and read it within the
- * grammar, and the calls must come back as the message had them. */
+ * An assistant message rendered through the model's template is the text the model is trained to
+ * write. Both parsers must agree, read it within the grammar, and return the message's calls. */
 
-/* What the template wrote for an argument, read back: a string argument is its text and any
- * other one is JSON -- a boolean or null included, which Jinja renders the Python way (`True`,
- * `None`) and the parser reads back as JSON's. One exception, the template's rendering rather than
- * the parser's reading: MiniCPM's template prints a value with a bare `{{ param_value }}`, and a
- * list or an object comes out of this Jinja engine without its brackets. Those are compared by
- * what the reply says, which the differential check already covers, rather than by what the
- * message held. */
+/* An argument as rendered and read back: a string is its text, anything else JSON, including
+ * booleans and null, which Jinja renders Python-style (`True`, `None`). Exception: MiniCPM's
+ * template prints values with a bare `{{ param_value }}`, so lists and objects lose their brackets;
+ * those are covered by the differential check rather than compared with the message. */
 static bool round_trips(const json& want, const json& got, bool containers) {
     if (!got.is_object() || want.size() != got.size()) return false;
     for (auto it = want.begin(); it != want.end(); ++it) {
@@ -176,10 +179,9 @@ static bool round_trips(const json& want, const json& got, bool containers) {
     return true;
 }
 
-/* A rendered reply the format's own grammar does not admit, and why. The grammar admits one call
- * when the request asked for no parallel calls; and MiniCPM's grammar ends a value at the first
- * `</param>`, so a CDATA-wrapped value that contains its own closing tag is split there -- by the
- * old path's grammar and by this parser alike. */
+/* A rendered reply the format's grammar does not admit, and why: without parallel calls the
+ * grammar admits one call, and MiniCPM's grammar ends a value at the first `</param>`, so a CDATA
+ * value containing that tag is split there by both parsers. */
 static bool outside_grammar(const Model& m, const ChatRequest& rq, const json& msg) {
     const size_t ncalls = msg.contains("tool_calls") ? msg["tool_calls"].size() : 0;
     if (!rq.parallel && ncalls > 1) return true;
@@ -197,7 +199,7 @@ TEST(rendered_replies_read_back_identically_under_every_request) {
                 const json& msg = corpus[i];
                 if (!rq.tools && msg.contains("tool_calls")) continue;
                 const std::string reply = b->render_reply(msg);
-                if (reply.empty()) continue;   /* the template does not continue its own prompt */
+                if (reply.empty()) continue;   /* the template does not continue its prompt */
                 const std::string what = "rendered reply " + std::to_string(i);
                 const Verdict v = run(b, reply, what.c_str());
                 if (outside_grammar(m, rq, msg)) continue;
@@ -224,8 +226,8 @@ TEST(rendered_replies_read_back_identically_under_every_request) {
     }
 }
 
-/* Every rendered reply, cut off after every byte: a truncated reply is read exactly as the legacy
- * path reads it -- a call in progress stays a call with the arguments that arrived. */
+/* Every rendered reply truncated after every byte reads as the legacy path reads it: a call in
+ * progress stays a call with the arguments that arrived. */
 TEST(every_truncation_of_a_rendered_reply_reads_as_the_old_path_did) {
     const std::vector<json> corpus = rendered_corpus();
     for (const Model& m : models()) {
@@ -251,8 +253,8 @@ TEST(every_truncation_of_a_rendered_reply_reads_as_the_old_path_did) {
 
 /* ================================================================== corpus 2: adversarial replies
  *
- * Hand-written in each format's spelling: the shapes models actually write, and the ones a
- * streaming parser is easiest to get wrong. */
+ * Hand-written in each format's spelling: shapes models write, and those a streaming parser most
+ * easily gets wrong. */
 
 TEST(adversarial_replies_agree_with_the_old_path_or_differ_as_documented) {
     for (const Model& m : models()) {
@@ -264,7 +266,7 @@ TEST(adversarial_replies_agree_with_the_old_path_or_differ_as_documented) {
     }
 }
 
-/* The adversarial shapes whose reading is a decision, stated. */
+/* Adversarial shapes whose reading is a design decision, with the decided result. */
 static ReplyMessage read_adv(const Model& m, const std::string& name) {
     Bench* b = bench(m, ChatRequest{});
     for (const Adversarial& a : adversarial(m))
@@ -283,9 +285,8 @@ TEST(the_decided_shapes_read_as_decided) {
         CHECK_EQ(r.calls.size(), (size_t)1);
         if (!r.calls.empty()) CHECK(!r.calls[0].closed);
 
-        /* Qwen's reasoning ends where a call starts; MiniCPM's template analysis names no call
-         * opener to end it at, so its unclosed block keeps the call as reasoning, as the legacy
-         * path reads it. */
+        /* Qwen's reasoning ends where a call starts; MiniCPM's analysis names no call opener to
+         * end it at, so an unclosed block keeps the call as reasoning, as the legacy path does. */
         r = read_adv(m, "unclosed think before a call");
         CHECK_EQ(r.calls.size(), q ? (size_t)1 : (size_t)0);
 
@@ -295,8 +296,8 @@ TEST(the_decided_shapes_read_as_decided) {
         if (!r.calls.empty())
             CHECK_EQ(r.calls[0].arguments, std::string("{\"command\":\"sleep\",\"timeout\":\"30 seconds\"}"));
 
-        /* A typed argument always reads as JSON: Python's literals as JSON's, inside a container
-         * too, an empty value as null, and text that spells no JSON value as a string of it.
+        /* A typed argument always reads as JSON: Python literals become JSON's (inside containers
+         * too), an empty value becomes null, and text that is no JSON value becomes a string.
          * Qwen's format reads non-string arguments as JSON; MiniCPM's reads every one as text. */
         if (q) {
             r = read_adv(m, "Python literals");
@@ -322,8 +323,8 @@ TEST(the_decided_shapes_read_as_decided) {
             r = read_adv(m, "a number that is not one");
             if (!r.calls.empty())
                 CHECK_EQ(r.calls[0].arguments, std::string("{\"path\":\"/a\",\"limit\":\"01\"}"));
-            /* A raw line break or tab inside a string is the escape JSON spells it as: a client's
-             * JSON parser refuses the raw character. */
+            /* A raw line break or tab inside a string is escaped, since JSON parsers refuse the
+             * raw character. */
             r = read_adv(m, "JSON strings holding a raw line break and tab");
             CHECK_EQ(r.calls.size(), (size_t)1);
             if (!r.calls.empty()) {
@@ -334,8 +335,8 @@ TEST(the_decided_shapes_read_as_decided) {
                     CHECK(a["extra"]["b"] == json("\tx"));
                 }
             }
-            /* A container is JSON once normalised, or the string of its text: a trailing comma,
-             * a bare word or a missing bracket is no JSON, and the arguments must stay JSON. */
+            /* A container is normalised JSON, or else its text as a string (trailing comma, bare
+             * word, missing bracket), so the arguments stay JSON. */
             r = read_adv(m, "Python containers that are no JSON");
             CHECK_EQ(r.calls.size(), (size_t)1);
             if (!r.calls.empty())
@@ -347,8 +348,8 @@ TEST(the_decided_shapes_read_as_decided) {
             r = read_adv(m, "an escaped quote in a double-quoted string");
             if (!r.calls.empty())
                 CHECK_EQ(r.calls[0].arguments, std::string("{\"tags\":[\"it's\", \"x\"]}"));
-            /* The grammar's JSON admits a number past a double's range and an unpaired surrogate
-             * escape, which a client's JSON parser refuses: such a value is its text. */
+            /* The grammar admits a number beyond double range and an unpaired surrogate escape,
+             * which clients' JSON parsers refuse, so such a value becomes its text. */
             r = read_adv(m, "JSON a client cannot read");
             if (!r.calls.empty()) {
                 const json a = json::parse(r.calls[0].arguments, nullptr, false);
@@ -416,10 +417,10 @@ TEST(the_decided_shapes_read_as_decided) {
     }
 }
 
-/* AN ARGUMENT NAME THAT REPEATS ITS OWN TAG'S OPENING -- `<parameter=parameter=command>`, which
- * models write and the grammar's undeclared arm admits -- is the argument it names, read
- * leniently: as the undeclared `parameter=command` the call reaches the tool without its command.
- * A name the repetition does not make a declared one stays as written. */
+/* An argument name repeating its tag's opening, `<parameter=parameter=command>` (models write it
+ * and the undeclared arm admits it), is read leniently as the argument it names; otherwise the
+ * tool would get `parameter=command` and no command. A name that does not resolve to a declared
+ * one stays as written. */
 TEST(an_argument_name_repeating_its_tag_is_the_argument_it_names) {
     for (const Model& m : models()) {
         Bench* b = bench(m, ChatRequest{});
@@ -444,9 +445,9 @@ TEST(an_argument_name_repeating_its_tag_is_the_argument_it_names) {
     }
 }
 
-/* A CALL THE REPLY ENDED INSIDE reads back, as content, as the text it was written as: the content
- * before it, then the call's own bytes -- never the reasoning, never a call that closed before it.
- * What a buffered response answers with when that call cannot be reported as a call. */
+/* A call the reply ended inside reads back as content in its written form: the content before it,
+ * then the call's bytes, never the reasoning or an earlier closed call. A buffered response uses
+ * this when the call cannot be reported as a call. */
 TEST(a_call_the_reply_ended_inside_reads_back_as_its_text) {
     auto trimmed = [](std::string s) {
         while (!s.empty() && (s.back() == '\n' || s.back() == ' ')) s.pop_back();
@@ -493,14 +494,13 @@ TEST(a_call_the_reply_ended_inside_reads_back_as_its_text) {
 
 /* ================================================================== calls without the wrapper
  *
- * Qwen's grammar opens a call at `<tool_call>\n`, and the lazy grammar engages only there -- so a
- * call the model writes WITHOUT that exact opener is unconstrained, and it is exactly the call that
- * reaches the parser malformed. Agent transcripts contain calls of these shapes: a bare
+ * Qwen's lazy grammar engages only at `<tool_call>\n`, so a call written without that exact
+ * opener is unconstrained and the likeliest to arrive malformed. Agent transcripts contain a bare
  * `<function=NAME>` ... `</function>`, or `<tool_call>` run straight into `<function=`. The legacy
- * path lifts them out of the content in a second pass; the parser reads them as calls in its one
- * pass, once what follows the name tag shows it is a call, and says the reply left its grammar.
+ * path lifts these in a second pass; the parser reads them as calls in one pass once what follows
+ * the name tag shows a call, and reports that the reply left its grammar.
  *
- * Each shape is read whole and cut every way, and compared with the legacy path's answer. */
+ * Each shape is read whole and at every cut, and compared with the legacy path. */
 
 static std::string qbare(const std::string& name,
                          const std::vector<std::pair<std::string, std::string>>& args) {
@@ -514,7 +514,7 @@ struct Shape {
     size_t calls;
     bool strict;       /* the reply stays within the grammar: nothing was read as a loose call */
     /* The opener is inside the reasoning block the generation prompt opened. With thinking off
-     * the prompt has closed that block already, the text is content, and the call is a call. */
+     * the prompt already closed it, so the text is content and the call is a call. */
     bool in_reasoning = false;
 };
 
@@ -530,13 +530,13 @@ static std::vector<Shape> bare_shapes() {
         { "two bare calls", T + ls + "\n" + rd, 2, false },
         { "two bare calls with a sentence between", T + ls + "\nNow the file.\n" + rd, 2, false },
         { "a bare call with no arguments", T + "<function=which gcc cc>\n</function>", 1, false },
-        /* The first argument's name is what makes the opener a call, and it is held while it is
-         * read: a tag name, not a delimiter, however long. */
+        /* The first argument's name confirms the call, so it is held while read: a tag name of
+         * any length, not a delimiter. */
         { "a bare call whose first argument name is long",
           T + "<function=bash>\n<parameter=" + std::string(200, 'x') + ">\nls\n</parameter>\n</function>",
           1, false },
-        /* Unconstrained, the model need not write the newlines the template puts around each
-         * tag; a loose call's tags are read with that whitespace optional. */
+        /* Unconstrained, the model may omit the newlines the template puts around each tag, so
+         * that whitespace is optional in a loose call. */
         { "a bare call written without newlines",
           T + "<function=bash><parameter=command>ls -la</parameter></function>", 1, false },
         { "the wrapper without its newline",
@@ -554,7 +554,7 @@ static std::vector<Shape> bare_shapes() {
         { "the wrapper and opener in prose", T + "Write `<tool_call><function=f>` first.", 0, true },
         { "a bare opener whose tag never closes", T + "See <function=bash and more.", 0, true },
         { "a bare opener at the very end", T + "Next: <function=ba", 0, true },
-        /* An argument name that runs into a tag is no argument: the opener was text. */
+        /* An argument name that runs into a tag is not an argument; the opener was text. */
         { "a bare opener whose argument name runs into a tag",
           T + "<function=bash>\n<parameter=com\nls\n</parameter>\n</function>", 0, true },
         { "a bare opener whose long argument name runs into a tag",
@@ -590,7 +590,7 @@ TEST(a_qwen_call_without_its_wrapper_is_a_call_as_the_old_path_read_it) {
                     CHECK(c.closed);
                     CHECK(server::json_complete(c.arguments));
                 }
-                /* Nothing of a call read loosely is ever left in the content. */
+                /* No part of a loosely read call is left in the content. */
                 if (s.calls > 0 && !s.strict) {
                     CHECK(r.content.find("<function=") == std::string::npos);
                     CHECK(r.content.find("<parameter=") == std::string::npos);
@@ -601,8 +601,8 @@ TEST(a_qwen_call_without_its_wrapper_is_a_call_as_the_old_path_read_it) {
     }
 }
 
-/* WHERE THE LEGACY PATH ANSWERS DIFFERENTLY, and why. Each is asserted as the parser reads it,
- * beside what the legacy path returns, so a change to either is seen. */
+/* Where the legacy path answers differently, and why. Both answers are asserted so a change to
+ * either is noticed. */
 TEST(a_bare_call_differs_from_the_old_path_only_where_the_old_path_was_wrong) {
     for (const Model& m : models()) {
         if (!is_qwen(m)) continue;
@@ -610,11 +610,10 @@ TEST(a_bare_call_differs_from_the_old_path_only_where_the_old_path_was_wrong) {
         if (!b) continue;
         const std::string T = "Thinking it over.\n</think>\n\n";
 
-        /* The legacy lifter knows no schema, so a typed argument comes back as a string; and it
-         * trims every value, which eats the indentation of an edit's first line -- the defect
-         * vendor/patches/0005 fixes on the grammar path. The parser types the value from the
-         * schema and strips only the newline the format puts around it, as it does inside the
-         * wrapper. */
+        /* The legacy lifter has no schema, so typed arguments come back as strings, and it trims
+         * every value, losing an edit's first-line indentation (vendor/patches/0005 fixes this on
+         * the grammar path). The parser types values from the schema and strips only the
+         * format's delimiting newline, as inside the wrapper. */
         {
             const std::string text =
                 T + qbare("read", { { "path", "/work/a.py" }, { "limit", "40" } }) + "\n" +
@@ -629,7 +628,7 @@ TEST(a_bare_call_differs_from_the_old_path_only_where_the_old_path_was_wrong) {
                      std::string("{\"path\":\"/work/b.py\",\"content\":\"return a + b\"}"));
             CHECK_EQ(r.calls[1].arguments,
                      std::string("{\"path\":\"/work/b.py\",\"content\":\"    return a + b\"}"));
-            /* And read inside the wrapper, the same call gives the same arguments. */
+            /* Inside the wrapper the same call gives the same arguments. */
             const ReplyMessage w = b->new_parse(
                 T + "<tool_call>\n" + qbare("read", { { "path", "/work/a.py" }, { "limit", "40" } }) +
                 "\n</tool_call>");
@@ -637,8 +636,8 @@ TEST(a_bare_call_differs_from_the_old_path_only_where_the_old_path_was_wrong) {
             CHECK_EQ(w.calls[0].arguments, r.calls[0].arguments);
         }
 
-        /* The legacy lifter runs only when nothing else parses as a call, so a bare call beside a
-         * wrapped one stays in the content as XML. */
+        /* The legacy lifter runs only when nothing else parses as a call, so it leaves a bare
+         * call beside a wrapped one in the content as XML. */
         {
             const std::string text = T + qbare("bash", { { "command", "ls" } }) +
                                      "\n<tool_call>\n" + qbare("read", { { "path", "/a" } }) +
@@ -654,9 +653,9 @@ TEST(a_bare_call_differs_from_the_old_path_only_where_the_old_path_was_wrong) {
             CHECK(r.content.empty());
         }
 
-        /* The legacy lifter drops a whole call when a LATER argument name runs into a tag. By then
-         * the call has streamed, so it ends at that argument, with the arguments before it, and
-         * the rest is content. */
+        /* The legacy lifter drops a whole call when a later argument name runs into a tag. The
+         * call has already streamed by then, so it ends at that argument and the rest is
+         * content. */
         {
             const std::string text = T + "<function=bash>\n<parameter=command>\nls\n</parameter>\n"
                                          "<parameter=x<y>\n1\n</parameter>\n</function>";
@@ -671,9 +670,9 @@ TEST(a_bare_call_differs_from_the_old_path_only_where_the_old_path_was_wrong) {
             CHECK(b->old_parse(text).calls.empty());
         }
 
-        /* The legacy lifter leaves a bare call cut off mid-argument as content, since it reads
-         * only what it can read end to end; a stream has already announced the call by then, so
-         * it is a call whose arguments did not finish -- as a wrapped call cut off there is. */
+        /* The legacy lifter leaves a bare call cut off mid-argument as content. A stream has
+         * already announced the call, so it is a call with unfinished arguments, as a wrapped
+         * call cut off there is. */
         {
             const std::string text = T + "<function=bash>\n<parameter=command>\nls -";
             const Verdict v = run(b, text, "truncated bare call");
@@ -687,9 +686,9 @@ TEST(a_bare_call_differs_from_the_old_path_only_where_the_old_path_was_wrong) {
     }
 }
 
-/* MiniCPM's calls are not wrapped: its opener is `<function name="` alone, which its grammar
- * already opens a call with. None of the above applies: its content automaton has its one opener,
- * a call is strict, and Qwen's spellings in its content are content. */
+/* MiniCPM's calls are unwrapped: its opener is `<function name="`, which its grammar already
+ * opens a call with. So none of the above applies: a call is strict and Qwen's spellings in its
+ * content are content. */
 TEST(minicpm_reads_with_no_loose_opener) {
     const Model& m = models()[2];
     REQUIRE(!is_qwen(m));
@@ -709,7 +708,7 @@ TEST(minicpm_reads_with_no_loose_opener) {
         CHECK(v.strict);
         CHECK_EQ(b->new_parse(text).calls.size(), n);
     }
-    /* A Qwen-spelled call in a MiniCPM reply is that model's content, left in place. */
+    /* A Qwen-spelled call in a MiniCPM reply is content, left in place. */
     const std::string q = T + "<tool_call>\n" + qbare("bash", { { "command", "ls" } }) + "\n</tool_call>";
     bool strict = false;
     const ReplyMessage r = b->new_parse(q, &strict);
@@ -720,11 +719,10 @@ TEST(minicpm_reads_with_no_loose_opener) {
 
 /* ================================================================== corpus 3: fuzz
  *
- * Random replies assembled from each format's own fragments -- which is what reaches the deep
- * states -- and random byte mutations of every corpus reply. Both parsers read each one; the
- * verdict must be allowed and every cut must stream to the same answer. Mutations may break
- * UTF-8, which no reply ever does once the decoder has sanitised it: the comparison runs on the
- * sanitised text, and the raw bytes are fed too, for the invariants alone. */
+ * Random replies assembled from each format's fragments (to reach deep states) and random byte
+ * mutations of every corpus reply. The verdict must be allowed and every cut must stream to the
+ * same answer. Mutations may break UTF-8, which the decoder always sanitises, so the comparison
+ * runs on sanitised text and the raw bytes are fed only to check invariants. */
 
 TEST(fuzzed_replies_never_break_the_contract) {
     std::mt19937 rng(20260924);
@@ -745,7 +743,7 @@ TEST(fuzzed_replies_never_break_the_contract) {
                 } else {
                     text = mutate(rng, seeds[rng() % seeds.size()], frag);
                 }
-                /* The raw bytes, for the invariants: no crash, and the stream agrees with itself. */
+                /* Raw bytes: no crash, and the stream agrees with itself. */
                 const std::string raw = stream_all(b->parser(), text, 0);
                 if (!raw.empty())
                     ::radtest::fail(__FILE__, __LINE__, m.name + " raw fuzz: " + raw + "\n  reply: " +
@@ -770,8 +768,7 @@ TEST(fuzzed_replies_never_break_the_contract) {
 
 /* ================================================================== response formats
  *
- * With a response format the reply is one JSON document, optionally fenced, and the document is
- * the content. */
+ * With a response format the reply is one JSON document, optionally fenced, and is the content. */
 TEST(response_format_replies_read_as_the_old_path_read_them) {
     const std::string schema = R"({"type":"object","properties":{"answer":{"type":"string"},)"
                                R"("n":{"type":"integer"}},"required":["answer"]})";
@@ -802,8 +799,8 @@ TEST(response_format_replies_read_as_the_old_path_read_them) {
 
 /* ================================================================== the grammar
  *
- * For a template-analysed format the grammar generated from the description is the vendored
- * generator's grammar, byte for byte, and accepts and rejects the same call text. */
+ * For a template-analysed format the grammar generated from the description equals the vendored
+ * generator's byte for byte and accepts and rejects the same call text. */
 
 static std::vector<json> tool_sets() {
     std::vector<json> v;
@@ -819,8 +816,8 @@ static std::vector<json> tool_sets() {
     return v;
 }
 
-/* The rules one grammar has and the other does not, marked - for the vendored and + for the
- * generated. Both list their rules sorted by name, one to a line. */
+/* Rules in only one grammar, marked - for vendored and + for generated. Both list rules sorted by
+ * name, one per line. */
 static std::string line_diff(const std::string& a, const std::string& b) {
     auto lines = [](const std::string& s) {
         std::vector<std::string> v;
@@ -872,8 +869,8 @@ TEST(the_generated_grammar_is_the_vendored_grammar) {
     CHECK(compared > 0);
 }
 
-/* The call section of every rendered reply is admitted by both grammars, and a mutated one is
- * admitted by both or by neither. */
+/* Both grammars admit every rendered reply's call section, and a mutated one by both or
+ * neither. */
 TEST(the_generated_grammar_accepts_what_the_vendored_one_accepts) {
     log_set_level(Log::Error);
     std::mt19937 rng(7);
@@ -888,7 +885,7 @@ TEST(the_generated_grammar_accepts_what_the_vendored_one_accepts) {
         CHECK_OK(chat_format_grammar(b->format(), gq, &g, &why));
         const std::string opener = b->format().call_open;
         const std::vector<std::string> frag = fragments(m);
-        /* A vocabulary of the printable bytes: the grammar walks text, and no mask is asked for. */
+        /* A vocabulary of printable bytes: the grammar walks text and no mask is requested. */
         static const SimpleVocab vocab = [] {
             SimpleVocab v;
             for (int c = 32; c < 127; ++c) v.add(std::string(1, (char)c));
@@ -918,10 +915,9 @@ TEST(the_generated_grammar_accepts_what_the_vendored_one_accepts) {
     log_set_level(Log::Warn);
 }
 
-/* A REQUIRED CALL IS THE WHOLE REPLY: from the generation prompt the sampler feeds it, the
- * reasoning block and then the calls, with no prose before them and nothing after them -- so a
- * complete grammar admits only the end of the turn and the reply stops at the last call. A named
- * function admits that function alone, and `parallel_tool_calls: false` one call. */
+/* A required call constrains the whole reply: after the generation prompt, the reasoning block and
+ * then the calls, with no prose before or after, so the reply ends at the last call. A named
+ * function admits only that function; `parallel_tool_calls: false` admits one call. */
 TEST(a_required_call_grammar_is_the_whole_reply) {
     log_set_level(Log::Error);
     static const SimpleVocab vocab = [] {
@@ -950,7 +946,7 @@ TEST(a_required_call_grammar_is_the_whole_reply) {
             return g.text;
         };
         /* 1 complete, 0 admitted but unfinished or refused. The sampler feeds the generation
-         * prompt first (SamplingParams::grammar_prefix), so the reply is read after it. */
+         * prompt first (SamplingParams::grammar_prefix). */
         auto admits = [&](const std::string& gbnf, const std::string& reply) {
             std::unique_ptr<GbnfGrammar> gr;
             std::string err;
@@ -1022,13 +1018,13 @@ TEST(the_derived_formats_are_the_ones_in_service) {
             CHECK(f.triggers.empty());
             CHECK(f.reasoning_breaks.empty());
         }
-        /* The decoder is told the same markers the vendored analysis named. */
+        /* The decoder gets the same markers the vendored analysis named. */
         Bench* b = bench(m, ChatRequest{});
         if (b) CHECK(chat_format_markers(f) == b->prompt().preserved_tokens);
     }
 }
 
-/* The ChatML fallback -- a model with no template -- has neither reasoning nor calls. */
+/* The ChatML fallback (a model with no template) has neither reasoning nor calls. */
 TEST(no_template_is_a_format_with_no_reasoning_and_no_calls) {
     ChatFormat f;
     std::string refused, why;
@@ -1042,7 +1038,7 @@ TEST(no_template_is_a_format_with_no_reasoning_and_no_calls) {
     CHECK_OK(ReplyParser::create(rf, ro, &rp, &why));
     const ReplyMessage r = reply_parse(*rp, "  <think>x</think> <tool_call>\n");
     CHECK_EQ(r.content, std::string("  <think>x</think> <tool_call>"));
-    /* And a request with tools is refused, naming why. */
+    /* A request with tools is refused with the reason. */
     const json tools = agent_tools();
     ro.tools = &tools;
     CHECK(ReplyParser::create(rf, ro, &rp, &why) == RAD_E_UNSUPPORTED);
@@ -1080,10 +1076,10 @@ static RadChatFormat qwen_abi() {
     return c;
 }
 
-/* WHERE THE REPLY STARTS AGAINST ITS REASONING BLOCK, read from the generation prompt as the stream
- * reads it: opened by the prompt, opened and closed again (thinking off), or not opened at all --
- * and the markers trimmed of the whitespace that is optional to match. The engine counts and closes
- * the block by these, so a reply this calls open has to be one the stream reads as reasoning. */
+/* Where the reply starts relative to its reasoning block, read from the generation prompt as the
+ * stream reads it: opened, opened and closed (thinking off), or not opened, with markers trimmed of
+ * optional whitespace. The engine counts and closes the block by these, so a reply reported open
+ * must be one the stream reads as reasoning. */
 TEST(the_parser_says_whether_a_reply_starts_inside_its_reasoning_block) {
     RadChatFormat c = qwen_abi();
     ChatFormat f;
@@ -1109,15 +1105,14 @@ TEST(the_parser_says_whether_a_reply_starts_inside_its_reasoning_block) {
 
     ChatFormat none;
     CHECK_OK(chat_format_from_template("", "", "", &none, &why, &why));
-    CHECK_OK(ReplyFormat::compile(none, &rf, &why));
-    std::shared_ptr<const ReplyParser> rp;
-    CHECK_OK(ReplyParser::create(rf, ReplyOptions{}, &rp, &why));
+    const std::shared_ptr<const ReplyParser> rp = parser_of(none, ReplyOptions{});
+    REQUIRE(rp);
     CHECK(rp->reasoning().close.empty());
     CHECK(!rp->reasoning().starts_open);
 }
 
-/* A plugin that declares its model's format gets exactly what the template analysis derives for
- * the same model: the same parser behaviour and the same grammar. */
+/* A plugin-declared format behaves exactly as the template-derived one: same parser, same
+ * grammar. */
 TEST(a_declared_format_reads_and_constrains_like_the_derived_one) {
     const Model& m = models()[0];
     RadChatFormat c = qwen_abi();
@@ -1132,14 +1127,12 @@ TEST(a_declared_format_reads_and_constrains_like_the_derived_one) {
     CHECK(chat_format_describe(derived) == chat_format_describe(declared));
     CHECK(chat_format_markers(derived) == chat_format_markers(declared));
 
-    std::shared_ptr<const ReplyFormat> rf;
-    CHECK_OK(ReplyFormat::compile(declared, &rf, &why));
     ReplyOptions ro;
     ro.generation_prompt = b->prompt().generation_prompt;
     ro.tools = &agent_tools();
     ro.terminators = m.terminators;
-    std::shared_ptr<const ReplyParser> rp;
-    CHECK_OK(ReplyParser::create(rf, ro, &rp, &why));
+    const std::shared_ptr<const ReplyParser> rp = parser_of(declared, ro);
+    REQUIRE(rp);
     for (const json& msg : rendered_corpus()) {
         const std::string reply = b->render_reply(msg);
         CHECK(same(reply_parse(*rp, reply), b->new_parse(reply)));
@@ -1152,10 +1145,9 @@ TEST(a_declared_format_reads_and_constrains_like_the_derived_one) {
     CHECK_EQ(g.text, b->prompt().grammar);
 }
 
-/* oh-my-pi's `task` tool in its batch form: `"model?": "never"`, which Arktype exports as
- * `{"not": {}}`. A schema no value satisfies needs no arm, and the declared format and the derived
- * one agree about that as they agree about everything else. Before, both refused the tool and the
- * request with it. */
+/* oh-my-pi's `task` tool in batch form: `"model?": "never"`, which Arktype exports as
+ * `{"not": {}}`. A schema no value satisfies gets no arm, and the declared and derived formats
+ * agree on it. */
 TEST(an_argument_no_value_satisfies_has_no_arm_in_either_grammar) {
     const json tools = json::parse(R"([{"type":"function","function":{"name":"task",
       "description":"Spawn subagents.","parameters":{"type":"object","properties":{
@@ -1182,8 +1174,8 @@ TEST(an_argument_no_value_satisfies_has_no_arm_in_either_grammar) {
     CHECK_OK(chat_format_grammar(declared, gq, &g, &why));
     CHECK_EQ(g.text, b->prompt().grammar);
 
-    /* And the parser reads such an argument as the grammar does, by the undeclared arm: text,
-     * though its value spells JSON. */
+    /* The parser reads such an argument via the undeclared arm, as the grammar does: as text,
+     * even when it spells JSON. */
     const std::string reply = "Thinking it over.\n</think>\n\n" +
         C(models()[0], "task", { { "context", "c" }, { "tasks", "[]" }, { "model", "123" } });
     const Verdict v = run(b, reply, "an argument no value satisfies");
@@ -1193,10 +1185,10 @@ TEST(an_argument_no_value_satisfies_has_no_arm_in_either_grammar) {
     CHECK_EQ(r.calls[0].arguments, std::string("{\"context\":\"c\",\"tasks\":[],\"model\":\"123\"}"));
 }
 
-/* OH-MY-PI 18.6.0's TOOLS AS AN UNMODIFIED CLIENT SENDS THEM (tests/data/chat), descriptions aside.
- * Its `task` tool spells the optional `model` as the `not` of a union of all six JSON types rather
- * than `{"not": {}}`, which is `never` all the same; the declared format must give it no arm and
- * agree with the derived format about the whole tool set, as it does about every other. */
+/* oh-my-pi 18.6.0's tools as the client sends them (tests/data/chat), without descriptions. Its
+ * `task` tool spells the optional `model` as `not` of a union of all six JSON types, which is also
+ * `never`; the declared format gives it no arm and agrees with the derived format on the whole
+ * tool set. */
 TEST(oh_my_pis_tools_build_the_same_grammar_in_either_format) {
     std::ifstream f(std::string(RAD_CHAT_FIXTURES) + "/oh-my-pi-18.6.0-tools.json");
     std::ostringstream ss;
@@ -1224,9 +1216,9 @@ TEST(oh_my_pis_tools_build_the_same_grammar_in_either_format) {
     CHECK_EQ(g.text, b->prompt().grammar);
 }
 
-/* THE STRUCT GROWS AT ITS END. A plugin built against a header with fewer fields reports a smaller
- * struct_size, and the fields past it read as zero; one built against a larger header has its
- * extra fields ignored. Nothing is read past what the plugin said it has. */
+/* The struct grows at its end. A plugin built against an older header reports a smaller
+ * struct_size and the missing fields read as zero; extra fields from a newer header are ignored.
+ * Nothing is read past the reported size. */
 TEST(the_declaration_reads_only_what_the_plugin_compiled) {
     RadChatFormat c = qwen_abi();
     ChatFormat f;
@@ -1251,7 +1243,7 @@ TEST(the_declaration_reads_only_what_the_plugin_compiled) {
     CHECK(chat_format_from_abi(nullptr, &f, &why) == RAD_E_INVAL);
 }
 
-/* What the parser cannot read is refused by name, never guessed at. */
+/* What the parser cannot read is refused by name, never guessed. */
 TEST(a_format_the_parser_cannot_read_is_refused_by_name) {
     auto refused = [](void (*edit)(RadChatFormat&), const char* word) {
         RadChatFormat c = qwen_abi();
@@ -1276,8 +1268,8 @@ TEST(a_format_the_parser_cannot_read_is_refused_by_name) {
     CHECK(refused([](RadChatFormat& c) { c.string_value = RAD_CHAT_VALUE_JSON; }, "string_value"));
 }
 
-/* A tool whose own name contains the delimiter that ends a name cannot be read unambiguously in
- * this format: the request is refused at admission, naming the tool. */
+/* A tool whose name contains the name-ending delimiter is ambiguous in this format; the request
+ * is refused at admission, naming the tool. */
 TEST(a_tool_name_holding_the_format_delimiter_is_refused_at_admission) {
     Bench* b = bench(models()[0], ChatRequest{});
     if (!b) return;
@@ -1299,25 +1291,18 @@ TEST(a_tool_name_holding_the_format_delimiter_is_refused_at_admission) {
 
 /* ================================================================== the wire
  *
- * What a streaming client assembles from the SSE chunks -- content, reasoning, each call's id,
- * name and arguments -- is the buffered answer, for every reply, cut a byte at a time. Every
- * chunk is the bytes nlohmann writes for the value it carries: the delta chunks are written
- * directly rather than through a tree, and are held to it here. */
+ * What a streaming client assembles from the SSE chunks (content, reasoning, each call's id, name
+ * and arguments) equals the buffered answer, for every reply cut a byte at a time. Delta chunks
+ * are written directly rather than through a JSON tree, and must match nlohmann's bytes. */
 TEST(what_a_streaming_client_assembles_is_the_buffered_answer) {
     for (const Model& m : models()) {
         Bench* b = bench(m, ChatRequest{});
         if (!b) continue;
-        std::shared_ptr<const ReplyParser> rp;
-        {
-            std::shared_ptr<const ReplyFormat> rf;
-            std::string why;
-            CHECK_OK(ReplyFormat::compile(b->format(), &rf, &why));
-            ReplyOptions ro;
-            ro.generation_prompt = b->prompt().generation_prompt;
-            ro.tools = &agent_tools();
-            ro.terminators = m.terminators;
-            CHECK_OK(ReplyParser::create(rf, ro, &rp, &why));
-        }
+        ReplyOptions ro;
+        ro.generation_prompt = b->prompt().generation_prompt;
+        ro.tools = &agent_tools();
+        ro.terminators = m.terminators;
+        const std::shared_ptr<const ReplyParser> rp = parser_of(b->format(), ro);
         server::ReplyParserBridge bridge(rp);
         std::vector<std::string> replies;
         for (const json& msg : rendered_corpus()) replies.push_back(b->render_reply(msg));
@@ -1371,7 +1356,7 @@ TEST(what_a_streaming_client_assembles_is_the_buffered_answer) {
                 CHECK_EQ(args[k], want.calls[k].arguments);
                 CHECK_EQ(p.tool_calls[k].id, ids[k]);
             }
-            /* A call is reported as one only when it closed and its arguments parse. */
+            /* A call is reported only when it closed and its arguments parse. */
             bool complete = !want.calls.empty() && want.calls.back().closed;
             for (const ReplyCall& c : want.calls) complete = complete && server::json_complete(c.arguments);
             CHECK_EQ(finish, std::string(complete ? "tool_calls" : "stop"));
@@ -1381,10 +1366,10 @@ TEST(what_a_streaming_client_assembles_is_the_buffered_answer) {
 
 /* ================================================================== the chat bridge
  *
- * What the server is handed for a request is all derived from ONE format: the grammar and its
- * trigger words, the tokens the decoder must render, and the parser. A plugin's declaration of
- * the same format yields the same request; a declaration the parser cannot run stops the chat
- * endpoint at startup; a template whose calls it cannot describe has its tool requests refused. */
+ * Everything the server gets for a request derives from one format: the grammar and its triggers,
+ * the tokens the decoder renders, and the parser. A plugin's declaration of the same format yields
+ * the same request; an unrunnable declaration stops the chat endpoint at startup; a template whose
+ * calls cannot be described has its tool requests refused. */
 
 static std::shared_ptr<Vocab> vocab_with(const std::string& tmpl) {
     VocabBuild vb;
@@ -1435,7 +1420,7 @@ TEST(the_chat_bridge_derives_the_whole_request_from_one_format) {
     REQUIRE(pm.tool_calls.size() == 1);
     CHECK_EQ(pm.tool_calls[0].arguments, std::string("{\"path\":\"/a\",\"limit\":3}"));
 
-    /* The same format, declared by a plugin: the same request. */
+    /* The same format declared by a plugin yields the same request. */
     RadChatFormat c = qwen_abi();
     server::ChatTemplateBridge declared;
     CHECK_OK(declared.init(*v, &c, "radtest"));
@@ -1444,12 +1429,12 @@ TEST(the_chat_bridge_derives_the_whole_request_from_one_format) {
     CHECK(d.grammar_triggers.size() == 1 && d.grammar_triggers[0].value == "<tool_call>\n");
     CHECK(d.preserved_tokens == r.preserved_tokens);
 
-    /* A declaration the parser cannot run is refused at startup, naming the field. */
+    /* An unrunnable declaration is refused at startup, naming the field. */
     c.call_separator = ", ";
     server::ChatTemplateBridge broken;
     CHECK(broken.init(*v, &c, "radtest") < 0);
 
-    /* A tool this format cannot read unambiguously is refused at admission, naming it. */
+    /* An ambiguous tool is refused at admission, by name. */
     std::string why;
     const server::ChatRender bad = bridge_render(
         derived, json::parse(R"([{"type":"function","function":{"name":"a>b"}}])"), &why);
@@ -1457,9 +1442,8 @@ TEST(the_chat_bridge_derives_the_whole_request_from_one_format) {
     CHECK(why.find("a>b") != std::string::npos);
 }
 
-/* A template that writes each call as a JSON object is a format this parser does not describe:
- * the model still chats with its reasoning split, and a request with tools is refused with the
- * reason instead of being read by some other parser. */
+/* A template writing each call as a JSON object is not a describable format: the model still
+ * chats with reasoning split, and a request with tools is refused with the reason. */
 TEST(a_template_whose_calls_cannot_be_described_refuses_tools_and_still_chats) {
     const std::string tmpl =
         "{%- if tools -%}<|im_start|>system\n# Tools\n{%- for t in tools %}\n{{ t | tojson }}"
@@ -1476,7 +1460,7 @@ TEST(a_template_whose_calls_cannot_be_described_refuses_tools_and_still_chats) {
     REQUIRE(v != nullptr);
     server::ChatTemplateBridge br;
     CHECK_OK(br.init(*v));
-    if (!br.supports_tools()) return;   /* the probe saw no tool support at all: nothing to refuse */
+    if (!br.supports_tools()) return;   /* no tool support probed, nothing to refuse */
     CHECK(!br.tool_refusal().empty());
     const server::ChatRender r = bridge_render(br, json::array());
     REQUIRE(r.parser != nullptr);
@@ -1485,7 +1469,7 @@ TEST(a_template_whose_calls_cannot_be_described_refuses_tools_and_still_chats) {
     rd->finish(nullptr);
     CHECK(rd->message().tool_calls.empty());
     CHECK(rd->message().content.find("Hello.") == 0);
-    /* A render with tools is refused too, should one get past the admission check. */
+    /* A render with tools is refused too, should one pass admission. */
     std::string why;
     const server::ChatRender t = bridge_render(br, agent_tools(), &why);
     CHECK(t.prompt.empty());
@@ -1494,11 +1478,10 @@ TEST(a_template_whose_calls_cannot_be_described_refuses_tools_and_still_chats) {
 
 /* ================================================================== the object family
  *
- * A call written as its name and ONE object holding the arguments (ChatArgs::Object): JSON behind
- * a name tag with neither an end nor a wrapper -- Mistral's `[TOOL_CALLS]NAME[ARGS]{...}` -- and
- * behind a function tag that has its own close. The dialect fields (Gemma 4's strings and bare
- * keys) are held in chatparse_gemma4_test, against the model's own template and llama.cpp's
- * parser for it. */
+ * A call written as its name and one object of arguments (ChatArgs::Object): JSON after a name tag
+ * with no end or wrapper (Mistral's `[TOOL_CALLS]NAME[ARGS]{...}`), or after a function tag with
+ * its own close. The dialect fields (Gemma 4's strings and bare keys) are tested in
+ * chatparse_gemma4_test. */
 
 static std::shared_ptr<const ReplyParser> object_format(bool tagged_end, ChatFormat* out = nullptr) {
     static const char* const kT1[] = { "[TOOL_CALLS]" };
@@ -1564,12 +1547,12 @@ TEST(json_arguments_behind_a_name_tag_read_as_one_object) {
     CHECK_EQ(m.calls[1].arguments, std::string("{\"path\":\"/a\",\"limit\":[1,{\"x\":null}]}"));
     const std::string err = stream_all(*p, reply);
     if (!err.empty()) ::radtest::fail(__FILE__, __LINE__, err);
-    /* A bare key is outside JSON: read, and said so. */
+    /* A bare key is outside JSON: read, and reported non-strict. */
     const ReplyMessage b = reply_parse(*p, "[TOOL_CALLS]read[ARGS]{path: \"/a\"}", &strict);
     CHECK(!strict);
     REQUIRE(b.calls.size() == 1);
     CHECK_EQ(b.calls[0].arguments, std::string("{\"path\":\"/a\"}"));
-    /* No object after the tag: a call with none, and what stood there is content. */
+    /* No object after the tag: a call without arguments, and the rest is content. */
     const ReplyMessage n = reply_parse(*p, "[TOOL_CALLS]ping[ARGS] and then", &strict);
     CHECK(!strict);
     REQUIRE(n.calls.size() == 1);
@@ -1591,7 +1574,7 @@ TEST(json_arguments_behind_a_function_tag_end_at_its_close) {
     CHECK_EQ(m.calls[1].arguments, std::string("{\"path\":\"/a\"}"));
     const std::string err = stream_all(*p, reply);
     if (!err.empty()) ::radtest::fail(__FILE__, __LINE__, err);
-    /* The function's close where the object was still open closes it. */
+    /* The function's close also closes a still-open object. */
     const ReplyMessage c = reply_parse(
         *p, "<tool_call>\n<function=read>{\"path\": \"/a\"</function>\n</tool_call>", &strict);
     CHECK(!strict);
@@ -1599,7 +1582,7 @@ TEST(json_arguments_behind_a_function_tag_end_at_its_close) {
     CHECK(c.calls[0].closed);
     CHECK_EQ(c.calls[0].arguments, std::string("{\"path\":\"/a\"}"));
 
-    /* The grammar: a JSON object between the tags, and the tags as written. */
+    /* The grammar: the tags as written with a JSON object between. */
     ChatGrammarRequest gq;
     gq.tools = &agent_tools();
     ChatGrammar g;
@@ -1614,29 +1597,27 @@ TEST(json_arguments_behind_a_function_tag_end_at_its_close) {
     log_set_level(Log::Warn);
 }
 
-/* reasoning_anywhere: a block that opens after the answer is reasoning there too, and a close
- * with no block open is not part of the answer. Without it, both are content. */
+/* reasoning_anywhere: a block opening after the answer is still reasoning, and a close with no
+ * block open is dropped. Without it, both are content. */
 TEST(a_reasoning_block_may_open_again_later_when_the_format_says_so) {
     for (bool anywhere : { false, true }) {
         RadChatFormat c = qwen_abi();
         c.reasoning_anywhere = anywhere ? 1 : 0;
         ChatFormat f;
         std::string why;
-        std::shared_ptr<const ReplyFormat> rf;
-        std::shared_ptr<const ReplyParser> p;
         CHECK_OK(chat_format_from_abi(&c, &f, &why));
-        CHECK_OK(ReplyFormat::compile(f, &rf, &why));
         ReplyOptions ro;
         ro.generation_prompt = "<|im_start|>assistant\n<think>\n";
         ro.tools = &agent_tools();
-        CHECK_OK(ReplyParser::create(rf, ro, &p, &why));
+        const std::shared_ptr<const ReplyParser> p = parser_of(f, ro);
+        REQUIRE(p);
         const std::string reply = "Plan.\n</think>\n\nAnswer.<think>\nmore\n</think>\n\nTail.</think>";
         bool strict = false;
         const ReplyMessage m = reply_parse(*p, reply, &strict);
         if (anywhere) {
             CHECK_EQ(m.reasoning, std::string("Plan.\nmore\n"));
             CHECK_EQ(m.content, std::string("Answer.Tail."));
-            CHECK(!strict);   /* the last </think> closed nothing */
+            CHECK(!strict);   /* the last </think> closes nothing */
         } else {
             CHECK_EQ(m.reasoning, std::string("Plan.\n"));
             CHECK_EQ(m.content, std::string("Answer.<think>\nmore\n</think>\n\nTail.</think>"));
@@ -1675,9 +1656,51 @@ TEST(an_object_format_the_parser_cannot_read_is_refused) {
 
 /* ================================================================== cost
  *
- * The legacy path re-parses the whole reply on every chunk, so a reply of n bytes costs O(n^2). The
- * budgets below are loose enough for a loaded machine and tight enough that a quadratic path
- * cannot pass them: a 200 KB reply streamed byte by byte re-parsed from the top would read 20 GB. */
+ * The legacy path re-parses the whole reply per chunk, O(n^2). The parser's own count of what it
+ * reads twice checks the claim deterministically; the `perf_` cases time it, with budgets that
+ * tolerate a loaded machine but no quadratic path (re-parsing a 200 KB reply per byte would read
+ * 20 GB). The timed cases belong in a serial run, apart from the unit tests. */
+
+/* Each step of the parser consumes a byte or queues bytes to be read again
+ * (ReplyStream::reread), so what it reads twice bounds its work per byte. Plain prose and a
+ * well-formed call are read once. A near miss of the call syntax is held and read again, a fixed
+ * amount each time, whatever the chunking: a path that re-read what it holds on every chunk, or
+ * everything since its last decision, would grow with the chunk count or the reply's square. */
+TEST(the_parser_reads_a_byte_twice_only_where_a_near_miss_is_read_again) {
+    for (const Model& m : models()) {
+        Bench* b = bench(m, ChatRequest{});
+        if (!b) continue;
+        auto reread = [&](const std::string& text, size_t piece) {
+            std::unique_ptr<ReplyStream> s = b->parser().open();
+            for (size_t at = 0; at < text.size(); at += piece)
+                s->feed(std::string_view(text).substr(at, piece), nullptr);
+            s->finish(nullptr);
+            return s->reread();
+        };
+        const std::string plain = long_reply(m, 200 * 1024);
+        for (const size_t piece : { plain.size(), (size_t)4, (size_t)1 })
+            CHECK_EQ(reread(plain, piece), (size_t)0);
+
+        /* Openers that turn out to be text, then an argument that turns out not to be JSON. */
+        const std::string unit =
+            (is_qwen(m) ? std::string("See <function=read and <function= more <tool_call> text, "
+                                      "<function=x>\nnot a call. ")
+                        : std::string("Use <function name=\"x\" oops and <function name= and "
+                                      "<param name=\"a\">v</param> here. ")) +
+            C(m, "configure", { { "verbose", "yes please" }, { "extra", "{'a': [1, 2}" } }) + "\n";
+        size_t at64 = 0;
+        for (const size_t copies : { (size_t)64, (size_t)256 }) {
+            std::string text = "Thinking it over.\n</think>\n\n";
+            for (size_t k = 0; k < copies; ++k) text += unit;
+            const size_t whole = reread(text, text.size());
+            CHECK_EQ(reread(text, 4), whole);
+            CHECK_EQ(reread(text, 1), whole);
+            CHECK(whole >= copies && whole < text.size());
+            if (copies == 64) at64 = whole;
+            else CHECK(whole <= 4 * at64 + 64);
+        }
+    }
+}
 
 static double seconds_to(const std::function<void()>& f, int reps = 3) {
     double best = 1e30;
@@ -1705,7 +1728,7 @@ static double stream_bytes(const ReplyParser& p, const std::string& text, size_t
     }, per_call ? 1 : reps);
 }
 
-TEST(a_long_reply_streamed_byte_by_byte_costs_a_constant_factor_of_parsing_it_once) {
+TEST(perf_a_long_reply_streamed_byte_by_byte_costs_a_constant_factor_of_parsing_it_once) {
     for (const Model& m : models()) {
         Bench* b = bench(m, ChatRequest{});
         if (!b) continue;
@@ -1719,19 +1742,17 @@ TEST(a_long_reply_streamed_byte_by_byte_costs_a_constant_factor_of_parsing_it_on
                         "(%.1f ns/byte), 4-byte pieces %.3f ms\n",
                 m.name.c_str(), text.size(), t_once * 1e3, text.size() / t_once / 1e6,
                 t_bytes * 1e3, t_bytes / text.size() * 1e9, t_tokens * 1e3);
-        /* A constant factor: the per-call cost of feeding one byte against a memchr skip. */
+        /* A constant factor: per-call cost of feeding one byte versus a memchr skip. */
         CHECK(t_bytes < 200.0 * std::max(t_once, 50e-6));
-        /* And an absolute ceiling per byte, far below one re-parse of the reply per byte. */
+        /* An absolute per-byte ceiling, far below one re-parse per byte. */
         CHECK(t_bytes / text.size() < 1e-6);
     }
 }
 
-/* FOUR TIMES THE REPLY COSTS FOUR TIMES THE TIME, and a quadratic path sixteen: the bound of 8 sits
- * a factor of two from each. The two sizes are timed in turns, best of five each, so a burst of load
- * from whatever else the machine runs lands on both: timed one size after the other, best of three,
- * a 2x step read x3.9 beside three other test binaries and a server, against the 4 a quadratic
- * path gives. */
-TEST(four_times_the_reply_costs_four_times_the_time) {
+/* Four times the reply costs four times the time, and a quadratic path sixteen; the bound of 8 is
+ * a factor of two from each. The sizes are timed alternately, best of five, so bursts of machine
+ * load affect both equally. */
+TEST(perf_four_times_the_reply_costs_four_times_the_time) {
     for (const Model& m : models()) {
         Bench* b = bench(m, ChatRequest{});
         if (!b) continue;
@@ -1748,7 +1769,7 @@ TEST(four_times_the_reply_costs_four_times_the_time) {
     }
 }
 
-TEST(a_chunk_costs_microseconds_at_the_99th_percentile) {
+TEST(perf_a_chunk_costs_microseconds_at_the_99th_percentile) {
     for (const Model& m : models()) {
         Bench* b = bench(m, ChatRequest{});
         if (!b) continue;
@@ -1763,7 +1784,7 @@ TEST(a_chunk_costs_microseconds_at_the_99th_percentile) {
     }
 }
 
-/* The held bytes of a long plain-text reply stay a constant: no buffer grows with the reply. */
+/* Held bytes stay constant over a long plain-text reply: no buffer grows with it. */
 TEST(a_long_reply_holds_a_constant_number_of_bytes) {
     for (const Model& m : models()) {
         Bench* b = bench(m, ChatRequest{});

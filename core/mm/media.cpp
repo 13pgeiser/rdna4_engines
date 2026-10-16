@@ -1,4 +1,5 @@
-/* media.cpp -- image and video decoding through libavformat / libavcodec / libswscale. */
+/* media.cpp -- image, video and audio decoding and image encoding through libavformat,
+ * libavcodec, libswscale and libswresample. */
 #include "mm/media.h"
 
 #include "rad_internal.h"
@@ -56,10 +57,9 @@ bool decoder_available() { return true; }
 
 namespace {
 
-/* THE DEMUXERS A REQUEST MAY REACH, and nothing else. A container format that can name another
- * file -- a playlist, a concat script, an image sequence pattern -- would otherwise let a request
- * make the server open a path of its choosing, so the probe only ever considers these, and the
- * protocol list below is empty so none of them can open anything either. */
+/* The only demuxers a request may reach. A format that can name another file (a playlist, a
+ * concat script, an image-sequence pattern) would let a request make the server open a path of
+ * its choosing. The empty protocol whitelist also stops these from opening anything. */
 constexpr const char* kFormats =
     "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpegts,flv,ogg,gif,apng,image2pipe,png_pipe,"
     "jpeg_pipe,jpegls_pipe,jpegxl_pipe,webp_pipe,bmp_pipe,tiff_pipe,qoi_pipe,pgm_pipe,ppm_pipe,"
@@ -152,8 +152,8 @@ struct Input {
         if (!dec) { *why = "out of memory"; return RAD_E_NOMEM; }
         e = avcodec_parameters_to_context(dec, fmt->streams[stream]->codecpar);
         if (e < 0) { *why = "decoder setup failed (" + averr(e) + ")"; return RAD_E_INVAL; }
-        /* A few threads a decode: this runs on a server worker, one per request in flight, so
-         * handing each one every core would oversubscribe the machine the engine runs on. */
+        /* Decodes run on server workers, one per request in flight; a few threads each avoids
+         * oversubscribing the machine. */
         dec->thread_count = 4;
         e = avcodec_open2(dec, codec, nullptr);
         if (e < 0) { *why = std::string("no decoder for ") + codec->name + " (" + averr(e) + ")"; return RAD_E_UNSUPPORTED; }
@@ -161,68 +161,19 @@ struct Input {
     }
 };
 
-/* One decoded frame to packed RGB24 at its own size. The YUV coefficients and range are the
- * frame's own, so a BT.709 video and a full-range JPEG both come out with the colours they were
- * encoded with.
+/* One decoded frame to packed `fmt` (RGB24 or RGBA, `ch` bytes a pixel) at its own size, rows
+ * tight. The YUV coefficients and range are the frame's own, so a BT.709 video and a full-range
+ * JPEG keep the colours they were encoded with.
  *
- * THE SCALER FLAGS ARE THE REFERENCE PIPELINE'S: transformers decodes video through PyAV
- * (`to_ndarray(format="rgb24")`, its default backend), which converts with plain SWS_BILINEAR.
- * The flags decide how chroma is upsampled, and at a sharp colour edge two choices differ by up to
- * 70 levels: measured on an EmbeddingGemma 2 clip, SWS_BICUBIC | ACCURATE_RND | FULL_CHR_H_INT
- * left the embedding at cosine 0.9995 against the reference, these at 0.99998 with every patch
- * within one level. */
-int to_rgb(const AVFrame* f, SwsContext** sws, Frame* out, std::string* why) {
+ * The scaler flags match the reference pipeline: transformers decodes video through PyAV
+ * (`to_ndarray(format="rgb24")`), which converts with plain SWS_BILINEAR. The flags decide chroma
+ * upsampling, which can differ by up to 70 levels at a sharp colour edge; with these flags every
+ * patch lands within one level of the reference. */
+int to_packed(const AVFrame* f, SwsContext** sws, AVPixelFormat fmt, size_t ch,
+              std::vector<uint8_t>* out, std::string* why) {
     const AVPixelFormat src = (AVPixelFormat)f->format;
-    *sws = sws_getCachedContext(*sws, f->width, f->height, src, f->width, f->height,
-                                AV_PIX_FMT_RGB24,
-                                SWS_BILINEAR, nullptr,
-                                nullptr, nullptr);
-    if (!*sws) { *why = "no colour conversion from this pixel format"; return RAD_E_UNSUPPORTED; }
-    int cs = f->colorspace;
-    if (cs == AVCOL_SPC_UNSPECIFIED || cs == AVCOL_SPC_RGB) cs = AVCOL_SPC_BT470BG;
-    const int* coef = sws_getCoefficients(cs);
-    const int src_full = f->color_range == AVCOL_RANGE_JPEG ||
-                         src == AV_PIX_FMT_YUVJ420P || src == AV_PIX_FMT_YUVJ422P ||
-                         src == AV_PIX_FMT_YUVJ444P || src == AV_PIX_FMT_YUVJ440P;
-    sws_setColorspaceDetails(*sws, coef, src_full, sws_getCoefficients(SWS_CS_DEFAULT), 1, 0,
-                             1 << 16, 1 << 16);
-    /* THE SCALER WRITES INTO A FRAME FFMPEG ALLOCATED, and the rows are copied out. Its SIMD paths
-     * store whole vectors, so a row ends wherever the last vector does: a 4:2:0 or 4:2:2 picture
-     * 1788 wide converted with these flags writes 12 bytes past 1788 x 3, and into a buffer of
-     * exactly width x height x 3 those land on the next heap chunk's header -- the process aborts
-     * at a later allocation ("malloc(): corrupted top size"). av_frame_get_buffer pads every line
-     * and the end as the scaler expects. */
-    AVFrame* rgb = av_frame_alloc();
-    if (!rgb) { *why = "out of memory"; return RAD_E_NOMEM; }
-    rgb->format = AV_PIX_FMT_RGB24;
-    rgb->width = f->width;
-    rgb->height = f->height;
-    if (av_frame_get_buffer(rgb, 0) < 0) {
-        av_frame_free(&rgb);
-        *why = "out of memory";
-        return RAD_E_NOMEM;
-    }
-    const int e = sws_scale(*sws, f->data, f->linesize, 0, f->height, rgb->data, rgb->linesize);
-    if (e != f->height) {
-        av_frame_free(&rgb);
-        *why = "colour conversion failed";
-        return RAD_E_INVAL;
-    }
-    out->w = f->width;
-    out->h = f->height;
-    const size_t row = (size_t)f->width * 3;
-    out->rgb.resize(row * (size_t)f->height);
-    for (int y = 0; y < f->height; ++y)
-        std::memcpy(out->rgb.data() + (size_t)y * row, rgb->data[0] + (ptrdiff_t)y * rgb->linesize[0], row);
-    av_frame_free(&rgb);
-    return RAD_OK;
-}
-
-/* The same conversion to packed RGBA, for a picture whose alpha is kept. */
-int to_rgba(const AVFrame* f, SwsContext** sws, FrameRGBA* out, std::string* why) {
-    const AVPixelFormat src = (AVPixelFormat)f->format;
-    *sws = sws_getCachedContext(*sws, f->width, f->height, src, f->width, f->height,
-                                AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
+    *sws = sws_getCachedContext(*sws, f->width, f->height, src, f->width, f->height, fmt,
+                                SWS_BILINEAR, nullptr, nullptr, nullptr);
     if (!*sws) { *why = "no colour conversion from this pixel format"; return RAD_E_UNSUPPORTED; }
     int cs = f->colorspace;
     if (cs == AVCOL_SPC_UNSPECIFIED || cs == AVCOL_SPC_RGB) cs = AVCOL_SPC_BT470BG;
@@ -231,9 +182,13 @@ int to_rgba(const AVFrame* f, SwsContext** sws, FrameRGBA* out, std::string* why
                          src == AV_PIX_FMT_YUVJ444P || src == AV_PIX_FMT_YUVJ440P;
     sws_setColorspaceDetails(*sws, sws_getCoefficients(cs), src_full,
                              sws_getCoefficients(SWS_CS_DEFAULT), 1, 0, 1 << 16, 1 << 16);
+    /* Convert into an FFmpeg-allocated frame, then copy the rows out. The scaler's SIMD paths
+     * store whole vectors and overrun a tight row (a 4:2:0 or 4:2:2 picture 1788 wide writes
+     * 12 bytes past 1788 x 3), which corrupts the heap in a buffer of exactly w x h x 3.
+     * av_frame_get_buffer pads every line and the end as the scaler expects. */
     AVFrame* dst = av_frame_alloc();
     if (!dst) { *why = "out of memory"; return RAD_E_NOMEM; }
-    dst->format = AV_PIX_FMT_RGBA;
+    dst->format = fmt;
     dst->width = f->width;
     dst->height = f->height;
     if (av_frame_get_buffer(dst, 0) < 0) {
@@ -247,24 +202,34 @@ int to_rgba(const AVFrame* f, SwsContext** sws, FrameRGBA* out, std::string* why
         *why = "colour conversion failed";
         return RAD_E_INVAL;
     }
-    out->w = f->width;
-    out->h = f->height;
-    const size_t row = (size_t)f->width * 4;
-    out->rgba.resize(row * (size_t)f->height);
+    const size_t row = (size_t)f->width * ch;
+    out->resize(row * (size_t)f->height);
     for (int y = 0; y < f->height; ++y)
-        std::memcpy(out->rgba.data() + (size_t)y * row, dst->data[0] + (ptrdiff_t)y * dst->linesize[0],
+        std::memcpy(out->data() + (size_t)y * row, dst->data[0] + (ptrdiff_t)y * dst->linesize[0],
                     row);
     av_frame_free(&dst);
     return RAD_OK;
 }
 
-/* THE DECODE LOOP, for both kinds: every frame in presentation order, `keep(i, frame)` told the
- * index of each and whether to stop.
+int to_rgb(const AVFrame* f, SwsContext** sws, Frame* out, std::string* why) {
+    out->w = f->width;
+    out->h = f->height;
+    return to_packed(f, sws, AV_PIX_FMT_RGB24, 3, &out->rgb, why);
+}
+
+/* As to_rgb, to packed RGBA, for a picture whose alpha is kept. */
+int to_rgba(const AVFrame* f, SwsContext** sws, FrameRGBA* out, std::string* why) {
+    out->w = f->width;
+    out->h = f->height;
+    return to_packed(f, sws, AV_PIX_FMT_RGBA, 4, &out->rgba, why);
+}
+
+/* The decode loop for images and video: every frame in presentation order goes to
+ * `keep(i, frame)`, which returns < 0 to fail, > 0 to stop and 0 to continue.
  *
- * AN EMPTY PACKET REPEATS THE FRAME BEFORE IT: it is how Ogg Theora stores a frame that does not
- * change. Sent to a decoder, an empty packet would read as the end of the stream and the next one
- * would be refused; it is passed to `keep` as another copy of the last frame instead, so the
- * frame indices and the stream's length are the ones the frame count promised. */
+ * An empty packet repeats the previous frame (Ogg Theora stores an unchanged frame this way).
+ * The decoder would read it as end of stream, so it is passed to `keep` as another copy of the
+ * last frame instead, keeping indices and length consistent with the stated frame count. */
 template <class Keep>
 int decode_frames(Input& in, Keep&& keep, std::string* why) {
     AVPacket* pkt = av_packet_alloc();
@@ -388,10 +353,9 @@ int decode_image_rgba(const uint8_t* data, size_t n, int64_t max_pixels, FrameRG
     return RAD_OK;
 }
 
-/* ONE PICTURE THROUGH ONE ENCODER. The pixels are converted to the pixel format the encoder takes
- * (swscale, full-range BT.601 for jpeg's YUV, as PIL writes it), sent as one frame, and the one
- * packet that comes back is the file: png, mjpeg and libwebp all write a complete image file a
- * packet. */
+/* One picture through one encoder: convert to the encoder's pixel format (swscale; full-range
+ * BT.601 for jpeg's YUV, as PIL writes it) and send one frame. png, mjpeg and libwebp each write
+ * a complete image file per packet, so the packet that comes back is the file. */
 int encode_image(const uint8_t* px, int32_t w, int32_t h, int32_t ch, const std::string& format,
                  int32_t quality, std::vector<uint8_t>* out, std::string* why) {
     std::string wy;
@@ -440,9 +404,8 @@ int encode_image(const uint8_t* px, int32_t w, int32_t h, int32_t ch, const std:
             cx->flags |= AV_CODEC_FLAG_QSCALE;
             cx->global_quality = FF_QP2LAMBDA * qs;
         }
-        /* PNG AT zlib LEVEL 1 WITH PER-ROW PREDICTION: a 2048^2 picture in 0.16 s and 5.9 MB, where
-         * the encoder's default (level 6) takes 1.0 s for 5.3 MB -- a second of a few-step image
-         * model's request, on one core, for a tenth of the bytes. */
+        /* zlib level 1 with per-row prediction: a 2048^2 picture takes 0.16 s for 5.9 MB, against
+         * 1.0 s for 5.3 MB at the default level 6, on one core. */
         if (format == "png") {
             cx->compression_level = 1;
             av_opt_set(cx->priv_data, "pred", "mixed", 0);
@@ -498,9 +461,9 @@ int decode_video(const uint8_t* data, size_t n, SampleFn sample, const void* use
     if (!why) why = &w;
     if (!data || n == 0) { *why = "empty"; return RAD_E_INVAL; }
 
-    /* THE FRAME COUNT FIRST, because which frames to keep depends on it. Many containers state it;
-     * those that do not are demuxed once without decoding, which counts packets -- one a frame for
-     * every codec a request is going to send -- at the cost of reading the bytes twice. */
+    /* Frame count first, since the sample choice depends on it. A container that does not state
+     * it is demuxed once without decoding to count packets (one per frame for the codecs requests
+     * send), at the cost of reading the bytes twice. */
     VideoInfo info;
     {
         Input probe;
@@ -547,8 +510,8 @@ int decode_video(const uint8_t* data, size_t n, SampleFn sample, const void* use
             *why = "a frame is larger than the server's pixel limit";
             return RAD_E_INVAL;
         }
-        /* The same frame may be sampled twice when the stream is shorter than its own header
-         * says; each slot that names this index takes a copy. */
+        /* A frame may be sampled twice when the stream is shorter than its header says; each
+         * slot naming this index takes a copy. */
         bool converted = false;
         while (next < out->index.size() && out->index[next] == i) {
             if (!converted) {
@@ -566,9 +529,8 @@ int decode_video(const uint8_t* data, size_t n, SampleFn sample, const void* use
     sws_freeContext(sws);
     if (s < 0) return s;
     if (last_kept < 0) { *why = "the video decoded to no frame"; return RAD_E_INVAL; }
-    /* A STREAM SHORTER THAN ITS HEADER leaves the last sampled indices unreached. They take the
-     * last frame that was decoded, which is what a reader that clamps an index past the end
-     * returns. */
+    /* A stream shorter than its header leaves the last sampled indices unreached. They take the
+     * last decoded frame, as a reader that clamps an index past the end would. */
     for (size_t k = next; k < out->index.size(); ++k) out->frames[k] = out->frames[(size_t)last_kept];
     return RAD_OK;
 }
@@ -577,7 +539,7 @@ int decode_video(const uint8_t* data, size_t n, SampleFn sample, const void* use
 
 namespace {
 
-/* THE AUDIO DEMUXERS A REQUEST MAY REACH, chosen as the video list is: formats that hold one
+/* The only audio demuxers a request may reach, chosen as kFormats is: formats that hold one
  * stream of samples and cannot name another file. */
 constexpr const char* kAudioFormats = "wav,w64,mp3,flac,ogg,mov,mp4,m4a,matroska,webm,aac,aiff";
 
@@ -706,7 +668,7 @@ int decode_audio(const uint8_t* data, size_t n, int32_t rate, int64_t max_sample
         if (st < 0) break;
         if (e != AVERROR(EAGAIN) && e != AVERROR_EOF) { *why = "the audio would not decode (" + averr(e) + ")"; st = RAD_E_INVAL; break; }
     }
-    /* What the resampler still holds. */
+    /* Flush what the resampler still holds. */
     if (st == RAD_OK && (int64_t)out->size() < max_samples) st = take(nullptr, 0);
     av_packet_free(&pkt);
     av_frame_free(&f);

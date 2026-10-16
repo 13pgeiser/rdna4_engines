@@ -1,25 +1,23 @@
-/* gen.h -- image generation: what a request is, what comes back, and the driver that turns one
+/* gen.h -- image generation: the request, what comes back, and the driver that turns a request
  * into the passes an image generator declares (rad_declare_generator, abi/rad_builder.h).
  *
- * A GENERATOR IS NOT DRIVEN BY TOKEN STEPS. Its work is three kinds of pass -- conditioning,
- * denoising, decoding -- and an image is tens of denoising passes over thousands of latent rows,
- * every one of them read whole, none of them sampled. The scheduler that serves text owns token
- * positions, prefix reuse, preemption and speculation, and none of that has a meaning here, so the
- * generator gets a driver of its own (this file) and shares everything below the step with the rest
- * of the engine: the ranks, the plugin's step function, the KV manager the conditioning lives in.
+ * A generator is not driven by token steps: an image is tens of denoising passes over thousands of
+ * latent rows, all read whole, none sampled. Token positions, prefix reuse, preemption and
+ * speculation have no meaning here, so the generator has its own driver and shares only what lies
+ * below the step: the ranks, the plugin's step function and the KV manager holding conditioning.
  *
- * THE PASSES, as the driver runs them:
+ * Passes, as the driver runs them:
  *
- *   COND     once for every conditioning sequence a request has -- its prompt, and with guidance
- *            its negative prompt -- the prompt (and its reference pictures) encoded into the
- *            generator's KV group. A request is admitted once its lanes and its KV are free.
- *   DENOISE  one step for each image in flight that fits the pass, any mix of requests, sizes and
- *            step counts: each image carries its own sigma. With guidance an image is two entries,
- *            its positive and its negative conditioning, which the plugin combines.
+ *   COND     once per conditioning sequence (the prompt, plus the negative prompt with guidance):
+ *            the prompt and its reference pictures encoded into the generator's KV group. A
+ *            request is admitted once its lanes and its KV are free.
+ *   DENOISE  one step for each in-flight image that fits the pass, any mix of requests, sizes and
+ *            step counts; each image carries its own sigma. With guidance an image is two entries,
+ *            positive and negative conditioning, which the plugin combines.
  *   DECODE   one image's latent to pixels, read back and handed to its request.
  *
- * A request's images run in LANES -- the plugin's own latent state, `max_lanes` of them -- so one
- * request of n images takes n lanes and shares one conditioning.
+ * Images run in lanes, the plugin's own latent state (`max_lanes` of them): a request of n images
+ * takes n lanes and shares one conditioning.
  */
 #pragma once
 #include "rad_core.h"
@@ -44,15 +42,15 @@ struct Pixels {
     std::vector<uint16_t> bf16;
 };
 
-/* ONE CONDITIONING SEQUENCE: the prompt as tokens, with the media it carries placed, and how many
- * of its first tokens the generator does not see (RadGeneratorDecl::drop_prefix). */
+/* One conditioning sequence: the prompt tokens with their media placed, and how many leading
+ * tokens the generator does not see (RadGeneratorDecl::drop_prefix). */
 struct Branch {
     std::vector<int32_t>             tokens;
     std::shared_ptr<mm::PromptMedia> media;    /* null for a prompt with no pictures */
     int32_t                          n_drop = 0;
 };
 
-/* ONE IMAGE, or one preview of one, on its way back. */
+/* One finished image, or a preview of one. */
 struct Image {
     int32_t              index = 0;     /* which of the request's n */
     int32_t              w = 0, h = 0, ch = 4;
@@ -62,18 +60,17 @@ struct Image {
     uint64_t             seed = 0;
 };
 
-/* THE CHANNEL BACK TO THE CALLER: images as they finish, then the end. The driver's thread writes,
- * the caller's reads; a mutex is enough -- an image is megabytes and there are a handful a
- * request. `cancel` is the caller's, read by the driver at its next pass. */
+/* The channel back to the caller: images as they finish, then the end. The driver thread writes,
+ * the caller reads; a mutex suffices for a handful of megabyte images per request. `cancel` is set
+ * by the caller and read by the driver at its next pass. */
 class Ticket {
 public:
     /* driver side */
     void push(Image&& im);
     void finish(int status, const std::string& why = std::string());
-    void step(int32_t done, int32_t total);
 
     /* caller side: the next image, or false once the request has ended and every image was taken.
-     * Waits at most `ms` milliseconds; `*timed_out` says a false was a timeout, not the end. */
+     * Waits at most `ms` milliseconds; `*timed_out` marks a false that was a timeout, not the end. */
     bool next(Image* out, int ms, bool* timed_out);
     bool finished() const;
     int  status() const;
@@ -81,8 +78,8 @@ public:
 
     std::atomic<bool> cancel{false};
 
-    /* What the request cost, for the response: the conditioning's tokens, the latent rows made, and
-     * the time each phase took. Written by the driver before finish(). */
+    /* Usage for the response: conditioning tokens, latent rows made, and per-phase times.
+     * Written by the driver before finish(). */
     int64_t in_tokens = 0, out_tokens = 0;
     int64_t t_submit_ns = 0, t_cond_ns = 0, t_first_step_ns = 0, t_denoised_ns = 0, t_done_ns = 0;
     int32_t steps = 0;
@@ -107,8 +104,8 @@ struct Request {
     int32_t  previews = 0;              /* partial images per image, 0..3 */
     /* The reference pictures' encoder view, one per media item of `pos`, in order. */
     std::vector<Pixels> refs;
-    /* REPAINTING (an edit with a mask): the picture at the size being made, and per latent token
-     * how much of it is repainted (1) and how much kept (0). */
+    /* Inpainting (an edit with a mask): the source picture at the output size, and per latent
+     * token how much is repainted (1) versus kept (0). */
     bool                 inpaint = false;
     Pixels               inp_src;
     std::vector<float>   inp_mask;
@@ -116,16 +113,15 @@ struct Request {
 };
 
 /* ================================================================== the sampler's schedule */
-/* The sigmas a request steps through, n + 1 of them, the last 0: the decl's fixed schedule, or
- * `steps` (0: the default) shifted the way the decl says. `tokens` is the image's latent token
- * count, which a dynamic shift reads. f32, as the reference holds them. */
+/* The n + 1 sigmas a request steps through, the last 0: the decl's fixed schedule, or `steps`
+ * (0: the default) shifted as the decl says. `tokens` is the image's latent token count, read by a
+ * dynamic shift. f32, matching the reference. */
 std::vector<float> schedule(const RadGeneratorDecl& d, const std::vector<double>& fixed,
                             int32_t steps, int64_t tokens);
 
 /* ================================================================== the generator's sequence */
-/* ONE CONDITIONING SEQUENCE AS THE GENERATOR SEES IT (RadGeneratorDecl::layout): which prompt row
- * or reference latent row each of its rows is, its rotary positions, its segments, and where the
- * image being made starts. */
+/* One conditioning sequence as the generator sees it (RadGeneratorDecl::layout): the prompt row or
+ * reference latent row behind each row, rotary positions, segments, and the output image's frame. */
 struct Layout {
     int64_t              rows = 0;
     std::vector<int32_t> src;          /* [rows] */

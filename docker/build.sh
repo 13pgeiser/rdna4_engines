@@ -1,10 +1,10 @@
 #!/bin/sh
 # docker/build.sh -- build the radiance image from a commit with BuildKit (docker buildx) and tag it.
 #
-# The build context is `git archive` of the commit, so the image holds exactly what is committed:
-# no build trees, no uncommitted edits, no model files. With -s the archive is streamed over ssh
-# to another machine's own `docker buildx`, which builds and keeps the image; that machine needs
-# Docker with buildx and nothing else.
+# The build context is `git archive` of the commit, so the image holds only committed files (no
+# build trees, uncommitted edits or model files). With -s the archive is streamed over ssh to
+# another machine's `docker buildx`, which builds and keeps the image; that machine needs only
+# Docker with buildx.
 #
 #   docker/build.sh                       HEAD, here
 #   docker/build.sh -s HOST               HEAD, built on and kept by HOST

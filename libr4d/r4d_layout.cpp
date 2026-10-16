@@ -1,38 +1,36 @@
-/* r4d_layout.cpp -- what libr4d's integer and MXFP4 GEMMs store for a weight, and the relayouts
+/* r4d_layout.cpp -- the stored form of libr4d's integer and MXFP4 GEMM weights, and the relayouts
  * that produce it from the weight's canonical planes (spec.md §4.3). Pure host C++: nothing here
- * includes r4d.h or <hip/hip_runtime.h>, so it compiles and can be exercised on a box with no
- * ROCm, which is where a packing bug is cheapest to find.
+ * includes r4d.h or <hip/hip_runtime.h>, so packing can be tested without ROCm.
  *
- * A container holds each weight's encoding -- codes, scales and zero points, canonical and
- * row-major -- and the kernel that reads it rearranges it at load. That is what lets this file
- * change a fragment order without anyone converting a model again; the numbers were chosen by a
- * quantiser (libquant), and nothing here chooses one.
+ * A container holds each weight's encoding (codes, scales and zero points, canonical and
+ * row-major), and the kernel that reads it rearranges it at load, so a fragment order can change
+ * without reconverting models. The numbers are chosen by a quantiser (libquant), never here.
  *
- * THE FRAGMENT ORDER IS THE WHOLE POINT. gfx1201's wave32 WMMA fragment layout is
+ * Fragment order. gfx1201's wave32 WMMA fragment layout is
  *
  *     idx = lane % 16 ,  k = 8*(e>>2) + 4*(lane>>4) + (e&3)
  *
- * so a B fragment maps lane l onto output row l&15: in canonical order the sixteen lanes of a
- * half-wave read sixteen rows K/2 bytes apart, which is a fully strided read on the operand that
- * dominates traffic. Rearranged, a wave's weight load for four k steps is one 512-byte
- * global_load_b128 with a constant stride and no address arithmetic in the loop.
+ * so a B fragment maps lane l onto output row l&15. In canonical order the sixteen lanes of a
+ * half-wave read sixteen rows K/2 bytes apart, a fully strided read on the operand that dominates
+ * traffic. Rearranged, a wave's weight load for four k steps is one 512-byte global_load_b128 with
+ * a constant stride and no address arithmetic in the loop.
  *
- * Every element->slot map below is transcribed from the kernel that reads it; the comment at the
- * top of each libr4d GEMM states it in closed form.
+ * Every element->slot map below is transcribed from the kernel that reads it; each libr4d GEMM's
+ * header states it in closed form.
  */
 
 #include "r4d_plugin.h"
 #include "r4d_enc.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
 /* ------------------------------------------------------------------ half-precision
  *
- * Written out rather than pulled from a header because this file must build without ROCm and
- * without any float16 extension: __fp16 is not portable and _Float16 is not guaranteed on every
- * host compiler the converter might be built with. */
+ * Written out so the file builds without ROCm or a float16 extension: __fp16 is not portable and
+ * _Float16 is not available on every host compiler. */
 
 static uint16_t f32_to_f16(float f) {
     uint32_t x;
@@ -84,12 +82,10 @@ static float f16_to_f32(uint16_t h) {
     return f;
 }
 
-/* THE SCALE DWORD. libr4d packs the group's two quantiser parameters into one 32-bit word: the f16
- * scale in the low half and the f16 of -(1024 + zero) in the high half, ready to be broadcast into
- * a v_pk_add_f16. The kernel builds 1024 + code and adds that constant, which is what makes the
- * subtraction of an INTEGER zero point exact. A symmetric 4-bit grid is expressed in the same
- * encoding with zero == 8, which is why one packed weight can feed both the f16 and the int8
- * kernel byte for byte. */
+/* The scale dword: a group's f16 scale in the low half and the f16 of -(1024 + zero) in the high
+ * half, broadcast into a v_pk_add_f16. The kernel builds 1024 + code and adds that constant, which
+ * subtracts an integer zero point exactly. A symmetric 4-bit grid uses zero == 8, so one packed
+ * weight feeds both the f16 and the int8 kernel. */
 static uint32_t scale_zero_dword(float scale, int zero) {
     const uint32_t lo = f32_to_f16(scale);
     const uint32_t hi = f32_to_f16(-(1024.0f + (float)zero));
@@ -120,20 +116,18 @@ static void fill(RadLayout* o, const char* tag, uint32_t dtype, long long r0, lo
     o->rank = 2;
     o->shape[0] = r0;
     o->shape[1] = r1;
-    /* Every one of these streams is read with 128-bit loads; 256 is a cacheline on the
-     * architectures in scope, and the .rad plane alignment. */
+    /* Every stream is read with 128-bit loads; 256 bytes is a cacheline on the target
+     * architectures and the .rad plane alignment. */
     o->align = 256;
     o->bytes = bytes;
 }
 
-/* THE ASYMMETRIC 4-BIT GRID IS A DIFFERENT WEIGHT, and `dtype` is what says so. `w4a8_asym`'s
- * kernels read the nibble UNSIGNED and subtract a per-group integer zero from the scale dword's
- * high half; the symmetric grid stores a two's-complement nibble with the zero pinned at 8. The
- * packing, the extents and the byte counts are identical, so a plane written for one and read by
- * the other is accepted everywhere and decodes to the wrong numbers -- a symmetric plane read
- * unsigned is eight levels off at every code. The test is the kernels' own (r4d_gemm_args.h's
- * is_asym), so the encoding the layout hook accepts -- i4 with no zero, or u4 with one -- is the
- * grid the launch selects, and the other is refused at declare. */
+/* The asymmetric 4-bit grid is a different weight, and `dtype` says which. `w4a8_asym` kernels
+ * read the nibble unsigned and subtract a per-group integer zero from the scale dword's high half;
+ * the symmetric grid stores a two's-complement nibble with the zero fixed at 8. Packing, extents
+ * and byte counts are identical, so a plane read as the other grid decodes eight levels off. This
+ * is the kernels' own test (r4d_gemm_args.h is_asym), so the layout hook accepts only the matching
+ * encoding (i4 without a zero, u4 with one) and refuses the other at declare. */
 static bool w4_asym(const RadParam* p, int n_p) {
     const char* d = r4d_pgets(p, n_p, "dtype");
     return d && std::strstr(d, "_asym") != nullptr;
@@ -141,80 +135,66 @@ static bool w4_asym(const RadParam* p, int n_p) {
 
 /* ================================================================== moe w4
  *
- * THE GROUPED MoE GEMM'S 4-BIT EXPERT WEIGHT, and it is a different plane from the dense w4 above
- * for one structural reason: the dense kernels read a WMMA fragment straight out of a coalesced
- * global load, so their weight is stored PERMUTED into fragment order; the grouped kernel stages
- * its weight through LDS -- it has to, because eight M tiles share one N tile of it -- so a
- * permutation would buy nothing and would have to be undone on the way in.
+ * The grouped MoE GEMM's 4-bit expert weight. Unlike the dense w4 it is not permuted into fragment
+ * order: the grouped kernel stages its weight through LDS (eight M tiles share one N tile), so a
+ * permutation would only have to be undone.
  *
- * WHAT THE FORMAT IS
+ *   weight  [N][K/2] bytes, row-major, two's complement codes -8..7: an ordinary symmetric int4
+ *           grid, as GPTQ writes.
+ *   scale   [N][K/group] bf16, one per row per 128 of K. w ~= code * scale.
  *
- *   weight  [N][K/2] bytes, row-major, TWO'S COMPLEMENT codes -8..7 -- an ordinary symmetric
- *           int4 grid, the one GPTQ and every other 4-bit method is written against.
- *   scale   [N][K/group] bf16, one per row per group of 128 along K. w ~= code * scale.
+ * Decode: V_PERM_B32 permutes the bytes of an eight-byte source, so one table holds eight entries
+ * and a two's complement nibble needs sixteen. Two perms index a positive and a negative table
+ * with the low three bits, and a third selects on bit 3 by adding 4 to a selector byte (which
+ * cannot carry): all sixteen levels for five more VALU per eight weights than a fifteen-level
+ * sign-magnitude grid. See r4d_moe.hip w4_e4m3.
  *
- * THE DECODE IS TWO V_PERM_B32 AND A THIRD THAT CHOOSES BETWEEN THEM. A perm is a byte permute of
- * an EIGHT-byte source, so one table holds eight entries and a two's complement nibble needs
- * sixteen. Indexing both a positive and a negative table with the low three bits and selecting on
- * bit 3 -- by ADDING 4 to a selector byte, which cannot carry -- gets all sixteen levels for five
- * more VALU per eight weights than a fifteen-level sign-magnitude grid would cost. r4d_moe.hip's
- * w4_e4m3 is the five lines.
+ * The integers -8..7 are exact in E4M3 (three mantissa bits reach 16), so expanding a code to an
+ * E4M3 byte is lossless and the weight runs on the existing f32_16x16x16_fp8_fp8 inner loop; only
+ * the staging differs.
  *
- * THE INTEGERS -8..7 ARE ALL EXACT IN E4M3 (three mantissa bits reach 16), so expanding a code to an
- * E4M3 byte is lossless and the product the WMMA computes is code * activation with no rounding
- * the fp8 path did not already have. That is the whole reason this weight can ride the existing
- * f32_16x16x16_fp8_fp8 inner loop untouched: only the STAGING changes.
+ * Nibble order: byte b of a packed dword holds element b in its low nibble and element b+4 in its
+ * high nibble, so the two masks yield elements 0..3 and 4..7 already in order, as in the dense
+ * w4a8 kernel.
  *
- * THE NIBBLE ORDER IS THE ONE THE EXPANSION WANTS. Byte b of a packed dword holds element b in its
- * low nibble and element b+4 in its high nibble, so the two masks above produce elements 0..3 and
- * 4..7 already in order and nothing has to be interleaved afterwards. It is the same argument the
- * dense w4a8 kernel's header makes for the same pair of masks.
- *
- * IT IS NOT SHARDABLE AND THE ARCHITECTURE SAYS SO. A packed row is K/2 bytes and a column shard
- * would cut a byte in half; an expert under expert parallelism is whole on one rank, which is the
- * only configuration that declares this format. rad_block_moe_fp8.h refuses a width-sharded
- * declaration by name rather than leaving it to the loader to discover.
+ * Not shardable: a packed row is K/2 bytes and a column shard could cut a byte in half. Under
+ * expert parallelism an expert is whole on one rank, the only configuration that declares this
+ * format; rad_block_moe_fp8.h refuses a width-sharded declaration.
  */
-/* THE ROTATED FORM IS THE SAME BYTES WITH DIFFERENT NUMBERS IN THEM, and that is exactly why the
- * encoding says so. `dtype=w4a8h` serves `i4*bf16[1x128]/fwht128`: every group of K was multiplied
- * by a `group`-wide Hadamard before it was quantised. Nothing in the packing, the extents or the
- * byte count would say so, and a weight quantised one way and served the other reads as noise --
- * so the layout hook accepts exactly the encoding the dtype names, and refuses the other at
- * declare.
+/* `dtype=w4a8h` serves `i4*bf16[1x128]/fwht128`: the same bytes, but every group of K was
+ * multiplied by a `group`-wide Hadamard before quantisation. Nothing in packing, extents or byte
+ * count shows this, and a weight served the other way reads as noise, so the layout hook accepts
+ * only the encoding the dtype names.
  *
- * THE KERNEL DOES NOT BRANCH ON IT. <Hw, Ha> = group * <w, a>, and the residual factor is folded
- * into the stored weight scale by the quantiser (docs/MOE-W4.md), so the GEMM multiplies codes by
- * scales exactly as it does for the unrotated grid. What has to agree is the ACTIVATION: the
- * routed experts' input must be quantised by the rotated quantiser at the same width, which is
- * what had_quant_act_fp8 is for. That pairing is not checkable from here -- it is a property of the
- * graph, and the arch block that declares one declares the other. */
-/* THE CODEBOOK FORM IS THE ROTATED FORM WITH OTHER NUMBERS FOR THE SAME CODES. `dtype=w4nla8h`
- * serves `u4*bf16[1x128]/fwht128` whose codes index a sixteen-entry `table` plane -- libquant's
- * `table=w4nl` -- and the kernel decodes that table and no other (r4d_args.h). An encoding cannot
- * say what its table holds, so the codes view selects the table plane beside the codes and the
- * relayout compares it with the kernel's, value for value, before it serves a byte: a container
- * quantised against another table is refused at load rather than served as other numbers. */
+ * The kernel does not branch on it: <Hw, Ha> = group * <w, a>, and the quantiser folds the
+ * residual factor into the stored scale (docs/MOE-W4.md). What must agree is the activation, which
+ * had_quant_act_fp8 quantises with the same rotation width. That pairing is a property of the
+ * graph and is not checked here; the arch block that declares one declares the other. */
+/* `dtype=w4nla8h` serves `u4*bf16[1x128]/fwht128` whose codes index a sixteen-entry `table` plane
+ * (libquant `table=w4nl`), and the kernel decodes only its own table (r4d_args.h). The codes view
+ * selects the table plane and the relayout compares it with the kernel's value for value, so a
+ * container quantised against another table is refused at load. */
 static int moe_w4_nl(const RadParam* p, int n_p) {
     const char* d = r4d_pgets(p, n_p, "dtype");
     return d && (std::strcmp(d, "w4nla8h") == 0 || std::strcmp(d, "w4nl64a8h") == 0 ||
                  std::strcmp(d, "w4nl32a8h") == 0 || std::strcmp(d, "w5nl64a8h") == 0);
 }
-/* `w5nl64a8h` IS w4nl64a8h AT FIVE BITS: `u5*fp8_e4m3[1x64]*f32[*x*]/fwht128` whose codes index
- * libquant's 32-entry `table=w5nl`. Its codes view relays each row into R4D_DT_MOEW5 -- the low
- * four bits of every code as w4nla8h's nibble plane, then the high bit of every code, the sign,
- * a dword a 32 elements (moew5_row says in which order) -- and compares the table with
- * kW5nlTable as w4nla8h's is; its scale view is w4nl64a8h's. */
+/* `w5nl64a8h` is w4nl64a8h at five bits: `u5*fp8_e4m3[1x64]*f32[*x*]/fwht128`, codes indexing
+ * libquant's 32-entry `table=w5nl`. Its codes view relays each row into R4D_DT_MOEW5 (the low four
+ * bits of every code as w4nla8h's nibble plane, then each code's high bit, the sign, one dword per
+ * 32 elements in moew5_row's order) and checks the table against kW5nlTable. Its scale view is
+ * w4nl64a8h's. */
 static bool moe_w5(const RadParam* p, int n_p) {
     const char* d = r4d_pgets(p, n_p, "dtype");
     return d && std::strcmp(d, "w5nl64a8h") == 0;
 }
-/* `w4nl64a8h` IS THE CODEBOOK FORM WITH ITS SCALES A 64 OF K, as E4M3 under the fixed
- * kW4G64Scale -- `u4*fp8_e4m3[1x64]*f32[*x*]/fwht128` with the table, the f32 second level being
- * that constant, stated once a weight. The codes are stored as w4nla8h's; the scale view selects
- * the E4M3 plane and the second level, and its relayout compares the second with the kernel's
- * constant, as the codes view does the table, and stores the E4M3 plane as it is. */
-/* And `w4nl32a8h` the same at one a (row, 32 of K). The value is the scale groups a 128 of K the
- * dtype has beside its bf16 forms' one: 2, 4, or 0 for neither. */
+/* `w4nl64a8h` is the codebook form with one E4M3 scale per (row, 64 of K) under a fixed f32
+ * second level, kW4G64Scale, stored once per weight (`u4*fp8_e4m3[1x64]*f32[*x*]/fwht128` with the
+ * table). Codes are stored as w4nla8h's. The scale view selects the E4M3 plane and the second
+ * level; its relayout checks the second level against the kernel's constant and stores the E4M3
+ * plane unchanged. `w4nl32a8h` is the same with one scale per (row, 32 of K).
+ *
+ * Returns the scale groups per 128 of K (the bf16 forms have one): 2, 4, or 0 for neither. */
 static int moe_w4_g64(const RadParam* p, int n_p) {
     const char* d = r4d_pgets(p, n_p, "dtype");
     if (!d) return 0;
@@ -229,10 +209,9 @@ static int moe_w4_rot(const RadParam* p, int n_p) {
 /* ================================================================== moe_gemm_q's two classes
  *
  * `moe_gemm_q` takes its experts as two tables by parity: operands 2 and 3 hold the even experts
- * at [N, K], operands 6 and 7 the odd ones at [N_odd, K_odd] (r4d_rows.cpp's schema says why). A
- * hook asked about 6 or 7 answers exactly as it would for 2 or 3 at the odd geometry, so every
- * hook below is the plain one behind this view, and the two classes cannot come to disagree about
- * a format they share. */
+ * at [N, K], operands 6 and 7 the odd ones at [N_odd, K_odd] (see the schema in r4d_rows.cpp). A
+ * hook asked about 6 or 7 answers as for 2 or 3 at the odd geometry, so both classes share one
+ * format definition. */
 namespace {
 struct MoeView {
     RadParam p[32];
@@ -258,8 +237,7 @@ int moe_view(const RadParam* p, int n_p, int operand, MoeView* v) {
 }
 
 /* `moe_gemm_q_mod4`'s four classes: operands 6/7, 8/9 and 10/11 are classes 1, 2 and 3 at
- * N_1/K_1, N_2/K_2 and N_3/K_3, answered as 2/3 at that geometry -- the same view, one class
- * further along. */
+ * N_1/K_1, N_2/K_2 and N_3/K_3, answered as 2/3 at that geometry. */
 int moe_view_mod4(const RadParam* p, int n_p, int operand, MoeView* v) {
     if (n_p < 0 || n_p > 32 || (n_p > 0 && !p)) return RAD_E_INVAL;
     v->n = n_p;
@@ -283,10 +261,9 @@ int moe_view_mod4(const RadParam* p, int n_p, int operand, MoeView* v) {
 
 /* ================================================================== the hooks
  *
- * The codes and scales arrive chosen, by a quantiser, and what is left here is the arrangement the
- * kernel reads -- fragment order, the (scale, zero) dword, a tile-major scale plane, a nibble
- * order -- which moves bits and chooses none. Each refuses, with RAD_E_DTYPE, an encoding its
- * kernel does not read. */
+ * Codes and scales arrive chosen by a quantiser; the hooks only arrange them as the kernel reads
+ * them (fragment order, the (scale, zero) dword, a tile-major scale plane, a nibble order). Each
+ * refuses an encoding its kernel does not read with RAD_E_DTYPE. */
 namespace {
 
 using r4d_enc::selects;
@@ -295,7 +272,7 @@ using r4d_enc::dims;
 /* A selected plane's dense bytes. */
 const uint8_t* pdata(const RadTensor& t) { return (const uint8_t*)t.data; }
 
-/* The f16 scale of a canonical plane, as f32 -- the value scale_zero_dword re-narrows exactly. */
+/* The f16 scale of a canonical plane as f32; scale_zero_dword narrows it back exactly. */
 float f16_at(const RadTensor& t, long long i) { return f16_to_f32(((const uint16_t*)t.data)[i]); }
 
 /* An integer zero point from a u4 or u8 plane. */
@@ -327,9 +304,9 @@ void sz_write(const WGeom& g, const RadTensor* pl, int zfixed, uint32_t* sz) {
             }
 }
 
-/* Every zero point a code of `bits` bits: what an asymmetric grid's zero is, and what the int8
- * prefill kernel reads back out of the scale dword (r4d_gemm_wpa8i8_tiled.hip takes five bits of it,
- * where the f16 kernel takes the whole value -- a larger zero would make the two disagree). */
+/* Whether every zero point fits in `bits` bits. The int8 prefill kernel (r4d_gemm_wpa8i8_tiled.hip)
+ * reads five bits of the zero out of the scale dword where the f16 kernel reads the whole value,
+ * so a larger zero would make the two disagree. */
 bool sz_zeros_fit(const WGeom& g, const RadTensor& zp, int bits) {
     const long long nz = g.N * (g.K / g.group);
     for (long long i = 0; i < nz; ++i) {
@@ -354,9 +331,9 @@ void sz_read(const WGeom& g, const uint32_t* sz, const RadTensor* pl, bool asym)
             }
 }
 
-/* A ROTATED asymmetric grid (ParoQuant): codes of `codes` dtype, an f16 scale and a u8 zero point a
- * group, then a `givens` transform and its tables -- the same bytes as the unrotated grid, the
- * rotation being the activation's. */
+/* A rotated asymmetric grid (ParoQuant): codes of dtype `codes`, an f16 scale and a zero point
+ * per group, optionally with a `givens` transform and its tables. The bytes are the unrotated
+ * grid's; the rotation is applied to the activation. */
 static bool paro_asym_enc(const RadEncoding* e, uint32_t codes, long long group) {
     if (!e || !rad_enc_is(e, "affine") || e->n_planes < 3) return false;
     const bool giv = std::strncmp(e->transform, "givens", RAD_ENC_STR) == 0;
@@ -428,10 +405,11 @@ extern "C" int r4d_rad_relayout_w4(const RadParam* p, int n_p, int operand, cons
     if (dst_bytes != L.bytes) return RAD_E_SHAPE;
     std::memset(dst, 0, (size_t)dst_bytes);
     if (operand == Q_BSCALE) {
-        /* a ROTATED (ParoQuant) grid's zero is a 4-bit code */
-        if (w4_asym(p, n_p) && std::strncmp(enc->transform, "givens", RAD_ENC_STR) == 0 &&
+        const bool asym = w4_asym(p, n_p);
+        /* A rotated (ParoQuant) grid's zero must fit a 4-bit code. */
+        if (asym && std::strncmp(enc->transform, "givens", RAD_ENC_STR) == 0 &&
             !sz_zeros_fit(g, pl[1], 4)) return RAD_E_FORMAT;
-        sz_write(g, pl, w4_asym(p, n_p) ? -1 : 8, (uint32_t*)dst);
+        sz_write(g, pl, asym ? -1 : 8, (uint32_t*)dst);
         return RAD_OK;
     }
     uint32_t* wq = (uint32_t*)dst;
@@ -473,13 +451,13 @@ extern "C" int r4d_rad_unrelayout_w4(const RadParam* p, int n_p, int operand,
     return RAD_OK;
 }
 
-/* ---- w5: ParoQuant's int5, asymmetric: u5 codes, an f16 scale and a u8 zero point (0..31) a 128 of K.
- * The blob is w4's fragment order for the low four bits of every code (offset binary, no sign flip)
- * followed by a plane of 32-bit words holding the fifth bits, one a (n-tile, 64 of K, lane): byte s
- * is k step s of the block and bit e the fragment element e -- the element whose nibble is
- * 2e (e < 4) or 2(e-4)+1 in dword s of that lane's 16 bytes (r4d_gemm_w5a16_nt_m64.hip). The scale
- * operand is w4u's (scale, zero) dword plane. A ROTATED weight (a `givens` transform and its
- * tables beside the first three planes) is the same bytes: the rotation is the activation's. */
+/* ---- w5: ParoQuant's asymmetric int5: u5 codes, an f16 scale and a u8 zero point (0..31) per
+ * 128 of K. The blob is w4's fragment order for the low four bits of every code (offset binary, no
+ * sign flip), then 32-bit words of fifth bits, one per (n-tile, 64 of K, lane): byte s is k step s
+ * of the block and bit e is fragment element e, whose nibble is 2e (e < 4) or 2(e-4)+1 in dword s
+ * of that lane's 16 bytes (r4d_gemm_w5a16_nt_m64.hip). The scale operand is w4u's (scale, zero)
+ * dword plane. A rotated weight (a `givens` transform and its tables beside the first three
+ * planes) has the same bytes; the rotation is the activation's. */
 namespace {
 bool w5_enc(const RadEncoding* e, long long group) { return paro_asym_enc(e, RAD_U5, group); }
 
@@ -571,10 +549,10 @@ extern "C" int r4d_rad_unrelayout_w5(const RadParam* p, int n_p, int operand, co
     return RAD_OK;
 }
 
-/* ---- givens pairs: ParoQuant's rotation pairs (i32 [P*S, K]), stored as they are but CHECKED.
- * The rotate kernels index a group's 128 LDS slots with them unchecked, so a stage that is not a
- * pairing of its own group -- an index outside the group, or one column twice -- is refused here,
- * at load, rather than read out of bounds. Operand 1 of the givens rows; the rest is as stored. */
+/* ---- givens pairs: ParoQuant's rotation pairs (i32 [P*S, K]), stored unchanged but checked. The
+ * rotate kernels index a group's 128 LDS slots with them unchecked, so a stage that is not a
+ * pairing within its own group (an index outside the group, or a column twice) is refused at load.
+ * Operand 1 of the givens rows; the other operands are stored as they are. */
 namespace {
 constexpr int GV_PAIRS_OPERAND = 1;
 constexpr long long GV_GROUP = 128;
@@ -636,14 +614,14 @@ extern "C" int r4d_rad_unrelayout_givens_pairs(const RadParam* p, int n_p, int o
     return RAD_OK;
 }
 
-/* ---- givens_dense: ParoQuant's rotation as one dense matrix a (part, group).
+/* ---- givens_dense: ParoQuant's rotation as one dense matrix per (part, group).
  *
- * The dense kernel (r4d_givens_dense.hip) applies a part's Givens stages over each group of 128 columns as
- * T (x / D), T being their composition. rad-convert composes T and stores it as the "givens" encoding's
- * "t.dense" table, f16 [P * K/128, 128 * 128], row p * (K/128) + g element j * 128 + i the output j for the
- * unit input e_i (abi/rad_encoding.h) -- which is the order the kernel stages a (part, group), 32 KiB, whole.
- * So the layout is the table as stored: a relayout that moves bytes and derives none (abi/rad_abi.h).
- * Operand 1 of givens_dense_quant; everything else stays as stored. */
+ * The dense kernel (r4d_givens_dense.hip) applies a part's Givens stages over each group of 128
+ * columns as T (x / D), T being their composition. rad-convert composes T and stores it as the
+ * "givens" encoding's "t.dense" table, f16 [P * K/128, 128 * 128]: in row p * (K/128) + g, element
+ * j * 128 + i is output j for unit input e_i (abi/rad_encoding.h). The kernel stages a (part,
+ * group), 32 KiB, whole in that order, so the layout is the table as stored. Operand 1 of
+ * givens_dense_quant; everything else stays as stored. */
 namespace {
 constexpr int GD_OPERAND = 1;
 constexpr long long GD_GROUP = 128;
@@ -676,14 +654,14 @@ extern "C" int r4d_rad_relayout_gdense(const RadParam* p, int n_p, int operand, 
     RadLayout L;
     int rc = r4d_rad_layout_gdense(p, n_p, operand, enc, sel, pl, n, &L);
     if (rc != RAD_OK) return rc;
-    if (dst_bytes != L.bytes) return RAD_E_SHAPE;
+    if (dst_bytes != L.bytes || !pl[0].data) return RAD_E_SHAPE;
     std::memcpy(dst, pdata(pl[0]), (size_t)L.bytes);
     return RAD_OK;
 }
 
-/* ---- w8: i8 codes, symmetric about zero, an f16 scale a group. The f16 kernel (a16) reads the
- * code offset binary with zero 128 in the shared dword; the int8 kernel (a8) reads it signed with a
- * bare f16 scale plane. */
+/* ---- w8: i8 codes, symmetric about zero, an f16 scale per group. The f16 kernel (a16) reads the
+ * code as offset binary with zero 128 in the shared dword; the int8 kernel (a8) reads it signed
+ * with a bare f16 scale plane. */
 namespace {
 int w8_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
                   const RadTensor* pl, int n, RadLayout* out, WGeom* gout, int a16) {
@@ -766,7 +744,7 @@ extern "C" int r4d_rad_relayout_w8a8(const RadParam* p, int n_p, int operand,
     return w8_relayout(p, n_p, operand, enc, sel, pl, n, dst, dst_bytes, 0);
 }
 
-/* ---- w2a8: u2 codes, asymmetric, an f16 scale and an integer zero a group, both streams
+/* ---- w2a8: u2 codes, asymmetric, an f16 scale and an integer zero per group, both streams
  * tile-major. */
 namespace {
 int w2_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
@@ -855,17 +833,15 @@ extern "C" int r4d_rad_unrelayout_w2a8(const RadParam* p, int n_p, int operand,
     return RAD_OK;
 }
 
-/* ---- MXFP4: fp4 e2m1 codes with an E8M0 exponent a 32. The codes go to fragment order, the
- * exponents to [K/32][N], and b_ref is each row's largest exponent -- a reduction over the plane,
- * which is a derivation any reader of the plane could make and so not a choice. */
+/* ---- MXFP4: fp4 e2m1 codes with an E8M0 exponent per 32. The codes go to fragment order, the
+ * exponents to [K/32][N], and b_ref is each row's largest exponent: a reduction any reader of the
+ * plane could compute, so not a choice. */
 namespace {
-/* A ROTATED MXFP4 WEIGHT (ParoQuant): the same two planes -- e2m1 codes, an E8M0 exponent a 32 --
- * stored in the basis the "givens" transform names, with the rotation's tables beside them. The
- * GEMM reads the codes and exponents exactly as it reads an unrotated weight; the rotation is the
- * activation's (givens_dense_quant), and the tables are separate weight operands of that op, so
- * nothing here touches them. What is checked is that they are there and are the kind of
- * rotation the quantiser applies: a transform this library does not read would hand the kernel
- * codes that decode to other numbers. */
+/* A rotated MXFP4 weight (ParoQuant): the same two planes stored in the basis the "givens"
+ * transform names, with the rotation's tables beside them. The GEMM reads codes and exponents as
+ * for an unrotated weight; the rotation is applied to the activation (givens_dense_quant), whose
+ * tables are separate weight operands. This only checks that the tables are present and are the
+ * rotation the quantiser applies; any other transform would decode to other numbers. */
 bool mx_paro_enc(const RadEncoding* e, long long K) {
     if (!e || !rad_enc_is(e, "affine") || std::strncmp(e->transform, "givens", RAD_ENC_STR) != 0) return false;
     if (e->n_planes < 5 || !rad_enc_valid(e)) return false;
@@ -878,7 +854,7 @@ bool mx_paro_enc(const RadEncoding* e, long long K) {
     if (p < 0 || an < 0 || sc < 0) return false;
     if (e->plane[p].dtype != RAD_I32 || e->plane[an].dtype != RAD_F32 || e->plane[sc].dtype != RAD_F32)
         return false;
-    // the quantiser rotates whole groups of 128 columns, one scale per group
+    /* The quantiser rotates whole groups of 128 columns, one scale per group. */
     return K % 128 == 0 && e->plane[p].extent[1] == K;
 }
 
@@ -956,11 +932,10 @@ extern "C" int r4d_rad_relayout_mxfp4(const RadParam* p, int n_p, int operand,
     return RAD_OK;
 }
 
-/* ---- the MoE experts. Their weight is staged through LDS, so it is not permuted: the int4 plane
- * is the canonical one with each dword's nibbles reordered for the expansion (byte b holds element
- * b low and element b+4 high), and the fp8 plane is the canonical one exactly. `w4a8h` is the same
- * plane with the weight rotated by the group's Hadamard, and only an encoding that says so is
- * accepted for it. */
+/* ---- the MoE experts. The weight is staged through LDS, so it is not permuted: the int4 plane is
+ * the canonical one with each dword's nibbles reordered for the expansion (byte b holds element b
+ * low and element b+4 high), and the fp8 plane is the canonical one unchanged. `w4a8h` is the same
+ * plane with the weight Hadamard-rotated per group, accepted only from an encoding that says so. */
 namespace {
 int moew4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                      const int* sel, const RadTensor* pl, int n, RadLayout* out, WGeom* gout) {
@@ -1024,12 +999,12 @@ bool moew5_table_is_kernels(const RadTensor& t) {
     return true;
 }
 
-/* THE EXPANSION'S NIBBLE ORDER, two dwords a word. Canonical element 8g+i is nibble i of dword g;
- * stored, byte b holds element b low and b+4 high -- nibbles n0 n4 n1 n5 n2 n6 n3 n7, a perfect
- * shuffle of the dword's halves. Swapping the middle bytes and then each half's middle nibbles
- * makes it; each step exchanges two fields, so the same steps in the other order undo it. Done
- * a nibble at a time, with the read-modify-write that implies, the same permutation costs most of
- * a Flash-Next load's CPU: every routed expert goes through it. */
+/* The expansion's nibble order, applied to a 64-bit word (two dwords). Canonical element 8g+i is
+ * nibble i of dword g; stored, byte b holds element b low and b+4 high (nibbles n0 n4 n1 n5 n2 n6
+ * n3 n7, a perfect shuffle of the dword's halves). Swapping the middle bytes, then each half's
+ * middle nibbles, produces it; each step swaps two fields, so the steps in reverse order undo it.
+ * Every routed expert passes through here at load, so a nibble-at-a-time loop would dominate the
+ * load's CPU time. */
 inline uint64_t moew4_bytes(uint64_t x) {
     return (x & 0xFF0000FFFF0000FFull) | ((x & 0x0000FF000000FF00ull) << 8) |
            ((x >> 8) & 0x0000FF000000FF00ull);
@@ -1039,7 +1014,7 @@ inline uint64_t moew4_nibbles(uint64_t x) {
            ((x >> 4) & 0x00F000F000F000F0ull);
 }
 
-/* `bytes` of codes, a multiple of four, from `s` to `d` -- forward or back. */
+/* Permutes `bytes` of codes (a multiple of four) from `s` to `d`, forward or back. */
 void moew4_permute(const uint8_t* s, uint8_t* d, int64_t bytes, bool forward) {
     int64_t i = 0;
     for (; i + 8 <= bytes; i += 8) {
@@ -1057,16 +1032,15 @@ void moew4_permute(const uint8_t* s, uint8_t* d, int64_t bytes, bool forward) {
         std::memcpy(d + i, &w, 4);
     }
 }
-/* ONE w5nl64a8h ROW BETWEEN THE CONTAINER AND THE KERNEL. Stored, a row is K five-bit codes,
- * LSB first (rad_plugin.h's packing), so every eight codes are five bytes. Served, it is the
- * codes' low nibbles in the canonical 4-bit order -- two a byte, element 2i low -- put through
- * moew4_permute as w4nla8h's are, then their high bits, one dword a 32 elements: K/2 + K/8 bytes,
- * the same count.
+/* One w5nl64a8h row between container and kernel. Stored, a row is K five-bit codes, LSB first
+ * (rad_plugin.h packing), so every eight codes are five bytes. Served, it is the codes' low nibbles
+ * in canonical 4-bit order (two per byte, element 2i low) put through moew4_permute as w4nla8h's
+ * are, then their high bits, one dword per 32 elements: K/2 + K/8 bytes, the same count.
  *
- * THE SIGN DWORD IS TRANSPOSED for the kernel's merge: element 4m+b of a 32 -- byte b of the
- * expansion's output dword m -- is bit 7-m of byte b, so `sg << m` lines dword m's four signs up
- * on E4M3's sign bits at once (r4d_moe.hip, w5_expand). `nib` is a scratch row of K/2 bytes. */
-inline uint32_t moew5_sign_bit(int64_t j) {        /* j: an element's place in its 32 */
+ * The sign dword is transposed for the kernel's merge: element 4m+b of a 32 (byte b of the
+ * expansion's output dword m) is bit 7-m of byte b, so `sg << m` aligns dword m's four signs with
+ * E4M3's sign bits at once (r4d_moe.hip, w5_expand). `nib` is a scratch row of K/2 bytes. */
+inline uint32_t moew5_sign_bit(int64_t j) {        /* j: the element's index within its 32 */
     return 8u * (uint32_t)(j & 3) + 7u - (uint32_t)(j >> 2);
 }
 void moew5_row(const uint8_t* s, uint8_t* d, int64_t K, uint8_t* nib, bool forward) {
@@ -1131,7 +1105,7 @@ int moew4_relayout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
     if (rc == RAD_OK) rc = moew4_enc_layout(v.p, v.n, v.operand, enc, sel, pl, n, &L, &g);
     if (rc != RAD_OK) return rc;
     if (dst_bytes != L.bytes) return RAD_E_SHAPE;
-    if (v.operand == Q_BSCALE) {                     /* w4nl64a8h's: the second level is ours */
+    if (v.operand == Q_BSCALE) {                     /* g64 forms: the second level is fixed */
         float s2 = 0.0f;
         std::memcpy(&s2, pdata(pl[1]), sizeof s2);
         if (s2 != kW4G64Scale) return RAD_E_DTYPE;
@@ -1233,13 +1207,12 @@ extern "C" int r4d_rad_layout_moe_fp8_mod4(const RadParam* p, int n_p, int opera
                                                                n, out);
 }
 
-/* ---- conv2d_nhwc: PyTorch's [cout][cin][k][k] stored TAP-MAJOR, [cout][k][k][cin].
+/* ---- conv2d_nhwc: PyTorch's [cout][cin][k][k] stored tap-major, [cout][k][k][cin].
  *
  * The implicit-GEMM convolution (r4d_gen.hip) contracts over K = (tap, channel) with the channel
- * innermost, so that eight consecutive K are eight channels of one input pixel -- one 16-byte read
- * of an NHWC row. The weight's K has to run the same way, and PyTorch's runs channel-major. A
- * permutation of a bf16 plane, so the inverse is the same loop backwards. Operand 1 of
- * conv2d_nhwc; the bias is read as it is. */
+ * innermost, so eight consecutive K are eight channels of one input pixel, one 16-byte read of an
+ * NHWC row. The weight's K must run the same way; PyTorch's is channel-major. Operand 1 of
+ * conv2d_nhwc; the bias is read as stored. */
 namespace {
 constexpr int CONV_W_OPERAND = 1;
 

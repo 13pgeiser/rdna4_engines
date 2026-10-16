@@ -1,0 +1,45 @@
+# Kernel rows a replay of this fixture reaches (rad-kbench --coverage).
+# A row listed here and not reached fails the replay; regenerate with
+# --coverage-write when a row is added or deliberately retired.
+ref_add
+ref_attn_dense
+ref_attn_paged
+ref_cast
+ref_dflash_select
+ref_embed_lookup
+ref_gated_quant_fp8
+ref_gather_rows
+ref_gdn_chunk_scan
+ref_gdn_conv_update
+ref_gdn_gated_rmsnorm
+ref_gdn_kkt_solve
+ref_gdn_recurrent_update
+ref_gemm_nt
+ref_gemm_nt_bias
+ref_gemm_nt_q
+ref_gemm_nt_q_gated
+ref_grid_embed
+ref_kv_store
+ref_layernorm
+ref_logits_gemm
+ref_quant_act_fp8
+ref_quant_act_i8
+ref_rmsnorm
+ref_rmsnorm_quant_fp8
+ref_rope
+ref_rope_table
+ref_row_topk
+ref_sample_argmax
+ref_sample_dry
+ref_sample_logprobs
+ref_sample_mask
+ref_sample_minp
+ref_sample_penalties
+ref_sample_pick
+ref_sample_temp
+ref_sample_topk
+ref_sample_topp
+ref_sample_typical
+ref_sample_xtc
+ref_scatter_rows
+ref_silu_mul

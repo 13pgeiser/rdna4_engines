@@ -1,17 +1,15 @@
-/* vmemprobe -- what a virtual-memory decommit actually returns to the card.
+/* vmemprobe -- measures what a virtual-memory decommit actually returns to the card.
  *
- * The elastic KV pool rests on one claim about the driver: that unmapping a sub-range of a live
- * reservation gives the card back memory another pool can then commit. That is not something the
- * pool can check for itself -- a commit that fails looks the same as a pool that is simply full --
- * and it is not something the API promises. This measures it.
+ * The elastic KV pool assumes that unmapping a sub-range of a live reservation frees memory another
+ * pool can commit. The API does not promise this and the pool cannot detect it (a failed commit
+ * looks like a full pool).
  *
- * Each trial commits a range, lets go of it a different way, and reports the card free counter
- * beside what a real hipMalloc can still reach, because the two disagree exactly where the driver
- * has stopped crediting something back.
+ * Each trial commits a range, releases it a different way, and reports the card's free counter
+ * beside what hipMalloc can still reach; they disagree where the driver failed to credit memory
+ * back.
  *
  * Build: hipcc -O1 --offload-arch=<gfx> -I/opt/rocm/include -L/opt/rocm/lib -o vmemprobe vmemprobe.cpp
- * Run it on an IDLE card: every number here is a free-memory reading and another process
- * allocating beside it makes all of them lies. */
+ * Run on an idle card: other allocations skew every reading. */
 #include <hip/hip_runtime.h>
 #include <cstdio>
 #include <cstdlib>
@@ -35,8 +33,18 @@ static void trial(const char* what, bool keep_handle, bool piecewise, bool free_
     if (hipMemAddressReserve(&base, bytes, G, nullptr, 0) != hipSuccess) { printf("%-34s reserve failed\n", what); return; }
     const double f0 = freem();
     hipMemGenericAllocationHandle_t h{};
-    if (hipMemCreate(&h, bytes, &prop, 0) != hipSuccess) { printf("%-34s create failed\n", what); return; }
-    if (hipMemMap(base, bytes, 0, h, 0) != hipSuccess) { printf("%-34s map failed\n", what); return; }
+    /* A failed trial gives back what it took, or later trials read less free memory. */
+    if (hipMemCreate(&h, bytes, &prop, 0) != hipSuccess) {
+        printf("%-34s create failed\n", what);
+        (void)hipMemAddressFree(base, bytes);
+        return;
+    }
+    if (hipMemMap(base, bytes, 0, h, 0) != hipSuccess) {
+        printf("%-34s map failed\n", what);
+        (void)hipMemRelease(h);
+        (void)hipMemAddressFree(base, bytes);
+        return;
+    }
     if (!keep_handle) (void)hipMemRelease(h);
     (void)hipMemSetAccess(base, bytes, &desc, 1);
     const double f1 = freem();
@@ -54,9 +62,8 @@ static void trial(const char* what, bool keep_handle, bool piecewise, bool free_
            what, f0, f1, f2, f3, reach(24));
     if (!free_va) (void)hipMemAddressFree(base, bytes);
 }
-/* THE CYCLE AN ELASTIC POOL ACTUALLY PERFORMS: commit a sub-range of a long-lived reservation,
- * unmap it, commit it again. A pool that grows and shrinks with load does this all run, so a
- * card that fell on every pass would be one the engine leaks away under a varying workload. */
+/* The elastic pool's cycle: commit a sub-range of a long-lived reservation, unmap it, repeat. Free
+ * memory that drops on every pass would leak under a varying workload. */
 static void cycle(int n) {
     const size_t total = (8ull << 30) / G * G;
     const size_t part  = (2ull << 30) / G * G;
@@ -66,8 +73,8 @@ static void cycle(int n) {
            total / 1073741824.0, part / 1073741824.0);
     for (int i = 0; i < n; ++i) {
         hipMemGenericAllocationHandle_t h{};
-        if (hipMemCreate(&h, part, &prop, 0) != hipSuccess) { printf("  pass %d: create FAILED\n", i); break; }
-        if (hipMemMap(base, part, 0, h, 0) != hipSuccess) { (void)hipMemRelease(h); printf("  pass %d: map FAILED\n", i); break; }
+        if (hipMemCreate(&h, part, &prop, 0) != hipSuccess) { printf("  pass %d: create failed\n", i); break; }
+        if (hipMemMap(base, part, 0, h, 0) != hipSuccess) { (void)hipMemRelease(h); printf("  pass %d: map failed\n", i); break; }
         (void)hipMemRelease(h);
         (void)hipMemSetAccess(base, part, &desc, 1);
         const double fm = freem();

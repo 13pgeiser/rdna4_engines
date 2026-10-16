@@ -1,20 +1,15 @@
 /* core/server/admin.cpp -- vLLM's and llama-server's non-generation endpoints.
  *
  * /version /ping /load /tokenize /detokenize /get_tokenizer_info /server_info /reset_prefix_cache
- * /props.
+ * /props /diagnostics.
  *
- * Separate from server.cpp because none of it touches the step path: no admission, no Sink, no
- * cancellation, nothing that outlives the handler. They are questions ABOUT the server, answered
- * on the HTTP thread and finished before they return, and mixing them into the file that owns the
- * streaming lifetime would make that file harder to read for no shared code at all.
+ * None of these touch the step path (no admission, no Sink, no cancellation); each is answered on
+ * the HTTP thread before it returns, so they are kept out of server.cpp.
  *
- * WHAT IS DELIBERATELY NOT HERE. vLLM's surface also carries /pooling, /classify, /score and
- * /rerank (a classifier or cross-encoder head, which this engine does not load), /sleep, /wake_up
- * and /is_sleeping (there is no sleep mode: weights are placed once, see spec §5), the LoRA
- * adapter endpoints (no LoRA), /invocations (a SageMaker envelope around the others) and the
- * Responses API's stored responses (retrieved or deleted by id: a conversation store, which is a
- * component and not an endpoint); llama-server's carries /slots (its own slot state). Each would
- * be a lie in the shape of a 200, so each is absent and answers 404 rather than pretending.
+ * Deliberately absent, answering 404: vLLM's /pooling, /classify, /score and /rerank (no
+ * classifier or cross-encoder head), /sleep, /wake_up and /is_sleeping (no sleep mode; weights
+ * are placed once, spec §5), the LoRA endpoints (no LoRA), /invocations (a SageMaker envelope),
+ * stored Responses-API responses (would need a conversation store), and llama-server's /slots.
  */
 #include "server.h"
 
@@ -28,18 +23,12 @@ namespace server {
 
 namespace {
 
-/* The body every "how loaded is this server" answer shares. /health and /ping are the same
- * question asked by a load balancer and by a human, and vLLM answers both, so both exist here and
- * neither is a redirect to the other -- a probe that follows a redirect is a probe that reports
- * the redirect's latency. */
-/* `queue_cap` AND NOT `queue_depth`. The value is the CEILING -- `opt_.queue_depth` or
- * max_seqs * 8 -- and it never changes while the server runs. Spelling it "queue_depth" would
- * collide head-on with `radiance:http_queue_depth`, which is the OCCUPANCY ("admitted by the HTTP
- * layer and not yet finished"): one name for two opposite quantities on the same server, so a
- * dashboard graphing both plots a flat ceiling beside a number that moves and calls them the same
- * thing. `queue_depth` therefore means occupancy everywhere it appears, and the occupancy is
- * carried here too under its own names -- `in_flight` on /health and /server_info, `server_load`
- * on /load. */
+/* The body /health and /ping share. vLLM answers both, and neither redirects to the other, so a
+ * probe never measures a redirect.
+ *
+ * `queue_cap` is the admission ceiling (`opt_.queue_depth` or max_seqs * 8), fixed while the
+ * server runs. It is not called `queue_depth` because `radiance:http_queue_depth` is the occupancy;
+ * the occupancy appears here as `in_flight` (and as `server_load` on /load). */
 json health_body(const std::string& model, bool stopping, int64_t in_flight, int64_t depth) {
     json o;
     o["status"]      = stopping ? "stopping" : "ok";
@@ -49,35 +38,15 @@ json health_body(const std::string& model, bool stopping, int64_t in_flight, int
     return o;
 }
 
-/* nlohmann parses "3" and "[1,2]" happily, and both are the wrong shape for every endpoint here.
- * Checking is_object() at the door means each handler's field reads can be plain rather than each
- * one re-deciding what a non-object body means. Bounded like the generation endpoints' bodies
- * (parse_json_bounded): /detokenize takes a token array, which is the body that grows most. */
-bool parse_object(const std::string& body, int64_t max_ctx, json* out, ApiError* err) {
-    *out = json::object();
-    if (body.empty()) return true;              /* {} -- every field takes its default */
-    bool over = false, deep = false;
-    json j = parse_json_bounded(body, max_ctx, &over, &deep);
-    if (deep) {
-        *err = err_bad("body", "the request body nests more than " +
-                                   std::to_string(kJsonMaxDepth) + " levels deep");
-        return false;
+/* Parses a body that must be a JSON object (an empty body is {}, so every field takes its
+ * default). Bounded like a generation body (parse_request_object), since /detokenize takes a
+ * token array of any length. */
+bool parse_object(const std::string& body, const OaiLimits& lim, json* out, ApiError* err) {
+    if (body.empty()) {
+        *out = json::object();
+        return true;
     }
-    if (over) {
-        *err = err_bad("body", "the request body holds more than " +
-                                   std::to_string(json_value_budget(max_ctx)) + " JSON values");
-        return false;
-    }
-    if (j.is_discarded()) {
-        *err = err_bad("body", "the request body is not valid JSON");
-        return false;
-    }
-    if (!j.is_object()) {
-        *err = err_bad("body", "the request body must be a JSON object");
-        return false;
-    }
-    *out = std::move(j);
-    return true;
+    return parse_request_object(body, lim, out, err) == RAD_OK;
 }
 
 bool get_bool_or(const json& b, const char* key, bool def) {
@@ -88,10 +57,8 @@ bool get_bool_or(const json& b, const char* key, bool def) {
 }  /* namespace */
 
 /* ================================================================== /version */
-/* vLLM answers {"version": "..."} and a client that checks compatibility reads exactly that key,
- * so it keeps the name and the shape. The rest is what this engine is, and it is here rather than
- * in /server_info because a client deciding whether to talk to us at all should not have to ask
- * for the whole configuration to find out which ABI the kernels were built against. */
+/* vLLM's {"version": "..."}, which compatibility checks read, plus the engine name and kernel ABI
+ * version so a client need not fetch the whole /server_info for them. */
 HttpResponse Server::handle_version(const HttpRequest&) {
     json o;
     o["version"]     = opt_.version;
@@ -102,10 +69,8 @@ HttpResponse Server::handle_version(const HttpRequest&) {
 }
 
 /* ================================================================== /load */
-/* vLLM's key is `server_load` and it means requests admitted and not yet finished -- which is
- * this server's `in_flight`, the same number admission control refuses on. `queue_cap` comes
- * along because a load figure without its ceiling cannot answer the question a load balancer is
- * actually asking, which is "how much room is left". */
+/* vLLM's `server_load`: requests admitted and not yet finished, i.e. `in_flight`, which admission
+ * control refuses on. `queue_cap` is included so a load balancer can tell how much room is left. */
 HttpResponse Server::handle_load(const HttpRequest&) {
     json o;
     o["server_load"] = in_flight_.load(std::memory_order_relaxed);
@@ -120,18 +85,13 @@ HttpResponse Server::handle_load(const HttpRequest&) {
 }
 
 /* ================================================================== /tokenize */
-/* Two request shapes under one path, exactly as vLLM has it: `prompt` is the completion form and
- * `messages` is the chat form, which renders the template first and tokenises what it produced.
+/* vLLM's two request shapes: `prompt` (completion form) and `messages` (chat form, rendered
+ * through the template, then tokenised), plus llama-server's `content`.
  *
- * `add_special_tokens` DEFAULTS DIFFERENTLY BETWEEN THEM, and that is not an inconsistency to
- * tidy away: a raw prompt wants BOS prepended because nothing else will, while a rendered chat
- * template already contains whatever opening the model expects, and adding another is a prompt
- * with two beginnings. vLLM's defaults are true and false respectively for that reason.
- *
- * PARSE_SPECIAL IS NOT THE CALLER'S CHOICE. The chat form tokenises a string this server rendered
- * and its control tokens must be recognised as themselves; the completion form tokenises text the
- * caller sent, where they must NOT be, or a caller who writes "<|im_start|>system" into `prompt`
- * finds out what this endpoint's token ids do to a subsequent /v1/completions. */
+ * `add_special_tokens` defaults to true for `prompt` and false for `messages`, as in vLLM: a raw
+ * prompt needs BOS prepended, while a rendered template already contains the model's opening.
+ * `parse_special` is not the caller's choice: each form tokenises exactly as /v1/completions or
+ * /v1/chat/completions would, so the count matches what that endpoint sees. */
 HttpResponse Server::handle_tokenize(const HttpRequest& req) {
     if (!deps_.tok)
         return error_response(err_not_implemented("the server has no tokenizer attached"),
@@ -139,7 +99,7 @@ HttpResponse Server::handle_tokenize(const HttpRequest& req) {
 
     json b;
     ApiError err;
-    if (!parse_object(req.body, opt_.max_ctx, &b, &err)) return error_response(err, req.peer);
+    if (!parse_object(req.body, lim_, &b, &err)) return error_response(err, req.peer);
 
     const bool want_strs = get_bool_or(b, "return_token_strs", false);
     std::vector<int32_t> toks;
@@ -151,11 +111,9 @@ HttpResponse Server::handle_tokenize(const HttpRequest& req) {
         return error_response(err_bad("prompt", "send one of `prompt`, `messages` or `content`"),
                               req.peer);
 
-    /* THE THIRD SHAPE IS llama-server's: `content` -- a string, or strings and token ids mixed,
-     * as its /completion takes a prompt -- with its own two flags and its own defaults (no BOS,
-     * control tokens recognised), answered under its own key, `tokens`, as ids or with
-     * `with_pieces` as {id, piece} objects. A piece that is not whole UTF-8 is its bytes, as
-     * llama-server sends it. */
+    /* llama-server's shape: `content` is a string, or strings and token ids mixed (as its
+     * /completion prompt), with its own flags and defaults (no BOS, control tokens recognised).
+     * Answered as `tokens`: ids, or with `with_pieces` {id, piece} objects. */
     if (cont != b.end()) {
         const bool add_special   = get_bool_or(b, "add_special", false);
         const bool parse_special = get_bool_or(b, "parse_special", true);
@@ -256,8 +214,8 @@ HttpResponse Server::handle_tokenize(const HttpRequest& req) {
 }
 
 /* ================================================================== /detokenize */
-/* vLLM's response key is `prompt` -- not `text` -- because the endpoint's purpose is to show what
- * a token array would arrive as. The name is odd and it is the name clients read. */
+/* vLLM's response key is `prompt`, not `text` (the text a token array would arrive as); clients
+ * read that name. */
 HttpResponse Server::handle_detokenize(const HttpRequest& req) {
     if (!deps_.tok)
         return error_response(err_not_implemented("the server has no tokenizer attached"),
@@ -265,7 +223,7 @@ HttpResponse Server::handle_detokenize(const HttpRequest& req) {
 
     json b;
     ApiError err;
-    if (!parse_object(req.body, opt_.max_ctx, &b, &err)) return error_response(err, req.peer);
+    if (!parse_object(req.body, lim_, &b, &err)) return error_response(err, req.peer);
 
     auto t = b.find("tokens");
     if (t == b.end() || !t->is_array())
@@ -292,19 +250,17 @@ HttpResponse Server::handle_detokenize(const HttpRequest& req) {
 }
 
 /* ================================================================== /props */
-/* llama-server's /props, for the clients built against it: a front-end that sizes its context
- * from default_generation_settings.n_ctx, shows an image button when modalities.vision is set,
- * and reads what a request that sends no sampler fields inherits. /server_info says all of it and
- * more, but nothing written for llama-server knows to ask there.
+/* llama-server's /props, for clients built against it: front-ends size their context from
+ * default_generation_settings.n_ctx, show an image button for modalities.vision, and read the
+ * default sampler settings. /server_info has all of it, but llama-server clients do not ask there.
  *
  * Only what this server can fill honestly, under llama-server's names: no GGUF metadata, no
- * per-slot state. n_ctx is the context ONE request may use, which is what llama-server's per-slot
- * n_ctx means to the clients reading it; left out when the server does not know its length. */
+ * per-slot state. n_ctx is the context one request may use (llama-server's per-slot n_ctx);
+ * omitted when the context length is unknown. */
 HttpResponse Server::handle_props(const HttpRequest&) {
     const SamplingParams& sp = opt_.default_sampling;
-    /* EVERY FIELD llama-server's `params` CARRIES, so a client that reads one does not find it
-     * missing. The samplers this server does not run are reported at their off values -- which
-     * is what it serves -- and `samplers` is its own order, temperature first. */
+    /* Every field llama-server's `params` carries, so no client finds one missing. Samplers this
+     * server does not run are reported at their off values, which is what it serves. */
     const int64_t n_predict = opt_.default_max_tokens > 0 ? opt_.default_max_tokens : -1;
     json params;
     params["n_predict"]           = n_predict;
@@ -329,9 +285,8 @@ HttpResponse Server::handle_props(const HttpRequest&) {
     params["dry_base"]            = sp.dry_base;
     params["dry_allowed_length"]  = sp.dry_allowed_length;
     params["dry_penalty_last_n"]  = sp.dry_penalty_last_n;
-    params["dry_sequence_breakers"] = sp.dry_seq_breakers.empty() && !opt_.default_dry_breakers_set
-                                    ? std::vector<std::string>{ "\n", ":", "\"", "*" }
-                                    : sp.dry_seq_breakers;
+    params["dry_sequence_breakers"] = dry_breakers(sp.dry_seq_breakers,
+                                                   opt_.default_dry_breakers_set);
     params["mirostat"]            = 0;
     params["mirostat_tau"]        = 5.0;
     params["mirostat_eta"]        = 0.1;
@@ -395,10 +350,9 @@ HttpResponse Server::handle_props(const HttpRequest&) {
 }
 
 /* ================================================================== /get_tokenizer_info */
-/* vLLM returns the HuggingFace tokenizer config verbatim, which this engine does not have: a .rad
- * container carries a normalised vocabulary and not the JSON it was built from. So this answers
- * the questions that config is actually READ for -- how big is the vocabulary, which ids end a
- * generation, is a chat template available -- and says nothing it would have to invent. */
+/* vLLM returns the HuggingFace tokenizer config verbatim, which a .rad container does not carry
+ * (it holds a normalised vocabulary). This answers what that config is read for: vocabulary size,
+ * the special ids, and whether a chat template is available. */
 HttpResponse Server::handle_tokenizer_info(const HttpRequest& req) {
     if (!deps_.tok)
         return error_response(err_not_implemented("the server has no tokenizer attached"),
@@ -429,8 +383,8 @@ json Server::capabilities() const {
     caps["chat"]      = deps_.chat != nullptr;
     caps["tools"]     = deps_.chat && deps_.chat->supports_tools();
     caps["reasoning"] = deps_.chat && deps_.chat->supports_reasoning();
-    /* An image model reads pictures for its edits and nothing else, and writes no text a grammar
-     * could constrain -- whatever its conditioning network's processor would take. */
+    /* An image model reads pictures only for edits and writes no text a grammar could constrain,
+     * whatever its conditioning network's processor would take. */
     const bool img = opt_.image_model;
     caps["grammar"]   = !img && deps_.grammar != nullptr;
     caps["embedding"] = deps_.embed != nullptr;
@@ -440,8 +394,8 @@ json Server::capabilities() const {
     caps["logprobs"]  = opt_.supports_logprobs;
     caps["image_generation"] = deps_.images != nullptr;
     caps["image_edit"]       = deps_.images != nullptr && deps_.images->info().max_refs > 0;
-    /* THE EFFORTS A CHAT REQUEST MAY SEND, as probed from the template at startup: null when it
-     * takes any word. "none" and "minimal" are this server's, and turn thinking off. */
+    /* The efforts a chat request may send, probed from the template at startup; null when it
+     * takes any word. "none" and "minimal" are this server's and turn thinking off. */
     if (lim_.reasoning_efforts.empty()) {
         caps["reasoning_efforts"] = nullptr;
     } else {
@@ -453,14 +407,10 @@ json Server::capabilities() const {
 }
 
 /* ================================================================== /server_info */
-/* vLLM returns the repr() of its config object, which is a Python string a client can only print.
- * This returns the same information as JSON, in two halves: what the SERVER decided, which is
- * this component's own state, and what the ENGINE decided, which arrives pre-rendered because the
- * server knows nothing about devices, containers or placement (ServerOptions::engine_info).
- *
- * `endpoints` is the router's own table rather than a list kept beside it. A hand-written list is
- * a list that goes stale the first time somebody adds a route, and this endpoint exists precisely
- * so that a client does not have to guess what is served. */
+/* vLLM returns the repr() of its config; this returns the information as JSON: the server's own
+ * state, plus the engine's, pre-rendered because the server knows nothing about devices,
+ * containers or placement (ServerOptions::engine_info). `endpoints` is the router's own table, so
+ * it cannot go stale. */
 HttpResponse Server::handle_server_info(const HttpRequest&) {
     json srv;
     srv["model"]              = opt_.model_id;
@@ -480,8 +430,7 @@ HttpResponse Server::handle_server_info(const HttpRequest&) {
 
     json caps = capabilities();
 
-    /* WHAT A REQUEST THAT LEAVES A FIELD OUT GETS, under the request's own spelling of each
-     * field, so a client can read off exactly what leaving one out means on this deployment. */
+    /* What a request that omits a field gets, under the request's own field names. */
     const SamplingParams& sp = opt_.default_sampling;
     json defs;
     defs["temperature"]        = sp.temp;
@@ -497,9 +446,8 @@ HttpResponse Server::handle_server_info(const HttpRequest&) {
     defs["dry_base"]           = sp.dry_base;
     defs["dry_allowed_length"] = sp.dry_allowed_length;
     defs["dry_penalty_last_n"] = sp.dry_penalty_last_n;
-    defs["dry_sequence_breakers"] = opt_.default_dry_breakers_set
-                                        ? json(sp.dry_seq_breakers)
-                                        : json(std::vector<std::string>{ "\n", ":", "\"", "*" });
+    defs["dry_sequence_breakers"] = dry_breakers(sp.dry_seq_breakers,
+                                                 opt_.default_dry_breakers_set);
     defs["xtc_probability"]    = sp.xtc_probability;
     defs["xtc_threshold"]      = sp.xtc_threshold;
     defs["max_tokens"]         = srv["default_max_tokens"];
@@ -524,10 +472,8 @@ HttpResponse Server::handle_server_info(const HttpRequest&) {
     o["capabilities"]     = std::move(caps);
     o["endpoints"]    = router_.routes();
 
-    /* Spliced rather than re-parsed field by field: the engine owns what it says about itself and
-     * this component is a pipe for it. A blob that is not an object is dropped with a warning
-     * instead of corrupting the response -- an unparseable /server_info is worse than one that is
-     * missing a section. */
+    /* Spliced in whole; the engine owns its contents. A blob that is not a JSON object is dropped
+     * with a warning rather than corrupting the response. */
     if (!opt_.engine_info.empty()) {
         json e = json::parse(opt_.engine_info, nullptr, false);
         if (e.is_discarded() || !e.is_object())
@@ -540,13 +486,10 @@ HttpResponse Server::handle_server_info(const HttpRequest&) {
 }
 
 /* ================================================================== /diagnostics */
-/* The startup report, read again for this request (ServerOptions::diagnostics_json). Behind the
- * bearer key like /server_info: it names the machine's devices and boot parameters.
- *
- * AND WITHOUT A KEY, ONLY TO THIS MACHINE. /server_info without a key describes the model a
- * client is already talking to; this describes the host -- its kernel, its boot parameters, its
- * PCI layout, its memory limits -- which a server bound to 0.0.0.0 with no key would otherwise
- * hand to anyone who can reach the port. A key is the operator's statement of who may ask. */
+/* The startup report, regenerated per request (ServerOptions::diagnostics_json), behind the API
+ * key like /server_info. Without a key it is served to loopback clients only: it describes the
+ * host (kernel, boot parameters, PCI layout, memory limits), which a keyless server bound to
+ * 0.0.0.0 would otherwise hand to anyone who can reach the port. */
 HttpResponse Server::handle_diagnostics(const HttpRequest& req) {
     if (!opt_.diagnostics_json)
         return error_response(err_not_implemented(
@@ -556,9 +499,8 @@ HttpResponse Server::handle_diagnostics(const HttpRequest& req) {
         ApiError e;
         e.status = 403;
         e.type = "permission_error";
-        e.message = "/diagnostics describes this machine, and a server started without --api-key "
-                    "answers it only to a client on the same machine (a loopback address); start "
-                    "it with --api-key to read it from elsewhere";
+        e.message = "without --api-key, /diagnostics answers only loopback clients; start the "
+                    "server with --api-key to read it from elsewhere";
         return error_response(e, req.peer);
     }
     metrics_.observe_http(200);
@@ -566,9 +508,8 @@ HttpResponse Server::handle_diagnostics(const HttpRequest& req) {
 }
 
 /* ================================================================== /reset_prefix_cache */
-/* 501 when there is no prefix cache to reset, and that is the point: vLLM answers 200 with an
- * empty body whether or not anything happened, so a benchmark that thinks it started cold has no
- * way to find out it did not. This says how many entries went. */
+/* 501 when there is no prefix cache to reset (vLLM answers 200 regardless, so a benchmark cannot
+ * tell whether it started cold). Reports how many entries were dropped. */
 HttpResponse Server::handle_reset_prefix_cache(const HttpRequest& req) {
     if (!deps_.sched)
         return error_response(err_not_implemented("the server has no engine attached"), req.peer);
@@ -586,9 +527,8 @@ HttpResponse Server::handle_reset_prefix_cache(const HttpRequest& req) {
 }
 
 /* ================================================================== /health, /ping */
-/* NOT counted in the HTTP status metrics, and neither is /metrics. A load balancer probing every
- * second would otherwise dominate `request_success_total` and make the 2xx/5xx ratio a statement
- * about the probe rather than about the service. */
+/* Not counted in the HTTP status metrics (nor is /metrics): a load balancer probing every second
+ * would dominate the 2xx/5xx ratio. */
 HttpResponse Server::handle_health(const HttpRequest& req) { return handle_ping(req); }
 
 HttpResponse Server::handle_ping(const HttpRequest&) {

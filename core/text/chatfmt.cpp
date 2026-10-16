@@ -3,8 +3,8 @@
 
 #include "rad_builder.h"
 
-/* The analyser and the grammar builder, at load and admission time only -- never while a reply
- * is being read. */
+/* The analyser and grammar builder, used at load and admission only, never while reading a
+ * reply. */
 #include "llama/common/chat.h"
 #include "llama/common/chat-auto-parser.h"
 #include "llama/common/json-schema-to-grammar.h"
@@ -44,6 +44,12 @@ bool starts_with(const std::string& s, const std::string& p) {
     return s.size() >= p.size() && s.compare(0, p.size(), p) == 0;
 }
 
+/* Two delimiters an automaton scanning for both cannot report in start order: one begins or
+ * occurs inside the other. */
+bool confusable(const std::string& a, const std::string& b) {
+    return starts_with(a, b) || starts_with(b, a) || occurs_inside(a, b) || occurs_inside(b, a);
+}
+
 std::string show(const std::string& s) { return nlohmann::json(s).dump(); }
 
 int refuse(std::string* why, const std::string& s) {
@@ -56,11 +62,11 @@ bool object_byte(unsigned char c) {
     return c == 0 || std::isalnum(c) || is_ws(c) || std::strchr("-+._'\"{}[],:", (int)c) != nullptr;
 }
 
-/* An argument object, as the streaming parser reads it (chatparse.cpp). Where a key or a value
- * may begin, it tells three literals apart by their first bytes: a dialect string's opener, and
- * the call's close and end, which a reply that leaves its object unclosed writes there. None may
- * begin another. A bare word ends at the object's punctuation or at the call's close; one
- * automaton finds both in the order they start only when the close holds none of it. */
+/* Checks an argument object against how chatparse.cpp reads it. Where a key or value may begin,
+ * the parser tells three literals apart by their first bytes: the dialect's string opener, and
+ * the call's close and end (a reply that leaves its object unclosed writes them there). None may
+ * begin another. A bare word ends at the object's punctuation or the call's close; one automaton
+ * reports both in start order only if the close contains no punctuation. */
 int object_check(const ChatFormat& f, std::string* why) {
     const std::string& so = f.object_string_open;
     const std::string& sc = f.object_string_close;
@@ -90,16 +96,15 @@ int object_check(const ChatFormat& f, std::string* why) {
             return refuse(why, show(*s) + " both opens an object string and closes the call");
     }
     for (size_t i = 0; i < lits.size(); ++i)
-        for (size_t j = 0; j < lits.size(); ++j)
-            if (i != j && (starts_with(lits[i], lits[j]) || occurs_inside(lits[j], lits[i])))
-                return refuse(why, show(lits[j]) + " and " + show(lits[i]) + " cannot be told "
+        for (size_t j = i + 1; j < lits.size(); ++j)
+            if (confusable(lits[i], lits[j]))
+                return refuse(why, show(lits[i]) + " and " + show(lits[j]) + " cannot be told "
                                    "apart inside an argument object");
     return RAD_OK;
 }
 
-/* Content is scanned for a later reasoning block's opener and for a stray close beside the call
- * openers, in one automaton, which reports them in the order they start only when none occurs
- * inside another or begins it. */
+/* Content is scanned for a later reasoning opener, a stray close and the call openers in one
+ * automaton, which reports them in start order only if none begins or occurs inside another. */
 int reasoning_anywhere_check(const ChatFormat& f, std::string* why) {
     if (!f.reasoning_anywhere) return RAD_OK;
     std::vector<std::string> d = { trim_ws(f.reasoning_open), trim_ws(f.reasoning_close) };
@@ -108,9 +113,9 @@ int reasoning_anywhere_check(const ChatFormat& f, std::string* why) {
         d.push_back(f.name_prefix);
     }
     for (size_t i = 0; i < d.size(); ++i)
-        for (size_t j = 0; j < d.size(); ++j)
-            if (i != j && (starts_with(d[i], d[j]) || occurs_inside(d[j], d[i])))
-                return refuse(why, show(d[j]) + " and " + show(d[i]) + " cannot be told apart in "
+        for (size_t j = i + 1; j < d.size(); ++j)
+            if (confusable(d[i], d[j]))
+                return refuse(why, show(d[i]) + " and " + show(d[j]) + " cannot be told apart in "
                                    "content, which a reasoning block may open anywhere in");
     return RAD_OK;
 }
@@ -120,10 +125,7 @@ int reasoning_anywhere_check(const ChatFormat& f, std::string* why) {
 /* ================================================================== validity */
 
 int chat_format_check(const ChatFormat& f, std::string* why) {
-    auto no = [&](const std::string& s) {
-        if (why) *why = s;
-        return RAD_E_UNSUPPORTED;
-    };
+    auto no = [why](const std::string& s) { return refuse(why, s); };
 
     if (!f.reasoning_open.empty() && f.reasoning_close.empty())
         return no("reasoning_open " + show(f.reasoning_open) + " has no reasoning_close");
@@ -202,8 +204,7 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
     if (!f.call_open.empty()) {
         const std::string co = trim_ws(f.call_open);
         if (co.empty()) return no("call_open is only whitespace");
-        if (starts_with(co, f.name_prefix) || starts_with(f.name_prefix, co) ||
-            occurs_inside(co, f.name_prefix) || occurs_inside(f.name_prefix, co))
+        if (confusable(co, f.name_prefix))
             return no("call_open " + show(f.call_open) + " and name_prefix " +
                       show(f.name_prefix) + " cannot be told apart");
     }
@@ -216,25 +217,22 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
     for (const std::string& t : f.triggers)
         if (t.empty()) return no("an empty grammar trigger");
 
-    /* The delimiter sets scanned together must be read in the order they START, which an
-     * automaton reports correctly only when no delimiter occurs inside another. */
+    /* Delimiters scanned together must be reported in start order, which an automaton does only
+     * when no delimiter occurs inside another. */
     if (f.has_reasoning()) {
         const std::string close = trim_ws(f.reasoning_close);
         for (const std::string& b : f.reasoning_breaks)
-            if (occurs_inside(close, b) || occurs_inside(b, close) || starts_with(b, close) ||
-                starts_with(close, b))
+            if (confusable(close, b))
                 return no("reasoning break " + show(b) + " overlaps reasoning_close " +
                           show(close));
     }
     if (!object) {
-        /* Inside a call the next tag is an argument or the close, and the close is recognised by
-         * its core as well: the whitespace around it is optional when a reply leaves the
-         * format. */
+        /* Inside a call the next tag is an argument or the close. The close also matches by its
+         * trimmed core, since a reply that strays from the format may drop its whitespace. */
         const std::string end = trim_ws(f.call_end);
         if (end.empty()) return no("call_end is only whitespace");
         for (const std::string* e : { &f.call_end, &end })
-            if (starts_with(f.arg_prefix, *e) || starts_with(*e, f.arg_prefix) ||
-                occurs_inside(f.arg_prefix, *e) || occurs_inside(*e, f.arg_prefix))
+            if (confusable(f.arg_prefix, *e))
                 return no("arg_prefix " + show(f.arg_prefix) + " and call_end " +
                           show(f.call_end) + " cannot be told apart");
     }
@@ -299,9 +297,9 @@ int chat_format_from_abi(const RadChatFormat* in, ChatFormat* out, std::string* 
 int chat_format_from_template(const std::string& jinja, const std::string& bos,
                               const std::string& eos, ChatFormat* out,
                               std::string* tools_refused, std::string* why) {
-    std::string dummy;
-    if (!tools_refused) tools_refused = &dummy;
-    if (!why) why = &dummy;
+    std::string refused_unused, why_unused;
+    if (!tools_refused) tools_refused = &refused_unused;
+    if (!why) why = &why_unused;
     tools_refused->clear();
     const std::string src = jinja.empty() ? std::string(ChatTemplate::chatml_source()) : jinja;
 
@@ -367,10 +365,9 @@ int chat_format_from_template(const std::string& jinja, const std::string& bos,
             c.string_value     = ChatValue::Cdata;
             c.other_value      = ChatValue::Json;
             c.value_newlines   = true;
-            /* What opens a call is what both the lazy grammar waits for and what ends an
-             * unclosed reasoning block -- the section or per-call opener. A format with neither
-             * gets no grammar and no break: its calls open with the function name prefix, which
-             * a model also writes in prose. */
+            /* The section or per-call opener both triggers the lazy grammar and ends an
+             * unclosed reasoning block. A format with neither gets no grammar and no break,
+             * since its calls open with the name prefix, which a model also writes in prose. */
             const std::string& marker = !t.format.section_start.empty() ? t.format.section_start
                                                                          : t.format.per_call_start;
             if (!marker.empty()) {
@@ -437,11 +434,10 @@ std::vector<std::string> chat_format_markers(const ChatFormat& f) {
 
 /* ================================================================== grammar
  *
- * The grammar is built as an expression tree and rendered by the rules the vendored PEG-to-GBNF
- * pass uses, so a format derived from a template yields the same text the vendored generator
- * produces for it: sequences and alternations are flattened as they are built, a sequence or
- * alternation nested in a sequence is parenthesised, only an alternation nested in an
- * alternation is, and a repeated sequence or alternation is. */
+ * The grammar is an expression tree rendered by the vendored PEG-to-GBNF rules, so a
+ * template-derived format yields the same text as the vendored generator. Sequences and
+ * alternations flatten as they are built. Parentheses go around a sequence or alternation inside
+ * a sequence, an alternation inside an alternation, and a repeated sequence or alternation. */
 namespace {
 
 struct G {
@@ -449,7 +445,6 @@ struct G {
     std::string s;               /* Lit: the text; Leaf: rendered GBNF */
     std::vector<G> kids;
     int min = 0, max = -1;
-    bool compound = false;       /* Leaf/Wrap: renders like a sequence for parenthesising */
 };
 
 G eps() { return G{}; }
@@ -458,26 +453,21 @@ G leaf(const std::string& s) { G g; g.k = G::Leaf; g.s = s; return g; }
 G space() { return leaf("space"); }
 G rule_ref(const std::string& name) { return leaf(name); }
 
-/* A tag or an atomic around a node: it renders as the node, is parenthesised as the node would
- * be, but a sequence built around it does not flatten into it. */
+/* A tag or atomic around a node: renders and parenthesises as the node, but an enclosing
+ * sequence does not flatten into it. */
 G wrap(G inner) { G g; g.k = G::Wrap; g.kids.push_back(std::move(inner)); return g; }
 
-G seq(std::vector<G> parts) {
-    G g; g.k = G::Seq;
+/* A sequence or alternation of `parts`, a part of the same kind spliced in flat. */
+G flat(G::K k, std::vector<G> parts) {
+    G g; g.k = k;
     for (G& p : parts) {
-        if (p.k == G::Seq) for (G& c : p.kids) g.kids.push_back(std::move(c));
+        if (p.k == k) for (G& c : p.kids) g.kids.push_back(std::move(c));
         else g.kids.push_back(std::move(p));
     }
     return g;
 }
-G alt(std::vector<G> parts) {
-    G g; g.k = G::Alt;
-    for (G& p : parts) {
-        if (p.k == G::Alt) for (G& c : p.kids) g.kids.push_back(std::move(c));
-        else g.kids.push_back(std::move(p));
-    }
-    return g;
-}
+G seq(std::vector<G> parts) { return flat(G::Seq, std::move(parts)); }
+G alt(std::vector<G> parts) { return flat(G::Alt, std::move(parts)); }
 G rep(G child, int min, int max) {
     G g; g.k = G::Rep; g.min = min; g.max = max; g.kids.push_back(std::move(child)); return g;
 }
@@ -542,10 +532,9 @@ std::string class_char(uint32_t c) {
     if (c == '\r') return "\\r";
     if (c >= 0x20 && c <= 0x7E) return std::string(1, (char)c);
     static const char* hex = "0123456789ABCDEF";
-    std::string s;
-    if (c <= 0xFF) { s = "\\x"; for (int i = 1; i >= 0; --i) s += hex[(c >> (4 * i)) & 15]; }
-    else if (c <= 0xFFFF) { s = "\\u"; for (int i = 3; i >= 0; --i) s += hex[(c >> (4 * i)) & 15]; }
-    else { s = "\\U"; for (int i = 7; i >= 0; --i) s += hex[(c >> (4 * i)) & 15]; }
+    const int digits = c <= 0xFF ? 2 : c <= 0xFFFF ? 4 : 8;
+    std::string s = digits == 2 ? "\\x" : digits == 4 ? "\\u" : "\\U";
+    for (int i = digits - 1; i >= 0; --i) s += hex[(c >> (4 * i)) & 15];
     return s;
 }
 
@@ -636,10 +625,9 @@ std::string until_pattern(const std::vector<std::string>& delims) {
     return "(" + pattern + ")*";
 }
 
-/* The rules the vendored generator emits for its generic JSON parser whenever an argument or a
- * document is typed by a schema. Nothing references them -- the schema's own rules do the
- * constraining -- but the vendored grammar carries them, and so does this one, so the two can be
- * compared byte for byte. */
+/* The generic JSON rules the vendored generator emits whenever a schema types an argument or
+ * document. Nothing references them (the schema's own rules constrain), but they are emitted so
+ * the output compares byte for byte with the vendored grammar. */
 void add_json_rules(const common_grammar_builder& b) {
     b.add_rule("json-array", "\"[\" space (\"]\" | json-value (\",\" space json-value)* space "
                              "\"]\") space");
@@ -656,12 +644,10 @@ void add_json_rules(const common_grammar_builder& b) {
                              "json-null");
 }
 
-/* THE ARGUMENT OBJECT of the object family, in its dialect: JSON, or strings between the
- * declared delimiters and keys written bare. As llama.cpp's own Gemma 4 grammar does, it fixes
- * the syntax and leaves the values to the model: a tool's schema says what JSON a value must be,
- * and the dialect is not JSON, so the schema converter has nothing to say about it. Whitespace
- * goes where the dialect's writers put it -- after a separator and inside the brackets -- and
- * nowhere else. */
+/* The object family's argument object in its dialect: JSON, or strings between the declared
+ * delimiters and bare keys. Like llama.cpp's Gemma 4 grammar, it fixes the syntax and leaves
+ * values unconstrained, since a tool's schema describes JSON and the dialect is not JSON.
+ * Whitespace is allowed only after a separator and inside the brackets. */
 void add_object_rules(const common_grammar_builder& b, const ChatFormat& f) {
     const std::string& so = f.object_string_open;
     if (!so.empty())
@@ -672,10 +658,10 @@ void add_object_rules(const common_grammar_builder& b, const ChatFormat& f) {
         b.add_rule("obj-string", "\"\\\"\" ( [^\"\\\\] | \"\\\\\" ( [\"\\\\/ bfnrt] | \"u\" "
                                  "[0-9a-fA-F]{4} ) )* \"\\\"\"");
     b.add_rule("obj-number", "\"-\"? (\"0\" | [1-9] [0-9]*) (\".\" [0-9]+)? ([eE] [+-]? [0-9]+)?");
-    /* A dialect with strings of its own still gets a value in Python's quotes, `'...'`, which
-     * is how Gemma 4 writes arguments it was handed as JSON (measured). Refused, the model
-     * takes the next token the grammar allows -- a `-` -- and every such string becomes a
-     * number; the parser reads the quoted text verbatim but for an escaped quote. */
+    /* A dialect with its own strings also admits Python-quoted `'...'` values, which Gemma 4
+     * writes for arguments it was given as JSON. Without this the model takes the next allowed
+     * token, `-`, and the string becomes a number. The parser reads the quoted text verbatim
+     * except for an escaped quote. */
     const char* sq = so.empty() ? "" : " | obj-sqstring";
     if (!so.empty()) b.add_rule("obj-sqstring", "\"'\" ( [^'\\\\] | \"\\\\\" [^\\x00] )* \"'\"");
     b.add_rule("obj-value", std::string("obj-object | obj-array | obj-string") + sq +
@@ -728,6 +714,11 @@ G reasoning_expr(const ChatFormat& f, const std::vector<std::string>& breaks) {
 
 }  /* namespace */
 
+bool chat_function_tool(const ojson& tool) {
+    return tool.is_object() && tool.contains("type") && tool.at("type") == "function" &&
+           tool.contains("function");
+}
+
 int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, ChatGrammar* out,
                         std::string* why) {
     *out = ChatGrammar{};
@@ -751,9 +742,7 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
     try {
         out->text = build_grammar([&](const common_grammar_builder& b) {
             for (const auto& tool : tools) {
-                if (!tool.is_object() || !tool.contains("type") || tool.at("type") != "function" ||
-                    !tool.contains("function"))
-                    continue;
+                if (!chat_function_tool(tool)) continue;
                 const auto& fn = tool.at("function");
                 auto schema = fn.contains("parameters") ? fn.at("parameters") : ojson::object();
                 b.resolve_refs(schema);
@@ -796,9 +785,7 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
             std::vector<G> choices;
             bool typed = false;
             for (const auto& tool : tools) {
-                if (!tool.is_object() || !tool.contains("type") || tool.at("type") != "function" ||
-                    !tool.contains("function"))
-                    continue;
+                if (!chat_function_tool(tool)) continue;
                 const auto& fn = tool.at("function");
                 const std::string name = fn.at("name");
                 if (!req.only_tool.empty() && name != req.only_tool) continue;
@@ -824,11 +811,11 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
 
                 std::vector<G> req_arms, opt_arms;
                 for (const auto& [pname, pschema] : properties.items()) {
-                    /* An optional argument no value satisfies -- `false`, or the `not` of a schema
-                     * every value satisfies, an Arktype or TypeBox `never` -- is one no call
-                     * writes, so it gets no arm; a model that writes it anyway reaches the
-                     * undeclared arm below. The template path does the same (vendor/patches/0012,
-                     * 0014); required, it goes through the schema and is refused there by name. */
+                    /* An optional argument no value satisfies (`false`, or the `not` of an
+                     * always-true schema, e.g. Arktype or TypeBox `never`) gets no arm; a model
+                     * that writes it reaches the undeclared arm. The template path does the same
+                     * (vendor/patches/0012, 0014). A required one goes through the schema and is
+                     * refused there by name. */
                     if (!required.count(pname) && info.unsatisfiable(pschema)) continue;
                     G value;
                     if (f.other_value != ChatValue::Json || info.resolves_to_string(pschema)) {
@@ -849,8 +836,8 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
                 }
                 std::vector<G> any = req_arms;
                 any.insert(any.end(), opt_arms.begin(), opt_arms.end());
-                /* The generic arm for an undeclared name. A tool that declares no parameters
-                 * takes no arguments at all, so its arm is never reached and not emitted. */
+                /* The generic arm for an undeclared name; not emitted for a tool that declares
+                 * no parameters, since it takes no arguments. */
                 if (!any.empty()) {
                     G arm = wrap(seq({ wrap(seq({ lit(f.arg_prefix),
                                                   wrap(leaf(until_pattern({ name_end }))),
@@ -892,8 +879,8 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
             }
             b.add_rule("tool-call", render(calls));
             if (req.require_call) {
-                /* The calls and nothing after them: a complete grammar admits only the end of
-                 * the turn, so the reply stops at the last call's closer. */
+                /* Nothing after the calls: a complete grammar admits only the end of the turn,
+                 * so the reply stops at the last call's closer. */
                 std::vector<G> root = whole_reply();
                 root.push_back(rule_ref("tool-call"));
                 b.add_rule("root", render(seq(std::move(root))));

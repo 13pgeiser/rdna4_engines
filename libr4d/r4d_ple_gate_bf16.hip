@@ -1,45 +1,29 @@
 // r4d_ple_gate_bf16.hip -- Per-Layer Embedding's dot-product gate.
 //
-// ============================== WHAT IT COMPUTES ==============================
-//
 //   K[c] = grouped_rmsnorm(k)[c] * (w_key   + wadd)     k is key_proj(embedding)
-//   Q[c] = grouped_rmsnorm(q)[c] * (w_query + wadd)     q is the INCOMING hc stream
+//   Q[c] = grouped_rmsnorm(q)[c] * (w_query + wadd)     q is the incoming hc stream
 //   s[c] = sum_d K[c][d] * Q[c][d] / sqrt(n)
-//   s[c] = sign(s[c]) * sqrt(max(|s[c]|, gate_eps))     <- the SIGNED square root
-//   gv[c] = sigmoid(s[c]) * v                           v is value_proj(embedding), ONE row
+//   s[c] = sign(s[c]) * sqrt(max(|s[c]|, gate_eps))     <- the signed square root
+//   gv[c] = sigmoid(s[c]) * v                           v is value_proj(embedding), one row
 //   gvn   = grouped_rmsnorm(gv) * (w_conv + wadd)
 //
-// libref/ref_ple.cpp is the oracle and docs/OPS.md the contract. THE SIGN COMES FROM THE ORIGINAL,
-// not from the clamped magnitude: torch's sign(0) is 0, so a dot of exactly zero stays zero instead
-// of becoming sqrt(gate_eps), and a quantised activation row produces exact zeros.
+// libref/ref_ple.cpp is the oracle and docs/OPS.md the contract. The sign comes from the original
+// value, not the clamped magnitude: torch's sign(0) is 0, so an exactly-zero dot (as a quantised
+// activation row produces) stays zero instead of becoming sqrt(gate_eps).
 //
-// ============================== ONE WORKGROUP A (ROW, STREAM) ==============================
+// One workgroup per (row, stream): every reduction (two norms, the dot, the gate's rms) is over
+// one stream's `n`, and a workgroup is the widest unit that reduces without a second launch. At
+// decode that is four workgroups, which is fine: the op moves 107 KB a row and is latency bound
+// well before occupancy matters.
 //
-// Every reduction here is over ONE stream's `n` -- two for the norms, one for the dot, one for the
-// gate's own rms -- and a workgroup is the widest thing that reduces without a second launch. So a
-// workgroup owns one (row, stream) pair and each thread carries n/threads elements of it.
+// Each thread keeps its n/threads elements of k and q in registers across the norm and the dot,
+// and `gv` from its store to its rms, so nothing is read twice. `gv` is narrowed to bf16 before
+// its rms, because the reference norms the bf16 tensor it wrote; keeping the f32 value would give
+// a different number.
 //
-// AT DECODE THAT IS FOUR WORKGROUPS, which is 1.6% of this part, and it is the right shape anyway:
-// the op moves 107 KB a row and is latency-bound long before it is occupancy-bound. Splitting the
-// reduction across workgroups would buy parallelism the launch floor eats.
-//
-// ============================== WHY k AND q LIVE IN REGISTERS ==============================
-//
-// The naive form reads k and q once for the norm and again for the dot. Each thread instead keeps
-// its own n/threads elements across both passes -- 10 values at this model's shape, 20 halves, ten
-// VGPRs -- and the second read disappears. The same trick carries `gv` from where it is written to
-// where its rms is taken.
-//
-// AND THAT IS NOT A SHORTCUT PAST THE NARROWING. `gv` is narrowed to bf16 BEFORE the rms sees it,
-// because the reference writes a bf16 tensor and norms what was written; keeping the narrowed value
-// in a register is the same bits as storing and reading it back. Keeping the f32 accumulator would
-// be a different number -- the epilogue-fold rule the GDN projection states at more length.
-//
-// ============================== AN INVARIANT WORTH KNOWING ==============================
-//
-// gv[c] is a SCALAR times one shared v row, and norm_conv's rms is per stream -- so the gate divides
-// straight back out and `gvn` does not depend on it at all. Exact only in exact arithmetic (gv is
-// narrowed first), so it is a thing to CHECK a fused kernel against, never a thing to fold.
+// Invariant: gv[c] is a scalar times one shared v row and norm_conv's rms is per stream, so the
+// gate cancels out of `gvn`. This holds only in exact arithmetic (gv is narrowed first), so it is a
+// property to check a fused kernel against, never one to fold.
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_common.h"
@@ -50,19 +34,16 @@ namespace {
 
 enum { kPgThreads = 256 };
 
-/* A value narrowed to bf16 and read back, which is what the reference's `.type_as(x)` does after
- * every norm. One definition, used four times below. */
+/* A value narrowed to bf16 and read back, as the reference's `.type_as(x)` after every norm. */
 __device__ __forceinline__ float pg_narrow(float v) {
     return bf16_to_f32(f32_to_bf16(v));
 }
 
-/* expf and NOT __expf. The fast intrinsic is a couple of ULP off, and this gate is compared against
- * libref's std::exp to a tolerance meant for summation order -- one op in one layer of the model is
- * not where to spend accuracy on an instruction. */
+/* expf, not __expf: this gate is compared against libref's std::exp with a tolerance meant for
+ * summation order. */
 __device__ __forceinline__ float pg_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
-/* A workgroup-wide sum through LDS, called four times. The trailing barrier is what lets the same
- * array serve the next reduction without a second allocation. */
+/* A workgroup-wide sum through LDS. The trailing barrier lets the next call reuse the array. */
 __device__ __forceinline__ float pg_reduce(float v, float* lds) {
     const uint32_t t = threadIdx.x;
     lds[t] = v;
@@ -85,8 +66,7 @@ __global__ __launch_bounds__(kPgThreads) void ple_gate_kernel(
     uint32_t g_ld, uint32_t gn_ld, float eps, float wadd, float geps, uint32_t per_thread) {
 
     __shared__ float lds[kPgThreads];
-    /* `gv` is carried from where it is written to where its rms is taken. 16 is the widest this
-     * kernel serves: n <= 16 * kPgThreads = 4096, which the row constrains. */
+    /* At most 16 elements per thread: n <= 16 * kPgThreads = 4096, which the row constrains. */
     float mine_k[16], mine_q[16], mine_gv[16];
 
     const uint32_t row = blockIdx.x / hc;
@@ -120,8 +100,8 @@ __global__ __launch_bounds__(kPgThreads) void ple_gate_kernel(
     }
     float s = pg_reduce(dot, lds) * rsqrtf((float)n);
 
-    /* THE SIGNED SQUARE ROOT, in the reference's order: clamp the MAGNITUDE, take the root, and
-     * take the SIGN FROM THE ORIGINAL. sign(0) is 0, so an exactly-zero dot stays zero. */
+    /* The signed square root in the reference's order: clamp the magnitude, take the root, take the
+     * sign from the original. */
     const float mag = sqrtf(fabsf(s) < geps ? geps : fabsf(s));
     s = s > 0.0f ? mag : (s < 0.0f ? -mag : 0.0f);
     const float gate = pg_sigmoid(s);
@@ -183,8 +163,8 @@ extern "C" int r4d_rad_ple_gate(const RadArgs* a, RadStream s) {
     const long long g_ld  = r4d_rows_pitch(gv, hn, &tg);
     const long long gn_ld = r4d_rows_pitch(gvn, hn, &tn);
     if (k_ld < 0 || q_ld < 0 || v_ld < 0 || g_ld < 0 || gn_ld < 0) return R4D_NO(RAD_E_STRIDE);
-    /* THE ROW COUNT COMES FROM THE OPERANDS AND EVERY ONE HAS TO AGREE: `M` is ranged, so the
-     * value in the args is the band's upper bound, and a grid sized by it walks off the arena. */
+    /* The row count comes from the operands, and they must agree: `M` is ranged, so the arg holds
+     * the band's upper bound and a grid sized by it would run off the arena. */
     if (T <= 0 || tq != T || tv != T || tg != T || tn != T) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(wk) < hn || r4d_numel(wq) < hn || r4d_numel(wc) < hn)
         return R4D_NO(RAD_E_SHAPE);

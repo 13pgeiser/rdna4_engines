@@ -1,23 +1,20 @@
-/* chat_test.cpp -- the chat template and the reply parser, against the REAL template.
+/* chat_test.cpp -- the chat template and the reply parser, against the real template.
  *
- * server_test covers the endpoint with a fake IChatTemplate and a fake IReplyParser, which is the
- * right shape for testing the endpoint and tests nothing about the model we actually serve. The
- * two halves that decide whether an agent turn works -- what the template renders, and whether
- * the reply comes back apart into reasoning, content and tool calls -- are what this file covers.
+ * server_test covers the endpoint with fake IChatTemplate and IReplyParser implementations. This
+ * file covers what decides whether an agent turn works: what the template renders, and whether
+ * the reply splits into reasoning, content and tool calls.
  *
- * The templates are read from disk rather than baked: tests/data/chat holds each one byte for
- * byte as the model ships it, and RAD_TEST_CHAT_JINJA / RAD_TEST_MINICPM_JINJA point the cases at
- * a checkpoint's own copy instead -- which is how a revised template is checked before the
- * fixture is replaced. The reply is read the way the server reads it: the format derived from
- * the template (chatfmt.h), bound to the request's tools, streamed through chatparse.h.
+ * Templates are read from disk: tests/data/chat holds each byte for byte as the model ships it,
+ * and RAD_TEST_CHAT_JINJA / RAD_TEST_MINICPM_JINJA point the cases at a checkpoint's own copy to
+ * check a revised template before replacing the fixture. Replies are read as the server reads
+ * them: the format derived from the template (chatfmt.h), bound to the request's tools, streamed
+ * through chatparse.h.
  *
- * WHAT THE CASES ARE FOR. Every one of them is a shape the model actually emitted into a served
- * agent turn, not a shape invented here. The tool-call syntax is Qwen's XML
- * (<tool_call><function=..><parameter=..>), the reasoning block is opened by the TEMPLATE and
- * closed by the MODEL, and the interesting cases are the ones where those two interact: a call
- * inside an unclosed think block, a second </think>, a call the model wrote with no reasoning at
- * all. A parser that handles only "reasoning, </think>, then a clean call" passes a happy-path
- * test and drops a tool call on the floor in production, which is what this file exists to stop.
+ * Every case is a shape the model emitted in a served agent turn. Qwen's tool calls are XML
+ * (<tool_call><function=..><parameter=..>); the template opens the reasoning block and the model
+ * closes it. The cases target where these interact: a call inside an unclosed think block, a
+ * second </think>, a call with no reasoning. A parser handling only the happy path drops tool
+ * calls in production.
  */
 #include "rad_test.h"
 
@@ -28,6 +25,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -37,41 +35,56 @@ using json = nlohmann::ordered_json;
 
 /* ------------------------------------------------------------------ the template under test */
 
-/* The committed fixture unless a checkpoint's copy is named. A template that cannot be read
- * skips every case that needs it, and says which file it wanted -- a template test with no
- * template must not read as a pass. */
-static std::string jinja_path() {
-    if (const char* p = std::getenv("RAD_TEST_CHAT_JINJA")) return p;
-    return std::string(RAD_CHAT_FIXTURES) + "/qwen3.8/chat_template.jinja";
+static std::string read_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return std::string();
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
 }
 
-static const std::string& jinja_source() {
-    static const std::string s = [] {
-        std::ifstream f(jinja_path());
-        if (!f) return std::string();
-        std::ostringstream ss; ss << f.rdbuf();
-        return ss.str();
-    }();
-    return s;
-}
+/* A template under test: the committed fixture `rel` unless `env` names a checkpoint's copy.
+ * It is compiled once and kept for the process: loading parses the Jinja and probes its
+ * capabilities, too slow to repeat per case. A template that does not load fails every case that
+ * needs it. One that cannot be read is a skip when `env` named it (a model file) and a missing
+ * in-tree artifact when it is the committed fixture. */
+struct TemplateFixture {
+    const char* env;
+    bool overridden = false;
+    std::string path, source;
+    ChatTemplate* t = nullptr;
 
-/* One compiled template, shared: loading it parses 9 KB of Jinja and probes its capabilities,
- * which is slow enough to notice once per case. */
-static ChatTemplate* tmpl() {
-    static ChatTemplate* t = [] () -> ChatTemplate* {
-        if (jinja_source().empty()) return nullptr;
-        auto* c = new ChatTemplate();
-        if (c->load(jinja_source(), "", "") < 0) { delete c; return nullptr; }
-        return c;
-    }();
-    return t;
-}
+    TemplateFixture(const char* env_, const char* rel, const char* bos, const char* eos)
+        : env(env_) {
+        const char* p = std::getenv(env);
+        overridden = p != nullptr;
+        path = p ? p : std::string(RAD_CHAT_FIXTURES) + "/" + rel;
+        source = read_file(path);
+        if (source.empty()) return;
+        t = new ChatTemplate();
+        if (t->load(source, bos, eos) < 0) {
+            delete t;
+            t = nullptr;
+        }
+    }
 
-static bool need_template(const char* what) {
-    if (tmpl() && tmpl()->ready()) return true;
-    fprintf(stderr, "  SKIP %s: no chat template at %s (set RAD_TEST_CHAT_JINJA)\n",
-            what, jinja_path().c_str());
-    return false;
+    /* False, with the case marked skipped or failed, when the template is not ready; the case
+     * then leaves. */
+    bool need() const {
+        if (t && t->ready()) return true;
+        if (overridden && source.empty())
+            ::radtest::skip("no chat template at %s (named by %s)", path.c_str(), env);
+        else if (source.empty())
+            ::radtest::artifact_missing(__FILE__, __LINE__, "the chat template at " + path);
+        else
+            ::radtest::fail(__FILE__, __LINE__, "the chat template at " + path + " does not load");
+        return false;
+    }
+};
+
+static const TemplateFixture& qwen() {
+    static const TemplateFixture f("RAD_TEST_CHAT_JINJA", "qwen3.8/chat_template.jinja", "", "");
+    return f;
 }
 
 static json tools_json() {
@@ -93,19 +106,24 @@ static json tools_json() {
                        "required":["path","old_string","new_string"]}}}])");
 }
 
-/* Render one turn. */
-static bool render(ChatPrompt* p, bool with_tools = true) {
+/* Render one turn, passing `effort` as the template's reasoning_effort when set. */
+static int render_turn(ChatPrompt* p, bool with_tools, const char* effort) {
     json msgs = json::array();
     msgs.push_back({{"role", "user"}, {"content", "Read /work/a.py and summarise it."}});
     ChatOptions opt;
     opt.add_generation_prompt = true;
     opt.enable_thinking = true;
-    return tmpl()->apply(msgs, with_tools ? tools_json() : json(), opt, p) >= 0;
+    if (effort) opt.template_kwargs["reasoning_effort"] = json(effort).dump();
+    return qwen().t->apply(msgs, with_tools ? tools_json() : json(), opt, p);
 }
 
-/* The reply parser for a render, built the way the server builds it: the format derived from
- * the template, bound to the request's tools and to the generation prompt the render produced --
- * which is what says the reply starts inside a reasoning block. */
+static bool render(ChatPrompt* p, bool with_tools = true) {
+    return render_turn(p, with_tools, nullptr) >= 0;
+}
+
+/* The reply parser for a render, built as the server builds it: the format derived from the
+ * template, bound to the request's tools and to the render's generation prompt, which tells it
+ * the reply starts inside a reasoning block. */
 static std::shared_ptr<const ReplyParser> parser_for(const std::string& jinja, const char* bos,
                                                      const char* eos, const ChatPrompt& p,
                                                      const json* tools, bool parallel) {
@@ -133,7 +151,7 @@ static std::shared_ptr<const ReplyParser> parser_for(const std::string& jinja, c
     return rp;
 }
 
-/* Read a reply whole, or -- `partial` -- as far as a stream has delivered it so far. */
+/* Read a reply whole, or (`partial`) as far as a stream has delivered it. */
 static ReplyMessage read_reply(const ReplyParser& rp, const std::string& text, bool partial) {
     std::unique_ptr<ReplyStream> s = rp.open();
     s->feed(text, nullptr);
@@ -144,12 +162,12 @@ static ReplyMessage read_reply(const ReplyParser& rp, const std::string& text, b
 /* ------------------------------------------------------------------ what the template renders */
 
 TEST(template_opens_the_think_block_itself) {
-    if (!need_template("template_opens_the_think_block_itself")) return;
+    if (!qwen().need()) return;
     ChatPrompt p;
     CHECK(render(&p));
-    /* The model never writes the opening tag: the template does, at the end of the prompt, and
-     * the reply therefore starts INSIDE a reasoning block. A parser that does not know this
-     * treats the whole turn as content and leaks the model's first </think> to the user. */
+    /* The template, not the model, writes the opening tag at the end of the prompt, so the reply
+     * starts inside a reasoning block. A parser unaware of this treats the turn as content and
+     * leaks the model's </think> to the user. */
     CHECK(p.prompt.find("<|im_start|>assistant") != std::string::npos);
     CHECK(p.prompt.size() >= 7 &&
           p.prompt.compare(p.prompt.size() - 8, 8, "<think>\n") == 0);
@@ -157,22 +175,20 @@ TEST(template_opens_the_think_block_itself) {
 }
 
 TEST(template_renders_the_xml_tool_preamble) {
-    if (!need_template("template_renders_the_xml_tool_preamble")) return;
+    if (!qwen().need()) return;
     ChatPrompt p;
     CHECK(render(&p));
     CHECK(p.prompt.find("<tool_call>") != std::string::npos);
     CHECK(p.prompt.find("<function=example_function_name>") != std::string::npos);
-    CHECK(tmpl()->caps().tools);
-    CHECK(tmpl()->caps().tool_calls);
+    CHECK(qwen().t->caps().tools);
+    CHECK(qwen().t->caps().tool_calls);
 }
 
-/* A tool call the CLIENT sends back arrives with `arguments` as a JSON string, because that is
- * what the OpenAI schema says it is. The stock template feeds it to `|items` regardless, which
- * is a type error on a string, and patched templates in the wild exist to fix exactly that.
- * Whatever this stack does about it, a multi-turn tool loop has to render the parameters the
- * model was trained on, and this is the assertion that says so. */
+/* A tool call the client sends back has `arguments` as a JSON string, per the OpenAI schema. The
+ * stock template applies `|items` to it, a type error on a string. A multi-turn tool loop must
+ * still render the parameter XML the model was trained on. */
 TEST(replayed_tool_call_arguments_render_as_parameter_xml) {
-    if (!need_template("replayed_tool_call_arguments_render_as_parameter_xml")) return;
+    if (!qwen().need()) return;
     json msgs = json::array();
     msgs.push_back({{"role", "user"}, {"content", "Read /work/a.py."}});
     json call = {{"id", "c1"}, {"type", "function"},
@@ -184,41 +200,134 @@ TEST(replayed_tool_call_arguments_render_as_parameter_xml) {
 
     ChatPrompt p;
     ChatOptions opt;
-    CHECK_OK(tmpl()->apply(msgs, tools_json(), opt, &p));
+    CHECK_OK(qwen().t->apply(msgs, tools_json(), opt, &p));
     CHECK(p.prompt.find("<function=read>") != std::string::npos);
     CHECK(p.prompt.find("<parameter=path>") != std::string::npos);
     CHECK(p.prompt.find("/work/a.py") != std::string::npos);
-    /* The arguments must NOT survive as the raw JSON string the client sent. Match the string
-     * the client actually sent, spaces and all -- the tool SCHEMA in the preamble legitimately
-     * contains `"path":`, so a looser needle finds the schema and passes for the wrong reason. */
+    /* The raw JSON string must not survive. The needle is the exact string sent, spaces
+     * included, because the tool schema in the preamble legitimately contains `"path":`. */
     CHECK(p.prompt.find("{\"path\": \"/work/a.py\"") == std::string::npos);
+}
+
+/* ------------------------------------------------------------------ golden renders
+ *
+ * Every shipped template renders the requests in tests/data/chat/golden/cases.json byte for byte
+ * as Python's jinja2 does under transformers' settings (tests/mkchatgolden.py wrote the goldens).
+ * The prompt is the one input that fails silently: a vendored-engine refresh that changes
+ * whitespace control, `tojson` spacing, a filter, or how history reasoning and tool calls reach
+ * the template still yields answers, only worse ones. The requests arrive as the server passes
+ * them (arguments as JSON strings, media as marker parts), so the conversion to what the template
+ * reads is checked too. */
+
+/* The first byte where two renders differ, with a little context, for a failure message. */
+static std::string first_difference(const std::string& want, const std::string& got) {
+    size_t i = 0;
+    while (i < want.size() && i < got.size() && want[i] == got[i]) ++i;
+    const size_t from = i > 40 ? i - 40 : 0;
+    return "at byte " + std::to_string(i) + "\n      reference: " +
+           json(want.substr(from, 100)).dump(-1, ' ', false, json::error_handler_t::replace) +
+           "\n      engine:    " +
+           json(got.substr(from, 100)).dump(-1, ' ', false, json::error_handler_t::replace);
+}
+
+TEST(every_shipped_template_renders_as_reference_jinja_does) {
+    const std::string root = RAD_CHAT_FIXTURES;
+    const json spec = json::parse(read_file(root + "/golden/cases.json"), nullptr, false);
+    REQUIRE(spec.is_object());
+    size_t compared = 0;
+    for (const auto& [model, info] : spec["models"].items()) {
+        ChatTemplate t;
+        CHECK_OK(t.load(read_file(root + "/" + model + "/chat_template.jinja"),
+                        info["bos"].get<std::string>(), info["eos"].get<std::string>()));
+        if (!t.ready()) continue;
+        const std::string media = info["media"].get<std::string>();
+        for (const json& c : spec["cases"]) {
+            const std::string name = c["name"].get<std::string>();
+            if (c.contains("models")) {
+                bool listed = false;
+                for (const json& m : c["models"]) listed |= m.get<std::string>() == model;
+                if (!listed) continue;
+            }
+            const std::string base = root + "/" + model + "/golden/" + name;
+            const std::string ref = read_file(base + ".txt"), refusal = read_file(base + ".err");
+            if (ref.empty() && refusal.empty()) {
+                ::radtest::fail(__FILE__, __LINE__, "no golden for " + model + "/" + name +
+                                " (run tests/mkchatgolden.py)");
+                continue;
+            }
+            ChatOptions opt;
+            opt.add_generation_prompt = c.value("add_generation_prompt", true);
+            opt.enable_thinking = c.value("enable_thinking", true);
+            opt.quiet = true;
+            if (c.contains("kwargs"))
+                for (const auto& [k, v] : c["kwargs"].items()) opt.template_kwargs[k] = v.dump();
+            ChatPrompt p;
+            const int st = t.apply(c["messages"], c.value("tools", false) ? spec["tools"] : json(),
+                                   opt, &p);
+            ++compared;
+            if (!refusal.empty()) {
+                /* The template refused in Python, so it must refuse here, in its own words. */
+                if (st >= 0 || p.error.find(refusal) == std::string::npos)
+                    ::radtest::fail(__FILE__, __LINE__, model + "/" + name + ": the reference "
+                                    "refused (\"" + refusal + "\"); the engine returned " +
+                                    std::to_string(st) + " \"" + p.error + "\"");
+                continue;
+            }
+            if (st < 0) {
+                ::radtest::fail(__FILE__, __LINE__, model + "/" + name + ": the engine refused: " +
+                                p.error);
+                continue;
+            }
+            /* The engine writes the marker where the template writes its own placeholder; the
+             * processor replaces the marker with the placeholder's tokens. */
+            std::string got = p.prompt;
+            for (size_t at; !media.empty() && (at = got.find("<__media__>")) != std::string::npos;)
+                got.replace(at, std::strlen("<__media__>"), media);
+            if (got != ref)
+                ::radtest::fail(__FILE__, __LINE__, model + "/" + name + " differs from the "
+                                "reference render " + first_difference(ref, got));
+        }
+    }
+    /* Four templates, every case each one renders. */
+    CHECK(compared >= 60);
 }
 
 /* ------------------------------------------------------------------ reading the reply back */
 
+/* The parser for the agent turn above (tools, one call per reply). Built once: the render and the
+ * derived format are functions of the template alone, so every reply reads with the same one. */
+static const ReplyParser* qwen_parser() {
+    static const std::shared_ptr<const ReplyParser> rp = []() -> std::shared_ptr<const ReplyParser> {
+        ChatPrompt p;
+        if (!qwen().t || !render(&p)) return nullptr;
+        const json tools = tools_json();
+        return parser_for(qwen().source, "", "", p, &tools, false);
+    }();
+    return rp.get();
+}
+
 static ReplyMessage parse_reply(const std::string& text, bool partial = false) {
-    ChatPrompt p;
-    if (!render(&p)) return ReplyMessage{};
-    const json tools = tools_json();
-    std::shared_ptr<const ReplyParser> rp = parser_for(jinja_source(), "", "", p, &tools, false);
-    if (!rp) return ReplyMessage{};
+    const ReplyParser* rp = qwen_parser();
+    if (!rp) {
+        ::radtest::fail(__FILE__, __LINE__, "no reply parser for the Qwen template");
+        return ReplyMessage{};
+    }
     return read_reply(*rp, text, partial);
 }
 
 TEST(reply_splits_reasoning_from_content) {
-    if (!need_template("reply_splits_reasoning_from_content")) return;
+    if (!qwen().need()) return;
     ReplyMessage r = parse_reply("The user wants a summary.\n</think>\n\nIt prints one.");
     CHECK(r.reasoning.find("The user wants a summary.") != std::string::npos);
     CHECK_EQ(r.content, std::string("It prints one."));
     CHECK_EQ(r.calls.size(), (size_t)0);
-    /* The closing tag is a delimiter, not text. Leaking it is what the user sees when the
-     * reasoning split is wrong. */
+    /* The closing tag is a delimiter, never text. */
     CHECK(r.content.find("</think>") == std::string::npos);
     CHECK(r.reasoning.find("</think>") == std::string::npos);
 }
 
 TEST(reply_with_tool_call_after_reasoning) {
-    if (!need_template("reply_with_tool_call_after_reasoning")) return;
+    if (!qwen().need()) return;
     ReplyMessage r = parse_reply(
         "I should read it.\n</think>\n\n"
         "<tool_call>\n<function=read>\n<parameter=path>\n/work/a.py\n</parameter>\n"
@@ -232,12 +341,11 @@ TEST(reply_with_tool_call_after_reasoning) {
     CHECK(r.content.find("</think>") == std::string::npos);
 }
 
-/* A REAL AGENT TURN: the model reasons at length, closes the block, and calls a tool. When this
- * fails the user gets the literal </think> followed by the literal <tool_call> XML and no tool
- * call at all. Long text before the tag is the only thing separating this from the case above, so
- * if it behaves differently the parser is length- or newline-sensitive. */
+/* An agent turn: long reasoning, the closing tag, then a tool call. It differs from the case
+ * above only in length, so a different result means the parser is length- or
+ * newline-sensitive. */
 TEST(long_reasoning_then_tool_call_still_parses) {
-    if (!need_template("long_reasoning_then_tool_call_still_parses")) return;
+    if (!qwen().need()) return;
     std::string reasoning;
     for (int i = 0; i < 60; ++i)
         reasoning += "Checking the file again, because the previous edit may not have applied. ";
@@ -252,12 +360,11 @@ TEST(long_reasoning_then_tool_call_still_parses) {
     CHECK(r.content.find("<function=") == std::string::npos);
 }
 
-/* The model skips the closing tag and goes straight to the call from inside the think block.
- * Patched templates carry an explicit self-heal for exactly this shape, so it is a real one. The
- * call must still come out: dropping it strands the agent, and the tool XML is unambiguous with
- * or without the reasoning tag around it. */
+/* The model skips the closing tag and calls from inside the think block (patched templates
+ * self-heal this shape, so models emit it). The call must still be extracted; the tool XML is
+ * unambiguous either way. */
 TEST(tool_call_inside_an_unclosed_think_block) {
-    if (!need_template("tool_call_inside_an_unclosed_think_block")) return;
+    if (!qwen().need()) return;
     ReplyMessage r = parse_reply(
         "I need to look at the file first.\n"
         "<tool_call>\n<function=read>\n<parameter=path>\n/work/a.py\n</parameter>\n"
@@ -268,16 +375,16 @@ TEST(tool_call_inside_an_unclosed_think_block) {
 
 /* A reply with no reasoning at all: the block the template opened is closed immediately. */
 TEST(reply_with_empty_reasoning) {
-    if (!need_template("reply_with_empty_reasoning")) return;
+    if (!qwen().need()) return;
     ReplyMessage r = parse_reply("\n</think>\n\nIt prints one.");
     CHECK_EQ(r.content, std::string("It prints one."));
     CHECK(r.content.find("</think>") == std::string::npos);
 }
 
-/* Streaming asks the same parser the same question with half a reply. A partial tool call is not
- * an error; a partial reply must never leak the delimiters either. */
+/* Streaming parses every prefix. A partial tool call is not an error, and no prefix may leak a
+ * delimiter into content. */
 TEST(partial_reply_does_not_leak_delimiters) {
-    if (!need_template("partial_reply_does_not_leak_delimiters")) return;
+    if (!qwen().need()) return;
     const std::string full =
         "Reading it.\n</think>\n\n"
         "<tool_call>\n<function=read>\n<parameter=path>\n/work/a.py\n</parameter>\n"
@@ -295,19 +402,17 @@ TEST(partial_reply_does_not_leak_delimiters) {
     }
 }
 
-/* ------------------------------------------------------------- the value is not text to tidy
+/* ------------------------------------------------------------- argument values are verbatim
  *
- * An agent's edit tool matches `old_string` against the file BYTE FOR BYTE. The XML carries the
- * value between two delimiting newlines --
+ * An agent's edit tool matches `old_string` against the file byte for byte. The XML carries the
+ * value between two delimiting newlines:
  *
  *     <parameter=old_string>\n    return a + b\n</parameter>
  *
- * -- and exactly those two newlines are the delimiters. Everything between them, INCLUDING the
- * leading indentation, is the value. A parser that strips "one leading whitespace character"
- * without checking that it is the delimiter eats the first space of every indented line and
- * every such edit fails to apply, on a model that wrote a perfectly good call. */
+ * Only those two newlines are delimiters; everything between, including leading indentation, is
+ * the value. Stripping any other leading whitespace breaks every indented edit. */
 TEST(indented_argument_keeps_every_leading_space) {
-    if (!need_template("indented_argument_keeps_every_leading_space")) return;
+    if (!qwen().need()) return;
     ReplyMessage r = parse_reply(
         "Fixing it.\n</think>\n\n"
         "<tool_call>\n<function=edit>\n"
@@ -325,10 +430,10 @@ TEST(indented_argument_keeps_every_leading_space) {
     CHECK_EQ(a.value("new_string", std::string()), std::string("    return a + b + 1"));
 }
 
-/* Multi-line, blank lines and a tab: a hunk is not one line, and the blank line in the middle of
- * one must not be collapsed either. Only the first and last newline belong to the XML. */
+/* Multi-line with blank lines and a tab: inner blank lines survive, and only the first and last
+ * newline belong to the XML. */
 TEST(multiline_argument_survives_verbatim) {
-    if (!need_template("multiline_argument_survives_verbatim")) return;
+    if (!qwen().need()) return;
     const std::string body = "def add(a, b):\n\n\t# sum\n    return a + b\n  ";
     ReplyMessage r = parse_reply(
         "Fixing it.\n</think>\n\n"
@@ -345,52 +450,36 @@ TEST(multiline_argument_survives_verbatim) {
     CHECK_EQ(a.value("old_string", std::string()), body);
 }
 
-
 /* ------------------------------------------------------------- reasoning effort
  *
- * THE TWO VOCABULARIES. OpenAI's `reasoning_effort` ladder is none/minimal/low/medium/high;
- * THIS model's template accepts xhigh/medium/low and `raise_exception`s on everything else, with
- * xhigh as its DEFAULT. A server that polices OpenAI's list instead gets both ends wrong:
- * `"high"` -- what an ordinary client sends -- reaches the template and is refused, and `"xhigh"`
- * -- this model's own documented maximum -- is refused by the server for a value the template
- * would have taken. Either is a hard 400 on every request of an agent loop.
+ * OpenAI's `reasoning_effort` ladder is none/minimal/low/medium/high; this model's template accepts
+ * xhigh/medium/low (default xhigh) and raises on anything else. The template, not the server,
+ * decides: policing OpenAI's list would refuse "xhigh", and "high" is refused by the template.
  */
-static int render_effort(ChatPrompt* p, const char* effort) {
-    json msgs = json::array();
-    msgs.push_back({{"role", "user"}, {"content", "Read /work/a.py and summarise it."}});
-    ChatOptions opt;
-    opt.add_generation_prompt = true;
-    opt.enable_thinking = true;
-    if (effort) opt.template_kwargs["reasoning_effort"] = json(effort).dump();
-    return tmpl()->apply(msgs, tools_json(), opt, p);
-}
-
 TEST(the_templates_own_effort_values_render) {
-    if (!need_template("the_templates_own_effort_values_render")) return;
+    if (!qwen().need()) return;
     for (const char* e : {"xhigh", "medium", "low"}) {
         ChatPrompt p;
-        CHECK_OK(render_effort(&p, e));
+        CHECK_OK(render_turn(&p, true, e));
         CHECK(p.error.empty());
-        /* medium is the template's "say nothing" rung: it injects no instruction at all. */
+        /* medium injects no instruction at all. */
         if (std::string(e) == "medium")
             CHECK(p.prompt.find("Reasoning effort is set to") == std::string::npos);
         else
             CHECK(p.prompt.find(std::string("Reasoning effort is set to ") + e) !=
                   std::string::npos);
     }
-    /* And the default, which is what every client that says nothing gets. */
+    /* The default, for clients that send none. */
     ChatPrompt d;
-    CHECK_OK(render_effort(&d, nullptr));
+    CHECK_OK(render_turn(&d, true, nullptr));
     CHECK(d.prompt.find("Reasoning effort is set to xhigh") != std::string::npos);
 }
 
 TEST(a_refused_effort_comes_back_in_the_templates_own_words) {
-    if (!need_template("a_refused_effort_comes_back_in_the_templates_own_words")) return;
+    if (!qwen().need()) return;
     ChatPrompt p;
-    CHECK(render_effort(&p, "high") < 0);
-    /* The template's own sentence has to SURVIVE to the caller. Logged and dropped, the 400 says
-     * only "the model's chat template refused this request" and names neither the field nor the
-     * values it would have accepted -- which is not something a caller can act on. */
+    CHECK(render_turn(&p, true, "high") < 0);
+    /* The template's own message reaches the caller, naming the field and the accepted values. */
     CHECK(!p.error.empty());
     CHECK(p.error.find("reasoning effort") != std::string::npos);
     CHECK(p.error.find("xhigh") != std::string::npos);
@@ -398,52 +487,20 @@ TEST(a_refused_effort_comes_back_in_the_templates_own_words) {
 
 /* ================================================================== MiniCPM5: the tagged format
  *
- * A SECOND TEMPLATE, because the first exercises none of this. Qwen's calls are
- * `<tool_call><function=f><parameter=p>`; MiniCPM5's are `<function name="f"><param name="p">`,
- * which the auto-parser classifies as TAG_WITH_TAGGED and drives down a different generator. A
- * failure anywhere on that path looks to the user like a model that cannot call tools: the
- * tool-call rule ends in p.end(), so ANY mismatch anywhere fails EVERYTHING and the optional
- * tool_calls matches none. There is no partial credit, which is why these are replays of what the
- * model actually emitted rather than shapes invented here.
- *
- * ONE CALL WITH ONE SCALAR ARGUMENT PASSES EVERY ONE OF THESE CASES, so a happy-path case is no
- * evidence at all.
+ * A second template on a different path. Qwen's calls are `<tool_call><function=f><parameter=p>`;
+ * MiniCPM5's are `<function name="f"><param name="p">`, classified TAG_WITH_TAGGED and handled by
+ * a different generator. Any mismatch on that path loses every tool call, so the cases replay what
+ * the model actually emitted; a single call with one scalar argument proves nothing.
  */
 
-static std::string mc_jinja_path() {
-    if (const char* p = std::getenv("RAD_TEST_MINICPM_JINJA")) return p;
-    return std::string(RAD_CHAT_FIXTURES) + "/minicpm5/chat_template.jinja";
+static const TemplateFixture& minicpm() {
+    static const TemplateFixture f("RAD_TEST_MINICPM_JINJA", "minicpm5/chat_template.jinja", "<s>",
+                                   "</s>");
+    return f;
 }
 
-static const std::string& mc_jinja_source() {
-    static const std::string s = [] {
-        std::ifstream f(mc_jinja_path());
-        if (!f) return std::string();
-        std::ostringstream ss; ss << f.rdbuf();
-        return ss.str();
-    }();
-    return s;
-}
-
-static ChatTemplate* mc_tmpl() {
-    static ChatTemplate* t = [] () -> ChatTemplate* {
-        if (mc_jinja_source().empty()) return nullptr;
-        auto* c = new ChatTemplate();
-        if (c->load(mc_jinja_source(), "<s>", "</s>") < 0) { delete c; return nullptr; }
-        return c;
-    }();
-    return t;
-}
-
-static bool mc_need(const char* what) {
-    if (mc_tmpl() && mc_tmpl()->ready()) return true;
-    fprintf(stderr, "  SKIP %s: no chat template at %s (set RAD_TEST_MINICPM_JINJA)\n",
-            what, mc_jinja_path().c_str());
-    return false;
-}
-
-/* `edits` is an ARRAY on purpose: a non-string argument is matched by a schema-constrained JSON
- * parser, and that is the one an agent's edit tool actually declares. */
+/* `edits` is an array on purpose: non-string arguments go through the schema-constrained JSON
+ * parser, as with a real agent's edit tool. */
 static json mc_tools_json() {
     return json::parse(R"([{
       "type": "function",
@@ -478,58 +535,64 @@ static json mc_tools_json() {
                        "required":["path","edits"]}}}])");
 }
 
+/* The parser for an agent turn rendered with these tools, built once like qwen_parser(). */
+static const ReplyParser* mc_parser() {
+    static const std::shared_ptr<const ReplyParser> rp = []() -> std::shared_ptr<const ReplyParser> {
+        if (!minicpm().t) return nullptr;
+        ChatPrompt p;
+        json msgs = json::array();
+        msgs.push_back({{"role", "user"}, {"content", "Implement tic tac toe in python."}});
+        ChatOptions opt;
+        opt.add_generation_prompt = true;
+        opt.enable_thinking = true;
+        /* As the server renders it (ChatRenderOptions defaults to true); it decides whether the
+         * generator repeats over calls. */
+        opt.parallel_tool_calls = true;
+        const int st = minicpm().t->apply(msgs, mc_tools_json(), opt, &p);
+        if (st < 0) {
+            fprintf(stderr, "    mc_parser: apply failed (%d): %s\n", st, p.error.c_str());
+            return nullptr;
+        }
+        const json tools = mc_tools_json();
+        return parser_for(minicpm().source, "<s>", "</s>", p, &tools, true);
+    }();
+    return rp.get();
+}
+
 static ReplyMessage mc_parse(const std::string& text, bool partial = false) {
-    ChatPrompt p;
-    json msgs = json::array();
-    msgs.push_back({{"role", "user"}, {"content", "Implement tic tac toe in python."}});
-    ChatOptions opt;
-    opt.add_generation_prompt = true;
-    opt.enable_thinking = true;
-    /* As the server renders it: ChatRenderOptions defaults this to true, and it decides whether
-     * the generator emits a repetition over calls at all. */
-    opt.parallel_tool_calls = true;
-    /* SAY WHICH STEP FAILED. A silent early return here makes every case in the section report
-     * zero tool calls, which reads as a parser that found nothing rather than a fixture that
-     * never ran. */
-    const int st = mc_tmpl()->apply(msgs, mc_tools_json(), opt, &p);
-    if (st < 0) {
-        fprintf(stderr, "    mc_parse: apply failed (%d): %s\n", st, p.error.c_str());
+    const ReplyParser* rp = mc_parser();
+    /* Report the failure; an empty message would read as a parser that found no calls. */
+    if (!rp) {
+        ::radtest::fail(__FILE__, __LINE__, "no reply parser for the MiniCPM5 template");
         return ReplyMessage{};
     }
-    const json tools = mc_tools_json();
-    std::shared_ptr<const ReplyParser> rp =
-        parser_for(mc_jinja_source(), "<s>", "</s>", p, &tools, true);
-    if (!rp) return ReplyMessage{};
     return read_reply(*rp, text, partial);
 }
 
-/* No marker of the format may survive into content. Every failure in this family looks the same
- * from the outside: the tags come back as prose. */
+/* No format marker may survive into content. */
 static void mc_content_is_clean(const ReplyMessage& r) {
     CHECK(r.content.find("<function") == std::string::npos);
     CHECK(r.content.find("<param") == std::string::npos);
     CHECK(r.content.find("</think>") == std::string::npos);
     CHECK(r.content.find("CDATA") == std::string::npos);
-    /* The turn terminator is an eog token: the decoder renders it only when the format needs
-     * it, and the parser trims one off the end of content when it does. Neither should ever
-     * leave it here. */
+    /* The turn terminator is an eog token: the decoder renders it only when the format needs it,
+     * and the parser then trims it from content. */
     CHECK(r.content.find("<|im_end|>") == std::string::npos);
 }
 
 /* ===================================== replies that leave the grammar
  *
- * Every case is a real reply shape that the grammar the template implies does not match -- a
- * function that is not a tool, a call written from inside prose. The parser reads them as calls
- * anyway, because the layer that can answer "no such tool" in words the model can act on is the
- * agent, and a call that comes back as prose with the XML in it is a turn the model loses. */
+ * Real reply shapes the template's grammar does not match: a function that is not a tool, a call
+ * written inside prose. The parser still reads them as calls, because the agent can answer "no
+ * such tool" usefully, while a call returned as prose loses the turn. */
 static void mc_recovered(const ReplyMessage& r, size_t calls) {
     CHECK_EQ(r.calls.size(), calls);
     mc_content_is_clean(r);
 }
 
 TEST(a_call_whose_function_is_not_a_tool_at_all_is_still_a_call) {
-    if (!mc_need("a_call_whose_function_is_not_a_tool_at_all_is_still_a_call")) return;
-    /* A shell command in the function name. No schema-driven grammar can match this. */
+    if (!minicpm().need()) return;
+    /* A shell command as the function name, which no schema-driven grammar matches. */
     ReplyMessage r = mc_parse("Checking.\n</think>\n\nLet me check the compiler version.\n\n"
                               "<function name=\"which gcc cc clang make\"></function>");
     mc_recovered(r, 1);
@@ -540,7 +603,7 @@ TEST(a_call_whose_function_is_not_a_tool_at_all_is_still_a_call) {
 }
 
 TEST(a_call_with_no_arguments_is_an_empty_object) {
-    if (!mc_need("a_call_with_no_arguments_is_an_empty_object")) return;
+    if (!minicpm().need()) return;
     ReplyMessage r = mc_parse("Notes.\n</think>\n\nI'll check my notes.\n\n"
                               "<function name=\"memory\"></function>");
     mc_recovered(r, 1);
@@ -550,7 +613,7 @@ TEST(a_call_with_no_arguments_is_an_empty_object) {
 }
 
 TEST(a_cdata_value_arrives_verbatim_without_its_delimiters) {
-    if (!mc_need("a_cdata_value_arrives_verbatim_without_its_delimiters")) return;
+    if (!minicpm().need()) return;
     ReplyMessage r = mc_parse("Writing.\n</think>\n\nWriting it.\n\n<function name=\"write\">"
                               "<param name=\"path\">/work/a.c</param>"
                               "<param name=\"content\"><![CDATA[int main(void) { return 0; }\n"
@@ -566,7 +629,7 @@ TEST(a_cdata_value_arrives_verbatim_without_its_delimiters) {
 }
 
 TEST(two_calls_keep_the_text_between_them) {
-    if (!mc_need("two_calls_keep_the_text_between_them")) return;
+    if (!minicpm().need()) return;
     ReplyMessage r = mc_parse("Both.\n</think>\n\nFirst.\n"
                               "<function name=\"bash\"><param name=\"cmd\">ls</param></function>"
                               "\nThen.\n<function name=\"bash\"><param name=\"cmd\">pwd</param>"
@@ -578,10 +641,9 @@ TEST(two_calls_keep_the_text_between_them) {
     CHECK_EQ(r.content, std::string("First.\nThen."));
 }
 
-/* QWEN'S FORMAT, with a sentence after the call -- which Qwen's grammar does not admit, so a parse
- * held to that grammar fails the whole reply. */
+/* Qwen's format with a sentence after the call, which Qwen's grammar does not admit. */
 TEST(a_qwen_call_followed_by_a_sentence_is_still_a_call) {
-    if (!need_template("a_qwen_call_followed_by_a_sentence_is_still_a_call")) return;
+    if (!qwen().need()) return;
     ReplyMessage r = parse_reply("Looking.\n</think>\n\n<tool_call>\n<function=read>\n"
                                  "<parameter=path>\n/work/a.py\n</parameter>\n</function>\n"
                                  "</tool_call>\nThat is the file.");
@@ -593,11 +655,11 @@ TEST(a_qwen_call_followed_by_a_sentence_is_still_a_call) {
     CHECK_EQ(r.reasoning, std::string("Looking.\n"));
 }
 
-/* A TRUNCATED CALL is a call in progress, never content: the stream has already announced it.
- * Its arguments are what arrived, unterminated -- the server reports finish_reason "length" or
- * "stop" rather than "tool_calls" for it, because they do not parse (json_partial.h). */
+/* A truncated call is a call in progress, never content, since the stream already announced it.
+ * Its arguments are what arrived, unterminated; because they do not parse, the server reports
+ * finish_reason "length" or "stop", not "tool_calls" (json_partial.h). */
 TEST(a_half_written_call_is_a_call_whose_arguments_did_not_finish) {
-    if (!mc_need("a_half_written_call_is_a_call_whose_arguments_did_not_finish")) return;
+    if (!minicpm().need()) return;
     ReplyMessage r = mc_parse("Writing.\n</think>\n\nWriting.\n<function name=\"write\">"
                               "<param name=\"content\"><![CDATA[int main(void) {");
     CHECK_EQ(r.calls.size(), (size_t)1);
@@ -609,7 +671,7 @@ TEST(a_half_written_call_is_a_call_whose_arguments_did_not_finish) {
 }
 
 TEST(a_reply_that_only_mentions_the_syntax_is_left_alone) {
-    if (!mc_need("a_reply_that_only_mentions_the_syntax_is_left_alone")) return;
+    if (!minicpm().need()) return;
     const std::string text = "A hash map stores key-value pairs. The `<function>` syntax is how "
                              "this model writes a call, but this sentence is not one.";
     ReplyMessage r = mc_parse("Hm.\n</think>\n\n" + text);
@@ -617,10 +679,10 @@ TEST(a_reply_that_only_mentions_the_syntax_is_left_alone) {
     CHECK_EQ(r.content, text);
 }
 
-/* THE STREAMING CONTRACT: content is sent as it grows and cannot be retracted, so the opening of a
- * call must never reach it -- at any prefix, including one that ends inside the opener. */
+/* Streamed content cannot be retracted, so a call's opener never reaches content at any prefix,
+ * including one ending inside the opener. */
 TEST(a_streamed_call_never_shows_its_opening_as_content) {
-    if (!mc_need("a_streamed_call_never_shows_its_opening_as_content")) return;
+    if (!minicpm().need()) return;
     const std::string full = "Writing.\n</think>\n\nWriting it now.\n<function name=\"write\">"
                              "<param name=\"path\">/work/a.c</param></function>";
     for (size_t n = 1; n <= full.size(); ++n) {
@@ -634,18 +696,15 @@ TEST(a_streamed_call_never_shows_its_opening_as_content) {
     CHECK_EQ(mc_parse(full).content, std::string("Writing it now."));
 }
 
-/* AN ARGUMENT NAME THE SCHEMA DOES NOT DECLARE. Every argument arm matches its parameter name as
- * a literal, so one name outside the schema matches nothing, the call matches nothing, and
- * p.end() makes that the whole reply. A real shape: `read` takes `path`, the model writes
+/* An argument name the schema does not declare. Schema arms match parameter names literally, so
+ * a strict grammar would reject the call, e.g.
  *
  *     <function name="read"><param name="action">read</param></function>
  *
- * and the turn comes back as prose with the XML in it. The second case shows what that really
- * costs -- a call that is entirely VALID is lost because of one extra argument beside it. Both
- * must reach the tool, which can reject an argument properly; a reply that never arrives
- * cannot. */
+ * and the second case would lose an otherwise valid call over one extra argument. Both must reach
+ * the tool, which can reject the argument properly. */
 TEST(mc_an_undeclared_argument_does_not_lose_the_call) {
-    if (!mc_need("mc_an_undeclared_argument_does_not_lose_the_call")) return;
+    if (!minicpm().need()) return;
     ReplyMessage r = mc_parse("Reading it.\n</think>\n\n"
                              "<function name=\"ls\"><param name=\"action\">read</param></function>");
     CHECK_EQ((int)r.calls.size(), 1);
@@ -656,21 +715,21 @@ TEST(mc_an_undeclared_argument_does_not_lose_the_call) {
 }
 
 TEST(mc_an_extra_argument_does_not_lose_a_valid_call) {
-    if (!mc_need("mc_an_extra_argument_does_not_lose_a_valid_call")) return;
+    if (!minicpm().need()) return;
     ReplyMessage r = mc_parse("Listing.\n</think>\n\n"
                              "<function name=\"ls\"><param name=\"path\">/work</param>"
                              "<param name=\"action\">read</param></function>");
     CHECK_EQ((int)r.calls.size(), 1);
     if (r.calls.empty()) return;
-    /* The declared argument still binds to its OWN schema-checked arm: the generic one is tried
-     * last, so nothing that parsed before parses differently. */
+    /* The declared argument still binds to its own schema-checked arm; the generic arm is tried
+     * last. */
     CHECK(r.calls[0].arguments.find("\"path\"") != std::string::npos);
     CHECK(r.calls[0].arguments.find("/work") != std::string::npos);
     mc_content_is_clean(r);
 }
 
 TEST(mc_one_call_with_one_argument) {
-    if (!mc_need("mc_one_call_with_one_argument")) return;
+    if (!minicpm().need()) return;
     ReplyMessage r = mc_parse(
         "I will look at the directory.\n</think>\n\n"
         "<function name=\"ls\"><param name=\"path\">/work</param></function>");
@@ -682,10 +741,10 @@ TEST(mc_one_call_with_one_argument) {
     mc_content_is_clean(r);
 }
 
-/* TWO CALLS. A parallel-call rule that separates them with a literal ", " -- the separator of a
- * JSON array of calls -- never matches the second, and the whole reply comes back as prose. */
+/* Two calls separated by a newline; a parallel-call rule expecting a JSON-array ", " separator
+ * would miss the second. */
 TEST(mc_two_calls_separated_by_a_newline) {
-    if (!mc_need("mc_two_calls_separated_by_a_newline")) return;
+    if (!minicpm().need()) return;
     ReplyMessage r = mc_parse(
         "Both, then.\n</think>\n\n"
         "<function name=\"ls\"><param name=\"path\">/work</param></function>\n"
@@ -699,11 +758,10 @@ TEST(mc_two_calls_separated_by_a_newline) {
     mc_content_is_clean(r);
 }
 
-/* A SENTENCE BEFORE THE CALL. content_before_tools reads up to the section or per-call opener,
- * and this format declares neither -- so it falls back to p.eps(), which permits no content at
- * all. */
+/* A sentence before the call. This format declares no section or per-call opener, so content
+ * must end at the call itself. */
 TEST(mc_a_sentence_before_the_call) {
-    if (!mc_need("mc_a_sentence_before_the_call")) return;
+    if (!minicpm().need()) return;
     ReplyMessage r = mc_parse(
         "The workspace is empty.\n</think>\n\n"
         "The workspace is empty. I will create the file.\n"
@@ -714,9 +772,9 @@ TEST(mc_a_sentence_before_the_call) {
     mc_content_is_clean(r);
 }
 
-/* And after it, and between two of them: the same trap with the ends swapped. */
+/* A sentence after the call, and between two calls. */
 TEST(mc_a_sentence_after_the_call) {
-    if (!mc_need("mc_a_sentence_after_the_call")) return;
+    if (!minicpm().need()) return;
     ReplyMessage r = mc_parse(
         "Writing it.\n</think>\n\n"
         "<function name=\"write\"><param name=\"path\">/work/t.py</param>"
@@ -728,7 +786,7 @@ TEST(mc_a_sentence_after_the_call) {
 }
 
 TEST(mc_a_sentence_between_two_calls) {
-    if (!mc_need("mc_a_sentence_between_two_calls")) return;
+    if (!minicpm().need()) return;
     ReplyMessage r = mc_parse(
         "First one, then the other.\n</think>\n\n"
         "<function name=\"ls\"><param name=\"path\">/work</param></function>\n"
@@ -739,11 +797,10 @@ TEST(mc_a_sentence_between_two_calls) {
     mc_content_is_clean(r);
 }
 
-/* ARGUMENT ORDER. A tagged argument carries its own name, so its position means nothing --
- * requiring the arguments in SCHEMA order loses the call. The model writes the content first
- * because that is the part it was thinking about. */
+/* A tagged argument carries its own name, so arguments may come in any order, not just schema
+ * order. */
 TEST(mc_arguments_in_any_order) {
-    if (!mc_need("mc_arguments_in_any_order")) return;
+    if (!minicpm().need()) return;
     ReplyMessage r = mc_parse(
         "Writing.\n</think>\n\n"
         "<function name=\"write\"><param name=\"content\">print(1)</param>"
@@ -756,11 +813,11 @@ TEST(mc_arguments_in_any_order) {
     mc_content_is_clean(r);
 }
 
-/* CDATA IS PUNCTUATION. The template tells the model to wrap any value holding <, & or a newline
- * in one, so this is the normal shape of every file an agent writes -- and a delimiter that
- * reaches the tool is a delimiter written into the file. */
+/* CDATA is punctuation. The template tells the model to wrap any value holding <, & or a newline
+ * in it, so it is the normal shape of a written file; a delimiter reaching the tool would be
+ * written into the file. */
 TEST(mc_cdata_is_not_part_of_the_value) {
-    if (!mc_need("mc_cdata_is_not_part_of_the_value")) return;
+    if (!minicpm().need()) return;
     ReplyMessage r = mc_parse(
         "Writing.\n</think>\n\n"
         "<function name=\"write\"><param name=\"path\">/work/t.py</param>"
@@ -775,27 +832,25 @@ TEST(mc_cdata_is_not_part_of_the_value) {
     }
 }
 
-/* A STREAMED value is re-parsed from the top on every chunk and only what is NEW is sent, so a
- * partial parse must never emit something it would later take back. `<![CDATA` is eight
- * characters and matches nothing yet; emitted once, it is in the user's file forever. */
+/* A streamed value is re-parsed every chunk and only new bytes are sent, so a partial parse must
+ * never emit what it would later retract, such as a partial `<![CDATA` opener. */
 TEST(mc_a_partial_cdata_value_emits_no_delimiter) {
-    if (!mc_need("mc_a_partial_cdata_value_emits_no_delimiter")) return;
+    if (!minicpm().need()) return;
     for (const char* head : { "<", "<![CDATA", "<![CDATA[", "<![CDATA[def f():" }) {
         ReplyMessage r = mc_parse(
             std::string("Writing.\n</think>\n\n"
                         "<function name=\"write\"><param name=\"path\">/work/t.py</param>"
                         "<param name=\"content\">") + head, /*partial=*/true);
-        if (r.calls.empty()) continue;   /* nothing emitted yet is also correct */
+        if (r.calls.empty()) continue;   /* emitting nothing yet is also correct */
         CHECK(r.calls[0].arguments.find("CDATA") == std::string::npos);
     }
 }
 
-/* A NON-STRING ARGUMENT THAT IS NOT JSON. An array parameter is matched by a schema-constrained
- * JSON parser, and the model writes Python. The JSON parser cannot begin on a single quote, so
- * the argument does not match, so the call does not, so the reply comes back as prose -- and the
- * model, reading that as a rejection, rewrites the same call over and over. */
+/* A non-string argument written as a Python literal rather than JSON. A strict JSON parser
+ * rejects the single quote and loses the call, and the model then retries the same call
+ * repeatedly. */
 TEST(mc_a_python_quoted_array_argument_still_parses) {
-    if (!mc_need("mc_a_python_quoted_array_argument_still_parses")) return;
+    if (!minicpm().need()) return;
     ReplyMessage r = mc_parse(
         "Fixing the typo.\n</think>\n\n"
         "<function name=\"edit\"><param name=\"edits\">"
@@ -805,7 +860,7 @@ TEST(mc_a_python_quoted_array_argument_still_parses) {
     if (r.calls.size() == 1) {
         const std::string& a = r.calls[0].arguments;
         CHECK_EQ(r.calls[0].name, std::string("edit"));
-        /* Normalised to JSON on the way out, because that is what `arguments` is. */
+        /* Normalised to JSON, as `arguments` requires. */
         CHECK(a.find("\"oldText\"") != std::string::npos);
         CHECK(a.find("def minimax:") != std::string::npos);
         CHECK(a.find("'") == std::string::npos);
@@ -813,41 +868,35 @@ TEST(mc_a_python_quoted_array_argument_still_parses) {
     mc_content_is_clean(r);
 }
 
-/* And the plain answer still comes back plain, with no tool call invented and no marker left. */
+/* A plain answer stays plain: no invented call and no marker left. */
 TEST(mc_a_reply_with_no_call_is_just_content) {
-    if (!mc_need("mc_a_reply_with_no_call_is_just_content")) return;
+    if (!minicpm().need()) return;
     ReplyMessage r = mc_parse("Thinking about it.\n</think>\n\nA hash table maps keys to values.");
     CHECK_EQ(r.calls.size(), (size_t)0);
     CHECK(r.content.find("A hash table maps keys to values.") != std::string::npos);
     mc_content_is_clean(r);
 }
 
-/* ===================================== the template face, with no checkpoint in the room
+/* ===================================== the template face, with no checkpoint
  *
- * EVERY CASE BELOW RUNS WITHOUT A VENDOR TEMPLATE, so the seam between core and the vendored
- * Jinja engine is covered even where no template file can be read and every case above skips.
- * ChatML ships in the binary (`ChatTemplate::chatml_source`), which is enough to exercise the
- * three things chat.h says this face is for, and those are the three a vendor template cannot
- * test any better:
+ * These cases need no vendor template: ChatML ships in the binary (`ChatTemplate::chatml_source`),
+ * so the seam to the vendored Jinja engine is covered even when the cases above skip. They check
+ * the three properties chat.h promises:
  *
- *   ERRORS ARE VALUES. Upstream throws on a bad template, a message it rejects, a malformed
- *   request -- and a throw crossing the server's request loop is not a failure mode this project
- *   accepts. Every one of those has to come back as a negative RAD_E_*.
+ *   Errors are values. Upstream throws on a bad template, a rejected message or a malformed
+ *   request; every one must come back as a negative RAD_E_*, never cross the request loop.
  *
- *   THE FALLBACK IS ANNOUNCED. An empty source is a model whose prompt format we are guessing,
- *   and guessing quietly is how a chat endpoint produces fluent nonsense.
+ *   The fallback is announced. An empty source means the prompt format is a guess.
  *
- *   THE CAPABILITIES ARE PROBED, not assumed -- rendered against synthetic inputs to see what the
- *   template does with them. A probe that answered from a default would report `tools: true` for
- *   a template with no tool support, and the adapter above it would then hand it tools.
+ *   Capabilities are probed by rendering synthetic inputs, not assumed; a default answer would
+ *   report tool support for a template without it.
  */
 
 TEST(an_empty_template_is_the_chatml_fallback_and_says_which_one_it_is) {
     ChatTemplate t;
     CHECK_OK(t.load("", "", ""));
     CHECK(t.ready());
-    /* Named rather than inlined precisely so the server can report which template it is running:
-     * an operator looking at /props has to be able to tell a guess from the model's own. */
+    /* Named, so /props can show the operator that the fallback is in use. */
     CHECK_EQ(t.source(), std::string(ChatTemplate::chatml_source()));
 }
 
@@ -857,7 +906,7 @@ TEST(a_template_is_not_ready_until_one_is_loaded) {
     json msgs = json::array();
     msgs.push_back({{"role", "user"}, {"content", "hello"}});
     ChatPrompt p;
-    /* A value, not a throw and not a crash: this is reached from the request loop. */
+    /* An error value, not a throw: this is reached from the request loop. */
     CHECK(t.apply(msgs, json(), ChatOptions{}, &p) < 0);
 }
 
@@ -884,15 +933,13 @@ TEST(chatml_renders_every_turn_in_order_and_marks_the_assistant_prefix) {
     CHECK(q1 != std::string::npos);
     CHECK(a1 != std::string::npos);
     CHECK(q2 != std::string::npos);
-    /* In the order they were sent. A template that rendered them in any other order would still
-     * contain every string, which is why the positions and not the presence are the check. */
+    /* In the order sent; positions, not mere presence, are checked. */
     CHECK(sys < q1);
     CHECK(q1 < a1);
     CHECK(a1 < q2);
 
-    /* THE GENERATION PROMPT IS ALREADY INSIDE THE PROMPT, and saying so is the contract the
-     * scheduler and the reply parser both read: the parser cuts the reply at it, and a copy that
-     * was not a suffix of the prompt would cut at the wrong byte. */
+    /* The generation prompt is a suffix of the prompt; the scheduler and the reply parser rely
+     * on it, and the parser cuts the reply there. */
     CHECK(!p.generation_prompt.empty());
     CHECK(p.prompt.size() >= p.generation_prompt.size());
     CHECK_EQ(p.prompt.compare(p.prompt.size() - p.generation_prompt.size(),
@@ -919,15 +966,12 @@ TEST(without_a_generation_prompt_nothing_is_appended_for_the_assistant) {
     CHECK_EQ(with.prompt.compare(0, without.prompt.size(), without.prompt), 0);
 }
 
-/* THE FLAG STRIPS A BOS, IT DOES NOT ADD ONE, and the difference is a whole token of prompt.
+/* The add-BOS flag strips the template's BOS rather than adding one. The container says whether
+ * the tokeniser adds BOS; if it does and the template also renders `bos_token`, the render drops
+ * the template's so exactly one reaches the model. A doubled BOS is a prompt the model was never
+ * trained on.
  *
- * The container says whether the TOKENISER adds BOS. When it does and the template also renders
- * `bos_token`, the prompt carries two -- so the render drops the one the template wrote. Read the
- * other way round, the flag would put a second one in rather than take one out, and a doubled BOS
- * is a prompt the model was never trained on with nothing in the output to say so.
- *
- * ChatML renders no bos_token, so this needs a template that does. Four lines of Jinja rather
- * than a checkpoint, because the behaviour under test is the render's and not the vendor's. */
+ * ChatML renders no bos_token, so a minimal inline template is used. */
 TEST(a_bos_the_tokeniser_will_add_is_not_also_rendered_into_the_prompt) {
     static const char* src =
         "{{- bos_token -}}"
@@ -936,15 +980,14 @@ TEST(a_bos_the_tokeniser_will_add_is_not_also_rendered_into_the_prompt) {
     json msgs = json::array();
     msgs.push_back({{"role", "user"}, {"content", "hello"}});
 
-    /* The tokeniser does not add one, so the template's own has to stay. */
+    /* The tokeniser adds none, so the template's stays. */
     ChatTemplate keeps;
     CHECK_OK(keeps.load(src, "<s>", "</s>", false, false));
     ChatPrompt a;
     CHECK_OK(keeps.apply(msgs, json(), ChatOptions{}, &a));
     CHECK_EQ(a.prompt.compare(0, 3, "<s>"), 0);
 
-    /* The tokeniser does add one, so the template's own is dropped -- exactly one BOS reaches the
-     * model either way. */
+    /* The tokeniser adds one, so the template's is dropped. */
     ChatTemplate drops;
     CHECK_OK(drops.load(src, "<s>", "</s>", true, false));
     ChatPrompt b;
@@ -952,39 +995,36 @@ TEST(a_bos_the_tokeniser_will_add_is_not_also_rendered_into_the_prompt) {
     CHECK(b.prompt.compare(0, 3, "<s>") != 0);
     CHECK_EQ(a.prompt.size() - b.prompt.size(), (size_t)3);
 
-    /* And the request may say so for a container that did not: the two are ORed, so a caller can
-     * turn it on and cannot turn it off. */
+    /* A request may set it for a container that did not; the two are ORed, so a caller can turn
+     * it on but not off. */
     ChatPrompt c;
     ChatOptions opt;
     opt.add_bos = true;
     CHECK_OK(keeps.apply(msgs, json(), opt, &c));
     CHECK_EQ(c.prompt, b.prompt);
 }
-/* THE PROBE HAS TO ANSWER FROM THE TEMPLATE. ChatML reads `message.content` and nothing else --
- * no tool loop, no tool_calls -- so a probe reporting tool support for it is a probe reporting a
- * default, and the adapter above would then hand this template a tool list it cannot render. */
+/* The probe answers from the template: ChatML reads only `message.content`, so it must not report
+ * tool support. */
 TEST(the_capability_probe_reads_what_the_template_actually_does) {
     ChatTemplate t;
     CHECK_OK(t.load(ChatTemplate::chatml_source(), "", ""));
     const ChatCaps& c = t.caps();
     CHECK(!c.tools);
     CHECK(!c.tool_calls);
-    /* It does read a string content, and it does render whatever role it is given. */
+    /* It reads string content and renders any role. */
     CHECK(c.string_content);
     CHECK(c.system_role);
 }
 
-/* Jinja that does not parse is the ordinary case for a container somebody built by hand, and it
- * arrives at load time rather than at the first request -- which is the whole point of loading
- * once at startup. It must be a value: a throw here crosses the bringup path. */
+/* Unparseable Jinja (common in hand-built containers) is reported at load time as an error value;
+ * a throw would cross the bringup path. */
 TEST(a_template_that_does_not_parse_is_a_value_and_not_a_throw) {
     ChatTemplate t;
     CHECK(t.load("{%- for message in messages -%}{{ message.content }}", "", "") < 0);
     CHECK(!t.ready());
 }
 
-/* The messages come off an HTTP request, so every shape a client can send has to come back as a
- * refusal rather than as an exception through the request loop. */
+/* Messages come from an HTTP request, so any malformed shape is refused, never thrown. */
 TEST(a_message_list_that_is_not_one_is_refused_rather_than_thrown) {
     ChatTemplate t;
     CHECK_OK(t.load(ChatTemplate::chatml_source(), "", ""));
@@ -996,13 +1036,12 @@ TEST(a_message_list_that_is_not_one_is_refused_rather_than_thrown) {
     json no_role = json::array();
     no_role.push_back({{"content", "hello"}});
     CHECK(t.apply(no_role, json(), ChatOptions{}, &p) < 0);
-    /* And a null, which is what a missing field deserialises to. */
+    /* A null, as a missing field deserialises. */
     CHECK(t.apply(json(), json(), ChatOptions{}, &p) < 0);
 }
 
-/* A client's tool and response schemas reach the JSON-schema converter, which recurses once per
- * level of nesting; a schema some thousands of levels deep -- tens of kilobytes of request --
- * exhausts the thread rendering it. It is refused on its depth before the template runs. */
+/* The JSON-schema converter recurses once per nesting level, so a schema thousands of levels
+ * deep (tens of KB of request) would exhaust the stack. It is refused on depth before rendering. */
 TEST(a_schema_nested_past_the_limit_is_refused_before_it_is_rendered) {
     ChatTemplate t;
     CHECK_OK(t.load(ChatTemplate::chatml_source(), "", ""));

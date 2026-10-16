@@ -1,39 +1,25 @@
 // H += X^T X, in f32, over an E4M3 activation with a per-(row, group) scale, or over a plain bf16
 // one.
 //
-// WHAT IT IS FOR. GPTQ needs a Gram matrix of the layer's real input -- the second moment
-// `H = sum_t x_t x_t^T` over a calibration corpus -- and this is the device half of producing one;
-// `rad_quantize` alone cannot, because it has no calibration harness to run the activations
-// through. The 4-bit expert format is the caller: see docs/MOE-W4.md.
+// Purpose: the device half of GPTQ's Gram matrix `H = sum_t x_t x_t^T` over a calibration corpus,
+// for the 4-bit expert format (docs/MOE-W4.md).
 //
-// IT IS NOT A GEMM AND CANNOT BE ONE. `gemm_nt` contracts the LAST axis of both operands; this
-// contracts the FIRST axis of both. Declaring it as a GEMM would need X transposed in memory,
-// which is a 26 MB scratch buffer and a transpose kernel for an op whose whole body is an FMA
-// loop. So it is its own row.
+// Not a GEMM: `gemm_nt` contracts the last axis of both operands, this contracts the first.
+// Expressing it as a GEMM would need a transposed copy of X (a 26 MB scratch and a transpose).
 //
-// WHY THE INPUT IS E4M3 AND NOT bf16. The two taps are the MoE block's own quantiser outputs --
-// `had_quant_act_fp8`'s (q, scale) for gate_up, and `gated_had_quant_fp8`'s for down. Those are
-// literally the bytes the expert GEMM contracts, so a Hessian built from them is a Hessian of the
-// arithmetic that actually runs rather than of the bf16 that preceded it. It is also the only
-// form the rotated path HAS: nothing stores the rotated activation as bf16.
+// E4M3 input: the taps are the MoE block's own quantiser outputs (`had_quant_act_fp8` for gate_up,
+// `gated_had_quant_fp8` for down), the bytes the expert GEMM actually contracts, and the only form
+// the rotated path stores. A bf16 instantiation reads the plain activation of a bf16-served model;
+// everything past the staging is shared.
 //
-// AND A bf16 FORM BESIDE IT, for the same reason pointing the other way. A model served at bf16
-// contracts its experts against the plain bf16 activation, so that IS the operand there, and the
-// bf16 instantiation reads it with no scale. Everything past the staging is shared.
+// The gate_up tap is the unsorted activation. Every token is routed to exactly top_k experts, so
+// the expert GEMM's input distribution gives H_sorted = top_k * H_token, and GPTQ is invariant to a
+// positive scale on H (damping is a fraction of the trace, LDLQ uses ratios). Taking M token rows
+// instead of M*top_k gathered ones saves a factor of top_k.
 //
-// THE TOP-K WEIGHTING IS FREE AND THIS IS WHY THE gate_up TAP IS THE UNSORTED ACTIVATION.
-// The expert GEMM reads token rows through a `sorted` index list, so its true input distribution
-// is every token repeated top_k times. Every token is routed to EXACTLY top_k experts, so that
-// distribution is the token distribution scaled by top_k -- H_sorted = top_k * H_token, exactly --
-// and GPTQ is invariant to a positive scale on H (the damping is a fraction of the trace and the
-// LDLQ update uses ratios). So the tap takes the M token rows once and not the M*top_k gathered
-// ones, at a top_k-fold saving, and loses nothing.
-//
-// ACCUMULATION IS f32 AND DELIBERATELY NOT f64. A block keeps its whole tile in registers across
-// the M loop and touches global once, so the error over a 2048-row launch is a register tree, not
-// a 2048-deep serial sum. Across launches the global f32 accumulator sees ~one add per launch.
-// The consumer damps H by a percent of its trace before inverting it, which is four orders of
-// magnitude above anything this rounds away; f64 would double 1.3 GB of state to buy nothing.
+// Accumulation is f32, not f64: a block keeps its tile in registers across the M loop and adds to
+// global once per launch. The consumer damps H by a percent of its trace, far above this rounding;
+// f64 would double 1.3 GB of state.
 //
 // Returns a negative code rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
 
@@ -43,19 +29,16 @@
 
 namespace {
 
-// A 64-wide C tile, 256 threads, 4x4 accumulators a thread: 16x16 threads x 16 = 4096 = 64*64.
-// 64 is chosen against the SCALE GRID as much as against the register file -- a 64-column tile
-// whose start is a multiple of 64 lies entirely inside one 128-wide scale group, so a row's scale
-// is ONE load a tile rather than one a column. The launcher enforces that by refusing a group the
-// tile does not divide.
+// A 64-wide C tile, 256 threads, 4x4 accumulators per thread (16x16 threads x 16 = 64*64). A
+// 64-aligned tile lies inside one scale group, so a row's scale is one load per tile; the launcher
+// refuses a group the tile does not divide.
 constexpr int kTile    = 64;
 constexpr int kThreads = 256;
 constexpr int kMB      = 32;    // M rows staged a pass; 2 * 32 * 64 * 4 = 16 KiB of LDS
 constexpr int kTT      = 4;
 
-/* BF16 reads a plain bf16 activation and no scale: a staging slot is then four elements in two
- * dwords, and everything after the staging -- the tile, the accumulation order, the store -- is the
- * fp8 form's. The fp8 instantiation carries none of the bf16 staging. */
+/* BF16 reads a plain bf16 activation with no scale: a staging slot is four elements in two dwords.
+ * Everything after the staging is shared with the fp8 form. */
 template <bool BF16>
 __global__ __launch_bounds__(kThreads) void gram_accum_kernel(
     const void* __restrict__ qv, const float* __restrict__ sc, float* __restrict__ h,
@@ -78,8 +61,8 @@ __global__ __launch_bounds__(kThreads) void gram_accum_kernel(
 
     for (uint32_t m0 = 0; m0 < M; m0 += (uint32_t)kMB) {
         __syncthreads();
-        // 32 rows x 16 dwords = 512 staging slots for 256 threads, twice, for each of the two
-        // tiles. A dword is four E4M3 codes and decodes in two v_cvt_pk_f32_fp8.
+        // 32 rows x 16 slots = 512 per tile, two per thread. An fp8 slot is a dword of four E4M3
+        // codes, decoded by two v_cvt_pk_f32_fp8.
         for (uint32_t idx = threadIdx.x; idx < (uint32_t)(kMB * kTile / 4);
              idx += (uint32_t)kThreads) {
             const uint32_t mi = idx >> 4, cq = (idx & 15u) * 4u;
@@ -103,9 +86,8 @@ __global__ __launch_bounds__(kThreads) void gram_accum_kernel(
                     }
                 } else {
                     if (c1 < K) {
-                        // The row is owned out to K rounded up to four bytes -- quant_act_fp8's
-                        // own contract -- so a dword load at c1 < K is inside the caller's
-                        // allocation even when the last group is ragged.
+                        // The row is owned out to K rounded up to four bytes (quant_act_fp8's
+                        // contract), so a dword load at c1 < K stays inside the allocation.
                         const uint32_t w = *(const uint32_t*)((const uint8_t*)qv + qrow + c1);
                         const float s = sc[(size_t)m * s_ld + g1];
                         const v2f lo = r4d_fp8::e4m3_pk<false>(w), hi = r4d_fp8::e4m3_pk<true>(w);
@@ -139,8 +121,8 @@ __global__ __launch_bounds__(kThreads) void gram_accum_kernel(
         }
     }
 
-    // One block owns one C tile, so this read-modify-write races with nothing. It is an ACCUMULATE
-    // and not a store: the caller zeroes H once and then drives the whole corpus through it.
+    // One block owns one C tile, so the read-modify-write is race-free. The caller zeroes H once
+    // and accumulates the whole corpus into it.
 #pragma unroll
     for (int i = 0; i < kTT; ++i) {
         const uint32_t k1 = k1_0 + ty * kTT + (uint32_t)i;
@@ -159,7 +141,7 @@ extern "C" int r4d_gram_accum_fp8_tile(void) { return kTile; }
 
 //   q  [M][K]                E4M3, `q_ld` bytes a row (0 = K), owned out to a multiple of 4
 //   s  [M][ceil(K/grp)]      f32,  `s_ld` elements a row (0 = ceil(K/grp))
-//   h  [K][K]                f32,  `h_ld` elements a row (0 = K) -- READ AND WRITTEN
+//   h  [K][K]                f32,  `h_ld` elements a row (0 = K), read and written
 extern "C" int r4d_gram_accum_fp8(long q, long s, long h, int M, int K, int grp,
                                   int q_ld, int s_ld, int h_ld, long stream) {
     if (!q || !s || !h) return -1;
@@ -179,7 +161,7 @@ extern "C" int r4d_gram_accum_fp8(long q, long s, long h, int M, int K, int grp,
 }
 
 //   a  [M][K]                bf16, `a_ld` elements a row (0 = K)
-//   h  [K][K]                f32,  `h_ld` elements a row (0 = K) -- READ AND WRITTEN
+//   h  [K][K]                f32,  `h_ld` elements a row (0 = K), read and written
 extern "C" int r4d_gram_accum_bf16(long a, long h, int M, int K, int a_ld, int h_ld, long stream) {
     if (!a || !h) return -1;
     if (M <= 0 || K <= 0) return -2;
@@ -203,9 +185,10 @@ extern "C" int r4d_rad_gram_accum(const RadArgs* a, RadStream s) {
     const RadTensor* sc = r4d_opt(a, GA_S);
     const RadTensor* h = r4d_opt(a, GA_H);
     if (!q || !sc || !h) return R4D_NO(RAD_E_INVAL);
-    /* ROWS ARE DIM 0 AND EVERYTHING AFTER IT IS THE ROW, the same reading r4d_rad_quant_act_fp8
-     * takes: a rank-3 activation is one row a token and its K is the product of the rest. `sc`
-     * and `h` stay rank 2 because this op's meaning fixes them. */
+    if (q->dtype != RAD_F8E4M3 || sc->dtype != RAD_F32 || h->dtype != RAD_F32)
+        return R4D_NO(RAD_E_DTYPE);
+    /* Rows are dim 0 and everything after is the row, as in r4d_rad_quant_act_fp8; `sc` and `h`
+     * are rank 2 by definition. */
     if (q->rank < 2 || sc->rank != 2 || h->rank != 2) return R4D_NO(RAD_E_SHAPE);
     const long long M = q->shape[0];
     if (M < 1 || r4d_numel(q) % M) return R4D_NO(RAD_E_SHAPE);
@@ -225,8 +208,7 @@ extern "C" int r4d_rad_gram_accum_bf16(const RadArgs* a, RadStream s) {
     const RadTensor* x = r4d_opt(a, GA_Q);
     const RadTensor* h = r4d_opt(a, GA_H);
     if (!x || !h) return R4D_NO(RAD_E_INVAL);
-    /* No scale: the bf16 form reads the activation as it stands. One handed over anyway is a
-     * caller that believes the input is quantised, and it is refused rather than ignored. */
+    /* A scale operand means the caller believes the input is quantised; refuse it. */
     if (r4d_opt(a, GA_S)) return R4D_NO(RAD_E_INVAL);
     if (x->dtype != RAD_BF16 || h->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
     if (x->rank < 2 || h->rank != 2) return R4D_NO(RAD_E_SHAPE);

@@ -1,38 +1,28 @@
 // r4d_had_quant_act_i8.hip - r4d_had_quant_act_i8: a block Hadamard along K, then per-row symmetric
 // int8 quantisation, written in the order r4d_gemm_w4a8_nt_m64's A fragment wants.
 //
-// WHY THE ROTATION LIVES HERE.  Plain per-token int8 activations are unusable on these models: the
-// KL against the bf16 model is an order of magnitude worse than per-token e4m3.  A block Hadamard
-// first puts int8 several times BETTER than e4m3 instead.  The mechanism is that a rotation fixes
-// RANGE, not precision: int8 spends its whole grid covering a few outlier channels, and mixing each
-// value with 127 others removes them.  The same rotation does nothing for e4m3 -- marginally worse,
-// in fact -- because four exponent bits already carry the outliers and Gaussianising does not add
-// mantissa bits.
+// Why the rotation: plain per-token int8 activations are unusable on these models (KL against bf16
+// an order of magnitude worse than per-token e4m3); a block Hadamard first makes int8 several times
+// better than e4m3. A rotation fixes range, not precision: int8 spends its grid covering a few
+// outlier channels, and mixing each value with 127 others removes them. It does not help e4m3
+// (marginally worse), whose four exponent bits already carry the outliers. It must happen before
+// the absmax, since the benefit is a smaller row maximum, so it belongs in the quantiser.
 //
-// It has to happen BEFORE the absmax, which is why it belongs in the quantiser rather than in front
-// of it: the entire benefit is that the row maximum the int8 grid is scaled by gets smaller.
+// The seven butterfly stages (~14 ops per element) ride on a launch the quantiser pays anyway. The
+// remaining cost is one launch per rotated site per layer, which fusing into the producing RMSNorm
+// or SwiGLU removes.
 //
-// THE ROTATION IS FREE, THE LAUNCH IS NOT.  A quantiser has to run either way, so seven butterfly
-// stages ride along on a launch already being paid -- ~14 ops per element on a kernel that already
-// touches every element twice.  What costs is the number of these a decode step needs: one per
-// rotated site per layer.  That cost comes out by fusing the rotation into the RMSNorm or SwiGLU
-// that produces the input, not by making the transform cheaper.
+// Width: 128, 256 and 512 are built; 1024 is not, for sharding reasons. A rotation block cannot
+// straddle a tensor-parallel boundary, so the width must divide the per-rank K, and a down_proj of
+// 17408 at TP=2 is 8704 = 2^9 * 17. The weight error barely moves from 128 to 1024, so the width
+// is picked on the activation's terms alone.
 //
-// WIDTH.  128, 256 and 512 are all buildable; 1024 is NOT, and the reason is sharding rather than
-// quality.  A rotation block cannot straddle a tensor-parallel boundary, so the width has to divide
-// the PER-RANK K, and a down_proj of 17408 at TP=2 is 8704 = 2^9 * 17.  512 divides it, 1024 does
-// not.  Width is nearly free to choose because the weight error barely moves across 128 through
-// 1024, so it is picked on the activation's terms alone.
+// The transform is in registers (r4d_fwht.h): one wave owns a `had`-wide block, and the only LDS
+// traffic left is one staging write so the row absmax can see the whole row.
 //
-// THE TRANSFORM IS IN REGISTERS, NOT LDS.  See r4d_fwht.h for why staging the butterfly in LDS
-// costs several times the whole quantiser.  One wave owns a `had`-wide block in registers and the
-// only shared traffic left is a single staging write, because the row absmax still has to see the
-// whole row.
-//
-// NORMALISATION IS FOLDED INTO THE SCALE.  The stages below compute the UNNORMALISED transform, whose
-// values are sqrt(had) times the orthonormal ones.  Rather than a pass to divide them, the row scale
-// carries it: quantising with inv = 127/absmax_unnorm gives exactly the codes the normalised
-// transform would, and S[row] = absmax_unnorm / (sqrt(had) * 127) is the scale that undoes both.
+// Normalisation is folded into the scale. The stages compute the unnormalised transform (sqrt(had)
+// times the orthonormal one); quantising with inv = 127/absmax_unnorm gives exactly the normalised
+// codes, and S[row] = absmax_unnorm / (sqrt(had) * 127) undoes both.
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_common.h"
@@ -40,12 +30,6 @@
 #include <hip/hip_bf16.h>
 #include <cstdint>
 #include <cmath>
-
-// 0 = choose the workgroup width from M at launch (see r4d_act_threads in r4d_common.h); a
-// non-zero build-time value pins one width for every M.
-#ifndef R4D_HQAI8_THREADS
-#define R4D_HQAI8_THREADS 0
-#endif
 
 template <int HAD, int THR>
 __global__ __launch_bounds__(THR) void r4d_had_quant_act_i8_kernel(
@@ -96,10 +80,8 @@ __global__ __launch_bounds__(THR) void r4d_had_quant_act_i8_kernel(
 // The launch, as the plugin ABI's RadLaunchFn. See the note at the head of r4d_quant_act_i8.hip on
 // the argument list and the status return.
 //
-// THE WIDTH SET IS A PROPERTY OF THIS FILE, not of the row that selects it: the rows bound the
-// rotation with `had <= 512` and nothing else, and the kernel compiles exactly 128, 256 and 512.
-// 1024 cannot tile a down_proj of 8704 per rank, and nothing narrower than 128 is instantiated, so
-// a legal-looking 64 is refused here.
+// The width set belongs to this file, not the row: the rows only bound `had <= 512`, and the kernel
+// compiles exactly 128, 256 and 512, so a legal-looking 64 is refused here.
 enum { HQ_X = 0, HQ_Q, HQ_S };
 
 extern "C" int r4d_rad_had_quant_act_i8(const RadArgs* args, RadStream stream) {
@@ -116,11 +98,11 @@ extern "C" int r4d_rad_had_quant_act_i8(const RadArgs* args, RadStream stream) {
 
   const long long had = r4d_geti_or(args, "group", 0);
   if (had != 128 && had != 256 && had != 512) return R4D_NO(RAD_E_SHAPE);
-  // A rotation block cannot straddle a tensor-parallel shard boundary, so the PER-RANK K is what
-  // it has to divide -- which is why 512 is the widest that down_proj's 8704 admits.
+  // A rotation block cannot straddle a tensor-parallel shard, so it must divide the per-rank K
+  // (down_proj's 8704 admits at most 512).
   if (K % had) return R4D_NO(RAD_E_SHAPE);
 
-  const int thr = R4D_HQAI8_THREADS ? R4D_HQAI8_THREADS : r4d_act_threads((int)M, (int)K);
+  const int thr = r4d_act_threads((int)M, (int)K);
   const size_t shmem = (size_t)K * sizeof(float) + (thr / 32) * sizeof(float);
   if (shmem > 65536) return R4D_NO(RAD_E_SCRATCH);   // K too large to stage in LDS
   const float rn = 1.f / sqrtf((float)had);
@@ -128,7 +110,6 @@ extern "C" int r4d_rad_had_quant_act_i8(const RadArgs* args, RadStream stream) {
     dim3(T), shmem, (hipStream_t)stream, (const __hip_bfloat16*)r4d_p(x), \
     (signed char*)r4d_wp(q), (float*)r4d_wp(sc), (int)K, rn)
 #define R4D_HQ_T(H) switch (thr) { \
-    case 128: R4D_HQ_LAUNCH(H, 128); break; \
     case 256: R4D_HQ_LAUNCH(H, 256); break; \
     case 512: R4D_HQ_LAUNCH(H, 512); break; \
     case 1024: R4D_HQ_LAUNCH(H, 1024); break; \
@@ -140,5 +121,5 @@ extern "C" int r4d_rad_had_quant_act_i8(const RadArgs* args, RadStream stream) {
   }
 #undef R4D_HQ_T
 #undef R4D_HQ_LAUNCH
-  return RAD_OK;
+  return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
 }

@@ -1,13 +1,11 @@
-/* engine_bringup.cpp -- everything the Engine does ONCE, in the order it does it.
+/* engine_bringup.cpp -- everything the Engine does once, in order: devices, the container's
+ * metadata, the plugins, declare, the placement plan, the weights, the KV pools, the rank threads
+ * and the vocabulary. Each numbered section is one component doing its own job.
  *
- * Devices, the container's metadata, the plugins, declare, the placement plan, the weights, the
- * KV pools, the ranks' threads, the vocabulary. Each numbered section is one component doing its
- * own job; this file is the order they happen in and nothing else.
- *
- * Kept apart from engine.cpp because none of it runs again: the step loop next door is on the hot
- * path and shares nothing with this but the Engine's fields. See engine_priv.h.
+ * Separate from engine.cpp (the hot step loop), with which it shares only the Engine's fields.
  */
 #include "engine_priv.h"
+#include "engine_hostmem.h"
 #include "gen/driver.h"
 
 #include "build/startup.h"
@@ -21,9 +19,11 @@
 #include "rad_plugin.h"
 #include "mem/vram_budget.h"
 #include "runtime/arena.h"
+#include "runtime/kvbind.h"
 #include "runtime/xprefetch.h"
 #include "sample/gbnf.h"
 #include "sched/scheduler.h"
+#include "text/token_view.h"
 #include "text/tokenizer.h"
 
 #include <sys/mman.h>
@@ -52,39 +52,27 @@
 namespace rad {
 
 /* ================================================================== the miss report */
-/* WHAT DID NOT RESOLVE, in the three shapes the three answers want.
+/* What did not resolve, in three classes reported differently:
  *
- * A DEVICE miss NO HOST KERNEL STANDS IN FOR is a hole (Program::device_holes has the rule). The
- * band exists and a request can land in it, so the engine refuses to start on one rather than
- * serve until the first step that does -- and every one gets a line of its own carrying the
- * geometry and the constraint that refused it.
+ *   - A device miss no host kernel stands in for is a hole (Program::device_holes). A request can
+ *     land in it, so the engine refuses to start; each gets its own line with the geometry and
+ *     refusing constraint.
+ *   - A device miss a host kernel stands in for is not a hole: the planner runs the op on the host
+ *     with its weights in the container's mapping (how `embed_lookup_q` serves a table too large
+ *     for VRAM). An op with no weights has nothing to place, so on a card its host kernel cannot
+ *     stand in (paged attention reads a VRAM cache).
+ *   - A host miss only removes one placement option and is normal for a GPU library: one line for
+ *     all of them.
  *
- * A DEVICE miss a host kernel stands in for is not a hole at all. The planner puts that op's
- * arithmetic on the host and its weights in the container's mapping, which is how `embed_lookup_q`
- * serves a table too large to copy into VRAM when no device kernel for it is loaded. Reporting
- * that as fatal produces an error nobody believes, and an error nobody believes is how a real one
- * goes unread. An op with no weights has nothing to place, so on a card its host kernel does not
- * stand in: paged attention reads a cache in VRAM, and only a device kernel can.
- *
- * A HOST miss removes ONE placement option for ONE op, and for a kernel library written for a GPU
- * it is the ordinary case rather than news: most ops have no host implementation and never will.
- * One line for all of them.
- *
- * The distinction is the whole point of this function. Printed alike, a large model at tp2 opens
- * with thousands of lines of `E` that are all host misses, and a real device hole is invisible
- * among them. */
+ * Printed alike, host misses would bury a real device hole in thousands of lines. */
 struct MissReport {
     std::vector<std::string> device;   /* one line each; the engine does not start */
     std::string              host;     /* one line, or empty */
-    /* Device bands whose op DOES have a host kernel. Not a hole: the planner runs such an op on
-     * the host and pins its weights there (Tier::Mapped), which is the whole of how a table too
-     * large to copy into VRAM is served. Reported apart because calling it fatal is a lie an
-     * operator has to learn to ignore -- and an error nobody believes is how a real one goes
-     * unread. */
+    /* Device misses covered by a host kernel (Tier::Mapped weights); informational. */
     std::string              host_only;
-    /* A hole is an all-reduce instance declared on the lossy wire (`exact` 0, which the model
-     * plugin derives from --tp-wire, rad_builder.h). The libraries may serve that world size on
-     * the exact wire, so the refusal names the flag that asks for it. */
+    /* A hole is an all-reduce declared on the lossy wire (`exact` 0, from --tp-wire;
+     * rad_builder.h). The exact wire may be served at that world size, so the refusal names the
+     * flag. */
     bool                     lossy_wire = false;
 
     bool operator==(const MissReport& o) const {
@@ -140,12 +128,8 @@ static MissReport miss_report(const Program& p, bool host_backend) {
     }
     if (host_ops.empty()) return r;
 
-    /* THE OP NAMES, ALL OF THEM UNTIL IT GETS SILLY, and not the bands: a reader who wants the
-     * bands wants --debug-graph, and the bands are what would make this report thousands of lines
-     * long. The names are what a reader can act on -- each one is a reference kernel somebody could
-     * write -- and a short list is not enough to act on: whole-model host execution needs EVERY op
-     * covered, so the op behind "and 1 more" is the one that stops the run and the one the line
-     * does not name. Sixteen is past the point where the answer is a list rather than a shape. */
+    /* Op names, not bands (--debug-graph has those), up to 16. Whole-model host execution needs
+     * every op covered, so the names are actionable; past 16 the list stops being useful. */
     std::string names;
     const size_t k_named = 16;
     for (size_t i = 0; i < host_ops.size() && i < k_named; ++i)
@@ -161,16 +145,13 @@ static MissReport miss_report(const Program& p, bool host_backend) {
 }
 
 /* ================================================================== 1. devices */
-/* A HIP device is not necessarily a discrete GPU. A host with an integrated GPU reports it as a
- * device of its own, claiming a slice of system RAM as VRAM, and a --tp that lands a rank on one
- * runs slowly and wrongly with a failure that looks like a kernel bug. So the engine uses the
- * discrete cards when there are any -- integrated graphics only when it is all there is, which is
- * an APU machine -- and of those the ones sharing the first one's arch, and prints only what that
- * choice DID, rather than reprinting the backend's inventory. Which devices the backend shows at
- * all is the runtime's to say: ROCR_VISIBLE_DEVICES and HIP_VISIBLE_DEVICES pick them. */
-/* `names` receives every device's product name, indexed by device ("" where its properties could
- * not be read), for the startup report's identification of the cards (Engine::identify_devices):
- * the properties are read here once, and reading them again visits each device. */
+/* Choose the devices. An integrated GPU appears as its own HIP device with system RAM as VRAM, and
+ * a rank placed on one runs slowly and wrongly. So the engine uses the discrete cards if any
+ * (integrated only on an APU-only machine), restricted to the first one's arch, and reports only
+ * what it skipped. ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES control what the runtime exposes.
+ *
+ * `names` receives every device's product name by index ("" if unreadable), for
+ * Engine::identify_devices, so the properties are read only once. */
 static int usable_devices(std::vector<int>* out, std::string* inventory, std::string* note,
                           std::vector<std::string>* names) {
     const int n = rad_dev_count();
@@ -191,7 +172,7 @@ static int usable_devices(std::vector<int>* out, std::string* inventory, std::st
         any_discrete |= !igpu;
     }
 
-    std::string want;              /* the arch of the first device taken -- the ranks must all match */
+    std::string want;              /* the first taken device's arch; all ranks must match */
     std::string use, skip;
     for (const D& d : all) {
         const bool take = (!any_discrete || !d.igpu) && (want.empty() || want == d.arch);
@@ -202,11 +183,8 @@ static int usable_devices(std::vector<int>* out, std::string* inventory, std::st
     }
     *inventory = fmt("%s backend, %d device(s) [%s]", device_backend_name(), n, inv.c_str());
 
-    /* THE BACKEND ALREADY PRINTED THAT INVENTORY (core/device/dispatch.cpp), so repeating it here
-     * would only cost a reader two lines that say the same thing in different capitalisation.
-     * What is the engine's to say is which of them it will USE -- and that is news only when the
-     * arch filter dropped one, so on a uniform machine this stays empty and nothing is
-     * printed. */
+    /* The backend already printed the inventory (core/device/dispatch.cpp); note only devices
+     * skipped by the filter. */
     *note = skip.empty()
           ? std::string()
           : fmt("using %zu of %d [%s], ignoring [%s]: integrated graphics beside a discrete card, "
@@ -216,16 +194,23 @@ static int usable_devices(std::vector<int>* out, std::string* inventory, std::st
     return out->empty() ? RAD_E_DEVICE : RAD_OK;
 }
 
-/* WHY A POOL'S MEMORY WAS REFUSED, from what the machine holds now. The refusal carries the
- * driver's own answer; these are the facts that explain most of them.
+/* A /proc/meminfo field ("MemTotal", "MemAvailable") in bytes, or -1 when absent. */
+static int64_t meminfo_bytes(const char* key) {
+    std::ifstream f("/proc/meminfo");
+    const std::string want = std::string(key) + ": %lld kB";
+    std::string line;
+    long long kb = 0;
+    while (std::getline(f, line))
+        if (std::sscanf(line.c_str(), want.c_str(), &kb) == 1) return (int64_t)kb * 1024;
+    return -1;
+}
+
+/* Explain a refused pool allocation from the machine's current state.
  *
- * A card refusing its weights pool after its budget was measured had that memory taken in
- * between, and another process on the card is the usual taker -- the budget is measured once,
- * before any rank allocates. A host pool is PINNED memory, and every rank pins its own
- * --host-pool-mib, so a second rank asks for the same amount again. The pool is locked user memory,
- * which the amdgpu driver counts against one system-wide cap: RAM less 1/64 and 1.5 GiB (half of
- * RAM less 1/64 below 3 GiB), unless amdgpu.no_system_mem_limit lifts it. ttm.pages_limit bounds
- * the driver's own allocations and not these. */
+ * A card pool refused after the budget was measured (once, before any rank allocates) usually
+ * lost the memory to another process. A host pool is pinned, once per rank. Pinned memory counts
+ * against amdgpu's system-wide cap: RAM less 1/64 and 1.5 GiB (half of RAM less 1/64 below
+ * 3 GiB), unless amdgpu.no_system_mem_limit lifts it; ttm.pages_limit does not apply. */
 static void report_pool_refusal(int rank, int device, const Pools& pools, const Config& cfg) {
     bool card = false, host = false;
     for (const Shortfall& f : pools.shortfalls()) (f.pool == "host_pool" ? host : card) = true;
@@ -241,16 +226,7 @@ static void report_pool_refusal(int rank, int device, const Pools& pools, const 
         int64_t pinned = 0, mapped = 0;
         rad_dev_alloc_totals(RAD_MEM_HOST_PINNED, &pinned, nullptr);
         rad_dev_alloc_totals(RAD_MEM_HOST_MAPPED, &mapped, nullptr);
-        int64_t total = -1, avail = -1;
-        {
-            std::ifstream f("/proc/meminfo");
-            std::string line;
-            while (std::getline(f, line)) {
-                long long kb = 0;
-                if (std::sscanf(line.c_str(), "MemTotal: %lld kB", &kb) == 1) total = (int64_t)kb * 1024;
-                if (std::sscanf(line.c_str(), "MemAvailable: %lld kB", &kb) == 1) avail = (int64_t)kb * 1024;
-            }
-        }
+        const int64_t total = meminfo_bytes("MemTotal"), avail = meminfo_bytes("MemAvailable");
         bool lifted = false;
         {
             std::ifstream f("/sys/module/amdgpu/parameters/no_system_mem_limit");
@@ -263,8 +239,7 @@ static void report_pool_refusal(int rank, int device, const Pools& pools, const 
             cap = total - (total >> 6);
             cap = cap < 2 * reserve ? cap >> 1 : cap - reserve;
         }
-        /* A refusal with room under both is not a capacity one, and advice to shrink the pool
-         * would send the reader after the wrong cause: the device's reason above is the answer. */
+        /* With room under both limits the refusal is not about size; do not advise shrinking. */
         const int64_t pool = cfg.host_pool_total_mib() * 1024 * 1024;
         std::string tables, advice = "Lower --host-pool-mib";
         if (cfg.embedding_host_mib) {
@@ -293,57 +268,17 @@ static void report_pool_refusal(int rank, int device, const Pools& pools, const 
 }
 
 /* ------------------------------------------------------------------ locked host memory */
-/* WHAT EVERYTHING ELSE ON THE HOST STILL NEEDS beside a table locked whole: the process's own
- * unpooled allocations, the load's staging windows and the page cache the container's hot pages
- * live in. A copy that spends the last of it trades a faster gather for the kernel reclaiming
- * the files this engine reads, and then for the OOM killer. */
+/* Host memory left free beside a table locked whole: the process's unpooled allocations, the
+ * load's staging windows, and the page cache holding the container's hot pages. Without it the
+ * kernel reclaims the files the engine reads, then the OOM killer runs. */
 static const int64_t kLockMargin = (int64_t)4 << 30;
 
-/* A cgroup limit and what its members use that reclaim cannot give back: memory.current less its
- * file pages (cgroup v2) or usage_in_bytes less its cache (v1), since page cache yields to a
- * locked allocation and anonymous memory does not. "max" and v1's near-INT64_MAX sentinel are no
- * limit. True with `room` set when `dir` holds one. */
-static bool cgroup_room(const std::string& dir, bool v2, int64_t* room) {
-    auto read_ll = [](const std::string& f, long long* v) {
-        std::ifstream in(f);
-        std::string t;
-        if (!(in >> t)) return false;
-        char* e = nullptr;
-        *v = std::strtoll(t.c_str(), &e, 10);
-        return e && *e == '\0';
-    };
-    auto stat_ll = [](const std::string& f, const char* key, long long* v) {
-        std::ifstream in(f);
-        std::string k;
-        long long x = 0;
-        while (in >> k >> x) if (k == key) { *v = x; return true; }
-        return false;
-    };
-    long long lim = 0, used = 0, file = 0;
-    if (v2) {
-        if (!read_ll(dir + "/memory.max", &lim)) return false;           /* "max" fails to parse */
-        if (!read_ll(dir + "/memory.current", &used)) return false;
-        (void)stat_ll(dir + "/memory.stat", "file", &file);
-    } else {
-        if (!read_ll(dir + "/memory.limit_in_bytes", &lim) || lim >= ((long long)1 << 62))
-            return false;
-        if (!read_ll(dir + "/memory.usage_in_bytes", &used)) return false;
-        if (!stat_ll(dir + "/memory.stat", "total_cache", &file))
-            (void)stat_ll(dir + "/memory.stat", "cache", &file);
-    }
-    const long long hard = used > file ? used - file : 0;
-    *room = lim > hard ? (int64_t)(lim - hard) : 0;
-    return true;
-}
-
-/* WHETHER `need` MORE BYTES CAN BE HELD IN HOST MEMORY, after `still` more that this process will
- * allocate before the copy is made, or why not. Each limit is one a copy would otherwise meet part
- * way through: the memory the kernel reports available, every memory cgroup from the process's own
- * up to the root it can see, which is the limit Docker's --memory sets and the kernel enforces by
- * killing the process -- and, for a copy mlock()ed for the host gather (`mlocks`), RLIMIT_MEMLOCK
- * unless the process holds CAP_IPC_LOCK. Pinned memory a card reads is the driver's userptr
- * mapping, the host pools' kind, and RLIMIT_MEMLOCK does not count it. A limit that cannot be read
- * is not one; a limit that can is never guessed at. */
+/* Whether `need` more bytes fit in host memory after `still` more this process will allocate
+ * first, or why not. Checks MemAvailable; every memory cgroup from the process's own up to the
+ * visible root (Docker's --memory, enforced by the OOM killer); and, for an mlock()ed copy
+ * (`mlocks`), RLIMIT_MEMLOCK unless the process has CAP_IPC_LOCK. Pinned memory a card reads is a
+ * driver userptr mapping, which RLIMIT_MEMLOCK does not count. An unreadable limit is ignored,
+ * never guessed. */
 static bool lockable_room(int64_t need, int64_t still, bool mlocks, std::string* why) {
     long long locked_kb = 0;
     unsigned long long caps = 0;
@@ -363,22 +298,17 @@ static bool lockable_room(int64_t need, int64_t still, bool mlocks, std::string*
                    humanb(need).c_str());
         return false;
     }
-    {
-        std::ifstream f("/proc/meminfo");
-        std::string line;
-        long long kb = -1;
-        while (std::getline(f, line))
-            if (std::sscanf(line.c_str(), "MemAvailable: %lld kB", &kb) == 1) break;
-        if (kb >= 0 && kb * 1024 - still - kLockMargin < need) {
-            *why = fmt("%s of memory is available, %s more is still to be allocated (the pinned "
-                       "host pools and the prefix cache's host tier), and the copy wants %s with %s "
-                       "to spare", humanb(kb * 1024).c_str(), humanb(still).c_str(),
-                       humanb(need).c_str(), humanb(kLockMargin).c_str());
-            return false;
-        }
+    if (const int64_t avail = meminfo_bytes("MemAvailable");
+        avail >= 0 && avail - still - kLockMargin < need) {
+        *why = fmt("%s of memory is available, %s more is still to be allocated (the pinned host "
+                   "pools, the prefix cache's host tier, the checkpoint slots and the host "
+                   "activation arenas), and this wants %s with %s to spare",
+                   humanb(avail).c_str(), humanb(still).c_str(), humanb(need).c_str(),
+                   humanb(kLockMargin).c_str());
+        return false;
     }
     /* /proc/self/cgroup: "0::/path" on v2, "N:memory:/path" (or a comma list naming memory) on v1.
-     * Each level up to the root of the hierarchy this process can see is a limit of its own. */
+     * Each level up to the visible root is a separate limit. */
     std::ifstream f("/proc/self/cgroup");
     std::string line;
     while (std::getline(f, line)) {
@@ -395,28 +325,24 @@ static bool lockable_room(int64_t need, int64_t still, bool mlocks, std::string*
         }
         if (!memory) continue;
         const std::string root = v2 ? "/sys/fs/cgroup" : "/sys/fs/cgroup/memory";
-        for (;;) {
-            const std::string dir = root + (path == "/" ? std::string() : path);
-            int64_t room = 0;
-            if (cgroup_room(dir, v2, &room) && room - still - kLockMargin < need) {
-                *why = fmt("the memory cgroup at %s leaves %s, %s more is still to be allocated, "
-                           "and the copy wants %s with %s to spare", dir.c_str(),
-                           humanb(room).c_str(), humanb(still).c_str(), humanb(need).c_str(),
-                           humanb(kLockMargin).c_str());
-                return false;
-            }
-            if (path.empty() || path == "/") break;
-            const size_t up = path.find_last_of('/');
-            path = up == 0 || up == std::string::npos ? "/" : path.substr(0, up);
-        }
+        bool fits = true;
+        cgroup_levels(root, path, v2, [&](const std::string& dir, int64_t room) {
+            if (room - still - kLockMargin >= need) return true;
+            *why = fmt("the memory cgroup at %s leaves %s, %s more is still to be allocated, "
+                       "and this wants %s with %s to spare", dir.c_str(),
+                       humanb(room).c_str(), humanb(still).c_str(), humanb(need).c_str(),
+                       humanb(kLockMargin).c_str());
+            fits = false;
+            return false;
+        });
+        if (!fits) return false;
     }
     return true;
 }
 
-/* --ngram-placement ram: the copy is table_copy_make's (core/format/table_copy.h), or for a card,
- * table_copy_fill's into pinned memory every card maps at its host address (rad_dev_alloc
- * RAD_MEM_HOST_MAPPED, locked in pieces). This keeps one a container address, shared by every rank,
- * and frees them after the ranks in ~Engine. */
+/* The copy is table_copy_make's (core/format/table_copy.h), or for a card, table_copy_fill into
+ * pinned memory every card maps (rad_dev_alloc RAD_MEM_HOST_MAPPED, locked in pieces). One copy
+ * per container address, shared by every rank; freed in ~Engine. */
 int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
                        std::string* why) {
     for (const auto& c : table_copy_of_)
@@ -450,11 +376,11 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
     return RAD_OK;
 }
 
-/* THE GATHER MOVES TO THE HOST WITH THE TABLE, when --ngram-placement auto chose a pinned copy for
- * a card and it could not be made. Every rank's n-gram weights take the host site, on the
- * WeightInfo Ctx::init reads to choose the op's domain and on the plan beside it, so the gather and
- * its scale move together; a copy some rank already published is host memory, which the host
- * gather reads as it reads RAM. False where no host kernel gathers the table. */
+/* When --ngram-placement auto chose a pinned copy for a card and it could not be made, move the
+ * gather to the host. Every rank's n-gram weights take the host site, in both the WeightInfo
+ * Ctx::init reads and the plan, so the gather and its scale move together; a copy already
+ * published is host memory the host gather can read. False when no host kernel gathers the
+ * table. */
 bool Engine::ngram_gather_to_host() {
     for (auto& r : ranks_) {
         WeightFootprint f;
@@ -471,32 +397,29 @@ bool Engine::ngram_gather_to_host() {
     return true;
 }
 
-/* WHERE THE TWO LOOKUP TABLES GO (--embedding-placement, --ngram-placement), decided once for every
- * rank before the card is split, and written into Config for the planner and the load phase.
+/* Resolve the lookup-table placements (--embedding-placement, --vision-tower-placement,
+ * --ngram-placement) once for every rank before the card is split, into Config for the planner
+ * and the load phase.
  *
- * THE EMBEDDING: Ram, the default, pins it in host memory of its own beside --host-pool-mib
- * (Config::embedding_host_mib), the card's lookup reading its M rows a step over the link in
- * place, so its VRAM goes to the KV cache and the experts. Where it cannot -- a model whose output
- * head is tied to the table reads it whole every step, and a host without the memory has nowhere
- * to pin it -- the default keeps it on the card and says why, and a named `ram` stops the server.
- * Vram keeps it on the card with every other weight a step reads. There is no third tier: the
- * lookup writes the activations a card reads, which a host kernel reading the container cannot
- * reach -- an architecture declares a buffer's domain, and the token embedding's is the device.
+ * Embedding: Ram (default) pins it in its own host memory beside --host-pool-mib
+ * (Config::embedding_host_mib); the card reads its M rows per step over the link, freeing VRAM for
+ * KV and experts. If impossible (an output head tied to the table reads it whole every step, or
+ * the host lacks memory) the default falls back to the card with a reason, while an explicit `ram`
+ * stops the server. There is no disk tier: the lookup writes device-domain activations.
  *
- * THE ENCODER TOWERS: Vram by default; Ram, when named, pins them beside the pool as the embedding
- * is (Config::tower_host_mib), read over the link once an image.
+ * Encoder towers: Vram by default; Ram pins them beside the pool (Config::tower_host_mib), read
+ * over the link once per image.
  *
- * THE N-GRAM TABLE: Vram where a device kernel gathers it and the card holds it; Ram as a copy,
- * pinned for that kernel to read over the link or locked for the host gather; Disk in the
- * container, read by the host gather. Each tier is refused where no kernel reads it there. Auto
- * takes the first that holds the table, in that order: the card's test is the fixed weights and a
- * KV pool for one --max-model-len sequence (`kv_floor`) beside it, and RAM's is lockable_room's --
- * the memory and every cgroup after the pools still to be allocated, and the memlock limit for a
- * locked copy. */
+ * N-gram table: Vram where a device kernel gathers it and it fits; Ram as a copy (pinned for the
+ * device kernel, or locked for the host gather); Disk in the container, read by the host gather.
+ * Each tier is refused where no kernel reads it. Auto takes the first that fits, in that order.
+ * The card test: the fixed weights plus a KV pool for one --max-model-len sequence (`kv_floor`).
+ * The RAM test: lockable_room after the pools still to be allocated. */
 int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
                                     const std::vector<int64_t>& emb_bytes,
-                                    const std::vector<int64_t>& tower_bytes, int64_t kv_floor,
-                                    int64_t ngram_bytes, bool ngram_device, bool ngram_host) {
+                                    const std::vector<WeightFootprint>& wfs, int64_t kv_floor,
+                                    int64_t ngram_bytes, bool ngram_device, bool ngram_host,
+                                    int64_t host_late) {
     const int64_t MiB = (int64_t)1 << 20;
     int64_t emb_max = 0;
     for (int64_t b : emb_bytes) emb_max = std::max(emb_max, b);
@@ -504,12 +427,11 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
     TablePlacement emb = cfg_.embedding_placement;
     const bool emb_asked = cfg_.embedding_placement_given;
     std::string emb_why;
-    /* THE HOST MEMORY THE TABLE WOULD PIN, every rank its own shard, after the pools and the prefix
-     * cache's host tier still to be allocated: lockable_room's test, without the memlock limit,
-     * which a pin the cards read is not charged to. */
+    /* Host memory the table would pin (each rank its shard) after the pools and the prefix cache's
+     * host tier still to be allocated; no memlock check, since card-read pins are not charged. */
     const int64_t emb_pin = (int64_t)cfg_.tp * align_up(emb_max, (int64_t)MiB);
     const int64_t pools_still = (int64_t)cfg_.tp * cfg_.host_pool_mib * MiB +
-                                cfg_.prefix_cache_mib * MiB;
+                                cfg_.prefix_cache_mib * MiB + host_late;
     std::string emb_room_why;
     auto emb_room = [&]() { return lockable_room(emb_pin, pools_still, false, &emb_room_why); };
     if (emb_max == 0) {
@@ -543,10 +465,13 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
     cfg_.embedding_resolved = emb;
     cfg_.embedding_host_mib = emb == TablePlacement::Ram ? align_up(emb_max, MiB) / MiB : 0;
 
-    /* THE ENCODER TOWERS: on the card unless ram was named, and then pinned beside the pool or the
-     * server stops -- the flag has no default to give way to. Every rank pins a whole tower: an
-     * encoder is not sharded. Decided before the n-gram table, whose card test needs the statics
-     * as they will be and whose RAM test the pools still to be allocated. */
+    /* Encoder towers: on the card unless ram was named; then pinned or the server stops. Every rank
+     * pins a whole tower (encoders are not sharded). Decided before the n-gram table, whose tests
+     * need the final statics and the pools still to be allocated. A rank's tower bytes leave out
+     * the lookup tables the embedding pins (tower_pin_bytes); the pin, the card test below and
+     * the split in Engine::plan all read that figure. */
+    std::vector<int64_t> tower_bytes;
+    for (const WeightFootprint& wf : wfs) tower_bytes.push_back(tower_pin_bytes(wf, emb));
     int64_t tower_max = 0;
     for (int64_t b : tower_bytes) tower_max = std::max(tower_max, b);
     const TablePlacement tw = cfg_.tower_placement;
@@ -575,13 +500,10 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
 
     TablePlacement ng = cfg_.ngram_placement;
     std::string ng_why;
-    /* THE FASTEST TIER WITH THE ROOM, the card first: the table on the card, every rank holding
-     * all of it (a lookup is not sharded), with the fixed weights and a KV pool for one
-     * --max-model-len sequence beside it; then a copy in RAM -- pinned
-     * for a device kernel to read over the link, or locked for the host gather; then the
-     * container, which only the host gather reads. Each is open only where a kernel reads it. */
+    /* The fastest tier with room: the card (every rank holds the whole table), then a RAM copy,
+     * then the container. */
     const int64_t still = (int64_t)cfg_.tp * cfg_.host_pool_total_mib() * MiB +
-                          cfg_.prefix_cache_mib * MiB;
+                          cfg_.prefix_cache_mib * MiB + host_late;
     const int64_t need = align_up(ngram_bytes, (int64_t)2 << 20);
     const char* copy = ngram_device ? "a pinned copy the card reads" : "a locked copy";
     auto card_holds = [&](std::string* why) {
@@ -594,13 +516,13 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
             if (tw == TablePlacement::Ram) f.statics -= tower_bytes[i];
             fixed = std::max(fixed, f.statics);
         }
-        /* `fixed` and not the trial's own statics: the split clamps those to what the card can give
-         * and serves on, streaming every expert, so the trial alone cannot say they do not fit. */
+        /* Use `fixed`, not the trial's statics: the split clamps those to the card and would
+         * stream every expert, so the trial alone cannot report a misfit. */
         VramBudget tb;
         const int st = vram_budget_trial(cfg_, with, &tb);
         const bool over = st == RAD_OK && fixed >= tb.claimable;
-        /* AND THE EXPERTS KEEP A TIER: where the cache lends, those the host pool cannot hold have
-         * only the card, and a table that took their room would leave them nowhere. */
+        /* The experts must keep a tier: when the cache lends, those the host pool cannot hold
+         * have only the card. */
         const bool starved = st == RAD_OK && tb.lends && tb.expert_ceiling > 0 &&
                              tb.experts < tb.expert_floor;
         if (st == RAD_OK && !over && !starved && tb.kv >= kv_floor)
@@ -708,14 +630,13 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
 }
 
 /* ================================================================== 2. metadata */
-/* The model's metadata ONLY -- architecture id, dimensions, quantisation, vocab. Not the weights:
- * which weights exist is the architecture plugin's answer, not the container's, and reading them
- * before declare would be reading them before we know what they are for. */
+/* The model's metadata only: architecture id, dimensions, quantisation, vocab. Which weights exist
+ * is the architecture plugin's answer at declare, not the container's. */
 namespace {
 
-/* A CONTAINER IS A FILE THAT SAYS SO: its first four bytes are the magic. Anything else --
- * a checkpoint directory, a .safetensors, an index, a .gguf -- is a checkpoint. A .rad that is not
- * one is still opened as a container, so its own reader names what is wrong with it. */
+/* A container is a file starting with the magic; anything else (a checkpoint directory, a
+ * .safetensors, an index, a .gguf) is a checkpoint. A .rad path is always opened as a container,
+ * so its reader reports what is wrong with it. */
 bool is_container(const std::string& path) {
     if (path.size() > 4 && path.compare(path.size() - 4, 4, ".rad") == 0) return true;
     FILE* f = std::fopen(path.c_str(), "rb");
@@ -747,24 +668,14 @@ int Engine::read_metadata() {
     auto geti = [&](const char* k, int64_t d) { int64_t v = d; file_->get_i(k, &v); return v; };
     auto getf = [&](const char* k, double d) { double v = d; file_->get_f(k, &v); return (float)v; };
 
-    /* THE KEYS ARE RadModelMeta'S OWN FIELD NAMES, because that is what rad-convert writes and
-     * what rad-kbench and rad-tune read. Reading GGUF's spellings instead -- `block_count`,
-     * `embedding_length`, `attention.head_count` -- yields zero for every dimension, since no
-     * writer in this project produces them; declare then refuses with "invalid argument" while
-     * rad-info prints the correct shape off the same file.
-     *
-     * The GGUF names are NOT accepted as a fallback. A container carries these because
-     * rad-convert normalises whatever it read -- safetensors or GGUF -- into RadModelMeta before
-     * writing, so a file that lacks them is a file no version of this project wrote, and reading
-     * it as if the absent keys were zeros turns a bad container into a wrong model instead of a
-     * refusal. */
+    /* Keys are RadModelMeta's field names, which rad-convert writes (normalising safetensors or
+     * GGUF input) and rad-kbench and rad-tune read. GGUF spellings (`block_count`, ...) are not a
+     * fallback: a file lacking these keys was not written by rad-convert and is refused below. */
     meta_.n_layers        = geti("n_layers", 0);
     meta_.n_embd          = geti("n_embd", 0);
     meta_.n_head          = geti("n_head", 0);
     meta_.n_head_kv       = geti("n_head_kv", 0);
-    /* Read head_dim; do NOT derive it. A model may declare a head_dim that is not n_embd/n_head,
-     * and a derived one then makes every downstream shape silently wrong
-     * (docs/ARCHITECTURES.md). */
+    /* Read head_dim, never derive it: it need not equal n_embd/n_head (docs/ARCHITECTURES.md). */
     meta_.head_dim        = geti("head_dim", 0);
     meta_.n_ff            = geti("n_ff", 0);
     meta_.n_vocab         = geti("n_vocab", 0);
@@ -774,12 +685,11 @@ int Engine::read_metadata() {
     meta_.n_expert_shared = geti("n_expert_shared", 0);
     meta_.rms_eps         = getf("rms_eps", 1e-6);
     meta_.rope_theta      = getf("rope_theta", 10000.0);
-    /* 1 (abi/rad_builder.h): the rotary's scaling is read with its type from the free-form keys.
-     * An older container's `rope_scale` key holds the factor alone and is not read. */
+    /* 1 (abi/rad_builder.h): rotary scaling and its type come from the free-form keys. A
+     * `rope_scale` key (the factor alone) is not read. */
     meta_.rope_scale      = 1.0f;
 
-    /* A container that says nothing about its own shape is refused HERE, by name, rather than at
-     * declare as an "invalid argument" from a plugin that was handed zeros. */
+    /* Refuse a container with no dimensions here, by name, rather than at declare. */
     if (meta_.n_layers <= 0 || meta_.n_embd <= 0 || meta_.n_head <= 0 || meta_.n_vocab <= 0) {
         RAD_ERR("%s carries no model dimensions (n_layers=%lld n_embd=%lld n_head=%lld "
                 "n_vocab=%lld). A .rad written by rad-convert always does; rad-info prints what "
@@ -788,8 +698,8 @@ int Engine::read_metadata() {
         return RAD_E_FORMAT;
     }
 
-    /* Everything the struct does not name, verbatim, for the plugin to read. The vectors own the
-     * storage because RadModelMeta holds bare pointers. */
+    /* All other keys verbatim for the plugin. The vectors own the storage; RadModelMeta holds
+     * bare pointers. */
     meta_kv_k_.clear(); meta_kv_v_.clear();
     for (int64_t i = 0; i < file_->meta_count(); ++i) {
         const RadFileKV& kv = file_->meta_at(i);
@@ -815,10 +725,9 @@ int Engine::read_metadata() {
     return RAD_OK;
 }
 
-/* A CHECKPOINT SERVED DIRECTLY (spec §4.3): its config.json -- or the GGUF header -- is the
- * metadata, read the way rad-convert reads it, and its tensors are the weights. Only an encoding
- * served as it stands is answered to declare (CheckpointSources), so a checkpoint whose served
- * form needs quantisation is refused by name after declare, with the container as the remedy. */
+/* A checkpoint served directly (spec §4.3): config.json or the GGUF header is the metadata, read
+ * as rad-convert reads it, and its tensors are the weights. Only encodings served as stored are
+ * answered (CheckpointSources); weights needing quantisation are refused after declare. */
 int Engine::read_checkpoint_metadata() {
     ckpt_ = std::make_unique<Checkpoint>();
     RAD_TRY(ckpt_->open(cfg_.model));
@@ -849,11 +758,10 @@ int Engine::read_checkpoint_metadata() {
     return RAD_OK;
 }
 
-/* --rope-scaling (format/rope_override.h): YaRN written into the container's own rotary keys at
- * load, where the architecture's reader takes them, so an existing container serves past its
- * trained context with no reconvert -- and is checked by the same reader a converted one is. The
- * drafter, when there is one, gets the same factor over its own trained length. Then one line says
- * what the rotary is, and a context past what it covers is named. */
+/* --rope-scaling (format/rope_override.h): write YaRN into the container's rotary keys at load,
+ * where the architecture's reader takes them, so a container serves past its trained context
+ * without reconversion. A drafter gets the same factor over its own trained length. Then log the
+ * rotary and warn if the context exceeds its reach. */
 int Engine::apply_rope_scaling() {
     RopeSpec spec;
     if (!rope_spec_parse(cfg_.rope_scaling.c_str(), &spec)) {
@@ -905,8 +813,11 @@ int Engine::load_plugins() {
                                    meta_.arch_id, meta_.quant ? meta_.quant : "", &plugins_,
                                    ckpt_ && ckpt_->imports() != Checkpoint::Import::None);
     if (s < 0) {
-        /* rad_tools_load_plugins has said why -- a plugin refused, or no architecture plugin for
-         * this model -- each by name. What it does not know is that this was the engine's start. */
+        /* rad_tools_load_plugins already logged why. A checkpoint whose quantisation the import
+         * refused keeps the tool's descriptor, which no plugin claims; the refusal is the reason. */
+        if (ckpt_ && !ckpt_->import_refusal().empty() && plugins_.arch_plugin.empty())
+            RAD_ERR("quantisation '%s' cannot be imported: %s", meta_.quant ? meta_.quant : "",
+                    ckpt_->import_refusal().c_str());
         RAD_ERR("the plugins under %s did not load (above)", cfg_.radiance_home.c_str());
         return s;
     }
@@ -925,47 +836,26 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.max_ctx    = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
     bc.max_spec   = cfg_.n_spec;
     bc.tp_wire_lossy = cfg_.tp_wire_exact ? 0 : 1;
-    /* One answer to "is the cache fp8", for every architecture. The engine always states it;
-     * RAD_DT_INVALID stays meaningful in the ABI for an out-of-tree caller that leaves the field
-     * zero, and means the plugin's own default. */
+    /* The engine always states the KV dtype. RAD_DT_INVALID (zero) remains valid in the ABI for
+     * other callers and means the plugin's default. */
     bc.kv_dtype = cfg_.kv_cache_dtype == "fp8" ? RAD_F8E4M3 : RAD_BF16;
     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
     bc.scope      = "";
     bc.max_enc_patches = cfg_.mm_max_patches > 0 ? cfg_.mm_max_patches : 0;
     bc.max_audio_frames = cfg_.mm_audio_frames > 0 ? cfg_.mm_audio_frames : 0;
-    /* A row at every token of the step and the sampler's row a sequence before them
-     * (core/kld.h); the KL mode has no speculation, so a sequence samples one. */
+    /* A row at every token of the step plus the sampler's one row per sequence before them
+     * (core/kld.h); KL mode has no speculation. */
     bc.max_out_rows = cfg_.kld() ? max_tok + cfg_.max_seqs : 0;
+    /* Under --prefill-span every step but a lone prefill is planned at the shared budget
+     * (Scheduler::step), so a wider step is one sequence; 0 without a span. */
+    bc.max_mixed_tok = cfg_.prefill_span > 1 ? std::min(max_tok, prefill_shared_tok(cfg_)) : 0;
     return bc;
 }
 
 int Engine::declare() {
-    /* Declare runs ONCE PER RANK, with rank and world_size in RadBuildCtx, and the plugin declares
-     * dimensions ALREADY DIVIDED. The core does not reason about sharding propagation and does not
-     * insert collectives -- a sharding inference pass is a compiler pass whose failure mode is a
-     * model that produces fluent wrong text on a rank count nobody tested (spec §9).
-     *
-     * EVERY RANK DECLARES AT THE SAME TIME, ON ITS OWN THREAD. That is a requirement and not a
-     * speed-up. Kernel init() runs from here (registry.h says so), and a collective's init is a
-     * RENDEZVOUS: libr4d's all-reduce publishes this rank's peer scratch pointer and then WAITS
-     * for every other rank to publish before it can enable peer access. A serial loop never gets
-     * a second rank there, so the first one times out after 60 seconds and --tp 2 fails startup
-     * with `ar_oneshot_2rank_exact ... called in the wrong phase`. Registry::select() and
-     * init_instance() are already behind one mutex for exactly this, and the arch plugin's
-     * per-rank state is indexed by ctx->rank.
-     *
-     * The device is bound per thread because the backend's current device is thread-local and a
-     * collective's init ALLOCATES on it -- unbound, both ranks would hand each other pointers into
-     * card 0 and the reduce would read its own scratch twice. */
-    /* Resolved HERE and not at argument parsing: it is the PLUGIN that says how deep this
-     * container's drafter goes, and the plugin is not selected until the container is open. Every
-     * consumer of `n_spec` -- buffer sizing, the kernel bands, the scheduler's window -- runs
-     * after this line. The core reads no drafter configuration of its own; rad_arch_probe is the
-     * whole of what it knows. */
-    /* THE KL MODE MEASURES THE TRUNK (core/kld.h). A drafter adds passes that write no scored
-     * row, and a prefix hit would start a document past positions the reference holds, so both
-     * are off -- and an explicit depth is refused rather than dropped, because the operator asked
-     * for something this run will not do. The tower stays off the card: the corpus is text. */
+    /* KL mode measures the trunk (core/kld.h): a drafter writes no scored rows and a prefix hit
+     * would skip positions the reference holds, so both are off, and an explicit depth is refused
+     * rather than ignored. The tower stays off the card; the corpus is text. */
     if (cfg_.kld()) {
         if (cfg_.n_spec > 0) {
             RAD_ERR("--num-speculative-tokens %d: the KL mode scores the trunk's own rows and "
@@ -980,11 +870,10 @@ int Engine::declare() {
             "the KL mode: a prefix hit would start a document past positions the reference holds";
         decide("--no-prefix-cache", "prefix caching off", prefix_off_why_);
     }
-    /* AN IMAGE GENERATOR SIZES THE STEP ITSELF (RadArchProbe::gen_rows): a denoise pass carries an
-     * image's every latent row at once -- twice with guidance -- and a conditioning pass encodes
-     * every reference picture a request may carry. What the operator named is kept; what they did
-     * not is the generator's. A generator samples no tokens, so it drafts none, and a conditioning
-     * is read only by its own request's images, so there is no prefix to cache. */
+    /* An image generator sizes the step itself (RadArchProbe::gen_rows): a denoise pass carries all
+     * of an image's latent rows (twice with guidance), and a conditioning pass encodes every
+     * reference picture of a request. Operator-given values are kept. No drafting (no tokens) and
+     * no prefix cache (a conditioning is read only by its own request). */
     {
         RadArchProbe pb{};
         (void)rad_tools_probe(plugins_, meta_, &pb);
@@ -1014,6 +903,10 @@ int Engine::declare() {
             cfg_.prefix_cache = false;
         }
     }
+    /* Resolved here, not at argument parsing: the plugin states its drafter's depth, and it is
+     * selected only once the container is open. Every consumer of `n_spec` (buffer sizing, kernel
+     * bands, the scheduler's window) runs after this. rad_arch_probe is the core's only source of
+     * drafter configuration. */
     if (cfg_.n_spec < 0) {
         RadArchProbe pb{};
         (void)rad_tools_probe(plugins_, meta_, &pb);
@@ -1027,14 +920,8 @@ int Engine::declare() {
                cfg_.n_spec > 0 ? "the depth the drafter in this container states as its operating point"
                                : "this container carries no draft head");
     }
-    /* THE ENCODER'S PASS SIZE, resolved the same way and for the same reason: whether there is a
-     * tower to size is a property of the model file. A container says so (`radiance.encoder`,
-     * written when its weights went in); a checkpoint served directly is the release itself, so a
-     * vision_config is a tower whose weights are in it. 16384 patches is a 2048 x 2048 image, the
-     * largest one pass takes; the reference processor allows sixteen times that area, which would
-     * need an activation region sixteen times as large on every card for one picture. */
-    /* THE AUDIO ENCODER'S PASS: the plugin's longest clip, when the model file carries an audio
-     * encoder (`radiance.encoder` names one) and the deployment did not ask for text only. */
+    /* The audio encoder's pass: the plugin's longest clip, when the model file carries an audio
+     * encoder (`radiance.encoder` names one) and the deployment is not text-only. */
     if (cfg_.mm_audio_frames < 0) {
         const char* enc = rad_meta_gets(&meta_, "radiance.encoder", "");
         const bool named = enc && std::strstr(enc, "audio") != nullptr;
@@ -1044,6 +931,10 @@ int Engine::declare() {
         cfg_.mm_audio_frames = !text_only && pb.audio_frames > 0 && (named || !file_)
                                    ? pb.audio_frames : 0;
     }
+    /* The vision encoder's pass size. A container records its tower in `radiance.encoder` (written
+     * when the tower's weights went in); a checkpoint served directly has one if it has a
+     * vision_config. 16384 patches is a 2048 x 2048 image; the reference processor allows 16x that
+     * area, which would need 16x the activation memory on every card. */
     if (cfg_.mm_max_patches < 0) {
         const char* enc = rad_meta_gets(&meta_, "radiance.encoder", "");
         const bool tower = rad_meta_geti(&meta_, "vision_config.patch_size", 0) > 0;
@@ -1065,6 +956,13 @@ int Engine::declare() {
                        : "the model carries no vision tower");
     }
 
+    /* Declare once per rank (rank and world_size in RadBuildCtx; the plugin declares dimensions
+     * already divided, spec §9), every rank concurrently on its own thread. Concurrency is
+     * required: kernel init() runs during declare, and a collective's init is a rendezvous
+     * (libr4d's all-reduce publishes its peer scratch pointer and waits for every other rank), so
+     * a serial loop times out. Registry::select() and init_instance() share a mutex for this. Each
+     * thread binds its device first, because the current device is thread-local and the init
+     * allocates on it. */
     std::vector<int>         st(ranks_.size(), RAD_OK);
     std::vector<std::thread> th;
     th.reserve(ranks_.size());
@@ -1086,9 +984,8 @@ int Engine::declare() {
                                                nullptr, sources());
         });
     }
-    /* A message is a step's rows of the residual stream in bf16, so the floor is a ROW COUNT: a
-     * decode step's rows are its sequences times one plus the speculative depth, and concurrency
-     * alone decides whether a decode step is under it. */
+    /* A message is a step's bf16 residual rows, so the floor is a row count: a decode step has
+     * sequences x (1 + speculative depth) rows. */
     if (cfg_.tp > 1 && !cfg_.tp_wire_exact) {
         const int64_t row_bytes = meta_.n_embd > 0 ? meta_.n_embd * 2 : 1;
         const int64_t exact_rows = (cfg_.tp_wire_min_kb * 1024 + row_bytes - 1) / row_bytes - 1;
@@ -1104,14 +1001,9 @@ int Engine::declare() {
 
     for (auto& t : th) t.join();
 
-    /* This phase ALWAYS completes: if anything failed to resolve, the FULL list is reported at
-     * the end rather than the first failure at the top (spec §1 step 4). Reported after the join
-     * and in rank order -- two ranks printing their lists concurrently interleaves them into one
-     * that reads like neither.
-     *
-     * ONCE FOR EVERY RANK THAT AGREES, which is normally all of them: each rank declares the same
-     * model against the same registry, so N ranks produce N identical copies of the same list. A
-     * rank whose report differs is itself worth seeing, and gets its own. */
+    /* Declare always completes and reports the full miss list (spec §1 step 4), after the join and
+     * in rank order so lists do not interleave. Printed once when all ranks agree (the normal
+     * case); a rank that differs gets its own report. */
     {
         std::vector<MissReport> rep;
         for (auto& r : ranks_) rep.push_back(miss_report(r->program, device_is_host()));
@@ -1130,12 +1022,9 @@ int Engine::declare() {
             if (!rep[i].host_only.empty()) RAD_INFO("%s", rep[i].host_only.c_str());
             if (!rep[i].host.empty()) RAD_INFO("%s", rep[i].host.c_str());
         }
-        /* A HOLE IS A REFUSAL HERE, not an error the first request finds. Every band is one a
-         * request can land in -- the bands are cut from the limits this run was started with --
-         * and the step that lands in one fails at issue and takes the engine down with it. A
-         * kernel library that serves the op (--kernels), or a model whose geometry the installed
-         * one covers, is the remedy; serving until then is not. --debug-graph serves nothing, so
-         * it goes on to print the graph the holes are in, and its exit status says they are there
+        /* A hole refuses startup: the bands come from this run's limits, so a request can land in
+         * one, and that step would fail at issue and stop the engine. --debug-graph serves nothing,
+         * so it continues to print the graph and reports the holes in its exit status
          * (Engine::dump). */
         for (const MissReport& m : rep)
             if (!m.device.empty() && !cfg_.debug_graph) {
@@ -1148,8 +1037,8 @@ int Engine::declare() {
                 return RAD_E_UNSUPPORTED;
             }
     }
-    /* A CHECKPOINT WEIGHT THAT IS NOT SERVED AS IT STANDS was declared as plain and nothing can
-     * load it: every one is named, with the remedy, whatever declare made of the rest. */
+    /* Checkpoint weights that cannot be served as stored cannot be loaded; name them all with the
+     * remedy. */
     if (ckpt_src_) {
         const std::vector<std::string> no = ckpt_src_->refused();
         if (!no.empty()) {
@@ -1167,24 +1056,16 @@ int Engine::declare() {
              ranks_[0]->program.ops.size() - 1, ranks_[0]->program.weights.size() - 1,
              ranks_[0]->program.buffers.size() - 1, ranks_[0]->program.kv_groups.size());
 
-    /* IS THERE A DRAFT HEAD, AND WHAT SHAPE IS IT? The plugin declared it (rad_declare_drafter)
-     * or it did not, and that is the whole of the question. There is no flag to read, no metadata
-     * key to re-read and no second place for the two to disagree.
-     *
-     * Sniffing it out instead -- scanning the declared weights for known draft-head names, then
-     * re-reading the metadata keys the plugin already read to build the head -- would put a list
-     * of model names in the core, and a third party's drafter could not then exist without
-     * editing this function. */
+    /* The draft head is exactly what the plugin declared (rad_declare_drafter). The core never
+     * infers one from weight names or metadata, so third-party drafters need no core changes. */
     const Program& p0 = ranks_[0]->program;
     drafter_       = p0.drafter;
     drafter_name_  = p0.drafter_name;
     drafter_.name  = drafter_name_.c_str();
     if (cfg_.n_spec <= 0) drafter_ = RadDrafterDecl{};
     if (drafter_.kind != RAD_DRAFT_NONE) {
-        /* The proposal buffer is a HANDLE the plugin passed, not a name this looked up. Zero is
-         * legal and means the sampler's token buffer -- a head whose logits go through the
-         * ordinary sampler chain, which the bf16 MTP head does and the 2-bit draft head does
-         * not. */
+        /* A zero proposal handle means the sampler's token buffer: the head's logits go through
+         * the ordinary sampler chain. */
         RAD_INFO("speculation: %s",
                  drafter_.kind == RAD_DRAFT_BLOCK
                  ? fmt("'%s' proposes %d token(s) in ONE block pass over %lld row(s) (mask id %d, "
@@ -1201,24 +1082,28 @@ int Engine::declare() {
     return RAD_OK;
 }
 
-/* THE ACTIVATION ARENA'S SMALLER LEVELS, sized by the plugin itself.
+/* The mebibyte between a level's highest buffer and the memory above it, which is lent or holds
+ * the stager's ring: what a kernel writes past the rows it was given lands there rather than in
+ * an expert's weights. */
+static constexpr int64_t kArenaGuard = 1ll << 20;
+
+/* The activation arena's smaller levels, sized by the plugin itself.
  *
- * Every activation is declared for the largest step, and a decode step is a few dozen rows of the
- * 2048 a prefill chunk carries: most of the arena sits unread for as long as nothing prefills. The
- * plugin is asked to declare again at a smaller step (RadBuildCtx::shape_probe) -- its own shape
- * rules are the only ones that know how each buffer scales, so no rule here second-guesses them --
- * and each answer that describes the same buffers with only their rows smaller becomes a level:
- * the same fixed region, the transients packed lower, and the arena above them free while the
- * steps are that small.
+ * Activations are declared for the largest step, but a decode step uses a few dozen of a prefill
+ * chunk's rows, leaving most of the arena idle. The plugin declares again at smaller step sizes
+ * (RadBuildCtx::shape_probe), since only its shape rules know how each buffer scales; each answer
+ * with the same buffers and fewer rows becomes a level: same fixed region, transients packed lower,
+ * the arena above them free while steps stay that small.
  *
- * THE SMALLEST LEVEL IS 256 ROWS AT LEAST. A kernel that computes whole tiles may write the
- * padding rows of its last one; at the real size those land inside the buffer because the chunk is
- * a multiple of every tile, and a level is held to the same property so that padding never reaches
- * the next buffer or the memory past the level's end. Each level above is four times the one
- * below, up to the chunk.
+ * The smallest level is at least 256 rows. A tiled kernel may write padding rows of its last tile;
+ * the real size is a multiple of every tile, and levels keep that property so padding never
+ * reaches the next buffer or past the level's end. Each level is 4x the one below, up to the chunk.
  *
- * A refusal costs a level and nothing else: the arena is lent from the levels that were accepted,
- * or not at all. */
+ * Under --prefill-span there is one level more, at the shared budget (prefill_shared_tok). The
+ * full plan is sized for a spanned step, which only a prefill alone in its step takes; every other
+ * step is at most the shared size, and at this level the span's extra rows are lent.
+ *
+ * A refused level is simply dropped. */
 void Engine::probe_arena_levels() {
     for (auto& r : ranks_) r->arena_levels.clear();
     RadArchProbe pb{};
@@ -1234,9 +1119,16 @@ void Engine::probe_arena_levels() {
     lo = std::max<int64_t>(lo, 256);
     std::vector<int64_t> want;
     for (int64_t R = lo; R < cfg_.max_tok; R *= 4) want.push_back(R);
+    arena_span_rows_ = 0;
+    const int64_t span_rows = cfg_.prefill_span > 1 ? prefill_shared_tok(cfg_) : 0;
+    if (span_rows >= lo && span_rows < cfg_.max_tok &&
+        std::find(want.begin(), want.end(), span_rows) == want.end()) {
+        want.push_back(span_rows);
+        std::sort(want.begin(), want.end());
+    }
 
-    /* One sizing declare a (level, rank), all of them side by side: a sizing declare selects and
-     * initialises nothing, so they share no state, and each is a whole declare of the model. */
+    /* One sizing declare per (level, rank), all in parallel: they select and initialise nothing,
+     * so they share no state. */
     const size_t nl = want.size(), nr = ranks_.size();
     std::vector<ArenaLevel>  got(nl * nr);
     std::vector<std::string> why(nl * nr);
@@ -1282,6 +1174,7 @@ void Engine::probe_arena_levels() {
         }
         for (size_t i = 0; i < nr; ++i)
             ranks_[i]->arena_levels.push_back(std::move(got[l * nr + i]));
+        if (R == span_rows) arena_span_rows_ = R;
         said += fmt("%s%lld tokens use %s", said.empty() ? "" : ", ", (long long)R,
                     humanb(ranks_[0]->arena_levels.back().end).c_str());
     }
@@ -1294,37 +1187,34 @@ void Engine::probe_arena_levels() {
 
 /* ================================================================== 5. plan */
 int Engine::plan() {
-    /* THE BUDGET IS RESOLVED ONCE, FOR EVERY RANK, BEFORE ANY RANK ALLOCATES.
+    /* The budget is resolved once, for every rank, before any rank allocates. vram_budget_resolve
+     * folds the smallest capacity with the largest program so one split fits every card, and
+     * writes it into Config; per-rank resolution would let rank 1 measure a card rank 0 already
+     * filled.
      *
-     * It has to happen here and not inside the per-rank loop below for two reasons. One card's
-     * answer is not another's -- the fold in vram_budget_resolve takes the smallest capacity and
-     * the largest program so that one split fits every card it is applied to -- and the answer is
-     * written back into Config, which the loop then reads. Doing it per rank would let rank 1
-     * re-resolve against a card rank 0 has already filled.
-     *
-     * Every input is available by now and not before: declare() has run, so the buffer plan exists
-     * and the arena can be sized; every kernel plugin's init has run, so the code objects are
-     * resident and the free-VRAM reading is the steady-state one; and the KV groups are declared,
-     * so a full cache's cost is computable. */
+     * All inputs exist by now: declare() has run (buffer plan, KV groups), and every kernel init
+     * has run, so code objects are resident and free VRAM is the steady-state reading. */
     {
         std::vector<VramFacts> facts;
         facts.reserve(ranks_.size());
         late_step_bytes_ = late_lazy_bytes_ = 0;
-        /* The placement flags' tables, per rank where they are sharded (the embedding) and once
-         * where they are not (the n-gram table every rank reads from the one mapping). */
-        std::vector<int64_t> emb_bytes, tower_bytes;
+        /* The lookup tables' sizes: per rank where sharded (the embedding; the towers are read
+         * from `wfs`), once where not (the n-gram table, read by every rank from one mapping). */
+        std::vector<int64_t> emb_bytes;
         std::vector<WeightFootprint> wfs;
         int64_t ngram_bytes = 0, kv_floor = 0;
+        /* One checkpoint slot (every rank's shard) and the ranks' host activation arenas: pinned
+         * after the tables are placed, outside every pool. */
+        int64_t ck_slot = 0, host_arenas = 0;
         bool ngram_device = false, ngram_host = false;
         const int64_t ctx = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
         for (auto& r : ranks_) {
             RAD_TRY(rad_dev_set(r->device));
             VramFacts f{};
-            /* ONE HARDWARE QUEUE'S VRAM, MEASURED BY MAKING TWO. The engine's compute stream,
-             * its mover's and a second compute lane are all made after this reading, and the
-             * driver backs each queue with VRAM the ring alone does not account for. The second
-             * queue is the unit, so a runtime that sets itself up on its first queue charges that
-             * once and to `already held`, which is read after both are gone. */
+            /* One hardware queue's VRAM, measured as the difference between creating the first and
+             * the second queue (the runtime's one-time setup lands on the first, and is charged to
+             * `already held`). The compute stream, the mover's and a second lane are created after
+             * this reading, and the driver backs each with VRAM beyond its ring. */
             {
                 RadStream q[2] = { nullptr, nullptr };
                 RadDeviceProps a{}, b{};
@@ -1334,57 +1224,49 @@ int Engine::plan() {
                 for (RadStream s : q) if (s) rad_stream_destroy(s);
             }
             f.n_queues = 2 + (r->program.scratch_regions > 1 ? 1 : 0);
-            /* THE EXPERT PREFETCH'S STREAM, RING AND BUFFERS, where it can be on: a placement that
-             * keeps experts in a pinned pool, not --deterministic, on a backend with a DMA engine to
-             * spare for it (asked before the free figure below, so its queue there is already held). */
-            WeightFootprint xwf;
-            weight_footprint(r->program, &xwf, TablePlacement::Vram, TablePlacement::Disk, device_is_host(),
-                             file_ != nullptr);
-            if (xwf.routed && xwf.expert_unit_max > 0 && !cfg_.deterministic &&
+            /* The weights' cost, split into the fixed floor and the elastic plane
+             * (weight_footprint in core/place/planner.h). Per rank, so already this card's share
+             * under TP. */
+            WeightFootprint wf;
+            weight_footprint(r->program, &wf, TablePlacement::Vram, TablePlacement::Disk,
+                             device_is_host(), file_ != nullptr);
+            /* The expert prefetch's stream, ring and buffers, when it can run: experts in a pinned
+             * pool, not --deterministic, and a spare DMA engine (asked before the free reading
+             * below, so its queue is already counted there). */
+            if (wf.routed && wf.expert_unit_max > 0 && !cfg_.deterministic &&
                 (cfg_.placement == "auto" || cfg_.placement == "expert_tiered") && rad_xp_supported(r->device)) {
-                /* Counted as Ctx::bind_routing counts the routed layers: past the trunk where a head is. */
+                /* Routed layers counted as Ctx::bind_routing does, including a head past the trunk. */
                 int64_t nl = r->program.meta.n_layers;
                 for (const WeightInfo& w : r->program.weights)
                     if (w.decl.group.expert >= 0) nl = std::max(nl, (int64_t)w.decl.group.layer + 1);
                 f.n_queues += 1;
-                f.prefetch = xp_device_bytes(xwf.expert_unit_max, nl);
+                f.prefetch = xp_device_bytes(wf.expert_unit_max, nl);
             }
             RadDeviceProps props{};
             rad_dev_props(r->device, &props);
             f.capacity = props.vram_bytes;
             f.free     = props.vram_free;
-            /* AN EIGHTH OF THE HOST'S MEMORY STAYS THE HOST'S on integrated graphics. The card's
-             * free figure is already bounded by what the host has available (core/device/hip.cpp);
-             * this is the margin the rest of the machine keeps on top of that, because a budget
-             * that spends every available byte leaves the operating system to reclaim its page
-             * cache and then to kill something. */
+            /* On integrated graphics an eighth of host memory stays the host's, on top of the free
+             * figure's own bound (core/device/hip.cpp), so the OS is not driven to reclaim and
+             * kill. */
             if (dev_integrated(r->device)) {
                 const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
                 if (pages > 0 && page > 0) f.host_reserve = (int64_t)pages * page / 8;
             }
             arena_plan_bytes(r->program, nullptr, &f.arena);
-            /* WHAT THE WEIGHTS WOULD COST, split into the floor and the elastic plane -- see
-             * weight_footprint in core/place/planner.h. Per RANK, which under tensor parallel is
-             * already this card's even share of the static weights: declare ran once per rank
-             * with every dimension divided. */
-            WeightFootprint wf;
-            weight_footprint(r->program, &wf, TablePlacement::Vram, TablePlacement::Disk,
-                             device_is_host(), file_ != nullptr);
             f.statics = wf.statics;
             f.experts = wf.experts;
             wfs.push_back(wf);
-            /* THE CACHE LENDS where units move and the pool can give its blocks back in place. */
+            /* The cache lends where units move and the pool can return blocks in place. */
             f.lends = VMem::supported() && !cfg_.deterministic &&
                       (cfg_.placement == "auto" || cfg_.placement == "expert_tiered");
             emb_bytes.push_back(wf.embedding);
-            tower_bytes.push_back(wf.tower);
             ngram_bytes = std::max(ngram_bytes, wf.ngram);
             ngram_device = ngram_device || wf.ngram_device;
             ngram_host = ngram_host || wf.ngram_host;
-            /* ONE --max-model-len SEQUENCE'S CACHE: the same groups planned for a single
-             * sequence, which is the least a KV pool can hold and still serve every request the
-             * API accepts (configure_kv warns below it). --ngram-placement auto puts the table
-             * on the card only where the pool stays above it. */
+            /* One --max-model-len sequence's cache: the least a KV pool can hold and still serve
+             * every acceptable request (configure_kv warns below it). --ngram-placement auto puts
+             * the table on the card only if the pool stays above it. */
             {
                 Config one = cfg_;
                 one.max_seqs = 1;
@@ -1394,36 +1276,36 @@ int Engine::plan() {
                     f.kv_one = single.ceiling(ctx);
                 }
             }
-            /* THE STAGING REGION IS SIZED ONLY WHERE THE ARENA LENDS ITS TOP: with no smaller level
-             * nothing gives the region back to the slab at decode, and a deterministic plan moves
-             * nothing, so neither can stage or recover what a region would cost. */
+            /* The staging region is sized only where the arena lends its top: without smaller
+             * levels nothing returns it to the slab at decode, and a deterministic plan moves
+             * nothing. */
             if (!r->arena_levels.empty() && !cfg_.deterministic) f.expert_layer_max = wf.expert_layer_max;
-            /* A THROWAWAY MANAGER, because the question is what the groups WOULD cost and the
-             * real one is configured against a pool that does not exist yet. plan_groups touches
-             * no memory and no pool; it is the half of configure() that is pure arithmetic on the
-             * declaration, split out for exactly this caller. */
+            /* A throwaway manager: plan_groups is configure()'s pure-arithmetic half and touches no
+             * memory, and the real pool does not exist yet. */
             KVManager probe;
+            host_arenas += arena_host_bytes(r->program);
             if (probe.plan_groups(r->program.kv_groups, cfg_) == RAD_OK) {
+                ck_slot += probe.checkpoint_bytes();
                 f.kv_ceiling = probe.ceiling(ctx);
                 f.kv_fixed   = probe.fixed_bytes();
             }
-            /* THE STEP BATCH'S DEVICE STAGING, which the scheduler reserves after this split: its
-             * block tables are carved for max_seqs sequences at max_ctx and its media staging for
-             * max_tok encoder rows. The state-index widths are the probe's, as the scheduler takes
-             * them from the configured manager. */
+            /* The step batch's device staging, reserved by the scheduler after this split: block
+             * tables for max_seqs sequences at max_ctx, media staging for max_tok encoder rows.
+             * State-index widths come from the probe, as the scheduler takes them from the
+             * configured manager. */
             KVGeom kg = KVGeom::of(r->program.kv_groups);
             for (size_t i = 0; i < kg.g.size(); ++i) {
                 const int64_t w = probe.state_index_width((int32_t)i);
                 if (w > 0) kg.g[i].sidx_width = w;
             }
-            f.staging = r->program.is_generator() ? gen::Driver::device_bytes(r->program, cfg_)
+            f.staging = r->program.is_generator() ? gen::Driver::device_bytes(r->program)
                                                   : BatchBuilder::device_bytes(r->program, cfg_, kg);
             if (f.staging < 0) return RAD_E_INVAL;
             late_step_bytes_ = std::max(late_step_bytes_, f.staging);
             int64_t lazy = r->program.scratch_regions > 1 ? f.queue_bytes : 0;
-            /* AND THE KV TIERS' COPY STAGING, which TierExec::device_init builds on the first
-             * copy out. Which groups the prefix cache indexes is settled after this split, so
-             * every paged group is counted: the entry it sizes can only be smaller. */
+            /* The KV tiers' copy staging, built by TierExec::device_init on the first copy out.
+             * The cached groups are settled later, so every paged group is counted (an upper
+             * bound). */
             if (cfg_.prefix_cache_mib > 0) {
                 int64_t entry = 0, bs = 0;
                 int ng = 0;
@@ -1441,24 +1323,30 @@ int Engine::plan() {
             late_lazy_bytes_ = std::max(late_lazy_bytes_, lazy);
             facts.push_back(f);
         }
-        /* THE PINNED HOST POOL IS THE EXPERTS' OTHER HOME, less the file tier's staging, which
-         * Planner::plan takes out of it before any expert. The embedding placed in host memory
-         * brings its own room (Config::embedding_host_mib), so it leaves this floor as it is. */
+        /* The pinned host pool is the experts' other home, less the file tier's staging, which
+         * Planner::plan takes first. A host-placed embedding has its own room
+         * (Config::embedding_host_mib). */
         for (size_t i = 0; i < facts.size(); ++i) {
             int64_t room = cfg_.host_pool_mib * ((int64_t)1 << 20);
             if (cfg_.weights_disk_tier)
                 room -= file_stage_reserve(wfs[i].layer_unit_max, wfs[i].routed);
             facts[i].expert_floor = expert_vram_floor(wfs[i], std::max<int64_t>(room, 0));
         }
-        RAD_TRY(resolve_table_placement(facts, emb_bytes, tower_bytes, kv_floor, ngram_bytes,
-                                        ngram_device, ngram_host));
-        /* The n-gram table was counted off the card; on it, it is every rank's whole table. */
+        /* Capped well below overflow, so the sums it joins stay defined: a store that large is
+         * refused by name in configure_kv. */
+        const int64_t ck_n = std::max<int64_t>(cfg_.checkpoint_slots, 0), ck_cap = INT64_MAX / 8;
+        const int64_t ck_store = !cfg_.prefix_cache || ck_slot <= 0 ? 0
+                                 : ck_n > ck_cap / ck_slot ? ck_cap : ck_slot * ck_n;
+        RAD_TRY(resolve_table_placement(facts, emb_bytes, wfs, kv_floor, ngram_bytes,
+                                        ngram_device, ngram_host, ck_store + host_arenas));
+        /* The n-gram table was counted off the card; on it, every rank holds the whole table. */
         if (cfg_.ngram_resolved == TablePlacement::Vram)
             for (VramFacts& f : facts) f.statics += ngram_bytes;
         if (cfg_.embedding_resolved == TablePlacement::Ram)
             for (size_t i = 0; i < facts.size(); ++i) facts[i].statics -= emb_bytes[i];
         if (cfg_.tower_resolved == TablePlacement::Ram)
-            for (size_t i = 0; i < facts.size(); ++i) facts[i].statics -= tower_bytes[i];
+            for (size_t i = 0; i < facts.size(); ++i)
+                facts[i].statics -= tower_pin_bytes(wfs[i], cfg_.embedding_resolved);
         VramBudget vb;
         RAD_TRY(vram_budget_resolve(cfg_, facts, &vb));
         if (!vb.report.empty()) RAD_INFO("%s", vb.report.c_str());
@@ -1466,8 +1354,8 @@ int Engine::plan() {
                fmt("weights %s (experts %s of it), KV cache %s, a card", humanb(vb.weights).c_str(),
                    humanb(vb.experts).c_str(), humanb(vb.kv).c_str()),
                vb.report);
-        /* The staging region the budget took out of the experts, above everything the buffer plan
-         * placed -- so it is at the top of the arena, the part the smaller levels lend. */
+        /* The staging region the budget took from the experts, placed above every planned buffer:
+         * the arena top that smaller levels lend. */
         if (vb.stage > 0)
             for (auto& r : ranks_) {
                 int64_t dev = 0;
@@ -1477,26 +1365,20 @@ int Engine::plan() {
                 r->program.arena_bytes       = r->program.arena_stage_off + vb.stage;
             }
 
-        /* ---- AN UNEVEN WORLD: EACH RANK'S OWN POOLS FOR THE ONE TOKEN COUNT -------------------
+        /* ---- uneven worlds: each rank's own pools for the common token count ------------------
          *
          * The split above is the dearest rank's, applied to every card, and one block table serves
-         * every rank -- configure_kv caps each at the least rank's paged tokens. A rank whose cache
-         * costs less per token (an attention-zero rank keeps no attention cache, only what its
-         * other groups cost) would reserve the common KV pool and page a fraction of it, while its
-         * experts beyond the common weights pool sit in the pinned host pool. So such a rank gets a
-         * KV pool that pages exactly the common token count and the difference in its weights
-         * pool, up to every one of its weights resident. The token count, the carve, the loan and
-         * the dearest ranks' pools are what they were.
+         * every rank (configure_kv caps each at the smallest paged token count). A rank whose cache
+         * costs less per token (an attention-zero rank) would page only part of the common KV pool
+         * while its extra experts sit in host memory. Such a rank gets a KV pool that pages exactly
+         * the common token count, and the difference goes to its weights pool, up to all of its
+         * weights resident. The token count, carve, loan and dearer ranks' pools are unchanged.
          *
-         * Only a split under expert_tiered is re-split: under `auto` a rank whose grown pool covers all of
-         * its weights would choose all_vram while its peers spill -- one strategy per world is the
-         * contract that keeps their movers alike, so `auto` keeps the common split. A cache that
-         * does not lend (--deterministic, or a device without virtual memory management) is
-         * re-split all the same: the bytes it would never page are bytes its experts can hold, and
-         * without virtual memory management they are allocated whole.
-         * Where every rank's cache costs the same per token no rank qualifies and rank_cfg_ is cfg_
-         * on every rank, field for field. A rank that qualifies and is not re-split is named with
-         * the reason, once. */
+         * Only expert_tiered re-splits: under `auto` a grown rank could pick all_vram while its
+         * peers spill, and one strategy per world keeps the movers alike. A cache that does not
+         * lend (--deterministic, or no virtual memory management) is still re-split, since its
+         * unpaged bytes would otherwise be wasted. When all ranks cost the same, rank_cfg_ equals
+         * cfg_. A qualifying rank that is not re-split is logged once with the reason. */
         rank_cfg_.assign(ranks_.size(), cfg_);
         kv_planned_tokens_ = 0;
         constexpr int64_t kMiB = (int64_t)1 << 20;
@@ -1515,9 +1397,9 @@ int Engine::plan() {
             kept = fmt("--placement %s keeps one split for every card; only expert_tiered re-splits",
                        cfg_.placement.c_str());
         } else {
-            /* THE TOKEN COUNT configure_kv WILL SETTLE ON: every rank's paged tokens in the common
-             * pool, the least of them. Asked of the same plan configure_kv makes, against the same
-             * bytes: nothing reserves from a KV pool before its carve. */
+            /* The token count configure_kv will settle on: the least paged token count over ranks in
+             * the common pool, from the same plan and bytes (nothing reserves from a KV pool before
+             * its carve). */
             for (size_t i = 0; i < ranks_.size(); ++i) {
                 probes[i] = std::make_unique<KVManager>();
                 if (probes[i]->plan_groups(ranks_[i]->program.kv_groups, cfg_) != RAD_OK) {
@@ -1540,10 +1422,9 @@ int Engine::plan() {
                 RAD_INFO("%s; its pools stay the common split: %s", costs.c_str(), kept.c_str());
                 continue;
             }
-            /* EXACT, NO MARGIN: paged_split is monotone in the budget, so the least whole MiB that
-             * pages T here pages at least T in configure_kv -- the same plan, the same arithmetic,
-             * a pool whose budget is exactly this many MiB. The pool's own alignment is already
-             * among the plan's fixed costs (a RAD_ALIGN_UNIT a reservation). */
+            /* Exact, no margin: paged_split is monotone in the budget, so the least whole MiB that
+             * pages T here pages at least T in configure_kv (same plan, same arithmetic). The
+             * pool's alignment is already among the plan's fixed costs. */
             const int64_t need = probes[i]->pool_mib_for_tokens(T, cfg_.vram_kv_mib);
             if (need < 0) {
                 RAD_INFO("%s; its pools stay the common split: it does not page the common %lld "
@@ -1579,18 +1460,14 @@ int Engine::plan() {
         /* This rank's own split: cfg_ field for field unless the block above re-split it. */
         const Config& rc = rank_cfg_[ri];
         LogRank lr(r->index);
-        /* THE MAIN THREAD RUNS EVERY RANK'S STARTUP, one rank after another, and every allocator
-         * reachable from here takes the CURRENT device -- rad_dev_alloc has no device argument.
-         * Unbound, rank 1's pools, its weights and its KV cache all land on card 0. That fits by
-         * accident at tp 1 and is silently wrong above it, so each phase binds the rank it is
-         * working on before it allocates anything for it. */
+        /* This thread runs every rank's setup in turn, and rad_dev_alloc uses the current device,
+         * so bind the rank's device before allocating anything for it. */
         RAD_TRY(rad_dev_set(r->device));
         RadDeviceProps props{};
         rad_dev_props(r->device, &props);
 
-        /* Every pool is budgeted explicitly. No profiling pass, no utilisation fraction, no
-         * inference about what the workload will be (spec §6). Pools refuses by name and by how
-         * much rather than shrinking anything. */
+        /* Every pool is budgeted explicitly, with no profiling pass or utilisation fraction
+         * (spec §6). Pools refuses by name and amount rather than shrinking anything. */
         int s = r->pools.configure(rc, props.vram_bytes);
         RAD_INFO("pools:\n%s", r->pools.fit_report().c_str());
         if (s < 0) {
@@ -1598,8 +1475,8 @@ int Engine::plan() {
             return s;
         }
 
-        /* Under tensor parallel the placement unit is a SHARD of a weight, so each rank plans
-         * against its own card's budget (spec §5.3) -- the same split its pools were given. */
+        /* Under TP the placement unit is a weight shard, so each rank plans against its own
+         * card's budget (spec §5.3), the split its pools were given. */
         PlannerInput in{};
         in.program    = &r->program;
         in.config     = &rc;
@@ -1616,7 +1493,7 @@ int Engine::plan() {
         if (cfg_.debug_placement || s < 0)
             fputs(r->plan.report(r->program).c_str(), stderr);
         if (s < 0) return s;
-        /* The slab the planner filled is the pool the mover will fill: one split, read twice. */
+        /* The planner's slab must match the weights pool the mover fills. */
         RAD_TRY(plan_check_weights_pool(r->plan, r->pools.weights().bytes()));
         if (r->index == 0) {
             decide("--placement", strategy_name(r->plan.strategy),
@@ -1634,9 +1511,8 @@ int Engine::plan() {
                              humanb(r->plan.forced_host_used).c_str())
                        : std::string());
         }
-        /* --host-pool-mib IS ONE NUMBER FOR EVERY RANK, allocated whole by Pools::configure, so a
-         * re-split rank whose grown weights pool took every weight still holds it. Said, because
-         * the `kv: rank N ...` line above reads as if that rank's memory were all accounted for. */
+        /* --host-pool-mib is allocated whole on every rank, so a re-split rank whose weights all
+         * fit its grown pool still holds an empty host pool; log it. */
         if (rc.vram_kv_mib < cfg_.vram_kv_mib && cfg_.host_pool_mib > 0 &&
             r->plan.totals.bytes[(int)Tier::HostPinned] == 0)
             RAD_INFO("kv: rank %d's weights all fit its grown weights pool, so its pinned host pool "
@@ -1647,19 +1523,19 @@ int Engine::plan() {
 }
 
 /* ================================================================== 6. load */
-/* Weights are mapped and staged according to the plan. The mover has already reserved every slot
- * and published the address each weight will live at, so this is a fill: for every declared
- * weight, find its entry in the container and copy THIS RANK'S SHARD of it into place.
+/* Weights are filled according to the plan. The mover has already reserved every slot and
+ * published each weight's address, so this copies this rank's shard of each declared weight from
+ * its container entry into place.
  *
- * The container holds whole weights unless it was converted pre-sharded, and the plugin declared
- * dimensions ALREADY DIVIDED (spec §9) -- so the slicing happens here, and it is the only place
- * in the engine that knows a weight is a piece of a larger one. Row sharding is a contiguous
- * range of dim 0. Column sharding is not contiguous and needs a 2D copy, which is exactly why
- * the two are different enum values rather than a bool. */
-/* ONE RUN OF CONTAINER BYTES, AND WHERE THEY GO. Emitted by the walk below, consumed by the
- * sweep; `ny == 1` with `span == wb` is one contiguous range, and everything else is a column
- * share, whose pieces are `wb` bytes every `sp`. A run with `stage >= 0` fills that staged
- * weight's input at `dst` bytes in rather than landing where the weight lives. */
+ * The container holds whole weights (unless converted pre-sharded) and the plugin declared
+ * dimensions already divided (spec §9), so slicing happens here, the only place that knows a
+ * weight is part of a larger one. A row shard is a contiguous range of dim 0; a column shard
+ * needs a 2D copy. */
+
+/* One run of container bytes and its destination, emitted by the walk and consumed by the sweep.
+ * `ny == 1` with `span == wb` is one contiguous range; otherwise a column share of `ny` pieces of
+ * `wb` bytes every `sp`. With `stage >= 0` it fills that staged weight's input at offset `dst`
+ * instead of the weight's home. */
 struct LoadRun {
     int64_t  foff;      /* first container byte the run reads */
     int64_t  span;      /* container bytes it covers, its own internal gaps included */
@@ -1674,24 +1550,20 @@ struct LoadRun {
 
 /* ================================================================== the relayout pool
  *
- * A WEIGHT THE LOADER HAS TO REARRANGE (spec §4.3): the resolved kernel stores something other
- * than the container's canonical planes -- a fragment order, a scale carried in each row's tail --
- * or the declaration widens a bf16 plane to f32. Its share of the planes is read out of the sweep
- * into host memory of its own, and when the last byte of it has arrived a worker produces the
- * stored form: straight into its host pool, or, for VRAM, into memory of its own and up through
- * that worker's pinned bounce buffers.
+ * Weights the loader must rearrange (spec §4.3): the resolved kernel stores something other than
+ * the canonical planes (a fragment order, a per-row scale tail), or the declaration widens bf16 to
+ * f32. The sweep copies the weight's planes into a host input; once all bytes arrive, a worker
+ * produces the stored form, directly into its host pool slot or, for VRAM, through the worker's
+ * pinned bounce buffers.
  *
- * IT HAS TO KEEP PACE WITH THE DISK, because Qwen3.8-27B-FP8 rearranges 24 GiB of its 29 at every
- * load and a single thread scattering bytes into fragment order runs at a fraction of 7 GB/s. So
- * it is a pool, and the sweep only reads: the copies out of its windows -- into a staged input,
- * or into a host pool slot -- are the pool's too, taken before any relayout, because a window
- * cannot be read into again until they are done. On the sweep thread those copies, and the first
- * touch of every fresh input, would run in series with the reads.
+ * It must keep pace with the disk (Qwen3.8-27B-FP8 rearranges 24 GiB of 29 per load; one thread
+ * runs at a fraction of 7 GB/s), so it is a thread pool and the sweep only reads. The copies out
+ * of sweep windows (into staged inputs or host pool slots) are also the pool's, done before any
+ * relayout, because a window cannot be refilled until they finish.
  *
- * AND IT HOLDS A BOUNDED AMOUNT, because a staged input is a copy of the weight in host memory and
- * a model is larger than that memory. A new input waits for room while there is finished work
- * that will free some -- and only then: a weight still arriving cannot be relaid, so waiting on
- * it would wait forever. Past the bound with nothing finished, the input is taken anyway. */
+ * The pool holds a bounded amount, since staged inputs are host copies and a model exceeds host
+ * memory. A new input waits for room only while finished work will free some (an incomplete
+ * weight cannot be relaid, so waiting on it would deadlock); otherwise it is taken anyway. */
 struct StagedWeight {
     const Program* prog = nullptr;
     size_t   wi = 0;
@@ -1704,8 +1576,8 @@ struct StagedWeight {
     bool     reserved = false;  /* its input counts against the pool's budget */
     uint8_t* in = nullptr;      /* its input: in the pool's region, or its own allocation */
     bool     own = false;       /* ...its own, because the region had no hole that size */
-    /* A checkpoint's weight has no sweep: the worker fills its input itself, from the mapped
-     * tensors, before it lays it out -- so the reads run on every worker at once. */
+    /* A checkpoint weight has no sweep: the worker fills its input from the mapped tensors
+     * itself, so reads run on all workers in parallel. */
     std::function<int(uint8_t* in)> fill;
 };
 
@@ -1719,11 +1591,9 @@ public:
         if (region_) ::munmap(region_, (size_t)budget_);
     }
 
-    /* THE INPUTS SHARE ONE REGION THE SIZE OF THE BUDGET, made once and handed out again as each
-     * weight is done with it. Memory made fresh for every input is a page fault every 4 KiB of
-     * it, and over a model's worth of weights those faults are most of the load's CPU time; a
-     * region the workers keep reusing faults once. An input with no hole its size -- larger than
-     * the budget, or the region too cut up -- gets an allocation of its own. */
+    /* Inputs share one budget-sized region, reused as weights finish: fresh memory per input
+     * would page-fault every 4 KiB, which dominates load CPU time. An input with no hole its size
+     * (larger than the budget, or fragmentation) gets its own allocation. */
     void start(int threads, int64_t budget) {
         budget_ = budget;
         void* p = ::mmap(nullptr, (size_t)budget_, PROT_READ | PROT_WRITE,
@@ -1740,10 +1610,9 @@ public:
         for (int t = 0; t < threads; ++t) threads_.emplace_back([this] { worker(); });
     }
 
-    /* The sweep thread: room for a staged weight's input, taken the first time a run reaches it.
-     * ROOM AND NOT MEMORY: the allocation is input()'s, on a worker. An allocation this size is
-     * an mmap, which waits on every munmap and fault the workers are making in the same address
-     * space -- milliseconds an input, and on the sweep thread that is a second of a load. */
+    /* Sweep thread: reserve budget for a staged weight's input when a run first reaches it. Only
+     * the accounting happens here; input() allocates on a worker, because an mmap this size
+     * contends with the workers' munmaps and faults and would stall the sweep. */
     void reserve(int i) {
         StagedWeight& s = items_[(size_t)i];
         if (s.reserved) return;
@@ -1754,7 +1623,7 @@ public:
         s.reserved = true;
     }
 
-    /* `n` more bytes of it are in -- from whichever worker copied them, so under the lock. */
+    /* `n` more bytes of input `i` arrived; called by any worker, so locked. */
     void arrived(int i, int64_t n) {
         std::lock_guard<std::mutex> lk(mu_);
         StagedWeight& s = items_[(size_t)i];
@@ -1765,13 +1634,12 @@ public:
         work_.notify_one();
     }
 
-    /* A COPY OUT OF A SWEEP WINDOW: the part of run `q` that lies in file range [j0, j1), out of
-     * window `slot`, whose first byte is file offset `w0`. A staged run lands in its weight's
-     * input, which the sweep has made room for with reserve() first; any other run is a host
-     * destination. */
+    /* A copy out of sweep window `slot` (first byte at file offset `w0`): the part of run `q` in
+     * file range [j0, j1). A staged run lands in its weight's input (reserved first); any other
+     * run has a host destination. */
     struct Copy { const uint8_t* win; int64_t w0, j0, j1; LoadRun q; int slot; };
 
-    /* The sweep thread: how many windows it reads into. */
+    /* Sweep thread: the number of windows it reads into. */
     void windows(int n) {
         std::lock_guard<std::mutex> lk(mu_);
         out_.assign((size_t)n, 0);
@@ -1782,8 +1650,8 @@ public:
         copies_.push_back(c);
         work_.notify_one();
     }
-    /* The sweep thread: until no copy out of window `slot` is outstanding. A failed pool still
-     * retires its copies, so this returns either way. */
+    /* Sweep thread: wait until no copy from window `slot` is outstanding. A failed pool still
+     * retires its copies, so this always returns. */
     void drain(int slot) {
         std::unique_lock<std::mutex> lk(mu_);
         drained_.wait(lk, [&] { return out_[(size_t)slot] == 0; });
@@ -1803,10 +1671,8 @@ public:
                 rad_stream_destroy(uplinks_[(size_t)d].st);
                 uplinks_[(size_t)d].st = nullptr;
             }
-        /* EVERY STAGED WEIGHT MUST HAVE BEEN DELIVERED. One nothing arrived for was never laid out
-         * and its slot holds whatever the card had there: zeros on a card whose freed memory the
-         * driver wipes, which is how such a slot serves for months unnoticed, and garbage on one
-         * that has just been through a reset. Refusing here is what makes the hole visible. */
+        /* Every staged weight must have been delivered; otherwise its slot holds whatever memory
+         * held before (often zeros, so the bug can go unnoticed). */
         if (status_ == RAD_OK && !audited_) {
             audited_ = true;
             int64_t undelivered = 0;
@@ -1831,32 +1697,30 @@ public:
     int64_t peak() const { return peak_; }
 
 private:
-    /* ONE STREAM A CARD FOR EVERY WORKER'S COPIES. A stream is a hardware queue of its own on
-     * this backend, and a stream a worker a card made some twenty queues a card, which the card
-     * time-slices: the workers spent three quarters of a Flash-Next load waiting on their copies.
-     * One link copy fills the link by itself, so one queue a card loses nothing; the workers take
-     * turns putting their copies on it. */
+    /* One stream per card shared by all workers. Each stream is a hardware queue on this backend,
+     * and a stream per worker per card means ~20 time-sliced queues per card (workers spent three
+     * quarters of a Flash-Next load waiting). One copy already saturates the link. */
     struct Uplink {
         std::mutex mu;
         RadStream  st = nullptr;
     };
 
-    /* A worker's way onto a card: a ring of pinned slots. A weight that fits one is laid out
-     * straight into it, and a larger one goes up a slot's worth at a time; each slot is waited
-     * for when the ring comes back round to it, not after every copy. */
+    /* A worker's path to a card: a ring of pinned slots. A weight that fits is laid out directly
+     * into a slot, a larger one goes up a slot at a time; a slot is waited for only when the ring
+     * wraps back to it. */
     struct Bounce {
         static constexpr int     kSlots = 8;
         static constexpr int64_t kSlot  = 4ll << 20;
         explicit Bounce(Uplink* up) : up_(up) {}
         Uplink* up_;
         void* buf = nullptr;
-        /* THE RELAYOUT'S OUTPUT for a weight larger than a slot, kept from one weight to the next
-         * up to kKeep -- the same page faults as the inputs' region saves, and a worker's own. */
+        /* Relayout output for weights larger than a slot, reused across weights up to kKeep to
+         * avoid page faults. */
         static constexpr int64_t kKeep = 256ll << 20;
         std::unique_ptr<uint8_t[]> out;
         int64_t out_cap = 0;
-        /* An event a device, since an event belongs to the device it was made on; `live` is the
-         * device the slot's last copy went to. */
+        /* One event per device (an event belongs to its device); `live` is the device of the
+         * slot's last copy. */
         struct Slot { std::vector<RadEvent> ev; int live = -1; };
         Slot slot[kSlots];
         int  next = 0;
@@ -1961,14 +1825,14 @@ private:
             if (st < 0 && !failed_) { failed_ = true; status_ = st; }
             room_.notify_all();
         }
-        /* Its copies are still in flight: finish() returns once every worker's have landed. */
+        /* Wait for this worker's copies still in flight. */
         const int fs = b.flush();
         std::lock_guard<std::mutex> lk(mu_);
         if (fs < 0 && !failed_) { failed_ = true; status_ = fs; }
     }
 
-    /* A staged weight's input, made by the first worker that needs it: the first copy into it, or
-     * the job that fills it from a checkpoint. The first hole that holds it. */
+    /* A staged weight's input, created once by the first worker to need it, in the first region
+     * hole that fits. */
     uint8_t* input(int i) {
         StagedWeight& s = items_[(size_t)i];
         std::call_once(once_[(size_t)i], [&] {
@@ -1989,8 +1853,7 @@ private:
         return s.in;
     }
 
-    /* Under the lock: [off, off + n) of the region is free again, merged with the holes either
-     * side of it. */
+    /* Under the lock: free [off, off + n) of the region, merging with adjacent holes. */
     void give_back(int64_t off, int64_t n) {
         auto next = holes_.lower_bound(off);
         if (next != holes_.end() && off + n == next->first) {
@@ -2004,8 +1867,8 @@ private:
         holes_[off] = n;
     }
 
-    /* One piece after another of the run, each the part of it the job's range holds: dense in
-     * the destination, a row of a column share at a time. */
+    /* Copy each piece of the run that falls in the copy's file range: dense in the destination,
+     * one row of a column share at a time. */
     void take(const Copy& c) {
         const LoadRun& q = c.q;
         uint8_t* base = q.stage >= 0 ? input(q.stage) + (intptr_t)q.dst : q.dst;
@@ -2028,7 +1891,7 @@ private:
             const int fs = s.fill(s.in);
             if (fs < 0) return fs;
         }
-        /* STORED AS IT IS, which only a weight with no sweep reaches: its share goes up as read. */
+        /* Stored as read (only reached by a weight with no sweep). */
         if (w.identity && !w.widen) {
             const int64_t n = w.stored_bytes;
             if (!s.dev) { std::memcpy(s.dst, s.in, (size_t)n); return RAD_OK; }
@@ -2058,7 +1921,7 @@ private:
         int st = RAD_OK;
         const char* who = "the loader";
         if (w.widen) {
-            /* EXACT: every bf16 and f16 value is an f32. */
+            /* Exact: every bf16 and f16 value is representable in f32. */
             const int64_t cnt = w.sel_rows[0] * w.sel_cols[0];
             if (cnt * 4 != n) st = RAD_E_SHAPE;
             else for (int64_t e = 0; e < cnt; ++e) ((float*)out)[e] = rad_load_f32(pt[0].data, pt[0].dtype, e);
@@ -2086,7 +1949,7 @@ private:
     }
 
     std::vector<StagedWeight>& items_;
-    std::unique_ptr<std::once_flag[]> once_;   /* one an item: its input is made once */
+    std::unique_ptr<std::once_flag[]> once_;   /* per item: its input is made once */
     std::unique_ptr<Uplink[]>  uplinks_;       /* indexed by device */
     int                        n_uplinks_ = 0;
     static constexpr int64_t kHole = 4096;     /* every input starts on a page of its own */
@@ -2105,45 +1968,36 @@ private:
     int status_ = RAD_OK;
 };
 
-/* THE ONE PASS OVER THE CONTAINER, SERVING EVERY RANK.
+/* One pass over the container, serving every rank. The runs (declaration order, grouped by rank)
+ * are sorted by file offset into one front-to-back sweep: read a window, hand it to every rank
+ * that wants a piece, move on.
  *
- * The runs arrive in declaration order, grouped by rank. Sorted by FILE OFFSET they become a
- * single front-to-back sweep: read a window, hand it to every rank that asked for a piece of it,
- * move on. That is three separate wins over reading per rank as the walk goes:
+ *   - The file is read once; replicated weights (gigabytes on a large container) are not read
+ *     once per rank.
+ *   - Reads are sequential, which one thread can sustain at the NVMe rate, provided they bypass
+ *     the page cache: a buffered pread copies every byte on this thread and caps the rate at
+ *     about two thirds (half with the relayout pool's copies). O_DIRECT DMAs into the window.
+ *   - Copies overlap reads: a ring of pinned windows with one event per rank each, so reading one
+ *     window overlaps the DMAs and pool memcpys out of the others. Serialising, or waiting on the
+ *     stream instead of the event, costs about a fifth of the load rate.
  *
- *   - the file is read ONCE. A weight every rank wants -- every replicated weight, which is
- *     gigabytes on a large container -- would otherwise be read once per rank.
- *   - the reads are SEQUENTIAL. A declaration-order access pattern reads at a fraction of an
- *     NVMe disk's sequential rate; one thread reading front to back reaches it, and more threads
- *     do not help -- provided the reads go around the page cache. A buffered pread is the kernel
- *     copying every byte out of the cache into the window on this one thread, and that copy,
- *     not the disk, sets the rate: about two thirds of it alone, and half once the relayout
- *     pool's copies share the memory system. O_DIRECT lands the disk's DMA in the window itself.
- *   - the copies OVERLAP the reads. A ring of pinned windows, an event a rank on each: the read
- *     that fills one window runs while the copies out of the others are in flight -- the DMAs to
- *     the cards, and the pool's memcpys to host memory. Serialising them costs about a fifth of
- *     the load rate; waiting on the stream instead of on the event costs the same, because the
- *     stream also holds the copies this read was supposed to hide under.
- *
- * Host pinned memory is portable across devices in one process, so ONE window feeds every card:
- * copying each window to all of them still runs at the disk's rate rather than the link's. */
+ * Pinned host memory is portable across devices in one process, so one window feeds every
+ * card. */
 static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
                            const std::vector<int>& devices, RelayoutPool* pool,
                            int64_t* read_out) {
     *read_out = 0;
     if (runs.empty()) return RAD_OK;
 
-    /* By where the bytes ARE, which is the whole idea: after this the runs are a reading order
-     * and no longer a rank order. The tie-break on span keeps the order total, so two builds of
-     * the same load issue their copies in the same sequence. */
+    /* Sort by file offset into a reading order; the span tie-break makes the order total, so the
+     * same load always issues copies in the same sequence. */
     std::sort(runs.begin(), runs.end(), [](const LoadRun& a, const LoadRun& b) {
         if (a.foff != b.foff) return a.foff < b.foff;
         return a.span > b.span;
     });
 
-    /* What the sweep will actually read, for the progress line: the union of the runs, which is
-     * NOT the sum of them at --tp 2 and not the size of the file either -- the mapped tier is in
-     * neither. */
+    /* Bytes the sweep reads, for the progress line: the union of the runs (not their sum under TP,
+     * nor the file size, since the mapped tier is excluded). */
     int64_t want_bytes = 0;
     {
         int64_t hi = -1;
@@ -2155,30 +2009,21 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
     }
 
     int64_t window = 64 << 20;
-    if (const char* e = getenv("RADIANCE_LOAD_WINDOW_MIB")) {
-        const long long v = atoll(e);
-        if (v > 0) window = (int64_t)v << 20;
-    }
-    /* A window WIDE ENOUGH to hold one piece of a strided run, whatever the widest is. The
-     * slicing below is correct at any window -- a piece cut by a chunk boundary is copied in the
-     * two halves it falls in -- but a window narrower than a piece turns every piece into two
-     * copies instead of one 2D copy for a whole row group at a time. Nothing in this tree comes
-     * near 64 MiB in a piece: a column shard's piece is one row group of one rank's columns. */
+    /* Widen the window to hold the widest strided piece. Slicing is correct at any width (a cut
+     * piece is copied in two halves), but a narrower window doubles the copies. In practice no
+     * piece approaches 64 MiB. */
     int64_t widest = 0;
     for (const LoadRun& q : runs) if (q.ny > 1 && q.wb > widest) widest = q.wb;
     if (widest > window) window = align_up(widest, 4096);
 
-    /* READ THROUGH A GAP RATHER THAN BREAK THE STREAM FOR IT, up to a point. On an NVMe disk a
-     * megabyte of sequential read costs about what starting a fresh read costs, so bytes nobody
-     * asked for are cheaper than the break until there are a few million of them. The gaps that
-     * matter are whole tiers -- a mapped n-gram table is tens of gigabytes of one -- and those
-     * are nowhere near this bound, so the choice only ever costs a little and saves a lot. */
+    /* Read through gaps up to kGap instead of breaking the stream: on NVMe a megabyte of
+     * sequential read costs about as much as starting a new read. Large gaps (a mapped n-gram
+     * table, tens of gigabytes) are far above this bound. */
     const int64_t kGap = 4 << 20;
 
-    /* SIX WINDOWS, because the host copies out of one are a worker's memcpy and not a DMA: a
-     * window a staged weight's piece sits in is free only when a worker has taken it, and the
-     * ring is how far the read may run ahead of them. Pieces are cut at kPiece so one window's
-     * worth spreads over several workers. */
+    /* Six windows: host copies out of a window are worker memcpys, so a window is free only once
+     * the workers have taken their pieces, and the ring bounds how far reads run ahead. Copies are
+     * cut at kPiece so one window spreads over several workers. */
     constexpr int     kWin   = 6;
     constexpr int64_t kPiece = 8 << 20;
     constexpr int64_t kBlk   = DirectFile::alignment();
@@ -2190,27 +2035,24 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
     void*    buf[kWin] = {};
     pool->windows(kWin);
     int64_t  read_bytes = 0;
-    double   read_s = 0;     /* of the sweep's wall time, how much was the disk itself */
+    double   read_s = 0;     /* the part of the sweep's wall time spent reading */
 
     const int rc = [&]() -> int {
         for (size_t k = 0; k < nr; ++k) {
-            /* A stream and an event both belong to the device that was current when they were
-             * made, and recording one on the other's stream is an error rather than a slow path.
-             * The COPIES need no such bind: a stream carries its own device. */
+            /* Streams and events belong to the device current at creation, so bind it here; the
+             * copies themselves need no bind, since a stream carries its device. */
             RAD_TRY(rad_dev_set(devices[k]));
             RAD_TRY(rad_stream_create(&st[k], 0));
             for (int b = 0; b < kWin; ++b) RAD_TRY(rad_event_create(&ev[(size_t)b * nr + k]));
         }
-        /* O_DIRECT WANTS THE OFFSET, THE LENGTH AND THE BUFFER BLOCK-ALIGNED, and a chunk is
-         * wherever its runs put it: a window is read from the block below the chunk to the block
-         * above it, so it is two blocks wider than the chunk can be. A filesystem that refuses
-         * O_DIRECT is read through the cache instead, at the cache's rate. */
+        /* O_DIRECT needs block-aligned offset, length and buffer, while a chunk falls wherever its
+         * runs do, so a window is read from the block below the chunk to the block above it (two
+         * blocks wider). A filesystem that refuses O_DIRECT is read buffered. */
         RAD_TRY(dio.open(file->path(), RAD_DIO_READ | RAD_DIO_ALLOW_BUFFERED));
         for (int b = 0; b < kWin; ++b) {
             buf[b] = rad_dev_alloc(window + 2 * kBlk, RAD_MEM_HOST_PINNED);
             if (!buf[b]) {
-                RAD_ERR("load: no %s pinned staging window. The load needs %d of them; lower "
-                        "RADIANCE_LOAD_WINDOW_MIB or free host memory.",
+                RAD_ERR("load: no %s pinned staging window (the load needs %d); free host memory",
                         humanb(window).c_str(), kWin);
                 return RAD_E_NOMEM;
             }
@@ -2218,11 +2060,10 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
 
         int cur = 0;
 
-        /* Read the chunk [c0, c1) into window `b`; `*at` is where its first byte landed. The
-         * blocks are whole up to the file's last full one, and a tail past that is the only read
-         * the bounce in DirectFile serves. Read buffered, the cache goes with the window: nothing
-         * comes back for a window the sweep has finished, and tens of gigabytes of dead pages
-         * turn into reclaim the reads then wait on. */
+        /* Read chunk [c0, c1) into window `b`; `*at` receives its first byte. Whole blocks up to
+         * the file's last full block; only the tail past it uses DirectFile's bounce. When read
+         * buffered, drop the window's pages afterwards, or tens of gigabytes of dead cache force
+         * reclaim that the reads then wait on. */
         const int64_t whole = file->size() / kBlk * kBlk;
         auto fill = [&](int b, int64_t c0, int64_t c1, const uint8_t** at) -> int {
             const auto t = std::chrono::steady_clock::now();
@@ -2238,17 +2079,10 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
             return RAD_OK;
         };
 
-        /* Hand one run the part of itself that lies in the staged chunk [c0, c1).
-         *
-         * A run is SLICED BY THE CHUNK rather than given a chunk of its own, and that is the
-         * whole reason the chunk is a file range and not a run. At --tp 2 a column-sharded weight
-         * is two runs over the same entry, half a row apart: served one run at a time the entry
-         * is read TWICE, so the sweep reads more bytes than the container holds; served as a
-         * range, both runs take their columns out of one read.
-         *
-         * The strided case keeps its 2D copy for every piece the chunk holds WHOLE, which is all
-         * of them but the two at the ends; a piece cut by a chunk boundary is the only thing that
-         * becomes a copy of its own. */
+        /* Issue the part of a run that lies in chunk [c0, c1). Chunks are file ranges, not runs, so
+         * runs over the same entry (a column-sharded weight's per-rank runs, half a row apart)
+         * share one read. Pieces wholly inside the chunk go as one 2D copy; only a piece cut by a
+         * chunk boundary is copied separately. */
         auto one = [&](const LoadRun& q, uint8_t* dst, const uint8_t* src, int64_t len) -> int {
             touched[(size_t)q.rank] = 1;
             return rad_memcpy_async(dst, src, len, st[(size_t)q.rank]);
@@ -2259,9 +2093,8 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         };
         auto issue = [&](const LoadRun& q, const uint8_t* win, int64_t c0, int64_t c1,
                          int slot) -> int {
-            /* A HOST DESTINATION IS A MEMCPY, and the pool's workers make it: a staged run into
-             * its weight's input, which tells the pool how much of it has arrived, and any other
-             * into its host pool slot. The sweep only reads. */
+            /* Host destinations are memcpys done by the pool's workers: a staged run into its
+             * weight's input (counted as arrived), any other into its host pool slot. */
             if (q.stage >= 0 || !q.dev) {
                 if (pool->failed()) return RAD_E_STATE;
                 if (q.stage >= 0) pool->reserve(q.stage);
@@ -2296,10 +2129,9 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
             }
             return RAD_OK;
         };
-        /* The window about to be overwritten is still the source of the copies issued out of it
-         * a turn of the ring ago. Wait for THOSE, by event, and not for the stream: the stream
-         * also holds the other windows' copies, which are exactly what this read is meant to hide
-         * under. And for the pool's memcpys out of it. */
+        /* Before reusing a window, wait for the copies issued from it a ring turn ago: by event,
+         * not stream sync (the stream also holds the other windows' copies this read should
+         * overlap), and for the pool's memcpys out of it. */
         auto acquire = [&](int b) -> int {
             for (size_t k = 0; k < nr; ++k)
                 if (live[(size_t)b * nr + k]) {
@@ -2321,10 +2153,9 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
 
         const auto t0 = std::chrono::steady_clock::now();
         int64_t    last_note = 0;
-        /* A LOAD THAT STOPS HAS TO SAY WHERE. This names a file offset, which `rad-info -v` turns
-         * back into a weight -- the only way to localise a stall inside the sweep. Coarse by
-         * default because the sweep is seconds long; RADIANCE_DEBUG_LOAD_EVERY_MIB=64 is the
-         * fine-grained trail. */
+        /* Progress lines name a container offset, which `rad-info -v` maps back to a weight, to
+         * localise a stalled sweep. Every 8 GiB by default; RADIANCE_DEBUG_LOAD_EVERY_MIB sets a
+         * finer interval. */
         int64_t kNoteEvery = 8LL << 30;
         if (const char* e = getenv("RADIANCE_DEBUG_LOAD_EVERY_MIB")) {
             const long long v = atoll(e);
@@ -2332,10 +2163,9 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         }
         size_t i = 0;
         while (i < runs.size()) {
-            /* THE GROUP IS A STRETCH OF FILE, NOT A RUN. Every run that chains to this one within
-             * kGap belongs to the same read stream, however many ranks and however many weights
-             * that is, and however far it reaches: a group larger than a window is read in
-             * windows, not abandoned to a path of its own. */
+            /* A group is a stretch of file: every run chaining to this one within kGap, across
+             * ranks and weights, however long. A group larger than a window is read window by
+             * window. */
             const int64_t g0 = runs[i].foff;
             int64_t g1 = g0 + runs[i].span;
             size_t  j  = i + 1;
@@ -2345,9 +2175,8 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
                 if (end > g1) g1 = end;
             }
 
-            /* `lo` is the first run that has not finished. Sorted by offset, a run whose last
-             * byte is behind the chunk is behind it for good, so the scan never goes backwards
-             * and each run is looked at once per chunk it reaches into. */
+            /* `lo` is the first unfinished run. Runs are sorted by offset, so one that ends before
+             * the chunk is done for good and the scan never goes back. */
             size_t lo = i;
             for (int64_t c0 = g0; c0 < g1; ) {
                 const int64_t c1 = g1 < c0 + window ? g1 : c0 + window;
@@ -2373,17 +2202,14 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
             i = j;
         }
 
-        /* The last host synchronisation before serving: after this the step path never waits on
-         * the host again (spec §5.4). */
+        /* The last host synchronisation before serving (spec §5.4). */
         for (size_t k = 0; k < nr; ++k) RAD_TRY(rad_stream_sync(st[k]));
         for (int b = 0; b < kWin; ++b) pool->drain(b);
 
         const double s = std::chrono::duration<double>(
                              std::chrono::steady_clock::now() - t0).count();
-        /* THE SPLIT IS THE DIAGNOSTIC. If the disk time is the whole of the wall time the sweep
-         * is at the drive's ceiling and there is nothing here to win; what is left over is the
-         * copies that did not hide under a read -- the host-tier memcpy, which is synchronous,
-         * and the per-run issue loop. */
+        /* Wall time vs disk time: when they match, the sweep is at the drive's ceiling; the
+         * difference is copies that did not overlap a read (host memcpys, the issue loop). */
         RAD_INFO("load: one pass over the container, %s read in %.1f s (%.1f GB/s) for %zu "
                  "rank(s); %.1f s of that was the disk (%.1f GB/s)",
                  humanb(read_bytes).c_str(), s, read_bytes / (s > 0 ? s : 1) / 1e9, nr,
@@ -2391,12 +2217,10 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         return RAD_OK;
     }();
 
-    /* AND THE PAGE CACHE GOES BACK. Weights that will never be read from the file again are cache
-     * the mapped tier cannot use: a mapped n-gram table is read from its mapping for the life of
-     * the process, and it is the one thing here that wants the cache. What this frees is worth
-     * more to the model than to the loader. */
+    /* Release the page cache of weights never read from the file again, leaving it to the mapped
+     * tier (e.g. a mapped n-gram table, read from its mapping for the process lifetime). */
     file->drop_blob_cache();
-    /* NOT FREED UNDER A WORKER: a sweep that failed part-way may have left copies out of them. */
+    /* Drain before freeing: a sweep that failed part-way may have copies outstanding. */
     for (int b = 0; b < kWin; ++b) pool->drain(b);
     for (int b = 0; b < kWin; ++b) if (buf[b]) rad_dev_free(buf[b], RAD_MEM_HOST_PINNED);
     for (size_t k = 0; k < ev.size(); ++k) if (ev[k]) rad_event_destroy(ev[k]);
@@ -2405,10 +2229,9 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
     return rc;
 }
 
-/* One rank's share of a checkpoint weight's selected planes, read out of the mapped tensors into
- * `in` at the offsets the pool laid out: whole rows as one read, a column share a block of rows at
- * a time with the bytes it owns taken out of each. A whole plane declared under another shape (a
- * reshape) is the same bytes, so it is read in the checkpoint's own rows. */
+/* Read one rank's share of a checkpoint weight's selected planes from the mapped tensors into
+ * `in` at the pool's offsets: whole rows in one read, a column share a block of rows at a time.
+ * A reshaped whole plane has the same bytes, so it is read in the checkpoint's rows. */
 static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneShare>& shares,
                                 const std::vector<int>& sel, const std::vector<int64_t>& offs,
                                 const std::string& name, uint8_t* in) {
@@ -2457,22 +2280,13 @@ static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneSha
 
 int Engine::load_weights() {
     int64_t total = 0, n_loaded = 0, n_missing = 0;
-    /* Counted apart from `n_loaded` because it is not a load: mapped weights are published where
-     * they already lie, and reporting their bytes as moved would credit the load with tens of
-     * gigabytes of work it did not do. */
+    /* Counted apart from `n_loaded`: mapped weights are published in place, not loaded. */
     int64_t n_mapped = 0, mapped_bytes = 0;
 
-    /* THE WALK AND THE READING ARE TWO PHASES.
-     *
-     * A loop over RANKS, each walking the whole weight list and reading as it goes, reads the
-     * container once per rank, in declaration order, one pread to a weight -- a fraction of the
-     * disk's sequential rate, and more bytes read than placed, because every replicated weight is
-     * read once per rank.
-     *
-     * So the walk below decides everything -- which rank wants which bytes, where they land,
-     * what has to be refused -- and writes it down without touching the disk. sweep_container
-     * then sorts what it wrote by file offset and reads the container once, front to back,
-     * handing each window to every rank that asked for a piece of it. */
+    /* Two phases. The walk decides which rank wants which bytes, where they land, and what is
+     * refused, without touching the disk; sweep_container then reads the container once in file
+     * order (reading per rank in declaration order would run far below the sequential rate and
+     * read replicated weights once per rank). */
     std::vector<LoadRun> runs;
     std::vector<StagedWeight> staged;
     int64_t n_out = 0;      /* destination overruns reported, capped */
@@ -2480,43 +2294,31 @@ int Engine::load_weights() {
     /* ============================================================== the walk */
     for (auto& r : ranks_) {
         LogRank lr(r->index);
-        /* Bound before anything is allocated for this rank: rad_dev_alloc has no device argument
-         * and takes whatever is current, so the mover's slabs would otherwise all land on card 0.
-         * See plan() for the same bind and the same reason. */
+        /* Bind before allocating for this rank (as in plan()). */
         RAD_TRY(rad_dev_set(r->device));
 
-        /* THE CONTAINER IS THE FILE TIER, and the mover has to be told so. `--weights-disk-tier` makes
-         * the planner place units on Tier::SSD, and a bare `MoverConfig{}` then dies in
-         * Mover::init with "the plan put weights on the file tier but no container path was
-         * given" -- after the plan has already been made. The mover reads THIS file with O_DIRECT
-         * rather than a copy of it: the weights are already
-         * here, RAD_ALIGN_UNIT-aligned (rad_format.h), which is DirectFile's alignment exactly,
-         * so a stage takes the no-bounce path. */
+        /* The container is the file tier (--weights-disk-tier places units on Tier::SSD), so the
+         * mover needs its path. It reads the container with O_DIRECT: weights are RAD_ALIGN_UNIT-
+         * aligned (rad_format.h), DirectFile's alignment, so stages take the no-bounce path. */
         MoverConfig mc{};
         mc.container_path = file_ ? cfg_.model : std::string();
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
-        /* WHAT THE MOVER TOOK, said before the first copy. The slabs are allocated in init, so by
-         * here the pool is as full as it will get -- the copy loop writes into slots that already
-         * exist and moves the cursor no further. A load that stops with the pool at zero free is
-         * a placement failure wearing a loader's costume, and this line is what tells the two
-         * apart from the outside. */
+        /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
+         * is as full as it will get; a load stopping with zero free is a placement failure, not
+         * a loader one. */
         RAD_INFO("load: rank %d, mover took %s, weights pool %s free of %s", r->index,
                  humanb(r->pools.weights().used()).c_str(),
                  humanb(r->pools.weights().avail()).c_str(),
                  humanb(r->pools.weights().used() + r->pools.weights().avail()).c_str());
 
-        /* THE POLICY HALF, BOUND TO THE SAME PLAN. It returns RAD_OK on a static plan and reports
-         * `enabled() == false`, which is a mode and not a failure -- all_vram and
-         * --deterministic both land there -- so there is nothing to branch on here. */
+        /* The heat engine, bound to the same plan. On a static plan (all_vram, --deterministic) it
+         * returns RAD_OK with `enabled() == false`. */
         RAD_TRY(r->heat.init(r->plan, HeatParams{}));
 
-        /* A DESTINATION HAS TO LIE INSIDE THE POOL IT WAS CARVED FROM. A slot pointer that runs
-         * past the end of the weights pool is a write to device memory the process does not own,
-         * and on this driver that does not fault -- the copy is accepted, never completes, and
-         * the host thread spins inside the runtime with the copy engine idle and no I/O. It looks
-         * exactly like a hang, and it moves with the weights pool's size because a bigger pool is a
-         * later overrun. Cheap enough to check on every copy, and checked before any of them
-         * start rather than as each one is issued. */
+        /* Every destination must lie inside the weights pool. A copy past its end targets memory
+         * the process does not own, which on this driver does not fault: the copy never completes
+         * and the host spins in the runtime, like a hang. Checked for every copy before any
+         * starts. */
         const uint8_t* wp_lo = (const uint8_t*)r->pools.weights().base();
         const uint8_t* wp_hi = wp_lo + r->pools.weights().bytes();
         auto dst_fits = [&](const void* p, int64_t len, const char* nm) {
@@ -2531,16 +2333,15 @@ int Engine::load_weights() {
             return false;
         };
 
-        /* AND THE SOURCE OF A SHARE HAS TO LIE INSIDE ITS PLANE. Every offset below is computed
-         * from the rank index, so rank 0 cannot exercise the arithmetic at all -- whatever the
-         * shape is, it reads from the start of the plane. An offset that runs off the end is a
-         * read of the wrong weight, or of nothing at all, so it is checked, not trusted. */
+        /* And every source range must lie inside its plane. Offsets depend on the rank index
+         * (rank 0 always starts at the plane's start, so it never exercises the arithmetic), and
+         * an overrun would read the wrong weight. */
         const int64_t file_bytes = file_ ? file_->size() : 0;
 
         for (size_t i = 1; i < r->program.weights.size(); ++i) {
             WeightInfo& w = r->program.weights[i];
-            /* WHERE ITS PLANES ARE: a container entry, or the checkpoint tensors declare resolved
-             * it to. Either way the encoding and the logical shape the share is cut in. */
+            /* The planes' source: a container entry or the checkpoint tensors declare resolved,
+             * giving the encoding and logical shape the share is cut in. */
             const RadFileEntry* e = file_ ? file_->find(w.source) : nullptr;
             const CkptWeight* cw = ckpt_src_ ? ckpt_src_->find(w.source) : nullptr;
             if (!e && !cw) {
@@ -2559,10 +2360,8 @@ int Engine::load_weights() {
             const uint32_t src_rank = e ? e->rank : cw->rank;
             const int64_t* src_shape = e ? e->shape : cw->shape;
 
-            /* THE ENCODING THE KERNELS WERE CHOSEN FOR IS THE ONE THE SOURCE HOLDS. Declare asked
-             * it (rad_weight_encoding) and every layout hook answered for that encoding, so a
-             * difference here is a declaration that was made against something else -- refused
-             * by name rather than relaid as if it were the same weight. */
+            /* The source must hold the encoding declare saw (rad_weight_encoding) and every layout
+             * hook answered for; otherwise refuse rather than relayout the wrong bytes. */
             if (!rad_enc_equal(&src_enc, &w.enc)) {
                 char want[256], have[256];
                 rad_enc_format(&w.enc, want, sizeof want);
@@ -2573,28 +2372,12 @@ int Engine::load_weights() {
                 return RAD_E_FORMAT;
             }
 
-            /* THE PLANNER'S DECISION HAS TO LAND ON WeightInfo, and this is where it lands.
-             *
-             * WeightInfo::tier/site/slab_slot say "Filled by the planner (spec §5.3)" and the
-             * planner's own finish() says it is "the component that fills these three" -- but
-             * what it fills is Plan::weight[], a parallel array. Leaving the two apart is silent
-             * in both directions:
-             *
-             *   - Ctx::bind_weights picks RAD_DOMAIN_HOST only when EVERY weight operand of an op
-             *     has site == Site::Host. Left at the default Site::Device that test can never
-             *     pass, so host-site execution is unreachable and the planner's whole
-             *     "contiguous host runs" objective lands nowhere -- layer offload becomes dead
-             *     code that still passes its tests.
-             *   - a file-tier weight is skipped below on `tier == Tier::SSD` read off the PLAN,
-             *     so the two spellings of the same fact would disagree right here.
-             *
-             * file_offset is the same story one layer down: Mover::stage reads it to pread the
-             * container, and left unset every SSD stage reads offset 0 -- the file header -- for
-             * every weight. It is the selected plane's, and only a weight read where it lies ever
-             * uses it (weight_file_direct).
-             *
-             * Set before the residency lookup, not after: a file-tier weight has no address yet
-             * and takes the `continue` below, and it is precisely the one that needs the offset. */
+            /* Copy the planner's decision (Plan::weight[], a parallel array) onto WeightInfo.
+             * Ctx::bind_weights picks RAD_DOMAIN_HOST only when every weight operand has
+             * Site::Host, so without this host-site execution is unreachable. file_offset (the
+             * selected plane's) is what Mover::stage preads for a weight read in place
+             * (weight_file_direct); unset, it would read the file header. Set before the residency
+             * lookup, because a file-tier weight has no address yet and `continue`s below. */
             w.tier        = r->plan.weight[i].tier;
             w.site        = r->plan.weight[i].site;
             w.slab_slot   = r->plan.weight[i].slab_slot;
@@ -2609,16 +2392,10 @@ int Engine::load_weights() {
                 return RAD_E_STATE;
             }
 
-            /* THE MAPPED TIER IS A PUBLISH AND NOT A LOAD. The bytes are already at a host
-             * address -- the container is mmapped and stays mapped for the life of the engine
-             * (core/format/radfile.cpp) -- so there is nothing to copy and no pool to copy into.
-             * This is the only weight class the load phase does not move, and the sweep below
-             * never reads a byte of it -- which on a container with a large mapped table is most
-             * of the file.
-             *
-             * IT HAS TO GO THROUGH THE RESIDENCY TABLE and not only onto WeightInfo::ptr, because
-             * Ctx::resolve_weight reads the table whenever a mover exists and would otherwise
-             * find the null the mover published for a unit with no slab class. */
+            /* The mapped tier is published, not loaded: the container stays mmapped for the
+             * engine's life (core/format/radfile.cpp), and the sweep never reads these bytes.
+             * Publish through the residency table too, not only WeightInfo::ptr, because
+             * Ctx::resolve_weight reads the table whenever a mover exists. */
             if (w.tier == Tier::Mapped) {
                 const RadFilePlane& p0 = file_->plane(*e, w.sel[0]);
                 const int64_t n = (int64_t)p0.bytes;
@@ -2630,12 +2407,10 @@ int Engine::load_weights() {
                 }
                 w.ptr = (void*)file_->data(p0);
                 w.host_ptr = w.ptr;
-                /* --ngram-placement ram: the gather reads a copy instead of the mapping -- pinned
-                 * memory a device kernel reads in place over the link, where the planner put the
-                 * table on the zero-copy site, or locked memory for the host gather. A copy auto
-                 * chose and could not make leaves the table in the container and says so, and a
-                 * card's gather moves to the host with it; one the operator asked for refuses the
-                 * start. */
+                /* --ngram-placement ram: the gather reads a copy instead of the mapping: pinned
+                 * memory for a device kernel on the zero-copy site, or locked memory for the host
+                 * gather. If auto's copy fails, the table stays in the container (a card's gather
+                 * moves to the host); if `ram` was asked for, startup fails. */
                 if (cfg_.ngram_resolved == TablePlacement::Ram &&
                     is_ngram_table(r->program, (rad_weight)i)) {
                     const bool card = w.site == Site::DeviceZeroCopy;
@@ -2672,21 +2447,10 @@ int Engine::load_weights() {
                                "rows are read from the container%s", into, why.c_str(),
                                card ? " by the host gather" : ""));
                 }
-                /* NO READAHEAD ON A MAPPED WEIGHT. What reads one is a host kernel gathering rows
-                 * out of it, and the only reason a weight is on this tier at all is that it is far
-                 * too big to be resident -- so a fault is a real read from the file and the pages
-                 * around it are pages nobody asked for. Linux's default 128 KiB readahead turns a
-                 * row of a few hundred bytes into 32 pages of I/O, and at a dozen rows a token
-                 * that is megabytes read to use kilobytes. MADV_RANDOM is the whole of the
-                 * correction and it is per range, so the rest of the container keeps the
-                 * sequential behaviour the load pass wants.
-                 *
-                 * IT SHOWS NOTHING ON A WARM PAGE CACHE. When the hot part of the table is
-                 * already resident the serving process reads nothing from disk and the advice
-                 * changes no timing at all; the regime it protects -- a table genuinely colder
-                 * than RAM -- is the regime this tier exists for, and it costs one syscall at
-                 * load. What shows its effect is a cold cache and a byte counter, not a
-                 * stopwatch. */
+                /* No readahead on a mapped weight: a host kernel gathers a few rows from a table
+                 * too large to be resident, so the default 128 KiB readahead would read 32 pages
+                 * for a row of a few hundred bytes. MADV_RANDOM is per range, so the rest of the
+                 * container keeps sequential readahead. The effect shows only with a cold cache. */
                 posix_madvise(w.ptr, (size_t)n, POSIX_MADV_RANDOM);
                 r->mover.publish_mapped((rad_weight)i, w.ptr);
                 ++n_mapped;
@@ -2696,36 +2460,25 @@ int Engine::load_weights() {
 
             const WeightSlot* slot = r->mover.residency()->lookup((rad_weight)i);
             if (!slot || !slot->ptr) {
-                /* A file-tier unit has no address until the mover stages it, which is correct and
-                 * not an error: RAD_ACCESS_RARE weights are read on demand (spec §5.2). */
+                /* A file-tier unit has no address until the mover stages it (spec §5.4). */
                 if (w.tier == Tier::SSD) continue;
                 RAD_ERR("rank %d: '%s' has no address after mover init", r->index, w.name.c_str());
                 return RAD_E_STATE;
             }
 
-            /* THE ADDRESS HAS TO LAND ON WeightInfo, not only in the residency table. In the
-             * all-in-VRAM case Ctx is built with a NULL residency -- the mover never runs, so
-             * there is nothing to look up per issue -- and `Ctx::resolve_weight` collapses to
-             * `WeightInfo::ptr` (core/runtime/issue.cpp says exactly that). Leaving it null
-             * leaves every weight in the program unbound at issue, which the run phase reports as
-             * "weight 'x' has no pointer at issue: the load phase never bound it" -- the load
-             * having copied the whole model into addresses nothing afterwards can name.
-             * `generation` is not bumped because `bind_weights` runs for the first time after
-             * this, in Ctx::init. */
+            /* The address must also land on WeightInfo: with everything in VRAM, Ctx has no
+             * residency table and Ctx::resolve_weight reads WeightInfo::ptr
+             * (core/runtime/issue.cpp). `generation` is not bumped, since bind_weights first runs
+             * after this, in Ctx::init. */
             w.ptr = slot->ptr;
 
-            /* HOST-POOL DESTINATIONS STAY A memcpy. The host pool is pinned and device-mapped
-             * (core/mem/pools.cpp), so the copy engine CAN write it, and the synchronous
-             * host-tier memcpy is most of what separates this sweep from the disk's own rate --
-             * which makes putting those copies on the stream look as though it would hide them
-             * under the next read. It does not: an async host-to-host copy is not a DMA on this
-             * stack, it is the same memcpy with a stream in front of it. */
+            /* Host-pool destinations stay a memcpy. The pool is pinned and device-mapped
+             * (core/mem/pools.cpp), but an async host-to-host copy on this stack is the same memcpy
+             * behind a stream, not a DMA, so streaming it would not overlap it with reads. */
             const bool dev = w.tier == Tier::VRAM;
             if (dev && !dst_fits(slot->ptr, w.stored_bytes, w.name.c_str())) return RAD_E_STATE;
 
-            /* THIS RANK'S SHARE OF THE SELECTED PLANES, cut on the canonical form where a ROW
-             * shard is rows of every plane and a COL shard is columns -- each on the plane's own
-             * block boundary, and refused where a block or a byte would be split. */
+            /* This rank's share of the selected planes (format/share.h). */
             PlaneShare sh[RAD_ENC_MAX_PLANES];
             std::string why;
             if (weight_share(w, src_enc, src_rank, src_shape, cfg_.tp, r->index, sh, &why) !=
@@ -2735,9 +2488,8 @@ int Engine::load_weights() {
                 return RAD_E_SHAPE;
             }
 
-            /* FROM A CHECKPOINT, every weight is staged and its worker reads it: there is no
-             * sweep to deliver it, and the stored form is whatever the pool makes of the share --
-             * as it is, widened, or relaid. */
+            /* From a checkpoint every weight is staged and read by its worker (no sweep); the pool
+             * stores it as is, widened, or relaid. */
             if (!e) {
                 StagedWeight sw;
                 sw.prog = &r->program;
@@ -2771,8 +2523,8 @@ int Engine::load_weights() {
                 continue;
             }
 
-            /* STORED AS IT IS: the share goes from the file to the slot. Otherwise it is staged
-             * whole for the relayout pool, plane after plane, and the pool writes the slot. */
+            /* Stored as is: the share goes from the file to the slot. Otherwise it is staged plane
+             * by plane for the relayout pool, which writes the slot. */
             int32_t stage = -1;
             int64_t in_bytes = 0;
             if (!w.identity || w.widen) {
@@ -2831,8 +2583,8 @@ int Engine::load_weights() {
     }
 
     if (n_missing) {
-        RAD_ERR("%lld declared weights are absent from the container. Reported whole rather than "
-                "first-failure-at-the-top; the model cannot run.", (long long)n_missing);
+        RAD_ERR("%lld declared weights are absent from the container; the model cannot run",
+                (long long)n_missing);
         return RAD_E_NOTFOUND;
     }
 
@@ -2845,15 +2597,15 @@ int Engine::load_weights() {
     for (const StagedWeight& sw : staged) staged_bytes += sw.in_bytes;
     RelayoutPool pool(staged);
     const unsigned hw = std::thread::hardware_concurrency();
-    /* Started whatever is staged: a host pool slot is filled by the same workers. */
+    /* Started even with nothing staged: the same workers fill host pool slots. */
     const int workers = (int)std::max(2u, std::min(16u, hw > 2 ? hw - 2 : 2u));
-    pool.start(workers, std::max<int64_t>(4ll << 30, 0));
+    pool.start(workers, 4ll << 30);
     const auto rt0 = std::chrono::steady_clock::now();
     int sw_st = RAD_OK;
     if (file_) {
         sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes);
     } else {
-        /* every weight to the workers, in declaration order, as fast as the budget lets them in */
+        /* Every weight to the workers in declaration order, as the budget allows. */
         for (size_t k = 0; k < staged.size() && !pool.failed(); ++k) {
             const int64_t n = staged[k].remaining;
             pool.reserve((int)k);
@@ -2879,10 +2631,8 @@ int Engine::load_weights() {
              humanb(total).c_str(), humanb(read_bytes).c_str(),
              file_ ? "container" : "checkpoint");
     if (n_mapped)
-        /* THE BYTES ARE SHARED BETWEEN RANKS and the counters are not: every rank maps the same
-         * file, so at --tp 2 this counts one mapped table twice. Said rather than halved,
-         * because what the number IS is the sum of the mappings -- and an operator reading it as
-         * memory would size a box for twice what the model needs. */
+        /* Summed over ranks, which map the same file, so under TP the resident bytes are this
+         * divided by --tp; the message says so. */
         RAD_INFO("load: %lld weight(s), %s, read in place from the container's mapping -- not "
                  "copied and charged to no pool%s", (long long)n_mapped,
                  humanb(mapped_bytes).c_str(),
@@ -2892,38 +2642,14 @@ int Engine::load_weights() {
 }
 
 /* ================================================================== 6b. KV pools */
-/* The block manager owns every KV group's memory -- paged attention caches, the GDN recurrent
- * states and the conv windows alike -- because two allocators disagreeing about what a sequence
- * owns is not a leak but the bug where a freed sequence's state slot is handed to the next
- * request while the first is still reading it (spec §7.2).
+/* The block manager owns all KV group memory (paged attention caches, GDN recurrent states, conv
+ * windows), so one owner decides what a sequence holds and a freed state slot is never handed out
+ * while still in use (spec §7.2).
  *
- * This runs after load, not before, because it takes what the weight pool LEFT. It has to be
- * before Ctx::init: a Ctx built without these bindings resolves every RAD_OPK_KV operand to null,
- * and the first attention kernel of the first step dereferences it. */
+ * Runs after load, since it takes what the weight pool left, and before Ctx::init, which would
+ * otherwise resolve every RAD_OPK_KV operand to null. */
 int Engine::configure_kv() {
-    /* THE ANCHOR IS A PROPERTY OF THE POOL, SO THE POOL'S OWNER TURNS IT ON. libr4d's recurrent
-     * update can keep one committed state a sequence and replay the accepted prefix onto it out
-     * of a scratch slot, instead of writing a full state per candidate token -- 2 slots a
-     * sequence against 1 + n_spec, which at a realistic depth is several times less. It is off by
-     * default because it is NOT PAGED: it assumes a sequence's state stays in the slot it was
-     * given, which is true of radiance's linear pool and is not true of vLLM's, and the two
-     * callers share the kernel. Set before any kernel runs; libr4d reads it once.
-     *
-     * The engine's half of the bargain is KVGroupPlan::state_copies (core/mem/kv.cpp): two slots
-     * a sequence, both zeroed on admission, named by a state_index row wide enough to reach
-     * them. Without speculation there is nothing to defer and the plain path is both correct and
-     * one slot cheaper. */
-    /* Overwrite 0, so an operator can still set it -- but the two settings are NOT both runnable at
-     * every depth. Per-candidate indexing needs `1 + n_spec` distinct slots and this pool has two,
-     * so at a draft depth above one it gives several candidate tokens the same slot: a partially
-     * accepted step then resumes from a state one or more tokens too far along, silently, in a
-     * cache nothing reads back. The arch declares `state_form` on the op from the same condition
-     * below, and libr4d refuses the form that disagrees with the declaration -- so an override that
-     * would corrupt is a selection error naming the kernel and the geometry, rather than a
-     * generation that drifts. */
-    if (cfg_.n_spec > 0) setenv("RADIANCE_GDN_ANCHOR", "1", 0);
-    /* Resolved once, for the cache below and for Scheduler::init later. Resolving it separately in
-     * each is how the two come to disagree, and the interval is the field where that shows. */
+    /* Resolved once, for the cache below and Scheduler::init later (see Engine::geo_). */
     RAD_TRY(chunk_geometry_resolve(ranks_[0]->program, cfg_, &geo_));
     if (geo_.checkpoint_interval != cfg_.checkpoint_interval)
         decide("--checkpoint-interval",
@@ -2933,22 +2659,18 @@ int Engine::configure_kv() {
                          "block and the linear-state chunk), so a checkpoint is a legal chunk split",
                          (long long)geo_.quantum)
                    : std::string("the model keeps no linear state to checkpoint"));
-    /* ONE BLOCK TABLE SERVES EVERY RANK (serve() checks it), so every rank carves the SAME number
-     * of paged blocks. The ranks' pools are not the same size under an uneven tensor-parallel
-     * split -- a rank with more delta-net heads holds more recurrent state, a rank with zero
-     * attention weights has more pool -- so each is planned first, asked what it could carve, and
-     * every rank is capped at the least before any carves. At an even split the cap is what
-     * every rank would have carved anyway. */
+    /* One block table serves every rank (serve() checks it), so every rank carves the same number
+     * of paged blocks. Under an uneven split the pools differ (more delta-net heads, or zero
+     * attention weights), so each rank is planned first and all are capped at the least before
+     * any carves. */
     int64_t least = -1;
     for (size_t i = 0; i < ranks_.size(); ++i) {
         auto& r = ranks_[i];
         LogRank lr(r->index);
         RAD_TRY(r->kv.plan_groups(r->program.kv_groups, cfg_));
         const int64_t t = r->kv.paged_tokens(r->pools.kv().avail());
-        /* A RANK plan() RE-SIZED FOR THE COMMON TOKEN COUNT PAGES AT LEAST THAT COUNT, by
-         * construction: its pool is the least whole MiB whose paged split reaches it, asked of the
-         * same plan against the same bytes. Short of it, this rank would set every rank's count
-         * under what its dearest peer pages -- a broken construction, refused by name. */
+        /* A rank plan() re-sized for the common token count must page at least that count (same
+         * plan, same bytes); anything less is a broken invariant. */
         if (rank_cfg_[i].vram_kv_mib < cfg_.vram_kv_mib && t < kv_planned_tokens_) {
             RAD_ERR("kv: rank %d's KV pool was sized at %lld MiB to page the common %lld tokens "
                     "and pages %lld: the pool and the plan that sized it disagree", r->index,
@@ -2961,7 +2683,7 @@ int Engine::configure_kv() {
     }
     for (auto& r : ranks_) {
         LogRank lr(r->index);
-        RAD_TRY(rad_dev_set(r->device));   /* allocates on the CURRENT device; see plan() */
+        RAD_TRY(rad_dev_set(r->device));   /* allocates on the current device; see plan() */
         if (ranks_.size() > 1) {
             const int64_t own = r->kv.paged_tokens(r->pools.kv().avail());
             if (own > least && own != KVManager::kUnboundedTokens)
@@ -2971,12 +2693,8 @@ int Engine::configure_kv() {
             r->kv.cap_paged_tokens(least);
         }
         RAD_TRY(r->kv.carve(r->pools.kv()));
-        /* THE ONE CASE WHERE THE CACHE CANNOT GIVE ANYTHING BACK, said once and named. Every
-         * caller is written against the elastic contract and runs unchanged here -- the pool
-         * simply holds its whole carve -- so nothing fails, and the only symptom is an expert
-         * plane that never grows and a split that stays where the budget put it.
-         * That is worth a line, because it is indistinguishable from a working run in every
-         * counter this engine reports. */
+        /* Without virtual memory management the cache cannot lend: everything still works, but
+         * the expert slab never grows, which no counter shows, so log it once. */
         if (r->index == 0 && !r->pools.kv().elastic())
             RAD_WARN("this device has no virtual memory management, so the KV cache holds its "
                      "whole carve and the expert slab has nothing to grow into. The experts were "
@@ -2985,18 +2703,13 @@ int Engine::configure_kv() {
     }
 
     /* ---------------- the linear-state snapshot store ---------------- */
-    /* PINNED HOST MEMORY, NOT THE CARD. A snapshot is a copy of a sequence's recurrent state that
-     * no kernel reads: a save copies the state out after the step that produced it and a hit
-     * copies it back before the step that resumes from it, each a few milliseconds across the
-     * link. Holding it in VRAM would charge the KV pool for memory the live cache could use.
-     *
-     * One slot holds every rank's shard, each at its own offset, so the disk tier moves a slot as
-     * one payload; rank 0's manager hands the ids out. Opened only where there is something to
-     * snapshot and a cache to serve it. */
+    /* Pinned host memory, not VRAM: no kernel reads a snapshot; it is copied out after the step
+     * that produced it and back before a resume, a few milliseconds over the link each. One slot
+     * holds every rank's shard at its own offset; rank 0's manager hands out ids. Opened only when
+     * there is state to snapshot and a prefix cache. */
     {
-        /* THE SHARDS NEED NOT BE EQUAL: a rank's state holds its own heads of each group, and a
-         * world the heads do not divide gives the ranks different shares. A slot is the sum of
-         * the ranks' shards and a rank's starts where the ranks before it end. */
+        /* Shards can differ in size (heads need not divide evenly), so a slot is the sum of the
+         * ranks' shards, each starting where the previous ends. */
         std::vector<int64_t> shard_off(ranks_.size(), 0);
         int64_t slot = 0;
         for (size_t i = 0; i < ranks_.size(); ++i) {
@@ -3007,15 +2720,32 @@ int Engine::configure_kv() {
         /* A slot holds linear state or a trunk's window, never both (KVGroupPlan::win_snap). */
         const char* what = ranks_[0]->kv.has_window_snapshot() ? "sliding-window" : "linear-state";
         if (slot > 0 && n > 0 && cfg_.prefix_cache) {
-            if (ck_store_.open(slot, slot * n) != RAD_OK) {
-                RAD_WARN("checkpoint slots: no pinned host memory for %lld %s snapshot(s) of %s; "
-                         "a session's prefix hits prefill from the start. Lower "
-                         "--checkpoint-slots.", (long long)n, what, humanb(slot).c_str());
-            } else {
-                RAD_INFO("checkpoint slots: %lld %s snapshot(s) of %s in pinned host memory (%s), "
-                         "none of it on the card", (long long)n, what, humanb(slot).c_str(),
-                         humanb(ck_store_.cap_bytes()).c_str());
-            }
+            /* Pinned all at once and outside every pool. A store larger than the memory left would
+             * push the process into reclaim, which stalls it without a word; one that cannot be had
+             * would leave every prefix hit on this model prefilling from the start, which no counter
+             * makes visible. Either stops startup. */
+            const bool sized = n <= INT64_MAX / slot;
+            auto refuse = [&](const std::string& reason) {
+                RAD_ERR("checkpoint slots: %lld %s snapshot(s) of %s are %s of pinned host memory, "
+                        "which %s. Lower --checkpoint-slots (a larger --checkpoint-interval needs "
+                        "fewer for the same context), or pass --checkpoint-slots 0 to serve with "
+                        "no %s snapshot, every prefix hit on this model then prefilling from the "
+                        "start", (long long)n, what, humanb(slot).c_str(),
+                        sized ? humanb(slot * n).c_str() : "more than 8 EiB", reason.c_str(),
+                        what);
+                return RAD_E_NOMEM;
+            };
+            if (!sized) return refuse("no host has");
+            std::string why;
+            if (!lockable_room(slot * n, 0, false, &why)) return refuse("does not fit: " + why);
+            if (ck_store_.open(slot, slot * n) != RAD_OK)
+                return refuse(std::string("the host did not pin: ") + rad_dev_last_error());
+            RAD_INFO("checkpoint slots: %lld %s snapshot(s) of %s in pinned host memory (%s), "
+                     "none of it on the card", (long long)n, what, humanb(slot).c_str(),
+                     humanb(ck_store_.cap_bytes()).c_str());
+        } else if (slot > 0 && cfg_.prefix_cache) {
+            RAD_INFO("checkpoint slots: --checkpoint-slots 0 keeps no %s snapshot, so every "
+                     "prefix hit on this model prefills from the start", what);
         }
         for (auto& r : ranks_)
             r->kv.set_checkpoint_store(&ck_store_, shard_off[(size_t)(&r - &ranks_[0])]);
@@ -3026,28 +2756,17 @@ int Engine::configure_kv() {
     }
 
     /* ---------------- the idle session tiers (spec §7.3) ---------------- */
-    /* AFTER the prefix cache, because the tiers are sized in units of ONE CACHE ENTRY and only the
-     * configured cache knows which groups an entry covers. No memory is committed unless the
-     * operator gave the host tier a size.
-     *
-     * CONFIGURED EVEN SO, because this object is also where a stored conversation is RECORDED,
-     * and that is not a tiering fact. A server with no --prefix-cache-mib holds its whole prefix
-     * cache in VRAM and holds it for exactly as long; skipping the configure would leave the
-     * sessions view reading an unconfigured object and reporting an empty server, on every
-     * deployment that has not opted into demotion. What the flags gate is the MOVER, below. */
+    /* After the prefix cache, since the tiers are sized in cache entries and only the configured
+     * cache knows which groups an entry covers. No memory is committed unless the host tier has a
+     * size, but the tiers are configured anyway because they also hold the session record the
+     * sessions view reads. The flags gate only the mover, below. */
     {
         const bool tier_asked = cfg_.prefix_cache_mib > 0;
         const std::vector<int32_t>& cg = ranks_[0]->prefix.cached_groups();
-        /* ONE SLOT HOLDS EVERY RANK'S SHARD. An entry under tensor parallelism is n_ranks
-         * pieces of KV that are not interchangeable, so the unit the tiers store and budget
-         * in is the whole thing; each rank writes only its own window of it. THE SHARDS NEED
-         * NOT BE EQUAL -- a rank's block holds its own heads of a group, and a world the heads
-         * do not divide gives the ranks different shares, or none (rad_kv_group_zero) -- so a
-         * slot is the SUM of the ranks' entries and a rank's window starts where the ranks
-         * before it end. Where every rank's share is the same this is n_ranks times one entry
-         * at offsets of one entry, as it always was. The sizing below (TierExec::sizes) takes
-         * the largest rank's entry: the staging ring is a rank's own, and the ring that fits
-         * the largest fits every one. */
+        /* One slot holds every rank's shard of an entry; each rank writes only its window. Shards
+         * can differ or be empty (uneven heads, rad_kv_group_zero), so a slot is the sum and each
+         * window starts where the previous ends. TierExec::sizes uses the largest rank's entry,
+         * since the staging ring is per rank. */
         std::vector<int64_t> rank_entry(ranks_.size(), 0), entry_off(ranks_.size(), 0);
         int64_t entry_bytes = 0, slot_bytes = 0;
         for (size_t i = 0; i < ranks_.size(); ++i) {
@@ -3060,12 +2779,11 @@ int Engine::configure_kv() {
             entry_bytes = std::max(entry_bytes, rank_entry[i]);
         }
 
-        /* THE SNAPSHOTS ARE NOT IN THE HOST TIER: they live in the checkpoint store, which
-         * --checkpoint-slots sizes, and --prefix-cache-mib is the blocks' alone. */
+        /* Snapshots live in the checkpoint store (--checkpoint-slots); --prefix-cache-mib is for
+         * blocks only. */
         const int64_t ck_slot_bytes = ck_store_.enabled() ? ck_store_.slot_bytes() : 0;
         if (cg.empty() || entry_bytes <= 0) {
-            /* Said only to an operator who asked for a tier. With no flag there is nothing to
-             * report: a cache that indexes no paged group stores no blocks to begin with. */
+            /* Warn only when a tier was asked for. */
             if (tier_asked)
                 RAD_WARN("kv tiers: the prefix cache indexes no paged group, so there is nothing "
                          "to move. --prefix-cache-mib does nothing here.");
@@ -3075,34 +2793,37 @@ int Engine::configure_kv() {
             tc.entry_bytes     = slot_bytes;
             tc.ckpt_bytes      = ck_slot_bytes;
             tc.ckpt_slots      = ck_store_.capacity();
+            tc.block_tokens    = ranks_[0]->prefix.block_size();
 
-            /* THE POLICY IS RANK 0'S AND THE TRANSFER IS EVERY RANK'S. A session is not sharded --
-             * it is a conversation -- so one decision is taken about it; but each rank holds its
-             * own shard of every block and gathers out of its own pool, so each rank moves its own
-             * bytes when that decision is taken. */
+            /* Policy on rank 0 (a session is not sharded); every rank moves its own shard. */
             IdleTiers& T = ranks_[0]->tiers;
             RAD_TRY(T.configure(tc));
             T.set_model(meta_.name && meta_.name[0] ? meta_.name : "(unnamed)");
-            if (T.any_on()) {
-                /* HOW MUCH A PASS MOVES, SIZED IN BYTES AND NOT IN ENTRIES. A cache entry is one
-                 * block per cached group, and that is 29 KiB on a 4-token-block hybrid and four
-                 * times more on a 16-token one -- so a fixed entry count means a fixed batch on
-                 * one model and a quarter of one on another. At a fixed 64 entries a 200K session
-                 * on a 4-token-block hybrid takes about thirteen minutes to leave VRAM: a tier that
-                 * works and is too slow to be worth having.
-                 *
-                 * 16 MiB of device staging a rank, which is about a millisecond of PCIe a pass
-                 * and 0.02 ms a step of the VRAM it costs. The batch is one gather per (group,
-                 * layer) however many entries are in it, so the launches are the same either
-                 * way -- this buys the copies, which are what there are thousands of. */
-                /* A COPY OUT IS FOUR STAGING BATCHES, about 64 MiB a rank. It shares the transfer
-                 * stream with the expert mover, so what it queues is what a promotion issued
-                 * behind it waits for -- a few milliseconds of link at this size -- and the next
-                 * copy goes out on the tick after this one lands, so a long conversation still
-                 * leaves at the rate the link carries it.
-                 *
-                 * A RESTORE IS A WHOLE CHAIN, as long as the longest context this server takes.
-                 * TierExec::sizes holds the arithmetic, which the VRAM budget reserves from. */
+            if (T.host_on()) {
+                /* A conversation longer than the tier keeps only its start on the host; the rest
+                 * is prefilled again once VRAM gives it up, which on a card whose experts do not
+                 * fit is right after the turn. */
+                const int64_t held = T.arena().capacity() * tc.block_tokens;
+                const int64_t ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : meta_.n_ctx_train;
+                if (held < ctx)
+                    RAD_WARN("kv tiers: --prefix-cache-mib %lld holds %lld tokens of context (%s "
+                             "per %lld-token block), less than one --max-model-len %lld "
+                             "conversation: a longer one keeps its first %lld tokens in host "
+                             "memory and is prefilled again past them once VRAM gives it up. "
+                             "%lld MiB would hold one.",
+                             (long long)cfg_.prefix_cache_mib, (long long)held,
+                             humanb(slot_bytes).c_str(), (long long)tc.block_tokens,
+                             (long long)ctx, (long long)held,
+                             (long long)((ctx + tc.block_tokens - 1) / tc.block_tokens *
+                                         slot_bytes / (1 << 20) + 1));
+                /* Pass sizes are in bytes, not entries: an entry (one block per cached group) is
+                 * 29 KiB on a 4-token-block hybrid and 4x that at 16 tokens, and a fixed 64-entry
+                 * batch would take ~13 minutes to move a 200K session. A batch is 16 MiB of device
+                 * staging per rank (about 1 ms of PCIe per pass), one gather per (group, layer)
+                 * regardless of entry count. A copy out is four batches (~64 MiB per rank); it
+                 * shares the transfer stream with the expert mover, so promotions wait at most a
+                 * few milliseconds behind it. A restore is a whole chain up to the longest
+                 * context. TierExec::sizes holds the arithmetic, which the VRAM budget uses. */
                 const TierExec::Sizes tz = TierExec::sizes(
                     entry_bytes, cfg_.max_ctx > 0 ? cfg_.max_ctx : meta_.n_ctx_train,
                     ranks_[0]->prefix.block_size());
@@ -3110,15 +2831,10 @@ int Engine::configure_kv() {
                 const int64_t max_copy = tz.max_copy, max_chain = tz.max_chain;
                 bool all = true;
                 for (auto& r : ranks_) {
-                    /* ON THAT RANK'S DEVICE. rad_dev_alloc takes the CURRENT device, and the
-                     * staging buffer TierExec builds on its first pass is this rank's. The device
-                     * is recorded in configure() and re-selected there, but selecting it here too
-                     * keeps the rule that a rank is configured on its own card in one place: a
-                     * gather reading a pointer that belongs to another card fails as a plain
-                     * device error with nothing to say it was an addressing mistake.
-                     *
-                     * AND THE STREAM IS THE MOVER'S. See Mover::transfer_stream -- a fourth
-                     * hardware queue costs an RDNA4 card 65% of its decode step. */
+                    /* Configure on the rank's own device (rad_dev_alloc uses the current one; a
+                     * cross-card pointer fails as an opaque device error). The stream is the
+                     * mover's: a fourth hardware queue costs an RDNA4 card 65% of its decode
+                     * step (Mover::transfer_stream). */
                     RAD_TRY(rad_dev_set(r->device));
                     if (r->tierx.configure(&rad_tools_registry(), &r->kv, &T, cg,
                                            max_batch, max_copy, max_chain,
@@ -3133,17 +2849,15 @@ int Engine::configure_kv() {
                 }
                 RAD_TRY(rad_dev_set(ranks_[0]->device));
                 if (!all) {
-                    /* THE MOVER IS OFF AND THE BOOKKEEPING IS NOT. close() forgets the entry and
-                     * snapshot sizes with everything else, and those are what a session's
-                     * reported size is computed from, so the object is re-configured for the
-                     * caps it can still honour -- none. */
+                    /* The mover is off but the bookkeeping stays: close() forgets the entry and
+                     * snapshot sizes that session sizes are computed from, so re-configure with
+                     * zero caps. */
                     T.close();
                     tc.host_cap_bytes = 0;
                     RAD_TRY(T.configure(tc));
                 } else {
-                    /* The tiers can lose an entry without the cache asking: a capacity drop, or a
-                     * promotion that failed. The cache has to hear about it or it will go on
-                     * serving block ids that are not its own any more. */
+                    /* The tiers can drop an entry on their own (capacity drop, failed promotion);
+                     * the cache must hear of it or it would serve block ids it no longer owns. */
                     T.set_drop_sink([this](const BlockHash& h) {
                         ranks_[0]->prefix.drop_offdevice(h);
                     });
@@ -3155,37 +2869,24 @@ int Engine::configure_kv() {
                     RAD_INFO("%s", ranks_[0]->tierx.report().c_str());
                 }
             }
-            /* ATTACHED WHETHER OR NOT ANYTHING MOVES. A null `tiers_` is the whole of the cache's
-             * "off" path, and it turns off the session record along with the demotion it was
-             * written for -- so detached, a server with no tier flag would publish no conversations
-             * at all and the sessions view would have nothing to draw. With the caps at zero every
-             * call the cache makes here is a record of what it is holding and nothing is ever
-             * moved. */
+            /* Attached even when nothing moves: a null `tiers_` would also disable the session
+             * record. With zero caps every call is bookkeeping only. */
             ranks_[0]->prefix.set_tiers(&T);
-            /* AND SAID EITHER WAY. configure() builds this line whether the tiers are on or off;
-             * printed only when they are on, a server that never moves a session would say
-             * nothing about it at all -- leaving "why is the KV pool full with one conversation
-             * open" with no answer in the log and a flag nobody knew was unset. */
+            /* Logged whether the tiers are on or off. */
             RAD_INFO("%s", T.report().c_str());
         }
     }
 
     RAD_INFO("kv: %s", ranks_[0]->kv.report().c_str());
-    /* PrefixCache::configure builds a report saying whether it is on, which groups it covers and
-     * which it had to skip, and this is where it is printed: unprinted, "why is cached_tokens
-     * always zero" has no answer short of reading the source. It is one line at startup and names
-     * the two things
-     * that silently turn caching off for a hybrid model: a windowed group cannot be served a
-     * prefix, and a linear model with no checkpoint interval replays from zero. */
+    /* The prefix cache's report: on or off, groups covered and skipped. It names the two things
+     * that silently disable caching on a hybrid model: a windowed group cannot be served a prefix,
+     * and a linear model with no checkpoint interval replays from zero. */
     RAD_INFO("%s", ranks_[0]->prefix.report().c_str());
 
-    /* CAN THE POOL ACTUALLY HOLD A MAX-LENGTH SEQUENCE? The context limit and the KV pool are set
-     * by two unrelated flags, and this is where they are compared. Uncompared, a server started
-     * with a context its cache cannot cover accepts the request at the door and refuses it at
-     * admission seconds later, with a message about blocks rather than about the flag that was
-     * wrong. A WINDOW group is exempt: its per-sequence cost is the window, not the context, which is
-     * the whole point of it. Only paged groups can run out this way; a linear group is O(1) in
-     * context and is sized per sequence. */
+    /* Can the pool hold one max-length sequence? The context limit and KV pool come from unrelated
+     * flags; otherwise such a request is accepted and then refused at admission with a message
+     * about blocks. Only full paged groups apply: a window group costs the window, and a linear
+     * group is O(1) in context. */
     {
         const int64_t want = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
         const KVManager& kv = ranks_[0]->kv;
@@ -3194,18 +2895,12 @@ int Engine::configure_kv() {
             if (!p || !p->paged() || p->window_blocks > 0) continue;
             const int64_t cap = p->n_blocks * p->block_size;
             if (cap >= want) continue;
-            /* THIS ONE IS A REAL LIMIT AND NOT A BACKING RATIO. How much of the worst case
-             * (every sequence at max_ctx at once) the pool backs is a provisioning choice and
-             * well under half is normal for one-shot traffic. (It is NOT harmless for
-             * multi-turn: prefix caching keeps a finished sequence's blocks so the next turn
-             * can reuse them, so a pool that backs fewer live SESSIONS than it admits makes
-             * every turn re-prefill. That is a provisioning choice too, and the budget line
-             * in vram_budget.cpp says it.) What is never acceptable is a pool that cannot
-             * hold ONE max-length sequence:
-             * that request is accepted by the API and can never complete, whatever the load. */
-            /* An image generator's sequence is a conditioning, and its driver refuses one the
-             * cache can never hold by name at admission; the limit is the operator's to know,
-             * in its own terms, with nothing about experts the model does not have. */
+            /* A hard limit, unlike the backing ratio (how much of every-sequence-at-max_ctx the
+             * pool backs, a provisioning choice reported in vram_budget.cpp): a pool that cannot
+             * hold one max-length sequence accepts requests that can never complete.
+             *
+             * For an image generator the sequence is a conditioning, which its driver refuses at
+             * admission; warn in those terms. */
             if (ranks_[0]->program.is_generator()) {
                 RAD_WARN("kv group '%s' holds %lld rows: a conditioning longer than that -- a "
                          "prompt with its pictures, up to %lld rows -- is refused. A picture "
@@ -3214,13 +2909,11 @@ int Engine::configure_kv() {
                          p->name.c_str(), (long long)cap, (long long)want);
                 continue;
             }
-            RAD_WARN("kv group '%s' holds %lld tokens but the context limit is %lld: ONE request "
-                     "longer than %lld tokens is accepted by the API and then refused as too "
-                     "large to ever fit -- this is a hard limit, not a backing ratio. Give the "
-                     "cache more (about %lld MiB for the whole context: a larger --host-pool-mib "
-                     "takes experts off the card), halve the cost a token with --kv-cache-dtype fp8, "
-                     "or lower "
-                     "--max-model-len to %lld.",
+            RAD_WARN("kv group '%s' holds %lld tokens but the context limit is %lld, so a "
+                     "prompt longer than %lld tokens is refused (400) and a reply that grows past "
+                     "it fails (kv_exhausted). Give the cache about %lld MiB "
+                     "more (a larger --host-pool-mib takes experts off the card), use "
+                     "--kv-cache-dtype fp8, or lower --max-model-len to %lld",
                      p->name.c_str(), (long long)cap, (long long)want, (long long)cap,
                      (long long)(((want - cap) / p->block_size * p->bytes_per_block) >> 20),
                      (long long)cap);
@@ -3229,77 +2922,17 @@ int Engine::configure_kv() {
     return RAD_OK;
 }
 
-/* The group pools, as the run phase addresses them. The operand names an ABSOLUTE model layer and
- * the pool holds only the layers bound to this group, so the binding carries the POSITION of each
- * absolute layer within the group -- a group covering layers 3,7,...,63 is sixteen caches and layer
- * 7 is the second, not the fifth, and subtracting the first bound layer says the fifth. */
-static void bind_kv_pools(const Program& p, const KVManager& kv, std::vector<KVPoolBinding>* out) {
-    out->assign(p.kv_groups.size(), KVPoolBinding{});
-    for (size_t g = 0; g < p.kv_groups.size(); ++g) {
-        const KVGroupPlan* gp = kv.plan((int32_t)g);
-        if (!gp) continue;
-        KVPoolBinding& b = (*out)[g];
-        b.base         = gp->base;
-        b.layer_stride = gp->layer_stride();
-        b.bytes        = gp->pool_bytes;
-        b.dtype        = p.kv_groups[g].decl.dtype;
-
-        /* The position of every bound layer, indexed by its absolute number. */
-        const std::vector<int32_t>& ls = p.kv_groups[g].layers;
-        int32_t hi = -1;
-        for (int32_t l : ls) if (l > hi) hi = l;
-        b.layer_slot.assign((size_t)(hi + 1), -1);
-        for (size_t i = 0; i < ls.size(); ++i) b.layer_slot[(size_t)ls[i]] = (int32_t)i;
-
-        /* The shape of ONE layer's cache, in the layout libref/ref_ops.h states for the whole
-         * project. Composed here because this is the only place that holds both halves of it: the
-         * plugin's declaration (heads, head_dim, state_dim, conv_width) and the block manager's
-         * decisions (block_size, n_blocks, n_states, conv_slots). A kernel cannot derive the conv
-         * window's depth or the slot count from any op parameter, so a flat span makes every shim
-         * that needs the structure refuse. */
-        const RadKVGroupDecl& d = p.kv_groups[g].decl;
-        switch (gp->kind) {
-        case RAD_KV_FULL:
-        case RAD_KV_WINDOW:
-            b.rank = 4;
-            b.shape[0] = gp->n_blocks;
-            b.shape[1] = d.n_head_kv;
-            b.shape[2] = gp->block_size;
-            b.shape[3] = 2 * d.head_dim;
-            break;
-        case RAD_KV_LINEAR:
-            b.rank = 4;
-            b.shape[0] = gp->n_states;
-            b.shape[1] = d.n_head_kv;
-            b.shape[2] = d.state_dim[0];
-            b.shape[3] = d.state_dim[1];
-            break;
-        case RAD_KV_CONV:
-            b.rank = 3;
-            b.shape[0] = gp->n_states;
-            b.shape[1] = d.n_head_kv * d.head_dim;
-            b.shape[2] = gp->conv_slots;
-            break;
-        default:
-            b.rank = 0;   /* the null sentinel at handle 0; nothing issues against it */
-            break;
-        }
-    }
-}
-
 /* ================================================================== start */
 int Engine::start() {
     std::vector<int> devs;
     std::string inventory;
     std::string devnote;
-    /* Rank tags on the log from here down, so the pools, the planner, the mover and the sampler
-     * are each attributed to the card they are about. At tp 1 there is nothing to disambiguate. */
+    /* Rank tags on log lines from here on (see LogRank). */
     log_rank_tags(cfg_.tp > 1);
 
     std::vector<std::string> dev_names;
     int s = usable_devices(&devs, &inventory, &devnote, &dev_names);
-    /* Before any refusal below, so a report printed for a startup that stopped here still joins
-     * the runtime's devices to the machine's cards. */
+    /* Before any refusal, so a failed startup's report still identifies the cards. */
     identify_devices(dev_names);
     if (!devnote.empty()) RAD_WARN("device: %s", devnote.c_str());
     devnote_ = devnote;
@@ -3316,14 +2949,13 @@ int Engine::start() {
         decide("--max-model-len", std::to_string(meta_.n_ctx_train),
                "the model's training context (--max-model-len 0)");
     RAD_TRY(load_vocab());
-    /* The cards are chosen, so a kernel library's device code is checked against the ones the
-     * ranks will run on and not against whichever device the backend happens to list first. */
+    /* Check kernel libraries' device code against the cards the ranks use, not device 0. */
     rad_tools_registry().set_code_device(devs[0]);
     rad_tools_registry().set_no_device_code(device_is_host());
     RAD_TRY(load_plugins());
     {
-        /* THE LIBRARIES THAT LOADED, in the order that decides selection: what --kernels named, or
-         * every library the home holds when it named none. */
+        /* The loaded libraries in selection order: as --kernels named them, or every library in
+         * the home. */
         std::string libs;
         for (const PluginId& p : plugins_.kernels)
             libs += (libs.empty() ? "" : ",") + p.name + (p.version.empty() ? "" : "@" + p.version);
@@ -3344,14 +2976,11 @@ int Engine::start() {
         ranks_.push_back(std::move(r));
     }
 
-    /* PEER ACCESS, MEASURED BEFORE ANYTHING IS SELECTED. A kernel that reads or writes another
-     * card's memory says so with a constraint on device.p2p (rad_types.h), and the selector reads
-     * it from here: on a machine where some pair of the ranks' cards cannot reach each other such a
-     * kernel is not selected, and one that exchanges through host memory takes the op instead (or
-     * declare names the constraint) rather than the all-reduce faulting or hanging on its first
-     * message. Every ordered pair, because access is granted one way at a time. --p2p overrides the
-     * answer in one direction each way (Config::p2p): off turns it down whatever the driver says,
-     * on refuses to start without it. */
+    /* Peer access, measured before selection. Kernels that touch another card's memory constrain
+     * device.p2p (rad_types.h); if any pair of the ranks' cards cannot reach each other, they are
+     * not selected and a host-memory variant takes the op (or declare names the constraint),
+     * rather than an all-reduce faulting or hanging. Every ordered pair is checked, since access is
+     * granted one way at a time. --p2p off forces it off; --p2p on refuses to start without it. */
     {
         long long p2p = 1;
         std::string blocked;
@@ -3404,19 +3033,15 @@ int Engine::start() {
 
     RAD_TRY(declare());
 
-    /* --debug-graph stops here on purpose: everything it prints is known between declare and
-     * plan, and a graph dump that first has to fit the model in VRAM is a graph dump you cannot
-     * run on the machine where the model does not fit. */
+    /* --debug-graph stops here: everything it prints is known after declare, and it must work on
+     * a machine where the model does not fit. */
     if (cfg_.debug_graph) return RAD_OK;
 
-    /* Before anything is placed or mapped. A container whose ops resolve to the reference
-     * implementation is a container that will serve at reference speed, and that is a decision the
-     * operator makes rather than one the engine discovers three minutes into a load. */
+    /* Before anything is placed or loaded, so serving at reference speed is refused up front. */
     RAD_TRY(rad_gate_reference_kernels(ranks_[0]->program, cfg_.accept_reference_kernels, "serve"));
     {
-        /* WHAT SELECTION CHOSE, in two lines a reader can compare across machines: how many of the
-         * declared op bands each library serves, and the attention rows by name -- the family whose
-         * choice moves with the card, the head width and the context. */
+        /* Selection summary for the report: op bands served per library, and the attention rows by
+         * name (the family whose choice varies with card, head width and context). */
         std::map<std::string, int> by_lib;
         std::set<std::string> attn;
         for (const OpInfo& op : ranks_[0]->program.ops)
@@ -3441,40 +3066,43 @@ int Engine::start() {
 
     for (auto& r : ranks_) {
         LogRank lr(r->index);
-        RAD_TRY(rad_dev_set(r->device));   /* allocates on the CURRENT device; see plan() */
+        RAD_TRY(rad_dev_set(r->device));   /* allocates on the current device; see plan() */
         CtxDesc d{};
         d.program     = &r->program;
         d.rank        = r->index;
         d.world_size  = cfg_.tp;
         d.device      = r->device;
-        /* Null in the all-in-VRAM case: the degenerate one where the planner assigned everything
-         * to tier 0 and the mover never runs, and lookup collapses to WeightInfo::ptr. */
+        /* Null for all-in-VRAM: the mover never runs and lookup uses WeightInfo::ptr. */
         d.residency   = r->plan.strategy == Strategy::AllVram ? nullptr : r->mover.residency();
         d.arch_step   = arch_step_;
         d.profile_ops = cfg_.profile_ops;
-        bind_kv_pools(r->program, r->kv, &d.kv);
+        bind_kv_pools(r->program, [&](int32_t g) { return r->kv.plan(g); }, &d.kv);
+        d.registry    = &rad_tools_registry();
         RAD_TRY(r->ctx.init(d));
 
-        /* THE MOVER NEEDS THE COMPUTE STREAM.
-         *
-         * Every transfer is ordered against the kernels that read the slot it targets, through an
-         * event recorded on the compute stream once per dispatch (Mover::record_gate). With no
-         * stream bound that function returns RAD_E_STATE, so a mover asked to move anything
-         * refuses. The bind belongs here rather than in load_weights: Ctx owns the stream and does
-         * not create it until init(), and the load runs on its own copy stream.
-         *
-         * Not under `if (d.residency)`: a plan can be static and still stage a file-tier weight
-         * on demand, and a mover that is bound but idle costs one pointer. */
+        /* The mover orders every transfer against the kernels reading its slot via an event on the
+         * compute stream (Mover::record_gate), which exists only after Ctx::init. Bound even for a
+         * static plan, which may still stage file-tier weights on demand. */
         RAD_TRY(r->mover.bind_compute_stream(r->ctx.stream()));
 
-        /* THE PREFILL STAGER, where the budget made room for it: a step larger than every smaller
-         * arena level is the only one that finds the region unlent, so that is the smallest pass
-         * it arms for. */
+        /* The prefill stager, where the budget made room. Only a step larger than every smaller
+         * arena level finds the region unlent, so that is the smallest pass it arms for. */
         if (r->program.arena_stage_bytes > 0 && r->plan.dynamic && !r->arena_levels.empty()) {
+            /* The smallest pass is one past every level that lends the ring. The span's shared
+             * level does not: it keeps its own place for it, right above its buffers and the
+             * guard, wherever that is below the region at the top (stager.h). */
             int64_t top_level = 0;
-            for (const ArenaLevel& lv : r->arena_levels) top_level = std::max(top_level, lv.rows);
+            r->arena_low_off = -1;
+            for (const ArenaLevel& lv : r->arena_levels) {
+                if (lv.rows != arena_span_rows_) { top_level = std::max(top_level, lv.rows); continue; }
+                const int64_t off = (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) /
+                                    RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+                r->arena_low_off = std::min(off, r->program.arena_stage_off);
+            }
+            char* const base = (char*)r->ctx.arena_base();
             RAD_TRY(r->stager.init(r->program, r->plan, &r->mover,
-                                   (char*)r->ctx.arena_base() + r->program.arena_stage_off,
+                                   base + r->program.arena_stage_off,
+                                   r->arena_low_off >= 0 ? base + r->arena_low_off : nullptr,
                                    r->program.arena_stage_bytes, top_level + 1));
             if (r->stager.enabled() && r->index == 0)
                 RAD_INFO("prefill staging: a %s ring at the top of the arena; a step of more "
@@ -3483,8 +3111,8 @@ int Engine::start() {
                          humanb(r->stager.ring_bytes()).c_str(), (long long)top_level,
                          r->stager.n_layers(), (int)PrefillStager::lead());
         }
-        /* THE FILE STAGER, wherever the plan put a routed expert on the file tier -- static plan
-         * or dynamic, since a file-tier unit has no other address. */
+        /* The file stager, wherever a routed expert is on the file tier (static or dynamic plan;
+         * such a unit has no other address). */
         RAD_TRY(r->fstager.init(r->program, r->plan, &r->mover));
         if (r->fstager.enabled() && r->index == 0)
             RAD_INFO("file stager: %zu routed layers hold experts read from the container; each "
@@ -3501,14 +3129,12 @@ int Engine::start() {
         }
 
     }
-    /* ---- THE LOAN: the cache's idle blocks, lent to the expert slab in place ----------------
+    /* ---- the loan: the cache's idle blocks, lent to the expert slab in place -----------------
      *
-     * Here and not earlier because it needs both halves: the cache's carve fixes the addresses and
-     * the mover's compute stream is what a recall drains. Every rank lends its own pool's strips --
-     * the same geometry on every card -- and only a plan that moves units borrows at all.
-     *
-     * A STRIP IS ONE LAYER'S STRIPE OF ONE LENDABLE GROUP, top down, because that is how the cache
-     * lends: the top blocks of a group are the top of every layer's stripe at once. */
+     * Here because it needs the cache's carve (the addresses) and the mover's compute stream
+     * (which a recall drains). Every rank lends its own pool, same geometry on every card; only a
+     * plan that moves units borrows. A strip is one layer's stripe of one lendable group, lent
+     * from the top, since a group's top blocks are the top of every layer's stripe. */
     for (auto& r : ranks_) {
         if (!r->heat.enabled()) continue;
         RAD_TRY(rad_dev_set(r->device));
@@ -3528,9 +3154,9 @@ int Engine::start() {
         RAD_TRY(r->mover.lend_from(Mover::kLendKV, strips));
         if (r->mover.flex_capacity() > 0) lending_ = true;
     }
-    /* THE NEXT-LAYER EXPERT PREFETCH, wherever the placement left experts in a pinned pool for a
-     * routed layer's GEMMs to read across the link (core/runtime/xprefetch.h). Its stream and ring are
-     * in the VRAM budget (xp_device_bytes, Engine::plan). Not under --deterministic, where nothing moves. */
+    /* The next-layer expert prefetch, wherever experts sit in a pinned pool for routed GEMMs to
+     * read over the link (core/runtime/xprefetch.h). Its stream and ring are in the VRAM budget
+     * (xp_device_bytes, Engine::plan). Off under --deterministic. */
     if (!cfg_.deterministic)
         for (auto& r : ranks_) {
             RAD_TRY(rad_dev_set(r->device));
@@ -3540,11 +3166,10 @@ int Engine::start() {
         }
     (void)rad_dev_set(ranks_[0]->device);
 
-    /* THE MOST THE CACHE CAN HOLD, said once in one line: the whole carve, with every block it lends
-     * the experts taken back -- which a request that needs them does, the same step. Tokens are the
-     * paged groups' shared axis, so the smallest of theirs; a windowed group bounds how far back a
-     * sequence keeps context, not how much fits, and is left out. The /stats and /metrics figures
-     * (kv_tokens_max, radiance:kv_cache_max_tokens) are the same numbers. */
+    /* The most the cache can hold: the whole carve, including lent blocks (a request reclaims them
+     * in the same step). Tokens are the smallest over the full paged groups; a windowed group
+     * bounds history, not capacity. /stats and /metrics report the same numbers (kv_tokens_max,
+     * radiance:kv_cache_max_tokens). */
     {
         const KVManager& kv = ranks_[0]->kv;
         int64_t bytes = 0, state = 0, tokens = 0;
@@ -3578,20 +3203,16 @@ int Engine::start() {
                               : "nothing is lent: it is all the cache's");
     }
 
-    /* ---- AND THE TOP OF THE ACTIVATION ARENA, lent while the steps are small ----------------
+    /* ---- the top of the activation arena, lent while steps are small ----------------------
      *
-     * One stretch a rank: from the end of the full plan's transients down to the end of the
-     * smallest level's, less a guard. A level lends everything above its own end and guard, so the
-     * loan is stated in bytes from the top -- the measure every level can say in one number. Each
-     * rank lends its own arena, whose plan may differ from rank 0's by the buffers only one rank
-     * declares, so each rank's amounts are its own.
+     * One stretch per rank, from the arena top down to the smallest level's end plus a guard. Each
+     * level lends everything above its end and guard, stated in bytes from the top. Ranks' plans
+     * can differ, so each rank's amounts are its own.
      *
-     * THE GUARD is a mebibyte between a level's highest buffer and the lent memory: what a kernel
-     * writes past the rows it was given lands there rather than in an expert's weights, which
-     * would stay corrupt for as long as the unit stayed resident. */
+     * The guard (1 MiB) catches a kernel writing past its rows, which would otherwise corrupt a
+     * resident expert's weights. */
     arena_rows_.clear();
     if (!ranks_.empty() && !ranks_[0]->arena_levels.empty() && ranks_[0]->heat.enabled()) {
-        static constexpr int64_t kGuard = 1ll << 20;
         bool ok = true;
         for (auto& r : ranks_) {
             RAD_TRY(rad_dev_set(r->device));
@@ -3600,8 +3221,14 @@ int Engine::start() {
             const int64_t top = P.arena_bytes;
             for (const ArenaLevel& lv : r->arena_levels) {
                 if (r->ctx.add_level(lv.rows, lv.offset, lv.decl) < 0) { ok = false; break; }
-                const int64_t edge = (lv.end + kGuard + RAD_ALIGN_UNIT - 1) /
-                                     RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+                /* The span's shared level keeps the stager's ring above its buffers: it lends
+                 * what is above the ring. */
+                const bool ring = lv.rows == arena_span_rows_ && r->arena_low_off >= 0 &&
+                                  r->stager.enabled();
+                const int64_t edge = ring
+                    ? (r->arena_low_off + P.arena_stage_bytes + RAD_ALIGN_UNIT - 1) /
+                          RAD_ALIGN_UNIT * RAD_ALIGN_UNIT
+                    : (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
                 r->arena_lent.push_back(top > edge ? top - edge : 0);
             }
             if (!ok) break;
@@ -3630,11 +3257,10 @@ int Engine::start() {
             for (auto& r : ranks_) r->arena_lent.clear();
         }
     }
-    /* A RECALL THAT CANNOT WAIT. When a request needs more of the cache than it kept in hand, rank
-     * 0's cache calls this from the scheduler, between dispatches, with every rank thread parked:
-     * each rank's slab is drained to the loan the cache can still afford before the blocks are
-     * handed out, and every follower's mark moves with rank 0's at once rather than at the next
-     * step's build -- a tier restore on a follower picks the id rank 0 just chose. */
+    /* Immediate recall: when a request needs more cache than is in hand, rank 0's cache calls this
+     * from the scheduler between dispatches, with every rank thread parked. Each rank's slab is
+     * drained to the affordable loan before the blocks are handed out, and the followers' marks
+     * move at once (a tier restore on a follower uses the id rank 0 just chose). */
     if (lending_)
         ranks_[0]->kv.set_reclaim([this](int64_t tokens) -> int {
             int st = RAD_OK;
@@ -3652,10 +3278,8 @@ int Engine::start() {
             return st;
         });
 
-    /* WHAT THE CORE SPENT, beside what the card says was spent. The two differ by exactly the
-     * allocations the core does not make: the driver's context, its code objects, and any kernel
-     * plugin that calls hipMalloc for itself. Naming the difference is the only way to tell a
-     * budget that is wrong from a plugin that is spending behind it. */
+    /* What the core allocated, to compare with the card's usage; the difference is the driver's
+     * context and code objects and any plugin's own hipMalloc. */
     {
         int64_t dev_bytes = 0, dev_count = 0;
         rad_dev_alloc_totals(RAD_MEM_DEVICE, &dev_bytes, &dev_count);
@@ -3670,30 +3294,21 @@ int Engine::start() {
 
     RAD_TRY(step_state_init());
 
-    /* ---- THE BUDGET, CHECKED AGAINST THE CARD IT WAS SPENT ON ----------------------------------
+    /* ---- the budget, checked against the card --------------------------------------------
      *
-     * Everything above this line allocated: the two pools, the activation arena, the step batch
-     * staging, the weight tables a grouped GEMM walks. What is left on the card should now be
-     * --gpu-headroom-mib plus what the budget kept for later, and this is the only place that can
-     * say whether it is.
+     * Everything is allocated now (pools, arena, step staging, grouped-GEMM weight tables), so the
+     * card should have --gpu-headroom-mib plus what the budget kept for later.
      *
-     * TOO LITTLE is memory taken after the budget read the card that the budget did not count:
-     * another process on the card (a desktop, a second server), or a driver allocation made
-     * after the reading. It comes out of the room a kernel's first launch allocates its code
-     * object and scratch from, and running out of that is a fault inside the HIP runtime.
+     * Too little means memory taken after the budget's reading (another process, a late driver
+     * allocation). It comes out of the room a kernel's first launch needs for its code object and
+     * scratch, and running out faults inside the HIP runtime.
      *
-     * THE WARNING IS ON THE ROOM, NOT ON THE FLAG. Raising --gpu-headroom-mib raises what is left
-     * here and what this compares it with by the same amount, so a check of free memory against
-     * the flag can never be satisfied by the flag: the gap is whatever was taken after the
-     * reading, and it is there at every value. The room a first launch has -- what is free less
-     * what the budget kept for later -- is what the flag actually moves, and it is held against
-     * this engine's own allowance for its first launches (the flag's default). A card short of
-     * that is warned with the value that clears it; one that kept the allowance but lost part of
-     * a larger stated headroom says so on its INFO line.
+     * The warning tests the room (free less what is kept for later) against the engine's own
+     * first-launch allowance (the flag's default), not free memory against the flag, which would
+     * move both sides equally. A short card is warned with the flag value that fixes it.
      *
-     * TOO MUCH means the budget left VRAM on the floor, which on a model whose experts do not
-     * fit is milliseconds of decode step for every unspent GiB. A slack of 256 MiB is tolerated
-     * silently: MiB rounding and a kernel plugin's own workspaces live in there. */
+     * Too much means VRAM left unused, costly when experts do not fit; up to 256 MiB of slack
+     * (MiB rounding, plugin workspaces) is silent. */
     const int64_t MiB = 1024 * 1024;
     const int64_t headroom = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) * MiB;
     const int64_t allowance = Config{}.gpu_headroom_mib * MiB;
@@ -3703,9 +3318,8 @@ int Engine::start() {
         RadDeviceProps props{};
         if (rad_dev_props(r->device, &props) < 0 || props.vram_bytes <= 0) continue;
 
-        /* AGAINST THE HEADROOM AND WHAT THE BUDGET KEPT FOR LATER, because both are still free
-         * here: the step staging is allocated by serve(), and the KV tiers' staging and a second
-         * compute lane are built on first use. */
+        /* Both the headroom and the later allocations are still free here: serve() allocates
+         * the step staging; the KV tiers' staging and a second lane are built on first use. */
         const int64_t late = late_step_bytes_ + late_lazy_bytes_;
         const int64_t want = headroom + late;
         const int64_t got  = props.vram_free;
@@ -3736,12 +3350,9 @@ int Engine::start() {
                      r->device, humanb(got).c_str(), asked.c_str(), humanb(want - got).c_str(),
                      humanb(room).c_str());
         } else if (got > want + 256 * MiB) {
-            /* "TOO MUCH" IS NOT A FAULT: the resolver made the split, and what is left is left
-             * because neither pool could address another byte -- a small dense model already at
-             * the largest context its cache can hold leaves most of the card -- and vram_budget.cpp
-             * printed it on the `unusable` line. A rank plan() re-split for the common token count
-             * also leaves what its weights could not use, and the `kv: rank N ...` line said how
-             * much. */
+            /* Not a fault: neither pool could use more (e.g. a small dense model at its largest
+             * context), reported on vram_budget.cpp's `unusable` line, or a re-split rank's
+             * unusable remainder (the `kv: rank N ...` line). */
             const int64_t unclaimed_mib =
                 (cfg_.vram_weights_mib + cfg_.vram_kv_mib) -
                 (rank_cfg_[ri].vram_weights_mib + rank_cfg_[ri].vram_kv_mib);
@@ -3767,72 +3378,22 @@ int Engine::start() {
 const Program& Engine::program() const { return ranks_[0]->program; }
 
 /* ================================================================== dump */
-/* The answer to "it is unclear what even runs" (spec §16). It is a first-class mode rather than a
- * side effect of a verbose flag, because that is the complaint this project exists to answer. */
+/* --debug-graph (spec §16); see Engine::dump in engine.h. */
 int Engine::dump() {
     Program& p = ranks_[0]->program;
     fputs(dump_graph_str(p, nullptr).c_str(), stdout);
     if (cfg_.debug_selection) fputs(rad_tools_registry().selection_table().c_str(), stdout);
-    /* The exit code answers "is there a hole a request can fall into", by the rule declare()
-     * refuses to serve on (Program::device_holes, miss_report()): a device band no kernel
-     * resolved, unless a host kernel stands in for an op whose weights the planner can place on
-     * the host. A host miss is not one. */
+    /* The exit code reports device holes by declare()'s rule (Program::device_holes). */
     for (auto& r : ranks_)
         if (!r->program.device_holes(device_is_host()).empty()) return RAD_E_NOKERNEL;
     return RAD_OK;
 }
 
 /* ================================================================== 6c. the vocabulary */
-/* The sampler needs three facts about a token plus the ability to tokenise a short literal; the
- * text frontend has a whole Vocab. vocab_view.h says core/text implements the view over the real
- * vocabulary; core/text does not, so the adapter is here, where the two are wired together and
- * nowhere else. It belongs in core/text the moment a second caller wants it. */
-namespace {
-class RealVocabView final : public VocabView {
-public:
-    int init(std::shared_ptr<const Vocab> v) {
-        v_ = std::move(v);
-        RAD_TRY(tok_.init(v_));
-        /* token_piece returns a reference, so the pieces have to outlive the call. Building them
-         * once costs one pass over the vocabulary and saves a string construction per candidate
-         * token per grammar step, which is host work on the step path.
-         *
-         * piece(), NOT Vocab::text(). text() is the vocab's OWN encoding -- for a byte-level BPE
-         * that is the GPT-2 mapped alphabet, where a space is 'Ġ' (U+0120) and a newline is 'Ċ'.
-         * piece() runs the declared decoder chain, which is what actually reaches the output
-         * stream, and vocab_view.h asks for exactly that. Handing the grammar the mapped form
-         * makes mask and accept consistently wrong, so nothing throws: every token containing a
-         * space or a newline is simply forbidden by every grammar. render_special is TRUE
-         * because the alternative gives a control token an empty piece, and an empty piece
-         * consumes nothing and so satisfies any grammar position. */
-        pieces_.resize((size_t)v_->n_tokens());
-        for (int32_t i = 0; i < v_->n_tokens(); ++i)
-            pieces_[(size_t)i] = tok_.piece(i, /*render_special=*/true);
-        return RAD_OK;
-    }
-    int32_t n_tokens() const override { return v_ ? v_->n_tokens() : 0; }
-    const std::string& token_piece(int32_t id) const override {
-        static const std::string kEmpty;
-        return (id >= 0 && (size_t)id < pieces_.size()) ? pieces_[(size_t)id] : kEmpty;
-    }
-    bool is_eog(int32_t id) const override { return v_ && v_->is_eog(id); }
-    int  tokenize(const std::string& s, std::vector<int32_t>* out) const override {
-        return out ? tok_.encode(s, *out, /*add_special=*/false, /*parse_special=*/false)
-                   : RAD_E_INVAL;
-    }
-    int  tokenize_special(const std::string& s, std::vector<int32_t>* out) const override {
-        return out ? tok_.encode(s, *out, /*add_special=*/false, /*parse_special=*/true)
-                   : RAD_E_INVAL;
-    }
-private:
-    std::shared_ptr<const Vocab> v_;
-    Tokenizer                    tok_;
-    std::vector<std::string>     pieces_;
-};
-}  /* namespace */
 
-/* The container carries the vocabulary and nothing else is consulted. A .rad without one cannot
- * serve text, and says so here rather than at the first request (spec §4.1, §12). */
+/* The vocabulary comes from the model source: the container's vocab section, a GGUF header, or
+ * tokenizer.json beside a checkpoint. A missing one is refused here rather than at the first
+ * request (spec §4.2, §12). */
 int Engine::load_vocab() {
     VocabBuild vb;
     if (file_) {
@@ -3844,22 +3405,23 @@ int Engine::load_vocab() {
         }
         RAD_TRY(vocab_deserialize(file_->base(), (uint64_t)file_->size(), vs.h, vb));
     } else if (ckpt_->is_gguf()) {
-        /* GGUF names its pre-tokeniser and the chain is reconstructed from the name, or refused
-         * where it cannot be -- a container converted with --tokenizer bakes the declared one. */
+        /* GGUF names its pre-tokeniser; the chain is reconstructed from the name or refused (a
+         * container converted with --tokenizer bakes in the declared one). */
         RAD_TRY(vocab_from_gguf(ckpt_->gguf(), vb));
     } else {
-        /* beside config.json, with tokenizer_config.json and chat_template.jinja */
-        const std::string tj = ckpt_->dir() + "/tokenizer.json";
+        /* With tokenizer_config.json and chat_template.jinja: beside config.json in a model
+         * repository, in a diffusers pipeline's processor/ or tokenizer/ folder. */
+        const std::string tj = ckpt_->tok_dir() + "/tokenizer.json";
         if (parse_tokenizer_json(tj.c_str(), vb) < 0) {
-            RAD_ERR("%s: no readable tokenizer.json beside the checkpoint", cfg_.model.c_str());
+            RAD_ERR("%s: no readable tokenizer.json in %s", cfg_.model.c_str(),
+                    ckpt_->tok_dir().c_str());
             return RAD_E_FORMAT;
         }
     }
 
-    /* THE OPERATOR'S TEMPLATE REPLACES THE CONTAINER'S before anything reads it, so the chat
-     * endpoint and the reply format derived from the template agree about which one is served. An
-     * unreadable or empty file is refused: serving the container's template in its place would be
-     * the silent fallback the flag exists to rule out. */
+    /* The operator's template replaces the container's before anything reads it, so the chat
+     * endpoint and the derived reply format agree. An unreadable or empty file is refused rather
+     * than silently falling back. */
     if (!cfg_.override_chat_template.empty()) {
         std::ifstream f(cfg_.override_chat_template);
         if (!f) {
@@ -3870,8 +3432,8 @@ int Engine::load_vocab() {
         std::ostringstream ss;
         ss << f.rdbuf();
         std::string t = ss.str();
-        /* Trailing newlines go, as they do for a checkpoint's own chat_template.jinja, so one file
-         * renders the same prompt whichever way it reaches the server. */
+        /* Strip trailing newlines, as for a checkpoint's chat_template.jinja, so the same file
+         * renders the same prompt either way. */
         while (!t.empty() && (t.back() == '\n' || t.back() == '\r')) t.pop_back();
         if (t.find_first_not_of(" \t\r\n") == std::string::npos) {
             RAD_ERR("--override-chat-template %s: the file is empty",
@@ -3884,8 +3446,8 @@ int Engine::load_vocab() {
         vb.chat_template = std::move(t);
     }
 
-    /* The checkpoint's own end-of-generation list travels as metadata, flattened from
-     * generation_config.json -- a space-separated list, or one id. */
+    /* The checkpoint's end-of-generation ids, flattened from generation_config.json into metadata
+     * as a space-separated list or one id. */
     if (const char* ids = rad_meta_gets(&meta_, "generation.eos_token_id", nullptr)) {
         const char* q = ids;
         while (*q) {
@@ -3901,16 +3463,15 @@ int Engine::load_vocab() {
     RAD_TRY(v->load(std::move(vb)));
     vocab_ = v;
 
-    auto view = std::make_unique<RealVocabView>();
+    auto view = std::make_unique<TokenView>();
     RAD_TRY(view->init(vocab_));
     vocab_view_ = std::move(view);
 
     RAD_INFO("vocab: %d tokens, bos=%d eos=%d%s", vocab_->n_tokens(), vocab_->bos(), vocab_->eos(),
              vocab_->chat_template().empty() ? ", no chat template" : "");
 
-    /* THE GRAMMAR ENGINE'S VOCABULARY INDEX, built here rather than by the first request that
-     * carries a grammar -- a tool-calling template gives nearly every agent request one -- so
-     * that request's admission pays only for its own grammar. */
+    /* Build the grammar engine's vocabulary index now rather than on the first grammar request
+     * (nearly every tool-calling request has one), so admission pays only for its own grammar. */
     GbnfVocabInfo gi;
     const int gs = gbnf_prepare_vocab(vocab_view_.get(), &gi);
     if (gs < 0) {

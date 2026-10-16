@@ -1,23 +1,22 @@
 /* rad_quant.h -- the quantiser plugin ABI. spec.md §4.5.
  *
- * A quantiser turns a weight, handed to it in f32, into the planes of an ENCODING (rad_encoding.h).
+ * A quantiser turns a weight, handed to it in f32, into the planes of an encoding (rad_encoding.h).
  * It is the third plugin kind beside kernels and architectures, loaded from
- * $RADIANCE_HOME/quantizers, and it is the only place a weight's numbers are chosen: a kernel
- * rearranges planes it is given (rad_abi.h, RadRelayoutFn) and never quantises.
+ * $RADIANCE_HOME/quantizers, and the only place a weight's numbers are chosen: a kernel only
+ * rearranges the planes it is given (rad_abi.h, RadRelayoutFn).
  *
- * rad-convert drives quantisers through a RECIPE -- ordered rules from a logical weight name to a
+ * rad-convert drives quantisers through a recipe: ordered rules from a logical weight name to a
  * quantiser and its options (spec §4.4). For each weight a rule picks, it asks the quantiser which
- * encoding it would write (`encoding`), lets the architecture plugin declare against that, and
- * then hands the weight over in row blocks (`row_block`, `quantize`), so a 51 GB table streams.
+ * encoding it would write (`encoding`), lets the architecture plugin declare against that, then
+ * hands the weight over in row blocks (`row_block`, `quantize`), so a 51 GB table streams.
  *
- * WHAT A QUANTISER IS GIVEN. The weight's logical name, shape and movement group, and when the
- * converter has an imatrix, the weight's column importances. Anything else it calibrates on -- a
- * GPTQ Hessian, AutoRound's activations -- is an option it reads itself (`calib=DIR`): what a
- * Hessian is and how it is stored is the quantiser's business, exactly as a layout is a kernel's.
+ * Input: the weight's logical name, shape and movement group, and the column importances when the
+ * converter has an imatrix. Other calibration data (a GPTQ Hessian, AutoRound's activations) is an
+ * option the quantiser reads itself (`calib=DIR`); its format is the quantiser's business.
  *
- * WHAT IT HANDS BACK is the canonical planes and nothing else, so its output is readable by every
- * kernel library that accepts the encoding and by the core's own decoder -- which is how rad-convert
- * measures its error without knowing what it did.
+ * Output: the canonical planes only, so every kernel library that accepts the encoding and the
+ * core's own decoder can read it. That is how rad-convert measures the error without knowing the
+ * method.
  *
  * Pure C, like the rest of abi/.
  */
@@ -37,12 +36,12 @@ typedef struct RadQuantWeight {
     uint32_t    rank;
     int64_t     shape[RAD_MAX_RANK];  /* the logical shape */
     int64_t     rows, cols;           /* the [rows, cols] view every plane is laid over */
-    /* The movement group; -1 for none. -1 also when `encoding` is asked at declare, which runs
-     * before the weight's group exists -- so an encoding may depend on the name and the shape and
-     * not on these, and rad-convert refuses a quantiser whose answer moves once it is told. */
+    /* The movement group; -1 for none. Also -1 when `encoding` is asked at declare, before the
+     * group exists, so an encoding may depend on the name and shape but not on these; rad-convert
+     * refuses a quantiser whose answer changes once it is told. */
     int32_t     layer, expert;
-    /* The imatrix's column importances for this weight -- a second moment of its input, one a
-     * column -- or null when the converter has none. Per expert where the imatrix has the form. */
+    /* The imatrix's column importances for this weight (the second moment of its input, one per
+     * column), or null when the converter has none. Per expert where the imatrix has that form. */
     const float* importance;
 } RadQuantWeight;
 
@@ -57,22 +56,22 @@ typedef struct RadQuantOption {
     const char* doc;
 } RadQuantOption;
 
-/* The encoding this quantiser writes for `w` under options `o`. RAD_E_UNSUPPORTED declines -- a
- * weight it does not quantise, like a rank-1 norm -- and the converter moves on to the next rule;
- * any other failure is an error in the recipe, said with the weight's name. */
+/* The encoding this quantiser writes for `w` under options `o`. RAD_E_UNSUPPORTED declines (a
+ * weight it does not quantise, like a rank-1 norm) and the converter moves on to the next rule;
+ * any other failure is a recipe error reported with the weight's name. */
 typedef int (*RadQuantEncodingFn)(const RadParam* o, int n_o, const RadQuantWeight* w,
                                   RadEncoding* out);
 
 /* The rows one `quantize` call may take: every call but the last gets a multiple of this, starting
- * on a multiple of it. 0 means the whole weight in one call -- what anything with a cross-row
- * decision needs (a per-tensor scale it derives, a rotation it learns, a Hessian it shares). It must
- * be a multiple of every TILED plane's block rows. */
+ * on a multiple of it. 0 means the whole weight in one call, needed for any cross-row decision (a
+ * derived per-tensor scale, a learned rotation, a shared Hessian). Must be a multiple of every
+ * TILED plane's block rows. */
 typedef int64_t (*RadQuantRowBlockFn)(const RadParam* o, int n_o, const RadQuantWeight* w);
 
 /* Quantise logical rows [row0, row0 + rows) of `w`, given as f32 [rows, cols] in `src`, into the
- * planes. `planes[i]` points at the element row of plane i that covers logical row `row0` -- for a
- * TILED plane of block rows br that is row row0 / br, for a plane covering the whole extent and for
- * a TABLE plane it is the plane's start -- and the call writes exactly the rows its block covers.
+ * planes. `planes[i]` points at the element row of plane i that covers logical row `row0` (row
+ * row0 / br for a TILED plane of block rows br; the plane's start for a whole-extent or TABLE
+ * plane), and the call writes exactly the rows its block covers.
  * The buffers arrive zeroed. `src` may be modified. */
 typedef int (*RadQuantizeFn)(const RadParam* o, int n_o, const RadQuantWeight* w,
                              float* src, int64_t row0, int64_t rows, void* const* planes);
@@ -81,12 +80,11 @@ typedef int (*RadQuantizeFn)(const RadParam* o, int n_o, const RadQuantWeight* w
  * does not decode. Null for a quantiser that writes only "plain" and "affine", which the core
  * decodes itself. `planes[i]` points at plane i's start.
  *
- * It is how a scheme of a quantiser's own is READ: the oracle checking a kernel against the
- * reference, rad-kbench drawing a weight, rad-convert measuring the quantiser's error all decode
+ * The oracle, rad-kbench and rad-convert's error measurement all read a quantiser's own scheme
  * through it. The core asks every loaded quantiser that has one, in load order, and takes the
- * first answer that is not RAD_E_UNSUPPORTED -- so a decoder answers RAD_E_UNSUPPORTED for an
- * encoding it did not write. `w` names the weight where the caller knows it; a decoder must not
- * need more than the encoding, `rows` and `cols`, because the oracle knows no more. */
+ * first answer that is not RAD_E_UNSUPPORTED, so a decoder must return RAD_E_UNSUPPORTED for an
+ * encoding it did not write. `w` names the weight where the caller knows it; a decoder must need
+ * nothing beyond the encoding, `rows` and `cols`, because the oracle knows no more. */
 typedef int (*RadQuantDecodeFn)(const RadEncoding* e, const RadQuantWeight* w,
                                 const void* const* planes, int64_t row0, int64_t rows,
                                 float* out);
@@ -102,10 +100,9 @@ typedef struct RadQuantizerInfo {
     RadQuantDecodeFn      decode;    /* optional */
 } RadQuantizerInfo;
 
-/* Every quantiser plugin exports these, beside rad_plugin_abi_version and rad_plugin_info (whose
- * kind is RAD_PLUGIN_QUANT). Two plugins naming the same quantiser is refused at load, both named,
- * for the reason two kernel plugins may not disagree about an op's schema: a recipe that names it
- * would mean different numbers depending on load order. */
+/* Every quantiser plugin exports these, beside rad_plugin_abi_version and rad_plugin_info (kind
+ * RAD_PLUGIN_QUANT). Two plugins naming the same quantiser are refused at load, both named, since
+ * a recipe naming it would otherwise give different numbers depending on load order. */
 int                     rad_quant_count(void);
 const RadQuantizerInfo* rad_quant_at(int i);
 

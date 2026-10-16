@@ -1,22 +1,20 @@
 /* core/server/adapters.h -- bind the real components onto the server's interfaces.
  *
- * iface.h deliberately knows nothing about core/sched or core/text, so that the HTTP layer can be
- * compiled and tested against fakes with no engine present. This file is where the two sides
- * actually meet, and it is included by exactly one translation unit: whoever wires the engine
- * (core/engine.cpp). Nothing in core/server/ includes it, so the server's own build stays
- * independent of those components' headers.
+ * iface.h knows nothing about core/sched or core/text, so the HTTP layer can be built and tested
+ * against fakes. This file joins the two sides and is included only by the translation unit that
+ * wires the engine (core/engine.cpp); nothing in core/server/ includes it.
  *
  *   rad::server::SchedulerBridge  sched(&engine_scheduler);
  *   rad::server::TokenizerBridge  tok(vocab);
  *   rad::server::Deps d; d.sched = &sched; d.tok = &tok; ...
  *
- * Every impedance mismatch between what the server wants and what those components provide is
- * resolved here, in one place, with the reason written down -- rather than being smeared across
- * either component as a special case for the other.
+ * Mismatches between what the server wants and what the components provide are resolved here
+ * rather than as special cases inside either side.
  */
 #pragma once
 #include "iface.h"
 #include "mem/kvtier.h"
+#include "sink.h"
 
 #if !defined(RAD_SERVER_NO_ENGINE_BRIDGE) && \
     __has_include("sched/scheduler.h") && __has_include("text/tokenizer.h")
@@ -37,6 +35,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <iterator>
 #include <memory>
 
 namespace rad {
@@ -44,15 +43,111 @@ namespace server {
 
 /* ================================================================== scheduler */
 
+/* The scheduler's snapshot in the server's terms (SchedulerBridge::metrics). */
+inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
+    SchedMetrics o;
+    o.waiting = m.queue_depth;
+    o.running = m.running;
+    o.preempted = m.preempted_waiting;
+
+    /* KV utilisation is the maximum over groups, not the mean: a hybrid model's attention
+     * and linear-state groups have different geometries (spec §7.2) and exhausting either
+     * one preempts.
+     *
+     * Token capacity is not a sum either. Paged groups share one token axis: each context
+     * token takes a slot in every paged group (e.g. Qwen4-Exp's `kv_attn` and `kv_qsa_bkey`),
+     * so summing overcounts by the number of paged groups. The token figures are the binding
+     * group's: the paged group nearest full, which decides the next preemption. A windowed group
+     * never binds: it recycles blocks below its window, so its fill bounds lookback, not how much
+     * context fits (a drafter's window sits full for the server's whole life). */
+    o.kv_util = 0.0;
+    int bind = -1;
+    for (int i = 0; i < m.n_kv_groups; ++i) {
+        if (m.kv[i].block_tokens <= 0) continue;     /* a linear state has no token axis */
+        if (m.kv[i].window) continue;
+        if (bind < 0 || m.kv[i].utilisation > m.kv[bind].utilisation) bind = i;
+    }
+    for (int i = 0; i < m.n_kv_groups; ++i)
+        o.kv_util = std::max(o.kv_util, (double)m.kv[i].utilisation);
+    if (bind >= 0) {
+        const int64_t bt = m.kv[bind].block_tokens;
+        o.kv_tokens_total = m.kv[bind].blocks_total * bt;
+        o.kv_tokens_used  = (m.kv[bind].blocks_total - m.kv[bind].blocks_free) * bt;
+    }
+
+    /* Bytes, unlike tokens, do sum: each group has its own extent of VRAM, so every group
+     * (recurrent ones included) is added. */
+    for (int i = 0; i < m.n_kv_groups; ++i) {
+        o.kv_bytes_total += m.kv[i].bytes_total;
+        o.kv_bytes_used  += m.kv[i].bytes_used;
+        o.kv_bytes_carved += m.kv[i].bytes_carved;
+        if (m.kv[i].block_tokens <= 0 || m.kv[i].window) continue;
+        const int64_t t = m.kv[i].blocks_total * m.kv[i].block_tokens;
+        if (o.kv_tokens_max == 0 || t < o.kv_tokens_max) o.kv_tokens_max = t;
+    }
+
+    /* vLLM's gpu_prefix_cache_hit_rate means attention caching. The linear-checkpoint hit
+     * rate has a different granularity (spec §7.3) and is reported separately, not averaged
+     * in. */
+    o.prefix_hit_rate = m.attn_hit_rate;
+    o.prefix_evictions = m.prefix_evictions;
+    /* What only the cache holds (SchedMetrics::prefix_held_tokens), clamped to the pool's
+     * used figure: the two are counted at different moments in a step, and cached > used
+     * would show a negative live share. */
+    o.kv_tokens_cached = std::min(m.prefix_held_tokens, o.kv_tokens_used);
+    o.prefix_ckpt_evictions = m.prefix_ckpt_evictions;
+    o.prefix_ckpt_retired = m.prefix_ckpt_retired;
+    o.prefix_ckpt_lru = m.prefix_ckpt_lru;
+    o.prefix_ckpt_refused = m.prefix_ckpt_refused;
+    o.hit_cut_no_snapshot = m.hit_cut_no_snapshot;
+    o.hit_cut_window = m.hit_cut_window;
+    o.hit_cut_adopt = m.hit_cut_adopt;
+    o.hit_cut_tokens = m.hit_cut_tokens;
+    o.prefix_expired = m.prefix_expired;
+    o.prefix_ckpt_expired = m.prefix_ckpt_expired;
+
+    o.prefill_tps = m.prefill_tps;
+    o.decode_tps = m.decode_tps;
+    o.draft_acceptance = m.draft_acceptance;
+    o.prefill_tokens = m.prefill_tokens;   o.decode_tokens = m.decode_tokens;
+    o.draft_tokens = m.draft_tokens;       o.draft_accepted = m.draft_accepted;
+    o.draft_refills = m.draft_refills;     o.draft_refill_tokens = m.draft_refill_tokens;
+    o.linear_hit_rate = m.linear_hit_rate;
+    o.attn_cached_tokens = m.attn_cached_tokens;
+    o.linear_cached_tokens = m.linear_cached_tokens;
+    o.checkpoints_written = m.checkpoints_written;
+    o.draft_depth_seen = m.draft_depth_seen;
+    if (o.draft_depth_seen > SchedMetrics::MAX_DRAFT_POS)
+        o.draft_depth_seen = SchedMetrics::MAX_DRAFT_POS;
+    for (int j = 0; j < o.draft_depth_seen; ++j) {
+        o.draft_pos_reached [j] = m.draft_pos_reached [j];
+        o.draft_pos_accepted[j] = m.draft_pos_accepted[j];
+    }
+    o.draft_adaptive = m.draft_adaptive;
+    o.draft_depth_adaptive = m.draft_depth_adaptive;
+    for (size_t d = 0;
+         d < std::size(m.draft_verify_depth) && d < std::size(o.draft_verify_depth); ++d)
+        o.draft_verify_depth[d] = m.draft_verify_depth[d];
+    o.preemptions = m.preemptions;
+    o.total_requests = m.admitted;
+    o.steps = m.steps;
+    o.steps_prefill = m.steps_prefill;  o.steps_mixed = m.steps_mixed;
+    o.steps_decode = m.steps_decode;
+    o.steps_ahead = m.steps_ahead;
+    o.prefill_chunks_capped = m.prefill_chunks_capped;
+    o.steps_held = m.steps_held;
+    o.decode_rows_unspeculated = m.decode_rows_unspeculated;
+    o.step_ns = m.step_ns;  o.step_ns_decode = m.step_ns_decode;
+    return o;
+}
+
 class SchedulerBridge final : public IScheduler {
 public:
-    /* `sampler` is the rank-0 sampler, and it is optional only so that a caller with no engine
-     * behind it still compiles. Every rank declares the same chain against the same hierarchy, so
-     * whether a stage resolved is not a per-rank fact and asking one of them is asking all. */
-    /* `tiers` is rank 0's IdleTiers, and it is given whether or not a tier can move anything:
-     * the object holds the session table either way, and a server with no --prefix-cache-mib is
-     * one whose every stored session is in VRAM rather than one with no sessions. Null only when
-     * there is no engine behind this at all. */
+    /* `sampler` is the rank-0 sampler; optional only for callers with no engine. Every rank
+     * declares the same chain against the same hierarchy, so rank 0 answers for all.
+     * `tiers` is rank 0's IdleTiers, passed even when no tier can move anything: it holds the
+     * session table either way (without --prefix-cache-mib every session is in VRAM). Null only
+     * with no engine. */
     explicit SchedulerBridge(Scheduler* s, const Sampler* sampler = nullptr,
                              const IdleTiers* tiers = nullptr)
         : s_(s), sampler_(sampler), tiers_(tiers) {}
@@ -62,33 +157,29 @@ public:
         return sampler_->check_request(sp, why);
     }
 
-    /* Request ids are the server's to allocate: Scheduler::add refuses a duplicate id and does
-     * not mint one, which is the right split -- the id has to exist before submission so that a
-     * connection dropped during submission still has something to cancel. */
     uint64_t submit(Request&& r) override {
-        auto p = std::make_unique<Request>(std::move(r));
-        p->id = next_.fetch_add(1, std::memory_order_relaxed);
-        const uint64_t id = p->id;
-        int st = s_->add(std::move(p));
-        if (st < 0) {
-            /* Failing here means the request never entered the queue, so nothing will ever finish
-             * its sink. Tell the sink itself, or the HTTP thread waits forever. */
-            RAD_WARN("server: scheduler refused request %llu: %s",
-                     (unsigned long long)id, rad_strerror(st));
-            return 0;
-        }
-        return id;
+        std::vector<Request> one;
+        one.push_back(std::move(r));
+        std::vector<uint64_t> ids;
+        submit_all(one, &ids);
+        return ids[0];
     }
 
+    /* The server allocates request ids (Scheduler::add refuses duplicates and mints none), so
+     * the id exists before submission and a connection dropped mid-submission can cancel it.
+     * A refused request gets id 0 and a failed sink: it never entered the queue, so nothing
+     * else would finish the sink, and the HTTP thread waiting on it would hang. */
     void submit_all(std::vector<Request>& rs, std::vector<uint64_t>* ids) override {
         const size_t n = rs.size();
         std::vector<std::unique_ptr<Request>> ps(n);
+        std::vector<void*> sinks(n);
         std::vector<int> rc(n, RAD_OK);
         ids->assign(n, 0);
         for (size_t i = 0; i < n; ++i) {
             ps[i] = std::make_unique<Request>(std::move(rs[i]));
             ps[i]->id = next_.fetch_add(1, std::memory_order_relaxed);
             (*ids)[i] = ps[i]->id;
+            sinks[i] = ps[i]->sink;
         }
         s_->add_all(ps.data(), n, rc.data());
         for (size_t i = 0; i < n; ++i) {
@@ -96,6 +187,9 @@ public:
             RAD_WARN("server: scheduler refused request %llu: %s",
                      (unsigned long long)(*ids)[i], rad_strerror(rc[i]));
             (*ids)[i] = 0;
+            /* A stopped engine has already failed the sink with its own reason. */
+            Sink* k = static_cast<Sink*>(sinks[i]);
+            if (k && !k->done()) k->fail(rc[i], "the scheduler refused the request");
         }
     }
 
@@ -104,15 +198,15 @@ public:
 
     int64_t reset_prefix_cache() override { return s_->reset_prefix_cache(); }
 
-    /* THE STORED CONVERSATIONS. Idle time is computed here rather than carried, because the tiers
-     * keep a monotonic timestamp and a browser wants "how long ago" -- converting at the edge
-     * means one clock is authoritative and the other never has to be trusted. */
+    /* The stored conversations. The tiers keep monotonic timestamps; idle and age are converted
+     * to "seconds ago" here, so only the monotonic clock is authoritative. */
     TierCounters tier_counters() const override {
         TierCounters c;
         if (!tiers_) return c;
         const IdleTiers::Stats& s = tiers_->stats();
         c.to_host = s.to_host; c.dropped = s.dropped; c.promoted = s.promoted;
         c.host_drops = s.host_drops; c.failures = s.failures;
+        c.held_back = s.held_back;
         c.host_bytes = s.host_bytes;
         c.restores = s.restores; c.restore_ns = s.restore_ns;
         c.flushes = s.flushes; c.flush_ns = s.flush_ns;
@@ -153,10 +247,8 @@ public:
         return (int)out->size();
     }
 
-    /* THE STATE NAME IS DERIVED, not stored: ReqState has no `Prefill`, because to the scheduler
-     * prefill is not a state -- it is a running request whose prompt is not yet all in the KV.
-     * That distinction is the single most useful thing this table shows, so it is made here
-     * rather than left for every reader to reconstruct from two integers. */
+    /* The state name is derived: ReqState has no `Prefill`, since to the scheduler prefill is a
+     * running request whose prompt is not yet all in the KV. The table reports it separately. */
     int requests(std::vector<RequestStat>* out) const override {
         std::vector<Scheduler::ReqStat> raw(256);
         const int n = s_->observed_requests(raw.data(), (int)raw.size());
@@ -195,109 +287,11 @@ public:
     /* Both read the copy the engine thread publishes (Scheduler::publish), never the
      * scheduler's live state: every caller is an observer. */
     SchedMetrics metrics() const override {
-        const rad::SchedMetrics m = s_->observed_metrics();
-        SchedMetrics o;
-        o.waiting = m.queue_depth;
-        o.running = m.running;
-        o.preempted = m.preempted_waiting;
-
-        /* One KV utilisation number, and it is the MAXIMUM over groups rather than the mean. A
-         * hybrid model has a full-attention group and a linear-state group with different
-         * geometries (spec §7.2), and exhausting either one preempts -- so the number a dashboard
-         * should be watching is the closest one to the wall, not the average of it with the one
-         * that has room.
-         *
-         * AND THE TOKEN CAPACITY IS NOT A SUM, for the same reason, which is easier to get wrong
-         * because the units look additive. PAGED GROUPS SHARE ONE TOKEN AXIS: on Qwen4-Exp
-         * `kv_attn` and `kv_qsa_bkey` are both 129216 blocks of 4 tokens, and one token of context
-         * takes a slot in BOTH of them (26.00 KiB + 3.25 KiB a block, 7.31 KiB a token together).
-         * Adding them would report 1,033,728 tokens of capacity for a pool that holds 516,864 --
-         * off by exactly the number of paged groups, an error that is invisible on a one-group
-         * model.
-         *
-         * So the figure is the BINDING group's: the one nearest the wall, which is the one that
-         * decides when the next sequence is preempted, and the same group `kv_util` reports. */
-        o.kv_util = 0.0;
-        int bind = -1;
-        for (int i = 0; i < m.n_kv_groups; ++i) {
-            if (m.kv[i].block_tokens <= 0) continue;     /* a linear state has no token axis */
-            if (bind < 0 || m.kv[i].utilisation > m.kv[bind].utilisation) bind = i;
-        }
-        for (int i = 0; i < m.n_kv_groups; ++i)
-            o.kv_util = std::max(o.kv_util, (double)m.kv[i].utilisation);
-        if (bind >= 0) {
-            const int64_t bt = m.kv[bind].block_tokens;
-            o.kv_tokens_total = m.kv[bind].blocks_total * bt;
-            o.kv_tokens_used  = (m.kv[bind].blocks_total - m.kv[bind].blocks_free) * bt;
-        }
-
-        /* AND THE WHOLE POOL IN BYTES, WHICH IS THE ONE FIGURE THAT IS A SUM. The paragraph above
-         * is about why tokens are not: the groups share a token axis. Bytes do not overlap -- each
-         * group was carved its own extent of the card -- so every group is added here, the
-         * recurrent ones included, and the answer is how much VRAM the KV cache is holding. */
-        for (int i = 0; i < m.n_kv_groups; ++i) {
-            o.kv_bytes_total += m.kv[i].bytes_total;
-            o.kv_bytes_used  += m.kv[i].bytes_used;
-            o.kv_bytes_carved += m.kv[i].bytes_carved;
-            if (m.kv[i].block_tokens <= 0 || m.kv[i].window) continue;
-            const int64_t t = m.kv[i].blocks_total * m.kv[i].block_tokens;
-            if (o.kv_tokens_max == 0 || t < o.kv_tokens_max) o.kv_tokens_max = t;
-        }
-
-        /* vLLM's gpu_prefix_cache_hit_rate is a single number and attention caching is what it
-         * has always meant. The linear-checkpoint hit rate is a different measurement at a
-         * different granularity (spec §7.3) and averaging the two would hide exactly the effect
-         * the decoupling exists to expose, so it is not folded in here. */
-        o.prefix_hit_rate = m.attn_hit_rate;
-        o.prefix_evictions = m.prefix_evictions;
-        /* WHAT ONLY THE CACHE IS HOLDING -- see SchedMetrics::prefix_held_tokens. Clamped to what
-         * the pool reports held: they are counted at different moments in a step and a cached
-         * figure above the used one would draw a negative live share. */
-        o.kv_tokens_cached = std::min(m.prefix_held_tokens, o.kv_tokens_used);
-        o.prefix_ckpt_evictions = m.prefix_ckpt_evictions;
-        o.prefix_expired = m.prefix_expired;
-        o.prefix_ckpt_expired = m.prefix_ckpt_expired;
-
-        o.prefill_tps = m.prefill_tps;
-        o.decode_tps = m.decode_tps;
-        o.draft_acceptance = m.draft_acceptance;
-        o.prefill_tokens = m.prefill_tokens;   o.decode_tokens = m.decode_tokens;
-        o.draft_tokens = m.draft_tokens;       o.draft_accepted = m.draft_accepted;
-        o.draft_refills = m.draft_refills;     o.draft_refill_tokens = m.draft_refill_tokens;
-        o.linear_hit_rate = m.linear_hit_rate;
-        o.attn_cached_tokens = m.attn_cached_tokens;
-        o.linear_cached_tokens = m.linear_cached_tokens;
-        o.checkpoints_written = m.checkpoints_written;
-        o.draft_depth_seen = m.draft_depth_seen;
-        if (o.draft_depth_seen > SchedMetrics::MAX_DRAFT_POS)
-            o.draft_depth_seen = SchedMetrics::MAX_DRAFT_POS;
-        for (int j = 0; j < o.draft_depth_seen; ++j) {
-            o.draft_pos_reached [j] = m.draft_pos_reached [j];
-            o.draft_pos_accepted[j] = m.draft_pos_accepted[j];
-        }
-        o.draft_adaptive = m.draft_adaptive;
-        o.draft_depth_adaptive = m.draft_depth_adaptive;
-        {
-            const int ka = (int)(sizeof m.draft_verify_depth / sizeof m.draft_verify_depth[0]);
-            const int kb = (int)(sizeof o.draft_verify_depth / sizeof o.draft_verify_depth[0]);
-            for (int d = 0; d < ka && d < kb; ++d) o.draft_verify_depth[d] = m.draft_verify_depth[d];
-        }
-        o.preemptions = m.preemptions;
-        o.total_requests = m.admitted;
-        o.steps = m.steps;
-        o.steps_prefill = m.steps_prefill;  o.steps_mixed = m.steps_mixed;
-        o.steps_decode = m.steps_decode;
-        o.steps_ahead = m.steps_ahead;
-        o.prefill_chunks_capped = m.prefill_chunks_capped;
-        o.decode_rows_unspeculated = m.decode_rows_unspeculated;
-        o.step_ns = m.step_ns;  o.step_ns_decode = m.step_ns_decode;
-        return o;
+        return bridge_metrics(s_->observed_metrics());
     }
 
 private:
-    /* DECLARED IN CONSTRUCTION ORDER. Members initialise in declaration order whatever the
-     * initialiser list says, so a list that disagrees with it draws a -Wreorder warning and
-     * becomes a use-before-initialisation the first time one of these is derived from another. */
+    /* Declared in the constructor's initialiser order (-Wreorder). */
     Scheduler*            s_;
     const Sampler*        sampler_ = nullptr;
     const IdleTiers*      tiers_ = nullptr;
@@ -332,9 +326,8 @@ public:
         std::vector<int32_t> out;
         int st = tok_.encode(text, out, add_special, parse_special);
         if (st < 0) {
-            /* The caller checks for an empty result and answers 400. Returning a partial
-             * tokenisation would be worse than returning none: it is a prompt that is silently
-             * not the prompt that was sent. */
+            /* The caller answers 400 on an empty result. A partial tokenisation would silently
+             * serve a different prompt. */
             RAD_WARN("server: tokenise failed: %s", rad_strerror(st));
             out.clear();
         }
@@ -342,9 +335,8 @@ public:
     }
 
     std::string decode(const std::vector<int32_t>& ids) const override {
-        /* Sanitised for the same reason Detokenizer::push is: a token array naming byte-fallback
-         * ids need not decode to well-formed UTF-8, and this text is echoed back inside a JSON
-         * string, where a malformed byte costs the client the whole response. */
+        /* Sanitised like Detokenizer::push: byte-fallback ids need not decode to valid UTF-8,
+         * and one malformed byte in a JSON string breaks the whole response. */
         return utf8_sanitize(tok_.decode(ids, /*render_special=*/false));
     }
     int32_t eos() const override { return vocab_->eos(); }
@@ -366,9 +358,8 @@ public:
         return i;
     }
 
-    /* Vocab::text, sanitised: a byte-level BPE piece is a mapped codepoint sequence that is valid
-     * UTF-8, but a byte-fallback vocabulary's piece need not be, and this goes into a JSON string
-     * where one malformed byte costs the client the whole response. */
+    /* Vocab::text, sanitised: a byte-fallback vocabulary's piece need not be valid UTF-8 (a
+     * byte-level BPE piece always is), and this goes into a JSON string. */
     std::string piece(int32_t id) const override {
         if (id < 0 || id >= vocab_->n_tokens()) return std::string();
         return utf8_sanitize(vocab_->text(id));
@@ -395,25 +386,19 @@ private:
 
 /* ================================================================== chat
  *
- * THE ONE PLACE THE TWO CHAT INTERFACES MEET. core/text's ChatTemplate renders the prompt and the
- * generation prompt; the model's reply format (chatfmt.h) says how the reply is spelled, and
- * everything that depends on the spelling -- the grammar, its trigger words, the tokens the
- * decoder must render, and the parser that reads the reply back -- is derived from that one
- * description here. Two decisions worth stating:
+ * core/text's ChatTemplate renders the prompt and generation prompt. The model's reply format
+ * (chatfmt.h) says how the reply is spelled, and everything depending on the spelling (grammar,
+ * trigger words, tokens the decoder must render, the reply parser) is derived from it here.
  *
- *   * `preserved_tokens` IS CARRIED, and the reason is not the one it has upstream. Upstream it
- *     stops a sampler that bans special tokens from banning the ones a tool-call format is made
- *     of; this sampler has no ban stage at all (core/sample/sampler.h), so there is nothing to
- *     preserve them FROM. It is carried because the DECODER suppresses control tokens, and a
- *     format can be built out of them -- MiniCPM5 writes `<function`, `<param` and their closers
- *     as control tokens, so a reply decoded the ordinary way reaches the parser as ` name="get
- *     _weather"> name="city">Berlin`, every tag gone, and comes back to the client as prose.
- *     These, and only these, are decoded as text. If a ban stage is ever added it wants this
- *     same field, for the original reason.
+ *   * `preserved_tokens` lists control tokens the decoder must render as text. The decoder
+ *     suppresses control tokens, and some formats are built from them: MiniCPM5 writes
+ *     `<function`, `<param` and their closers as control tokens, so without this the parser
+ *     sees no tags and the call reaches the client as prose. (Upstream the field protects them
+ *     from a sampler ban stage; this sampler has none, core/sample/sampler.h.)
  *
- *   * THE PARSER IS BUILT PER RENDER and handed over behind IReplyParser. A server-wide parser
- *     cannot be correct: which arguments are JSON depends on the schemas THIS request sent, and
- *     whether the reply starts inside a reasoning block depends on THIS generation prompt.
+ *   * The parser is built per render, behind IReplyParser: which arguments are JSON depends on
+ *     this request's tool schemas, and whether the reply starts inside a reasoning block on this
+ *     generation prompt.
  */
 class ReplyReaderBridge final : public IReplyReader {
 public:
@@ -430,10 +415,9 @@ public:
     void finish(std::vector<ReplyDelta>* out) override {
         s_->finish(out ? &ev_ : nullptr);
         move_out(out);
-        /* A reply that left the grammar still came back whole -- a call to a function that is
-         * not a tool, text inside a call, a call after a closing sentence -- but it is worth a
-         * line: it is either a model writing its format loosely or a format described wrongly,
-         * and nothing in the response says which. */
+        /* A reply outside the format (a call to an unknown function, text inside a call, a call
+         * after closing prose) is still returned whole, but logged once: either the model writes
+         * its format loosely or the format is described wrongly. */
         if (!s_->strict() && !warned_) {
             warned_ = true;
             RAD_WARN("server: a reply left the '%s' reply format and was read by its recovery "
@@ -495,13 +479,11 @@ private:
 
 class ChatTemplateBridge final : public IChatTemplate {
 public:
-    /* Returns RAD_OK, or the status ChatTemplate::load_from_vocab gave. A server whose template
-     * did not compile must not be wired: the endpoint answering 501 is a better outcome than one
-     * answering 200 with ChatML-shaped nonsense.
+    /* Returns RAD_OK, or ChatTemplate::load_from_vocab's status. A server whose template did not
+     * compile must not wire it: a 501 beats a 200 with ChatML-shaped nonsense.
      *
      * `declared` is the architecture plugin's reply format (rad_arch_chat_format), or null to
-     * derive it from the template. A declaration the parser cannot run is refused here, at
-     * startup, rather than at the first request that needs it. */
+     * derive it from the template. A declaration the parser cannot run is refused at startup. */
     int init(const Vocab& v, const RadChatFormat* declared = nullptr,
              const std::string& plugin = std::string()) {
         /* The spellings, resolved once. See ReplyOptions::terminators. */
@@ -587,9 +569,8 @@ public:
         ChatPrompt p;
         const int st = t_.apply(messages, tools, o, &p);
         if (st < 0) {
-            /* THE TEMPLATE'S OWN SENTENCE WHERE THERE IS ONE. A jinja `raise_exception` names the
-             * field and the values it accepts; the generic line below names neither, and a caller
-             * reading a 400 has no other way to find out. */
+            /* Prefer the template's own message: a jinja `raise_exception` names the field and
+             * its accepted values, which the generic lines below do not. */
             if (why)
                 *why = !p.error.empty()
                            ? p.error
@@ -680,9 +661,8 @@ private:
 
 /* ================================================================== grammar
  *
- * Compiles at ADMISSION, not at first token, so a schema that cannot be compiled is a 400 naming
- * it rather than a request that starts and then dies on the step path -- and so the scheduler
- * thread never compiles one.
+ * Compiles at admission, not at first token, so an uncompilable schema is a 400 rather than a
+ * request that fails on the step path, and the scheduler thread never compiles.
  */
 class GrammarBridge final : public IGrammarCompiler {
 public:
@@ -692,9 +672,8 @@ public:
         return grammar_from_json_schema(schema.dump(), "root", &out, &err);
     }
 
-    /* The whole compile -- parse, checks and mask plan -- on the admission thread. The program
-     * goes back to ride on the request; the sampler finds it by its text when the request starts,
-     * for as long as the request holds it. */
+    /* The whole compile (parse, checks, mask plan) runs on the admission thread. The program
+     * rides on the request; the sampler finds it by its text while the request holds it. */
     int compile(const std::string& gbnf, std::shared_ptr<const GbnfProgram>* out,
                 std::string& err) const override {
         if (gbnf.empty()) return RAD_OK;
@@ -706,10 +685,9 @@ private:
     const VocabView* v_;
 };
 
-/* MEDIA, through the processor the container describes (core/mm). Present only when the program
- * declared an encoder: `accepts` answers from what that encoder said it serves, so a request for
- * video against an image-only tower is refused by the server with a reason rather than processed
- * into patches nothing can encode. */
+/* Media, through the container's processor (core/mm). Present only when the program declares an
+ * encoder; `accepts` follows the modalities that encoder serves, so e.g. video against an
+ * image-only tower is refused with a reason instead of processed into unencodable patches. */
 class MultimodalBridge final : public IMultimodal {
 public:
     MultimodalBridge(const mm::Processor* p, uint32_t modalities) : p_(p), mod_(modalities) {}
@@ -730,6 +708,30 @@ public:
                    ? p_->image(bytes.data(), bytes.size(), opts.image_tokens, out, why,
                                opts.max_pixels)
                    : p_->video(bytes.data(), bytes.size(), out, why);
+    }
+
+    int32_t audio_rate() const override {
+        return accepts(MediaKind::Audio) ? p_->audio_config().rate : 0;
+    }
+    int64_t audio_max_samples() const override {
+        return accepts(MediaKind::Audio) ? p_->audio_config().max_samples : 0;
+    }
+    int decode_audio(const std::vector<uint8_t>& bytes, int64_t max_samples,
+                     std::vector<float>* out, std::string* why) override {
+        if (!accepts(MediaKind::Audio)) { if (why) *why = "audio is not served"; return RAD_E_UNSUPPORTED; }
+        /* One sample past the bound is decoded, so a longer file is refused rather than cut. */
+        RAD_TRY(mm::decode_audio(bytes.data(), bytes.size(), p_->audio_config().rate,
+                                 max_samples + 1, out, why));
+        if ((int64_t)out->size() > max_samples) {
+            if (why) *why = "the recording is longer than this server transcribes";
+            return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
+    int prepare_audio(const std::vector<float>& samples, std::shared_ptr<mm::Item>* out,
+                      std::string* why) override {
+        if (!accepts(MediaKind::Audio)) { if (why) *why = "audio is not served"; return RAD_E_UNSUPPORTED; }
+        return p_->audio_from(samples, out, why);
     }
 
 private:

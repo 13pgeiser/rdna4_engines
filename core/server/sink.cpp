@@ -39,12 +39,11 @@ Sink::Sink(size_t capacity) {
 }
 
 Sink::~Sink() {
-    /* Only a sink the producer actually terminated can have a notify in flight; one that was
-     * never handed to the scheduler quiesces trivially. */
+    /* Only a sink the producer terminated can have a notify in flight. */
     if (finish_.load(std::memory_order_acquire) == (int)Finish::None) return;
     for (int spins = 0; !quiesced_.load(std::memory_order_acquire); ++spins) {
-        /* The window is a handful of instructions wide, so a short spin covers it; the sleep is
-         * there so a descheduled producer cannot burn a core. */
+        /* The window is a few instructions wide, so a short spin covers it; the sleep keeps a
+         * descheduled producer from burning a core. */
         if (spins > 256) std::this_thread::sleep_for(std::chrono::microseconds(20));
     }
 }
@@ -52,9 +51,8 @@ Sink::~Sink() {
 int64_t Sink::age_ns() const { return now_ns() - t_start_ns_; }
 
 void Sink::notify() {
-    /* Deliberately not holding m_. See the header: this can lose a wake-up, and the consumer's
-     * bounded wait is what pays for that. Taking the lock here would put the scheduler thread
-     * behind whatever an HTTP thread happens to be doing. */
+    /* Deliberately without m_ (see sink.h): a lost wake-up is covered by the consumer's bounded
+     * wait, and the scheduler thread never waits on an HTTP thread. */
     cv_.notify_one();
 }
 
@@ -68,7 +66,7 @@ bool Sink::push(int32_t token, const TokenLogprobs* lp) {
     const uint64_t h = head_.load(std::memory_order_relaxed);
     const uint64_t t = tail_.load(std::memory_order_acquire);
     if (h - t > mask_) {
-        /* The consumer is not draining. Failing loudly beats a stream with a hole in it. */
+        /* The consumer is not draining; fail rather than leave a hole in the stream. */
         overflow_.store(true, std::memory_order_release);
         fail(RAD_E_FULL);
         return false;
@@ -96,9 +94,8 @@ void Sink::finish(Finish f) {
     /* First terminal state wins: a cancel racing an EOS must not be reported twice. */
     if (finish_.compare_exchange_strong(expected, (int)f, std::memory_order_acq_rel)) {
         notify();
-        /* The last write the producer ever makes to this object, and the one the destructor
-         * waits on. It has to come after the notify, not before it: the point is to publish that
-         * the condition variable is no longer being touched. */
+        /* The producer's last write to this object, which the destructor waits on. It must
+         * follow the notify: it publishes that the condition variable is no longer in use. */
         quiesced_.store(true, std::memory_order_release);
     }
 }
@@ -126,7 +123,7 @@ void Sink::mark_admitted() {
         t_admit_.store(now_ns() - t_start_ns_, std::memory_order_release);
 }
 
-/* One producer, so a load and a store is the whole of the update. */
+/* One producer, so a load and a store suffice. */
 void Sink::add_drafts(int32_t n, int32_t accepted) {
     n_draft_.store(n_draft_.load(std::memory_order_relaxed) + n, std::memory_order_release);
     n_draft_acc_.store(n_draft_acc_.load(std::memory_order_relaxed) + accepted,

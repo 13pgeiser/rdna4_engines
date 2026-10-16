@@ -1,30 +1,25 @@
-// r4d_fwht.h - a wave-local fast Walsh-Hadamard transform, in registers, with no LDS and no barrier.
+// r4d_fwht.h - a wave-local fast Walsh-Hadamard transform in registers, with no LDS and no barrier.
 //
-// WHY IT IS IN REGISTERS.  Staging the row in LDS and running the butterfly there costs seven
-// stages, each a read-modify-write of every element plus a __syncthreads() -- roughly 28 LDS
-// operations and 7 barriers per element.  The transform's own ARITHMETIC is a fraction of a percent
-// of a rotated quantiser; the LDS traffic and the barriers around it are what a butterfly staged in
-// LDS actually costs, and they are several times the rest of the kernel.  None of that is the
-// transform, so none of it is paid here.
+// A butterfly staged in LDS costs seven stages, each a read-modify-write of every element plus a
+// __syncthreads() (about 28 LDS operations and 7 barriers per element), several times the rest of
+// a rotated quantiser; the transform's arithmetic is a fraction of a percent.
 //
-// THE MAPPING.  Give one wave a `HAD`-wide block, VPL = HAD/32 contiguous values per lane, so lane l
-// holds indices l*VPL .. l*VPL+VPL-1.  A butterfly at stride h pairs index i with i+h:
+// Mapping: one wave holds a `HAD`-wide block, VPL = HAD/32 contiguous values per lane, so lane l
+// holds indices l*VPL .. l*VPL+VPL-1. A butterfly at stride h pairs index i with i+h:
 //
-//   h < VPL    both indices are in the SAME lane      -- plain register arithmetic, no communication
-//   h >= VPL   the partner is lane l + h/VPL          -- one lane exchange with mask h/VPL
+//   h < VPL    both indices in the same lane     -- plain register arithmetic
+//   h >= VPL   the partner is lane l + h/VPL     -- one lane exchange with mask h/VPL
 //
-// Since HAD/VPL is always 32, the cross-lane masks are exactly 1, 2, 4, 8, 16 whatever HAD is: five
-// exchanges per register (r4d_xor_lane, DPP rather than LDS) and no barrier at any width.  The lane holding the LOW index of a pair keeps
-// (v + partner) and the high one keeps (partner - v), which is the same butterfly written twice.
-//
-// The caller still needs one barrier before a whole-row reduction, but ONE, not seven.
+// HAD/VPL is always 32, so the cross-lane masks are 1, 2, 4, 8, 16 at any HAD: five exchanges per
+// register (r4d_xor_lane, DPP) and no barrier. The lane holding the low index keeps (v + partner),
+// the high one (partner - v). The caller still needs one barrier before a whole-row reduction.
 #pragma once
 #include <hip/hip_runtime.h>
 #include "r4d_common.h"
 
-// `hi ? (o - v) : (v + o)` written as `o + (hi ? -v : v)`: the sign flip is one XOR against a mask
-// that is uniform over the stage, so the per-element select disappears.  Bit-identical -- IEEE
-// negation is exact and addition commutes.
+// `hi ? (o - v) : (v + o)` written as `o + (hi ? -v : v)`, with the sign flip one XOR against a
+// stage-uniform mask, so there is no per-element select. Bit-identical: negation is exact and
+// addition commutes.
 template <int VPL, int MASK>
 __device__ __forceinline__ void r4d_fwht_xstage(float* v, int lane) {
     const unsigned int sm = (lane & MASK) ? 0x80000000u : 0u;

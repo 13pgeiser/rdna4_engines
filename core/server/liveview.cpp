@@ -26,9 +26,8 @@ void snapshot_from(const SchedMetrics& m, LiveSnapshot* out) {
     out->draft_acceptance = m.draft_acceptance;
     out->total_requests = m.total_requests;
     out->preemptions = m.preemptions;
-    /* The step counter is the one field a stalled loop moves and everything else does not:
-     * throughput decays toward zero on its own, but a step count frozen between two draws says
-     * the loop itself stopped. It comes from the same metrics as the rest. */
+    /* Throughput decays toward zero on its own; a step count frozen between two draws is what
+     * shows the loop itself stopped. */
     out->step = m.steps;
 }
 
@@ -36,9 +35,8 @@ void snapshot_from(const SchedMetrics& m, LiveSnapshot* out) {
 
 namespace {
 
-/* Tier -> colour. The order matches rad::Tier: VRAM, HostPinned, HostPageable, SSD, Mapped. Green is
- * resident and fast, red is on a disk; the gradient is the point, so a glance at the plane says
- * how much of the model is where without reading a number. */
+/* Tier -> colour, in rad::Tier order: VRAM, HostPinned, HostPageable, SSD, Mapped. Green is
+ * resident, red is on disk, so the plane shows at a glance where the model lives. */
 const char* tier_colour(uint8_t t) {
     switch (t) {
         case 0: return "\033[32m";   /* VRAM */
@@ -48,6 +46,13 @@ const char* tier_colour(uint8_t t) {
         default: return "\033[31m";  /* SSD */
     }
 }
+/* Tier names, in rad::Tier order. */
+const char* const kTierNames[kLiveTiers] = {"vram", "pinned", "host", "ssd", "mapped"};
+
+/* How slow a tier is to read, in rad::Tier order, for a column's worst tier: SSD is the slowest,
+ * so it outranks the mapping though it comes first in the enum. */
+const uint8_t kTierRank[kLiveTiers] = {0, 1, 2, 4, 3};
+
 char tier_glyph(uint8_t t) {
     switch (t) {
         case 0: return '#';
@@ -81,8 +86,8 @@ std::string f2(double v) {
     return b;
 }
 
-/* Tokens a second, never scaled by a prefix: rates are read against each other digit by digit,
- * and 6.12k beside 5.98k hides the difference 6116 beside 5979 shows. */
+/* Tokens per second, never SI-scaled: rates are compared digit by digit, and 6.12k beside 5.98k
+ * hides what 6116 beside 5979 shows. */
 std::string tps(double v) {
     char b[32];
     snprintf(b, sizeof b, v >= 99.95 ? "%.0f" : "%.1f", v);
@@ -91,14 +96,13 @@ std::string tps(double v) {
 
 /* ---- the terminal form's figures.
  *
- * THE WEB PAGE'S RULES (dashboard.cpp), so the two views of one snapshot print one figure. Three
- * significant figures and at most two decimals, ROUNDED BEFORE THE UNIT IS CHOSEN -- choosing the
- * unit first prints 1023.7 MiB as "1024 MiB". Sizes in binary units, because the card and every
- * --*-mib flag count in them. Counters exact and grouped in threes by a narrow space past four
- * digits, as SI writes them. A share never rounds onto 0% or 100%.
+ * Same rules as the web page (dashboard.cpp), so both views print the same figure. Three
+ * significant figures and at most two decimals, rounded before the unit is chosen (otherwise
+ * 1023.7 MiB prints as "1024 MiB"). Sizes in binary units, as the card and every --*-mib flag
+ * count. Counters exact, grouped in threes by a narrow space past four digits, as SI writes them.
+ * A share never rounds onto 0% or 100%.
  *
- * The piped form above keeps its own formatting: it is parsed as well as read, and its keys and
- * value shapes are what a log consumer already matches. */
+ * The piped form keeps its own formatting, since log consumers parse its keys and value shapes. */
 
 /* The digits of 0 <= a < 999.5; the thresholds are where the rounded value gains a digit. */
 std::string sig3(double a) {
@@ -108,7 +112,7 @@ std::string sig3(double a) {
 }
 
 /* A value on a unit ladder: steps up while the value would round to four digits. `exact` prints
- * the first rung as a whole number -- "5.00 B" is a precision that does not exist. */
+ * the first rung as a whole number (no "5.00 B"). */
 std::string ladder(double v, double base, const char* const* units, int n_units, bool exact,
                    const char* sep) {
     if (!std::isfinite(v)) return "-";
@@ -141,8 +145,8 @@ std::string size_of(int64_t used, int64_t total) {
     return a + " / " + b;
 }
 
-/* A continuous quantity -- watts, degrees -- to three figures and an SI prefix. Not tokens a
- * second: tps() prints those whole. */
+/* A continuous quantity (watts, degrees) to three figures and an SI prefix. Not for tokens per
+ * second, which tps() prints whole. */
 std::string num_si(double v) { return ladder(v, 1000.0, kPfx, 6, false, ""); }
 
 /* A counter, exact, grouped in threes by U+202F past four digits. */
@@ -155,7 +159,8 @@ std::string grouped(int64_t n) {
     return n < 0 ? "-" + o : o;
 }
 
-/* A share of one to one decimal. Only exactly 0 reads 0 and only exactly 1 reads 100. */
+/* A fraction as a percentage to one decimal. Only exactly 0 reads 0 and only exactly 1 reads
+ * 100. */
 std::string share(double f) {
     if (!std::isfinite(f)) return "-";
     char b[32];
@@ -210,8 +215,8 @@ void LiveView::loop() {
 
 /* ------------------------------------------------------------------ the piped form
  *
- * One ordinary line per interval, key=value, no escape sequences, no cursor movement. This is
- * what a log file or a `| tee` gets, and it is greppable and diffable by construction.
+ * One line per interval, key=value, no escape sequences or cursor movement, so a log file or a
+ * `| tee` stays greppable and diffable.
  */
 std::string LiveView::render_line(const LiveSnapshot& s) const {
     std::string o = "live";
@@ -235,20 +240,17 @@ std::string LiveView::render_line(const LiveSnapshot& s) const {
     }
 
     if (s.experts.n_units > 0) {
-        /* THE SNAPSHOT'S OWN TALLY, not a second walk of the plane. Walking it would count CELLS,
-         * which is not the same as counting UNITS: the plane is a rectangle and a model need not
-         * fill it -- a draft head carrying fewer experts than the trunk leaves empty cells, and
-         * those cells would be charged to whatever tier their row was initialised at. The engine
-         * counts the units it actually placed (liveview.h) and both renderers read that. */
-        o += " experts vram=" + std::to_string(s.experts.units[0]);
-        o += " pinned=" + std::to_string(s.experts.units[1]);
-        o += " host=" + std::to_string(s.experts.units[2]);
-        o += " ssd=" + std::to_string(s.experts.units[3]);
+        /* The snapshot's own unit tally, not a walk of the plane. The plane is a rectangle a
+         * model need not fill (a draft head with fewer experts than the trunk leaves empty
+         * cells), so counting cells would charge empty ones to some tier. */
+        o += " experts";
+        for (int t = 0; t < kLiveTiers; ++t)
+            o += std::string(" ") + kTierNames[t] + "=" + std::to_string(s.experts.units[t]);
         o += " resident=" + f2(s.experts.n_units
                                    ? 100.0 * (double)s.experts.units[0] / (double)s.experts.n_units
                                    : 0.0) + "%";
-        /* THE HIT RATE, which residency does not imply: a plan holding most of the units still
-         * misses on most tokens if the hot ones are the ones outside. */
+        /* Hit rate, which residency does not imply: a plan holding most units still misses on
+         * most tokens if the hot ones are outside. */
         if (s.experts.routed > 0)
             o += " hit=" + f2(100.0 * (double)s.experts.routed_resident /
                               (double)s.experts.routed) + "%";
@@ -258,10 +260,8 @@ std::string LiveView::render_line(const LiveSnapshot& s) const {
             o += " readmit=" + std::to_string(s.experts.readmits);
         }
     }
-    /* THE LINK, and the THREE things sharing it: the collective, the mover, and the MoE GEMM
-     * reading an expert that was not resident. Cumulative, so a `| tee` of this line is a time
-     * series a reader can difference -- which is the only form that says which of them is
-     * filling the bus. */
+    /* Link traffic by consumer (collective, mover, MoE GEMM streaming), cumulative so a `| tee`
+     * of these lines can be differenced into rates. */
     if (s.link.present &&
         (s.link.ar_bytes || s.link.h2d_bytes || s.link.d2h_bytes || s.link.stream_bytes)) {
         o += " link ar=" + std::to_string(s.link.ar_bytes);
@@ -308,10 +308,8 @@ std::string LiveView::render_screen(const LiveSnapshot& s) const {
     o += "\n";
     o += "  kv      [" + bar(s.kv_util, std::max(10, W / 4), true) + "] " +
          share(s.kv_util) + "   prefix hit " + share(s.prefix_hit_rate);
-    /* THE NUMBER THAT PREDICTS THE CLIFF, beside the one that reports it afterwards. Past
-     * ~75% kv the cache starts dropping prefixes the next turn wants and an agent's turn goes
-     * from seconds to minutes; the hit rate only falls once that has already happened. Shown
-     * only when non-zero -- a cache that has never evicted has nothing to say. */
+    /* Evictions predict a prefix-cache collapse that the hit rate reports only afterwards: past
+     * ~75% kv the cache drops prefixes the next turn wants. Shown only when non-zero. */
     if (s.prefix_evictions) o += "   evicted " + grouped(s.prefix_evictions);
     o += "\n";
     o += "  prefill " + tps(s.prefill_tps) + " tok/s    decode " + tps(s.decode_tps) + " tok/s";
@@ -322,16 +320,14 @@ std::string LiveView::render_screen(const LiveSnapshot& s) const {
     if (s.experts.n_layers > 0 && s.experts.n_experts > 0) {
         o += "\n  experts by tier  " + grouped(s.experts.n_units) + " units  " +
              size_iec(s.experts.total_bytes) + "\n  ";
-        /* RESIDENCY, ABSOLUTE AND PROPORTIONAL, so it can be read off the legend rather than by
-         * counting glyphs in the plane. Units and their share, plus the bytes -- a tier's unit
-         * count and its byte share are not the same ratio, because the tiers hold different
-         * weight classes. */
+        /* Residency per tier in the legend: units, their share, and bytes. Unit share and byte
+         * share differ because the tiers hold different weight classes. */
         char tl[192];
-        for (int t = 0; t < 4; ++t) {
+        for (int t = 0; t < kLiveTiers; ++t) {
             if (!s.experts.units[t]) continue;
             snprintf(tl, sizeof tl, "%s%c %-6s\033[0m %s  %s  %s   ",
                      tier_colour((uint8_t)t), tier_glyph((uint8_t)t),
-                     t == 0 ? "vram" : t == 1 ? "pinned" : t == 2 ? "host" : "ssd",
+                     kTierNames[t],
                      grouped(s.experts.units[t]).c_str(),
                      share((double)s.experts.units[t] / (double)s.experts.n_units).c_str(),
                      size_iec(s.experts.bytes[t]).c_str());
@@ -339,10 +335,9 @@ std::string LiveView::render_screen(const LiveSnapshot& s) const {
         }
         o += "\n";
 
-        /* The plane is usually wider than the terminal (128 experts x 48 layers is normal), so it
-         * is downsampled by taking the worst tier in each column group. Worst, not average: the
-         * question the plane answers is "what is going to be slow", and one SSD expert in a group
-         * of four is what makes that group slow. */
+        /* The plane is usually wider than the terminal (128 experts x 48 layers is typical), so
+         * each column group shows its worst tier, not the average: one SSD expert makes the
+         * group slow. */
         const int avail = W - 8;
         const int stride = std::max(1, (s.experts.n_experts + avail - 1) / std::max(1, avail));
         for (int l = 0; l < s.experts.n_layers; ++l) {
@@ -353,7 +348,9 @@ std::string LiveView::render_screen(const LiveSnapshot& s) const {
                 uint8_t worst = 0;
                 for (int k = 0; k < stride && e + k < s.experts.n_experts; ++k) {
                     size_t idx = (size_t)l * s.experts.n_experts + e + k;
-                    if (idx < s.experts.tier.size()) worst = std::max(worst, s.experts.tier[idx]);
+                    if (idx >= s.experts.tier.size()) continue;
+                    const uint8_t t = s.experts.tier[idx];
+                    if (t < kLiveTiers && kTierRank[t] > kTierRank[worst]) worst = t;
                 }
                 o += tier_colour(worst);
                 o += tier_glyph(worst);

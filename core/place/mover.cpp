@@ -1,11 +1,8 @@
-/* mover.cpp -- the mover's mechanics. See mover.h for why any of it is shaped this way.
+/* mover.cpp -- the mover's mechanics; mover.h has the design.
  *
- * Everything here runs on the DISPATCH THREAD. The transfers are asynchronous -- their own
- * stream, gated behind an event recorded after the layer's launches -- but every table edit is
- * applied by this thread at a layer boundary, draining a queue of transfers that have landed. No
- * mutex on the read side, because that side is the critical path of every layer, and no
- * background thread mutating placement mid-layer, because placement would then depend on host
- * timing and stop being reproducible.
+ * Everything here runs on the dispatch thread. Transfers run asynchronously on the mover's
+ * stream, gated behind an event recorded after the layer's launches, but every table edit is
+ * applied by this thread at a layer boundary (see Mover::Move).
  */
 #include "mover.h"
 #include "../device/device.h"
@@ -21,10 +18,9 @@ namespace rad {
 
 /* ------------------------------------------------------------------ the file tier */
 int FileTier::open(const std::string& path) {
-    /* No RAD_DIO_ALLOW_BUFFERED. The weight tier is read on the dispatch path in whole movement
-     * units; a silent buffered fallback turns it into a page-cache pump that is several times
-     * slower, evicts the container's own mapped pages, and looks like nothing at all in a
-     * profile. An operator who pointed the tier at tmpfs wants to be told, not accommodated. */
+    /* No RAD_DIO_ALLOW_BUFFERED: a silent buffered fallback would make the tier a page-cache pump
+     * that is several times slower, evicts the container's own mapped pages and does not show in
+     * a profile. A tier pointed at tmpfs gets an error instead. */
     const int rc = f_.open(path.c_str(), RAD_DIO_READ);
     if (rc < 0)
         RAD_ERR("file tier: cannot open %s with O_DIRECT. The tier needs a filesystem that "
@@ -35,8 +31,8 @@ int FileTier::open(const std::string& path) {
 int FileTier::read(uint64_t offset, int64_t bytes, void* dst, int64_t dst_cap) {
     if (!f_.is_open()) return RAD_E_STATE;
     if (!dst || bytes <= 0) return RAD_E_INVAL;
-    /* The whole extent, rounded up: a movement unit's stride is already aligned, and reading the
-     * padding costs one block against a branch on the step path. */
+    /* The extent rounded up to the alignment: the unit stride already covers it, and reading
+     * one extra block is cheaper than a branch on the step path. */
     const int64_t want = direct_align(bytes);
     if (want > dst_cap) {
         RAD_ERR("file tier: a %s read needs a %s aligned buffer, the staging slot is %s",
@@ -44,37 +40,21 @@ int FileTier::read(uint64_t offset, int64_t bytes, void* dst, int64_t dst_cap) {
         return RAD_E_SCRATCH;
     }
     RAD_TRY(f_.read_at(dst, (int64_t)offset, want));
-    ++reads_;
-    bytes_ += (uint64_t)bytes;
     return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ residency */
-void Residency::init(const Program& prog, const Plan& plan) {
-    (void)plan;
+void Residency::init(const Program& prog) {
     slot_.assign(prog.weights.size(), WeightSlot{});
     noted_.assign(prog.weights.size(), 0);
     changed_.clear();
     ++epoch_;
 }
 
-/* The generation bump is the whole of the staleness protocol, and it is deliberately not a lock:
- * at this instant BOTH copies of the bytes are valid -- the mover wrote a shadow slot and has not
- * freed the old one -- so whichever side of this write a reader lands on names bytes that are
- * correct. The quarantine is what makes that sentence stay true.
- *
- * Both writers bump. `publish` settles a slot whose transfer has landed; `begin_transfer` opens
- * one, and it MUST bump too, because the run phase memoises its stream wait per generation and a
- * new event at an old generation is a wait that never happens (residency_iface.h). */
-void Residency::publish(rad_weight w, void* ptr) {
-    if ((size_t)w >= slot_.size()) return;
-    slot_[w].ptr = ptr;
-    slot_[w].ready = nullptr;
-    ++slot_[w].generation;
-    ++epoch_;
-    note(w);
-}
-
+/* The generation bump is the whole staleness protocol, with no lock: at this point both copies of
+ * the bytes are valid (the mover wrote a shadow slot and has not freed the old one), so a reader
+ * on either side of the write names correct bytes. The quarantine keeps that true. Why both
+ * writers bump: mover.h. */
 void Residency::begin_transfer(rad_weight w, void* ptr, RadEvent ready) {
     if ((size_t)w >= slot_.size()) return;
     slot_[w].ptr = ptr;
@@ -86,9 +66,8 @@ void Residency::begin_transfer(rad_weight w, void* ptr, RadEvent ready) {
 
 /* ------------------------------------------------------------------ the mover */
 Mover::~Mover() {
-    /* The stream first, drained. What it still holds are the gate waits and the move records
-     * that name the events below and the copies into and out of the memory below, so each of
-     * those goes only once nothing queued refers to it. */
+    /* Drain the stream first: its queued gate waits, event records and copies refer to the
+     * events and memory freed below. */
     if (mover_) {
         (void)flush_moves();
         rad_stream_sync(mover_);
@@ -98,7 +77,7 @@ Mover::~Mover() {
     for (RadEvent e : lead_) if (e) rad_event_destroy(e);
     for (RadEvent e : win_ev_) if (e) rad_event_destroy(e);
     if (gate_) rad_event_destroy(gate_);
-    /* Only what this object allocated itself. A Pool reservation belongs to the Pool. */
+    /* Only what this object allocated; a Pool reservation belongs to the Pool. */
     if (owns_memory_) {
         for (ClassPools& c : pools_) {
             if (c.slab_base) rad_dev_free(c.slab_base, RAD_MEM_DEVICE);
@@ -109,14 +88,14 @@ Mover::~Mover() {
         if (file_vram_) rad_dev_free(file_vram_, RAD_MEM_DEVICE);
         if (windows_) rad_dev_free(windows_, RAD_MEM_HOST_PINNED);
     }
-    /* The pageable region is always ours: Pools has no pageable pool, because pageable host
-     * memory is not a device-visible budget and nothing else contends for it. */
+    /* The pageable region is always ours: Pools has no pageable pool, since pageable memory is
+     * not a device-visible budget and nothing else contends for it. */
     if (pageable_) rad_dev_free(pageable_, RAD_MEM_HOST);
 }
 
-/* One place the mover asks for memory. Everything device-side and everything pinned comes out of
- * the resolved budgets (spec §6); the fallback exists so the placement test can run without
- * standing a whole Pools up, and it announces itself. */
+/* The one place the mover asks for memory. Device and pinned memory come out of the resolved
+ * budgets (spec §6); the direct allocation is for the placement test, which runs without a Pools
+ * (init() warns). */
 void* Mover::reserve(const char* what, int64_t bytes, int kind) {
     if (bytes <= 0) return nullptr;
     if (budget_) {
@@ -134,9 +113,7 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     budget_ = budget;
     stats_ = MoverStats{};
     if (!budget_)
-        RAD_WARN("mover: no Pools handed over; allocating its slab and host pool directly. That "
-                 "double-spends the weights pool against whatever else already reserved it, so "
-                 "it is a test path and not a deployment.");
+        RAD_WARN("mover: no Pools given; allocating the slab and host pool directly (test only)");
 
     unit_.assign(plan.units.size(), UnitState{});
     copying_.assign(plan.units.size(), 0);
@@ -158,8 +135,6 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         us.klass = mu.slab_class;
         us.bytes = mu.bytes;
         if (mu.slab_class < 0) continue;
-        const int64_t stride = plan.classes[(size_t)mu.slab_class].stride;
-
         if (mu.tier == Tier::VRAM && mu.slab_slot >= 0) {
             n_slab[(size_t)mu.slab_class] = std::max(n_slab[(size_t)mu.slab_class],
                                                      (int64_t)mu.slab_slot + 1);
@@ -173,41 +148,34 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
             us.static_off = align_up(pageable_need, RAD_ALIGN_UNIT);
             pageable_need = us.static_off + mu.bytes;
         }
-        (void)stride;
     }
 
     /* ---- allocate ------------------------------------------------------------------------- */
-    int64_t total_shadow = 0, total_turn = 0;
+    int64_t total_shadow = 0, total_turn = 0, total_slab = 0, total_pool = 0;
     for (size_t c = 0; c < plan.classes.size(); ++c) {
         const SlabClass& sc = plan.classes[c];
         ClassPools& cp = pools_[c];
         cp.stride = sc.stride;
 
-        /* Shadow slots sit PAST the resident ones, so a slot index is a slot index and the
-         * resident count is untouched by turning the engine on. Under a static plan the plan
-         * asked for none and the slab is exactly the resident set. */
-        /* THE PLAN'S NUMBER, not a config cap. The planner reserved these out of
-         * the weights pool and the report told the operator how many; allocating a different
-         * count here would mean the mover works against one number while the operator was charged
-         * for another, and the direction that is wrong in is an overrun. */
+        /* Shadow slots follow the resident ones, so resident indices do not depend on the engine;
+         * a static plan has none. Use the plan's count, which the planner budgeted. */
         const int64_t shadow = plan.dynamic ? sc.n_shadow : 0;
-        /* Shadow slots and staging slots are both "slab slots that belong to no unit", and the
-         * mover takes them off one free list because at the point of use they are the same thing:
-         * somewhere to copy into that nothing is reading. They are budgeted separately by the
-         * planner because they are the price of two different features. */
+        /* Shadow and staging slots share one free list: both are somewhere to copy into that
+         * nothing reads. */
         const int64_t slab_slots = n_slab[c] + shadow + sc.n_stage;
-        /* The flex slots are not here: their memory is the KV cache's and is not carved yet.
-         * lend_from() adds them once it is. */
+        /* Flex slots are added later by lend_from(), once the lender's memory is carved. */
         cp.n_fixed = slab_slots;
         cp.n_work = shadow + sc.n_stage;
         cp.n_turn = std::min<int64_t>(std::max(cfg.turnover_slots, 0),
                                       shadow * RAD_PLACE_TURNOVER_SLOTS / RAD_PLACE_SHADOW_SLOTS);
         total_turn += cp.n_turn;
         cp.slab.init(slab_slots, sc.stride);
+        total_slab += slab_slots;
+        total_pool += n_pool[c];
         if (slab_slots > 0) {
-            /* Tail padding: a kernel that assembles a packed code window from a wide read
-             * legitimately reads a few bytes past the last slot's data. Inside the slab that
-             * lands in a neighbour; at the end it runs off the allocation and faults the card. */
+            /* Tail padding: a kernel assembling a packed code window from a wide read may read a
+             * few bytes past the last slot; without padding that runs off the allocation and
+             * faults the card. */
             cp.slab_base = reserve(sc.name.c_str(), slab_slots * sc.stride + RAD_ALIGN_UNIT,
                                    RAD_MEM_DEVICE);
             if (!cp.slab_base) {
@@ -227,49 +195,33 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
                         sc.name.c_str(), (long long)n_pool[c], humanb(sc.stride).c_str());
                 return RAD_E_NOMEM;
             }
-            /* The pool's base as the CARD sees it. On a unified backend this is the host address
-             * itself, but going through the device layer is what makes that a checked fact
-             * rather than an assumption -- and without it a zero-copy expert is a bounce-buffer
-             * memcpy and there is no hybrid tier at all. */
+            /* The pool's base as the card addresses it (equal to the host address on a unified
+             * backend). Without one there is no zero-copy tier. */
             cp.pool_dev = rad_dev_device_ptr(cp.pool_base);
-            /* AND A FAILURE HERE IS NAMED RATHER THAN PAPERED OVER. Falling back silently to the
-             * host pointer hands a kernel an address it cannot dereference -- so a zero-copy
-             * expert would fault, or read whatever the backend happens to map there.
-             *
-             * It is not refused HERE because this is not where the consequence lands: a unit with
-             * no pool address gets a null base from unit_base(), republish() publishes the null,
-             * and the load phase already refuses by name on the first weight that needs one. That
-             * is the right place -- a pool nothing zero-copies out of is not an error. This line
-             * is what turns that refusal from "no address after mover init" into a cause. */
+            /* Warned, not refused: a pool nothing zero-copies out of is not an error. The host
+             * pointer is valid on the device only where the two coincide. A deployment's pool is
+             * RAD_MEM_HOST_MAPPED (core/mem/pools.cpp), so this fires only on the test path. */
             if (!cp.pool_dev) {
-                RAD_WARN("mover: the '%s' host pool did not resolve to a device address; the "
-                         "zero-copy tier cannot be served out of it. In a deployment the pool is "
-                         "RAD_MEM_HOST_MAPPED (core/mem/pools.cpp) and this does not fire; where "
-                         "it does, the pool is ordinary host memory and a kernel handed this "
-                         "address would fault.", sc.name.c_str());
+                RAD_WARN("mover: the '%s' host pool has no device address; a kernel reading it "
+                         "zero-copy would fault", sc.name.c_str());
                 cp.pool_dev = cp.pool_base;
             }
         }
-        /* The pool free list starts EMPTY: every pooled unit occupies its slot. The engine primes
-         * off the shadow slab slots, runs ahead by at most that many, and settles into
-         * alternating pairs -- a promotion frees a pool slot, which is what a demotion needs. */
-
-        /* AND NOTHING HERE IS MEMSET. A fresh pool holds garbage until the load phase writes it,
-         * which is correct -- a weight is read only after it is loaded -- and zeroing it would be
-         * a full pass over the host tier for no information. It is also the one asymmetry between
-         * the two device backends: rad_memset_async on RAD_MEM_HOST refuses on a real card
-         * (pageable memory the GPU has never been shown) and quietly succeeds on the host backend,
-         * so a memset added here passes in tests and fails on a card. If a host buffer ever
-         * genuinely needs clearing, clear it with std::memset on the host. */
+        /* The pool free list starts empty: every pooled unit occupies its slot. The engine primes
+         * off the shadow slots and then alternates, a promotion freeing the pool slot a demotion
+         * needs.
+         *
+         * Nothing is memset; the load phase writes every weight. rad_memset_async on
+         * RAD_MEM_HOST fails on a real card but succeeds on the host backend, so use std::memset
+         * if a host buffer ever needs clearing. */
     }
 
     if (static_need > 0) {
         static_vram_ = reserve("static weights", static_need, RAD_MEM_DEVICE);
         if (!static_vram_) {
-            /* THE ARITHMETIC, not just the refusal: the slab is reserved first and takes its
-             * shadow and staging slots with it, so "no VRAM" here means the budget covered the
-             * resident set and not the fixed weights beside it. An operator cannot act on the
-             * sentence without the two numbers. */
+            /* Log the budget arithmetic too: the slab, with its shadow and staging slots, was
+             * reserved first, so this failure means the budget covered the resident set but not
+             * the static weights beside it. */
             if (budget_)
                 RAD_ERR("mover: the weight budget is %s and the slab already took %s of it, "
                         "leaving %s",
@@ -284,7 +236,11 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     }
     if (pageable_need > 0) {
         pageable_ = rad_dev_alloc(pageable_need, RAD_MEM_HOST);
-        if (!pageable_) return RAD_E_NOMEM;
+        if (!pageable_) {
+            RAD_ERR("mover: no pageable host memory for %s of weights",
+                    humanb(pageable_need).c_str());
+            return RAD_E_NOMEM;
+        }
         pageable_bytes_ = pageable_need;
     }
 
@@ -293,20 +249,15 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     for (const MoveUnit& mu : plan.units) if (mu.tier == Tier::SSD) want_file = true;
     if (want_file) {
         if (cfg_.container_path.empty()) {
-            RAD_ERR("mover: the plan put weights on the file tier but no container path was "
-                    "given; a file-tier unit with nowhere to read from is an error, not a slow "
-                    "path");
+            RAD_ERR("mover: the plan puts weights on the file tier but no container path was "
+                    "given");
             return RAD_E_INVAL;
         }
         RAD_TRY(file_.open(cfg_.container_path));
-        /* THE WIDEST UNIT THAT IS ACTUALLY ON THE FILE TIER, not the widest class in the plan.
-         *
-         * A staging slot only ever receives a unit read from the container, so sizing it off every
-         * class charges the host pool for classes that are never staged. The widest class is
-         * typically the embedding table -- its own class, gigabytes wide, and never on the file
-         * tier: in VRAM, or in the pinned host pool by --embedding-placement -- so sizing on it
-         * reserves several times that in pinned memory to receive a weight that never arrives, and
-         * the file tier is then refused for want of memory it did not need. */
+        /* Staging slots are sized by the widest unit actually on the file tier, not the widest
+         * class. The widest class is usually the embedding table (gigabytes, and never on the
+         * file tier), and sizing on it would reserve pinned memory for a weight that never
+         * arrives, possibly failing the file tier for lack of memory. */
         int64_t widest = 0;
         for (const MoveUnit& mu : plan.units) {
             if (mu.tier != Tier::SSD || mu.slab_class < 0) continue;
@@ -325,9 +276,9 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
 
     /* ---- the file stager's buffers ---------------------------------------------------------
      *
-     * Exactly what the plan charged: the two VRAM buffers out of the weight budget and the read
-     * windows out of the host pool's file-staging reserve. Allocated only when a routed unit is
-     * actually on the file tier, which is when the plan sized them. */
+     * Exactly what the plan charged: two VRAM buffers from the weight budget and the read windows
+     * from the host pool's file-staging reserve. The plan sizes them only when a routed unit is
+     * on the file tier. */
     if (plan.file_stage_vram > 0) {
         if (!file_.ok()) {
             RAD_ERR("mover: the plan reads routed experts from the container and the file tier "
@@ -343,7 +294,11 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         /* Two halves of what was charged, each at least the largest layer and aligned, so the
          * tail pad the plan added stays past the second buffer's end. */
         file_buf_bytes_ = (plan.file_stage_vram - RAD_ALIGN_UNIT) / 2 / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
-        if (file_buf_bytes_ < plan.file_layer_max) return RAD_E_STATE;
+        if (file_buf_bytes_ < plan.file_layer_max) {
+            RAD_ERR("mover: the plan charged %s for two file-tier layer buffers of %s",
+                    humanb(plan.file_stage_vram).c_str(), humanb(plan.file_layer_max).c_str());
+            return RAD_E_STATE;
+        }
         if (plan.file_windows < (int64_t)RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES) {
             RAD_ERR("mover: the plan reads routed experts from the container but reserved no read "
                     "windows for them");
@@ -362,10 +317,9 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
 
     /* ---- streams, events, move records ------------------------------------------------------ */
     RAD_TRY(rad_stream_create(&mover_, /*high_priority=*/0));
-    /* EVERY EVENT HERE IS LOCAL. They order the mover's queue against this card's compute queue
-     * and tell the host WHEN a slot is free; the bytes they order are read by this card's kernels
-     * and never by the host through them. A copy out to host memory carries the system scope on
-     * its own packets. */
+    /* Every event here is local: they order the mover's queue against this card's compute queue
+     * and tell the host when a slot is free, and the host never reads the ordered bytes through
+     * them. A copy out to host memory carries system scope on its own packets. */
     RAD_TRY(rad_event_create_local(&gate_));
     /* A window's event is waited on by the HOST, before the window is read into again. */
     win_ev_.assign((size_t)n_windows_, nullptr);
@@ -376,18 +330,15 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     lead_.assign((size_t)lead + 1, nullptr);
     for (RadEvent& e : lead_) RAD_TRY(rad_event_create_as(&e, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
 
-    /* TWO records per free slot, shadow or turnover, not one. A promotion holds a slab slot for
-     * its whole life, so there can never be more promotions in flight than there are free slots --
-     * but a swap is two transfers, and the matching demotion needs a record of its own or the pair
-     * can never be in flight together and the engine never issues a demotion at all. That failure
-     * is silent: it shows up as `no_record` where the real symptom is a resident set that only ever
-     * grows. The floor is what makes a one-shadow plan still able to hold a swap. */
+    /* Two records per free slot (shadow or turnover): a swap is two transfers, and with one
+     * record per slot the demotion could never be in flight beside its promotion, so the resident
+     * set would only grow. The floor lets a one-shadow plan still hold a swap. */
     const int64_t n_records = std::max<int64_t>(2 * (total_shadow + total_turn), 4);
     moves_.assign((size_t)n_records, Move{});
     for (Move& m : moves_) RAD_TRY(rad_event_create_local(&m.ev));
 
     /* ---- publish the initial addresses ------------------------------------------------------ */
-    res_.init(prog, plan);
+    res_.init(prog);
     for (int32_t u = 0; u < (int32_t)plan.units.size(); ++u) {
         unit_[(size_t)u].slab_slot = plan.units[(size_t)u].slab_slot;
         republish(u);
@@ -395,13 +346,10 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
 
     RAD_INFO("mover: %lld slab slots (%lld shadow, %lld more kept free out of a loan), %lld pinned "
              "pool slots, %s static vram%s",
-             (long long)[&] { int64_t n = 0; for (auto& c : pools_) n += c.slab.size(); return n; }(),
-             (long long)total_shadow, (long long)total_turn,
-             (long long)[&] { int64_t n = 0; for (auto& c : pools_) n += c.pool.size(); return n; }(),
+             (long long)total_slab, (long long)total_shadow, (long long)total_turn,
+             (long long)total_pool,
              humanb(static_bytes_).c_str(), file_.ok() ? ", file tier open" : "");
-    /* The pageable host region is allocated here and charged to no budget -- Pools has no
-     * pageable pool because the memory is not device-visible and nothing else contends for it.
-     * That makes the receipt the only place it is ever named. */
+    /* The pageable region is charged to no budget, so this is the only place it is reported. */
     if (pageable_bytes_ > 0)
         RAD_INFO("mover: %s of pageable host memory for the units no tier could hold",
                  humanb(pageable_bytes_).c_str());
@@ -427,8 +375,8 @@ void* Mover::unit_base(int32_t unit) const {
         return (char*)cp.pool_dev + us.pool_slot * cp.stride;
     if (us.tier == Tier::HostPageable && us.static_off >= 0 && pageable_)
         return (char*)pageable_ + us.static_off;
-    /* A file-tier unit that is not staged has NO address, and saying so is the point: a kernel
-     * cannot read one off disk, so a caller that meets a null here must stage it or refuse. */
+    /* An unstaged file-tier unit has no address; a kernel cannot read from disk, so a caller
+     * that gets null must stage the unit or refuse. */
     return nullptr;
 }
 
@@ -439,15 +387,18 @@ void Mover::republish(int32_t unit) {
         res_.publish(mu.weights[i], base ? base + mu.offset[i] : nullptr);
 }
 
-/* Is a COPY INTO this unit's slot still in flight? The release path needs it: a slot whose
- * staging copy has not landed cannot be given back, because the quarantine barrier is recorded on
- * the COMPUTE stream and would say nothing about an H2D still in flight on the mover's.
- *
- * Copying and only Copying. "Any record that is not Free" is the same question asked too widely:
- * a record past Copying has its bytes in place, and treating it as in-flight holds the slot for
- * as long as the record takes to recycle rather than as long as the copy takes to land. */
+/* Whether a copy into this unit's slot is still in flight. A slot whose staging copy has not
+ * landed cannot be released: the quarantine barrier is on the compute stream and says nothing
+ * about an H2D copy on the mover's. Only Copying counts; a record past it has its bytes in place,
+ * and counting it would hold the slot until the record recycles. */
 bool Mover::unit_in_flight(int32_t unit) const {
     return unit >= 0 && (size_t)unit < copying_.size() && copying_[(size_t)unit] > 0;
+}
+
+bool Mover::stageable(int32_t unit) const {
+    const UnitState& us = unit_[(size_t)unit];
+    return us.tier == Tier::HostPinned && us.pool_slot >= 0 && us.slab_slot < 0 && us.klass >= 0 &&
+           !unit_in_flight(unit);
 }
 
 int Mover::free_move_record() const {
@@ -459,10 +410,9 @@ int Mover::free_move_record() const {
     return -1;
 }
 
-/* The ordering event, recorded ONCE PER DISPATCH and only when a move is actually going out.
- * Everything the mover issues this dispatch waits on it, and it is downstream of every launch
- * made up to now. Once per dispatch rather than once per move: re-recording per move is a dozen
- * event records a layer restating one ordering constraint. */
+/* The ordering event, recorded on the compute stream once per dispatch and only when a move goes
+ * out. Everything the mover issues this dispatch waits on it, and it is downstream of every
+ * launch so far; re-recording it per move would restate the same ordering. */
 int Mover::record_gate() {
     if (!compute_) {
         RAD_ERR("mover: no compute stream bound; a transfer cannot be ordered against the "
@@ -480,12 +430,9 @@ int Mover::begin_dispatch(int dispatch, HeatEngine* heat) {
     ++stats_.dispatches;
     RAD_TRY(retire(heat));
 
-    /* THE LEAD GATE. This is a host wait and it is NOT a transfer synchronisation: no transfer
-     * waits on the host and no host thread waits on a transfer. What it bounds is how far ahead
-     * of the cards this thread may queue work, and it exists because a freed slot returns to the
-     * free list only when its quarantine event signals -- and that event is on the compute
-     * stream. Let the host run and the stream carries a whole step, the recycle latency becomes
-     * that depth, and the mover finds no free slot to move into on almost every round. */
+    /* The lead gate: a host wait bounding how far ahead of the cards this thread queues work,
+     * so quarantine events on the compute stream signal soon enough to recycle slots
+     * (MoverConfig::max_lead_dispatches). It never waits on a transfer. */
     if (compute_ && cfg_.max_lead_dispatches > 0) {
         RadEvent old = lead_[(size_t)lead_next_];
         if (stats_.dispatches > (uint64_t)lead_.size()) RAD_TRY(rad_event_sync(old));
@@ -495,26 +442,24 @@ int Mover::begin_dispatch(int dispatch, HeatEngine* heat) {
     return RAD_OK;
 }
 
-/* ---- the exact prefetch, which is the whole of layer offload's policy -------------------------
+/* ---- the exact prefetch: layer offload's whole policy -----------------------------------------
  *
- * Declare enumerated every op with its weight operands in order, so the deadline for each staged
- * unit is a fact and not a guess. WHEN to start is the supply question -- start as early as a
- * slot is free, and stop at the first unit that cannot get one rather than skipping ahead,
- * because the schedule is in deadline order and serving a later unit before an earlier one is how
- * a prefetch turns into a cache.
+ * Declare recorded every op with its weight operands in order, so each staged unit's deadline is
+ * known. Transfers start as soon as a slot is free and stop at the first unit that cannot get
+ * one rather than skipping ahead: the schedule is in deadline order, and serving a later unit
+ * first would turn the prefetch into a cache.
  */
 int Mover::prefetch_to_op(int32_t op_index) {
     if (!plan_) return RAD_E_STATE;
 
-    /* A backwards op index is the next step starting. The schedule is per step, so the cursor
-     * rewinds; nothing else has to know a step boundary happened. */
+    /* A backwards op index means the next step started; the schedule is per step, so the cursor
+     * rewinds. */
     if (op_index < last_op_) prefetch_cursor_ = 0;
     last_op_ = op_index;
 
-    /* RELEASE FIRST, so the slots this op finished with are available to the units it is about to
-     * need. A staged unit's slot goes back once its last_use_op is behind us: the declared order
-     * is what makes that safe, because a weight read outside [first_use_op, last_use_op] would
-     * contradict the order declare recorded. */
+    /* Release first, so slots this op finished with are free for the units it needs next. A
+     * staged unit's slot goes back once its last_use_op has passed; the declared order rules out
+     * a read outside [first_use_op, last_use_op]. */
     for (int32_t u = 0; u < (int32_t)unit_.size(); ++u) {
         const UnitState& us = unit_[(size_t)u];
         if (us.site != Site::DeviceStaged || us.slab_slot < 0) continue;
@@ -556,16 +501,16 @@ int Mover::start_stage(int32_t unit, int64_t slab_slot) {
     else if (us.tier == Tier::HostPageable && us.static_off >= 0)
         src = (char*)pageable_ + us.static_off;
     else if (us.tier == Tier::SSD) {
-        /* The file tier's cliff, and it is a BLOCKING host read in the middle of a dispatch. It
-         * is counted so a run that leans on it is visible as a run to re-budget, not as a mystery
-         * in the throughput. */
+        /* A blocking host read inside the dispatch, counted in ssd_reads. */
         if (!file_.ok() || !stage_) return RAD_E_STATE;
+        /* The ring has wrapped: the copies out of its slots may still be queued on the mover's
+         * stream, and the pread below would overwrite a source they have not read yet. */
+        if (stage_next_ == 0 && stats_.ssd_reads > 0) RAD_TRY(rad_stream_sync(mover_));
         char* stage = (char*)stage_ + (int64_t)stage_next_ * stage_stride_;
         stage_next_ = (stage_next_ + 1) % std::max(1, cfg_.stage_slots);
-        /* WEIGHT BY WEIGHT, each from its own plane into its own place in the unit. A container
-         * entry is a logical weight's planes at 256-byte alignment and a unit lays its weights out
-         * at their declared alignment, so the two arrangements are not the same bytes and one
-         * read of the unit's span would put every weight after the first at the wrong offset. */
+        /* Weight by weight, each to its own offset in the unit. A container entry holds a
+         * weight's planes at 256-byte alignment while a unit lays weights out at their declared
+         * alignment, so one read of the unit's span would misplace every weight after the first. */
         const MoveUnit& mu = plan_->units[(size_t)unit];
         for (size_t k = 0; k < mu.weights.size(); ++k) {
             const WeightInfo& w = prog_->weights[mu.weights[k]];
@@ -593,14 +538,11 @@ int Mover::start_stage(int32_t unit, int64_t slab_slot) {
     stats_.prefetch_bytes += (uint64_t)us.bytes;
     ++stats_.prefetched;
 
-    /* PUBLISH THE DESTINATION NOW, not at retire, and with the event. A staging copy is the one
-     * move whose destination the run phase will read: the old address (the pinned pool) stays
-     * valid for everything already issued, and everything issued from here on names the slab slot
-     * and is ordered behind `ev` on the compute stream. That stream wait is the only thing
-     * standing between a staged weight and a race, and it costs no host time.
-     *
-     * begin_transfer bumps the generation, which is what makes the run phase actually perform
-     * that wait rather than skipping it as already done. */
+    /* Publish the destination now, with the event, not at retire. Staging is the one move whose
+     * destination the run phase reads: work already issued uses the old address (the pinned
+     * pool), and work issued from here on names the slab slot and waits on `ev` on the compute
+     * stream. That wait is the only guard against a race; begin_transfer bumps the generation so
+     * the run phase performs it. */
     us.slab_slot = slab_slot;
     char* base = (char*)unit_base(unit);
     const MoveUnit& mu = plan_->units[(size_t)unit];
@@ -625,23 +567,20 @@ int Mover::stage_units(const std::vector<int32_t>& units, const StageSpan* spans
     stage_picks_.clear();
     for (int32_t u : units) {
         if (u < 0 || (size_t)u >= unit_.size()) return RAD_E_INVAL;
+        if (!stageable(u)) continue;
         const UnitState& us = unit_[(size_t)u];
-        if (us.tier != Tier::HostPinned || us.pool_slot < 0 || us.slab_slot >= 0 || us.klass < 0)
-            continue;
-        if (unit_in_flight(u)) continue;
         const ClassPools& cp = pools_[(size_t)us.klass];
         const char* src = (const char*)cp.pool_base + us.pool_slot * cp.stride;
         stage_picks_.push_back(StagePick{src, u, us.bytes, align_up(us.bytes, RAD_ALIGN_UNIT),
                                          nullptr});
     }
     if (stage_picks_.empty()) return RAD_OK;
-    /* THE SPANS ARE FILLED IN POOL ORDER, so units on neighbouring pool slots land side by side
-     * and go as one copy. A layer's pooled experts were given their slots together and mostly
-     * still hold them, so a layer's ~90 units go as fewer copies -- each one a launch or a DMA
-     * packet whatever its size. A class's stride is its units' aligned size, so a run's source and
-     * destination advance alike, padding included. A unit the span in hand has no room left for
-     * goes to the start of the next; one that no span has room for is read across the link in
-     * place. */
+    /* Spans are filled in pool order, so units on neighbouring pool slots land side by side and
+     * go as one copy. A layer's pooled experts were assigned slots together and mostly keep them,
+     * so its ~90 units take far fewer copies, each a launch or DMA packet whatever its size. A
+     * class's stride is its units' aligned size, so a run's source and destination advance alike.
+     * A unit that does not fit the current span starts the next; one that fits no span is read
+     * across the link in place. */
     std::sort(stage_picks_.begin(), stage_picks_.end(),
               [](const StagePick& a, const StagePick& b) { return a.src < b.src; });
     int k = 0;
@@ -693,12 +632,8 @@ void Mover::unstage_units(const std::vector<int32_t>& staged) {
 int64_t Mover::stage_need(const std::vector<int32_t>& units, int64_t* largest) const {
     int64_t total = 0, most = 0;
     for (int32_t u : units) {
-        if (u < 0 || (size_t)u >= unit_.size()) continue;
-        const UnitState& us = unit_[(size_t)u];
-        if (us.tier != Tier::HostPinned || us.pool_slot < 0 || us.slab_slot >= 0 || us.klass < 0)
-            continue;
-        if (unit_in_flight(u)) continue;
-        const int64_t need = align_up(us.bytes, RAD_ALIGN_UNIT);
+        if (u < 0 || (size_t)u >= unit_.size() || !stageable(u)) continue;
+        const int64_t need = align_up(unit_[(size_t)u].bytes, RAD_ALIGN_UNIT);
         total += need;
         most = std::max(most, need);
     }
@@ -715,12 +650,11 @@ struct FileExt {
     char*   dst = nullptr;
 };
 
-/* THE GAP A RUN READS THROUGH rather than starting another pread. The weights of one routed
- * layer sit together in the container, each starting on RAD_ALIGN_UNIT, so between two that are
- * both on the file tier there is either alignment padding or a run of units that are not -- a
- * resident expert or a pooled one. Reading padding is free next to a second pread; reading a
- * resident expert is a megabyte or ten the drive delivers for nothing. 256 KiB is above every
- * padding and below every expert this engine serves. */
+/* The largest gap a run reads through instead of starting another pread. A routed layer's
+ * weights sit together in the container, each on RAD_ALIGN_UNIT, so a gap between two file-tier
+ * weights is either alignment padding (cheaper to read than a second pread) or units on another
+ * tier (megabytes read for nothing). 256 KiB is above every padding and below every expert this
+ * engine serves. */
 constexpr int64_t kReadThrough = (int64_t)256 << 10;
 
 }  /* namespace */
@@ -756,7 +690,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
         off += need;
     }
     if (staged->empty()) return RAD_OK;
-    /* CONTAINER ORDER, so a window is one long run of the drive and not a seek per weight. */
+    /* Container order, so a window is one long run of the drive rather than a seek per weight. */
     std::stable_sort(ext.begin(), ext.end(),
                      [](const FileExt& a, const FileExt& b) { return a.foff < b.foff; });
 
@@ -862,7 +796,7 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
         if (us.klass < 0) return false;
         ClassPools& cp = pools_[(size_t)us.klass];
 
-        /* A UNIT THAT KEPT ITS HOST COPY IS DROPPED, NOT DEMOTED: its pool slot still holds its
+        /* A unit that kept its host copy is dropped, not demoted: its pool slot still holds its
          * bytes, so there is nothing to copy and no second pool slot to take. */
         if (!promote && us.pool_slot >= 0 && us.slab_slot >= 0) return drop(unit, heat) >= 0;
 
@@ -873,32 +807,26 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
             return true;
         }
 
+        /* Every refusal comes before pool_slot_for, which may take a donor's host copy
+         * (donor_slot) that a failed demotion could not give back. */
+        if (us.slab_slot < 0) return false;
         const int rec = free_move_record();
         if (rec < 0) { ++stats_.no_record; return false; }
         if (record_gate() < 0) return false;
+        const int64_t g = pool_slot_for(unit, heat);
+        if (g < 0) { ++stats_.starved_pool; return false; }
+        /* D2H out of the slab; the slab layout is the pool layout, so a straight copy. It is not
+         * free even though zero-copy reads use the other direction: both directions share one
+         * budget and a demotion costs about what a promotion does, the exchange rate heat.h's
+         * min_gain is tuned against. */
+        if (rad_event_wait(mover_, gate_) < 0) { cp.pool.add_free(g); return false; }
+        queue_move_copy((char*)cp.pool_base + g * cp.stride, cp.slot_ptr(us.slab_slot), us.bytes,
+                        rec);
         Move& m = moves_[(size_t)rec];
-        {
-            const int64_t g = pool_slot_for(unit, heat);
-            if (g < 0) { ++stats_.starved_pool; return false; }
-            char* dst = (char*)cp.pool_base + g * cp.stride;
-            if (us.slab_slot < 0) { cp.pool.add_free(g); return false; }
-            const void* src = cp.slot_ptr(us.slab_slot);
-            /* D2H out of the slab. The slab layout IS the pool layout, so this is a straight copy
-             * with no transform -- and IT IS NOT FREE. It is tempting to read a demotion as
-             * running in the direction the zero-copy tier leaves idle and therefore as nearly
-             * free; it is not. The two costs are additive: the directions share one budget and a
-             * demotion costs about what a promotion does. That is the exchange rate heat.h's
-             * min_gain is tuned against. */
-            if (rad_event_wait(mover_, gate_) < 0) { cp.pool.add_free(g); return false; }
-            if (queue_move_copy(dst, src, us.bytes, (int)(&m - moves_.data())) < 0) {
-                cp.pool.add_free(g);
-                return false;
-            }
-            m.kind = Move::Kind::Demote;
-            m.slab_slot = us.slab_slot;
-            m.pool_slot = g;
-            stats_.d2h_bytes += (uint64_t)us.bytes;
-        }
+        m.kind = Move::Kind::Demote;
+        m.slab_slot = us.slab_slot;
+        m.pool_slot = g;
+        stats_.d2h_bytes += (uint64_t)us.bytes;
         m.state = Move::State::Copying;
         m.unit = unit;
         ++copying_[(size_t)unit];
@@ -907,10 +835,9 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
 
     const bool up = one(s.promote, true);
     const bool down = one(s.demote, false);
-    /* A half-issued swap is legal and self-correcting: the two halves create each other's supply,
-     * so the missing one goes out on a later dispatch. What is NOT legal is leaving a unit busy
-     * that no move will ever publish -- the heat engine would never consider it again and would
-     * go quiet with no counter saying why. */
+    /* A half-issued swap is legal: the halves supply each other, so the missing one goes out on
+     * a later dispatch. A unit no move will publish must not stay busy, or the heat engine would
+     * never consider it again, with no counter showing why. */
     if (heat) {
         if (!up) heat->set_busy(s.promote, false);
         if (!down) heat->set_busy(s.demote, false);
@@ -919,6 +846,10 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
 }
 
 /* ------------------------------------------------------------------ the loan */
+static const char* lender_name(int lender) {
+    return lender == Mover::kLendKV ? "KV cache" : "activation arena";
+}
+
 static char* align_down_ptr(char* p) {
     const uintptr_t v = (uintptr_t)p;
     return (char*)(v - v % (uintptr_t)RAD_ALIGN_UNIT);
@@ -934,9 +865,8 @@ int Mover::lend_from(int lender, const std::vector<LoanStrip>& strips) {
                 return RAD_E_STATE;
             }
 
-    /* WHO GETS THE SLOTS. A class with units in the pinned pool that could be promoted, in
-     * proportion to their bytes -- and never more slots than it has such units, because a slot no
-     * unit can ever fill is VRAM lent to nothing. */
+    /* Slots go to classes with promotable units in the pinned pool, in proportion to their
+     * bytes, and never more slots than such units, since a slot no unit can fill is wasted. */
     const size_t nc = pools_.size();
     std::vector<int64_t> want(nc, 0), got(nc, 0);
     for (size_t u = 0; u < unit_.size(); ++u) {
@@ -949,9 +879,8 @@ int Mover::lend_from(int lender, const std::vector<LoanStrip>& strips) {
     for (size_t c = 0; c < nc; ++c)
         weight[c] = pools_[c].stride > 0 ? (double)want[c] * (double)pools_[c].stride : 0.0;
 
-    /* EVERY STRETCH, TOP DOWN. The classes take turns in proportion to their weight, so each
-     * stretch holds each class's share and the share does not depend on the order the stretches
-     * arrive in. */
+    /* Every stretch, top down. Classes take turns in proportion to their weight, so each stretch
+     * holds each class's share regardless of the order the stretches arrive in. */
     struct Cut { int64_t need; char* p; };
     std::vector<std::vector<Cut>> cuts(nc);
     for (const LoanStrip& st : strips) {
@@ -959,10 +888,9 @@ int Mover::lend_from(int lender, const std::vector<LoanStrip>& strips) {
             st.unit_tokens <= 0)
             continue;
         char* const bottom = st.top - st.bytes;
-        /* THE TOP ALIGNMENT UNIT STAYS EMPTY. A kernel assembling a packed code window reads a
-         * few bytes past the end of the slot it was handed; inside the stretch that lands in the
-         * slot above, and above the top of the stretch is memory that is not the slab's -- the
-         * next layer's blocks, or at the end of the carve a region nothing may have mapped. */
+        /* The top alignment unit stays empty. A kernel assembling a packed code window reads a
+         * few bytes past its slot; past the stretch's top is memory that is not the slab's (the
+         * next layer's blocks, or at the end of the carve possibly unmapped memory). */
         char* cur = align_down_ptr(st.top - RAD_ALIGN_UNIT);
         for (;;) {
             int best = -1;
@@ -985,8 +913,8 @@ int Mover::lend_from(int lender, const std::vector<LoanStrip>& strips) {
         }
     }
 
-    /* SMALLEST LOAN FIRST, so a loan of any size is a prefix of the slots and the one it gives
-     * back first is the deepest -- which is the one the owner wants back first. */
+    /* Smallest loan first, so any loan covers a prefix of the slots and the deepest slot, which
+     * the owner wants back first, is given back first. */
     int64_t n_new = 0, bytes_new = 0;
     for (size_t c = 0; c < nc; ++c) {
         if (cuts[c].empty()) continue;
@@ -997,8 +925,8 @@ int Mover::lend_from(int lender, const std::vector<LoanStrip>& strips) {
         l.lender = lender;
         l.seg = cp.slab.add_segment((int64_t)cuts[c].size());
         l.first = cp.slab.seg_lo(l.seg);
-        /* THE SLOT NUMBER AND THE POINTER LIST AGREE BY CONSTRUCTION: segments are appended in the
-         * order their pointers are, so slot_ptr's `slot - n_fixed` indexes straight into them. */
+        /* Segments are appended in the same order as their pointers, so slot_ptr's
+         * `slot - n_fixed` indexes flex_ptr directly. */
         if (l.first != cp.n_fixed + (int64_t)cp.flex_ptr.size()) {
             RAD_ERR("mover: a lent segment starts at slot %lld with %zu lent slots before it",
                     (long long)l.first, cp.flex_ptr.size());
@@ -1011,16 +939,16 @@ int Mover::lend_from(int lender, const std::vector<LoanStrip>& strips) {
     }
     if (n_new <= 0) return RAD_OK;
 
-    /* A RECORD FOR EVERY SLOT THAT CAN BE LENT. A fill issues a promotion into every free slot
-     * at once and a recall drops every unit past the loan at once, and each of those is a record
-     * until its barrier clears; sized at the shadow count, the records -- not the link -- would
-     * decide how fast a loan is used. */
+    /* A record for every lendable slot. A fill promotes into every free slot at once and a recall
+     * drops every unit past the loan at once, each holding a record until its barrier clears;
+     * with only the shadow count, records rather than the link would limit how fast a loan is
+     * used. */
     const size_t had = moves_.size();
     moves_.resize(had + (size_t)n_new);
     for (size_t i = had; i < moves_.size(); ++i) RAD_TRY(rad_event_create_local(&moves_[i].ev));
 
     RAD_INFO("mover: %lld slots can be lent out of the %s (%s), filled as it lends them",
-             (long long)n_new, lender == kLendKV ? "KV cache" : "activation arena",
+             (long long)n_new, lender_name(lender),
              humanb(bytes_new).c_str());
     count_flex();
     return RAD_OK;
@@ -1103,35 +1031,25 @@ int Mover::drop(int32_t unit, HeatEngine* heat) {
     return RAD_OK;
 }
 
-/* THE POOL IS SIZED TO THE UNITS THAT LIVE IN IT, so it has a slot free only while a promotion
- * into a budgeted slot is on its way through the quarantine -- and the budgeted range turns over
- * only as fast as those few slots come round. A budgeted unit that goes cold then stays, and the
- * engine's swap drops the coldest lent unit in its place, which is warmer: replaying a mixed
- * workload's routing at TP1, the hit rate is 72.7% that way against 76.7% with up to n_turn
- * donors a class, and 78.5% for one resident set with no regions at all.
+/* The pool is sized to its units, so it has a free slot only while a promotion passes through
+ * quarantine. Without donors a cold budgeted unit stays and the engine's swap drops a warmer lent
+ * unit instead; replaying mixed routing at TP1, the hit rate is 72.7% that way, 76.7% with up to
+ * n_turn donors per class, and 78.5% for one resident set with no regions.
  *
- * A unit in a lent slot keeps its host copy only so that a recall is a change of address. Giving
- * the copy to the victim costs that for this one unit: a recall moves it, into a free budgeted
- * slot or back across the link (reclaim), and a loan that shrinks under it moves it the same way
- * (balance). There is always somewhere for it to go -- each donor's copy went to a unit
- * whose budgeted slot it left free, so the free budgeted slots and the free pool slots together
- * number at least the donors once the quarantine has emptied (a recall drains it first). The
- * donors are bounded by the turnover slots, and they come out of the KV cache's loan only: the
- * arena takes its loan back at every prompt's first chunk, and that recall stays a change of
- * address.
+ * A donor loses its cheap recall: a recall or shrink must move it into a free budgeted slot or
+ * back across the link (reclaim, balance). There is always room once quarantine has emptied,
+ * since each donation left a budgeted slot free. Donors are capped at the turnover slots and come
+ * only from the KV cache's loan, so the arena's per-prompt recall stays an address change.
  *
- * THE HOTTEST UNIT GIVES ITS COPY -- of the victim's layer, when pool_slot_for asks for one --
- * because a donor the engine later demotes needs a pool slot of its own where it would have been a
- * drop. Its pool slot has no reader: the unit has been resident since its promotion retired, and
- * the copy into the slot waits on the gate besides. */
+ * The hottest unit (of the victim's layer, when asked) donates, since a donor later demoted needs
+ * a pool slot of its own. Its pool slot has no reader: the unit is resident and the copy into the
+ * slot waits on the gate. */
 int64_t Mover::donor_slot(size_t klass, int32_t layer, HeatEngine* heat) {
     ClassPools& cp = pools_[klass];
     if (cp.n_donated >= cp.n_turn) return -1;
-    /* NOT WHILE THE TURNOVER SLOTS ARE HELD: through a prompt and the few steps after it
-     * (Engine::tiering_dispatch). A donation lets a starved demotion go and the swap behind it
-     * with it, two copies on the stream the next prompt stages on; at TP2, where the resident set
-     * is nine tenths of the experts and a donor buys no decode at all, 26K-token prompts back to
-     * back ran 0.3% slower with them. A decode run reaches the count in a few steps. */
+    /* Not while the turnover slots are held (around a prompt): a donation releases a starved
+     * swap, two copies on the stream the next prompt stages on. A decode run reaches the donor
+     * count within a few steps anyway. */
     if (hold_turnover_) return -1;
     DonorRank& d = donors_[klass];
     if (d.at != dispatch_) {
@@ -1176,14 +1094,11 @@ int64_t Mover::donor_slot(size_t klass, int32_t layer, HeatEngine* heat) {
     }
 }
 
-/* THE STAGER COPIES A LAYER'S POOLED UNITS IN RUNS OF NEIGHBOURING POOL SLOTS (stage_units), and
- * the pool is laid out in unit order, so a layer's pooled units start out side by side. A demotion
- * that lands in a slot another layer's unit left breaks one run in that layer and starts a run of
- * one in its own, a copy more in each, for every prompt after it. So a slot one of the unit's own
- * layer started out in comes first, then a donor of the same layer -- its slot most likely one of
- * those -- and only then any free slot, or any donor. At TP1, 26K-token prompts with 256 tokens
- * decoded between them staged a layer in 162 copies without the preference and 112 with it (95
- * when the budget was 8 swaps a step). */
+/* The prefill stager copies runs of neighbouring pool slots, and the pool starts in unit order,
+ * so a demotion into another layer's slot costs an extra copy in both layers on every later
+ * prompt. Prefer a slot the unit's own layer started in, then a same-layer donor, then any free
+ * slot, then any donor. At TP1 (26K-token prompts, 256 decoded tokens between) this takes a
+ * layer's staging from 162 copies to 112. */
 int64_t Mover::pool_slot_for(int32_t unit, HeatEngine* heat) {
     const UnitState& us = unit_[(size_t)unit];
     ClassPools& cp = pools_[(size_t)us.klass];
@@ -1214,12 +1129,12 @@ bool Mover::migrate(int32_t unit, HeatEngine* heat) {
         cp.slab.add_free(to);
         return false;
     }
-    Move& m = moves_[(size_t)rec];
-    if (rad_event_wait(mover_, gate_) < 0 ||
-        queue_move_copy(cp.slot_ptr(to), cp.slot_ptr(us.slab_slot), us.bytes, rec) < 0) {
+    if (rad_event_wait(mover_, gate_) < 0) {
         cp.slab.add_free(to);
         return false;
     }
+    queue_move_copy(cp.slot_ptr(to), cp.slot_ptr(us.slab_slot), us.bytes, rec);
+    Move& m = moves_[(size_t)rec];
     m.state = Move::State::Copying;
     m.kind = Move::Kind::Migrate;
     m.unit = unit;
@@ -1241,13 +1156,13 @@ int Mover::promote_to(int32_t unit, int64_t slot) {
     const void* src = (const char*)cp.pool_base + us.pool_slot * cp.stride;
     Move& m = moves_[(size_t)rec];
     RAD_TRY(rad_event_wait(mover_, gate_));
-    RAD_TRY(queue_move_copy(cp.slot_ptr(slot), src, us.bytes, rec));
+    queue_move_copy(cp.slot_ptr(slot), src, us.bytes, rec);
     m.kind = Move::Kind::Promote;
     m.slab_slot = slot;
-    /* INTO A LENT SLOT, THE HOST COPY STAYS. The loan can be recalled at any time and a unit that
-     * kept its pool slot goes back by a change of address; one that gave it up would need a pool
-     * slot and a copy across the link at the moment the cache is asking for its memory. The
-     * quarantine then has no pool slot to free. */
+    /* Into a lent slot the host copy stays: the loan can be recalled at any time, and a unit
+     * that kept its pool slot goes back by a change of address instead of needing a pool slot and
+     * a link copy just as the cache wants its memory. The quarantine then has no pool slot to
+     * free. */
     m.pool_slot = cp.is_flex(slot) ? -1 : us.pool_slot;
     m.state = Move::State::Copying;
     m.unit = unit;
@@ -1269,11 +1184,10 @@ int Mover::fill(size_t klass, int64_t room, HeatEngine* heat) {
     }
     std::stable_sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.h > b.h; });
 
-    /* HOTTEST FIRST, AND ON AN EXACT TIE THE LAYER HOLDING THE FEWEST RESIDENT UNITS -- the
-     * statement `pick` makes, and it has to keep holding as the batch lands. Every promotion here
-     * is issued before any of them retires, so the heat engine's own count does not move during
-     * the batch; it is counted here instead. Without that a fill of a cold slab, where every heat
-     * is zero, would put its whole batch into whichever layer was thinnest when it began. */
+    /* Hottest first; on an exact tie, the layer with the fewest resident units. Every promotion
+     * here is issued before any retires, so the heat engine's resident count does not move during
+     * the batch and `added` tracks it instead; otherwise a fill of a cold slab (all heats zero)
+     * would put the whole batch into whichever layer was thinnest at the start. */
     std::unordered_map<int32_t, int32_t> added;
     int64_t issued = 0;
     for (size_t i = 0; i < cand.size() && issued < room;) {
@@ -1293,10 +1207,9 @@ int Mover::fill(size_t klass, int64_t room, HeatEngine* heat) {
             std::vector<int32_t>& us = by_layer[k.second];
             const int32_t u = us.back();
             us.pop_back();
-            /* A LENT SLOT AND NEVER A WORKING ONE. The shadow and staging slots are what lets a
-             * swap happen at all, and a unit filled into one sits in the budgeted range where no
-             * loan can give it back -- the reserve would be gone for good the first time the loan
-             * shrank. */
+            /* A lent slot, never a working one. Shadow and staging slots are what let a swap
+             * happen, and a unit filled into one sits in the budgeted range where no loan shrink
+             * returns it, so the reserve would be lost. */
             const int64_t slot = pools_[klass].slab.take_at_least(pools_[klass].n_fixed);
             if (slot < 0) return RAD_OK;
             if (heat) heat->set_busy(u, true);
@@ -1322,18 +1235,17 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
         if (cp.flex_ptr.empty()) continue;
         bool drained = false;
 
-        /* ---- EMPTY WHAT THE LOAN NO LONGER COVERS, FIRST AND ALL OF IT. Each is a drop -- a
-         * change of address, with no copy -- so there is no link to ration it against, and the
-         * cache is waiting for these bytes. A unit still busy is on its way in; it goes on the
-         * next call, once its promotion has retired. The sweep is over every unit, so it runs
-         * only while a shrink may have stranded one (ClassPools::strand_check). */
+        /* ---- Empty what the loan no longer covers, all of it, first: drops cost no link
+         * traffic and the lender is waiting. A busy unit is still on its way in and goes on a
+         * later call. The sweep walks every unit, so it runs only after a shrink
+         * (ClassPools::strand_check). */
         if (cp.strand_check) {
             bool left = false;
             for (int32_t u = 0; u < (int32_t)unit_.size(); ++u) {
                 const UnitState& us = unit_[(size_t)u];
                 if (us.klass != (int32_t)c || us.slab_slot < 0 || cp.slab.covered(us.slab_slot)) continue;
-                /* Anything else still past the loan -- a promotion that has not retired, a staged
-                 * unit -- becomes droppable later, so the sweep has to come back for it. */
+                /* Anything else past the loan (an unretired promotion, a staged unit) becomes
+                 * droppable later, so the sweep must come back for it. */
                 if (us.tier != Tier::VRAM || us.site != Site::Device || (heat && heat->busy(u))) {
                     left = true;
                     continue;
@@ -1358,27 +1270,20 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
             cp.strand_check = left;
         }
 
-        /* ---- THE WORKING RESERVE. The shadow and staging slots have to stay free whatever the
-         * loan is, or the mover cannot turn over: a loan that shrank past units sitting in the
-         * slots that were serving as the reserve leaves the slab too full by that many, and the
-         * coldest lent units go -- drops, never copies. A slot already on its way back below the
-         * target counts as free, because it is, a barrier from now; draining against it again is
-         * how a slab empties itself.
+        /* ---- The working reserve. Shadow and staging slots must stay free whatever the loan,
+         * or the mover cannot turn over; after a shrink the coldest lent units are dropped to
+         * restore them. A slot already on its way back (`pending`) counts as free, or the drain
+         * would repeat and empty the slab.
          *
-         * THE TURNOVER SLOTS ARE REBUILT THE SAME WAY, out of the lent units alone. They are the
-         * top of the lent range, which is exactly what a cache that wants memory back takes first,
-         * and the loan grows back only a prefill chunk at a time: left to the fill, they would be
-         * gone for as long as requests keep arriving. Dropping the coldest lent units costs
-         * nothing on the link -- each still has its host copy -- and gives up the same residents
-         * the slots would have cost anyway. A swap whose demotion found no pool slot is completed
-         * the same way, by the coldest lent unit instead. */
+         * The turnover slots are rebuilt the same way. They are the top of the lent range, which
+         * a recall takes first, and the loan regrows only a prefill chunk at a time, so the fill
+         * alone would leave them gone. A swap whose demotion found no pool slot is completed the
+         * same way. */
         int64_t pending = 0;
         for (const Move& m : moves_) {
             if (m.state == Move::State::Free || m.unit < 0 || m.slab_slot < 0) continue;
             if (unit_[(size_t)m.unit].klass != (int32_t)c || !cp.slab.covered(m.slab_slot)) continue;
-            if (m.kind == Move::Kind::Drop || m.kind == Move::Kind::Demote ||
-                m.kind == Move::Kind::Release || m.kind == Move::Kind::Migrate)
-                ++pending;
+            if (m.frees_slab()) ++pending;
         }
         const int64_t turn = turnover ? cp.n_turn : 0;
         int64_t short_by = cp.n_work + turn - (cp.slab.n_free() + pending);
@@ -1404,12 +1309,10 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
                 --short_by;
             }
         }
-        /* AND WITH NO LENT UNIT LEFT TO DROP, THE COLDEST BUDGETED ONE GOES BACK TO THE POOL -- a
-         * real demotion, one a call, and for the working reserve only: the turnover slots are the
-         * loan's to give, and a copy across the link to keep them would spend the very link they
-         * exist to save. A swap can leave the free slots in the lent range, and a loan that then
-         * shrinks away takes them with it; the working reserve has to be rebuilt out of the
-         * budgeted slots or the mover stops turning over. */
+        /* With no lent unit left to drop, demote the coldest budgeted unit (a real copy, one per
+         * call), for the working reserve only: link traffic to keep turnover slots would cost what
+         * they save. A shrinking loan can take the free slots a swap left in the lent range, so
+         * the reserve must be rebuildable from the budgeted slots. */
         if (short_by > turn) {
             int32_t victim = -1;
             float coldest = 0.0f;
@@ -1433,7 +1336,7 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
          * trying to hand back. */
         if (drained) continue;
 
-        /* ---- THEN FILL, every free slot past the working reserve and the turnover slots. */
+        /* ---- Then fill every free slot past the working reserve and the turnover slots. */
         RAD_TRY(fill(c, cp.slab.n_free() - cp.n_work - turn, heat));
     }
     count_flex();
@@ -1454,30 +1357,21 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
                 "the kernels that may still read the slots");
         return RAD_E_STATE;
     }
-    /* NO COPY IS STILL WRITING A SLOT: everything the mover issued has landed, and retiring it
-     * publishes the promotions that landed in slots about to be taken back. */
+    /* No copy may still be writing a slot: drain the mover's stream, then retire to publish
+     * promotions that landed in slots about to be taken back. */
     RAD_TRY(flush_moves());
     RAD_TRY(rad_stream_sync(mover_));
     RAD_TRY(retire(heat));
-    /* AND NO SLOT IS STILL IN QUARANTINE. The slots the donors below are owed come back through
-     * it: a donation's victim leaves its budgeted slot that way, and a promotion that refilled the
-     * slot leaves its pool slot that way (donor_slot). Looked for before the compute stream has
-     * passed their barriers, the slots of the last few dispatches' swaps are not free yet, and a
-     * donor finds nowhere to go. Nothing goes on the compute stream from this drain to the end of
-     * the recall, which issues only the mover's own copies. */
+    /* Drain quarantine too: the slots owed to the donors below come back through it (see
+     * donor_slot). Nothing goes on the compute stream from here to the end of the recall. */
     RAD_TRY(rad_stream_sync(compute_));
     RAD_TRY(retire(heat));
 
-    /* EVERY UNIT PAST THE LOAN GOES BACK TO ITS HOST COPY, which is a change of address -- or,
-     * for a donor (donor_slot), which has none, it moves: into a free budgeted slot, a copy inside
-     * the card, or else back across the link into a free pool slot. One of the two is free for
-     * every donor once the quarantine is empty (donor_slot says why). Nothing is published until
-     * the copies have landed.
-     *
-     * A DONOR WITH NOWHERE TO GO STAYS WHERE IT IS, and the recall still finishes: every other
-     * slot is given back and every moved donor published, so the loan stops short only by that
-     * unit's slot, and a later recall or balance() moves it. Stopping at it instead would leave
-     * the slots already taken off their units held by nothing, for the life of the process. */
+    /* Every unit past the loan goes back to its host copy. A donor has none, so it moves into a
+     * free budgeted slot or else across the link into a free pool slot, published once the
+     * copies land. A donor with nowhere to go stays and the recall finishes short by its slot
+     * (a later recall or balance() moves it); aborting instead would leak the slots already
+     * taken off their units. */
     std::vector<std::pair<size_t, int64_t>> freed;
     std::vector<int32_t> moved;
     int stuck = 0;
@@ -1538,67 +1432,61 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
         for (int32_t u : moved) republish(u);
     }
 
-    /* AND NO KERNEL STILL NAMES ONE. The compute stream is the only reader of the slab -- the
-     * quarantine barrier rests on the same fact -- and it drained above with nothing issued since,
-     * so nothing can reach a slot past the loan, and everything issued from here reads the host
-     * copies. */
+    /* No kernel still names a freed slot: the compute stream is the slab's only reader (the
+     * quarantine relies on the same fact), it drained above with nothing issued since, and work
+     * issued from here reads the host copies. */
     for (const auto& f : freed) pools_[f.first].slab.add_free(f.second);
 
-    /* EVERY RECORD WAITING ON ONE OF THOSE SLOTS IS DONE WAITING: its barrier is behind the
-     * drain. A promotion's record has nothing to free -- its unit kept the pool slot -- and a
-     * drop's frees the slot it left. */
+    /* Every record waiting on one of those slots is done: its barrier is behind the drain. A
+     * promotion's record has nothing to free (its unit kept the pool slot); a drop's frees the
+     * slot it left. */
     for (Move& m : moves_) {
         if (m.state == Move::State::Free || m.unit < 0 || m.slab_slot < 0) continue;
         const int32_t klass = unit_[(size_t)m.unit].klass;
         if (klass < 0) continue;
         ClassPools& cp = pools_[(size_t)klass];
         if (!cp.is_flex(m.slab_slot) || cp.slab.covered(m.slab_slot)) continue;
-        if (m.kind == Move::Kind::Drop || m.kind == Move::Kind::Demote ||
-            m.kind == Move::Kind::Release || m.kind == Move::Kind::Migrate)
-            cp.slab.add_free(m.slab_slot);
+        if (m.frees_slab()) cp.slab.add_free(m.slab_slot);
         if (heat && m.kind != Move::Kind::Stage && m.kind != Move::Kind::Release)
             heat->set_busy(m.unit, false);
         if (m.state == Move::State::Copying) --copying_[(size_t)m.unit];
-        m.state = Move::State::Free;
-        m.unit = -1;
-        m.slab_slot = m.pool_slot = m.to_slot = -1;
+        m.clear();
     }
     count_flex();
     if (stuck > 0) {
         stats_.stranded += (uint64_t)stuck;
         RAD_ERR("mover: %d unit(s) that gave their host copy away found no free slot to move to; "
                 "the %s loan stops at %lld instead of %lld until they move", stuck,
-                lender == kLendKV ? "KV" : "arena", (long long)loan_held(lender),
+                lender_name(lender), (long long)loan_held(lender),
                 (long long)loan_[lender]);
         return RAD_E_FULL;
     }
     if (loan_held(lender) > loan_[lender]) {
         RAD_ERR("mover: recalled the %s loan to %lld and a slot at %lld is still held",
-                lender == kLendKV ? "KV" : "arena", (long long)loan_[lender],
+                lender_name(lender), (long long)loan_[lender],
                 (long long)loan_held(lender));
         return RAD_E_STATE;
     }
     return RAD_OK;
 }
 
-int Mover::queue_move_copy(void* dst, const void* src, int64_t bytes, int rec) {
+void Mover::queue_move_copy(void* dst, const void* src, int64_t bytes, int rec) {
     move_segs_.push_back(RadCopySeg{ src, dst, bytes });
     move_recs_.push_back((int32_t)rec);
-    return RAD_OK;
 }
 
-/* THE DMA ENGINE AND NOT COPY KERNELS. A copy kernel runs on the compute units beside the step's
- * kernels: at the heat engine's budget of 64 swaps a step, Qwen3.8-Flash-Next at one card spent 10 ms
- * a step in about 68 of them while the step took 36. The engine moves the same bytes at the link's
- * rate and takes nothing from the kernels; decode at one sequence went 34.1 -> 33.0 ms a step, and
- * two cards, prefill and the output were unchanged. A card with no DMA queue of this process's own
- * gets the list as copy kernels (rad_memcpy_list_async), as before. The list yields to the link's
- * collectives like the prefill stager's. */
+/* Swap copies go to the DMA engine as one list. Copy kernels would compete with the step's
+ * kernels: at 64 swaps a step, Qwen3.8-Flash-Next on one card spends about 10 ms of a 36 ms step
+ * in them. Without a DMA queue of this process's own, rad_memcpy_list_async falls back to copy
+ * kernels. The list yields to the link's collectives, like the prefill stager's. */
 int Mover::flush_moves() {
     if (move_segs_.empty()) return RAD_OK;
-    const int rc = rad_memcpy_list_async(move_segs_.data(), (int)move_segs_.size(), RAD_COPY_YIELD,
-                                         mover_);
-    for (int32_t rec : move_recs_) (void)rad_event_record(moves_[(size_t)rec].ev, mover_);
+    int rc = rad_memcpy_list_async(move_segs_.data(), (int)move_segs_.size(), RAD_COPY_YIELD,
+                                   mover_);
+    for (int32_t rec : move_recs_) {
+        const int er = rad_event_record(moves_[(size_t)rec].ev, mover_);
+        if (rc >= 0) rc = er;
+    }
     move_segs_.clear();
     move_recs_.clear();
     return rc;
@@ -1617,8 +1505,8 @@ int Mover::retire(HeatEngine* heat) {
         switch (m.kind) {
             case Move::Kind::Promote:
                 us.slab_slot = m.slab_slot;
-                /* The source slot goes back on quarantine, not to us -- unless the destination
-                 * was lent, in which case it is kept (see issue()). */
+                /* The source pool slot is freed after quarantine, unless the destination was
+                 * lent, in which case the unit keeps it (see promote_to). */
                 if (m.pool_slot >= 0) us.pool_slot = -1;
                 us.tier = Tier::VRAM;
                 us.site = Site::Device;
@@ -1632,35 +1520,22 @@ int Mover::retire(HeatEngine* heat) {
                 us.pool_slot = m.pool_slot;
                 us.slab_slot = -1;
                 us.tier = Tier::HostPinned;
-                /* Demoted, not exiled: the unit is now the zero-copy tier's, so the GEMM streams
-                 * it out of the pinned pool as it computes. There is no third dispatch path. */
+                /* The unit joins the zero-copy tier: the GEMM streams it from the pinned pool as
+                 * it computes. */
                 us.site = Site::DeviceZeroCopy;
                 ++stats_.demotions;
                 if (heat) heat->set_tier(m.unit, Tier::HostPinned);
                 break;
             case Move::Kind::Stage:
-                /* The destination was published at issue, with the event. All that is left is to
-                 * clear the event: the copy has landed, so the wait is no longer needed and the
-                 * common case -- a staged unit read many times before it is released -- costs no
-                 * runtime call at all. No generation bump: the address did not change, and
-                 * bumping would make the run phase re-wait on an event that has already
-                 * signalled. */
+                /* The destination was published at issue with the event. The copy has landed, so
+                 * clear the event and later reads of the staged unit cost no runtime call. No
+                 * generation bump: the address did not change, and a bump would make the run
+                 * phase wait again on an event that has already signalled. */
                 for (rad_weight w : plan_->units[(size_t)m.unit].weights) res_.settle(w);
-                /* ...AND STRAIGHT TO FREE, SKIPPING THE QUARANTINE. The barrier exists to protect
-                 * a slot on its way back to the free list from kernels that still name it; a
-                 * staging copy returns no slot -- the slot stays with the unit until a later
-                 * Release hands it back, and THAT is the move the barrier belongs to.
-                 *
-                 * Sending a Stage through the quarantine anyway is not merely redundant, it
-                 * stalls the prefetch: the record stays occupied for two more dispatches, and
-                 * unit_in_flight() therefore keeps reporting the unit busy, which blocks the very
-                 * Release that would recycle its slot. With a ring two deep that is the whole
-                 * supply. Invisible on the host backend, where every copy lands within the
-                 * dispatch that issued it; on a real card the copies take tens of microseconds
-                 * and the pipeline simply stops turning over. */
-                m.state = Move::State::Free;
-                m.unit = -1;
-                m.slab_slot = m.pool_slot = m.to_slot = -1;
+                /* Straight to Free, skipping quarantine: a staging copy returns no slot (the
+                 * later Release does, and is quarantined). Quarantining it would only hold the
+                 * record for two more dispatches and stall the prefetch on a real card. */
+                m.clear();
                 continue;
             case Move::Kind::Migrate:
                 us.slab_slot = m.to_slot;
@@ -1671,20 +1546,16 @@ int Mover::retire(HeatEngine* heat) {
             case Move::Kind::Drop:
                 break;
         }
-        /* PUBLISH. Both copies of the bytes are valid at this instant -- the mover wrote a shadow
-         * slot and has not freed the source -- which is what makes this edit safe to make from
-         * this thread with nothing synchronised: whichever side of the write a reader lands on
-         * names bytes that are correct. */
+        /* Safe without synchronisation: both copies of the bytes are valid now (see
+         * Residency::publish). */
         republish(m.unit);
         m.state = Move::State::Published;
     }
 
-    /* QUARANTINE, and it is a SECOND pass on purpose. The slot being freed was named by kernels
-     * issued in earlier layers and those may still be running. Re-recording the move's event on
-     * the COMPUTE stream is the barrier: when it signals, every launch made before the publish
-     * has retired and the slot is safe to write. It has to sit downstream of the publish in
-     * stream order for that sentence to be true, which is why it cannot be folded into the loop
-     * above. A slot reused too early is not a crash -- it is fluent text with a new hash. */
+    /* Quarantine, as a separate pass. Kernels issued in earlier layers may still name the freed
+     * slot. Re-recording the move's event on the compute stream is the barrier: when it signals,
+     * every launch made before the publish has retired and the slot is safe to write. It must be
+     * downstream of the publish in stream order, so it is not folded into the loop above. */
     for (Move& m : moves_) {
         if (m.state != Move::State::Published) continue;
         if (!compute_) {
@@ -1703,22 +1574,12 @@ int Mover::retire(HeatEngine* heat) {
         if (q < 0) return RAD_E_DEVICE;
         if (q == 0) continue;
 
-        UnitState& us = unit_[(size_t)m.unit];
-        ClassPools& cp = pools_[(size_t)us.klass];
-        switch (m.kind) {
-            case Move::Kind::Promote: cp.pool.add_free(m.pool_slot); break;
-            case Move::Kind::Demote:  cp.slab.add_free(m.slab_slot); break;
-            case Move::Kind::Release: cp.slab.add_free(m.slab_slot); break;
-            case Move::Kind::Drop:    cp.slab.add_free(m.slab_slot); break;
-            case Move::Kind::Migrate: cp.slab.add_free(m.slab_slot); break;
-            case Move::Kind::Stage:   break;   /* never reaches here; freed as soon as it lands */
-        }
-        if (heat && (m.kind == Move::Kind::Promote || m.kind == Move::Kind::Demote ||
-                     m.kind == Move::Kind::Drop || m.kind == Move::Kind::Migrate))
-            heat->set_busy(m.unit, false);
-        m.state = Move::State::Free;
-        m.unit = -1;
-        m.slab_slot = m.pool_slot = m.to_slot = -1;
+        /* A Stage record never gets here: it is freed as soon as it lands. */
+        ClassPools& cp = pools_[(size_t)unit_[(size_t)m.unit].klass];
+        if (m.kind == Move::Kind::Promote) cp.pool.add_free(m.pool_slot);
+        else if (m.frees_slab())           cp.slab.add_free(m.slab_slot);
+        if (heat && m.kind != Move::Kind::Release) heat->set_busy(m.unit, false);
+        m.clear();
     }
     count_flex();
     return RAD_OK;
@@ -1733,8 +1594,7 @@ std::string Mover::report() const {
                         (unsigned long long)stats_.demotions,
                         (unsigned long long)stats_.prefetched,
                         (double)stats_.h2d_bytes * gib, (double)stats_.d2h_bytes * gib);
-    /* Supply, not policy. These three are the difference between a mover at its budget and one
-     * that never got to spend it, and without them they look identical from the outside. */
+    /* Supply counters: they separate a mover at its budget from one that never got to spend it. */
     s += fmt("  %llu found no free move record, %llu starved of a slab slot, %llu of a pool "
              "slot; %llu slots quarantined\n",
              (unsigned long long)stats_.no_record, (unsigned long long)stats_.starved_slab,
@@ -1748,8 +1608,8 @@ std::string Mover::report() const {
         s += fmt("  file tier: %llu demand reads (%.2f GiB), each a blocking pread in the middle "
                  "of a dispatch. Raise --host-pool-mib.\n",
                  (unsigned long long)stats_.ssd_reads, (double)stats_.ssd_bytes * gib);
-    /* The routed layers read from the container, and what they cost the issuing thread: read is
-     * the drive, wait is a window whose copies had not drained when it came round again. */
+    /* The file stager's cost to the issuing thread: read is time in the drive, wait is time on a
+     * window whose copies had not drained when it came round again. */
     if (stats_.file_layers) {
         const double rs = (double)stats_.file_read_ns * 1e-9;
         s += fmt("  file stager: %llu routed layers read, %llu units, %.2f GiB in %llu preads; "

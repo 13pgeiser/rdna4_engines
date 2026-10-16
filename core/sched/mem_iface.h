@@ -1,24 +1,14 @@
 /* mem_iface.h -- the seam between core/sched and core/mem.
  *
- * core/mem owns the concrete `KVManager` and `PrefixCache`. The scheduler binds to the pure-virtual
- * mirrors below rather than to those classes directly, for two reasons and neither is abstraction
- * for its own sake:
+ * The scheduler binds to pure-virtual mirrors of core/mem's `KVManager` (kv.h) and `PrefixCache`
+ * (prefix.h) instead of the classes themselves:
  *
- *   - it lets tests/sched_test.cpp drive the scheduler against a block pool it can make
- *     arbitrarily small, which is the only way to test admission refusal and preemption at all;
- *   - it costs one indirect call per SEQUENCE per step (at most max_seqs, a few hundred), not one
- *     per token, so it is off the part of the step path that is actually hot.
+ *   - tests/sched_test.cpp can drive the scheduler against an arbitrarily small block pool, the
+ *     only way to test admission refusal and preemption;
+ *   - the cost is one indirect call per sequence per step, not per token.
  *
- * `KVBinding` / `PCBinding` at the bottom adapt the concrete classes and require no change on
- * their side. They are templates so that they are only type-checked where the engine instantiates
- * them -- so a method core/mem does not provide is a compile error at exactly one line rather
- * than a comment nobody reads.
- *
- * The interface below mirrors core/mem/kv.h and core/mem/prefix.h.
- *
- * `CacheHit` comes from core/mem/prefix.h and is NOT redefined here. Two identical definitions of
- * a struct that crosses a component boundary is an ODR violation that costs nothing today and
- * becomes a silent layout mismatch the first time one side adds a field.
+ * `KVBinding` / `PCBinding` at the bottom adapt the concrete classes. `CacheHit` comes from
+ * core/mem/prefix.h; do not redefine it here (ODR).
  */
 #pragma once
 #include <functional>
@@ -31,10 +21,9 @@
 namespace rad {
 
 /* ------------------------------------------------------------------ the KV manager */
-/* Keyed by SEQUENCE ID, which is the request id. The manager owns the block tables; Request::blocks
- * is not the source of truth and the scheduler does not read it. Two allocators disagreeing about
- * what a sequence owns is not a leak, it is the bug where a freed sequence's state slot is handed
- * to the next request while the first still reads it. */
+/* Keyed by sequence id (the request id). The manager owns the block tables; the scheduler does
+ * not read Request::blocks, so there is one owner and a freed state slot cannot be handed out
+ * while its previous sequence still reads it. */
 struct IKVManager {
     virtual ~IKVManager() = default;
 
@@ -43,98 +32,80 @@ struct IKVManager {
     virtual void free_sequence(uint64_t seq) = 0;
 
     /* Grow the sequence's mapping to cover `n_tokens` in every group. RAD_E_FULL when a group's
-     * free list is empty, which is a scheduling signal and not an error: the caller preempts a
-     * victim and retries. */
+     * free list is empty; the caller preempts a victim and retries. */
     virtual int  ensure(uint64_t seq, int64_t n_tokens) = 0;
-    /* The same, for a step whose first query sits at `keep_from` (the request's n_computed): a
-     * WINDOW group then keeps every block that query can still read, however long the step is.
-     * See KVManager::ensure. The default is for a manager with no windowed group. */
+    /* As ensure(), for a step whose first query is at `keep_from` (the request's n_computed): a
+     * window group keeps every block that query can still read (KVManager::ensure). The default
+     * suits a manager with no windowed group. */
     virtual int  ensure_from(uint64_t seq, int64_t n_tokens, int64_t keep_from) {
         (void)keep_from;
         return ensure(seq, n_tokens);
     }
-    /* A committed step: a WINDOW group gives back what no later query can read. A no-op for a
-     * manager with no windowed group. See KVManager::trim_window. */
+    /* After a committed step, a window group frees what no later query can read
+     * (KVManager::trim_window). */
     virtual void trim_window(uint64_t seq, int64_t keep_from) { (void)seq; (void)keep_from; }
-    /* The window snapshot of a prefix hit (KVManager::has_window_snapshot / seed_window). The
-     * defaults are a manager with none: no hit on a windowed trunk is ever resumed. */
+    /* Window snapshot of a prefix hit (KVManager::has_window_snapshot / seed_window). The
+     * defaults mean no hit on a windowed trunk is ever resumed. */
     virtual bool has_window_snapshot() const { return false; }
     virtual int  seed_window(uint64_t seq, int64_t pos) { (void)seq; (void)pos; return -1; }
 
-    /* Adopt blocks a prefix-cache hit found. `n_tokens` must be a whole multiple of the group's
-     * block size -- a partial block is never shared, because the next token written into it would
-     * corrupt the cache entry. */
+    /* Adopt blocks a prefix-cache hit found. `n_tokens` must be a multiple of the group's block
+     * size; a shared partial block would be corrupted by the next token written into it. */
     virtual int  adopt(uint64_t seq, int32_t group, const std::vector<int32_t>& blocks,
                        int64_t n_tokens) = 0;
 
     /* Free the blocks and mark the sequence for re-prefill. */
     virtual int  preempt(uint64_t seq) = 0;
 
-    /* Could a sequence of this length EVER fit, in an empty pool? If not, preempting the whole
-     * server would not help and the request is failed immediately rather than the engine
-     * deadlocking on it (spec §17). */
+    /* Whether a sequence of this length fits an empty pool. If not, the request fails at once
+     * instead of deadlocking the engine (spec §17). */
     virtual bool can_ever_fit(int64_t n_tokens) const = 0;
 
     virtual const std::vector<int32_t>& block_table(uint64_t seq, int32_t group) const = 0;
     virtual int32_t state_slot(uint64_t seq, int32_t group) const = 0;
 
-    /* THE WHOLE state_index ROW FOR A SEQUENCE, and how wide it is. One entry, normally: the
-     * sequence's state. A group whose kernel asked for scratch beside the state names that too,
-     * and the manager owns the mapping from column to physical slot because it owns the pool --
-     * the scheduler stages the row and does not read it. Returns the width written, 0 for a
-     * paged group. `max` bounds the write. */
+    /* The sequence's state_index row: normally one entry (its state slot), plus any scratch
+     * slots the group's kernel asked for. The manager owns the column-to-slot mapping; the
+     * scheduler stages the row without reading it. Returns the width written (0 for a paged
+     * group), at most `max`. */
     virtual int state_index_row(uint64_t seq, int32_t group, int32_t* out, int max) const = 0;
     virtual int64_t state_index_width(int32_t group) const = 0;
 
     virtual int64_t free_blocks(int32_t group) const = 0;
     virtual int64_t total_blocks(int32_t group) const = 0;
-    /* What anything is HOLDING, as against what may be handed out right now. See
-     * KVManager::held_blocks: on an elastic pool the two differ by whatever the cache has
-     * released, and an occupancy figure built from the second reads an idle server as full. */
+    /* Blocks held by anything, as opposed to free_blocks (what can be handed out now). On an
+     * elastic pool they differ by what the cache released (KVManager::held_blocks). */
     virtual int64_t held_blocks(int32_t group) const = 0;
 
-    /* THE SAME POOL IN BYTES. Blocks and tokens are both un-summable across groups -- a stateful
-     * group has neither, and two paged groups share one token axis -- so bytes are the only
-     * measure a reader can add up to "how much of the card is the KV cache holding". Asked of the
-     * manager rather than derived here, because the manager owns the plan that knows whether a
-     * group is counted in blocks or in states. */
+    /* The pool in bytes, the only unit that sums across groups. Asked of the manager because its
+     * plan knows whether a group counts blocks or states. */
     virtual int64_t pool_bytes(int32_t group) const = 0;
     virtual int64_t pool_bytes_used(int32_t group) const = 0;
-    /* What the carve gave the group, which an elastic pool may have released part of. */
+    /* What the carve gave the group; an elastic pool may have released part of it. */
     virtual int64_t pool_bytes_carved(int32_t group) const = 0;
 
-    /* HOW MANY TOKENS ONE BLOCK OF THIS GROUP COVERS, or 0 for a stateful group. The pool's
-     * capacity in blocks is already here; the live request table wants it in TOKENS, because that
-     * is the unit a request is measured in and the only one the two can be compared in. */
+    /* Tokens one block covers, or 0 for a stateful group. */
     virtual int64_t block_tokens(int32_t group) const = 0;
 
-    /* SPECULATIVE REJECTION ROLLBACK (spec §10). A verify writes KV for 1 + n_spec
-     * positions and the sampler accepts a prefix of them; the sequence's length must come back to
-     * the accepted position and the blocks past it must go to the free list. `ensure` is monotone
-     * and cannot express it.
-     *
-     * It is a slot-table edit and nothing else -- crucially it does NOT touch the linear or conv
-     * groups, whose rollback is a change of read offset the kernels perform themselves. Without
-     * this the pool leaks one block per rejected block-crossing, which is a slow leak and
-     * therefore the worst kind. */
+    /* Speculative rejection rollback (spec §10). A verify writes KV for 1 + n_spec positions and
+     * the sampler accepts a prefix; this shrinks the sequence to `n_tokens` and frees blocks past
+     * it, which the monotone ensure() cannot. Only the slot table changes: linear and conv groups
+     * roll back by read offset inside their kernels. */
     virtual int  rollback(uint64_t seq, int64_t n_tokens) = 0;
 
-    /* THE ABSOLUTE TOKEN POSITION that block_table(seq, group)[0] covers. Zero for a
-     * FULL group and non-zero for a WINDOW group, whose blocks below the window are recycled: the
-     * step batch's slot mapping is `(pos - first_block_pos) / block_size`, and with the offset
-     * missing every sliding-window sequence writes its KV to the wrong slot the moment it passes
-     * its window. KVManager::Seq already tracks this privately as `first_block_pos`. */
+    /* Absolute token position that block_table(seq, group)[0] covers: zero for a full group,
+     * non-zero for a window group once blocks below the window are recycled. The step batch maps
+     * a slot as `(pos - first_block_pos) / block_size`. */
     virtual int64_t first_block_pos(uint64_t seq, int32_t group) const = 0;
 
-    /* THE ENTRIES OF block_table(seq, group) THAT CHANGED since the previous call: everything
-     * below the returned index is unchanged, and INT64_MAX says nothing changed. Reading clears
-     * it, so the batch builder is its one caller: it keeps the device's copy of a table and
-     * stages only what moved. 0 is always a correct answer -- it restages the whole table. */
+    /* Index of the first entry of block_table(seq, group) changed since the previous call;
+     * INT64_MAX if none.
+     * Reading clears it, so the batch builder, which keeps the device copy and stages only the
+     * changed tail, must be the only caller. 0 is always correct (restage the whole table). */
     virtual int64_t take_table_changes(uint64_t seq, int32_t group) const = 0;
 
-    /* THE SNAPSHOT STORE STILL HOLDS `slot`: it was allocated and not given back since. A step
-     * that restores from a slot the store gave back would read another session's state or
-     * nothing, so the scheduler asks before it builds one. */
+    /* Whether the snapshot store still holds `slot`. The scheduler checks before building a
+     * restore step, since a released slot may hold another session's state. */
     virtual bool checkpoint_held(int32_t slot) const = 0;
 };
 
@@ -142,53 +113,42 @@ struct IKVManager {
 struct IPrefixCache {
     virtual ~IPrefixCache() = default;
 
-    /* Longest cached prefix, plus the checkpoint covering the linear state for a prefix of it.
-     * `blocks_out` receives the block ids per cached group, in cached_groups() order, ready for
-     * IKVManager::adopt. */
-    /* GIVE BACK WHATEVER THE TIERS HOLD FOR THIS PROMPT, before the lookup that would otherwise
-     * stop at it.
-     *
-     * The scheduler calls it and must not know what a tier is: a restore allocates blocks and
-     * runs a device scatter, so it is the engine's to perform and is installed as a callable
-     * rather than reached through this header. A failure is not an error here -- it leaves a
-     * shorter prefix, and a shorter prefix is always safe. */
+    /* Bring back whatever the idle tiers hold for this prompt, before the lookup. The engine
+     * performs it (it allocates blocks and runs a device scatter). A failure only leaves a
+     * shorter prefix, which is always safe. */
     virtual void restore(const Request&) {}
-    /* A step's admissions begin: what the last step's lookups handed out has been read. */
+    /* A step's admissions begin; the last step's lookup results have been consumed. */
     virtual void begin_step() {}
-    /* KEEP THIS WAITING REQUEST'S CHAIN WHERE IT IS until release(). Called when an admission is
-     * refused after restore(): the request gives its hit back, and without the hold the chain it
-     * just had restored would leave VRAM again before the next attempt restores it once more. */
+    /* Keep this waiting request's chain in VRAM until release(). Called when admission is refused
+     * after restore(), so the restored chain is not moved out again before the next attempt. */
     virtual void hold(const Request&) {}
-    /* The request is gone -- finished, failed or cancelled -- and holds nothing any more. */
+    /* The request finished, failed or was cancelled and holds nothing any more. */
     virtual void release(const Request&) {}
 
-    /* `cap`, when not null, ends the hit early (HitCap, core/mem/prefix.h). */
+    /* Longest cached prefix, plus the checkpoint covering the linear state for a prefix of it.
+     * `blocks_out` receives block ids per cached group, in cached_groups() order, for
+     * IKVManager::adopt. `cap`, when not null, ends the hit early (HitCap, core/mem/prefix.h). */
     virtual CacheHit lookup(const Request& r, std::vector<std::vector<int32_t>>* blocks_out,
                             const HitCap* cap) const = 0;
     virtual const std::vector<int32_t>& cached_groups() const = 0;
 
-    /* PUBLISH what this sequence computed, so the next request sharing the prefix can adopt it.
-     * Without this the cache is only ever read: every lookup misses, `cached_tokens` is always
-     * zero, and a chat client re-prefills its whole history on every turn, which for a long
-     * conversation is seconds a message. `blocks[i]` is the block table of cached_groups()[i], and
-     * `n_tokens` how many of them are backed. Takes a KV reference on every newly indexed block,
-     * so it must be called BEFORE the sequence's own blocks are released. */
+    /* Publish what this sequence computed so a later request sharing the prefix can adopt it.
+     * `blocks[i]` is the block table of cached_groups()[i]; `n_tokens` is how many tokens are
+     * backed. Takes a KV reference on every newly indexed block, so call it before the sequence's
+     * own blocks are released. */
     virtual int insert(const Request& r, const std::vector<std::vector<int32_t>>& blocks,
                        int64_t n_tokens) = 0;
 
-    /* Release the least recently used entries, and with them their KV references. The cache holds
-     * blocks no live sequence needs, so this is what the scheduler tries BEFORE preempting a
-     * running request: a cached prefix is a saving, a running request is work already done. */
+    /* Release the least recently used entries and their KV references. The scheduler tries this
+     * before preempting a running request. */
     virtual int64_t evict(int64_t n_entries) = 0;
-    /* FREE UP TO `n_blocks` FOR THE RESERVE, and nothing a later turn needs. Unlike evict(), which
-     * answers a shortfall that cannot wait, this passes over an entry a live sequence still holds
-     * (releasing it frees no block) and one whose only copy is in VRAM (it is the next turn's
-     * context). Returns how many blocks went back to the pool. */
+    /* Free up to `n_blocks` for the reserve without losing anything a later turn needs. Unlike
+     * evict(), it skips entries a live sequence still holds (no block would be freed) and entries
+     * whose only copy is in VRAM. Returns the number of blocks freed. */
     virtual int64_t trim(int64_t n_blocks) = 0;
 
-    /* FORGET EVERYTHING, wherever it is. Not a loop over evict(): with idle tiers an eviction moves
-     * an entry whose host copy has landed off the card and keeps it, so a reset built out of
-     * evictions would leave every such conversation behind. Returns how many entries went. */
+    /* Drop every entry in every tier. Implementations with idle tiers must override this: there,
+     * evict() keeps an entry whose host copy has landed. Returns the number of entries dropped. */
     virtual int64_t reset() {
         int64_t dropped = 0;
         for (int guard = 0; guard < 65536; ++guard) {
@@ -199,60 +159,50 @@ struct IPrefixCache {
         return dropped;
     }
 
-    /* HOW MANY ENTRIES THE CACHE HAS THROWN AWAY, which is the leading indicator of the failure
-     * mode that matters operationally: once the pool is utilised past the reserve the scheduler
-     * keeps free (a quarter of it), the cache begins evicting prefixes that are about to be
-     * reused, and an agent's next turn re-prefills its whole context -- turning a cached turn of
-     * a few seconds into a full prefill of a very long prompt. `prefix_hit_rate` only falls AFTER
-     * that has happened; this count rises first. */
+    /* Entries evicted, cumulative. Once the pool fills past the scheduler's reserve (a quarter of
+     * it), the cache evicts prefixes about to be reused; this count rises before the hit rate
+     * falls. */
     virtual int64_t evictions() const = 0;
     virtual int64_t ckpt_evictions() const = 0;
-    /* And what --prefix-cache-ttl took: not memory pressure, so not evictions. */
+    /* ckpt_evictions by reason, and reservations that found nothing to give up
+     * (PrefixCache::Stats). */
+    struct CkptCounts { int64_t retired = 0, lru = 0, refused = 0; };
+    virtual CkptCounts ckpt_counts() const { return {}; }
+    /* Entries expired by --prefix-cache-ttl; not counted as evictions. */
     virtual int64_t expired() const { return 0; }
     virtual int64_t ckpt_expired() const { return 0; }
 
-    /* WHAT IT IS HOLDING ON ITS OWN RIGHT NOW, in tokens of context, as against the counters
-     * above which are cumulative. A finished turn's blocks stay held so the next turn can reuse
-     * them, so on any server serving conversations MOST of a full KV pool is this rather than the
-     * live sequences -- and with one number for the pool there is no way to see that, which makes
-     * a working cache indistinguishable from a leak.
-     *
-     * ON ITS OWN is the whole of it. A cached block a running sequence is also reading is not
-     * memory the cache is keeping back from anybody, and counting those would make a single 200K
-     * request look like a cache refusing to release 200K. */
+    /* Tokens of context held only by the cache right now. Blocks a running sequence also reads
+     * are excluded. Separates a working cache from a leak in the pool figures. */
     virtual int64_t held_tokens() const = 0;
 
     /* The next position strictly after `pos` at which the scheduler must split a chunk so that a
      * checkpoint lands on a boundary. */
     virtual int64_t next_checkpoint_after(int64_t pos) const = 0;
 
-    /* Reserve the snapshot slot the scheduler is about to WRITE. Retention is budgeted (§7.3:
-     * ~96 MiB a snapshot, so 64 of them is 6 GiB), which makes RAD_E_FULL an ordinary condition
-     * and not a failure -- the scheduler simply does not write a checkpoint at that boundary and
-     * the next hit replays from the previous one. */
+    /* Reserve the snapshot slot the scheduler is about to write. Retention is budgeted (§7.3: on
+     * Qwen3.5-27B a snapshot is 144 MiB, and a 128K session at the default interval is 64 of them,
+     * about 9 GiB), so RAD_E_FULL is ordinary: no checkpoint is written at that boundary and a
+     * later hit replays from the previous one. */
     virtual int reserve_checkpoint(const Request& r, int64_t pos, int32_t* slot_out) = 0;
 
-    /* The state that reservation named is now IN its slot. A reservation is made when the chunk is
-     * PLANNED and the state exists only after the step that computes it, so a lookup in between
-     * would adopt a slot holding the previous tenant's history. Until this is called, the
-     * reservation is a promise and lookup will not offer it. */
+    /* The reserved state is now in its slot. Reservation happens at planning, before the step
+     * computes the state, so lookup does not offer the slot until this is called. */
     virtual void commit_checkpoint(const Request& r, int64_t pos) = 0;
 };
 
 /* ------------------------------------------------------------------ block geometry */
-/* Everything the step batch needs to turn a token position into a KV slot, read off the declared
- * program rather than off the manager: block size is KVGroupInfo::block_size, which the build
- * component already took from the resolved attention kernel's constraints (§7.2). Duplicating it
- * through a second interface would be a second place for it to be wrong. */
+/* What the step batch needs to turn a token position into a KV slot, read from the declared
+ * program: KVGroupInfo::block_size comes from the resolved attention kernel's constraints
+ * (§7.2). */
 struct KVGeom {
     struct G {
         int     kind = RAD_KV_FULL;
         int64_t block_size = 1;
         int64_t window = 0;
         bool    paged = true;
-        /* Columns in this group's state_index row. The MANAGER decides it -- it depends on what
-         * the group's kernel wants beside the state -- so KVGeom::of leaves it at 1 and the
-         * scheduler fills it in from the configured pool. */
+        /* Columns in this group's state_index row. The manager decides it, so KVGeom::of leaves
+         * it at 1 and the scheduler fills it in from the configured pool. */
         int64_t sidx_width = 1;
     };
     std::vector<G> g;
@@ -282,8 +232,7 @@ struct KVGeom {
 };
 
 /* ------------------------------------------------------------------ binding the concrete classes */
-/* Templates, so nothing here is type-checked until the engine instantiates it against the real
- * classes. That instantiation is where a mismatch with core/mem is reported. */
+/* Templates, so a mismatch with core/mem is reported where the engine instantiates them. */
 template <class KV>
 struct KVBinding final : IKVManager {
     KV* m;
@@ -330,11 +279,9 @@ struct KVBinding final : IKVManager {
     bool checkpoint_held(int32_t slot) const override { return m->checkpoint_held(slot); }
 };
 
-/* The prefix cache's own lookup takes tokens and content-hashed multimodal keys rather than a
- * Request, because the placeholder ids inside a media run are identical for every picture: hashing
- * the ids alone would serve one request another's image. Each run is keyed by its item's content
- * key (core/mm, taken over the processed patches) and its segment, so the same picture at the same
- * place hits -- and skips the encoder along with the prefill -- and two pictures never alias. */
+/* Content keys for a request's media runs. Placeholder ids are identical for every picture, so
+ * the prefix cache also hashes each run's item content key (core/mm, over the processed patches)
+ * and segment: the same picture at the same place hits, two pictures never alias. */
 inline void media_keys(const Request& r, std::vector<MMContentKey>* out) {
     out->clear();
     if (!r.media) return;
@@ -376,9 +323,8 @@ struct PCBinding final : IPrefixCache {
     void release(const Request& r) override { m->release(r.id); }
     const std::vector<int32_t>& cached_groups() const override { return m->cached_groups(); }
 
-    /* prompt ++ output, for the same reason reserve_checkpoint chains both: the next turn of a
-     * conversation sends the reply back as part of its prompt, so a cache that indexed only the
-     * prompt would stop hitting at the first assistant token and re-prefill everything after it. */
+    /* Indexes prompt ++ output: the next turn sends the reply back in its prompt, so indexing the
+     * prompt alone would stop hitting at the first assistant token. */
     int insert(const Request& r, const std::vector<std::vector<int32_t>>& blocks,
                int64_t n_tokens) override {
         std::vector<int32_t> toks;
@@ -386,20 +332,16 @@ struct PCBinding final : IPrefixCache {
         toks.insert(toks.end(), r.prompt.begin(), r.prompt.end());
         toks.insert(toks.end(), r.output.begin(), r.output.end());
         if (n_tokens > (int64_t)toks.size()) n_tokens = (int64_t)toks.size();
-        /* r.id is the session, and it is the SAME id reserve_checkpoint keys its snapshots by --
-         * so the tiers' session view and the checkpoint index are talking about one thing. */
+        /* r.id is the session, the same id reserve_checkpoint keys its snapshots by. */
         media_keys(r, &mm_);
         return m->insert(r.id, toks, mm_, blocks, n_tokens, r.session_label);
     }
-    /* Installed by the engine when the idle tiers are on: lands every host copy that is waiting,
-     * now, and says whether any landed. Called on the step thread under the scheduler's lock. */
+    /* Installed by the engine when the idle tiers are on: lands every pending host copy now and
+     * returns whether any landed. Runs on the step thread under the scheduler's lock. */
     std::function<bool()> flush_fn;
-    uint64_t lost_warned_ns_ = 0;
-    /* PRESSURE TAKES WHAT CAN LEAVE VRAM AND STAY, FIRST. An entry whose host copy has landed is
-     * dropped and kept (trim); a copy still on its way is landed and that entry dropped too; only
-     * what the tiers then still cannot take -- an arena with no room, or no tiers at all -- is
-     * erased, and an erase with the tiers on is said, because it is a conversation a later turn
-     * will prefill again. */
+    /* Under pressure, first drop entries whose host copy has landed (trim), then land pending
+     * copies and trim again. Only the rest is erased; with tiers on, an erase is warned about,
+     * since a later turn will prefill that conversation again. */
     int64_t evict(int64_t n) override {
         int64_t k = m->trim(n);
         if (k < n && flush_fn && flush_fn()) k += m->trim(n - k);
@@ -427,23 +369,20 @@ struct PCBinding final : IPrefixCache {
     }
     int64_t evictions() const override { return m->stats().evictions; }
     int64_t ckpt_evictions() const override { return m->stats().ckpt_evictions; }
+    CkptCounts ckpt_counts() const override {
+        const auto& st = m->stats();
+        return { st.ckpt_retired, st.ckpt_lru, st.ckpt_refused };
+    }
     int64_t expired() const override { return m->stats().expired; }
     int64_t ckpt_expired() const override { return m->stats().ckpt_expired; }
     int64_t held_tokens() const override { return m->unshared_tokens(); }
 
     int64_t next_checkpoint_after(int64_t p) const override { return m->next_checkpoint_after(p); }
     int reserve_checkpoint(const Request& r, int64_t pos, int32_t* slot_out) override {
-        /* The cache keys a snapshot by the CHAINED HASH of the prefix it covers, and the chain is
-         * built here rather than inside the cache because the cache does not hold the tokens --
-         * that is the whole reason this interface passes a Request. It must be the SAME chain
-         * lookup() walks, or a checkpoint reserved at `pos` and a later hit at `pos` name two
-         * different entries and the linear cache silently never hits.
-         *
-         * The prefix is prompt ++ output: a checkpoint written during decode covers tokens the
-         * request has generated, and keying it on the prompt alone would alias every continuation
-         * of the same prompt onto one snapshot -- which is one session's recurrent state served to
-         * another. Whole blocks only; a partial block is never keyed, because the next token
-         * written into it would change what the key stands for. */
+        /* A snapshot is keyed by the chained hash of the prefix it covers, built here because the
+         * cache does not hold the tokens. It must match the chain lookup() walks, or the linear
+         * cache never hits. The prefix is prompt ++ output, so continuations of one prompt do not
+         * share a snapshot; whole blocks only, since a partial block's key would change. */
         return m->reserve_checkpoint(r.id, pos, prefix_hash(r, pos), slot_out);
     }
 
@@ -452,9 +391,11 @@ struct PCBinding final : IPrefixCache {
     }
 
 private:
-    /* The chain reserve_checkpoint keys on, factored out so commit cannot drift from it: two
-     * copies of this walk that agreed when written would be two copies that could stop agreeing,
-     * and the symptom would be a checkpoint that is written and never found. */
+    uint64_t lost_warned_ns_ = 0;
+    mutable std::vector<int32_t> blk_;   /* prefix_hash's block of tokens, kept for its capacity */
+
+    /* The chain reserve_checkpoint and commit_checkpoint both key on; shared so they cannot
+     * drift apart. */
     BlockHash prefix_hash(const Request& r, int64_t pos) const {
         media_keys(r, &mm_);
         const int64_t bs = m->block_size();
@@ -463,14 +404,14 @@ private:
         const int64_t np = (int64_t)r.prompt.size(), no = (int64_t)r.output.size();
         const int64_t have = np + no;
         const int64_t n_blocks = (pos < have ? pos : have) / bs;
-        std::vector<int32_t> blk((size_t)bs);
+        blk_.resize((size_t)bs);
         for (int64_t b = 0; b < n_blocks; ++b) {
             const int64_t base = b * bs;
             for (int64_t j = 0; j < bs; ++j) {
                 const int64_t k = base + j;
-                blk[(size_t)j] = k < np ? r.prompt[(size_t)k] : r.output[(size_t)(k - np)];
+                blk_[(size_t)j] = k < np ? r.prompt[(size_t)k] : r.output[(size_t)(k - np)];
             }
-            h = chain_block_hash(h, blk.data(), (int32_t)bs, mm_.data(), (int32_t)mm_.size(), base);
+            h = chain_block_hash(h, blk_.data(), (int32_t)bs, mm_.data(), (int32_t)mm_.size(), base);
         }
         return h;
     }

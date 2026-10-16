@@ -1,6 +1,4 @@
-/* rad_util.cpp -- logging, error strings, dtype arithmetic and tensor helpers. The bedrock every
- * other translation unit links against.
- */
+/* rad_util.cpp -- logging, string formatting, Geometry and constraint matching. */
 #include <atomic>
 #include <chrono>
 #include "../rad_internal.h"
@@ -10,20 +8,16 @@
 #include <cstdlib>
 #include <cinttypes>
 #include <ctime>
+#include <iterator>
 #include <unistd.h>
 
 namespace rad {
 
 /* ------------------------------------------------------------------ logging */
 
-/* THE LEVEL COMES FROM THE ENVIRONMENT, because nothing in the tree calls `log_set_level`. Without
- * that, the level is Info for the life of every process and every RAD_DEBUG and RAD_TRACE site in
- * the engine is unreachable code that reads like a diagnostic somebody could turn on -- the
- * sampler's mask timing, the grammar's admissible-token count, the drafter's per-position trace,
- * the step loop's batch dump. RADIANCE_LOG=error|warn|info|debug|trace reaches them.
- *
- * Read once, on first use, because this is called from the step path on every logged line. The
- * setter stays: a host embedding the engine as a library has no environment to speak through. */
+/* The initial level comes from RADIANCE_LOG=error|warn|info|debug|trace (default info), so
+ * RAD_DEBUG / RAD_TRACE sites are reachable in any process. Read once at startup; log_set_level
+ * overrides it (command-line -v, tests, embedding hosts). */
 static Log level_from_env() {
     const char* v = std::getenv("RADIANCE_LOG");
     if (!v || !*v) return Log::Info;
@@ -32,8 +26,7 @@ static Log level_from_env() {
     if (!std::strcmp(v, "info"))  return Log::Info;
     if (!std::strcmp(v, "debug")) return Log::Debug;
     if (!std::strcmp(v, "trace")) return Log::Trace;
-    /* Not a level. Said at the level that is always on, rather than silently ignored -- a
-     * misspelt knob that changes nothing looks exactly like a knob that does not work. */
+    /* Report a misspelt level instead of silently ignoring it. */
     std::fprintf(stderr, "E RADIANCE_LOG='%s' is not error|warn|info|debug|trace; using info\n", v);
     return Log::Info;
 }
@@ -52,8 +45,7 @@ static const char* level_tag(Log l) {
     }
 }
 
-/* Colour only when stderr is a terminal. Piped or redirected it prints ordinary lines, which is
- * the same rule the live view follows (spec §16). */
+/* Colour only when stderr is a terminal, as the live view does (spec §16). */
 static const char* level_colour(Log l) {
     if (!isatty(2)) return "";
     switch (l) {
@@ -65,8 +57,7 @@ static const char* level_colour(Log l) {
     }
 }
 
-/* Thread-local because the ranks' declare threads run concurrently; a plain global would have
- * whichever rank last entered a scope tagging every other rank's lines. */
+/* Thread-local: the ranks' declare threads run concurrently and each tags its own lines. */
 static thread_local int  g_log_rank  = -1;
 static bool              g_rank_tags = false;
 
@@ -93,8 +84,7 @@ void log_emit(Log l, const char* file, int line, const char* fmt, ...) {
     char rank[16] = "";
     if (g_rank_tags && g_log_rank >= 0) snprintf(rank, sizeof rank, "[%d]", g_log_rank);
 
-    /* Debug and Trace carry the source site; Info and above do not, because an operator reading
-     * a normal startup does not care which file said it. */
+    /* Debug and Trace carry the source site; Info and above do not. */
     if ((int)l >= (int)Log::Debug)
         fprintf(stderr, "%s%s%s%s %s:%d  %s\n", col, level_tag(l), rank, rst, base, line, msg);
     else
@@ -157,38 +147,26 @@ std::vector<std::string_view> split_ws(std::string_view s) {
 }
 
 /* ------------------------------------------------------------------ Geometry */
-/* Small, linear-scanned, and that is correct: an op has a handful of parameters and the selector
- * touches this at declare, not per step. A hash map here would be slower and less predictable. */
-void Geometry::set_i(std::string_view k, long long v) {
-    for (size_t i = 0; i < keys_.size(); ++i)
-        if (keys_[i] == k) { kinds_[i] = RAD_P_INT; ivals_[i] = v; rebuild(); return; }
-    keys_.emplace_back(k);
-    svals_.emplace_back();
-    ivals_.push_back(v);
-    dvals_.push_back(0.0);
-    kinds_.push_back(RAD_P_INT);
-    rebuild();
+/* Linear scan on purpose: an op has a handful of parameters and the selector reads this at
+ * declare, not per step. */
+size_t Geometry::slot(std::string_view k, int kind) {
+    size_t i = 0;
+    while (i < keys_.size() && keys_[i] != k) ++i;
+    if (i == keys_.size()) {
+        keys_.emplace_back(k);
+        svals_.emplace_back();
+        ivals_.push_back(0);
+        dvals_.push_back(0.0);
+        kinds_.push_back(kind);
+    }
+    kinds_[i] = kind;
+    return i;
 }
 
-void Geometry::set_f(std::string_view k, double v) {
-    for (size_t i = 0; i < keys_.size(); ++i)
-        if (keys_[i] == k) { kinds_[i] = RAD_P_F64; dvals_[i] = v; rebuild(); return; }
-    keys_.emplace_back(k);
-    svals_.emplace_back();
-    ivals_.push_back(0);
-    dvals_.push_back(v);
-    kinds_.push_back(RAD_P_F64);
-    rebuild();
-}
-
+void Geometry::set_i(std::string_view k, long long v) { ivals_[slot(k, RAD_P_INT)] = v; rebuild(); }
+void Geometry::set_f(std::string_view k, double v)    { dvals_[slot(k, RAD_P_F64)] = v; rebuild(); }
 void Geometry::set_s(std::string_view k, std::string_view v) {
-    for (size_t i = 0; i < keys_.size(); ++i)
-        if (keys_[i] == k) { kinds_[i] = RAD_P_STR; svals_[i] = std::string(v); rebuild(); return; }
-    keys_.emplace_back(k);
-    svals_.emplace_back(v);
-    ivals_.push_back(0);
-    dvals_.push_back(0.0);
-    kinds_.push_back(RAD_P_STR);
+    svals_[slot(k, RAD_P_STR)] = std::string(v);
     rebuild();
 }
 
@@ -215,9 +193,8 @@ bool Geometry::has(std::string_view k) const {
     return false;
 }
 
-/* Every key and every string value may have moved: an append can reallocate keys_ and svals_, and
- * a short string lives inside its element. So the whole view is redone, which is the same handful
- * of entries the setter's scan already walked. */
+/* Rebuild the whole view: an append can reallocate keys_ and svals_, and short strings live
+ * inside their element, so every c_str() may have moved. */
 void Geometry::rebuild() {
     view_.clear();
     view_.reserve(keys_.size());
@@ -246,10 +223,8 @@ std::string Geometry::str() const {
 }
 
 /* ------------------------------------------------------------------ constraint matching */
-/* A constraint whose key the geometry does not carry does NOT hold. That is libr4d's rule: a row
- * that constrains an optional parameter serves only a caller that states it, so the more
- * constrained of two rows is reached only when it is asked for, and a caller that leaves the
- * parameter out is handed the row that does not need it. */
+/* A constraint on a key the geometry lacks does not hold (libr4d's rule): a row constraining an
+ * optional parameter serves only callers that state it, and others get a row without it. */
 bool constraint_holds(const RadConstraint& c, const Geometry& g) {
     if (c.op == RAD_C_IN) {
         const char* v = g.get_s(c.key);
@@ -279,7 +254,7 @@ bool constraint_holds(const RadConstraint& c, const Geometry& g) {
 
 std::string constraint_why(const RadConstraint& c, const Geometry& g) {
     static const char* opname[] = { "==", "<=", ">=", "%", "in" };
-    const char* on = (c.op >= 0 && c.op <= 4) ? opname[c.op] : "?";
+    const char* on = (c.op >= 0 && c.op < (int)std::size(opname)) ? opname[c.op] : "?";
 
     if (c.op == RAD_C_IN) {
         const char* v = g.get_s(c.key);
@@ -299,11 +274,7 @@ std::string constraint_why(const RadConstraint& c, const Geometry& g) {
 
 /* ------------------------------------------------------------------ the C surface
  *
- * EMPTY, AND THAT IS THE POINT. rad_strerror, the four dtype helpers, the three tensor helpers
- * and rad_args_geti/gets are `static inline` in the ABI headers. Defined here instead -- declared
- * in abi/, defined in rad_core -- they would be callable by everything EXCEPT the plugins that
- * want them most; see the long note above rad_strerror in rad_types.h for the failure that
- * motivates the arrangement and for what it costs.
- *
- * Nothing belongs here. A helper a plugin may need belongs in the header; a helper only the
- * core needs belongs in namespace rad above, not behind extern "C". */
+ * Intentionally empty. rad_strerror, the dtype and tensor helpers and rad_args_geti/gets are
+ * `static inline` in the ABI headers; defined in rad_core they would be unreachable from plugins
+ * (see the note above rad_strerror in rad_types.h). A helper plugins need goes in the header; a
+ * core-only helper goes in namespace rad, not behind extern "C". */

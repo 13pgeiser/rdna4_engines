@@ -1,17 +1,16 @@
-/* lq_grid.h -- a quantisation GRID: what codes a weight may take and how its scales sit over it.
+/* lq_grid.h -- a quantisation grid: the codes a weight may take and how its scales sit over it.
  *
- * libquant separates three things a recipe names independently (spec.md §4.5): the GRID, which is
- * the code type and the scale, zero and transform structure around it; the ALGORITHM that picks
- * codes on that grid (round-to-nearest, GPTQ, AWQ, ...); and the encoding the result is stored as,
- * which follows from the grid alone. Every algorithm takes the same grid options, so a grid
- * written once is available to all of them.
+ * libquant separates three things a recipe names independently (spec.md §4.5): the grid (code type
+ * plus the scale, zero and transform structure around it); the algorithm that picks codes on it
+ * (round-to-nearest, GPTQ, AWQ, ...); and the stored encoding, which follows from the grid alone.
+ * Every algorithm takes the same grid options.
  *
  * A grid is parsed from a rule's options:
  *
  *   codes=DT        the code dtype: i2..i8, i16, i32 (symmetric), u1..u8, u16 with zero=
  *                   (asymmetric), or a float code: fp8_e4m3, fp8_e5m2, fp6_e2m3, fp6_e3m2,
  *                   fp4_e2m1. Required, except beside table=, which implies it.
- *   table=T         a SCALAR CODEBOOK: each code indexes a table of values, which a block's scale
+ *   table=T         a scalar codebook: each code indexes a table of values, which a block's scale
  *                   multiplies. nf4 (QLoRA's NormalFloat), iq4nl (llama.cpp's IQ4_NL values),
  *                   w4nl (the rotated expert grid libr4d's w4nla8h kernel decodes), w5nl (its
  *                   32-level form, libr4d's w5nl64a8h),
@@ -22,14 +21,13 @@
  *                   (default: one scale a row, 1x*)
  *   scale=DT        the scale dtype: f32, bf16, f16, fp8_e4m3, e8m0 (default bf16); under scale2=
  *                   also an integer, u4..u8, i6, i8 -- a K-quant's sub-block scale
- *   scale2=DT       a SECOND SCALE LEVEL the first is relative to: f32, bf16, f16, fp8_e4m3, e8m0.
- *                   NVFP4 is fp4 codes, an fp8_e4m3 scale a [1 x 16] and an f32 scale2 a tensor.
- *   scale2_value=X  the second level FIXED at X for every one of its blocks, rather than taken
- *                   from the largest first-level scale under it: exactly representable in scale2=.
- *                   It is a constant a reader can know -- a first level of E4M3 sub-scales over a
- *                   model whose scales sit inside E4M3's range needs no per-row level, only an
- *                   offset (libr4d's w4nl64a8h experts) -- and a first level it would push past its
- *                   dtype's top is held there, said once on stderr.
+ *   scale2=DT       a second scale level the first is relative to: f32, bf16, f16, fp8_e4m3, e8m0.
+ *                   NVFP4 is fp4 codes, an fp8_e4m3 scale per [1 x 16] and an f32 scale2 per tensor.
+ *   scale2_value=X  the second level fixed at X for all its blocks instead of derived from the
+ *                   largest first-level scale under it; must be exact in scale2=. For E4M3
+ *                   sub-scales over a model whose scales fit E4M3's range, only a known offset is
+ *                   needed (libr4d's w4nl64a8h experts). A first-level value it would push past its
+ *                   dtype's top is clamped there, reported once on stderr.
  *   group2=N        the second level's block, [1 x N]; or
  *   block2=RxC      in general (default: the whole tensor, *x*). A multiple of the first level's
  *                   block in each extent.
@@ -43,12 +41,11 @@
  *   scale_value=X   the fixed scale for rule=fixed
  *   clamp=full|sym  a signed code's range: [-2^(b-1), 2^(b-1)-1], or symmetric about zero
  *
- * THE RULES ARE THE ONES THE CONTAINERS IN SERVICE WERE MADE WITH, exactly -- the order of a
- * division, which number is rounded to the scale dtype before the codes are chosen against it, and
- * what a block of zeros gets -- so a recipe reproduces those containers byte for byte. Each is
- * stated where it is implemented. The forms no container in service uses -- a codebook, a second
- * level, the searched rule and the 16- and 32-bit codes -- go through a general path of their own,
- * which leaves those rules where they are.
+ * The rules are exactly those the containers in service were made with (the order of a division,
+ * which number is rounded to the scale dtype before codes are chosen, what an all-zero block gets),
+ * so a recipe reproduces those containers byte for byte. Each is stated where it is implemented.
+ * Forms no container in service uses (a codebook, a second level, rule=search, 16- and 32-bit
+ * codes) take a separate general path, which leaves those rules untouched.
  */
 #pragma once
 #include "rad_quant.h"
@@ -97,7 +94,7 @@ struct Grid {
     int plane_table() const {
         return table.empty() ? -1 : 2 + (asym ? 1 : 0) + (lv2 ? 1 : 0);
     }
-    /* Does this grid take the general path (see the head of the file)? */
+    /* Whether this grid takes the general path (see the file header). */
     bool general() const { return lv2 || rule == SEARCH || !table.empty() || wide; }
 };
 
@@ -109,7 +106,7 @@ RadEncoding grid_encoding(const Grid& g);
 
 /* The rows one quantize call may take for this grid: a multiple of every level's block rows, or 0
  * when a scale covers every row and has to see them all. */
-int64_t grid_row_block(const Grid& g, int64_t rows);
+int64_t grid_row_block(const Grid& g);
 
 /* One block's quantiser state: the scale the codes are chosen against, its stored form, the
  * reciprocal, and for an asymmetric grid the zero. */
@@ -119,8 +116,8 @@ struct BlockScale {
     double  inv_d = 1.0;     /* rule=fixed reads its reciprocal in double; see grid.cpp */
     int     zero = 0;
     int     e8 = 0;          /* rule=mx: the shared exponent's E8M0 code */
-    float   stored = 1.0f;   /* what the scale plane holds: s, divided by a transform's order --
-                                or, under a second level, the first level's own value */
+    float   stored = 1.0f;   /* what the scale plane holds: s divided by a transform's order, or
+                                under a second level the first level's own value */
     float   lo = 0.0f;       /* an asymmetric block's low end, which the zero is taken against */
 };
 
@@ -167,9 +164,9 @@ struct Scales {
     }
 };
 
-/* The whole scale grid of rows [0, rows) of `w`, without choosing a code -- what round-to-nearest
- * codes against and the static-groups form an error-feedback algorithm quantises against. `imp`
- * is the columns' importances for rule=search, or null. */
+/* The whole scale grid of rows [0, rows) of `w`, without choosing codes: what round-to-nearest and
+ * the static-groups form of an error-feedback algorithm quantise against. `imp` is the columns'
+ * importances for rule=search, or null. */
 Scales grid_scales(const Grid& g, const float* w, int64_t rows, int64_t cols,
                    const float* imp = nullptr);
 
@@ -179,14 +176,14 @@ void grid_store_scales(const Grid& g, const Scales& s, const Planes& p);
 /* Store one code into element `i` of a code row, any width this grid writes. */
 void grid_store_code(const Grid& g, uint8_t* row, int64_t i, int code);
 
-/* Rows [0, rows) of `w` quantised and decoded again, into `out` [rows, cols]: the weight a reader of
- * this grid would see, for an algorithm that measures a candidate. `rows` covers whole blocks. */
+/* Quantise and decode rows [0, rows) of `w` into `out` [rows, cols]: the weight a reader would see,
+ * for algorithms that measure a candidate. `rows` covers whole blocks. */
 void grid_fake(const Grid& g, const float* w, int64_t rows, int64_t cols, float* out,
                const float* imp = nullptr);
 
-/* A block's state from its scale -- `s` unrounded, `lo` the asymmetric low end the zero is taken
- * against -- rounded as the general path rounds one. For an algorithm that chose the scale itself;
- * a grid with a second level has its own pass and does not take this. */
+/* A block's state from an unrounded scale `s` and the asymmetric low end `lo` the zero is taken
+ * against, rounded as the general path rounds. For algorithms that choose the scale themselves;
+ * not for grids with a second level, which have their own pass. */
 BlockScale grid_finish(const Grid& g, double s, float lo);
 
 /* Round-to-nearest over rows [0, rows) of `w` (logical rows [row0, row0+rows)). The block scales

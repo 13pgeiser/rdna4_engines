@@ -29,11 +29,6 @@ void Ticket::finish(int status, const std::string& why) {
     cv_.notify_all();
 }
 
-void Ticket::step(int32_t done, int32_t total) {
-    (void)done;
-    (void)total;
-}
-
 bool Ticket::next(Image* out, int ms, bool* timed_out) {
     std::unique_lock<std::mutex> lk(mu_);
     if (timed_out) *timed_out = false;
@@ -65,8 +60,8 @@ std::string Ticket::why() const {
 
 /* ================================================================== the schedule */
 /* diffusers' FlowMatchEulerDiscreteScheduler.set_timesteps with explicit sigmas, as the pipeline
- * calls it, in the precision it runs at: the sigmas are an f32 array and every shift is numpy f32
- * arithmetic, the Python floats in it (exp(mu), the shift, the terminal) taking the array's type. */
+ * calls it and at its precision: the sigmas are f32 and every shift is numpy f32 arithmetic, with
+ * the Python scalars (exp(mu), the shift, the terminal) taking the array's type. */
 std::vector<float> schedule(const RadGeneratorDecl& d, const std::vector<double>& fixed,
                             int32_t steps, int64_t tokens) {
     std::vector<float> s;

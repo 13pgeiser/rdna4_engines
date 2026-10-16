@@ -1,8 +1,9 @@
 # tests/data/media
 
-One solid red picture in every still format `core/mm/media.cpp` admits, and one short solid red
-clip in each container and codec it admits; `mm_test` decodes every one and checks it is red at
-its size. They were made with FFmpeg 8.1 (libx264, libx265, libvpx, libsvtav1, libaom, libtheora,
+Fixtures for `mm_test`. Solid red: a picture in eleven of the still formats `core/mm/media.cpp`
+admits (PNG, APNG, JPEG, WebP, GIF, BMP, TIFF, QOI, PPM, JPEG-LS, AVIF) and a short clip in nine of
+the container and codec pairs it admits. The test decodes each one and checks that it is red at its
+size. They were made with FFmpeg 8.1 (libx264, libx265, libvpx, libsvtav1, libaom, libtheora,
 libwebp):
 
 ```sh
@@ -31,8 +32,19 @@ ffmpeg $V -c:v mpeg4 red-mpeg4.avi
 ffmpeg $V -c:v libtheora red-theora.ogv
 ```
 
-`red-1788x282.jpg` is 4:2:0 at a width the scaler's vectors do not divide: converted to RGB it
-is written 12 bytes past width x 3 (`a_picture_of_an_awkward_width_converts_inside_its_buffer`).
+`red-1788x282.jpg` is 4:2:0 at a width the scaler's vectors do not divide: converting it to RGB,
+the scaler writes 12 bytes past width x 3, and
+`a_picture_of_an_awkward_width_converts_inside_its_buffer` checks that the output buffer holds
+them.
 
 The Theora clip repeats its first frame with empty packets, which is how Ogg Theora encodes a frame
 that does not change.
+
+`quad.png`, `quad.bmp`, `quad.jpg` (quality 95, 4:4:4), `quad.webp` (lossless) and `quad-alpha.png`
+are written by Pillow (`python3 tests/mkimggolden.py`): 33 x 17 pixels, red top left, green top
+right, blue bottom left, white bottom right, split at x = 16 and y = 8. A decoder that flips the
+row order (BMP stores rows bottom up), mirrors a row or takes the wrong stride at an odd width puts
+a wrong colour in some quadrant, which a solid picture cannot show.
+`pictures_decode_the_right_way_up_and_the_right_way_round` checks them. `quad-alpha.png` carries
+the same colours with alpha round(255 x / 32) in column x, for
+`the_rgba_decode_keeps_alpha_and_the_rgb_decode_drops_it_uncomposited`.

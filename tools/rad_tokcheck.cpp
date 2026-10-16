@@ -1,20 +1,19 @@
-/* rad-tokcheck -- hold the tokeniser to its references over real text, and time it.
+/* rad-tokcheck -- checks the tokeniser against its references over real text, and times it.
  *
- * Three questions, each answered per corpus file:
- *   1. Does the encoder produce the ids the reference encoder produces (tools/tokref: llama.cpp's
- *      splitters and std::regex, a string-keyed merge)? Any difference is printed with the ids
- *      and text around it.
- *   2. Does it produce the ids HuggingFace tokenizers produces? Those are read from files made
- *      elsewhere (`tokenizer.encode(text, add_special_tokens=False).ids`, little-endian int32,
- *      one file per corpus file), so nothing here needs Python.
- *   3. How fast is it: MB/s for both encoders, and what re-tokenising a growing conversation
- *      costs with the segment cache and without it -- the shape of an agent re-sending its whole
- *      history every turn.
+ * Per corpus file:
+ *   1. Compare ids with the reference encoder (tools/tokref: llama.cpp's splitters, std::regex, a
+ *      string-keyed merge). A difference is printed with the surrounding ids and text.
+ *   2. Compare ids with HuggingFace tokenizers, read from pre-made files
+ *      (`tokenizer.encode(text, add_special_tokens=False).ids`, little-endian int32, one file per
+ *      corpus file), so no Python is needed here.
+ *   3. Time both encoders (MB/s), and re-tokenising a growing conversation with and without the
+ *      segment cache, as when an agent re-sends its whole history every turn.
  *
  * Exits non-zero on any difference, so it can gate a change.
  */
 #include "text/tokenizer.h"
 #include "tokref.h"
+#include "iface.h"
 
 #include <algorithm>
 #include <chrono>
@@ -143,9 +142,9 @@ int main(int argc, char** argv) {
         else if (a == "--hf-dir")  hf_dir = next();
         else if (a == "--no-ref")  ref = false;
         else if (a == "--user")    parse_special = false;
-        else if (a == "--turns")   turns = std::atoi(next());
-        else if (a == "--repeat")  repeat = std::max(1, std::atoi(next()));
-        else if (a == "--context") ctx = std::atoi(next());
+        else if (a == "--turns")   turns = (int)rad_flag_int("rad-tokcheck", "--turns", next(), 0, INT32_MAX);
+        else if (a == "--repeat")  repeat = (int)rad_flag_int("rad-tokcheck", "--repeat", next(), 1, INT32_MAX);
+        else if (a == "--context") ctx = (int)rad_flag_int("rad-tokcheck", "--context", next(), 0, INT32_MAX);
         else if (!a.empty() && a[0] == '-') { std::fprintf(stderr, "rad-tokcheck: unknown option %s\n", a.c_str()); return 2; }
         else args.push_back(a);
     }
@@ -172,9 +171,8 @@ int main(int argc, char** argv) {
         if (!read_file(args[f], &text)) { std::printf("  %s: cannot read\n", args[f].c_str()); ++bad; continue; }
         std::printf("  %s: %zu bytes\n", args[f].c_str(), text.size());
 
-        /* The first encode of a file is reported apart from the best repeat: the vocab keeps what
-         * it learns about which tokens merge back to themselves, so a repeat is faster than the
-         * first sight of a text, and both numbers are real. */
+        /* The first encode is reported separately from the best repeat: the vocab caches which
+         * tokens merge back to themselves, so repeats are faster. */
         std::vector<int32_t> ids;
         double best = 1e30, first = 0;
         for (int r = 0; r < repeat; ++r) {
@@ -225,7 +223,7 @@ int main(int argc, char** argv) {
         if (turns > 0) {
             const std::vector<std::string> prompts = conversation(*vocab, text, turns);
             Tokenizer cached;
-            cached.init(vocab);
+            if (cached.init(vocab) < 0) { std::printf("    multi-turn: init failed\n"); ++bad; continue; }
             cached.clear_cache();
             double cold = 0, warm = 0, cold_last = 0, warm_last = 0, rtot = 0, rlast = 0;
             size_t prompt_bytes = 0;
@@ -233,11 +231,16 @@ int main(int argc, char** argv) {
             for (size_t k = 0; k < prompts.size(); ++k) {
                 std::vector<int32_t> a, b, r;
                 auto t0 = Clock::now();
-                tok.encode(prompts[k], a, false, true);
+                const int sa = tok.encode(prompts[k], a, false, true);
                 const double c = secs(t0);
                 t0 = Clock::now();
-                cached.encode(prompts[k], b, false, true);
+                const int sb = cached.encode(prompts[k], b, false, true);
                 const double w = secs(t0);
+                if (sa < 0 || sb < 0) {
+                    std::printf("    turn %zu: encode failed\n", k);
+                    same = false;
+                    continue;
+                }
                 cold += c;
                 warm += w;
                 cold_last = c;
@@ -257,7 +260,7 @@ int main(int argc, char** argv) {
             const Tokenizer::CacheStats cs = cached.cache_stats();
             std::printf("    %zu turns, %.1f MB re-sent (last prompt %zu bytes): %s\n", prompts.size(),
                         prompt_bytes / 1e6, prompts.empty() ? 0 : prompts.back().size(),
-                        same ? "cached ids identical to uncached on every turn" : "CACHED IDS DIFFER");
+                        same ? "cached ids identical to uncached on every turn" : "cached ids differ");
             std::printf("      uncached   %9.1f ms total, last turn %8.2f ms\n", cold * 1e3, cold_last * 1e3);
             std::printf("      cached     %9.1f ms total, last turn %8.2f ms  (%llu hits, %zu entries, %.1f MB)\n",
                         warm * 1e3, warm_last * 1e3, (unsigned long long)cs.hits, cs.entries, cs.bytes / 1e6);

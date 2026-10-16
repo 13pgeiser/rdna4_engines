@@ -1,14 +1,16 @@
 /* tests/r4d_emu: the sandwich-norm joins (r4d_norm_join_bf16.hip) on the host SIMT emulator.
  *
- * Two references. The CHAIN is the unfused sequence the arch plugin would otherwise issue -- rmsnorm,
- * add, rmsnorm (or rmsnorm x2, add, rmsnorm, add, mul_weight) -- in libr4d's per-element arithmetic,
- * its sums of squares added in this kernel's block order: the fused kernel must match it BIT FOR
- * BIT, which is the claim that fusing changes nothing but the launch count. The HOST ARM sums in
- * index order -- what a different libr4d block width does too -- and may differ by a flipped
- * rounding, measured against the row's scale (see cmp). Padding columns and rows past M must be
- * left alone. The route form's chain adds the router's rmsnorm (with its mult) and libr4d's
- * rmsnorm_quant_fp8 of the experts' norm -- amax * (1 / 448) a group, the clamped value encoded by
- * the emulator's v_cvt_pk_fp8_f32, the saturating encoder every fp8 cast here uses. */
+ * Two references:
+ *   Chain: the unfused sequence the arch plugin would otherwise issue (rmsnorm, add, rmsnorm; or
+ *     rmsnorm x2, add, rmsnorm, add, mul_weight) in libr4d's per-element arithmetic, with sums of
+ *     squares in this kernel's block order. The fused kernel must match it bit for bit: fusing
+ *     changes only the launch count.
+ *   Host arm: sums in index order (as a different libr4d block width would) and may differ by a
+ *     flipped rounding, measured against the row's scale (see cmp).
+ * Padding columns and rows past M must be left alone. The route form's chain adds the router's
+ * rmsnorm (with its mult) and libr4d's rmsnorm_quant_fp8 of the experts' norm: scale amax / 448
+ * per group, the clamped value encoded by the emulator's v_cvt_pk_fp8_f32, the saturating
+ * encoder every fp8 cast here uses. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
@@ -21,9 +23,6 @@
 #include <vector>
 
 static std::mt19937 rng(11);
-static float b2f(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f; std::memcpy(&f, &u, 4); return f; }
-static uint16_t f2b(float f) { uint32_t u; std::memcpy(&u, &f, 4); return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16); }
-static float rb(float f) { return b2f(f2b(f)); }
 
 /* the kernel's sum of squares: 256 threads strided over the row, a butterfly a wave, waves in order */
 static float block_factor(const std::vector<float>& v, int n, float eps) {
@@ -73,10 +72,9 @@ static std::vector<float> gains(int n) {
     for (auto& x : g) x = d(rng);
     return g;
 }
-/* vs the host arm, the difference in units of the row's RMS: a different summation order moves the
- * norm factor by an f32 ulp, which flips a bf16 rounding here and there -- and where the residual
- * add cancels, a flipped ulp of the addend is many ulps of a small sum, so ulps of the OUTPUT are
- * the wrong yardstick and the row's scale is the right one. */
+/* Difference from the host arm in units of the row's RMS. A different summation order moves the
+ * norm factor by an f32 ulp, which flips the odd bf16 rounding; where the residual add cancels,
+ * one ulp of the addend is many ulps of the small sum, so output ulps are the wrong yardstick. */
 struct Tally { long chain_bad = 0, host_diff = 0, host_bad = 0, pad = 0; double worst = 0.0; };
 static void cmp(const uint16_t* got, const uint16_t* chain, const uint16_t* host, int n, Tally& t) {
     double ss = 0.0;
@@ -195,8 +193,8 @@ static int case_route(int M, int n, int pad, int extra_rows, bool zero_group = f
             for (int j = 0; j < 128; ++j) {
                 const int i = g * 128 + j;
                 q_chain += qd[oq + i] != rad_f32_to_fp8e4m3(std::fmin(std::fmax(h[j] * inv, -448.0f), 448.0f));
-                /* vs the host arm: one code step is an eighth of its value at most, which is no
-                 * more than an eighth of the group's amax; a scale an ulp off moves less */
+                /* vs the host arm: one code step is at most an eighth of its value, so at most an
+                 * eighth of the group's amax; a scale an ulp off moves less */
                 const double dv = std::fabs((double)rad_fp8e4m3_to_f32(qd[oq + i]) * sd[os + g] -
                                             (double)rad_fp8e4m3_to_f32(qh[oq + i]) * sh[os + g]);
                 if (dv > (double)am / 8 + 1e-30) ++q_host_bad;

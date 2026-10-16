@@ -1,8 +1,8 @@
 /* advance_impl.h -- one row of an advance, shared by the kernel (advance.hip) and the host backend
- * (advance.cpp). See advance.h for what the modes are and why the card computes them.
+ * (advance.cpp). See advance.h for the modes.
  *
- * Every row is independent: it reads its own slot's state and writes only its own positions,
- * tokens and slots, so the kernel runs one thread a row and the host a loop.
+ * Rows are independent: each reads its own slot's state and writes only its own positions, tokens
+ * and slots, so the kernel runs one thread per row and the host a loop.
  */
 #pragma once
 #include "advance.h"
@@ -28,10 +28,9 @@ RAD_ADV_FN bool adv_is_eog(const AdvanceArgs& a, int32_t t) {
     return lo < a.n_eog && a.eog[lo] == t;
 }
 
-/* Every group's slots for the row's `n` positions, read from the positions just written, and its
- * length from `base`. A position its block table does not reach gets slot -1, which the kernels
- * read as "no slot" -- the builder sized the tables for the furthest position a pass can reach,
- * so it only happens to a row that is being computed for nothing. */
+/* Every group's slots for the row's `n` positions (from the positions just written) and its
+ * length from `base`. A position past the block table gets slot -1 ("no slot"); the builder sizes
+ * tables for the furthest reachable position, so only a row whose output is unused hits this. */
 RAD_ADV_FN void adv_groups(const AdvanceArgs& a, int i, int32_t k, int32_t base, int32_t n) {
     const AdvGroup* G = reinterpret_cast<const AdvGroup*>(a.slab + a.grp_off);
     const int32_t* pos = adv_i32(a, a.pos_off);
@@ -51,8 +50,8 @@ RAD_ADV_FN void adv_groups(const AdvanceArgs& a, int i, int32_t k, int32_t base,
     }
 }
 
-/* A row's position, written, with its rotary components moved by the same amount -- only when it
- * moved, so a row the host placed exactly keeps whatever components the host gave it. */
+/* Writes a row's position and moves its rotary components by the same amount. A row whose
+ * position does not change keeps the host's components. */
 RAD_ADV_FN void adv_pos(const AdvanceArgs& a, int32_t* pos, int32_t row, int32_t p) {
     const int32_t was = pos[row];
     pos[row] = p;
@@ -83,9 +82,9 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
 
     switch (a.mode) {
     case ADV_ACCEPT: {
-        /* THE RULE accept_greedy states, and then the end-of-generation cut collect_step applies:
-         * a draft is accepted while it equals the target's own pick at its position, and the run
-         * stops AT an end-of-generation token rather than after it. */
+        /* accept_greedy's rule, then collect_step's end-of-generation cut: a draft is accepted
+         * while it equals the target's pick at its position, and the run stops at an
+         * end-of-generation token, not after it. */
         const int32_t* y = a.src + rout;
         const int32_t* d = tok + rtok + 1;
         int32_t acc = 0;
@@ -110,13 +109,12 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
     }
     case ADV_HIST: {
         if (a.shared_kv) {
-            /* A HEAD THAT READS THE TRUNK'S CACHE AND KEEPS NONE (rad_drafter_shared_kv). There is
-             * no history to fill, so the pass is round 1 alone and its one row is the last one of
-             * the run below: the committed position, the trunk's row there, the token the trunk
-             * chose after it. Its context is the committed positions and NOT the verify step's
-             * whole run -- the cache past the committed position holds the K and V of the drafts
-             * this verify rejected. The host staged the run's first trunk row; the card adds the
-             * drafts it accepted. */
+            /* A head that reads the trunk's cache and keeps none (rad_drafter_shared_kv). With no
+             * history to fill, the pass is round 1 alone: one row at the committed position, with
+             * the trunk's row there and the token chosen after it. Its context ends at the
+             * committed position, not the verify step's whole run, because the cache past it
+             * holds K/V of rejected drafts. The host staged the run's first trunk row; the card
+             * adds the accepted drafts. */
             int32_t* out = adv_i32(a, a.out_off);
             tok[k] = a.src[rout + S.acc];
             adv_pos(a, pos, k, S.head + a.rot_shift);
@@ -125,14 +123,12 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
             adv_groups(a, i, k, S.head, 1);
             return;
         }
-        /* `aux` positions the host already knew the tokens of, then the verify step's own
-         * positions up to the last one it committed, each with the token committed after it --
-         * the sampler's pick there, since the drafts before it agreed with it. The pass has a
-         * row for every position the step COULD have committed, and the ones past the last
-         * committed repeat it: a position past it would take a rejected draft's hidden state
-         * into the head's cache. The repeat is also what makes the run's LAST row draft round
-         * 1's -- the committed position, its hidden state and the token after it -- whatever
-         * the acceptance was (RadBatch::draft_out_ids). */
+        /* `aux` host-known positions, then the verify step's positions up to the last committed
+         * one, each with the token committed after it (the sampler's pick there). The pass has a
+         * row for every position the step could have committed; rows past the last committed
+         * repeat it, so no rejected draft's hidden state enters the head's cache. The repeat also
+         * makes the run's last row draft round 1's input whatever the acceptance was
+         * (RadBatch::draft_out_ids). */
         const int32_t base = S.head - S.acc - aux;
         const int32_t last = aux + S.acc;
         int32_t* out = adv_i32(a, a.out_off);
@@ -148,10 +144,9 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
         return;
     }
     case ADV_ROUND: {
-        /* Round 2 onward: round 1 is the history pass's last row (ADV_HIST above), so every
-         * round embeds the proposal of the round before it. A head with no cache of its own does
-         * not step forward: it stays at the committed position over the committed context, and
-         * what it proposed reaches the next round through its own hidden state. */
+        /* Round 2 onward (round 1 is the history pass's last row); each round embeds the previous
+         * round's proposal. A head with no cache of its own stays at the committed position over
+         * the committed context; its proposal reaches the next round through its hidden state. */
         const int32_t base = a.shared_kv ? S.head : S.head + a.round - 1;
         const int32_t t = a.src[(int64_t)i * a.src_pitch];
         S.tok[a.round - 1] = t;

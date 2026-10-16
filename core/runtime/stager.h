@@ -1,15 +1,13 @@
 /* stager.h -- the seam a step-time weight stager plugs into.
  *
- * The run phase resolves weights through the residency table (runtime/residency.h), and the mover
- * changes that table between steps. A stager changes it WITHIN a step: it copies a weight that
- * lives off the card into VRAM ahead of the op that reads it and publishes the copy for that op,
- * then publishes the host address again once the op is behind it. The run phase does not know what
- * is staged or why; it calls the stager around the ops of a pass it armed for and re-reads the
- * residency table when the stager says it changed it.
+ * The mover changes the residency table (runtime/residency.h) between steps; a stager changes it
+ * within a step. It copies an off-card weight into VRAM ahead of the op that reads it, publishes
+ * the copy for that op, and republishes the host address once the op is behind it. The run phase
+ * calls the stager around the ops of a pass it armed for and re-reads the residency table when
+ * told it changed.
  *
- * A PASS THE STAGER ARMS FOR IS ISSUED LIVE, never recorded or played from a tape: a tape replays
- * the packets of the pass it recorded and not the host work between them, and the copies and
- * publishes here are exactly that host work.
+ * A pass the stager arms for is issued live, never recorded or replayed from a tape: a tape
+ * replays only packets, not the host work (copies, publishes) between them.
  */
 #pragma once
 #include "../rad_core.h"
@@ -31,7 +29,7 @@ public:
     virtual int before_op(rad_op h, RadStream s, bool* resync) = 0;
 
     /* After op `h` was issued on stream `s`: the point a staged weight's last reader is behind. */
-    virtual int after_op(rad_op h, RadStream s) = 0;
+    virtual int after_op(rad_op, RadStream) { return RAD_OK; }
 
     /* The pass has been issued, on `s`: nothing the stager published for it may outlive it. It
      * may publish weights for a later pass it expects to arm for, which that pass's begin_pass
@@ -39,11 +37,9 @@ public:
     virtual int end_pass(RadStream s) = 0;
 };
 
-/* TWO STAGERS ON ONE PASS, each called only on the passes it armed for. A stager that declined a
- * pass is not handed its ops: one that arms only for large passes -- because its buffers are lent
- * out the rest of the time -- must not stage into memory it does not own because another stager
- * armed. The order is fixed, so the copies and stream waits each issues land in the same order on
- * every pass. */
+/* Two stagers on one pass, each called only on the passes it armed for, so a stager whose
+ * buffers are lent out on small passes never stages because the other one armed. The call order
+ * is fixed, so copies and stream waits land in the same order on every pass. */
 class StagerChain final : public OpStager {
 public:
     void set(OpStager* a, OpStager* b) { s_[0] = a; s_[1] = b; }

@@ -1,4 +1,4 @@
-/* derive.cpp -- the derivation table. One row per name; adding one is adding a row.
+/* derive.cpp -- the derivation table, one row per name.
  */
 #include "derive.h"
 
@@ -8,9 +8,7 @@ namespace rad {
 
 /* ------------------------------------------------------------------ seq_start_index */
 /* [n_seq+1] -- where each sequence's tokens begin in this step's flat token array, and the total.
- * This is cu_seqlens, exposed as a declared buffer so a plugin can name it as an operand instead
- * of reaching into RadBatch. It costs a copy of n_seq+1 int32 and it means an op's operand list
- * says what it reads. */
+ * A copy of cu_seqlens, so a plugin can name it as an operand instead of reaching into RadBatch. */
 static int d_seq_start_index(const DeriveInput& in, int32_t* out, int64_t cap, int64_t* n_out) {
     int64_t n = in.n_seq + 1;
     if (n > cap) return RAD_E_FULL;
@@ -20,13 +18,12 @@ static int d_seq_start_index(const DeriveInput& in, int32_t* out, int64_t cap, i
 }
 
 /* ------------------------------------------------------------------ conv_state_index */
-/* [n_seq] -- the entry of the conv state cache this sequence's update reads from.
+/* [n_seq] -- the conv state cache entry this sequence's update reads from.
  *
- * libr4d treats the conv state as a rolling window of `width-1 + num_spec` entries and reads at
- * the slot the last accepted token left, so a speculative rejection is a change of READ OFFSET
- * rather than a recompute (spec §10). The window base is the sequence's state slot; the offset is
- * the cursor the scheduler advances by 1 + num_accepted per verify. Both numbers live in the
- * request's bookkeeping, which is why this is a scheduler-side derivation and not a kernel one. */
+ * The conv state is a rolling window of `width-1 + num_spec` entries read at the slot the last
+ * accepted token left, so a speculative rejection moves the read offset instead of recomputing
+ * (spec §10). Base is the sequence's state slot; offset is the cursor the scheduler advances by
+ * 1 + num_accepted per verify. Both live in request bookkeeping, hence a scheduler derivation. */
 static int d_conv_state_index(const DeriveInput& in, int32_t* out, int64_t cap, int64_t* n_out) {
     if (in.n_seq > cap) return RAD_E_FULL;
     if (!in.conv_slot) return RAD_E_STATE;
@@ -41,15 +38,11 @@ static int d_conv_state_index(const DeriveInput& in, int32_t* out, int64_t cap, 
 }
 
 /* ------------------------------------------------------- the linear-state chunk walk */
-/* The chunked linear-attention kernels tile a sequence in fixed chunks measured from the
- * sequence's own origin, not from the start of the step's token array. In a varlen batch those two
- * disagree, so the boundaries have to be derived: a chunk may never cross a sequence boundary, and
- * a chunk boundary must land on an absolute multiple of the chunk length or the recurrent state
- * carried into the next chunk is the state of a partial tile.
- *
- * The scheduler already guarantees a prefill chunk ends on a multiple of the quantum (geometry.h),
- * so in a pure prefill step the interior boundaries are exactly the multiples; the walk still runs
- * because a mixed step's decode rows start at arbitrary positions. */
+/* Chunked linear-attention kernels tile each sequence in fixed chunks from the sequence's own
+ * origin, not the step's token array. A chunk never crosses a sequence boundary, and interior
+ * boundaries land on absolute multiples of the chunk length, or the carried recurrent state would
+ * be that of a partial tile. Prefill chunks already end on the quantum (geometry.h); the walk is
+ * still needed because a mixed step's decode rows start at arbitrary positions. */
 template <bool WantSeq>
 static int chunk_walk(const DeriveInput& in, int32_t* out, int64_t cap, int64_t* n_out) {
     const int64_t C = in.state_chunk > 0 ? in.state_chunk : 1;
@@ -77,14 +70,13 @@ static int chunk_walk(const DeriveInput& in, int32_t* out, int64_t cap, int64_t*
 }
 
 /* [n_chunks+1] token indices: chunk c covers [out[c], out[c+1]). out[0] is 0 and the last entry is
- * n_tok, so the array reads exactly like cu_seqlens does. */
+ * n_tok, like cu_seqlens. */
 static int d_state_chunk_bounds(const DeriveInput& in, int32_t* out, int64_t cap, int64_t* n_out) {
     return chunk_walk<false>(in, out, cap, n_out);
 }
 
-/* [n_chunks] -- which sequence each chunk belongs to. Recoverable from the bounds by a search
- * against cu_seqlens, but the search is per chunk in every layer that wants it, and this is one
- * pass shared by all of them. */
+/* [n_chunks] -- which sequence each chunk belongs to. Derivable from the bounds, but one shared
+ * pass here saves a per-chunk search in every layer. */
 static int d_state_chunk_seq(const DeriveInput& in, int32_t* out, int64_t cap, int64_t* n_out) {
     return chunk_walk<true>(in, out, cap, n_out);
 }

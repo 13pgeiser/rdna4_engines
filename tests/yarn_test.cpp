@@ -31,7 +31,7 @@ TEST(yarn_metadata_is_independent_of_deployment_context) {
     CHECK_EQ(draft.yarn.factor, 4.0f); CHECK_EQ(target.yarn.factor, 2.0f);
 }
 
-/* THE CORRECTION BOUNDS ARE vLLM's: _yarn_find_correction_range at beta 32/1 over 262144 trained
+/* The correction bounds are vLLM's: _yarn_find_correction_range at beta 32/1 over 262144 trained
  * positions and theta 1e7, floored and ceiled, for the three rotary widths the Qwen family uses.
  * These integers and the blend formula in abi/rad_yarn.h are the whole of the vLLM agreement; the
  * frequency and phase references in tests/ref_test.cpp are pinned to them. */
@@ -50,9 +50,9 @@ TEST(yarn_correction_bounds_match_vllm_at_every_rotary_width) {
     }
 }
 
-/* ONE READER, AND IT ANSWERS FOR EVERY TYPE: default and the legacy `mrope` spelling are no
- * scaling, linear divides positions, and a scheme it does not implement is refused by name with
- * the geometry left as it was -- never read as a linear divide by its factor. */
+/* One reader for every type: default and the legacy `mrope` spelling mean no scaling, linear
+ * divides positions, and an unimplemented scheme is refused by name with the geometry unchanged,
+ * never read as a linear divide by its factor. */
 TEST(the_rotary_reader_names_every_type_it_does_not_implement) {
     const char* keys[] = {"rope_scaling.type", "rope_scaling.factor",
                           "rope_scaling.original_max_position_embeddings"};
@@ -153,7 +153,7 @@ TEST(yarn_legacy_explicit_magnitude_and_fractional_bounds) {
 }
 
 /* --rope-scaling (core/format/rope_override.h) rewrites a container's keys at load; yarn_from then
- * reads the result as it reads a converted container. These hold the two together. */
+ * reads the result as it reads a converted container. These cases check the two together. */
 namespace {
 struct Meta {
     std::vector<std::string> k, v;
@@ -207,8 +207,8 @@ TEST(rope_spec_parse_takes_yarn_with_a_factor_above_one_or_none) {
         CHECK(!rad::rope_spec_parse(bad, &r));
 }
 
-/* THE TRAP THE OVERRIDE EXISTS TO AVOID: the container names its rotary under text_config., and
- * the reader takes the first object that names one -- so YaRN written beside it is never read. */
+/* The case the override exists for: the container names its rotary under text_config., and the
+ * reader takes the first object that names one, so YaRN written beside it is never read. */
 TEST(rope_override_writes_where_the_reader_looks_on_a_qwen38_container) {
     {
         Meta naive = qfn_container();
@@ -242,9 +242,9 @@ TEST(rope_override_writes_where_the_reader_looks_on_a_qwen38_container) {
     CHECK(g2.yarn.low < 14.0f);   /* a shorter trained length moves the ramp down */
 }
 
-/* A checkpoint's own YaRN: the override's factor replaces it, its trained length stays, and what
- * belonged to the old factor (an explicit attention_factor) goes so the reader derives it anew.
- * `none` takes it off. */
+/* A checkpoint's own YaRN: the override's factor replaces it, its trained length stays, and
+ * anything tied to the old factor (an explicit attention_factor) is dropped so the reader derives
+ * it again. `none` removes it. */
 TEST(rope_override_over_a_checkpoints_own_yarn_and_none_takes_it_off) {
     auto legacy = [] {
         return Meta{ { "rope_scaling.type", "yarn" }, { "rope_scaling.factor", "4" },

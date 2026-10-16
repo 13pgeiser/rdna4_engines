@@ -1,10 +1,10 @@
 /* wtab.h -- writing entries of a device weight table in stream order.
  *
- * A routed layer's weight table is a device array of expert pointers, and the mover changes a few
- * of its entries on most steps. The new values travel IN THE KERNEL'S ARGUMENTS, which the backend
- * copies when the dispatch is enqueued. A copy out of a host array would read that array when the
- * card reaches the copy instead -- and the host runs ahead of the card, so by then it may hold the
- * NEXT step's pointers, including one whose transfer that earlier step was never ordered behind.
+ * A routed layer's weight table is a device array of expert pointers; the mover changes a few
+ * entries on most steps. The new values travel in the kernel arguments, which the backend copies
+ * at enqueue. A copy from a host array would read it when the card reaches the copy, and since the
+ * host runs ahead, it could then hold the next step's pointers, including one whose transfer this
+ * step is not ordered behind.
  */
 #pragma once
 #include <cstdint>

@@ -2,33 +2,19 @@
  *
  *     nt: C[M,N] = A[M,K] @ B[N,K]^T
  *
- * B is stored TRANSPOSED because that is the layout every weight in a transformer already has, so
- * both operands are k-contiguous and the inner loop is a DOT PRODUCT over k rather than an outer
- * product over n. That single fact decides the whole shape of this file, and it is worth being
- * explicit about what it costs, because the textbook GEMM does the opposite.
+ * B is stored transposed, as transformer weights are, so both operands are k-contiguous.
  *
- * ============================== WHY DOT PRODUCT AND NOT OUTER PRODUCT ==============================
+ * Which product runs:
+ *   gemm_q_bf16    (avx_gemm_tile.cpp) on AVX512_BF16 parts: bf16 x bf16 and every plain
+ *                  gemm_nt_q form, including a joined lm head read as codes and a scale grid
+ *   gemm_tile_f32  (avx_gemm_tile.cpp) everything else, at every level
+ *   gemm_drive's own loop, below: the forms the tile drivers decline (an E8M0 scale they cannot
+ *                  fold, a decoded weight with a separate scale stream)
+ *   the zero-point grids' small-M paths: their integer and 16-bit forms at M <= 16
  *
- * The classical high-performance GEMM (Goto's, and every BLAS since) packs B into panels laid out
- * so the inner loop broadcasts one A element against a VECTOR of n, accumulating C[m, n0:n0+w] in
- * registers with no horizontal reduction anywhere. It is the right shape when you may choose B's
- * layout.
- *
- * Here B's layout is given, it is k-contiguous, and a transformer weight is READ ONCE PER LAUNCH --
- * there is no second GEMM against the same weight to amortise a pack over. Packing B into n-major
- * panels would mean touching the largest operand twice to save horizontal reductions that only
- * happen once per output element. At decode (M = 1) the whole GEMM is a matvec: the weight is
- * streamed exactly once, the arithmetic intensity is 2 flops a byte, and nothing about the
- * instruction mix matters because the memory system is the wall. At prefill the register blocking
- * below recovers most of what a packed form would give.
- *
- * So: REGISTER-BLOCKED DOT PRODUCT. MR rows of A against NR rows of B, MR*NR vector accumulators
- * live across the whole k loop, MR + NR vector loads per k step, and the horizontal reduction paid
- * once per output element rather than once per k step.
- *
- * ============================== THE BLOCK SIZE IS THE REGISTER FILE, AND IT WAS SWEPT ==============================
- *
- * MEASURED, gemm_nt bf16 at M=512, N=2048, K=2048, one thread, on the part libavx/README.md names:
+ * gemm_drive's loop is a dot-product register block: MR rows of A against NR rows of B, MR*NR
+ * vector accumulators across the k loop, one horizontal reduction per output and group. The block
+ * was swept (gemm_nt bf16, M=512, N=2048, K=2048, one thread; libavx/README.md names the part):
  *
  *   AVX-512, 32 ZMM         4x4  23.2 ms      4x6  22.1 ms  <-- chosen
  *                           6x4  24.2 ms      6x6  24.0 ms
@@ -37,60 +23,16 @@
  *                           2x5  31.9 ms      2x4  34.8 ms      2x3  40.5 ms
  *                           3x4  58.4 ms      4x3  58.1 ms
  *
- * TWO THINGS IN THAT TABLE ARE WORTH MORE THAN THE CHOICE. The first is the cliff: 3x4 and 4x3 at
- * AVX2 are 58 ms against 31-34 for everything around them, because 12 accumulators plus 3 or 4 A
- * vectors plus one B vector is 16 or 17 live in a 16-register file -- the spill lands INSIDE the k
- * loop and costs 1.9x. That is why this is written out per level rather than derived from a
- * formula, and why the numbers sit next to the code.
- *
- * The second is that WIDER IN N BEAT WIDER IN M at both levels, at equal arithmetic intensity:
- * 2x6 and 3x3 both load 8 vectors for 12 and 9 FMAs respectively -- intensity 1.5 either way -- and
- * 2x6 is 11% faster. The B vector is loaded once and reused across the MR inner iterations, so a
- * small MR keeps fewer values live and schedules better. Nothing about the flop count predicts
- * this; it came out of the sweep.
- *
- * scalar stays 2x2, where "vector" is one float and the blocking only helps the load/store
- * scheduler.
- *
- * ============================== ONE MICROKERNEL, NOT TWENTY-EIGHT ==============================
- *
- * libref templates its inner loop on (A dtype, B dtype) and selects through a function pointer,
- * because for it the per-element dtype switch WOULD be the cost -- one element is read per FLOP.
- * That is 16 instantiations for the plain family and 28 for the quantised one.
- *
- * This plugin instead PACKS TO f32 and has ONE microkernel:
- *
- *     A is widened once into a contiguous [M, K] f32 buffer   -- M*K conversions
- *     each B row is widened once, per n-block, into a thread-local buffer  -- N*K conversions
- *
- * The conversion count is the same as the fused form's (every element of both operands is
- * converted exactly once either way); what it buys is that W4, W2, MXFP4, fp8 and i8 all arrive at
- * the same code, so the packed-nibble unpack is written once (avx_support.cpp) and the microkernel
- * never sees a dtype. 28 instantiations x 4 ISA levels of hand-written vector code is not a
- * maintainable object, and the ones nobody runs would be the ones that are wrong.
- *
- * What it costs is an L1 round trip: the packed rows are written and read back. Against an operand
- * that came from L2 or DRAM -- which a weight always did -- that is not measurable, and the
- * exception is stated where it happens (an f32 contiguous A is used in place, unpacked).
- *
- * THE MEMORY THIS COSTS IS BOUNDED BY THE M BLOCK below -- the pack is MB*K floats, not M*K -- and
- * it is not blocked over K. That is a deliberate omission: K-blocking would bound the pack further
- * but would force the C accumulator into memory, because the k reduction could then no longer live
- * in registers across the whole launch. C is M*N floats, larger than the pack at every shape this
- * plugin sees, and another pass over it.
- *
- * ============================== PARALLELISM IS OVER N ==============================
- *
- * A decode step is M = 1 and a verify step is M <= 64, so an M-major split leaves all but one core
- * idle on exactly the shape the engine spends its life in. N is thousands in every GEMM a
- * transformer issues. libref made the same choice for the same reason. Each thread owns whole
- * output elements, so the summation order does not depend on the thread count and two runs at
- * different loads are bit-identical.
+ * At AVX2, 3x4 and 4x3 need 12 accumulators + 3-4 A vectors + 1 B vector, 16-17 live registers in a
+ * 16-register file: the spill lands inside the k loop and costs 1.9x. The scalar level uses 2x2.
+ * Both operands are packed to f32 (A once per M block, each B row once per n-block), so every
+ * weight format reaches one microkernel. Parallelism is over N; each thread owns whole outputs, so
+ * results do not depend on the thread count.
  */
-#include "avx_vec.h"
-#include "avx_common.h"
+#include "avx_gemm.h"
 #include "avx_rows.h"
 
+#include <algorithm>
 #include <vector>
 
 using namespace avx;
@@ -106,12 +48,10 @@ constexpr int64_t MR = 2, NR = 6;
 constexpr int64_t MR = 2, NR = 2;
 #endif
 
-/* MR x NR dot products over [k0, k1), accumulated into `out` (which is ADDED to, not overwritten,
- * so the grouped GEMM can call this per group).
+/* MR x NR dot products over [k0, k1), added into `out` so the grouped GEMM can call it per group.
  *
- * The tail is summed separately and added to the horizontal reduction rather than folded into a
- * masked vector: the two give different orders and the masked form is only free at AVX-512. One
- * order, four levels. */
+ * The k tail is summed scalar after the horizontal reduction rather than in a masked vector (free
+ * only at AVX-512), so all four levels share one summation order. */
 template <int MB_, int NB_>
 static inline void dot_block(const float* A, int64_t lda, const float* B, int64_t ldb,
                              int64_t k0, int64_t k1, float out[MB_][NB_]) {
@@ -136,124 +76,100 @@ static inline void dot_block(const float* A, int64_t lda, const float* B, int64_
         }
 }
 
-/* One dot product, for the ragged edge of the M and N loops. Four accumulators, which is what
- * covers the FMA latency; the edge is at most MR-1 by NR-1 blocks of a launch, so its cost is
- * noise, but writing it as a scalar loop would make a narrow GEMM (N < NR) run scalar throughout
- * and a draft head's lm_head is exactly that shape. */
-static inline float dot1(const float* a, const float* b, int64_t k0, int64_t k1) {
-    vf a0 = vf_zero(), a1 = vf_zero(), a2 = vf_zero(), a3 = vf_zero();
-    int64_t k = k0;
-    for (; k + 4 * VF_N <= k1; k += 4 * VF_N) {
-        a0 = vf_fma(vf_loadu(a + k), vf_loadu(b + k), a0);
-        a1 = vf_fma(vf_loadu(a + k + VF_N), vf_loadu(b + k + VF_N), a1);
-        a2 = vf_fma(vf_loadu(a + k + 2 * VF_N), vf_loadu(b + k + 2 * VF_N), a2);
-        a3 = vf_fma(vf_loadu(a + k + 3 * VF_N), vf_loadu(b + k + 3 * VF_N), a3);
-    }
-    for (; k + VF_N <= k1; k += VF_N) a0 = vf_fma(vf_loadu(a + k), vf_loadu(b + k), a0);
-    float s = vf_hsum(vf_add(vf_add(a0, a1), vf_add(a2, a3)));
-    for (; k < k1; ++k) s += a[k] * b[k];
-    return s;
-}
-
-/* ================================================================== operand readings
- * libref/ref_gemm.h's, and they are copied for the same reason avx_common.h copies the addressing
- * helpers: they are the CONTRACT for which bytes an operand's (row, col) lives at, not a
- * convenience. `row_stride` (avx_common.h) in particular is the one that makes an oracle wrong
- * when it is wrong -- a rank-3 [tokens, heads, width] activation read as [tokens, heads*width] has
- * a row stride that is the product of the trailing dimensions and NOT stride[rank-2], and taking
- * the head stride instead lands row 0 correctly and starts every row after it `width` elements
- * in. */
-
-struct Mat { const RadTensor* t; int64_t rs, cs; };
-
-static inline Mat as_mat(const RadTensor* t, int64_t cols) {
-    Mat m{ t, cols, 1 };
-    if (t->rank < 2) return m;
-    m.cs = t->stride[t->rank - 1];
-    m.rs = row_stride(t, cols);
-    return m;
-}
-
-/* A quantised operand's scale stream. libref/ref_gemm.h is the definition, including the `rblk`
- * rule that makes a DeepSeek-style [ceil(N/128)][ceil(K/128)] block grid readable: without it a
- * 17408-row weight's 136-row scale plane is read as if it had 17408 rows and lands on groups = 0,
- * which is a plausible wrong number rather than a diagnosable failure. */
-struct Scales {
-    const void* p;
-    uint32_t dt;
-    int64_t rs, cs, group, rblk;
-    bool e8m0;
-    inline float grp(int64_t row, int64_t g) const {
-        const int64_t i = (rblk > 1 ? row / rblk : row) * rs + g * cs;
-        if (e8m0) {
-            const uint8_t e = ((const uint8_t*)p)[i];
-            return e == 0xff ? std::nanf("") : std::ldexp(1.0f, (int)e - 127);
-        }
-        return rad_load_f32(p, dt, i);
-    }
-};
-
-static Scales make_scales(const RadTensor* s, int64_t rows, int64_t K, bool mxfp4_weight) {
-    Scales q{};
-    q.rblk = 1;
-    if (!s || !s->data || rows <= 0 || numel(s) <= 0) {
-        q.p = nullptr; q.group = K; q.dt = RAD_F32; return q;
-    }
-    q.p = s->data;
-    q.dt = s->dtype;
-    /* libref's reading, block for block: a rank-2 stream with fewer rows than the operand is a
-     * block grid whatever the remainder, and a flat stream shorter than the row count is one
-     * scale per block of rows rather than a per-row stream to read past its end. */
-    int64_t groups = 0;
-    if (s->rank >= 2) {
-        const int64_t srows = s->shape[s->rank - 2];
-        q.rblk = srows >= rows ? 1 : grid_block(rows, srows);
-        groups = s->shape[s->rank - 1];
-        q.rs = s->stride[s->rank - 2];
-        q.cs = s->stride[s->rank - 1];
-    } else {
-        const int64_t nel = numel(s);
-        if (nel >= rows) { groups = nel / rows; q.rs = groups; }
-        else             { groups = 1; q.rblk = grid_block(rows, nel); q.rs = 1; }
-        q.cs = 1;
-    }
-    q.group = grid_block(K, groups);
-    q.e8m0 = mxfp4_weight && (s->dtype == RAD_U8);
-    return q;
-}
 
 /* ================================================================== packing
- * A row of an operand, widened into f32 and made contiguous. Returns the caller's own pointer when
- * the operand is ALREADY dense f32 -- the one case where the pack is skipped entirely, and the
- * reason a f32 GEMM does not pay for the generality. */
+ * Rows of an operand widened to contiguous f32. Returns a pointer into the operand itself when it
+ * is already dense f32 with the right pitch, skipping the pack. */
 static const float* pack_rows(const Mat& m, int64_t r0, int64_t nrows, int64_t K, float* dst,
                               int64_t ldd) {
+    if (m.dec) {
+        for (int64_t r = 0; r < nrows; ++r) m.dec->row(r0 + r, dst + r * ldd);
+        return dst;
+    }
     const RadTensor* t = m.t;
     if (m.cs == 1 && t->dtype == RAD_F32 && m.rs == ldd)
         return (const float*)t->data + r0 * m.rs;
-    for (int64_t r = 0; r < nrows; ++r) {
-        const int64_t base = (r0 + r) * m.rs;
-        if (m.cs == 1) {
-            const int sub = (t->dtype == RAD_I4 || t->dtype == RAD_FP4E2M1) ? 1
-                          : (t->dtype == RAD_I2) ? 3 : 0;
-            if (!sub || (base & sub) == 0) {
-                row_to_f32(t->dtype, byte_at(t->data, t->dtype, base), dst + r * ldd, K);
-                continue;
-            }
-        }
-        for (int64_t k = 0; k < K; ++k)
-            dst[r * ldd + k] = ld_elem(t->data, t->dtype, base + k * m.cs);
-    }
+    for (int64_t r = 0; r < nrows; ++r) widen_cols(m, r0 + r, 0, K, dst + r * ldd);
     return dst;
 }
 
+/* ================================================================== joined weights
+ *
+ * Row decoders for weights stored joined (avx_planes.h). Each writes a row as f32 with its scales
+ * folded in, so the driver multiplies it like a plain row in one group:
+ *
+ *   HeadDec  codes times the scale covering them: an lm head, a mixing or fc row. Each element is
+ *            the f32 the core's affine decoder gives, the head libref multiplies.
+ *   ZpDec    a zero-point grid's row, (code - zero) * scale. For the grids that remove the zero
+ *            through `a_sum` it is code * scale with one more column a group holding
+ *            -zero * scale, against an activation whose matching column holds that group's sum.
+ *
+ * With the scales folded into the rows each product rounds once, where libref rounds each
+ * group's sub-sum once; the two differ within the tolerance. */
+
+/* Rows of codes and one scale (avx_planes.h: ScaledRows), `K` wide. */
+struct HeadDec final : RowDecoder {
+    avxp::ScaledRows sr;
+    int64_t K = 0;
+    void row(int64_t r, float* dst) const override { scaled_row(sr, r, K, dst); }
+    void cols(int64_t r, int64_t k0, int64_t k1, float* dst) const override {
+        const uint8_t* c = sr.codes.p + r * sr.codes.row_bytes;
+        const int64_t span = sr.span(K);
+        for (int64_t c0 = k0; c0 < k1; c0 += span)
+            decode_scaled(sr.codes.dt, c + c0, sr.scale_at(r, c0), dst + (c0 - k0),
+                          std::min(span, k1 - c0));
+    }
+    int64_t align() const override { return sr.span(K); }
+    void codes(int64_t r, int64_t k0, int64_t k1, const void** p, int64_t* bytes) const override {
+        *p = sr.codes.p + r * sr.codes.row_bytes + k0;
+        *bytes = k1 - k0;
+    }
+};
+
+/* A zero-point grid's rows (avx_planes.h: ZpGrid) from row `n0` on: codes at `codes_p`, `rb` bytes
+ * a row, with the joined scale and zero planes. `aug` writes code * scale and the extra column of
+ * -zero * scale per group, `group + 1` columns a group; otherwise (code - zero) * scale. */
+struct ZpDec final : RowDecoder {
+    const uint8_t* codes_p = nullptr;
+    int64_t rb = 0, K = 0, group = 0, n0 = 0;
+    int bits = 0;
+    bool aug = false;
+    avxp::JPlane sc, zp;
+    void row(int64_t r, float* dst) const override { cols(r, 0, K / group * align(), dst); }
+    /* Whole groups: [k0, k1) in the decoded row's columns, `group + 1` a group when aug. */
+    void cols(int64_t r, int64_t k0, int64_t k1, float* dst) const override {
+        const int64_t n = n0 + r;
+        const uint8_t* cr = codes_p + n * rb;
+        const int64_t gw = align();
+        for (int64_t g = k0 / gw; g * gw < k1; ++g) {
+            const float s = sc.at(n, g);
+            const int32_t z = (int32_t)zp.at(n, g);
+            float* d = dst + (g * gw - k0);
+            if (aug) {
+                decode_zp(cr, bits, g * group, group, 0, s, d);
+                d[group] = -(float)z * s;
+            } else {
+                decode_zp(cr, bits, g * group, group, z, s, d);
+            }
+        }
+    }
+    int64_t align() const override { return aug ? group + 1 : group; }
+    void codes(int64_t r, int64_t k0, int64_t k1, const void** p, int64_t* bytes) const override {
+        const int64_t gw = align();
+        *p = codes_p + (n0 + r) * rb + (k0 / gw) * group * bits / 8;
+        *bytes = ((k1 - k0 + gw - 1) / gw) * group * bits / 8;
+    }
+};
+
 /* ================================================================== the driver
  *
- * `SB`/`SA` null means the unquantised family, which is the same loop with one group of width K
- * and both scales 1 -- so there is one driver and not two. The grouped form accumulates the
- * sub-sum from the RAW CODES and scales once at the end of the group, which is what an int8 WMMA
- * kernel does and what libref does; folding the scales into every product instead would be a
- * different number in the last bits and the checker would blame the kernel for the choice. */
+ * Null `SB`/`SA` is the unquantised family: one group of width K, scales 1. The grouped form sums
+ * raw codes and applies the scales once per group, as libref and an int8 WMMA kernel do; scaling
+ * every product would differ in the last bits. */
+static int gemm_drive_fine_a(const Mat& ma, const Mat& mb, const Scales* SA, const Scales* SB,
+                             const RadTensor* Y, const RadTensor* bias, int64_t M, int64_t N,
+                             int64_t K);
+
 static int gemm_drive(const Mat& ma, const Mat& mb, const Scales* SA, const Scales* SB,
                       const RadTensor* Y, const RadTensor* bias, int64_t M, int64_t N,
                       int64_t K) {
@@ -261,46 +177,31 @@ static int gemm_drive(const Mat& ma, const Mat& mb, const Scales* SA, const Scal
     const int64_t ys_c = Y->rank >= 2 ? Y->stride[Y->rank - 1] : 1;
     const int64_t g = (SB && SB->p && SB->group > 0) ? SB->group : K;
     const int64_t ngrp = (K + g - 1) / g;
-    /* An activation grid FINER than the weight's cannot have its scale hoisted out of the group.
-     * No format in this project has one; the branch exists so that a format that did would be
-     * refused rather than silently mis-scaled. */
+    /* An activation scale grid finer than the weight's cannot be hoisted out of the group. */
     const bool coarse_a = !SA || !SA->p || SA->group >= g;
-    if (!coarse_a) return RAD_E_UNSUPPORTED;
+    if (!coarse_a) return gemm_drive_fine_a(ma, mb, SA, SB, Y, bias, M, N, K);
+    if (gemm_tile_f32(ma, mb, SA, SB, Y, bias, M, N, K)) return RAD_OK;
 
-    /* ================================================== THE M BLOCK, AND A NULL RESULT
+    /* ================================================== the M block
      *
-     * The loop nest below is (M block) x (N block) x (K). With the N loop outermost and the whole
-     * of A packed, every one of the N/NR n-blocks walks the ENTIRE packed A, so at M=512, K=2048
-     * that is a 4 MiB panel re-read 341 times: 1.4 GiB of traffic to do 4.3 GFLOP. Blocking M so
-     * the panel stays resident is the textbook fix, and the traffic argument predicts a large win.
+     * Loop nest: (M block) x (N block) x K. Unblocked, every n-block re-reads the whole packed A
+     * (at M=512, K=2048, a 4 MiB panel read 341 times). Blocking M keeps the panel in L2.
      *
-     * MEASURED, AND THE PREDICTION DOES NOT HOLD HERE. gemm_nt bf16 at M=512, N=2048, K=2048,
-     * AVX-512, one thread, sweeping the panel target:
+     * On a part with 128 MiB of L3 the gain is only ~6% (gemm_nt bf16, M=512, N=2048, K=2048,
+     * AVX-512, one thread: 23.4 ms at a 256 KiB panel vs 25.0 ms unblocked), because the panel
+     * stays in L3 anyway; at M=64 it is ~2% slower (B is packed twice). It is kept for parts with
+     * small L3, where the re-reads go to DRAM.
      *
-     *       128 KiB  26.0 ms        4 MiB  25.4 ms
-     *       256 KiB  23.4 ms       16 MiB  25.4 ms
-     *         1 MiB  24.0 ms      256 MiB  25.0 ms   (= no blocking at this shape)
-     *
-     * Six percent, not the several-fold the traffic argument implies -- and at M=64 it is WORSE
-     * (2.85 ms unblocked against 2.91 at 256 KiB), because there the block splits a batch that did
-     * not need splitting and B gets packed twice.
-     *
-     * THE REASON IS THE PART. The measurement above comes from one with 128 MiB of L3, where the
-     * 4 MiB A panel never leaves cache however many times it is walked -- so the traffic the
-     * blocking removes is served at L3 bandwidth and not DRAM's. On a part with a 32 MiB L3
-     * the same argument still holds; on one with 8 MiB the blocking is the several-fold win the
-     * theory predicts. It is kept because it is never much worse and is much better on hardware
-     * the measurement above cannot represent -- but it is recorded here as a SIX PERCENT effect on
-     * a large-cache part, and not as the fix it looks like.
-     *
-     * THE BLOCK SIZE IS COMPUTED FROM K, NOT TUNED: the panel is MB x K floats against a fixed
-     * byte target. There is nothing to search -- unlike a GPU tile it does not interact with an
-     * occupancy limit -- which is why avx_registry.cpp declares no tunable axes. The target is
-     * stated rather than probed from CPUID because the cache descriptors there are a fiction on
-     * more parts than they are a fact, and the sweep above shows the curve is flat enough that
-     * being wrong about it costs ten percent rather than an order. */
+     * MB is derived from K against a fixed byte target, not tuned (hence no tunable axes in
+     * avx_registry.cpp). The target is a constant rather than read from CPUID cache descriptors,
+     * which are unreliable; the measured curve is flat, so a wrong guess costs about 10%. */
     enum { AVX_L2_PANEL = 256 * 1024 };
     int64_t MB = (int64_t)AVX_L2_PANEL / ((int64_t)K * (int64_t)sizeof(float));
+    /* A decoded weight (a joined head, a zero-point grid) costs a decode per M block on top of
+     * the read, so its M block is as tall as a 16 MiB panel allows: an lm head at K = 5120 is
+     * decoded once up to M = 819 instead of once every 12 rows. The panel is read-only and
+     * shared by the threads through the last level. */
+    if (mb.dec) MB = (int64_t)(16 << 20) / ((int64_t)K * (int64_t)sizeof(float));
     if (MB < MR) MB = MR;
     if (MB > M) MB = M;
 
@@ -310,8 +211,8 @@ static int gemm_drive(const Mat& ma, const Mat& mb, const Scales* SA, const Scal
 
     for (int64_t mb0 = 0; mb0 < M; mb0 += MB) {
         const int64_t mrows = (M - mb0) < MB ? (M - mb0) : MB;
-        /* Packed on the calling thread, before the parallel region: every worker reads it, and
-         * nothing inside the region touches this arena, so the pointer cannot move under them. */
+        /* Packed on the calling thread before the parallel region; nothing in the region calls
+         * scratch_raw, so the pointer stays valid for the workers. */
         const float* Ap = pack_rows(ma, mb0, mrows, K, apack, lda);
 
         AVX_PARALLEL_FOR_IF(mrows * N * K >= 65536)
@@ -349,8 +250,8 @@ static int gemm_drive(const Mat& ma, const Mat& mb, const Scales* SA, const Scal
                             for (int64_t i = 0; i < mm; ++i) {
                                 const float sa = (SA && SA->p)
                                                      ? SA->grp(mb0 + m0 + i, k0 / SA->group) : 1.0f;
-                                acc[i][j] +=
-                                    dot1(Ap + (m0 + i) * lda, Bp + j * ldb, k0, k1) * sa * sb;
+                                acc[i][j] += dotf(Ap + (m0 + i) * lda + k0, Bp + j * ldb + k0,
+                                                  k1 - k0) * sa * sb;
                             }
                         }
                     }
@@ -367,337 +268,39 @@ static int gemm_drive(const Mat& ma, const Mat& mb, const Scales* SA, const Scal
     return RAD_OK;
 }
 
-/* ================================================================== the bf16 outer-product path
- *
- * AN ENCODER'S GEMM IS ALL PREFILL: M is the step's whole token count, thousands of rows, every
- * launch. The driver above is shaped for decode -- it packs A on the calling thread one M block at
- * a time and re-widens each weight row into f32 once per M block -- and at M = 3000, K = 2048 that
- * is the weight widened a hundred times over, behind a single-threaded pack, for 0.14 TFLOPS on a
- * 16-core part.
- *
- * Where both operands are bf16 with unit element stride and the CPU has AVX512_BF16 (Zen 4 on,
- * Cooper Lake and Sapphire Rapids on), this path runs instead, and it is the OUTER-PRODUCT form
- * this file otherwise argues against -- because here M is large enough to pay for the one thing
- * that argument says it costs, a pack of B:
- *
- *   B is packed ONCE A CALL, in parallel, into panels of 48 columns in vdpbf16ps's pair layout,
- *   Bp[panel][K/2][48][2]: one k-pair of 48 columns is three zmm, read contiguously. Columns past
- *   N and the second half of an odd K's last pair are zeros.
- *   The microkernel is 8 rows of A by one panel: per k-pair, three panel loads, eight 32-bit
- *   broadcasts of A's (k, k+1) pair, 24 vdpbf16ps into 24 accumulators. NO HORIZONTAL REDUCTION
- *   anywhere -- each accumulator lane is one output element -- and a row is stored as three
- *   16-wide vectors.
- *   Threads take tiles of (64 rows) x (up to four panels), dynamically. Within a tile the panel
- *   loop is outer, so a panel (K x 96 bytes: 48 KiB at K = 512, 192 KiB at K = 2048) stays in L2
- *   while the tile's row blocks stream through it.
- *
- * MEASURED on a 9950X3D, 16 threads, M = 2048: 6.9 TFLOPS at N = 4096, K = 512 and 6.1 at
- * N = 512, K = 2048. The dot-product form -- vdpbf16ps along K straight out of both rows, 4 x 6
- * blocks -- reached 1.5 at both: at K = 512 a block does sixteen k steps and then 24 sixteen-lane
- * reductions, so the reductions were most of its instruction stream. Below 128 rows the per-call
- * pack is not paid back, and that form (gemm_bf16_dot) still runs there.
- *
- * It is one instruction stream inside the AVX-512 object, compiled for the extra feature with a
- * function attribute and entered only after __builtin_cpu_supports says the CPU has it: an
- * AVX-512 part without BF16 takes the driver above, unchanged.
- *
- * THE ARITHMETIC: products of bf16 pairs in f32, accumulated per output in k order two at a time,
- * with bf16 denormals read as zero (the instruction's DAZ); the bias is the accumulator's start
- * and the store rounds to nearest even. A different summation order from the driver's, inside the
- * checker's bf16 tolerance like every vectorised reduction here. Each output element is computed
- * by one thread, so the result does not depend on the thread count. */
-#if AVX_LEVEL == 3
-#define AVX_BF16_TARGET __attribute__((target("avx512f,avx512bw,avx512vl,avx512bf16")))
-
-constexpr int64_t BP_COLS = 48;     /* columns a panel: three zmm of f32 accumulators */
-constexpr int64_t BP_MR   = 8;      /* rows of A a microkernel */
-
-/* f32 -> bf16 round-to-nearest-even, sixteen lanes, a NaN kept a (quiet) NaN: the scalar
- * converter's arithmetic, vectorised. */
-AVX_BF16_TARGET static inline __m256i bf16_rne16(__m512 x) {
-    const __m512i u = _mm512_castps_si512(x);
-    const __m512i lsb = _mm512_and_si512(_mm512_srli_epi32(u, 16), _mm512_set1_epi32(1));
-    __m512i r = _mm512_srli_epi32(_mm512_add_epi32(_mm512_add_epi32(u, _mm512_set1_epi32(0x7fff)),
-                                                   lsb), 16);
-    const __mmask16 nan = _mm512_cmpgt_epu32_mask(_mm512_and_si512(u, _mm512_set1_epi32(0x7fffffff)),
-                                                  _mm512_set1_epi32(0x7f800000));
-    r = _mm512_mask_mov_epi32(r, nan, _mm512_or_si512(_mm512_srli_epi32(u, 16),
-                                                      _mm512_set1_epi32(0x40)));
-    return _mm512_cvtepi32_epi16(r);
+/* gemm_drive over an activation scale grid finer than the weight's. No supported format has one,
+ * but libref applies such a scale to each element before the product, so A is scaled into an f32
+ * copy here and the product read with no activation scale. The copy is one pass over A. */
+static int gemm_drive_fine_a(const Mat& ma, const Mat& mb, const Scales* SA, const Scales* SB,
+                             const RadTensor* Y, const RadTensor* bias, int64_t M, int64_t N,
+                             int64_t K) {
+    static thread_local std::vector<float> scaled;
+    scaled.resize((size_t)(M * K));
+    for (int64_t m = 0; m < M; ++m) {
+        float* row = scaled.data() + m * K;
+        const float* src = pack_rows(ma, m, 1, K, row, K);
+        for (int64_t k = 0; k < K; ++k) row[k] = src[k] * SA->grp(m, k / SA->group);
+    }
+    RadTensor a{};
+    a.data = scaled.data();
+    a.dtype = RAD_F32;
+    a.rank = 2;
+    a.shape[0] = M; a.shape[1] = K;
+    a.stride[0] = K; a.stride[1] = 1;
+    return gemm_drive(as_mat(&a, K), mb, nullptr, SB, Y, bias, M, N, K);
 }
 
-/* MR_ rows of A against one packed panel, over all of K, stored to the panel's `cols` columns of
- * Y rows 0..MR_-1 (Y already offset to the block's first element). `bv` starts the accumulators:
- * the bias, or zeros. */
-template <int MR_>
-AVX_BF16_TARGET static inline void op_block(const uint16_t* A, int64_t lda, const uint16_t* panel,
-                                            int64_t K, const __m512* bv, void* Y, int64_t ys_r,
-                                            bool yb, int64_t cols) {
-    __m512 acc[MR_][3];
-#pragma GCC unroll 8
-    for (int i = 0; i < MR_; ++i) {
-        acc[i][0] = bv[0];
-        acc[i][1] = bv[1];
-        acc[i][2] = bv[2];
-    }
-    const int64_t kp_full = K / 2;
-    const uint16_t* bp = panel;
-    for (int64_t kp = 0; kp < kp_full; ++kp, bp += 2 * BP_COLS) {
-        const __m512bh b0 = (__m512bh)_mm512_loadu_si512((const void*)bp);
-        const __m512bh b1 = (__m512bh)_mm512_loadu_si512((const void*)(bp + 32));
-        const __m512bh b2 = (__m512bh)_mm512_loadu_si512((const void*)(bp + 64));
-#pragma GCC unroll 8
-        for (int i = 0; i < MR_; ++i) {
-            uint32_t pr;
-            std::memcpy(&pr, A + i * lda + 2 * kp, 4);
-            const __m512bh av = (__m512bh)_mm512_set1_epi32((int)pr);
-            acc[i][0] = _mm512_dpbf16_ps(acc[i][0], av, b0);
-            acc[i][1] = _mm512_dpbf16_ps(acc[i][1], av, b1);
-            acc[i][2] = _mm512_dpbf16_ps(acc[i][2], av, b2);
-        }
-    }
-    if (K & 1) {
-        /* The odd last k: A's element alone in the pair's low half, never the one past the row. */
-        const __m512bh b0 = (__m512bh)_mm512_loadu_si512((const void*)bp);
-        const __m512bh b1 = (__m512bh)_mm512_loadu_si512((const void*)(bp + 32));
-        const __m512bh b2 = (__m512bh)_mm512_loadu_si512((const void*)(bp + 64));
-#pragma GCC unroll 8
-        for (int i = 0; i < MR_; ++i) {
-            const __m512bh av = (__m512bh)_mm512_set1_epi32((int)(uint32_t)A[i * lda + K - 1]);
-            acc[i][0] = _mm512_dpbf16_ps(acc[i][0], av, b0);
-            acc[i][1] = _mm512_dpbf16_ps(acc[i][1], av, b1);
-            acc[i][2] = _mm512_dpbf16_ps(acc[i][2], av, b2);
-        }
-    }
-    /* Every accumulator index is a constant, so the block never leaves the registers. */
-    auto mask = [&](int64_t c0) {
-        const int64_t w = cols - c0 <= 0 ? 0 : (cols - c0 < 16 ? cols - c0 : 16);
-        return (__mmask16)((1u << w) - 1);
-    };
-    const __mmask16 m0 = mask(0), m1 = mask(16), m2 = mask(32);
-#pragma GCC unroll 8
-    for (int i = 0; i < MR_; ++i) {
-        if (yb) {
-            uint16_t* yr = (uint16_t*)Y + i * ys_r;
-            _mm256_mask_storeu_epi16(yr, m0, bf16_rne16(acc[i][0]));
-            _mm256_mask_storeu_epi16(yr + 16, m1, bf16_rne16(acc[i][1]));
-            _mm256_mask_storeu_epi16(yr + 32, m2, bf16_rne16(acc[i][2]));
-        } else {
-            float* yr = (float*)Y + i * ys_r;
-            _mm512_mask_storeu_ps(yr, m0, acc[i][0]);
-            _mm512_mask_storeu_ps(yr + 16, m1, acc[i][1]);
-            _mm512_mask_storeu_ps(yr + 32, m2, acc[i][2]);
-        }
-    }
+/* A quantised product (gemm_nt_q and its gated and parted forms): the bf16 grouped driver
+ * (avx_gemm_tile.cpp) where it applies, which keeps libref's group structure, else gemm_drive. */
+static int gemm_q_drive(const Mat& ma, const Mat& mb, const Scales* SA, const Scales* SB,
+                        const RadTensor* Y, const RadTensor* bias, int64_t M, int64_t N,
+                        int64_t K) {
+    if (gemm_q_bf16(ma, mb, SA, SB, Y, bias, M, N, K)) return RAD_OK;
+    return gemm_drive(ma, mb, SA, SB, Y, bias, M, N, K);
 }
 
-/* THE SMALL-M FORM: vdpbf16ps along K straight out of both rows, 4 x 6 blocks, no pack. The pack
- * in gemm_bf16_dp touches every weight once a call -- 250 MB a forward pass for EmbeddingGemma
- * 2 -- which an encoder step of thousands of rows amortises and a single 16-token query does not:
- * there the outer-product path took a query from 13 to 17 ms. The pack pays for itself where the rows it
- * serves are many; by the measured rates (1.5 against 6 TFLOPS, the pack streaming at memory
- * speed) that is from about 75 rows, and 128 is the switch. */
-template <int MB_, int NB_>
-AVX_BF16_TARGET static inline void dp_block(const uint16_t* A, int64_t lda, const uint16_t* B,
-                                            int64_t ldb, int64_t K, float out[MB_][NB_]) {
-    __m512 acc[MB_][NB_];
-    for (int i = 0; i < MB_; ++i)
-        for (int j = 0; j < NB_; ++j) acc[i][j] = _mm512_setzero_ps();
-    int64_t k = 0;
-    for (; k + 32 <= K; k += 32) {
-        __m512bh av[MB_];
-        for (int i = 0; i < MB_; ++i)
-            av[i] = (__m512bh)_mm512_loadu_si512((const void*)(A + i * lda + k));
-        for (int j = 0; j < NB_; ++j) {
-            const __m512bh bv = (__m512bh)_mm512_loadu_si512((const void*)(B + j * ldb + k));
-            for (int i = 0; i < MB_; ++i) acc[i][j] = _mm512_dpbf16_ps(acc[i][j], av[i], bv);
-        }
-    }
-    if (k < K) {
-        const __mmask32 mk = (__mmask32)((1ull << (K - k)) - 1);
-        __m512bh av[MB_];
-        for (int i = 0; i < MB_; ++i)
-            av[i] = (__m512bh)_mm512_maskz_loadu_epi16(mk, (const void*)(A + i * lda + k));
-        for (int j = 0; j < NB_; ++j) {
-            const __m512bh bv = (__m512bh)_mm512_maskz_loadu_epi16(mk, (const void*)(B + j * ldb + k));
-            for (int i = 0; i < MB_; ++i) acc[i][j] = _mm512_dpbf16_ps(acc[i][j], av[i], bv);
-        }
-    }
-    for (int i = 0; i < MB_; ++i)
-        for (int j = 0; j < NB_; ++j) out[i][j] = _mm512_reduce_add_ps(acc[i][j]);
-}
-
-static inline uint16_t f32_bf16_rne(float f) {
-    uint32_t u;
-    std::memcpy(&u, &f, 4);
-    if ((u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu)) return (uint16_t)((u >> 16) | 0x40u);
-    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
-}
-
-AVX_BF16_TARGET static void gemm_bf16_dot(const uint16_t* A, int64_t lda, const uint16_t* B,
-                                          int64_t ldb, const RadTensor* Y, int64_t ys_r,
-                                          const RadTensor* bias, int64_t M, int64_t N, int64_t K) {
-    const bool yb = Y->dtype == RAD_BF16;
-    /* The tile grid: 64 rows of A by a column count chosen so there are at least four tiles a
-     * thread, capped at 192 columns. */
-    constexpr int64_t BMR = 4, BNR = 6, MC = 64;
-    const int64_t mt = (M + MC - 1) / MC;
-#ifdef _OPENMP
-    const int64_t nth = (int64_t)avx_team_size();
-#else
-    const int64_t nth = 1;
-#endif
-    int64_t want_nt = (4 * nth + mt - 1) / mt;
-    if (want_nt < 1) want_nt = 1;
-    int64_t NC = (N + want_nt - 1) / want_nt;
-    NC = ((NC + BNR - 1) / BNR) * BNR;
-    if (NC > 192) NC = 192;
-    if (NC < BNR) NC = BNR;
-    const int64_t ntl = (N + NC - 1) / NC;
-
-    auto store = [&](int64_t m, int64_t n, float v) {
-        if (bias) v += ldt(bias, n * laststride(bias));
-        if (yb) ((uint16_t*)Y->data)[m * ys_r + n] = f32_bf16_rne(v);
-        else    ((float*)Y->data)[m * ys_r + n] = v;
-    };
-
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 1) num_threads(avx_team_size())
-#endif
-    for (int64_t t = 0; t < mt * ntl; ++t) {
-        const int64_t m_lo = (t / ntl) * MC, n_lo = (t % ntl) * NC;
-        const int64_t m_hi = m_lo + MC < M ? m_lo + MC : M;
-        const int64_t n_hi = n_lo + NC < N ? n_lo + NC : N;
-        for (int64_t n0 = n_lo; n0 < n_hi; n0 += BNR) {
-            const int64_t nn = n_hi - n0 < BNR ? n_hi - n0 : BNR;
-            for (int64_t m0 = m_lo; m0 < m_hi; m0 += BMR) {
-                const int64_t mm = m_hi - m0 < BMR ? m_hi - m0 : BMR;
-                if (mm == BMR && nn == BNR) {
-                    float o[BMR][BNR];
-                    dp_block<BMR, BNR>(A + m0 * lda, lda, B + n0 * ldb, ldb, K, o);
-                    for (int i = 0; i < BMR; ++i)
-                        for (int j = 0; j < BNR; ++j) store(m0 + i, n0 + j, o[i][j]);
-                } else {
-                    for (int64_t i = 0; i < mm; ++i)
-                        for (int64_t j = 0; j < nn; ++j) {
-                            float o[1][1];
-                            dp_block<1, 1>(A + (m0 + i) * lda, lda, B + (n0 + j) * ldb, ldb, K, o);
-                            store(m0 + i, n0 + j, o[0][0]);
-                        }
-                }
-            }
-        }
-    }
-}
-
-/* A bf16 x bf16 product into Y, or false when this path does not apply and the driver should run. */
-AVX_BF16_TARGET static bool gemm_bf16_dp(const Mat& ma, const Mat& mb, const RadTensor* Y,
-                                         const RadTensor* bias, int64_t M, int64_t N, int64_t K) {
-    static const bool have = __builtin_cpu_supports("avx512bf16");
-    if (!have || M < 16) return false;
-    if (ma.t->dtype != RAD_BF16 || mb.t->dtype != RAD_BF16 || ma.cs != 1 || mb.cs != 1) return false;
-    if (Y->dtype != RAD_BF16 && Y->dtype != RAD_F32) return false;
-    const int64_t ys_r = row_stride(Y, N);
-    const int64_t ys_c = Y->rank >= 2 ? Y->stride[Y->rank - 1] : 1;
-    if (ys_c != 1) return false;
-
-    const uint16_t* A = (const uint16_t*)ma.t->data;
-    const uint16_t* B = (const uint16_t*)mb.t->data;
-    const int64_t lda = ma.rs, ldb = mb.rs;
-    if (M < 128) {
-        gemm_bf16_dot(A, lda, B, ldb, Y, ys_r, bias, M, N, K);
-        return true;
-    }
-    const bool yb = Y->dtype == RAD_BF16;
-    const size_t yel = yb ? 2 : 4;
-
-    /* ---- the pack, into the calling thread's arena before any worker reads it */
-    const int64_t np = (N + BP_COLS - 1) / BP_COLS;
-    const int64_t kp_n = (K + 1) / 2;
-    const int64_t pstride = kp_n * 2 * BP_COLS;              /* uint16 a panel */
-    uint16_t* Bp = (uint16_t*)scratch_raw((size_t)(np * pstride) * sizeof(uint16_t) + 64);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) num_threads(avx_team_size()) if(np * pstride >= 65536)
-#endif
-    for (int64_t p = 0; p < np; ++p) {
-        uint32_t* dst = (uint32_t*)(Bp + p * pstride);
-        const int64_t n0 = p * BP_COLS;
-        for (int64_t c = 0; c < BP_COLS; ++c) {
-            const int64_t n = n0 + c;
-            if (n >= N) {
-                for (int64_t kp = 0; kp < kp_n; ++kp) dst[kp * BP_COLS + c] = 0;
-                continue;
-            }
-            const uint16_t* row = B + n * ldb;
-            for (int64_t kp = 0; kp < K / 2; ++kp) {
-                uint32_t pr;
-                std::memcpy(&pr, row + 2 * kp, 4);
-                dst[kp * BP_COLS + c] = pr;
-            }
-            if (K & 1) dst[(kp_n - 1) * BP_COLS + c] = (uint32_t)row[K - 1];
-        }
-    }
-
-    /* ---- the tile grid: 64-row M blocks by groups of panels, at least four tiles a thread */
-    constexpr int64_t MC = 64;
-    const int64_t mt = (M + MC - 1) / MC;
-#ifdef _OPENMP
-    const int64_t nth = (int64_t)avx_team_size();
-#else
-    const int64_t nth = 1;
-#endif
-    int64_t groups = (4 * nth + mt - 1) / mt;
-    if (groups < 1) groups = 1;
-    int64_t PG = (np + groups - 1) / groups;
-    if (PG > 4) PG = 4;
-    if (PG < 1) PG = 1;
-    const int64_t ng = (np + PG - 1) / PG;
-
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 1) num_threads(avx_team_size())
-#endif
-    for (int64_t t = 0; t < mt * ng; ++t) {
-        const int64_t m_lo = (t / ng) * MC, p_lo = (t % ng) * PG;
-        const int64_t m_hi = m_lo + MC < M ? m_lo + MC : M;
-        const int64_t p_hi = p_lo + PG < np ? p_lo + PG : np;
-        for (int64_t p = p_lo; p < p_hi; ++p) {
-            const int64_t n0 = p * BP_COLS;
-            const int64_t cols = N - n0 < BP_COLS ? N - n0 : BP_COLS;
-            __m512 bv[3];
-            for (int v = 0; v < 3; ++v) {
-                alignas(64) float bb[16];
-                for (int e = 0; e < 16; ++e) {
-                    const int64_t n = n0 + 16 * v + e;
-                    bb[e] = (bias && n < N) ? ldt(bias, n * laststride(bias)) : 0.0f;
-                }
-                bv[v] = _mm512_load_ps(bb);
-            }
-            const uint16_t* panel = Bp + p * pstride;
-            for (int64_t m0 = m_lo; m0 < m_hi; m0 += BP_MR) {
-                const int64_t mm = m_hi - m0 < BP_MR ? m_hi - m0 : BP_MR;
-                const uint16_t* Ar = A + m0 * lda;
-                void* Yr = (char*)Y->data + (size_t)(m0 * ys_r + n0) * yel;
-                switch (mm) {
-                    case 8: op_block<8>(Ar, lda, panel, K, bv, Yr, ys_r, yb, cols); break;
-                    case 7: op_block<7>(Ar, lda, panel, K, bv, Yr, ys_r, yb, cols); break;
-                    case 6: op_block<6>(Ar, lda, panel, K, bv, Yr, ys_r, yb, cols); break;
-                    case 5: op_block<5>(Ar, lda, panel, K, bv, Yr, ys_r, yb, cols); break;
-                    case 4: op_block<4>(Ar, lda, panel, K, bv, Yr, ys_r, yb, cols); break;
-                    case 3: op_block<3>(Ar, lda, panel, K, bv, Yr, ys_r, yb, cols); break;
-                    case 2: op_block<2>(Ar, lda, panel, K, bv, Yr, ys_r, yb, cols); break;
-                    default: op_block<1>(Ar, lda, panel, K, bv, Yr, ys_r, yb, cols); break;
-                }
-            }
-        }
-    }
-    return true;
-}
-#endif
-
-/* Shared entry for gemm_nt / gemm_nt_bias / logits_gemm. `nkey`/`kkey` name which parameters carry
- * N and K, because logits_gemm spells them n_vocab and n_embd. */
-/* gemm_nt_bias's epilogue (docs/OPS.md): an activation of the stored product, then a residual,
- * each step read back from and stored to the output's dtype -- the unfused chain, as libref has it. */
+/* gemm_nt_bias's epilogue (docs/OPS.md): activation of the stored product, then the residual add,
+ * each step read from and stored to the output's dtype (the unfused chain, as in libref). */
 static void gemm_epilogue(const RadTensor* Y, const RadTensor* res, int act, int64_t M, int64_t N) {
     const int64_t ys = laststride(Y), yr = Y->rank >= 2 ? Y->stride[Y->rank - 2] : N;
     const int64_t rs = res ? laststride(res) : 0, rr = res && res->rank >= 2 ? res->stride[res->rank - 2] : N;
@@ -706,15 +309,51 @@ static void gemm_epilogue(const RadTensor* Y, const RadTensor* res, int act, int
         for (int64_t n = 0; n < N; ++n) {
             const int64_t o = m * yr + n * ys;
             float v = ldt(Y, o);
-            if (act == 1) { v = 0.5f * v * (1.0f + std::erf(v * 0.70710678118654752f)); stt(Y, o, v); }
+            if (act == 1) { v = 0.5f * v * (1.0f + sc_erf(v * 0.70710678118654752f)); stt(Y, o, v); }
             else if (act == 2) {
-                v = 0.5f * v * (1.0f + std::tanh(0.7978845608028654f * (v + 0.044715f * v * v * v)));
+                v = 0.5f * v * (1.0f + sc_tanh(0.7978845608028654f * (v + 0.044715f * v * v * v)));
                 stt(Y, o, v);
             }
             if (res) stt(Y, o, ldt(res, m * rr + n * rs) + ldt(Y, o));
         }
 }
 
+/* Whether two operands' memory overlaps: from the first element to one past the last element
+ * their strides reach. A residual may be the output itself (an in-place residual add). */
+static bool spans_overlap(const RadTensor* a, const RadTensor* b) {
+    auto span = [](const RadTensor* t, const char** lo, const char** hi) {
+        int64_t last = 0;
+        for (uint32_t i = 0; i < t->rank; ++i) last += (t->shape[i] - 1) * t->stride[i];
+        const int64_t eb = (rad_dtype_bits(t->dtype) + 7) / 8;
+        *lo = static_cast<const char*>(t->data);
+        *hi = *lo + (last + 1) * eb;
+    };
+    const char *alo, *ahi, *blo, *bhi;
+    span(a, &alo, &ahi);
+    span(b, &blo, &bhi);
+    return alo < bhi && blo < ahi;
+}
+
+/* The residual as f32 [M, N], read before the product overwrites it when it is the output's own
+ * memory. Widening is exact for every float dtype, so the epilogue's sum is unchanged. */
+static RadTensor snapshot_res(const RadTensor* res, int64_t M, int64_t N, std::vector<float>* buf) {
+    const int64_t rs_r = res->rank >= 2 ? res->stride[res->rank - 2] : N, rs_c = laststride(res);
+    buf->resize((size_t)(M * N));
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t n = 0; n < N; ++n) (*buf)[(size_t)(m * N + n)] = ldt(res, m * rs_r + n * rs_c);
+    RadTensor t{};
+    t.dtype = RAD_F32;
+    t.rank = 2;
+    t.shape[0] = M;
+    t.shape[1] = N;
+    t.stride[0] = N;
+    t.stride[1] = 1;
+    t.data = buf->data();
+    return t;
+}
+
+/* Shared entry for gemm_nt / gemm_nt_bias / logits_gemm. `nkey`/`kkey` name the N and K
+ * parameters (logits_gemm uses n_vocab and n_embd). */
 static int gemm_nt_impl(const RadArgs* a, bool bias_operand, const char* nkey, const char* kkey) {
     /* gemm_nt_bias is a, b, bias, res?, y; the other two are a, b, y. */
     const int nt = bias_operand ? 5 : 3;
@@ -724,26 +363,604 @@ static int gemm_nt_impl(const RadArgs* a, bool bias_operand, const char* nkey, c
     const RadTensor* res  = bias_operand ? rad_arg_in(a, 3) : nullptr;
     static const char* kActs[] = { "none", "gelu", "gelu_tanh" };
     const int act = bias_operand ? p_enum(a, "act", kActs, 3, 0) : 0;
+    if (act < 0 || act > 2) return RAD_E_INVAL;
 
     const int64_t K = p_int(a, kkey, B->rank >= 2 ? B->shape[B->rank - 1] : 0);
     const int64_t N = p_int(a, nkey, B->rank >= 2 ? B->shape[B->rank - 2] : 0);
     if (K <= 0 || N <= 0) return RAD_E_SHAPE;
     const int64_t M = numel(Y) / N;
     if (M <= 0) return RAD_E_SHAPE;
-    if (numel(A) < M * K || numel(B) < N * K) return RAD_E_SHAPE;
+    /* A head of codes and scale, joined (avx_planes.h); its extents are its planes'. */
+    const bool joined = avxp::is_joined(B);
+    if (numel(A) < M * K || (!joined && numel(B) < N * K)) return RAD_E_SHAPE;
     if (bias && numel(bias) < N) return RAD_E_SHAPE;
 
     if (res && numel(res) < M * N) return RAD_E_SHAPE;
+    std::vector<float> res_buf;
+    RadTensor res_copy{};
+    if (res && spans_overlap(res, Y)) {
+        res_copy = snapshot_res(res, M, N, &res_buf);
+        res = &res_copy;
+    }
 
-    const Mat ma = as_mat(A, K), mb = as_mat(B, K);
-#if AVX_LEVEL == 3
-    if (!gemm_bf16_dp(ma, mb, Y, bias, M, N, K))
-#endif
-    {
+    const Mat ma = as_mat(A, K);
+    if (joined) {
+        HeadDec dec;
+        int st = avxp::scaled_rows(B, N, K, &dec.sr);
+        if (st != RAD_OK) return st;
+        dec.K = K;
+        /* The codes and their scale grid read as a quantised weight, where the bf16 grouped
+         * driver applies (E4M3 or int8 codes against a bf16 activation). */
+        RadTensor ct{}, sct{};
+        const avxp::JPlane& cp = dec.sr.codes;
+        const avxp::JPlane& sp = dec.sr.scale;
+        const int64_t ses = rad_dtype_bits(sp.dt) / 8;
+        if (ses > 0 && sp.row_bytes % ses == 0) {
+            ct.data = (void*)cp.p; ct.dtype = cp.dt; ct.rank = 2;
+            ct.shape[0] = N; ct.shape[1] = K; ct.stride[0] = cp.row_bytes; ct.stride[1] = 1;
+            sct.data = (void*)sp.p; sct.dtype = sp.dt; sct.rank = 2;
+            sct.shape[0] = sp.rows; sct.shape[1] = sp.cols;
+            sct.stride[0] = sp.row_bytes / ses; sct.stride[1] = 1;
+            const Scales SB = make_scales(&sct, N, K, false);
+            if (gemm_q_bf16(ma, as_mat(&ct, K), nullptr, &SB, Y, bias, M, N, K)) {
+                if (act || res) gemm_epilogue(Y, res, act, M, N);
+                return RAD_OK;
+            }
+        }
+        const Mat mb{ B, K, 1, &dec };
+        st = gemm_drive(ma, mb, nullptr, nullptr, Y, bias, M, N, K);
+        if (st < 0) return st;
+        if (act || res) gemm_epilogue(Y, res, act, M, N);
+        return RAD_OK;
+    }
+    const Mat mb = as_mat(B, K);
+    /* bf16 x bf16 takes the grouped driver where the CPU has AVX512_BF16, as one group. */
+    if (!gemm_q_bf16(ma, mb, nullptr, nullptr, Y, bias, M, N, K)) {
         const int st = gemm_drive(ma, mb, nullptr, nullptr, Y, bias, M, N, K);
         if (st < 0) return st;
     }
     if (act || res) gemm_epilogue(Y, res, act, M, N);
+    return RAD_OK;
+}
+
+/* Parts (`pb1`, `pb2`): weight rows [0, pb1), [pb1, pb2) and [pb2, N) each multiply their own
+ * copy of the activation, for a fused projection whose pieces were rotated separately (ParoQuant,
+ * MXFP4 weights). The copies sit side by side, so `a` is [M, parts * K] and its scale
+ * [M, parts * K / 128]; each part is a plain product over its rows. 0 omits a bound: no `pb1` is
+ * one part, no `pb2` ends the second at N. libref's reading and refusals (ref_gemm.cpp). */
+static int gemm_ntq_parts(const RadTensor* A, const RadTensor* as_, const RadTensor* B,
+                          const RadTensor* bs_, const RadTensor* Y, int64_t pb1, int64_t pb2,
+                          int64_t M, int64_t N, int64_t K) {
+    if (B->dtype != RAD_FP4E2M1 || A->rank < 2) return RAD_E_UNSUPPORTED;
+    const int64_t e1 = pb1 > 0 ? std::min<int64_t>(pb1, N) : N;
+    const int64_t e2 = pb2 > 0 ? std::max<int64_t>(e1, std::min<int64_t>(pb2, N)) : N;
+    const int64_t bound[4] = { 0, e1, e2, N };
+    const int64_t acols = A->shape[A->rank - 1];
+    const int64_t parts = e2 < N ? 3 : (e1 < N ? 2 : 1);
+    if (acols != parts * K || (e1 % 16) || (e2 % 16)) return RAD_E_SHAPE;
+    if (!as_ || as_->rank < 2 || !bs_ || bs_->rank < 1) return RAD_E_INVAL;
+    const int64_t sa_cols = as_->shape[as_->rank - 1];
+    if (sa_cols % parts) return RAD_E_SHAPE;
+    const int64_t sa_part = sa_cols / parts;                 /* K / 128 */
+    const int64_t bs_cols = bs_->shape[bs_->rank - 1];
+    const int64_t ys = row_stride(Y, N);
+    for (int p = 0; p < 3; ++p) {
+        const int64_t n0 = bound[p], n1 = bound[p + 1];
+        if (n1 <= n0) continue;
+        RadTensor Ap = *A, Sp = *as_, Bp = *B, Bsp = *bs_, Yp = *Y;
+        Ap.data = (uint8_t*)A->data + rad_dtype_bytes(A->dtype, p * K);
+        Ap.rank = 2; Ap.shape[0] = M; Ap.shape[1] = K;
+        Ap.stride[0] = row_stride(A, acols); Ap.stride[1] = 1;
+        Sp.data = (uint8_t*)as_->data + rad_dtype_bytes(as_->dtype, p * sa_part);
+        Sp.shape[Sp.rank - 1] = sa_part;
+        Bp.data = (uint8_t*)B->data + rad_dtype_bytes(B->dtype, n0 * K);
+        Bp.rank = 2; Bp.shape[0] = n1 - n0; Bp.shape[1] = K; Bp.stride[0] = K; Bp.stride[1] = 1;
+        Bsp.data = (uint8_t*)bs_->data + rad_dtype_bytes(bs_->dtype, n0 * bs_cols);
+        Bsp.rank = 2; Bsp.shape[0] = n1 - n0; Bsp.shape[1] = bs_cols;
+        Bsp.stride[0] = bs_cols; Bsp.stride[1] = 1;
+        Yp.data = (uint8_t*)Y->data + rad_dtype_bytes(Y->dtype, n0);
+        Yp.rank = 2; Yp.shape[0] = M; Yp.shape[1] = n1 - n0; Yp.stride[0] = ys; Yp.stride[1] = 1;
+        const Scales SAp = make_scales(&Sp, M, K, false);
+        const Scales SBp = make_scales(&Bsp, n1 - n0, K, true);
+        const int rc = gemm_q_drive(as_mat(&Ap, K), as_mat(&Bp, K), &SAp, &SBp, &Yp, nullptr, M,
+                                    n1 - n0, K);
+        if (rc != RAD_OK) return rc;
+    }
+    return RAD_OK;
+}
+
+/* ================================================================== the small-M integer path
+ *
+ * w2a8 and w4a8_asym at decode and draft row counts (M <= 16, a draft head's rows): the weight is
+ * read once and never widened. Each 32 bytes of codes split into code planes in registers (four
+ * of u2, two of u4, one shift and mask each), and the activation is rearranged once per call into
+ * the same plane order, so a plane meets its activation bytes with vpmaddubsw (unsigned code times
+ * signed code, pairs summed exactly: at most 2 * 15 * 127) and vpmaddwd into int32. Per row and
+ * group of 128 the integer sum is exact; it is widened and scaled into f32 lanes, and the zero is
+ * removed per (row, group) through a_sum:
+ *
+ *   y[m][n] = a_scale[m] * (sum_g scale[n][g] * sum(a * code) - sum_g scale * zero * a_sum[g][m])
+ *
+ * the arithmetic libref's reference states, in another order. Levels below AVX2 use the decoded
+ * driver. At AVX-512 a CPU with VNNI multiplies each plane in one vpdpbusd. */
+#if AVX_LEVEL >= 2
+
+/* A joined zero-point grid's scale and zero for (row, group), read directly for the planes the
+ * grids are stored in (f16, u8) and through the generic reader otherwise. */
+static inline float zp_scale_at(const avxp::JPlane& p, int64_t i, int64_t j) {
+    if (p.dt == RAD_F16) return _cvtsh_ss(((const uint16_t*)(p.p + i * p.row_bytes))[j]);
+    return p.at(i, j);
+}
+static inline int32_t zp_zero_at(const avxp::JPlane& p, int64_t i, int64_t j) {
+    if (p.dt == RAD_U8) return p.p[i * p.row_bytes + j];
+    return (int32_t)p.at(i, j);
+}
+
+/* The activation codes in the weight's plane order: per group of 128 and per 32 bytes of codes
+ * (`cpb` codes a byte), plane t's byte j meets code cpb * j + t of those 32 bytes' codes. */
+static void zp_planes_a(const int8_t* a, int64_t K, int cpb, int8_t* out) {
+    const int64_t span = 32 * (int64_t)cpb;              /* codes in 32 bytes */
+    for (int64_t c0 = 0; c0 < K; c0 += span)
+        for (int t = 0; t < cpb; ++t)
+            for (int64_t j = 0; j < 32; ++j) out[c0 + t * 32 + j] = a[c0 + cpb * j + t];
+}
+
+/* At AVX-512 the integer path is compiled for VNNI as well, and the VNNI instantiations run only
+ * where the CPU reports it; the others use no VNNI instruction. */
+#if AVX_LEVEL == 3
+#define AVX_ZP_I8_TARGET __attribute__((target("avx512vnni,avx512vl")))
+#else
+#define AVX_ZP_I8_TARGET
+#endif
+
+/* One plane's products into the int32 lanes: vpmaddubsw then vpmaddwd, or with VNNI the one
+ * vpdpbusd that does both, exactly (u8 times s8, four products a lane, no saturation either way at
+ * these code widths). */
+template <bool VNNI>
+AVX_ZP_I8_TARGET static inline __m256i zp_dot_plane(__m256i acc, __m256i w, __m256i a,
+                                                    __m256i ones) {
+#if AVX_LEVEL == 3
+    if constexpr (VNNI) return _mm256_dpbusd_epi32(acc, w, a);
+#endif
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(w, a), ones));
+}
+
+template <int MB, int BITS, bool VNNI>
+AVX_ZP_I8_TARGET
+static void zp_rows_i8(const int8_t* ap, int64_t K, const uint8_t* codes, int64_t rb,
+                       const avxp::JPlane& sc, const avxp::JPlane& zp, const float* sa,
+                       const float* asum, int64_t asum_ld, int64_t n0, int64_t n1, int64_t m0,
+                       const RadTensor* Y, int64_t ys_r, int64_t ys_c) {
+    constexpr int CPB = 8 / BITS;                         /* codes a byte */
+    constexpr int64_t SPAN = 32 * CPB;                    /* codes a 32-byte chunk */
+    const int64_t G = K / 128;
+    const __m256i mask = _mm256_set1_epi8((char)((1 << BITS) - 1));
+    const __m256i ones = _mm256_set1_epi16(1);
+    for (int64_t n = n0; n < n1; ++n) {
+        const uint8_t* cr = codes + n * rb;
+        __m256 acc[MB];
+        for (int i = 0; i < MB; ++i) acc[i] = _mm256_setzero_ps();
+        float corr[MB] = {};
+        for (int64_t g = 0; g < G; ++g) {
+            const float s = zp_scale_at(sc, n, g);
+            const float zs = (float)zp_zero_at(zp, n, g) * s;
+            const __m256 vs = _mm256_set1_ps(s);
+            for (int i = 0; i < MB; ++i) corr[i] += zs * asum[g * asum_ld + m0 + i];
+            for (int64_t c0 = g * 128; c0 < (g + 1) * 128; c0 += SPAN) {
+                const __m256i x = _mm256_loadu_si256((const __m256i*)(cr + c0 / CPB));
+                __m256i w[CPB];
+                for (int t = 0; t < CPB; ++t)
+                    w[t] = _mm256_and_si256(_mm256_srli_epi16(x, BITS * t), mask);
+                for (int i = 0; i < MB; ++i) {
+                    const int8_t* ar = ap + (m0 + i) * K + c0;
+                    __m256i d = _mm256_setzero_si256();
+                    for (int t = 0; t < CPB; ++t)
+                        d = zp_dot_plane<VNNI>(
+                            d, w[t], _mm256_loadu_si256((const __m256i*)(ar + 32 * t)), ones);
+                    acc[i] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), vs, acc[i]);
+                }
+            }
+        }
+        for (int i = 0; i < MB; ++i) {
+            __m128 h = _mm_add_ps(_mm256_castps256_ps128(acc[i]),
+                                  _mm256_extractf128_ps(acc[i], 1));
+            h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+            h = _mm_add_ss(h, _mm_movehdup_ps(h));
+            stt(Y, (m0 + i) * ys_r + n * ys_c, (_mm_cvtss_f32(h) - corr[i]) * sa[m0 + i]);
+        }
+    }
+}
+
+/* y for rows [0, M) of the integer path; false when it does not apply (M over 16, a group other
+ * than 128, codes other than u2 / u4). `a` is column-order int8 [M, K]. */
+static bool zp_small_i8(int bits, const int8_t* a, int64_t lda, const float* sa,
+                        const RadTensor* asum, int64_t mpad, const uint8_t* codes, int64_t rb,
+                        const avxp::JPlane& sc, const avxp::JPlane& zp, int64_t group,
+                        const RadTensor* Y, int64_t M, int64_t N, int64_t K) {
+    if (M > 16 || group != 128 || K % 128 || (bits != 2 && bits != 4)) return false;
+    if (asum->dtype != RAD_F32 || laststride(asum) != 1) return false;
+    const int cpb = 8 / bits;
+    static thread_local std::vector<int8_t> ap;
+    ap.resize((size_t)(M * K));
+    for (int64_t m = 0; m < M; ++m) zp_planes_a(a + m * lda, K, cpb, ap.data() + m * K);
+    const float* as = (const float*)asum->data;
+    const int64_t ys_r = row_stride(Y, N), ys_c = laststride(Y);
+    /* Rows a thread takes at a time: enough to amortise the scheduling, few enough to spread a
+     * 5120-row projection over every core. */
+    const int64_t NB = 16, nblk = (N + NB - 1) / NB;
+    using Fn = void (*)(const int8_t*, int64_t, const uint8_t*, int64_t, const avxp::JPlane&,
+                        const avxp::JPlane&, const float*, const float*, int64_t, int64_t,
+                        int64_t, int64_t, const RadTensor*, int64_t, int64_t);
+    static const Fn kFn[2][2][4] = {
+        { { zp_rows_i8<1, 2, false>, zp_rows_i8<2, 2, false>, zp_rows_i8<4, 2, false>,
+            zp_rows_i8<8, 2, false> },
+          { zp_rows_i8<1, 4, false>, zp_rows_i8<2, 4, false>, zp_rows_i8<4, 4, false>,
+            zp_rows_i8<8, 4, false> } },
+        { { zp_rows_i8<1, 2, true>, zp_rows_i8<2, 2, true>, zp_rows_i8<4, 2, true>,
+            zp_rows_i8<8, 2, true> },
+          { zp_rows_i8<1, 4, true>, zp_rows_i8<2, 4, true>, zp_rows_i8<4, 4, true>,
+            zp_rows_i8<8, 4, true> } },
+    };
+    /* AVX512-VNNI is not in the level's flags (many AVX-512 parts lack it) and is checked here. */
+#if AVX_LEVEL == 3
+    static const bool vnni = __builtin_cpu_supports("avx512vnni");
+#else
+    static const bool vnni = false;
+#endif
+    const Fn* fn = kFn[vnni ? 1 : 0][bits == 4 ? 1 : 0];
+    /* Taken here: inside the region `ap` names each worker's own (empty) thread_local. */
+    const int8_t* apd = ap.data();
+    AVX_PARALLEL_FOR_IF(M * N * K >= 65536)
+    for (int64_t b = 0; b < nblk; ++b) {
+        const int64_t n0 = b * NB, n1 = n0 + NB < N ? n0 + NB : N;
+        for (int64_t m0 = 0; m0 < M;) {
+            const int64_t left = M - m0;
+            const int lv = left >= 8 ? 3 : left >= 4 ? 2 : left >= 2 ? 1 : 0;
+            fn[lv](apd, K, codes, rb, sc, zp, sa, as, mpad, n0, n1, m0, Y, ys_r, ys_c);
+            m0 += (int64_t)1 << lv;
+        }
+    }
+    return true;
+}
+#endif
+
+/* ================================================================== the small-M 16-bit path
+ *
+ * w4a16_asym and w5a16 at decode and verify row counts (M <= 16): every weight row decodes in
+ * registers, sixteen codes at a time, to (code - zero) * scale, and meets each activation row
+ * (widened to f32 once per call) with one FMA, so the weight is read once and never stored widened.
+ * The decoded driver writes each row to a packing buffer and reads it back, a pass through L2 this
+ * path does not make. u4 is split by mask and shift, u5 by pdep (BMI2, checked at run time: the
+ * path is taken only where the CPU has it). */
+#if AVX_LEVEL >= 2
+
+/* Sixteen codes of a row's 4- or 5-bit stream from element k (a multiple of 16), one a byte. In the
+ * last 16 codes of a row the u5 read takes only the bytes asked for. */
+template <int BITS>
+__attribute__((target("bmi2"))) static inline __m128i zp_codes16(const uint8_t* row, int64_t k,
+                                                                 bool last) {
+    if (BITS == 4) {
+        const __m128i x = _mm_loadl_epi64((const __m128i*)(row + k / 2));
+        const __m128i m4 = _mm_set1_epi8(0x0f);
+        return _mm_unpacklo_epi8(_mm_and_si128(x, m4), _mm_and_si128(_mm_srli_epi16(x, 4), m4));
+    }
+    const uint8_t* p = row + k / 8 * 5;
+    uint64_t v0 = 0, v1 = 0;
+    if (!last) {
+        std::memcpy(&v0, p, 8);
+        std::memcpy(&v1, p + 5, 8);
+        v0 &= 0xffffffffffull;
+        v1 &= 0xffffffffffull;
+    } else {
+        std::memcpy(&v0, p, 5);
+        std::memcpy(&v1, p + 5, 5);
+    }
+    const unsigned long long kLow5 = 0x1f1f1f1f1f1f1f1full;
+    return _mm_set_epi64x((long long)_pdep_u64(v1, kLow5), (long long)_pdep_u64(v0, kLow5));
+}
+
+/* Rows [n0, n1) (at most 16) against activation rows [m0, m0 + MB). K is walked in chunks of
+ * whole groups, about 512 columns, and within a chunk every weight row of the block: the chunk of
+ * activation rows (MB x 512 floats, 16 KiB at MB = 8) stays in L1 while the block's rows stream
+ * past it, where a row at a time would read every activation row from L2 per weight row. The
+ * accumulators wait in `accb` between chunks. U independent accumulators a row (4 at MB = 1, 2 at
+ * MB = 2) cover the FMA latency a single dependent chain would wait on. NR weight rows (2 at
+ * AVX-512 from MB = 4, whose 32 registers hold both rows' accumulators) decode side by side and
+ * share each activation load. A block never straddles a part: parts end on multiples of 16. */
+template <int MB, int BITS, int U, int NR>
+__attribute__((target("bmi2"))) static void zp_rows_f16(
+        const float* af, int64_t lda, int64_t K, const uint8_t* codes, int64_t rb,
+        const avxp::JPlane& sc, const avxp::JPlane& zp, int64_t group, int64_t n0, int64_t n1,
+        int64_t m0, int64_t e1, int64_t e2, const RadTensor* Y, int64_t ys_r, int64_t ys_c) {
+#if AVX_LEVEL == 3
+    using V = __m512;
+    using VI = __m512i;
+#else
+    using V = __m256;
+    using VI = __m256i;
+#endif
+    constexpr int64_t kNB = 16;
+    alignas(64) V accb[kNB][MB * U];
+    for (int64_t r = 0; r < n1 - n0; ++r)
+        for (int i = 0; i < MB * U; ++i) accb[r][i] = (V){};
+    const int64_t kc = group * (group >= 512 ? 1 : 512 / group);
+    const float* a0 = af + m0 * lda + (n0 < e1 ? 0 : n0 < e2 ? 1 : 2) * K;
+    for (int64_t c0 = 0; c0 < K; c0 += kc) {
+        const int64_t c1 = c0 + kc < K ? c0 + kc : K;
+        for (int64_t n = n0; n < n1; n += NR) {
+            const int nr = n + NR <= n1 ? NR : 1;
+            const uint8_t* cr[NR];
+            V acc[NR][MB * U];
+            for (int r = 0; r < NR; ++r) {
+                cr[r] = codes + (n + (r < nr ? r : 0)) * rb;
+                for (int i = 0; i < MB * U; ++i) acc[r][i] = accb[n - n0 + (r < nr ? r : 0)][i];
+            }
+            for (int64_t g = c0 / group; g < c1 / group; ++g) {
+                VI vz[NR];
+                V vs[NR];
+                for (int r = 0; r < NR; ++r) {
+                    const int64_t row = n + (r < nr ? r : 0);
+#if AVX_LEVEL == 3
+                    vz[r] = _mm512_set1_epi32(zp_zero_at(zp, row, g));
+                    vs[r] = _mm512_set1_ps(zp_scale_at(sc, row, g));
+#else
+                    vz[r] = _mm256_set1_epi32(zp_zero_at(zp, row, g));
+                    vs[r] = _mm256_set1_ps(zp_scale_at(sc, row, g));
+#endif
+                }
+                for (int64_t k0 = g * group; k0 < (g + 1) * group; k0 += 16 * U)
+                    for (int u = 0; u < U; ++u) {
+                        const int64_t k = k0 + 16 * u;
+#if AVX_LEVEL == 3
+                        __m512 w[NR];
+                        for (int r = 0; r < NR; ++r) {
+                            const __m128i b = zp_codes16<BITS>(cr[r], k, k + 16 == K);
+                            w[r] = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(
+                                                     _mm512_cvtepu8_epi32(b), vz[r])), vs[r]);
+                        }
+                        for (int i = 0; i < MB; ++i) {
+                            const __m512 a = _mm512_loadu_ps(a0 + i * lda + k);
+                            for (int r = 0; r < NR; ++r)
+                                acc[r][i * U + u] = _mm512_fmadd_ps(a, w[r], acc[r][i * U + u]);
+                        }
+#else
+                        __m256 w0[NR], w1[NR];
+                        for (int r = 0; r < NR; ++r) {
+                            const __m128i b = zp_codes16<BITS>(cr[r], k, k + 16 == K);
+                            w0[r] = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(
+                                                      _mm256_cvtepu8_epi32(b), vz[r])), vs[r]);
+                            w1[r] = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(
+                                                      _mm256_cvtepu8_epi32(_mm_srli_si128(b, 8)),
+                                                      vz[r])), vs[r]);
+                        }
+                        for (int i = 0; i < MB; ++i) {
+                            const __m256 a = _mm256_loadu_ps(a0 + i * lda + k);
+                            const __m256 b8 = _mm256_loadu_ps(a0 + i * lda + k + 8);
+                            for (int r = 0; r < NR; ++r) {
+                                V& c = acc[r][i * U + u];
+                                c = _mm256_fmadd_ps(a, w0[r], c);
+                                c = _mm256_fmadd_ps(b8, w1[r], c);
+                            }
+                        }
+#endif
+                    }
+            }
+            for (int r = 0; r < nr; ++r)
+                for (int i = 0; i < MB * U; ++i) accb[n - n0 + r][i] = acc[r][i];
+        }
+    }
+    for (int64_t n = n0; n < n1; ++n)
+        for (int i = 0; i < MB; ++i) {
+            V a = accb[n - n0][i * U];
+            for (int u = 1; u < U; ++u) a = a + accb[n - n0][i * U + u];
+#if AVX_LEVEL == 3
+            const float v = _mm512_reduce_add_ps(a);
+#else
+            __m128 h = _mm_add_ps(_mm256_castps256_ps128(a), _mm256_extractf128_ps(a, 1));
+            h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+            h = _mm_add_ss(h, _mm_movehdup_ps(h));
+            const float v = _mm_cvtss_f32(h);
+#endif
+            stt(Y, (m0 + i) * ys_r + n * ys_c, v);
+        }
+}
+
+/* y over the rows of every part; false when the path does not apply (no BMI2, M over 16, a group
+ * that is not whole 64s, codes other than u4 / u5). `af` is the activation as f32 [M, lda]. */
+static bool zp_small_f16(int bits, const float* af, int64_t lda, const uint8_t* codes, int64_t rb,
+                         const avxp::JPlane& sc, const avxp::JPlane& zp, int64_t group,
+                         int64_t e1, int64_t e2, const RadTensor* Y, int64_t M, int64_t N,
+                         int64_t K) {
+    static const bool bmi2 = __builtin_cpu_supports("bmi2");
+    if (!bmi2 || M > 16 || group % 64 || K % group || (bits != 4 && bits != 5)) return false;
+    using Fn = void (*)(const float*, int64_t, int64_t, const uint8_t*, int64_t,
+                        const avxp::JPlane&, const avxp::JPlane&, int64_t, int64_t, int64_t,
+                        int64_t, int64_t, int64_t, const RadTensor*, int64_t, int64_t);
+#if AVX_LEVEL == 3
+    constexpr int kNR = 2;
+#else
+    constexpr int kNR = 1;
+#endif
+    static const Fn kFn[2][4] = {
+        { zp_rows_f16<1, 4, 4, 1>, zp_rows_f16<2, 4, 2, 1>, zp_rows_f16<4, 4, 1, kNR>,
+          zp_rows_f16<8, 4, 1, kNR> },
+        { zp_rows_f16<1, 5, 4, 1>, zp_rows_f16<2, 5, 2, 1>, zp_rows_f16<4, 5, 1, kNR>,
+          zp_rows_f16<8, 5, 1, kNR> },
+    };
+    const Fn* fn = kFn[bits == 5 ? 1 : 0];
+    const int64_t ys_r = row_stride(Y, N), ys_c = laststride(Y);
+    const int64_t NB = 16, nblk = (N + NB - 1) / NB;
+    AVX_PARALLEL_FOR_IF(M * N * K >= 65536)
+    for (int64_t b = 0; b < nblk; ++b) {
+        const int64_t n0 = b * NB, n1 = n0 + NB < N ? n0 + NB : N;
+        for (int64_t m0 = 0; m0 < M;) {
+            const int64_t left = M - m0;
+            const int lv = left >= 8 ? 3 : left >= 4 ? 2 : left >= 2 ? 1 : 0;
+            fn[lv](af, lda, K, codes, rb, sc, zp, group, n0, n1, m0, e1, e2, Y, ys_r, ys_c);
+            m0 += (int64_t)1 << lv;
+        }
+    }
+    return true;
+}
+#endif
+
+/* gemm_nt_q over a zero-point grid (avx_planes.h: ZpGrid), with libref's checks and refusals
+ * (libref/ref_gemm.cpp: gemm_zp). Each part of the weight is one plain product over decoded rows
+ * (ZpDec), against an f32 activation that carries what the grid scales by:
+ *
+ *   ZP_F16       the activation as it is; the rows are (code - zero) * scale
+ *   ZP_I8_GROUP  code * a_scale[m][g], against (code - zero) * scale
+ *   ZP_I8_ROW    code * a_scale[m] with a_sum[g][m] * a_scale[m] after each group, against
+ *                code * scale and -zero * scale after each group
+ *
+ * so every output is a sum over k of a'(k) * w'(k) in one group, which the driver blocks over M
+ * and N. `a` arrives in column order (the caller undoes the step order). */
+static int gemm_zp(const avxp::ZpGrid& zg, const RadTensor* A, const RadTensor* as_,
+                   const RadTensor* B, const RadTensor* bs_, const RadTensor* asum,
+                   const RadTensor* Y, int64_t M, int64_t N, int64_t K, int64_t group,
+                   int64_t pb1, int64_t pb2) {
+    using namespace avxp;
+    if (!is_joined(bs_)) return RAD_E_DTYPE;
+    const JPlane sc = jplane(bs_, "scale"), zp = jplane(bs_, "zero");
+    if (!sc || !zp || !float_scale_dt(sc.dt) || !zero_dt(zp.dt)) return RAD_E_DTYPE;
+    if (B->dtype != zg.codes) return RAD_E_DTYPE;
+    if (group <= 0 || K % group) return RAD_E_SHAPE;
+    const int64_t G = K / group;
+    if (sc.rows != N || sc.cols != G || zp.rows != N || zp.cols != G) return RAD_E_SHAPE;
+    if (!rad_tensor_is_contiguous(B)) return RAD_E_STRIDE;
+
+    const bool parted = pb1 > 0 || pb2 > 0;
+    if (parted && zg.act == ZP_I8_ROW) return RAD_E_UNSUPPORTED;
+    const int64_t e1 = pb1 > 0 ? std::min<int64_t>(pb1, N) : N;
+    const int64_t e2 = pb2 > 0 ? std::max<int64_t>(e1, std::min<int64_t>(pb2, N)) : N;
+    const int64_t parts = e2 < N ? 3 : (e1 < N ? 2 : 1);
+    if (parted && ((e1 % 16) || (e2 % 16))) return RAD_E_SHAPE;
+    const int64_t acols = parts * K;
+    if (numel(A) < M * acols) return RAD_E_SHAPE;
+    if (A->rank >= 2 && A->shape[A->rank - 1] != acols) return RAD_E_SHAPE;
+    const int64_t ars = row_stride(A, acols), acs = laststride(A);
+
+    const bool i8 = zg.act != ZP_F16;
+    if (i8 && A->dtype != RAD_I8) return RAD_E_DTYPE;
+    if (!i8 && !float_scale_dt(A->dtype)) return RAD_E_DTYPE;
+    const int64_t mpad = (M + 15) / 16 * 16;
+    if (zg.act == ZP_I8_ROW) {
+        if (!as_ || numel(as_) < M) return RAD_E_INVAL;
+        if (!asum || numel(asum) < G * mpad) return RAD_E_INVAL;
+    }
+    if (zg.act == ZP_I8_GROUP && (!as_ || numel(as_) < M * parts * G)) return RAD_E_INVAL;
+    const int64_t sa_rs = as_ ? row_stride(as_, zg.act == ZP_I8_GROUP ? parts * G : 1) : 0;
+    const int64_t sa_cs = as_ ? laststride(as_) : 0;
+    const int64_t ys = row_stride(Y, N), yc = laststride(Y);
+    const bool aug = zg.act == ZP_I8_ROW;
+    const int64_t Kw = aug ? G * (group + 1) : K;
+#if AVX_LEVEL >= 2
+    if (zg.act == ZP_F16 && acs == 1 && M <= 16) {
+        static thread_local std::vector<float> afv;
+        afv.resize((size_t)(M * acols));
+        for (int64_t m = 0; m < M; ++m)
+            row_to_f32(A->dtype, (const uint8_t*)A->data + rad_dtype_bytes(A->dtype, m * ars),
+                       afv.data() + m * acols, acols);
+        if (zp_small_f16(rad_dtype_bits(B->dtype), afv.data(), acols, (const uint8_t*)B->data,
+                         rad_enc_row_bytes(B->dtype, K), sc, zp, group, e1, e2, Y, M, N, K))
+            return RAD_OK;
+    }
+    if (aug && acs == 1) {
+        static thread_local std::vector<float> sav;
+        sav.resize((size_t)M);
+        for (int64_t m = 0; m < M; ++m) sav[(size_t)m] = ldt(as_, m * sa_rs);
+        if (zp_small_i8(rad_dtype_bits(B->dtype), (const int8_t*)A->data, ars, sav.data(), asum,
+                        mpad, (const uint8_t*)B->data, rad_enc_row_bytes(B->dtype, K), sc, zp,
+                        group, Y, M, N, K))
+            return RAD_OK;
+    }
+#endif
+
+    /* The int8-activation grids on the bf16 grouped driver (avx_gemm_tile.cpp): code - zero and
+     * the int8 codes are exact in bf16, so each group's sub-sum is libref's exact integer, then
+     * (sub * a_scale) * scale. One job a part, each part against its own copy of the activation;
+     * where a part is declined, the decoded driver below computes all of Y. */
+    if (zg.act == ZP_I8_GROUP && acs == 1 && zp.dt == RAD_U8 &&
+        rad_enc_row_bytes(B->dtype, K) * 8 == K * rad_dtype_bits(B->dtype)) {
+        RadTensor ct{}, st{};
+        ct.data = B->data; ct.dtype = B->dtype; ct.rank = 2;
+        ct.shape[0] = N; ct.shape[1] = K; ct.stride[0] = K; ct.stride[1] = 1;
+        const int64_t ses = rad_dtype_bits(sc.dt) / 8;
+        st.data = (void*)sc.p; st.dtype = sc.dt; st.rank = 2;
+        st.shape[0] = N; st.shape[1] = G; st.stride[0] = sc.row_bytes / ses; st.stride[1] = 1;
+        const Scales SBz = make_scales(&st, N, K, false);
+        const int64_t bound[4] = { 0, e1, e2, N };
+        bool ok = true;
+        for (int p = 0; p < 3 && ok; ++p) {
+            const int64_t n0 = bound[p], n1 = bound[p + 1];
+            if (n1 <= n0) continue;
+            RadTensor Ap = *A, Sp = *as_;
+            Ap.data = (uint8_t*)A->data + p * K * acs;
+            Ap.rank = 2; Ap.shape[0] = M; Ap.shape[1] = K; Ap.stride[0] = ars; Ap.stride[1] = 1;
+            Sp.data = (uint8_t*)as_->data + rad_dtype_bytes(as_->dtype, p * G * sa_cs);
+            Sp.rank = 2; Sp.shape[0] = M; Sp.shape[1] = G; Sp.stride[0] = sa_rs;
+            Sp.stride[1] = sa_cs;
+            const Scales SAz = make_scales(&Sp, M, K, false);
+            TileJob jb{};
+            jb.mb = as_mat(&ct, K);
+            jb.SB = SBz;
+            jb.b0 = n0; jb.a0 = 0; jb.M = M; jb.N = n1 - n0; jb.K = K;
+            jb.y0 = 0; jb.yc0 = n0;
+            jb.zero = zp;
+            ok = gemm_q_bf16_jobs(as_mat(&Ap, K), nullptr, M, &SAz, &jb, 1, Y, N);
+        }
+        if (ok) return RAD_OK;
+    }
+
+    ZpDec dec;
+    dec.codes_p = (const uint8_t*)B->data;
+    dec.rb = rad_enc_row_bytes(B->dtype, K);
+    dec.K = K;
+    dec.group = group;
+    dec.bits = rad_dtype_bits(B->dtype);
+    dec.aug = aug;
+    dec.sc = sc;
+    dec.zp = zp;
+
+    static thread_local std::vector<float> aw;
+    const int64_t bound[4] = { 0, e1, e2, N };
+    for (int p = 0; p < 3; ++p) {
+        const int64_t n0 = bound[p], n1 = bound[p + 1];
+        if (n1 <= n0) continue;
+        dec.n0 = n0;
+        RadTensor Ap{}, Yp = *Y;
+        Yp.data = (uint8_t*)Y->data + rad_dtype_bytes(Y->dtype, n0 * yc);
+        Yp.rank = 2; Yp.shape[0] = M; Yp.shape[1] = n1 - n0; Yp.stride[0] = ys; Yp.stride[1] = yc;
+        if (i8) {
+            /* The scaled activation, f32 [M, Kw], which the driver reads in place. */
+            aw.resize((size_t)(M * Kw));
+            const int8_t* ar = (const int8_t*)A->data;
+            for (int64_t m = 0; m < M; ++m) {
+                float* d = aw.data() + m * Kw;
+                const int64_t ab = m * ars + p * K * acs;
+                for (int64_t g = 0; g < G; ++g) {
+                    const float sa = zg.act == ZP_I8_ROW
+                                         ? ldt(as_, m * sa_rs)
+                                         : ldt(as_, m * sa_rs + (p * G + g) * sa_cs);
+                    float* dg = d + g * (aug ? group + 1 : group);
+                    for (int64_t k = 0; k < group; ++k)
+                        dg[k] = (float)ar[ab + (g * group + k) * acs] * sa;
+                    if (aug) dg[group] = ldt(asum, (g * mpad + m) * laststride(asum)) * sa;
+                }
+            }
+            Ap.data = aw.data();
+            Ap.dtype = RAD_F32;
+            Ap.rank = 2; Ap.shape[0] = M; Ap.shape[1] = Kw; Ap.stride[0] = Kw; Ap.stride[1] = 1;
+        } else {
+            Ap = *A;
+            Ap.data = (uint8_t*)A->data + rad_dtype_bytes(A->dtype, p * K * acs);
+            Ap.rank = 2; Ap.shape[0] = M; Ap.shape[1] = K; Ap.stride[0] = ars; Ap.stride[1] = acs;
+        }
+        const Mat mb{ B, Kw, 1, &dec };
+        const int rc = gemm_drive(as_mat(&Ap, Kw), mb, nullptr, nullptr, &Yp, nullptr, M,
+                                  n1 - n0, Kw);
+        if (rc != RAD_OK) return rc;
+    }
     return RAD_OK;
 }
 
@@ -754,10 +971,14 @@ static int gemm_ntq_impl(const RadArgs* a, bool bias_operand) {
     const RadTensor* as_ = rad_arg_in(a, 1);
     const RadTensor* bs_ = rad_arg_in(a, 3);
     const RadTensor* bias = bias_operand ? rad_arg_in(a, 4) : nullptr;
-
-    /* `pb1`/`pb2` split the weight's rows into parts that meet separate copies of the activation
-     * (ParoQuant); this driver reads one. Refused rather than computed against the wrong copy. */
-    if (p_int(a, "pb1", 0) || p_int(a, "pb2", 0)) return RAD_E_UNSUPPORTED;
+    /* libref's refusals (ref_gemm.cpp): the zero-point grids have no bias form, `a_sum` belongs
+     * to the grids that remove a zero through it, `b_ref` to an e2m1 weight. */
+    const avxp::ZpGrid* zg = avxp::zp_grid(p_str(a, "dtype", nullptr));
+    if (zg && bias_operand) return RAD_E_UNSUPPORTED;
+    if (!bias_operand) {
+        if (rad_arg_in(a, 5) && (!zg || zg->act != avxp::ZP_I8_ROW)) return RAD_E_UNSUPPORTED;
+        if (rad_arg_in(a, 6) && B->dtype != RAD_FP4E2M1) return RAD_E_UNSUPPORTED;
+    }
 
     const int64_t K = p_int(a, "K", B->rank >= 2 ? B->shape[B->rank - 1] : 0);
     const int64_t N = p_int(a, "N", B->rank >= 2 ? B->shape[B->rank - 2] : 0);
@@ -767,17 +988,49 @@ static int gemm_ntq_impl(const RadArgs* a, bool bias_operand) {
     if (numel(A) < M * K || numel(B) < N * K) return RAD_E_SHAPE;
     if (bias && numel(bias) < N) return RAD_E_SHAPE;
 
+    /* quant_act_i8's codes arrive with the middle two dwords of every 16-byte step exchanged;
+     * exchange them back into a contiguous copy. */
+    RadTensor Ac;
+    if (A->dtype == RAD_I8 && i8_steps_dtype(p_str(a, "dtype", nullptr))) {
+        if (K % 16) return RAD_E_SHAPE;
+        if (!dense_row(A)) return RAD_E_STRIDE;
+        static thread_local std::vector<int8_t> cols;
+        cols.resize((size_t)(M * K));
+        for (int64_t m = 0; m < M; ++m) {
+            const int8_t* row = (const int8_t*)A->data + rowoff(A, m, K);
+            int8_t* dst = cols.data() + m * K;
+            for (int64_t k = 0; k < K; k += 16) {
+                std::memcpy(dst + k,      row + k,      4);
+                std::memcpy(dst + k + 4,  row + k + 8,  4);
+                std::memcpy(dst + k + 8,  row + k + 4,  4);
+                std::memcpy(dst + k + 12, row + k + 12, 4);
+            }
+        }
+        Ac = *A;
+        Ac.data = cols.data();
+        Ac.rank = 2; Ac.shape[0] = M; Ac.shape[1] = K; Ac.stride[0] = K; Ac.stride[1] = 1;
+        A = &Ac;
+    }
+
+    const int64_t pb1 = p_int(a, "pb1", 0), pb2 = p_int(a, "pb2", 0);
+    if (zg)
+        return gemm_zp(*zg, A, as_, B, bs_, rad_arg_in(a, 5), Y, M, N, K, p_int(a, "group", 0),
+                       pb1, pb2);
+    if (pb1 > 0 || pb2 > 0) {
+        if (bias_operand) return RAD_E_UNSUPPORTED;
+        return gemm_ntq_parts(A, as_, B, bs_, Y, pb1, pb2, M, N, K);
+    }
+
     const bool mx = B->dtype == RAD_FP4E2M1;
     Scales SA = make_scales(as_, M, K, false);
     Scales SB = make_scales(bs_, N, K, mx);
-    /* `group` is what the SELECTOR matches on; the loop uses the group the scale stream actually
-     * implies. They agree in every well-formed call, and where they do not the stream is the one
-     * that describes the bytes -- so a disagreement is refused rather than silently resolved. */
+    /* `group` is what the selector matches on; the loop uses the group the scale stream implies.
+     * A disagreement is refused. */
     const int64_t gp = p_int(a, "group", 0);
     if (gp > 0 && SB.p && SB.group != gp) return RAD_E_SHAPE;
 
     const Mat ma = as_mat(A, K), mb = as_mat(B, K);
-    return gemm_drive(ma, mb, &SA, &SB, Y, bias, M, N, K);
+    return gemm_q_drive(ma, mb, &SA, &SB, Y, bias, M, N, K);
 }
 
 AVX_KERNEL(gemm_nt)        { return gemm_nt_impl(a, false, "N", "K"); }
@@ -786,19 +1039,16 @@ AVX_KERNEL(gemm_nt_q)      { return gemm_ntq_impl(a, false); }
 AVX_KERNEL(gemm_nt_q_bias) { return gemm_ntq_impl(a, true); }
 
 /* ------------------------------------------------------------------ gemm_nt_q_gated */
-/* gemm_nt_q over a [N, K] gate_up plane -- N is the WEIGHT's rows, twice the fused width, gate half
- * first -- with gated_quant_fp8 as the epilogue; the output is [M, N/2].
+/* gemm_nt_q over an [N, K] gate_up weight (N is twice the fused width, gate half first), with
+ * gated_quant_fp8 as the epilogue; output [M, N/2].
  *
- * BYTE-IDENTICAL TO THE PAIR IT STANDS FOR, gemm_nt_q into a bf16 [M, N] tensor and then
- * gated_quant_fp8 over it. The product is gemm_drive's, the same driver at the same blocking; both
- * halves are narrowed to bf16 by the ABI's own converter, which is what gemm_nt_q's element store
- * does to a bf16 output; and the gate and the codes are avx_had.h's, which gated_quant_fp8 runs.
- * Taking either half off the f32 accumulator instead would be a different function.
+ * Byte-identical to gemm_nt_q into a bf16 [M, N] tensor followed by gated_quant_fp8: same driver
+ * and blocking, both halves narrowed to bf16 with the ABI's converter (as gemm_nt_q's bf16 store
+ * does), then avx_had.h's gate and codes.
  *
- * The f32 plane between the two is materialised whole, in a buffer the calling thread keeps: the
- * driver parallelises over the plane's columns, and the epilogue over its rows. `act` is REQUIRED
- * here where the quantiser defaults it -- an implementation may compile one gate, and a default
- * would let it resolve for the other. */
+ * The f32 plane between the two is materialised whole in a thread-kept buffer, since the driver
+ * parallelises over columns and the epilogue over rows. `act` is required here (the quantiser
+ * defaults it) so an implementation that compiles one gate cannot match a call for the other. */
 AVX_KERNEL(gemm_nt_q_gated) {
     if (a->n_t < 6) return RAD_E_INVAL;
     const RadTensor *A = &a->t[0], *B = &a->t[2], *q = &a->t[4], *s = &a->t[5];
@@ -835,7 +1085,7 @@ AVX_KERNEL(gemm_nt_q_gated) {
     Y.rank = 2;
     Y.shape[0] = M; Y.shape[1] = N;
     Y.stride[0] = N; Y.stride[1] = 1;
-    const int rc = gemm_drive(ma, mb, &SA, &SB, &Y, nullptr, M, N, K);
+    const int rc = gemm_q_drive(ma, mb, &SA, &SB, &Y, nullptr, M, N, K);
     if (rc != RAD_OK) return rc;
 
     const float* P = plane.data();
@@ -851,25 +1101,39 @@ AVX_KERNEL(gemm_nt_q_gated) {
     return RAD_OK;
 }
 
-/* The same arithmetic as gemm_nt, and a separate op anyway: lm_head is its own access class
- * (RAD_ACCESS_VOCAB) and the sampler wants to fuse against it, so the two have to be selectable
- * apart even when one kernel serves both. N and K are spelled n_vocab and n_embd. */
+/* gemm_nt's arithmetic as a separate op: lm_head has its own access class (RAD_ACCESS_VOCAB) and
+ * the sampler fuses against it, so the two must be selectable apart. N and K are n_vocab and
+ * n_embd. */
 AVX_KERNEL(logits_gemm) { return gemm_nt_impl(a, false, "n_vocab", "n_embd"); }
+
+/* gemm_nt's product for this plugin's composite kernels (the image convolution, avx_gen.cpp), over
+ * operands they assembled: Y = A B^T + bias, f32 accumulation, one rounding. Runs on the calling
+ * thread's team like gemm_nt and uses the same scratch arenas, so a caller keeps its own buffers
+ * elsewhere. */
+namespace avx {
+inline namespace AVX_SUFFIX {
+int gemm_nt_into(const RadTensor* A, const RadTensor* B, const RadTensor* bias, const RadTensor* Y,
+                 int64_t M, int64_t N, int64_t K) {
+    const Mat ma = as_mat(A, K), mb = as_mat(B, K);
+    if (gemm_q_bf16(ma, mb, nullptr, nullptr, Y, bias, M, N, K)) return RAD_OK;
+    return gemm_drive(ma, mb, nullptr, nullptr, Y, bias, M, N, K);
+}
+}  /* inline namespace AVX_SUFFIX */
+}  /* namespace avx */
 
 /* ================================================================== the vocabulary edges
  *
- * A gather, not a GEMM. A NEGATIVE token id writes a ZERO ROW -- the padding convention a batch
- * with a short sequence needs. `vocab_offset` makes the table this rank's slice of a vocab-parallel
- * embedding: ids stay GLOBAL, one outside the slice writes a zero row, and summing the ranks
- * reconstructs x.
+ * Embedding gather. A negative token id writes a zero row (padding). `vocab_offset` makes the table
+ * this rank's slice of a vocab-parallel embedding: ids stay global, ids outside the slice write
+ * zero rows, and summing the ranks reconstructs x.
  *
- * WITHOUT AN OFFSET AN ID AT OR ABOVE n_vocab STILL FAILS THE LAUNCH, because there it is a caller
- * bug rather than another rank's token and a plausible embedding is the worst possible answer.
- * With one, this kernel cannot know the global vocabulary, so the bound is the caller's. */
+ * When this rank holds the whole vocabulary, an id >= n_vocab fails the launch (a caller bug).
+ * Under a split, rank 0 included, the kernel cannot know the global vocabulary, so bounds are the
+ * caller's responsibility. */
 template <bool QUANT>
 static int embed_impl(const RadArgs* a) {
     const int nt = QUANT ? 4 : 3;
-    /* embed_lookup_q's scale (operand 2) is optional; everything else must be there. */
+    /* embed_lookup_q's scale (operand 2) is optional; the rest are required. */
     for (int i = 0; i < nt; ++i)
         if (!(QUANT && i == 2) && !rad_arg_in(a, i)) return RAD_E_INVAL;
     const RadTensor* tok = &a->t[0];
@@ -882,29 +1146,28 @@ static int embed_impl(const RadArgs* a) {
     if (n_embd <= 0 || n_vocab <= 0 || voff < 0) return RAD_E_SHAPE;
     const int64_t M = numel(x) / n_embd;
     if (M <= 0 || numel(tok) < M || numel(wte) < n_vocab * n_embd) return RAD_E_SHAPE;
-    /* An absent scale is one (ref_embed_lookup_q says why the op allows it). embed_lookup's
-     * `mult` is the same multiply, a parameter instead of a table scale. */
+    /* An absent scale is 1 (see ref_embed_lookup_q). embed_lookup's `mult` is the same multiply
+     * as a parameter. */
     const float scale = QUANT ? (sc->data && numel(sc) >= 1 ? ldt(sc, 0) : 1.0f)
                               : p_f32(a, "mult", 1.0f);
 
-    /* Validated before the loop, because an OpenMP body cannot return. */
-    if (voff == 0)
+    /* Validated before the loop; an OpenMP body cannot return. */
+    if (voff == 0 && a->world_size <= 1)
         for (int64_t m = 0; m < M; ++m)
             if (ldi(tok, offlin(tok, m)) >= n_vocab) return RAD_E_INVAL;
 
     const int64_t ws = wte->rank >= 2 ? wte->stride[wte->rank - 2] : n_embd;
     const int64_t wc = wte->rank >= 2 ? wte->stride[wte->rank - 1] : 1;
-    /* A ROW COPY WHEN NOTHING HAS TO CHANGE, which for the unquantised gather is the usual case:
-     * the table and the activation are the same dtype and a memcpy moves the row at the width of
-     * the machine instead of through an f32 round trip that would also re-round it. */
+    /* Byte copy when nothing changes (same dtype, no scale), the usual case for the unquantised
+     * gather. Whole-byte dtypes only: a sub-byte row can start mid-byte. */
     const bool copy = !QUANT && scale == 1.0f && wte->dtype == x->dtype && wc == 1 &&
-                      laststride(x) == 1;
+                      laststride(x) == 1 && rad_dtype_bits(x->dtype) % 8 == 0;
     const size_t rowb = copy ? (size_t)((rad_dtype_bits(x->dtype) * n_embd) / 8) : 0;
 
     AVX_PARALLEL_FOR_IF(M * n_embd >= AVX_PAR_MIN)
     for (int64_t m = 0; m < M; ++m) {
         const int64_t id = ldi(tok, offlin(tok, m)) - voff;
-        const int64_t xb = rowoff(x, m, n_embd), xs = laststride(x);
+        const int64_t xb = rowoff(x, m, n_embd);
         const bool have_row = id >= 0 && id < n_vocab;
         if (copy) {
             void* dst = (void*)byte_at(x->data, x->dtype, xb);
@@ -927,8 +1190,7 @@ static int embed_impl(const RadArgs* a) {
             for (int64_t i = 0; i < n_embd; ++i)
                 s[i] = ld_elem(wte->data, wte->dtype, id * ws + i * wc) * scale;
         }
-        if (xs == 1) out_row(x, xb, n_embd, s);
-        else for (int64_t i = 0; i < n_embd; ++i) stt(x, xb + i * xs, s[i]);
+        out_row(x, xb, n_embd, s);
     }
     return RAD_OK;
 }
@@ -937,20 +1199,17 @@ AVX_KERNEL(embed_lookup)   { return embed_impl<false>(a); }
 
 /* ================================================================== the E4M3 table into bf16
  *
- * The form a model serves -- an E4M3 table, a bf16 activation -- is a gather whose rows are usually
- * not in memory, and avx_ngram.cpp is where they come from: a row cache shared by every thread, a
- * direct read for each miss, a reader a step ahead. What stays here is the part that is this
- * level's: turning a row of codes into bf16 through the call's 256-entry table.
+ * The served form (E4M3 table, bf16 activation) gathers rows that are usually not in memory; they
+ * are fetched by avx_ngram.cpp (shared row cache, direct reads for misses, a reader one step
+ * ahead). This level only decodes a row of codes to bf16 through the call's 256-entry table.
  *
- * AT AVX-512 THE TABLE LIVES IN EIGHT REGISTERS. 256 bf16 are 512 bytes; vpermt2w indexes 64 words
- * across a register pair, so four of them look every code up in its quarter and the code's top two
- * bits pick the quarter -- a dozen instructions for 32 codes, against 32 dependent loads. Below
- * AVX-512 the table has no in-register form (vpshufb indexes 16 bytes and a gather issues one load
- * a lane, the null result in README.md), so those levels look a code up at a time.
+ * At AVX-512 the table (256 bf16, 512 bytes) lives in eight registers. vpermt2w indexes 64 words
+ * across a register pair, so four of them look up each code in its quarter and the code's top two
+ * bits select the quarter: about a dozen instructions per 32 codes. Lower levels have no
+ * in-register form (vpshufb indexes 16 bytes; a gather is one load per lane, see README.md) and
+ * look up one code at a time.
  *
- * EVERY ROW IS A CACHE MISS, so each row's lines are requested kAhead rows before its decode:
- * a batch is thousands of rows scattered over the row cache, and a decode that waited for each
- * row's lines in turn would spend its time on the memory latency rather than the lookups. */
+ * Every row is a cache miss, so each row's lines are prefetched kAhead rows before its decode. */
 static void decode_e4m3_rows(const uint8_t* const* src, uint16_t* const* dst, int64_t count,
                              int64_t n, const uint16_t* lut) {
     constexpr int64_t kAhead = 8;
@@ -994,17 +1253,16 @@ static void decode_e4m3_rows(const uint8_t* const* src, uint16_t* const* dst, in
     }
 }
 
-/* A bf16 table's rows ARE their output: the decode is a copy, and the row cache in front of it is
- * the whole of the work, as it is for the E4M3 table. */
+/* A bf16 table's rows are the output: the decode is a copy. */
 static void decode_bf16_rows(const uint8_t* const* src, uint16_t* const* dst, int64_t count,
                              int64_t n, const uint16_t*) {
     for (int64_t r = 0; r < count; ++r) std::memcpy(dst[r], src[r], (size_t)n * sizeof(uint16_t));
 }
 
-/* The call in avx_ngram.cpp's form, or false: i32 ids, a dense E4M3 table with its scale or a
- * dense bf16 table without one, bf16 rows at one pitch. */
+/* Fills `g` for avx_ngram.cpp's gather, or returns false: i32 ids, a dense E4M3 table with a
+ * scale or a dense bf16 table without, bf16 output rows at one pitch. */
 static bool rows_form(const RadArgs* a, RowGather* g) {
-    /* The scale is optional, so it is not part of what must be present. */
+    /* The scale (operand 2) is optional. */
     if (!rad_arg_in(a, 0) || !rad_arg_in(a, 1) || !rad_arg_in(a, 3)) return false;
     const RadTensor* tok = &a->t[0];
     const RadTensor* wte = &a->t[1];
@@ -1047,10 +1305,9 @@ AVX_KERNEL(embed_lookup_q) {
     if (!rows_form(a, &g)) return embed_impl<true>(a);
     if (g.voff < 0 || g.M <= 0 || numel(&a->t[0]) < g.M || numel(&a->t[1]) < g.n_vocab * g.n_embd)
         return RAD_E_SHAPE;
-    /* Checked before the gather, not inside it: a refusal halfway through would leave the output
-     * half written and the step would carry on over it. The bound is embed_impl's -- with an offset
-     * an id outside this rank's slice is another rank's row and writes a zero one. */
-    if (g.voff == 0)
+    /* Checked before the gather so a refusal never leaves the output half written. Same bound
+     * as embed_impl. */
+    if (g.voff == 0 && g.world_size <= 1)
         for (int64_t m = 0; m < g.M; ++m)
             if ((int64_t)g.ids[m] >= g.n_vocab) return RAD_E_INVAL;
     return row_gather(g, g.row_bytes == g.n_embd ? decode_e4m3_rows : decode_bf16_rows);

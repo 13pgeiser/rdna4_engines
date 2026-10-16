@@ -1,14 +1,9 @@
 /* plugin_test.cpp -- the plugin layer: loading, the hierarchy, op schemas, selection, bucket
- * tables, the selection table and per-instance init. spec.md §2 and §16.
+ * tables, the selection table and per-instance init (spec.md §2 and §16).
  *
- * The plugins it loads are core/plugin/testplugin/, built as real .so files: a loader tested
- * against a mock is a loader that has never been dlopen'd. Their rows are chosen so that the
- * assertions here are the spec's own claims -- §2.2's worked example is asserted band for band, so
- * the paragraph is a regression test rather than a paragraph.
- *
- * A passing run PRINTS error and warning lines. They are the diagnostics under test: a refused
- * plugin and a missing host kernel are meant to say so out loud, and asserting on a message nobody
- * ever sees is how a message rots.
+ * The test plugins in core/plugin/testplugin/ are real .so files, so the loader is tested through
+ * dlopen, and their rows make the spec's claims assertable (§2.2's worked example band for band).
+ * A passing run prints error and warning lines: they are the diagnostics under test.
  */
 #include "rad_test.h"
 
@@ -19,21 +14,17 @@
 #include <nlohmann/json.hpp>
 
 #include <dlfcn.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 using namespace rad;
 
 /* ------------------------------------------------------------------ fixtures */
 namespace {
 
-/* $RADIANCE_HOME is what ctest sets; RAD_TESTPLUGIN_HOME overrides it for a hand-built run. */
-std::string home() {
-    if (const char* d = std::getenv("RAD_TESTPLUGIN_HOME")) return d;
-    const char* h = std::getenv("RADIANCE_HOME");
-    return h ? h : "radiance_home";
-}
 std::string kernels_dir() { return home() + "/testkernels"; }
 std::string bad_dir()     { return home() + "/testkernels/bad"; }
 std::string order_dir()   { return home() + "/testkernels/order"; }
@@ -46,10 +37,6 @@ int load(Registry& r, std::vector<std::string> hierarchy = { "radtest_over", "ra
         fprintf(stderr, "    (no test plugins in %s -- build the radtest_* targets)\n",
                 kernels_dir().c_str());
     return st;
-}
-
-bool has(const std::string& hay, const std::string& needle) {
-    return hay.find(needle) != std::string::npos;
 }
 
 std::string errs(const Registry& r) {
@@ -67,10 +54,9 @@ Geometry gemm_geom(long long M, long long K = 4096, const char* dtype = "bf16") 
     return g;
 }
 
-/* A t_attn geometry every constraint of t_attn_paged holds for, WITHOUT the derived block_size --
- * which is how a caller actually asks, since block_size is what it is trying to find out. The
- * operator tests break exactly one key at a time, so the first unmet constraint is the one under
- * test. */
+/* A t_attn geometry every constraint of t_attn_paged holds for, without the derived block_size,
+ * as a real caller asks (block_size is what it wants to find out). The operator tests break one
+ * key at a time, so the first unmet constraint is the one under test. */
 Geometry attn_geom() {
     Geometry g;
     g.set_i("q_len", 8);
@@ -82,7 +68,7 @@ Geometry attn_geom() {
     return g;
 }
 
-/* The same question with the derived key PINNED by the caller. */
+/* The same question with the derived key pinned by the caller. */
 Geometry attn_geom_pinned(long long block_size) {
     Geometry g = attn_geom();
     g.set_i("block_size", block_size);
@@ -90,6 +76,27 @@ Geometry attn_geom_pinned(long long block_size) {
 }
 
 std::string picked(const KernelRow* k) { return k ? k->info->name : std::string("<none>"); }
+
+/* Each band as "hi:row " with its device row, for comparing a whole band table at once. */
+std::string band_names(const std::vector<Band>& b) {
+    std::string s;
+    for (const Band& x : b)
+        s += fmt("%lld:%s ", (long long)x.hi, picked(x.dom[RAD_DOMAIN_DEVICE].row).c_str());
+    return s;
+}
+
+/* The shipped libr4d.so, or "" for the case to leave. A build without HIP makes none, which skips;
+ * a HIP build always makes it, so there its absence is a missing in-tree artifact. */
+std::string libr4d() {
+    const std::string so = home() + "/kernels/libr4d.so";
+    if (access(so.c_str(), R_OK) == 0) return so;
+#ifdef RAD_HAVE_HIP
+    radtest::artifact_missing(__FILE__, __LINE__, so);
+#else
+    radtest::skip("no %s (a build without HIP)", so.c_str());
+#endif
+    return "";
+}
 
 /* The reason select() gives for a refusal, which is the miss column of §16's table. */
 std::string refusal(Registry& r, const char* op, const Geometry& g, int domain = RAD_DOMAIN_DEVICE) {
@@ -128,9 +135,8 @@ TEST(loading_reads_identity_and_calls_open) {
     if (open_calls) CHECK(open_calls() >= 1);
 }
 
-/* The hierarchy is CONFIGURED, not discovered: a named plugin takes its position, and a kernel
- * library present on disk but absent from the list is not loaded at all -- naming the libraries
- * is choosing them. With no list, everything on disk loads. */
+/* The hierarchy is configured, not discovered: a named plugin takes its position, and a kernel
+ * library on disk but absent from the list is not loaded. With no list, everything loads. */
 TEST(hierarchy_order_is_configured) {
     Registry r;
     CHECK_OK(r.load_dir(kernels_dir(), { "radtest_base" }));
@@ -151,15 +157,10 @@ TEST(hierarchy_order_is_configured) {
     CHECK_EQ(r2.plugin("radtest_base")->order, 1);
 }
 
-/* AND WITH NOTHING NAMED, THE REFERENCE LIBRARY IS STILL LAST. It declares a kernel for every op
- * in the vocabulary, so a plugin ranked behind it can never be selected: an unnamed kernel library
- * for this machine's card would load, win nothing, and leave the whole model resolving to the
- * naive implementation while the engine reported a full plugin set.
- *
- * The fixture is built so that alphabetical order alone would get this wrong -- `radtest_ord_a.so`
- * is the one declaring itself a reference (RadPluginReferenceFn) and is staged first -- which is
- * what makes the assertion mean something. Both plugins declare the same schemas, which is not a
- * conflict. */
+/* With nothing named, the reference library still sorts last: it declares every op, so anything
+ * ranked behind it could never be selected and the model would silently run the naive kernels.
+ * Alphabetical order would get this wrong: `radtest_ord_a.so` is the reference and is staged
+ * first. Both plugins declare the same schemas, which is not a conflict. */
 TEST(the_reference_library_sorts_last_with_no_hierarchy) {
     Registry r;
     const int st = r.load_dir(order_dir(), {});
@@ -177,14 +178,14 @@ TEST(the_reference_library_sorts_last_with_no_hierarchy) {
     CHECK(!other->reference);
     CHECK(other->order < ref->order);
 
-    /* Naming it is still an override: an operator comparing a library against the reference puts
-     * the reference in front on purpose, and the pin must not defeat that. */
+    /* Naming it is still an override: an operator comparing a library against the reference may
+     * put the reference first on purpose. */
     Registry r2;
     CHECK_OK(r2.load_dir(order_dir(), { "radtest_reference", "radtest_base" }));
     CHECK_EQ(r2.plugin("radtest_reference")->order, 0);
     CHECK(r2.plugin("radtest_base")->order > 0);
 
-    /* And a list that leaves it out leaves it out: the reference is a library like any other. */
+    /* A list that leaves it out leaves it out: the reference is a library like any other. */
     Registry r3;
     CHECK_OK(r3.load_dir(order_dir(), { "radtest_base" }));
     CHECK(r3.plugin("radtest_reference") == nullptr);
@@ -224,9 +225,9 @@ TEST(schema_conflict_is_refused_with_both_plugins_named) {
     CHECK_EQ(picked(r.select("t_gemm", gemm_geom(8), RAD_DOMAIN_DEVICE)), "t_gemm_m16");
 }
 
-/* An architecture plugin is loaded and IDENTIFIED here; the build component drives it. One plugin
- * implements one architecture id and no two may claim the same one, because the id is what selects
- * the plugin a model is built from. */
+/* An architecture plugin is loaded and identified here; the build component drives it. One plugin
+ * implements one architecture id and no two may claim the same one, since the id selects the
+ * plugin a model is built from. */
 TEST(architecture_plugins_are_identified_and_deduplicated) {
     Registry r;
     const int st = r.load_dir(arch_dir(), {});
@@ -247,10 +248,9 @@ TEST(architecture_plugins_are_identified_and_deduplicated) {
     CHECK(has(e, "radtest_arch2"));
 }
 
-/* THE REPLY FORMAT IS AN OPTIONAL EXPORT. Absent, the loader leaves the slot null and the plugin
- * loads -- rad_arch_probe, which this plugin does not export either, shows the same rule -- and
- * the engine derives the format from the chat template. Present, it is resolved, and what it
- * returns is a description the reply parser can run. */
+/* The reply format is an optional export. Absent, the slot stays null and the plugin loads (as
+ * with rad_arch_probe, also not exported here), and the engine derives the format from the chat
+ * template. Present, it resolves to a description the reply parser can run. */
 TEST(an_architecture_plugin_may_declare_its_reply_format) {
     Registry r;
     (void)r.load_dir(arch_dir(), {});
@@ -355,16 +355,16 @@ TEST(schema_validation_rejects_a_bad_param_set) {
     CHECK_EQ(r.validate("t_gemm", twice, 5, &err), RAD_E_SCHEMA);
     CHECK(has(err, "twice"));
 
-    /* At most one ranged parameter per op: that is what keeps the bucket-table index a single
-     * integer at issue. */
+    /* At most one ranged parameter per op, so the bucket-table index stays a single integer at
+     * issue. */
     RadParam two_ranges[] = { prange("M", 1, 64), pint("N", 4096), prange("K", 1, 64),
                               pstr("dtype", "bf16") };
     CHECK_EQ(r.validate("t_gemm", two_ranges, 4, &err), RAD_E_SCHEMA);
     CHECK(has(err, "at most one ranged parameter"));
 }
 
-/* A RAD_DERIVED parameter is not one the caller owes: demanding it would re-create the very
- * circularity it exists to break. Supplying it is allowed, and pins it. */
+/* A RAD_DERIVED parameter is not owed by the caller; demanding it would recreate the circularity
+ * it exists to break. Supplying it is allowed and pins it. */
 TEST(schema_validation_does_not_demand_a_derived_parameter) {
     Registry r;
     CHECK_OK(load(r));
@@ -380,8 +380,8 @@ TEST(schema_validation_does_not_demand_a_derived_parameter) {
     CHECK_OK(r.validate("t_attn", with, 7, &err));
 }
 
-/* Constraints never match on a float, so the schema check is the only thing standing between
- * RAD_F64("eps", 1e-6) and an integer spelling of it that reaches the kernel as a zero. */
+/* Constraints never match on a float, so the schema check is all that stops an integer spelling
+ * of RAD_F64("eps", 1e-6) from reaching the kernel as zero. */
 TEST(schema_validation_separates_a_float_from_an_integer) {
     Registry r;
     CHECK_OK(load(r));
@@ -408,8 +408,8 @@ TEST(selection_takes_the_highest_declared_priority) {
     CHECK_EQ(picked(r.select("t_gemm", gemm_geom(17), RAD_DOMAIN_DEVICE)), "t_gemm_m64");
     CHECK_EQ(picked(r.select("t_gemm", gemm_geom(65), RAD_DOMAIN_DEVICE)), "t_gemm_any");
 
-    /* K = 1000 is divisible by neither 256 nor 16, and w8a8 is in no row's set: both specialised
-     * rows drop out and the unconstrained one serves it. */
+    /* K = 1000 is divisible by neither 256 nor 16, and w8a8 is in no row's set, so both
+     * specialised rows drop out and the unconstrained one serves. */
     CHECK_EQ(picked(r.select("t_gemm", gemm_geom(8, 1000), RAD_DOMAIN_DEVICE)), "t_gemm_any");
     CHECK_EQ(picked(r.select("t_gemm", gemm_geom(8, 4096, "w8a8"), RAD_DOMAIN_DEVICE)),
              "t_gemm_any");
@@ -430,9 +430,9 @@ TEST(selection_breaks_ties_on_declaration_order) {
     CHECK_EQ(picked(r.select("t_tie", g, RAD_DOMAIN_DEVICE)), "t_tie_first");
 }
 
-/* THE HIERARCHY IS ABSOLUTE. radtest_over's t_norm row is unconstrained and priority 1;
- * radtest_base's is EQ n==4096 and priority 100. Whichever plugin is named first wins, and
- * priority never crosses the plugin boundary. */
+/* The hierarchy is absolute. radtest_over's t_norm row is unconstrained at priority 1;
+ * radtest_base's is EQ n==4096 at priority 100. The plugin named first wins; priority never
+ * crosses the plugin boundary. */
 TEST(hierarchy_beats_priority_and_specificity) {
     Geometry g;
     g.set_i("M", 1);
@@ -448,7 +448,7 @@ TEST(hierarchy_beats_priority_and_specificity) {
     CHECK_EQ(picked(base_first.select("t_norm", g, RAD_DOMAIN_DEVICE)), "t_norm_specialised");
 
     /* Domains resolve independently: radtest_over has no host row, so the host question falls
-     * through to the plugin below it rather than being answered "none". */
+     * through to the next plugin instead of being answered "none". */
     CHECK_EQ(picked(over_first.select("t_norm", g, RAD_DOMAIN_HOST)), "t_norm_host");
 }
 
@@ -499,17 +499,17 @@ TEST(every_constraint_operator_refuses_with_its_own_reason) {
     g = attn_geom(); g.set_s("kv_dtype", "f32");
     CHECK(has(refusal(r, "t_attn", g), "kv_dtype in {bf16 fp8_e4m3}, have f32"));
 
-    /* A constraint whose key the geometry lacks does NOT hold -- libr4d's rule: a row that needs
-     * a parameter the caller did not state is not a match. */
+    /* A constraint on a key the geometry lacks does not hold (libr4d's rule): a row that needs a
+     * parameter the caller did not state is not a match. */
     Geometry partial;
     partial.set_i("q_len", 8);
     CHECK(has(refusal(r, "t_attn", partial), "did not name head_dim"));
 }
 
-/* RAD_DERIVED: the parameter the KERNEL supplies. Skipped during matching when the caller did not
- * name it -- otherwise spec §7.2 is circular, since the block manager reads the block size off the
- * resolved kernel and the kernel cannot resolve without it -- and written into the resolved
- * geometry once a winner exists. */
+/* RAD_DERIVED: a parameter the kernel supplies. Skipped during matching when the caller did not
+ * name it, since otherwise spec §7.2 is circular (the block manager reads the block size off the
+ * resolved kernel, which cannot resolve without it); written into the resolved geometry once a
+ * winner exists. */
 TEST(a_derived_parameter_is_skipped_then_supplied) {
     Registry r;
     CHECK_OK(load(r));
@@ -532,7 +532,7 @@ TEST(a_derived_parameter_is_skipped_then_supplied) {
     CHECK_EQ(bs, 16);
 
     /* A caller that supplies it has pinned it: matched normally, so a mismatch is a refusal by
-     * name rather than a silent substitution, and nothing is derived afterwards. */
+     * name, and nothing is derived afterwards. */
     SelectionTrace pinned;
     CHECK_EQ(picked(r.select("t_attn", attn_geom_pinned(16), RAD_DOMAIN_DEVICE, &pinned)),
              "t_attn_paged");
@@ -540,9 +540,9 @@ TEST(a_derived_parameter_is_skipped_then_supplied) {
     CHECK(r.select("t_attn", attn_geom_pinned(32), RAD_DOMAIN_DEVICE) == nullptr);
 }
 
-/* A winner with no RAD_C_EQ on the derived key -- ref's `block_size >= 1`, which admits every
- * value -- leaves it unset. "any" is not a number, and the caller has to decide rather than be
- * handed a zero that looks like an answer. */
+/* A winner with no RAD_C_EQ on the derived key (ref's `block_size >= 1`, which admits any value)
+ * leaves it unset: the caller must decide rather than be handed a zero that looks like an
+ * answer. */
 TEST(a_derived_key_with_no_eq_stays_unset) {
     Registry r;
     CHECK_OK(load(r));
@@ -564,7 +564,7 @@ TEST(bands_carry_the_derived_value_into_every_band) {
     CHECK_OK(load(r));
     std::vector<Band> b = r.build_bands("t_attn", "q_len", 1, 64, attn_geom());
     /* q_len <= 16 is the only boundary the rows place on it, so (0,16] resolves and (16,64] does
-     * not -- and the resolved band still carries the kernel's block size. */
+     * not, and the resolved band carries the kernel's block size. */
     CHECK_EQ(b.size(), (size_t)2);
     if (b.size() != 2) return;
     CHECK_EQ(b[0].hi, 16);
@@ -575,7 +575,7 @@ TEST(bands_carry_the_derived_value_into_every_band) {
     CHECK(!b[1].dom[RAD_DOMAIN_DEVICE]);
 }
 
-/* §7.2: the block size comes from the resolved attention kernel's own constraints, not from a core
+/* §7.2: the block size comes from the resolved attention kernel's constraints, not a core
  * constant. This is the accessor the block manager reads it with. */
 TEST(a_resolved_kernel_s_constraints_are_readable) {
     Registry r;
@@ -588,16 +588,16 @@ TEST(a_resolved_kernel_s_constraints_are_readable) {
     CHECK_EQ(v, 16);
     CHECK(kernel_constraint(*k, "q_len", RAD_C_LE, &v));
     CHECK_EQ(v, 16);
-    /* Absent is not a default: the kernel says nothing about window with EQ, and the caller has to
-     * notice rather than being handed a zero. */
+    /* Absent is not a default: the kernel states no EQ on window, and the caller must notice
+     * rather than be handed a zero. */
     CHECK(!kernel_constraint(*k, "window", RAD_C_EQ, &v));
     CHECK(!kernel_constraint(*k, "nonesuch", RAD_C_EQ, &v));
 }
 
 /* ================================================================== bucket tables */
 
-/* spec.md §2.2's worked example, asserted band for band: three kernels constraining M<=16, M<=64
- * and nothing produce (0,16], (16,64], (64,max] and no policy was chosen by anyone. */
+/* spec.md §2.2's worked example, band for band: three kernels constraining M<=16, M<=64 and
+ * nothing produce (0,16], (16,64], (64,max] without any configured policy. */
 TEST(band_table_is_the_worked_example) {
     Registry r;
     CHECK_OK(load(r));
@@ -624,15 +624,14 @@ TEST(band_table_is_the_worked_example) {
         CHECK(band.miss[RAD_DOMAIN_DEVICE].empty());
     }
 
-    /* Each band is frozen AT ITS UPPER BOUND, which is the worst case in the band. */
+    /* Each band is frozen at its upper bound, the worst case in the band. */
     long long m = 0;
     CHECK(b[1].dom[RAD_DOMAIN_DEVICE].geom.get_i("M", &m));
     CHECK_EQ(m, 64);
     CHECK_EQ(b[1].dom[RAD_DOMAIN_DEVICE].tune_source, "axis defaults");
-
 }
 
-/* A range with a hole in it is reported as that band, not as the whole op. The boundaries are the
+/* A range with a hole is reported as that band, not as the whole op. Boundaries are the
  * constraint values themselves: LE 64 gives 64, GE 4096 ends the band below it at 4095. */
 TEST(band_boundaries_come_from_the_constraints) {
     Registry r;
@@ -737,7 +736,7 @@ TEST(init_runs_once_per_resolved_instance) {
     CHECK_EQ(n_init() - init0, 3);
     CHECK_EQ(r.n_instances(), (size_t)3);
 
-    /* The instance saw the FROZEN geometry -- its own band's upper bound, not the range. */
+    /* The instance saw the frozen geometry: its own band's upper bound, not the range. */
     CHECK_EQ(inst_m(b[0].dom[RAD_DOMAIN_DEVICE].instance), 16);
     CHECK_EQ(inst_m(b[2].dom[RAD_DOMAIN_DEVICE].instance), 8192);
 
@@ -792,8 +791,8 @@ TEST(the_selection_table_folds_repeats_and_names_the_refusal) {
     CHECK(has(table, "t_gemm_m16 (radtest_base, prio 30)"));
     CHECK(has(table, "M=16 N=4096 K=4096 dtype=bf16"));
     CHECK(has(table, "-- none: q_len <= 16, have 17"));
-    /* A derived key was not part of the question, so it is printed as the kernel's answer and not
-     * inside the geometry column. */
+    /* A derived key was not part of the question, so it is printed as the kernel's answer, not
+     * in the geometry column. */
     CHECK(has(table, "derived block_size:=16"));
     CHECK(!has(table, "block_size=16 "));
 
@@ -801,11 +800,10 @@ TEST(the_selection_table_folds_repeats_and_names_the_refusal) {
     CHECK_EQ(r.n_selections(), (size_t)0);
 }
 
-/* A "device." CONSTRAINT IS READ FROM THE MACHINE, not from the query: the engine measures peer
- * access at launch and the selector holds a kernel that needs it to that. Unmeasured, the kernel
- * is not selected and the refusal says nothing measured it; measured absent, the next row in the
- * plugin takes the op, and an op with no such row is refused naming the fact. The query never
- * carries the key, so no geometry -- and no tuning key -- changes. */
+/* A "device." constraint is read from the machine, not the query: the engine measures peer
+ * access at launch. Unmeasured, the kernel is not selected and the refusal says so; measured
+ * absent, the plugin's next row takes the op, and an op with no such row is refused naming the
+ * fact. The query never carries the key, so no geometry (and no tuning key) changes. */
 TEST(a_device_fact_constraint_is_matched_against_the_machine) {
     Registry r;
     CHECK_OK(load(r));
@@ -828,19 +826,13 @@ TEST(a_device_fact_constraint_is_matched_against_the_machine) {
     CHECK(has(why, "measured at launch"));
 }
 
-/* AN ENGINE SERVING WITH NO CARD LEAVES A GPU LIBRARY'S DEVICE ROWS OUT. On the host backend no
- * GPU code object runs, and a device row that resolved anyway would be launched at the first step
- * and fail -- CPU-only serving with the shipped libraries installed was exactly that. Only the
- * engine says so (set_no_device_code); a registry that only selects keeps every row, which the
- * libr4d tests below rely on wherever they run. First of the libr4d tests in this file, so its
- * dlopen is the one that registers the library's fat binaries. */
+/* An engine with no card leaves a GPU library's device rows out, since on the host backend a
+ * resolved device row would fail at its first launch. Only the engine sets this
+ * (set_no_device_code); a selecting-only registry keeps every row, as the libr4d tests below need.
+ * As the first libr4d test, its dlopen registers the library's fat binaries. */
 TEST(an_engine_with_no_card_leaves_a_gpu_librarys_device_rows_out) {
-    const std::string so = home() + "/kernels/libr4d.so";
-    if (access(so.c_str(), R_OK) != 0) {
-        fprintf(stderr, "  SKIP %s: no %s (a build without HIP)\n", ::radtest::current(),
-                so.c_str());
-        return;
-    }
+    const std::string so = libr4d();
+    if (so.empty()) return;
     Registry r;
     r.set_no_device_code(true);
     CHECK(r.load_plugin(so, 0) >= 0);
@@ -851,21 +843,16 @@ TEST(an_engine_with_no_card_leaves_a_gpu_librarys_device_rows_out) {
     for (const KernelRow& row : r.rows()) CHECK(row.info->domain != RAD_DOMAIN_DEVICE);
 }
 
-/* THE SHIPPED libr4d PICKS THE ALL-REDUCE BY MESSAGE SIZE, and the selector is what says so. At 3,
- * 4 and 8 ranks the exact sum is a one-shot for a decode-sized message and a two-shot for a
- * prefill chunk; the two-shot rows start one element above the one-shot bound, so that bound is a
- * band edge of the blocks' ranged `numel`. The band at or under the edge has to stay resolvable
- * for every row that places a DIV on `numel` -- the two-rank wht6 wire (64) and the three- and
- * four-rank ti8 wires (32, 128) among them -- or a lossy serve would lose its decode band. Checked
- * here against the real plugin, because nothing else can run a resolution above two ranks on a
- * two-card machine. Geometry is Qwen3.8-Flash-Next's: 2560 wide, a 2048-token chunk. */
+/* The shipped libr4d picks the all-reduce by message size. At 3, 4 and 8 ranks the exact sum is a
+ * one-shot for decode-sized messages and a two-shot for prefill chunks; the two-shot rows start one
+ * element above the one-shot bound, which is a band edge of the ranged `numel`. The band under it
+ * must stay resolvable for every row with a DIV on `numel` (two-rank wht6 (64), three- and
+ * four-rank ti8 (32, 128)), or a lossy serve loses its decode band. Only the real plugin can show
+ * resolution above two ranks on a two-card machine. Geometry: Qwen3.8-Flash-Next, 2560 wide,
+ * 2048-token chunk. */
 TEST(libr4d_resolves_the_all_reduce_by_message_size) {
-    const std::string so = home() + "/kernels/libr4d.so";
-    if (access(so.c_str(), R_OK) != 0) {
-        fprintf(stderr, "  SKIP %s: no %s (a build without HIP)\n", ::radtest::current(),
-                so.c_str());
-        return;
-    }
+    const std::string so = libr4d();
+    if (so.empty()) return;
     Registry r;
     CHECK(r.load_plugin(so, 0) >= 0);
     r.set_device_fact(RAD_FACT_P2P, 1);
@@ -879,43 +866,37 @@ TEST(libr4d_resolves_the_all_reduce_by_message_size) {
         g.set_i("min_bytes", 128 * 1024);
         return r.build_bands("all_reduce", "numel", width, max_tok * width, g);
     };
-    auto names = [](const std::vector<Band>& b) {
-        std::string s;
-        for (const Band& x : b)
-            s += fmt("%lld:%s ", (long long)x.hi, picked(x.dom[RAD_DOMAIN_DEVICE].row).c_str());
-        return s;
-    };
 
-    CHECK_EQ(names(bands(3, 1, chunk)),
+    CHECK_EQ(band_names(bands(3, 1, chunk)),
              "524288:ar_oneshot_3rank_exact 5242880:ar_twoshot_3rank_exact ");
-    CHECK_EQ(names(bands(4, 1, chunk)),
+    CHECK_EQ(band_names(bands(4, 1, chunk)),
              "524288:ar_oneshot_4rank_exact 5242880:ar_twoshot_4rank_exact ");
-    CHECK_EQ(names(bands(8, 1, chunk)),
+    CHECK_EQ(band_names(bands(8, 1, chunk)),
              "524288:ar_oneshot_8rank_exact 5242880:ar_twoshot_8rank_exact ");
-    CHECK_EQ(names(bands(3, 0, chunk)),
+    CHECK_EQ(band_names(bands(3, 0, chunk)),
              "524288:ar_twoshot_3rank_ti8 5242880:ar_twoshot_3rank_ti8 ");
-    CHECK_EQ(names(bands(4, 0, chunk)),
+    CHECK_EQ(band_names(bands(4, 0, chunk)),
              "524288:ar_twoshot_4rank_ti8 5242880:ar_twoshot_4rank_ti8 ");
-    CHECK_EQ(names(bands(2, 0, chunk)),
+    CHECK_EQ(band_names(bands(2, 0, chunk)),
              "524288:ar_oneshot_2rank_wht6 5242880:ar_oneshot_2rank_wht6 ");
-    CHECK_EQ(names(bands(2, 1, chunk)),
+    CHECK_EQ(band_names(bands(2, 1, chunk)),
              "524288:ar_oneshot_2rank_exact 5242880:ar_oneshot_2rank_exact ");
 
-    /* A 16384-token chunk is two-shot to its end: the two-shot's bound is a guard on its word
-     * offsets, not a prefill size, and a chunk past the old 20971520 went back to the one-shot's
-     * twice-as-heavy send. */
-    CHECK_EQ(names(bands(4, 1, 16384)),
+    /* A 16384-token chunk is two-shot to its end: the two-shot's bound guards its word offsets,
+     * it is not a prefill size, and a chunk past 20971520 elements would otherwise fall back to
+     * the one-shot's twice-as-heavy send. */
+    CHECK_EQ(band_names(bands(4, 1, 16384)),
              "524288:ar_oneshot_4rank_exact 41943040:ar_twoshot_4rank_exact ");
-    CHECK_EQ(names(bands(3, 1, 16384)),
+    CHECK_EQ(band_names(bands(3, 1, 16384)),
              "524288:ar_oneshot_3rank_exact 41943040:ar_twoshot_3rank_exact ");
 
     /* Above the two-shot's bound the one-shot takes the message back. */
-    CHECK_EQ(names(bands(4, 1, 131072)),
+    CHECK_EQ(band_names(bands(4, 1, 131072)),
              "524288:ar_oneshot_4rank_exact 268435456:ar_twoshot_4rank_exact "
              "335544320:ar_oneshot_4rank_exact ");
 
     /* A step that never exceeds the bound has one band, and it is the one-shot's. */
-    CHECK_EQ(names(bands(4, 1, 128)), "327680:ar_oneshot_4rank_exact ");
+    CHECK_EQ(band_names(bands(4, 1, 128)), "327680:ar_oneshot_4rank_exact ");
 
     /* Eight ranks have no lossy wire: every band is a miss that names the request. */
     const std::vector<Band> none = bands(8, 0, chunk);
@@ -924,21 +905,27 @@ TEST(libr4d_resolves_the_all_reduce_by_message_size) {
         CHECK(!b.dom[RAD_DOMAIN_DEVICE]);
         CHECK(has(b.miss[RAD_DOMAIN_DEVICE], "exact"));
     }
+
+    /* A row with a DIV on the message carries it, and the issue path refuses a message it does
+     * not divide. Every message here (rows times 2560) is a multiple of 128, so none is refused. */
+    for (const Band& b : bands(2, 0, chunk)) CHECK_EQ(b.dom[RAD_DOMAIN_DEVICE].ranged_div, 64ll);
+    for (const Band& b : bands(3, 0, chunk)) CHECK_EQ(b.dom[RAD_DOMAIN_DEVICE].ranged_div, 32ll);
+    for (const Band& b : bands(4, 0, chunk)) CHECK_EQ(b.dom[RAD_DOMAIN_DEVICE].ranged_div, 128ll);
+    const std::vector<Band> exact4 = bands(4, 1, chunk);
+    REQUIRE_EQ(exact4.size(), 2u);
+    CHECK_EQ(exact4[0].dom[RAD_DOMAIN_DEVICE].ranged_div, 0ll);
+    CHECK_EQ(exact4[1].dom[RAD_DOMAIN_DEVICE].ranged_div, 64ll);
+    for (const Band& b : bands(3, 1, chunk)) CHECK_EQ(b.dom[RAD_DOMAIN_DEVICE].ranged_div, 0ll);
 }
 
-/* THE FOUR-RANK FUSED WRITES SERVE THE EXACT WIRE ONLY, AND SAY SO IN SELECTION. A caller states
- * `wire` 0 for the exact form and gets the four-rank rows; a request for the rotated wire at four
- * ranks is a miss that names `wire`, so the caller keeps its unfused pair -- not a row that
- * matches and then refuses its instance, which would stop declare. At two ranks both wires keep
- * their row. Geometry is Qwen3.8-Flash-Next's: 2560 wide, four streams, top-k 10, declared over a
- * decode or verify step of 8 sequences at depth 3. */
+/* The four-rank fused writes serve the exact wire only, and selection says so. `wire` 0 (exact)
+ * gets the four-rank rows; the rotated wire at four ranks is a miss naming `wire`, so the caller
+ * keeps its unfused pair (a row that matched and then refused its instance would stop declare).
+ * At two ranks both wires keep their row. Geometry is Qwen3.8-Flash-Next's: 2560 wide, four
+ * streams, top-k 10, over a decode or verify step of 8 sequences at depth 3. */
 TEST(libr4d_resolves_the_four_rank_fused_writes_on_the_exact_wire_only) {
-    const std::string so = home() + "/kernels/libr4d.so";
-    if (access(so.c_str(), R_OK) != 0) {
-        fprintf(stderr, "  SKIP %s: no %s (a build without HIP)\n", ::radtest::current(),
-                so.c_str());
-        return;
-    }
+    const std::string so = libr4d();
+    if (so.empty()) return;
     Registry r;
     CHECK(r.load_plugin(so, 0) >= 0);
     r.set_device_fact(RAD_FACT_P2P, 1);
@@ -957,18 +944,12 @@ TEST(libr4d_resolves_the_four_rank_fused_writes_on_the_exact_wire_only) {
         }
         return r.build_bands(op, "M", 1, rows, g);
     };
-    auto names = [](const std::vector<Band>& b) {
-        std::string s;
-        for (const Band& x : b)
-            s += fmt("%lld:%s ", (long long)x.hi, picked(x.dom[RAD_DOMAIN_DEVICE].row).c_str());
-        return s;
-    };
 
-    CHECK_EQ(names(bands("ar_hc_write", 4, 0)), "32:ar_hc_write_4rank ");
-    CHECK_EQ(names(bands("ar_gather_hc_write", 4, 0)), "32:ar_gather_hc_write_4rank ");
+    CHECK_EQ(band_names(bands("ar_hc_write", 4, 0)), "32:ar_hc_write_4rank ");
+    CHECK_EQ(band_names(bands("ar_gather_hc_write", 4, 0)), "32:ar_gather_hc_write_4rank ");
     for (int wire : { 0, 6 }) {
-        CHECK_EQ(names(bands("ar_hc_write", 2, wire)), "32:ar_hc_write ");
-        CHECK_EQ(names(bands("ar_gather_hc_write", 2, wire)), "32:ar_gather_hc_write ");
+        CHECK_EQ(band_names(bands("ar_hc_write", 2, wire)), "32:ar_hc_write ");
+        CHECK_EQ(band_names(bands("ar_gather_hc_write", 2, wire)), "32:ar_gather_hc_write ");
     }
 
     for (const char* op : { "ar_hc_write", "ar_gather_hc_write" }) {
@@ -981,18 +962,13 @@ TEST(libr4d_resolves_the_four_rank_fused_writes_on_the_exact_wire_only) {
     }
 }
 
-/* THE VISION TOWER'S ATTENTION RESOLVES AS rad_block_vit.h DECLARES IT: head_dim 72, no `window`.
- * `window` is optional in attn_dense's schema and a constraint on a key the geometry lacks does not
- * hold, so a row that constrains it is unreachable for a caller that leaves it out -- which is how
- * every Qwen image request on a card came to stop the engine with "no device kernel for this
- * band". rad-kbench cannot see that: its cases always name the window. */
+/* The vision tower's attention resolves as rad_block_vit.h declares it: head_dim 72, no
+ * `window`. `window` is optional in attn_dense's schema and a constraint on an absent key does
+ * not hold, so a row constraining it is unreachable for a caller that omits it. rad-kbench cannot
+ * catch this: its cases always name the window. */
 TEST(libr4d_resolves_the_vision_attention_without_a_window) {
-    const std::string so = home() + "/kernels/libr4d.so";
-    if (access(so.c_str(), R_OK) != 0) {
-        fprintf(stderr, "  SKIP %s: no %s (a build without HIP)\n", ::radtest::current(),
-                so.c_str());
-        return;
-    }
+    const std::string so = libr4d();
+    if (so.empty()) return;
     Registry r;
     CHECK(r.load_plugin(so, 0) >= 0);
     Geometry g;
@@ -1004,6 +980,247 @@ TEST(libr4d_resolves_the_vision_attention_without_a_window) {
     const std::vector<Band> b = r.build_bands("attn_dense", "M", 1, 16384, g);
     CHECK(!b.empty());
     for (const Band& x : b) CHECK_EQ(picked(x.dom[RAD_DOMAIN_DEVICE].row), "attn_vit_h72_bf16");
+}
+
+/* ================================================================== constraints that are not intervals */
+namespace {
+std::string extra_dir()   { return home() + "/testkernels/extra"; }
+std::string decline_dir() { return home() + "/testkernels/decline"; }
+
+/* The base plugin and radtest_extra behind it. */
+int load_extra(Registry& r) {
+    return r.load_dirs({ kernels_dir(), extra_dir() }, { "radtest_base", "radtest_extra" });
+}
+
+/* The band holding `v`, or null. */
+const Band* band_at(const std::vector<Band>& b, int64_t v) {
+    for (const Band& x : b) if (v <= x.hi) return &x;
+    return nullptr;
+}
+
+/* An empty directory of its own under the test's temporary directory. */
+struct TempDir {
+    std::string path;
+    TempDir() {
+        std::string tmpl = radtest::tmp_path("dir.XXXXXX");
+        if (mkdtemp(tmpl.data())) path = tmpl;
+    }
+    std::string sub(const std::string& rel) const {
+        const std::string p = path + "/" + rel;
+        mkdir(p.c_str(), 0755);
+        return p;
+    }
+};
+}  /* namespace */
+
+/* Bands are resolved at their upper bound, so a row whose constraint on the ranged parameter is not
+ * an interval would win a band at its top and be issued at values inside it that it rejects. An IN
+ * lists its values, each of which gets a band of its own; a DIV row keeps its bands and they carry
+ * its divisor, which the issue path checks. Every value of the range is then either served by its
+ * band's row or refused at issue, never launched outside the row's contract. */
+TEST(no_band_issues_a_row_at_a_value_its_constraints_reject) {
+    Registry r;
+    REQUIRE_EQ(load_extra(r), RAD_OK);
+    Geometry base;
+    base.set_i("n", 1);
+    const std::vector<Band> b = r.build_bands("t_div", "M", 1, 64, base);
+    for (int64_t m = 1; m <= 64; ++m) {
+        const Band* x = band_at(b, m);
+        REQUIRE(x != nullptr);
+        const Resolved& w = x->dom[RAD_DOMAIN_DEVICE];
+        REQUIRE(w.row != nullptr);
+        Geometry g = base;
+        g.set_i("M", m);
+        bool holds = true;
+        for (int i = 0; i < w.row->info->n_constraints; ++i)
+            holds = holds && constraint_holds(w.row->info->constraints[i], g);
+        const bool refused = w.ranged_div > 1 && m % w.ranged_div != 0;
+        if (holds == refused)
+            fprintf(stderr, "    M=%lld: band <= %lld, %s, ranged_div %lld\n", (long long)m,
+                    (long long)x->hi, w.row->info->name, (long long)w.ranged_div);
+        CHECK(holds != refused);
+    }
+    /* The listed values have bands of their own, and only they reach the IN row. */
+    CHECK_EQ(picked(band_at(b, 8)->dom[RAD_DOMAIN_DEVICE].row), "t_div_in");
+    CHECK_EQ(band_at(b, 8)->hi, 8);
+    CHECK_EQ(picked(band_at(b, 24)->dom[RAD_DOMAIN_DEVICE].row), "t_div_in");
+    CHECK_EQ(picked(band_at(b, 9)->dom[RAD_DOMAIN_DEVICE].row), "t_div_any");
+    CHECK_EQ(picked(band_at(b, 7)->dom[RAD_DOMAIN_DEVICE].row), "t_div_any");
+    /* The DIV row still wins the top band at its upper bound, as before, and says what it needs. */
+    CHECK_EQ(picked(band_at(b, 64)->dom[RAD_DOMAIN_DEVICE].row), "t_div_m16");
+    CHECK_EQ(band_at(b, 64)->dom[RAD_DOMAIN_DEVICE].ranged_div, 16ll);
+    CHECK_EQ(band_at(b, 8)->dom[RAD_DOMAIN_DEVICE].ranged_div, 0ll);
+    /* An IN or DIV on any other key cuts nothing: t_gemm's DIV on K and IN on dtype leave the
+     * worked example's three bands. */
+    Geometry gb;
+    gb.set_i("N", 4096);
+    gb.set_i("K", 4096);
+    gb.set_s("dtype", "bf16");
+    const std::vector<Band> g = r.build_bands("t_gemm", "M", 1, 8192, gb);
+    CHECK_EQ(band_names(g), "16:t_gemm_m16 64:t_gemm_m64 8192:t_gemm_any ");
+    for (const Band& x : g) CHECK_EQ(x.dom[RAD_DOMAIN_DEVICE].ranged_div, 0ll);
+}
+
+/* ================================================================== the tuning cache */
+/* A cache row moves one shape off its axis defaults. It applies to the kernel, plugin and geometry
+ * it names, keyed without the choices themselves; a value the axis does not declare is never
+ * launched; and a combination the kernel's cross-axis test refuses falls back to every default,
+ * which the kernel must always run. */
+TEST(a_tuning_cache_row_moves_its_shape_off_the_defaults_and_only_within_the_axis) {
+    TempDir home_dir;
+    REQUIRE(!home_dir.path.empty());
+    const std::string machine = "radtest-machine";
+    Geometry wide;
+    wide.set_i("M", 64);
+    wide.set_i("N", 256);
+    wide.set_i("K", 64);
+    wide.set_s("dtype", "bf16");
+    Geometry narrow = wide;
+    narrow.set_i("N", 64);
+    std::string wide_key, narrow_key;
+    {
+        Registry r;
+        REQUIRE_EQ(load_extra(r), RAD_OK);
+        const Resolved a = r.resolve("t_tune", wide, RAD_DOMAIN_DEVICE);
+        REQUIRE(a.row != nullptr);
+        CHECK_EQ(a.tune_source, "axis defaults");
+        CHECK_EQ(a.choice, "bn=64");
+        wide_key = a.geom_key;
+        narrow_key = r.resolve("t_tune", narrow, RAD_DOMAIN_DEVICE).geom_key;
+        CHECK(!has(wide_key, "bn="));
+    }
+    TuneCache tc;
+    tc.set_machine(machine);
+    auto row = [&](const char* choice, const std::string& geom) {
+        TuneRow t;
+        t.kernel = "t_tune_picky";
+        t.plugin = "radtest_extra";
+        t.choice = choice;
+        t.geom = geom;
+        t.us = 1.0;
+        t.measured = "2026-10-15T00:00:00Z";
+        tc.put(t);
+    };
+    row("bn=128", wide_key);
+    row("bn=128", narrow_key);
+    /* Rows a lookup must never take: an undeclared value, and a key that includes its answer. */
+    Geometry other = wide;
+    other.set_i("N", 512);
+    Registry probe;
+    REQUIRE_EQ(load_extra(probe), RAD_OK);
+    const std::string other_key = probe.resolve("t_tune", other, RAD_DOMAIN_DEVICE).geom_key;
+    row("bn=999", other_key);
+    Geometry with_answer = wide;
+    with_answer.set_i("N", 1024);
+    with_answer.set_i("bn", 128);
+    row("bn=128", TuneCache::canon_geometry(with_answer));
+    REQUIRE_EQ(tc.save(home_dir.path), RAD_OK);
+
+    Registry r;
+    REQUIRE_EQ(load_extra(r), RAD_OK);
+    CHECK_EQ(r.load_tune(home_dir.path, machine), 4);
+    const Resolved a = r.resolve("t_tune", wide, RAD_DOMAIN_DEVICE);
+    long long bn = 0;
+    CHECK(a.geom.get_i("bn", &bn));
+    CHECK_EQ(bn, 128ll);
+    CHECK(a.tune_source.rfind("tuned", 0) == 0);
+    CHECK_EQ(a.choice, "bn=128");
+
+    const Resolved u = r.resolve("t_tune", other, RAD_DOMAIN_DEVICE);
+    CHECK(u.geom.get_i("bn", &bn));
+    CHECK_EQ(bn, 64ll);
+    CHECK_EQ(u.tune_source, "axis defaults");
+
+    Geometry asked = wide;
+    asked.set_i("N", 1024);
+    const Resolved k = r.resolve("t_tune", asked, RAD_DOMAIN_DEVICE);
+    CHECK_EQ(k.choice, "bn=64");
+
+    Resolved n;
+    const std::string warn = stderr_of([&] { n = r.resolve("t_tune", narrow, RAD_DOMAIN_DEVICE); });
+    CHECK(n.row != nullptr);
+    CHECK_EQ(n.choice, "bn=64");
+    CHECK_EQ(n.tune_source, "axis defaults");
+    CHECK(has(warn, "falling back to its defaults"));
+}
+
+/* ================================================================== the loader's edges */
+
+/* --kernels names a library by its declared name or its file, in any spelling: `radtest_base`,
+ * `libradtest_base`, `radtest_base.so` and a path to it are one library. An entry that matches
+ * nothing loads nothing in its place and is warned about. */
+TEST(a_kernel_library_is_named_by_any_spelling_of_its_file) {
+    for (const std::string& h : { std::string("radtest_base"), std::string("libradtest_base"),
+                                  std::string("radtest_base.so"),
+                                  kernels_dir() + "/radtest_base.so" }) {
+        Registry r;
+        CHECK_OK(r.load_dir(kernels_dir(), { h }));
+        const Plugin* p = r.plugin("radtest_base");
+        CHECK(p != nullptr);
+        if (p) CHECK_EQ(p->order, 0);
+        CHECK(r.plugin("radtest_over") == nullptr);
+    }
+    Registry r;
+    std::string log;
+    log = stderr_of([&] { CHECK_OK(r.load_dir(kernels_dir(), { "nope", "radtest_base" })); });
+    CHECK(has(log, "'nope'"));
+    CHECK_EQ(r.plugins().size(), (size_t)1);
+    CHECK(r.plugin("radtest_base") != nullptr);
+}
+
+/* A directory earlier on the search path shadows a file of the same name later on it, so an
+ * operator's own build of a library wins over the installation's. Loading a second directory
+ * continues the order from the first. */
+TEST(an_earlier_directory_shadows_a_later_one_and_orders_continue) {
+    TempDir own;
+    REQUIRE(!own.path.empty());
+    const std::string link = own.path + "/radtest_over.so";
+    REQUIRE_EQ(symlink((kernels_dir() + "/radtest_over.so").c_str(), link.c_str()), 0);
+    Registry r;
+    CHECK_OK(r.load_dirs({ own.path, kernels_dir() }, {}));
+    const Plugin* over = r.plugin("radtest_over");
+    REQUIRE(over != nullptr);
+    CHECK_EQ(over->path, link);
+    CHECK_EQ(r.plugins().size(), (size_t)2);
+
+    Registry r2;
+    CHECK_OK(r2.load_dir(kernels_dir(), {}));
+    (void)stderr_of([&] { (void)r2.load_dir(arch_dir(), {}); });
+    const Plugin* arch = r2.plugin("radtest_arch");
+    REQUIRE(arch != nullptr);
+    CHECK(arch->order >= 2);
+}
+
+/* A tunable axis whose default is not one of its values, or an axis declared twice, would run an
+ * unsupported configuration on every untuned shape; the loader refuses the library by name. */
+TEST(a_tunable_axis_the_kernel_cannot_run_by_default_is_refused_at_load) {
+    Registry r;
+    std::string log = stderr_of([&] {
+        CHECK_EQ(r.load_plugin(bad_dir() + "/radtest_badtune_default.so", 0), RAD_E_INVAL);
+    });
+    CHECK(has(errs(r), "defaults to 96, which is not one of its declared values"));
+    CHECK(r.plugins().empty());
+    Registry r2;
+    log = stderr_of([&] {
+        CHECK_EQ(r2.load_plugin(bad_dir() + "/radtest_badtune_twice.so", 0), RAD_E_INVAL);
+    });
+    CHECK(has(errs(r2), "declares tunable 'bn' twice"));
+    CHECK(r2.rows().empty());
+}
+
+/* A library that declines this machine at open (built for another card) is skipped, not refused:
+ * nothing registers and it takes no position in the hierarchy. */
+TEST(a_library_that_declines_the_machine_registers_nothing_and_takes_no_place) {
+    Registry r;
+    CHECK_OK(r.load_dirs({ decline_dir(), kernels_dir() }, {}));
+    CHECK(r.plugin("radtest_decline") == nullptr);
+    CHECK_EQ(r.plugins().size(), (size_t)2);
+    for (const Plugin& p : r.plugins()) CHECK(p.order < 2);
+    for (const KernelRow& k : r.rows()) CHECK(std::string(k.info->name) != "t_decline_gemm");
+    Registry r2;
+    CHECK_EQ(r2.load_plugin(decline_dir() + "/radtest_decline.so", 0), 1);
+    CHECK(r2.plugins().empty());
+    CHECK(r2.load_errors().empty());
 }
 
 RAD_TEST_MAIN()

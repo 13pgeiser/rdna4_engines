@@ -1,4 +1,5 @@
 #include "server.h"
+#include "server_priv.h"
 
 #include <cstdio>
 #include "json_partial.h"
@@ -15,46 +16,6 @@
 
 namespace rad {
 namespace server {
-
-/* ------------------------------------------------------------------ per-choice state */
-
-struct Server::Generation {
-    std::shared_ptr<Sink>         sink;
-    std::unique_ptr<IDetokenizer> detok;
-    std::unique_ptr<ReplyStream> delta;   /* chat streaming only, in the request's API shape */
-    uint64_t    id = 0;
-    int         index = 0;
-    int         prompt_index = 0;
-    std::string text;
-    std::vector<LogprobEntry> logprobs;
-    size_t      lp_sent = 0;         /* streaming: how many of `logprobs` a chunk already carried */
-    /* The reply against its reasoning block, every token the sink delivers: what
-     * completion_tokens_details.reasoning_tokens reports. */
-    ReasoningCount think;
-    Finish      finish = Finish::None;
-    bool        closed = false;      /* the server has decided this choice is over */
-    size_t      scanned = 0;         /* how far the stop-string scan has reached */
-    /* OaiRequest::stops_after: where in `text` the reasoning block's closer ends (npos until it
-     * has been generated) and how far the search for it has reached. */
-    size_t      stops_floor = std::string::npos;
-    size_t      closer_scanned = 0;
-    size_t      stop_cut = std::string::npos;
-    std::string stop_word;           /* the stop string at stop_cut, "" when the decoder cut it */
-    size_t      emitted = 0;         /* streaming: text already handed to the delta stream */
-    std::vector<int32_t> tokens;     /* llama-server's native shape: the ids generated */
-    size_t      tokens_sent = 0;     /* ...and how many of them a stream chunk carried */
-    int32_t     progress_sent = -1;  /* streaming: the prompt_progress last sent, -1 for none */
-    bool        retired = false;     /* reap() has been said for this id, at most once */
-};
-
-struct Server::StreamState {
-    OaiRequest              r;
-    std::vector<Generation> gens;
-    std::function<bool()>   peer_closed;
-    bool opened = false;
-    bool done_sent = false;
-    bool released = false;
-};
 
 /* ------------------------------------------------------------------ construction */
 
@@ -94,15 +55,11 @@ Server::Server(const Deps& d, const ServerOptions& o)
 
 Server::~Server() { stop(); }
 
-/* Sinks the engine may still be writing into must not be freed. `Request::sink` is a raw pointer
- * the scheduler holds for the life of the request, so the only safe moment to release one is
- * after the scheduler has reported it terminal. At shutdown we wait a bounded time for that and,
- * if it never comes, we leak the remainder on purpose and say so.
- *
- * A deliberate leak of a few KiB at process exit is the cheap failure. Freeing under a running
- * step is the expensive one: it corrupts whatever the allocator hands out next, and it surfaces
- * as garbage in an unrelated request several steps later, which is precisely the class of bug
- * spec §17 exists to keep out of this engine. */
+/* A sink may be freed only after the scheduler reports its request terminal, since
+ * `Request::sink` is a raw pointer the scheduler holds for the request's life. At shutdown this
+ * waits a bounded time, then deliberately leaks the remainder (a few KiB at exit) rather than
+ * free memory a running step may write into, which would corrupt an unrelated allocation
+ * (spec §17). */
 void Server::drain_graveyard(int timeout_ms) {
     const int slice = 5;
     for (int waited = 0; waited <= timeout_ms; waited += slice) {
@@ -126,13 +83,11 @@ void Server::drain_graveyard(int timeout_ms) {
     grave_.clear();
 }
 
-/* WHAT IS SERVED. One table, and /server_info answers with it rather than with a copy -- a list
- * kept beside this one is a list that goes stale on the next route added.
+/* Every route, in one table that /server_info also reports.
  *
- * Method spellings follow vLLM's, including the ones that look wrong: /tokenize and /detokenize
- * are POST because their input is a body, /reset_prefix_cache is POST because it changes state,
- * and /ping answers both GET and POST because different load balancers send different ones and
- * neither is worth a 405 on a health probe. */
+ * Methods follow vLLM's: /tokenize and /detokenize are POST (their input is a body),
+ * /reset_prefix_cache is POST (it changes state), and /ping takes GET and POST because load
+ * balancers differ. */
 void Server::register_routes() {
     router_.post("/v1/chat/completions", [this](const HttpRequest& q) { return handle_chat(q); });
     router_.post("/v1/completions",      [this](const HttpRequest& q) { return handle_completion(q); });
@@ -140,37 +95,61 @@ void Server::register_routes() {
     router_.post("/v1/images/generations", [this](const HttpRequest& q) { return handle_images(q, false); });
     router_.post("/v1/images/edits",     [this](const HttpRequest& q) { return handle_images(q, true); });
     router_.post("/v1/systemone",        [this](const HttpRequest& q) { return handle_systemone(q); });
+    /* Speech to text, for a model whose plugin says how it transcribes (RadAudioFormat). */
+    router_.post("/v1/audio/transcriptions",
+                 [this](const HttpRequest& q) { return handle_transcription(q); });
+    /* The same, live over a WebSocket (OpenAI's realtime transcription session). A plain GET
+     * there is told what the path wants. */
+    router_.socket("/v1/realtime", [this](const HttpRequest& q, WsConn& c) { handle_realtime(q, c); });
+    router_.get ("/v1/realtime", [this](const HttpRequest& q) {
+        ApiError e;
+        e.status = 426;
+        e.type = "invalid_request_error";
+        e.message = "/v1/realtime is a WebSocket: connect with an Upgrade: websocket request";
+        HttpResponse r = error_response(e, q.peer);
+        r.set_header("Upgrade", "websocket");
+        return r;
+    });
     router_.get ("/v1/models",           [this](const HttpRequest& q) { return handle_models(q); });
-    router_.get ("/v1/models/:id",       [this](const HttpRequest& q) { return handle_models(q); });
-    /* THE SAME ROUTES WITHOUT /v1, as llama-server answers them: a client configured with the
-     * bare host as its base URL appends the path alone. */
+    router_.get ("/v1/models/*id",       [this](const HttpRequest& q) { return handle_models(q); });
+    /* The same routes without /v1, as llama-server answers them, for clients whose base URL is
+     * the bare host. */
     router_.post("/chat/completions",    [this](const HttpRequest& q) { return handle_chat(q); });
-    /* llama-server's native completion, under both of its names: /completions without /v1 is
-     * the native endpoint there, not OpenAI's. */
+    /* llama-server's native completion under both its names; /completions without /v1 is the
+     * native endpoint there, not OpenAI's. */
     router_.post("/completion",          [this](const HttpRequest& q) { return handle_native_completion(q); });
     router_.post("/completions",         [this](const HttpRequest& q) { return handle_native_completion(q); });
     router_.post("/infill",              [this](const HttpRequest& q) { return handle_infill(q); });
     router_.post("/embeddings",          [this](const HttpRequest& q) { return handle_embeddings(q); });
     router_.post("/images/generations",  [this](const HttpRequest& q) { return handle_images(q, false); });
     router_.post("/images/edits",        [this](const HttpRequest& q) { return handle_images(q, true); });
+    router_.post("/audio/transcriptions", [this](const HttpRequest& q) { return handle_transcription(q); });
     router_.get ("/models",              [this](const HttpRequest& q) { return handle_models(q); });
     /* llama-server's: the prompt a chat request renders to, and how many tokens it is. */
     router_.post("/apply-template",      [this](const HttpRequest& q) { return handle_apply_template(q); });
-    router_.post("/v1/chat/completions/input_tokens",
-                 [this](const HttpRequest& q) { return handle_input_tokens(q); });
-    router_.post("/chat/completions/input_tokens",
-                 [this](const HttpRequest& q) { return handle_input_tokens(q); });
+    auto chat_tokens = [this](const HttpRequest& q) {
+        return count_tokens(q, nullptr, ApiShape::OpenAI, "response.input_tokens");
+    };
+    router_.post("/v1/chat/completions/input_tokens", chat_tokens);
+    router_.post("/chat/completions/input_tokens", chat_tokens);
     /* Anthropic's Messages API, translated onto the chat path (anthropic_to_chat). */
     router_.post("/v1/messages",         [this](const HttpRequest& q) { return handle_messages(q); });
-    router_.post("/v1/messages/count_tokens",
-                 [this](const HttpRequest& q) { return handle_count_tokens(q); });
+    router_.post("/v1/messages/count_tokens", [this](const HttpRequest& q) {
+        return count_tokens(q,
+                            [](const std::string& b, const OaiLimits& l, std::string* c,
+                               std::string* lb, ApiError* e) {
+                                return anthropic_to_chat(b, l, c, lb, e);
+                            },
+                            ApiShape::Anthropic, nullptr);
+    });
     /* OpenAI's Responses API, translated the same way (responses_to_chat). */
     router_.post("/v1/responses",        [this](const HttpRequest& q) { return handle_responses(q); });
     router_.post("/responses",           [this](const HttpRequest& q) { return handle_responses(q); });
-    router_.post("/v1/responses/input_tokens",
-                 [this](const HttpRequest& q) { return handle_responses_tokens(q); });
-    router_.post("/responses/input_tokens",
-                 [this](const HttpRequest& q) { return handle_responses_tokens(q); });
+    auto responses_tokens = [this](const HttpRequest& q) {
+        return count_tokens(q, responses_to_chat, ApiShape::OpenAI, "response.input_tokens");
+    };
+    router_.post("/v1/responses/input_tokens", responses_tokens);
+    router_.post("/responses/input_tokens", responses_tokens);
 
     router_.get ("/metrics",             [this](const HttpRequest& q) { return handle_metrics(q); });
     router_.get ("/health",              [this](const HttpRequest& q) { return handle_health(q); });
@@ -189,9 +168,7 @@ void Server::register_routes() {
 
     router_.post("/reset_prefix_cache",  [this](const HttpRequest& q) { return handle_reset_prefix_cache(q); });
 
-    /* The dashboard. `/` rather than only `/dashboard` because a person who has the host and port
-     * of a running engine types exactly that, and answering it with a 404 is answering the
-     * question "is this thing alive" with "no". */
+    /* The dashboard, also at `/`, since that is what a person with the host and port types. */
     router_.get ("/",                    [this](const HttpRequest& q) { return handle_dashboard(q); });
     router_.get ("/dashboard",           [this](const HttpRequest& q) { return handle_dashboard(q); });
     router_.get ("/stats",               [this](const HttpRequest& q) { return handle_stats(q); });
@@ -199,16 +176,11 @@ void Server::register_routes() {
     router_.get ("/sessions",            [this](const HttpRequest& q) { return handle_sessions(q); });
 }
 
-/* WORKERS FOR EVERYTHING ADMISSION CAN LET IN, AND A RESERVE BESIDE THEM.
- *
- * A generation holds its connection's worker for as long as it runs -- a stream writes from it, a
- * blocking request waits on its sink in it -- so a pool no larger than the admission ceiling runs
- * out of workers before admission refuses anyone. The 429 can then never happen, and every
- * connection after that waits in the pool's queue behind generations that may run for minutes,
- * /health included. So the pool may grow to the ceiling plus a reserve no admitted generation can
- * occupy: that is what keeps a probe, the dashboard, a request about to be told 429 and a
- * client's idle keep-alive connections answerable while every admitted request is running. The
- * same number bounds the connections that may wait once even the reserve is busy. */
+/* Workers beyond the admission ceiling. A generation holds its connection's worker for its whole
+ * run, so a pool capped at the ceiling would run out before admission refuses anyone: no 429, and
+ * every later connection (/health included) queued behind minutes-long generations. The reserve
+ * keeps probes, the dashboard, 429 answers and idle keep-alive connections serviceable. The same
+ * number bounds the connections that may wait once the reserve is busy too. */
 static const int64_t kSpareWorkers = 64;
 
 int Server::run() {
@@ -266,8 +238,8 @@ std::vector<std::string> Server::probe_reasoning_efforts() {
         ApiError e;
         return parse_chat_request(body, odeps_, l, &r, &e) >= 0;
     };
-    /* A render that fails with no effort at all says nothing about efforts, and one that takes a
-     * word no ladder has takes every word. */
+    /* A render that fails without an effort says nothing about efforts; one that takes a
+     * nonsense word takes every word. */
     if (!takes("") || takes("radiance-probe-not-a-level")) return {};
     std::vector<std::string> set;
     for (const char* w : { "low", "medium", "high", "xhigh", "max" })
@@ -312,14 +284,26 @@ void Server::stop() {
 
 /* ------------------------------------------------------------------ admission */
 
-bool Server::admit(int64_t n) {
+std::optional<HttpResponse> Server::admit(int64_t n, const std::string& peer, ApiShape shape,
+                                          const char* field) {
+    sweep_abandoned();
+    if (n > queue_depth_)
+        return error_response(err_bad(field, "this request needs " + std::to_string(n) +
+                                                 " admission places, and this server admits at "
+                                                 "most " + std::to_string(queue_depth_) +
+                                                 " requests at once (--max-queued-requests); "
+                                                 "split it"),
+                              peer, shape);
     int64_t cur = in_flight_.fetch_add(n, std::memory_order_acq_rel) + n;
     if (cur > queue_depth_) {
         in_flight_.fetch_sub(n, std::memory_order_acq_rel);
-        return false;
+        metrics_.observe_rejected();
+        return error_response(err_overloaded("the admission queue is full; retry after " +
+                                             std::to_string(opt_.retry_after_s) + "s"),
+                              peer, shape);
     }
     metrics_.set_queue_depth(cur);
-    return true;
+    return std::nullopt;
 }
 
 void Server::release(int64_t n) {
@@ -345,17 +329,15 @@ void Server::sweep_abandoned() {
 
 /* ------------------------------------------------------------------ errors */
 
-/* " from <addr:port>" for the request log, or nothing in-process, where no transport names a
- * peer. */
+/* " from <addr:port>" for the request log, or "" in-process. */
 static std::string from_peer(const std::string& peer) {
     return peer.empty() ? std::string() : " from " + peer;
 }
 
 HttpResponse Server::error_response(const ApiError& e, const std::string& peer, ApiShape shape) {
     metrics_.observe_http(e.status);
-    /* A refusal is the line the operator is looking for when a client says "rejected": the
-     * status, the type, the message, and who asked. 4xx is the client's doing and said at info;
-     * 5xx is ours and said as a warning. */
+    /* Log every refusal with status, type, message and peer: 4xx at info (the client's doing),
+     * 5xx as a warning (ours). */
     if (e.status >= 500)
         RAD_WARN("req refused%s -> %d %s: %s", from_peer(peer).c_str(), e.status, e.type.c_str(),
                  e.message.c_str());
@@ -394,12 +376,9 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
     const int n_choices = r.n_choices();
     gens->reserve((size_t)n_choices);
 
-    /* THE SAMPLER GETS A SAY BEFORE ANYTHING IS QUEUED. A stage that did not resolve is not a
-     * declare failure -- it becomes one when a request asks for it. Refusing here makes that a
-     * 400 naming the parameter, instead of an admitted request that the step loop cancels three
-     * steps in with a dead stream at the client.
-     *
-     * Once, not per choice: `n` varies only the seed, and no check here reads it. */
+    /* The sampler vets the parameters before anything is queued (IScheduler::admit), so an
+     * unresolved stage is a 400 naming the parameter rather than a mid-stream cancellation.
+     * Once, not per choice: `n` varies only the seed, which no check reads. */
     {
         std::string why;
         if (deps_.sched->admit(r.sp, &why) < 0) {
@@ -431,12 +410,12 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
             Request rq;
             rq.prompt = r.prompts[p].tokens;
             rq.sp = r.sp;
-            /* n identical seeds would give n identical completions, which is not what `n` means.
-             * Offsetting is enough: the sampler's stream is seeded, not chained. */
+            /* Distinct seeds per choice, or `n` identical completions. An offset suffices: the
+             * sampler's stream is seeded, not chained. */
             rq.sp.seed = r.sp.seed + (uint64_t)k;
             rq.max_tokens = r.max_tokens;
-            /* With the stop strings deferred past the reasoning block, the scheduler -- which
-             * cannot tell reasoning from answer -- gets none; the decoder and pump() cut. */
+            /* With stop strings deferred past the reasoning block, the scheduler (which cannot
+             * tell reasoning from answer) gets none; the decoder and pump() cut instead. */
             rq.stop = r.stops_after.empty() ? r.stop : std::vector<std::string>{};
             rq.ignore_eos = r.ignore_eos;
             rq.priority = r.priority;
@@ -455,7 +434,36 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
         g.id = ids[i];
         g.sink->id = g.id;
     }
+    /* Refused because the prompt is longer than the KV cache can ever hold (RAD_E_FULL at
+     * submission): the client's error, answered now as a context overflow, with the choices
+     * the scheduler did take cancelled. */
+    for (size_t i = 0; i < ids.size(); ++i) {
+        const Generation& g = (*gens)[first + i];
+        if (ids[i] != 0 || g.sink->status() != RAD_E_FULL) continue;
+        const std::string why = g.sink->why() ? g.sink->why() : "the prompt is too long";
+        cancel_all(*gens, false);
+        *err = err_bad("prompt", why);
+        err->message = why;
+        err->code = "context_length_exceeded";
+        err->n_prompt_tokens = (int64_t)r.prompts[(size_t)g.prompt_index].tokens.size();
+        return RAD_E_FULL;
+    }
     return RAD_OK;
+}
+
+std::optional<HttpResponse> Server::abandoned(const HttpRequest& req,
+                                              std::vector<Generation>& gens, int64_t n,
+                                              ApiShape shape, const OaiRequest* r) {
+    const bool gone = req.peer_gone();
+    if (!gone && !stopping_.load()) return std::nullopt;
+    cancel_all(gens, gone);
+    if (r) record(*r, gens, Finish::Cancelled);
+    retire(gens);
+    release(n);
+    if (!gone)
+        return error_response(err_overloaded("the server is shutting down"), req.peer, shape);
+    metrics_.observe_http(499);
+    return HttpResponse::text(499, "client closed request\n");
 }
 
 void Server::cancel_all(std::vector<Generation>& gens, bool count_disconnect) {
@@ -467,15 +475,17 @@ void Server::cancel_all(std::vector<Generation>& gens, bool count_disconnect) {
     if (count_disconnect) metrics_.observe_disconnect();
 }
 
-/* Every exit from a request goes through here exactly once. A generation the engine has finished
- * is reaped -- that is the server telling the scheduler it may drop the Request, which it cannot
- * know on its own because we are the ones holding the sink. One the engine has not finished moves
- * to the graveyard, and is reaped by the sweep when it does. */
+/* Every exit from a request goes through here exactly once. A finished generation is reaped
+ * (the scheduler may drop the Request; only the server knows the sink is released). An
+ * unfinished one moves to the graveyard and is reaped by the sweep once it finishes. Id 0 is a
+ * request the scheduler refused or never received: it holds nothing, so there is nothing to
+ * reap and nothing to wait for. */
 void Server::retire(std::vector<Generation>& gens) {
     std::vector<std::shared_ptr<Sink>> pending;
     for (auto& g : gens) {
         if (g.retired) continue;
         g.retired = true;
+        if (!g.id) continue;
         if (g.sink->done()) deps_.sched->reap(g.id);
         else pending.push_back(g.sink);
     }
@@ -497,9 +507,8 @@ static void lp_text(const ITokenizer& tok, int32_t id, std::string* text, std::s
     *text = bytes->substr(0, utf8_valid_prefix(*bytes));
 }
 
-/* How many of the entries from `from` went out with the reply: under a stop string, every one
- * whose text BEGAN before the cut -- one that straddles it contributed text the client got, and
- * the stop string's own tokens did not -- and otherwise all of them. */
+/* How many entries from `from` went out with the reply: with a stop cut, every entry whose text
+ * began before the cut (a straddling token contributed text the client got); otherwise all. */
 static size_t lp_before_cut(const std::vector<LogprobEntry>& lp, size_t from, size_t cut) {
     if (cut == std::string::npos) return lp.size() - from;
     size_t start = from ? lp[from - 1].end : 0, n = 0;
@@ -524,12 +533,19 @@ bool Server::pump(std::vector<Generation>& gens, const OaiRequest& r) {
     for (auto& g : gens) {
         if (g.closed) continue;
 
+        /* Read before the drain: the producer pushes its last tokens and then finishes, so once
+         * the finish is seen every token is in the sink and the drain below takes them all. Read
+         * after it, a finish landing between the last read and the check would close the choice
+         * with those tokens unread, and the reply would lose its end. */
+        const bool finished = g.sink->done();
+
         size_t n;
         while ((n = g.sink->read(buf, 128, r.want_logprobs ? alts.data() : nullptr)) > 0) {
             progress = true;
             for (size_t i = 0; i < n; ++i) {
                 g.think.push(r.sp.reasoning, buf[i].token);
-                if (r.shape == ApiShape::LlamaNative) g.tokens.push_back(buf[i].token);
+                if (r.shape == ApiShape::LlamaNative || r.return_tokens)
+                    g.tokens.push_back(buf[i].token);
                 std::string piece = g.detok->push(buf[i].token);
                 if (!piece.empty()) g.text += piece;
                 if (!r.want_logprobs) continue;
@@ -550,8 +566,8 @@ bool Server::pump(std::vector<Generation>& gens, const OaiRequest& r) {
             }
         }
 
-        /* The decoder may have swallowed the stop string itself, in which case our own scan below
-         * can never find it -- it is searching text the stop string was already removed from. */
+        /* The decoder may have swallowed the stop string itself; the scan below cannot find it
+         * in text it was already removed from. */
         if (maxstop && !g.closed && g.stop_cut == std::string::npos && g.detok->stopped()) {
             g.stop_cut = g.text.size();
             g.stop_word = g.detok->stop_hit();
@@ -563,13 +579,13 @@ bool Server::pump(std::vector<Generation>& gens, const OaiRequest& r) {
             continue;
         }
 
-        /* Stop strings. The scheduler is given Request::stop and may stop first, but a stop
-         * string straddles token boundaries and only the detokenised text can be searched, so the
-         * authoritative cut is made here. Scanning restarts (maxstop-1) bytes behind the previous
-         * end so a match spanning two drains is still found. */
-        /* Stop strings deferred past the reasoning block match only after its closer. The closer
-         * is searched for incrementally, from (closer length - 1) bytes behind the previous end,
-         * so a reply that thinks for a long time is not rescanned from its start every drain. */
+        /* Stop strings. The scheduler gets Request::stop and may stop first, but a stop string
+         * can straddle tokens, so the authoritative cut is made here on the detokenised text.
+         * Scanning restarts (maxstop - 1) bytes behind the previous end so a match spanning two
+         * drains is found.
+         *
+         * Stop strings deferred past the reasoning block match only after its closer, which is
+         * searched incrementally from (closer length - 1) bytes behind the previous end. */
         size_t floor = 0;
         if (!r.stops_after.empty()) {
             if (g.stops_floor == std::string::npos) {
@@ -599,15 +615,14 @@ bool Server::pump(std::vector<Generation>& gens, const OaiRequest& r) {
                 g.finish = Finish::StopString;
                 g.closed = true;
                 progress = true;
-                /* The client will never see another token of this choice, so the blocks it holds
-                 * are dead weight the moment we decide that (spec §14). */
+                /* No further token reaches the client, so free its blocks now (spec §14). */
                 g.sink->request_cancel();
                 deps_.sched->cancel(g.id);
                 continue;
             }
         }
 
-        if (g.sink->done()) {
+        if (finished) {
             std::string tail = g.detok->flush();
             if (!tail.empty()) { g.text += tail; progress = true; }
             g.finish = g.sink->finish_reason();
@@ -621,10 +636,9 @@ bool Server::pump(std::vector<Generation>& gens, const OaiRequest& r) {
 
 /* ------------------------------------------------------------------ usage */
 
-/* THE REQUEST'S TOKENS, ONCE FOR BOTH PATHS. `n` choices share a prompt, so the prompt and its
- * cached part are counted once per prompt. Reasoning is reported only where the reply's block can
- * be counted by token (ReasoningSpan); a model without one reports no breakdown rather than a
- * zero that would claim there was no reasoning. */
+/* The request's token usage, shared by both paths. `n` choices share a prompt, so prompt and
+ * cached tokens count once per prompt. Reasoning is reported only when the block can be counted
+ * by token (ReasoningSpan); otherwise no breakdown rather than a misleading zero. */
 UsageOut Server::usage_of(const OaiRequest& r, const std::vector<Generation>& gens) {
     UsageOut u;
     for (const auto& p : r.prompts) u.prompt += (int64_t)p.tokens.size();
@@ -637,10 +651,9 @@ UsageOut Server::usage_of(const OaiRequest& r, const std::vector<Generation>& ge
     return u;
 }
 
-/* WHERE THE REQUEST'S TIME WENT, from its sinks: one for a choice's final chunk, all of them for
- * the request. Every time is moved onto one clock first -- each sink counts from its own
- * construction, and `received_ns` (the body's arrival, -1 when unknown) is on that clock already.
- * See TimingsOut for what each field means. */
+/* Where the request's time went, from its sinks (one for a choice's final chunk, all for the
+ * request). Each sink counts from its own construction, so times are moved onto the steady clock
+ * first; `received_ns` (body arrival, -1 when unknown) is already on it. Fields: TimingsOut. */
 TimingsOut Server::timings_of(const Sink* const* sinks, size_t n, int64_t received_ns) {
     TimingsOut t;
     int64_t admit = INT64_MAX, first_lo = INT64_MAX, first_hi = INT64_MIN, last = INT64_MIN;
@@ -683,14 +696,19 @@ TimingsOut Server::timings_of(const std::vector<Generation>& gens, int64_t recei
 
 /* ------------------------------------------------------------------ metrics bookkeeping */
 
-/* WHAT FAILED, for the client: the sentence the failing component gave, and the status. A failed
- * request always carries a status -- an engine that stopped carries the one that stopped it -- so
- * this never reads "ok". */
-static std::string engine_failure(const Sink& s) {
-    const int st = s.status() < 0 ? s.status() : RAD_E_STATE;
-    const char* why = s.why();
-    return why ? fmt("the engine failed this request: %s (%s)", why, rad_strerror(st))
-               : fmt("the engine failed this request: %s", rad_strerror(st));
+/* A request's outcome over its choices, for record() and /metrics: an error over a cancellation
+ * over a cut at max_tokens over a tool call over a plain stop. */
+static Finish outcome(Finish overall, Finish f) {
+    auto rank = [](Finish x) {
+        switch (x) {
+            case Finish::Error:     return 4;
+            case Finish::Cancelled: return 3;
+            case Finish::Length:    return 2;
+            case Finish::ToolCalls: return 1;
+            default:                return 0;
+        }
+    };
+    return rank(f) > rank(overall) ? f : overall;
 }
 
 static SuccessReason to_reason(Finish f) {
@@ -703,7 +721,8 @@ static SuccessReason to_reason(Finish f) {
     }
 }
 
-void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Finish overall) {
+void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Finish overall,
+                    bool quiet) {
     int64_t n_prompt = 0;
     for (const auto& p : r.prompts) n_prompt += (int64_t)p.tokens.size();
 
@@ -728,9 +747,8 @@ void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Fi
     metrics_.observe_request(n_prompt, n_gen, ttft, tpot, e2e, decode,
                              r.n, r.max_tokens, to_reason(overall));
 
-    /* THE OTHER HALF OF THE REQUEST LOG. The same figures /metrics aggregates, for this one
-     * request: how it ended, what the prefix cache spared, the reasoning share when the parser
-     * knows it, time to first token, the decode rate after it, and the whole. */
+    /* The request log's closing line: this request's share of what /metrics aggregates (finish,
+     * cached prompt, reasoning tokens when known, TTFT, decode rate, total time). */
     const TimingsOut t = timings_of(gens, r.t_received_ns);
     const UsageOut u = usage_of(r, gens);
     const double rate = (decode > 0.0 && n_gen > 1) ? (double)(n_gen - 1) / decode : -1.0;
@@ -740,10 +758,11 @@ void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Fi
     if (ttft >= 0) std::snprintf(ttft_s, sizeof ttft_s, "ttft=%.2fs", ttft);
     char rate_s[32] = "";
     if (rate > 0) std::snprintf(rate_s, sizeof rate_s, " %.1f tok/s", rate);
-    RAD_INFO("req %s done%s finish=%s prompt=%lld (cache %lld) gen=%lld%s %s%s %.2fs",
-             r.id.c_str(), from_peer(r.peer).c_str(), finish_reason_oai(overall),
-             (long long)n_prompt, (long long)(t.valid ? t.cache_n : 0), (long long)n_gen, reason,
-             ttft_s, rate_s, e2e);
+    RAD_LOG_AT(quiet ? Log::Debug : Log::Info,
+               "req %s done%s finish=%s prompt=%lld (cache %lld) gen=%lld%s %s%s %.2fs",
+               r.id.c_str(), from_peer(r.peer).c_str(), finish_reason_oai(overall),
+               (long long)n_prompt, (long long)(t.valid ? t.cache_n : 0), (long long)n_gen,
+               reason, ttft_s, rate_s, e2e);
 }
 
 /* ------------------------------------------------------------------ non-streaming */
@@ -762,22 +781,8 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
         pump(gens, r);
         if (all_done(gens)) break;
 
-        /* A client that hangs up before the answer is ready is a cancellation, not something to
-         * finish computing for nobody. */
-        if (req.peer_gone()) {
-            cancel_all(gens, true);
-            retire(gens);
-            release(r.n_choices());
-            metrics_.observe_http(499);
-            HttpResponse res = HttpResponse::text(499, "client closed request\n");
-            return res;
-        }
-        if (stopping_.load()) {
-            cancel_all(gens, false);
-            retire(gens);
-            release(r.n_choices());
-            return error_response(err_overloaded("the server is shutting down"), req.peer, r.shape);
-        }
+        /* A client that hangs up before the answer is ready cancels the request. */
+        if (auto no = abandoned(req, gens, r.n_choices(), r.shape, &r)) return *no;
         /* Wait on whichever choice is still running. Bounded, so the peer check above runs. */
         for (auto& g : gens) if (!g.closed) { g.sink->wait(); break; }
     }
@@ -796,28 +801,24 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
         if (r.want_logprobs) c.logprobs = kept_logprobs(g.logprobs, g.stop_cut);
 
         if (r.endpoint == Endpoint::Chat) {
-            /* Parse whenever there is a parser, not only when tools were sent: the same parser
-             * separates the reasoning block from the answer, and a request with no tools still
-             * wants `reasoning_content` split out rather than glued to the front of the reply.
-             * It is the same reader the streaming path feeds a piece at a time, fed the whole
-             * reply at once, so the two agree by construction. With no tools in the request the
-             * parser reads no calls and the tool bookkeeping below finds none. */
+            /* Parse whenever there is a parser, not only with tools: it also splits
+             * `reasoning_content` from the answer. It is the reader the streaming path feeds
+             * piecewise, fed the whole reply, so both paths agree. Without tools it reads no
+             * calls. */
             if (r.reply_parser) {
                 std::unique_ptr<IReplyReader> rd = r.reply_parser->open();
                 rd->feed(g.text, nullptr);
                 rd->finish(nullptr);
                 c.msg = rd->message();
-                /* Only claim a tool call when every call closed and its arguments parse
-                 * (json_partial.h) -- the streaming path's rule (calls_complete). */
+                /* Claim a tool call only when every call closed and its arguments parse
+                 * (json_partial.h), the streaming path's rule (calls_complete). */
                 const bool complete = r.parse_tools && calls_complete(c.msg);
                 if (complete && (c.finish == Finish::Stop || c.finish == Finish::StopString))
                     c.finish = Finish::ToolCalls;
                 if (c.msg.open_call) {
-                    /* A half-finished call is content, not a call: the client gets what the model
-                     * wrote instead of a tool invocation with truncated arguments. Only that call
-                     * -- the reply ended inside it, so it is the last -- and only its own text:
-                     * the reasoning stays reasoning, and the calls before it, which closed, stay
-                     * calls, as the stream announced them. The finish reason is the stream's. */
+                    /* A half-finished call (necessarily the last) becomes content, so no tool is
+                     * invoked with truncated arguments. Reasoning and earlier closed calls are
+                     * kept, as the stream announced them; the finish reason is the stream's. */
                     c.msg.content = rd->content_with_open_call(g.text);
                     c.msg.tool_calls.pop_back();
                     c.msg.open_call = false;
@@ -829,11 +830,7 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
         } else {
             c.text = r.echo ? r.prompts[g.prompt_index].text + g.text : g.text;
         }
-        /* The request's outcome for record() and /metrics: a failure or a cancellation over
-         * anything, else a tool call over a plain stop -- the same promotion the streaming path
-         * makes, so a blocking tool call is not counted as "stop". */
-        if (c.finish == Finish::Error || c.finish == Finish::Cancelled) overall = c.finish;
-        else if (c.finish == Finish::ToolCalls && overall == Finish::Stop) overall = c.finish;
+        overall = outcome(overall, c.finish);
         choices.push_back(std::move(c));
     }
 
@@ -844,11 +841,7 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
             retire(gens);
             release(r.n_choices());
             record(r, gens, Finish::Error);
-            ApiError e;
-            e.status = 500;
-            e.type = "internal_server_error";
-            e.message = why;
-            return error_response(e, req.peer, r.shape);
+            return error_response(err_internal(why), req.peer, r.shape);
         }
     }
 
@@ -923,9 +916,8 @@ static const char* native_stop_type(Finish f) {
     }
 }
 
-/* llama-server's final result for one choice: the text, how it ended, the prompt it ran on and
- * where the time went. A stream's last chunk is this with `content` empty -- the text went out
- * in the chunks before it. */
+/* llama-server's final result for one choice: text, finish, prompt and timings. A stream's last
+ * chunk is this with `content` empty, the text having gone out in earlier chunks. */
 json Server::native_result(const OaiRequest& r, const Generation& g, const std::string& content) {
     const Sink* one = g.sink.get();
     const TimingsOut t = timings_of(&one, 1, r.t_received_ns);
@@ -947,8 +939,8 @@ json Server::native_result(const OaiRequest& r, const Generation& g, const std::
     o["stopping_word"] = g.stop_word;
     o["tokens_cached"] = n_prompt + g.sink->n_produced();
     if (t.valid) o["timings"] = timings_json(t);
-    /* The whole reply's probabilities on the answer, as llama-server sends them: a stream
-     * carried them chunk by chunk instead. */
+    /* The whole reply's probabilities, as llama-server sends them; a stream sent them per
+     * chunk instead. */
     if (r.want_logprobs && !r.stream) {
         const std::vector<LogprobEntry> kept = kept_logprobs(g.logprobs, g.stop_cut);
         o["completion_probabilities"] =
@@ -979,24 +971,27 @@ static std::string text_chunk(const OaiRequest& r, int index, const std::string&
     return sse_event(o.dump());
 }
 
-/* llama-server's `prompt_progress` chunk: the endpoint's opening chunk -- an assistant role with
- * no content, or an empty text -- carrying how much of the prompt is in the cache, of how much,
- * how much of that the prefix cache supplied, and the time since the prompt phase began. */
+/* llama-server's `prompt_progress` chunk: the endpoint's opening chunk (an assistant role with no
+ * content, or empty text) carrying prompt tokens processed, the total, how many the prefix cache
+ * supplied, and the time since the prompt phase began. */
 static std::string progress_chunk(const OaiRequest& r, int index, const Sink& s) {
-    nlohmann::ordered_json ch;
+    const int64_t ta = s.t_admitted_ns();
+    nlohmann::ordered_json pp;
+    pp["total"]     = s.progress_total();
+    pp["cache"]     = s.progress_cached();
+    pp["processed"] = s.progress_processed();
+    pp["time_ms"]   = ta >= 0 ? (s.age_ns() - ta) / 1000000 : 0;
     if (r.shape == ApiShape::LlamaNative) {
         /* llama-server's native chunk carries the progress at its top level. */
-        const int64_t ta = s.t_admitted_ns();
         nlohmann::ordered_json o;
         o["index"] = index;
         o["content"] = "";
         o["tokens"] = nlohmann::ordered_json::array();
         o["stop"] = false;
-        o["prompt_progress"] = { { "total", s.progress_total() }, { "cache", s.progress_cached() },
-                                 { "processed", s.progress_processed() },
-                                 { "time_ms", ta >= 0 ? (s.age_ns() - ta) / 1000000 : 0 } };
+        o["prompt_progress"] = std::move(pp);
         return sse_event(o.dump());
     }
+    nlohmann::ordered_json ch;
     if (r.endpoint == Endpoint::Chat) {
         ch["index"] = index;
         ch["delta"] = { { "role", "assistant" }, { "content", nullptr } };
@@ -1006,12 +1001,6 @@ static std::string progress_chunk(const OaiRequest& r, int index, const Sink& s)
         ch["logprobs"] = nullptr;
     }
     ch["finish_reason"] = nullptr;
-    const int64_t ta = s.t_admitted_ns();
-    nlohmann::ordered_json pp;
-    pp["total"]     = s.progress_total();
-    pp["cache"]     = s.progress_cached();
-    pp["processed"] = s.progress_processed();
-    pp["time_ms"]   = ta >= 0 ? (s.age_ns() - ta) / 1000000 : 0;
     nlohmann::ordered_json o;
     o["id"] = r.id;
     o["object"] = r.endpoint == Endpoint::Chat ? "chat.completion.chunk" : "text_completion";
@@ -1049,8 +1038,7 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
     res.content_type = "text/event-stream; charset=utf-8";
     res.set_header("Cache-Control", "no-cache");
     res.set_header("Connection", "keep-alive");
-    /* nginx buffers proxied responses by default, which turns a token stream into one large
-     * delivery at the end. This header is the documented opt-out and costs nothing elsewhere. */
+    /* nginx buffers proxied responses by default; this header is its documented opt-out. */
     res.set_header("X-Accel-Buffering", "no");
 
     Server* self = this;
@@ -1064,14 +1052,9 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
             if (st->r.endpoint == Endpoint::Chat) {
                 for (auto& g : st->gens) out += g.delta->first_chunk();
             } else if (st->r.echo) {
-                /* `echo`, ON THE STREAMING PATH. The buffered path applies it by prepending the
-                 * prompt to the choice's text; this is the equivalent, and without it the same
-                 * request would answer differently depending on `stream`.
-                 *
-                 * The prompt goes out as the first content chunk, before any token, which is what
-                 * "echo" means and what a client reassembling the deltas needs: concatenating the
-                 * stream gives the same string the buffered response returns.
-                 * Empty prompts emit nothing rather than an empty chunk. */
+                /* `echo` on the streaming path: the prompt goes out as the first content chunk,
+                 * so the concatenated stream equals the buffered response. Empty prompts emit
+                 * nothing. */
                 for (auto& g : st->gens) {
                     const std::string& p = st->r.prompts[(size_t)g.prompt_index].text;
                     if (!p.empty()) out += text_chunk(st->r, g.index, p, nullptr);
@@ -1089,8 +1072,8 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
         for (const auto& s : st->r.stop) maxstop = std::max(maxstop, s.size());
 
         for (auto& g : st->gens) {
-            /* The prompt's progress first, so a client sees it before the first token: every
-             * advance the scheduler reported, as llama-server sends one a prefill batch. */
+            /* Prompt progress first, before the first token: one chunk per reported advance, as
+             * llama-server sends one per prefill batch. */
             if (st->r.return_progress) {
                 const int32_t done = g.sink->progress_processed();
                 if (done > g.progress_sent) {
@@ -1098,14 +1081,13 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
                     g.progress_sent = done;
                 }
             }
-            /* Hold back the longest stop string minus one byte while the choice is still running:
-             * otherwise the first half of a stop sequence is already on the wire by the time we
-             * recognise it, and it cannot be taken back.
+            if (g.delta && g.sink->n_produced() > 0) out += g.delta->started();
+            /* While the choice runs, hold back the longest stop string minus one byte, or the
+             * start of a stop sequence would already be on the wire when it is recognised.
              *
-             * ONLY WHILE IT IS RUNNING. Every hold-back rule here waits for bytes that may still
-             * arrive, and a closed choice has none coming, so its whole text is the answer. That
-             * includes a tail the escape rule would keep -- a trailing `\` or a partial `\uXXXX`
-             * is ordinary text in a completion, and holding it back at the end drops it. */
+             * Only while running: a closed choice has no more bytes coming, so its whole text is
+             * the answer, including a trailing `\` or partial `\uXXXX` the escape rule would
+             * otherwise hold back. */
             size_t safe = g.text.size();
             if (!g.closed) {
                 if (maxstop > 1) safe = safe > maxstop - 1 ? safe - (maxstop - 1) : 0;
@@ -1113,9 +1095,9 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
                 if (safe <= g.emitted) continue;
             }
 
-            /* THE LOGPROBS OF THE TOKENS WHOSE TEXT THIS CHUNK CARRIES: every entry ending inside
-             * it while the choice runs, and once it is closed the rest of what went out with the
-             * reply (lp_before_cut). */
+            /* Logprobs for the tokens whose text this chunk carries: entries ending inside it
+             * while the choice runs; once closed, the rest that went out with the reply
+             * (lp_before_cut). */
             size_t lp_n = 0, lp_off = 0;
             if (st->r.want_logprobs) {
                 lp_off = g.lp_sent ? g.logprobs[g.lp_sent - 1].end : 0;
@@ -1136,8 +1118,7 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
                 if (g.delta) g.delta->set_timings(now);
             }
             if (st->r.endpoint == Endpoint::Chat) {
-                /* Only what is new: the reader keeps its own place in the reply, which is what
-                 * makes a long reply cost its length rather than its length squared. */
+                /* Only the new text: the reader keeps its place, so a reply costs linear time. */
                 if (lp_n) g.delta->add_logprobs(logprobs_content(lp_at, lp_n));
                 out += g.delta->push(std::string_view(g.text).substr(g.emitted, safe - g.emitted),
                                      g.closed);
@@ -1167,9 +1148,8 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
                                   lp_n ? logprobs_legacy(lp_at, lp_n, lp_off) : std::string());
             }
             g.emitted = safe;
-            /* A sent entry is read again only as the one before the next, for where that one
-             * starts; keeping the rest would hold ~1.7 KB a token at 20 alternatives for the
-             * whole of a long stream. */
+            /* Of the sent entries only the last is read again (for where the next one starts);
+             * keeping all would hold ~1.7 KB per token at 20 alternatives for a long stream. */
             if (g.lp_sent > 1) {
                 g.logprobs.erase(g.logprobs.begin(), g.logprobs.begin() + (long)(g.lp_sent - 1));
                 g.lp_sent = 1;
@@ -1180,18 +1160,15 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
             const UsageOut u = usage_of(st->r, st->gens);
             Finish overall = Finish::Stop;
             for (auto& g : st->gens) {
-                /* EACH CHOICE'S OWN TIMINGS ON ITS FINAL CHUNK, so a client that asked for no
-                 * usage chunk still has them, as llama.cpp sends them. */
+                /* Each choice's own timings on its final chunk, as llama.cpp sends them, so they
+                 * arrive even without a usage chunk. */
                 const Sink* one = g.sink.get();
                 const TimingsOut gt = timings_of(&one, 1, st->r.t_received_ns);
-                /* A failed generation cannot become a non-200 -- the headers left long ago -- so
-                 * it travels as an error event in the stream. Silence would look like a normal
-                 * end of stream and the client would use a truncated answer. */
+                /* The 200 headers are already sent, so a failed generation becomes an error event
+                 * in the stream; a silent end would pass a truncated answer as complete. */
                 ApiError e;
                 if (g.finish == Finish::Error) {
-                    e.status = 500;
-                    e.type = "internal_server_error";
-                    e.message = engine_failure(*g.sink);
+                    e = err_internal(engine_failure(*g.sink));
                     overall = Finish::Error;
                 }
                 if (st->r.endpoint == Endpoint::Chat) {
@@ -1201,27 +1178,21 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
                         out += g.delta->error_chunk(e, gt, u);
                     } else {
                         out += g.delta->final_chunk(g.finish, gt, u);
-                        const Finish adj = g.delta->adjusted_finish(g.finish);
-                        if (overall != Finish::Error &&
-                            (adj == Finish::Cancelled || adj == Finish::ToolCalls))
-                            overall = adj;
+                        overall = outcome(overall, g.delta->adjusted_finish(g.finish));
                     }
                 } else if (st->r.shape == ApiShape::LlamaNative) {
                     out += sse_event(json_dump(self->native_result(st->r, g, "")));
                     if (g.finish == Finish::Error) out += sse_error(e);
+                    overall = outcome(overall, g.finish);
                 } else {
                     out += text_chunk(st->r, g.index, "", finish_reason_oai(g.finish), &gt);
                     if (g.finish == Finish::Error) out += sse_error(e);
+                    overall = outcome(overall, g.finish);
                 }
             }
-            /* THE USAGE CHUNK. `stream_options.include_usage` is parsed and validated on both
-             * endpoints, so both have to honour it -- accepting a field and then ignoring it is
-             * the outcome oai.h's header forbids.
-             *
-             * After the per-generation final chunks and before [DONE], which is where OpenAI puts
-             * it, and once for the request rather than once per choice: `n` completions share one
-             * prompt and one total, so emitting it per generation would count the prompt n times
-             * and interleave usage between the choices' final chunks. */
+            /* The usage chunk (`stream_options.include_usage`, honoured on both endpoints).
+             * After the final chunks and before [DONE], where OpenAI puts it, and once per
+             * request: the `n` choices share one prompt and one total. */
             if (st->r.include_usage) {
                 const TimingsOut t = timings_of(st->gens, st->r.t_received_ns);
                 out += st->r.endpoint == Endpoint::Chat ? chat_usage_chunk(st->r, u, t)
@@ -1240,8 +1211,8 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
         }
 
         if (!progress && out.empty()) {
-            /* Nothing to send: sleep on the first live sink rather than spinning. The bounded
-             * wait is what makes the peer-closed check above run a few times a second. */
+            /* Nothing to send: sleep on the first live sink. The wait is bounded so the
+             * peer-closed check above runs a few times a second. */
             for (auto& g : st->gens) if (!g.closed) { g.sink->wait(); break; }
         }
         return true;
@@ -1249,8 +1220,7 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
 
     res.on_close = [self, st](bool ok) {
         if (!st->done_sent) {
-            /* Either the peer went away or the write failed. Both are cancellations, and the
-             * blocks have to go back now rather than when the generation would have ended. */
+            /* The peer went away or the write failed: cancel now so the blocks are freed. */
             self->cancel_all(st->gens, true);
             self->record(st->r, st->gens, Finish::Cancelled);
             self->retire(st->gens);
@@ -1265,39 +1235,31 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
 
 /* ------------------------------------------------------------------ endpoints */
 
-HttpResponse Server::handle_chat(const HttpRequest& req) {
-    if (!deps_.sched || !deps_.tok)
-        return error_response(err_not_implemented("the server has no engine attached"), req.peer);
-    if (opt_.embedding_model)
-        return error_response(err_not_implemented("this is an embedding model: it serves "
-                                                  "/v1/embeddings and generates no text"),
-                              req.peer);
-    if (opt_.image_model)
-        return error_response(err_not_implemented("this is an image model: it serves "
-                                                  "/v1/images/generations and /v1/images/edits "
-                                                  "and generates no text"),
-                              req.peer);
+/* The 501 for a text-generation endpoint this deployment cannot serve, or nothing. */
+std::optional<HttpResponse> Server::refuse_text(const std::string& peer, ApiShape shape) {
+    const char* why =
+        !deps_.sched || !deps_.tok ? "the server has no engine attached"
+        : opt_.embedding_model     ? "this is an embedding model: it serves /v1/embeddings and "
+                                     "generates no text"
+        : opt_.image_model         ? "this is an image model: it serves /v1/images/generations "
+                                     "and /v1/images/edits and generates no text"
+                                   : nullptr;
+    if (!why) return std::nullopt;
+    return error_response(err_not_implemented(why), peer, shape);
+}
 
+HttpResponse Server::handle_chat(const HttpRequest& req) {
+    if (auto no = refuse_text(req.peer)) return *no;
     OaiRequest r;
     ApiError err;
     if (parse_chat_request(req.body, odeps_, lim_, &r, &err) < 0)
         return error_response(err, req.peer);
-    r.peer = req.peer;
-
-    sweep_abandoned();
-    if (!admit(r.n_choices())) {
-        metrics_.observe_rejected();
-        return error_response(err_overloaded(
-            "the admission queue is full; retry after " + std::to_string(opt_.retry_after_s) +
-            "s. The server refuses rather than queueing without bound"), req.peer);
-    }
-    log_admitted(r);
-    return r.stream ? streaming_completion(req, r) : blocking_completion(req, r);
+    return serve(req, r);
 }
 
-/* llama-server's /apply-template and its token count. Both parse the request exactly as
- * /v1/chat/completions does -- the same template defaults, the same refusals -- and stop before
- * anything is queued, so the prompt they report is the prompt a chat request would run. */
+/* llama-server's /apply-template and its token count. Both parse exactly as /v1/chat/completions
+ * does (same defaults, same refusals) and stop before queueing, so they report the prompt a chat
+ * request would run. */
 HttpResponse Server::handle_apply_template(const HttpRequest& req) {
     if (!deps_.tok || !deps_.chat)
         return error_response(err_not_implemented("rendering a chat requires a chat template; "
@@ -1312,87 +1274,69 @@ HttpResponse Server::handle_apply_template(const HttpRequest& req) {
     return HttpResponse::json_body(200, json_dump(o));
 }
 
-HttpResponse Server::handle_input_tokens(const HttpRequest& req) {
+/* The token count of the prompt a request would run, parsed as a chat request and not queued.
+ * `to_chat` translates another API's body first (null for a chat body); `object` is the
+ * response's `object` field, or null for none. */
+HttpResponse Server::count_tokens(const HttpRequest& req, ToChat to_chat, ApiShape shape,
+                                  const char* object) {
     if (!deps_.tok || !deps_.chat)
         return error_response(err_not_implemented("rendering a chat requires a chat template; "
-                                                  "this model was loaded without one"), req.peer);
-    OaiRequest r;
+                                                  "this model was loaded without one"),
+                              req.peer, shape);
+    std::string chat;
     ApiError err;
-    if (parse_chat_request(req.body, odeps_, lim_, &r, &err) < 0)
-        return error_response(err, req.peer);
+    OaiRequest r;
+    if ((to_chat && to_chat(req.body, lim_, &chat, nullptr, &err) < 0) ||
+        parse_chat_request(to_chat ? chat : req.body, odeps_, lim_, &r, &err) < 0)
+        return error_response(err, req.peer, shape);
     json o;
-    o["object"] = "response.input_tokens";
+    if (object) o["object"] = object;
     o["input_tokens"] = r.prompts.empty() ? 0 : (int64_t)r.prompts[0].tokens.size();
     metrics_.observe_http(200);
     return HttpResponse::json_body(200, json_dump(o));
 }
 
-/* ANTHROPIC'S MESSAGES API. The request is translated into the chat request it means and parsed by
- * the chat endpoint's own parser, so every default, refusal and template rule is that endpoint's;
- * the answer and the errors go out in Anthropic's shapes. */
+/* Anthropic's Messages API: translated into the equivalent chat request and parsed by the chat
+ * parser, so every default, refusal and template rule is the chat endpoint's; answers and errors
+ * go out in Anthropic's shapes. */
 HttpResponse Server::handle_messages(const HttpRequest& req) {
-    if (!deps_.sched || !deps_.tok)
-        return error_response(err_not_implemented("the server has no engine attached"), req.peer,
-                              ApiShape::Anthropic);
-    if (opt_.embedding_model)
-        return error_response(err_not_implemented("this is an embedding model: it serves "
-                                                  "/v1/embeddings and generates no text"),
-                              req.peer, ApiShape::Anthropic);
-    if (opt_.image_model)
-        return error_response(err_not_implemented("this is an image model: it serves "
-                                                  "/v1/images/generations and /v1/images/edits "
-                                                  "and generates no text"),
-                              req.peer, ApiShape::Anthropic);
+    if (auto no = refuse_text(req.peer, ApiShape::Anthropic)) return *no;
     std::string chat, label;
+    bool cm = false;
     ApiError err;
     OaiRequest r;
-    if (anthropic_to_chat(req.body, lim_, &chat, &label, &err) < 0 ||
+    if (anthropic_to_chat(req.body, lim_, &chat, &label, &err, &cm) < 0 ||
         parse_chat_request(chat, odeps_, lim_, &r, &err) < 0)
         return error_response(err, req.peer, ApiShape::Anthropic);
     r.shape = ApiShape::Anthropic;
+    r.context_management = cm;
     r.id = random_id("msg_");
     if (r.session_label.empty()) r.session_label = label;
-    return serve_translated(req, r);
+    return serve(req, r);
 }
 
-HttpResponse Server::serve_translated(const HttpRequest& req, OaiRequest& r) {
+HttpResponse Server::serve(const HttpRequest& req, OaiRequest& r) {
     r.peer = req.peer;
-    sweep_abandoned();
-    if (!admit(r.n_choices())) {
-        metrics_.observe_rejected();
-        return error_response(err_overloaded(
-            "the admission queue is full; retry after " + std::to_string(opt_.retry_after_s) +
-            "s. The server refuses rather than queueing without bound"), req.peer, r.shape);
-    }
+    if (auto no = admit(r.n_choices(), req.peer, r.shape, r.prompts.size() > 1 ? "prompt" : "n"))
+        return *no;
     log_admitted(r);
     return r.stream ? streaming_completion(req, r) : blocking_completion(req, r);
 }
 
-/* llama-server's NATIVE /completion: the completions parser with llama-server's prompt forms,
+/* llama-server's native /completion: the completions parser with llama-server's prompt forms,
  * answered in its shape (native_result). */
 HttpResponse Server::handle_native_completion(const HttpRequest& req) {
-    if (!deps_.sched || !deps_.tok)
-        return error_response(err_not_implemented("the server has no engine attached"), req.peer);
-    if (opt_.embedding_model)
-        return error_response(err_not_implemented("this is an embedding model: it serves "
-                                                  "/v1/embeddings and generates no text"),
-                              req.peer);
-    if (opt_.image_model)
-        return error_response(err_not_implemented("this is an image model: it serves "
-                                                  "/v1/images/generations and /v1/images/edits "
-                                                  "and generates no text"),
-                              req.peer);
+    if (auto no = refuse_text(req.peer)) return *no;
     OaiRequest r;
     ApiError err;
     if (parse_completion_request(req.body, odeps_, lim_, &r, &err, /*native=*/true) < 0)
         return error_response(err, req.peer);
     r.shape = ApiShape::LlamaNative;
-    return serve_translated(req, r);
+    return serve(req, r);
 }
 
-/* A control token by the spellings model families give it, or -1: what llama.cpp's vocabulary
- * loader recognises the fill-in-the-middle tokens by. A spelling counts only when it is ONE token
- * that renders as itself. */
+/* The first of `names` (the spellings llama.cpp's vocabulary loader recognises for a FIM token)
+ * that is one token rendering as itself, or -1. */
 static int32_t special_token(const ITokenizer& tok, std::initializer_list<const char*> names) {
     for (const char* n : names) {
         const std::vector<int32_t> t = tok.encode(n, false, /*parse_special=*/true);
@@ -1401,17 +1345,16 @@ static int32_t special_token(const ITokenizer& tok, std::initializer_list<const 
     return -1;
 }
 
-/* llama-server's /infill: code completion between a prefix and a suffix, as llama.vim and
- * llama.vscode ask for it, in the repository-level FIM layout (arXiv 2409.12186) llama-server
- * builds -- the extra files each under its name, then prefix, suffix and middle:
+/* llama-server's /infill: code completion between a prefix and a suffix (llama.vim,
+ * llama.vscode), in llama-server's repository-level FIM layout (arXiv 2409.12186), each extra file
+ * under its name, then prefix, suffix and middle:
  *
  *   [REPO]myproject\n [SEP]name\n text ... [SEP]filename\n [PRE]prefix+prompt [SUF]suffix [MID]
  *
- * A model with no fill-in-the-middle tokens cannot do it and is refused. The completion itself is
- * a native one, with every native field. */
+ * A model without FIM tokens is refused. The completion is a native one, with every native
+ * field. */
 HttpResponse Server::handle_infill(const HttpRequest& req) {
-    if (!deps_.sched || !deps_.tok)
-        return error_response(err_not_implemented("the server has no engine attached"), req.peer);
+    if (auto no = refuse_text(req.peer)) return *no;
     const ITokenizer& tok = *deps_.tok;
     const int32_t pre = special_token(tok, { "<|fim_prefix|>", "<fim_prefix>", "<fim-prefix>",
                                              "<｜fim▁begin｜>", "<PRE>", "▁<PRE>", "<|code_prefix|>" });
@@ -1498,8 +1441,8 @@ HttpResponse Server::handle_infill(const HttpRequest& req) {
         extra.insert(extra.end(), t.begin(), t.end());
     }
 
-    /* THE EXTRA FILES GIVE WAY FIRST, newest kept, when the whole does not fit beside what the
-     * reply may generate: they are context, and the prefix and suffix are the edit. */
+    /* When everything does not fit beside the reply's budget, the extra files are trimmed first
+     * (newest kept): they are context, while prefix and suffix are the edit. */
     int64_t reserve = 256;
     for (const char* k : { "max_tokens", "n_predict" }) {
         auto it = b.find(k);
@@ -1532,23 +1475,13 @@ HttpResponse Server::handle_infill(const HttpRequest& req) {
     if (parse_completion_request(b.dump(), odeps_, lim_, &r, &err, /*native=*/true) < 0)
         return error_response(err, req.peer);
     r.shape = ApiShape::LlamaNative;
-    return serve_translated(req, r);
+    return serve(req, r);
 }
 
-/* OPENAI'S RESPONSES API, as the Messages API: translated into the chat request it means, served
- * by the chat path, answered as a response object or its event stream. */
+/* OpenAI's Responses API, like the Messages API: translated into the equivalent chat request,
+ * served by the chat path, answered as a response object or its event stream. */
 HttpResponse Server::handle_responses(const HttpRequest& req) {
-    if (!deps_.sched || !deps_.tok)
-        return error_response(err_not_implemented("the server has no engine attached"), req.peer);
-    if (opt_.embedding_model)
-        return error_response(err_not_implemented("this is an embedding model: it serves "
-                                                  "/v1/embeddings and generates no text"),
-                              req.peer);
-    if (opt_.image_model)
-        return error_response(err_not_implemented("this is an image model: it serves "
-                                                  "/v1/images/generations and /v1/images/edits "
-                                                  "and generates no text"),
-                              req.peer);
+    if (auto no = refuse_text(req.peer)) return *no;
     std::string chat, echo;
     ApiError err;
     OaiRequest r;
@@ -1558,71 +1491,16 @@ HttpResponse Server::handle_responses(const HttpRequest& req) {
     r.shape = ApiShape::Responses;
     r.id = random_id("resp_");
     r.echo_json = std::move(echo);
-    return serve_translated(req, r);
-}
-
-HttpResponse Server::handle_responses_tokens(const HttpRequest& req) {
-    if (!deps_.tok || !deps_.chat)
-        return error_response(err_not_implemented("rendering a chat requires a chat template; "
-                                                  "this model was loaded without one"), req.peer);
-    std::string chat;
-    ApiError err;
-    OaiRequest r;
-    if (responses_to_chat(req.body, lim_, &chat, nullptr, &err) < 0 ||
-        parse_chat_request(chat, odeps_, lim_, &r, &err) < 0)
-        return error_response(err, req.peer);
-    json o;
-    o["object"] = "response.input_tokens";
-    o["input_tokens"] = r.prompts.empty() ? 0 : (int64_t)r.prompts[0].tokens.size();
-    metrics_.observe_http(200);
-    return HttpResponse::json_body(200, json_dump(o));
-}
-
-HttpResponse Server::handle_count_tokens(const HttpRequest& req) {
-    if (!deps_.tok || !deps_.chat)
-        return error_response(err_not_implemented("rendering a chat requires a chat template; "
-                                                  "this model was loaded without one"), req.peer,
-                              ApiShape::Anthropic);
-    std::string chat;
-    ApiError err;
-    OaiRequest r;
-    if (anthropic_to_chat(req.body, lim_, &chat, nullptr, &err) < 0 ||
-        parse_chat_request(chat, odeps_, lim_, &r, &err) < 0)
-        return error_response(err, req.peer, ApiShape::Anthropic);
-    json o;
-    o["input_tokens"] = r.prompts.empty() ? 0 : (int64_t)r.prompts[0].tokens.size();
-    metrics_.observe_http(200);
-    return HttpResponse::json_body(200, json_dump(o));
+    return serve(req, r);
 }
 
 HttpResponse Server::handle_completion(const HttpRequest& req) {
-    if (!deps_.sched || !deps_.tok)
-        return error_response(err_not_implemented("the server has no engine attached"), req.peer);
-    if (opt_.embedding_model)
-        return error_response(err_not_implemented("this is an embedding model: it serves "
-                                                  "/v1/embeddings and generates no text"),
-                              req.peer);
-    if (opt_.image_model)
-        return error_response(err_not_implemented("this is an image model: it serves "
-                                                  "/v1/images/generations and /v1/images/edits "
-                                                  "and generates no text"),
-                              req.peer);
-
+    if (auto no = refuse_text(req.peer)) return *no;
     OaiRequest r;
     ApiError err;
     if (parse_completion_request(req.body, odeps_, lim_, &r, &err) < 0)
         return error_response(err, req.peer);
-    r.peer = req.peer;
-
-    sweep_abandoned();
-    if (!admit(r.n_choices())) {
-        metrics_.observe_rejected();
-        return error_response(err_overloaded(
-            "the admission queue is full; retry after " + std::to_string(opt_.retry_after_s) +
-            "s. The server refuses rather than queueing without bound"), req.peer);
-    }
-    log_admitted(r);
-    return r.stream ? streaming_completion(req, r) : blocking_completion(req, r);
+    return serve(req, r);
 }
 
 HttpResponse Server::handle_embeddings(const HttpRequest& req) {
@@ -1645,8 +1523,8 @@ HttpResponse Server::handle_embeddings(const HttpRequest& req) {
     if (r.dimensions > dim)
         return error_response(err_bad("dimensions", "this model's vectors are " +
                                                         std::to_string(dim) + " wide"), req.peer);
-    /* AN INPUT IS NEVER SPLIT (Request::embed), so one longer than a step is refused here, with
-     * the number, rather than by the scheduler with none. */
+    /* An input is never split (Request::embed), so one longer than a step is refused here, with
+     * the limit in the message. */
     for (size_t i = 0; i < r.prompts.size(); ++i) {
         const int64_t n = (int64_t)r.prompts[i].tokens.size();
         if (n > deps_.embed->max_input()) {
@@ -1660,17 +1538,11 @@ HttpResponse Server::handle_embeddings(const HttpRequest& req) {
         }
     }
 
-    sweep_abandoned();
     const int n_in = (int)r.prompts.size();
-    if (!admit(n_in)) {
-        metrics_.observe_rejected();
-        return error_response(err_overloaded(
-            "the admission queue is full; retry after " + std::to_string(opt_.retry_after_s) +
-            "s. The server refuses rather than queueing without bound"), req.peer);
-    }
+    if (auto no = admit(n_in, req.peer, ApiShape::OpenAI, "input")) return *no;
     log_admitted(r);
 
-    /* EVERY INPUT AT ONCE, so the scheduler can put them in one step. */
+    /* Submit every input at once so the scheduler can batch them in one step. */
     std::vector<Generation> gens;
     std::vector<Request> rqs;
     gens.reserve((size_t)n_in);
@@ -1696,13 +1568,11 @@ HttpResponse Server::handle_embeddings(const HttpRequest& req) {
         gens[i].id = ids[i];
         gens[i].sink->id = ids[i];
         if (!ids[i]) {
+            cancel_all(gens, false);
             retire(gens);
             release(n_in);
-            ApiError e;
-            e.status = 500;
-            e.type = "internal_server_error";
-            e.message = "the scheduler refused input " + std::to_string(i);
-            return error_response(e, req.peer);
+            return error_response(err_internal("the scheduler refused input " + std::to_string(i)),
+                                  req.peer);
         }
     }
 
@@ -1713,25 +1583,13 @@ HttpResponse Server::handle_embeddings(const HttpRequest& req) {
             all = all && g.closed;
         }
         if (all) break;
-        if (req.peer_gone()) {
-            cancel_all(gens, true);
-            retire(gens);
-            release(n_in);
-            metrics_.observe_http(499);
-            return HttpResponse::text(499, "client closed request\n");
-        }
-        if (stopping_.load()) {
-            cancel_all(gens, false);
-            retire(gens);
-            release(n_in);
-            return error_response(err_overloaded("the server is shutting down"), req.peer);
-        }
+        if (auto no = abandoned(req, gens, n_in)) return *no;
         for (auto& g : gens) if (!g.closed) { g.sink->wait(); break; }
     }
 
-    /* THE VECTORS, truncated to `dimensions` and L2-normalised: what OpenAI's endpoint returns and
-     * what a sentence-transformers model's Normalize module does. Truncating a unit vector does
-     * not keep it unit, so the normalisation comes after. */
+    /* Vectors truncated to `dimensions`, then L2-normalised (as OpenAI's endpoint and
+     * sentence-transformers' Normalize module return them); truncation breaks unit length, so
+     * normalisation comes after. */
     std::vector<std::vector<float>> vecs;
     vecs.reserve((size_t)n_in);
     UsageOut u;
@@ -1744,11 +1602,7 @@ HttpResponse Server::handle_embeddings(const HttpRequest& req) {
                                           std::to_string(g.index);
             retire(gens);
             release(n_in);
-            ApiError e;
-            e.status = 500;
-            e.type = "internal_server_error";
-            e.message = why;
-            return error_response(e, req.peer);
+            return error_response(err_internal(why), req.peer);
         }
         std::vector<float> out(v.begin(), v.begin() + keep);
         double ss = 0.0;
@@ -1764,14 +1618,14 @@ HttpResponse Server::handle_embeddings(const HttpRequest& req) {
     return HttpResponse::json_body(200, embeddings_body(r, vecs, u));
 }
 
-/* /v1/systemone (systemone.h): one request a question, each reading its answer's candidates at
- * the prompt's last position (Request::token_scores) and sampling one token nobody reads.
+/* /v1/systemone (systemone.h): one engine request per question, each reading its answer
+ * candidates at the prompt's last position (Request::token_scores) and sampling one discarded
+ * token.
  *
- * SEVERAL QUESTIONS SHARE THE STATE THEY ARE ASKED OVER, and it is read once. The first question
- * runs alone and leaves the state at the end of that shared head in the prefix cache -- its
- * attention blocks, and a checkpoint of the convolutions there (Request::checkpoint_at) -- and the
- * rest are submitted together once it has finished, each starting from that head and computing
- * only its own tail. d1's own runner shares the head the same way, as one batched tree. */
+ * Questions share the state they are asked over, and it is read once: the first question runs
+ * alone and leaves the shared head in the prefix cache (attention blocks plus a convolution
+ * checkpoint, Request::checkpoint_at); the rest are then submitted together and compute only their
+ * own tails. d1's runner shares the head the same way, as one batched tree. */
 HttpResponse Server::handle_systemone(const HttpRequest& req) {
     if (!deps_.sched || !deps_.tok)
         return error_response(err_not_implemented("the server has no engine attached"), req.peer);
@@ -1785,14 +1639,8 @@ HttpResponse Server::handle_systemone(const HttpRequest& req) {
     if (parse_decision_request(req.body, odeps_, lim_, opt_.model_id, &r, &err) < 0)
         return error_response(err, req.peer);
 
-    sweep_abandoned();
     const int n = (int)r.questions.size();
-    if (!admit(n)) {
-        metrics_.observe_rejected();
-        return error_response(err_overloaded(
-            "the admission queue is full; retry after " + std::to_string(opt_.retry_after_s) +
-            "s. The server refuses rather than queueing without bound"), req.peer);
-    }
+    if (auto no = admit(n, req.peer, ApiShape::OpenAI, "questions")) return *no;
     RAD_INFO("systemone admitted%s questions=%d prompt=%lld tok", from_peer(req.peer).c_str(), n,
              (long long)r.input_tokens);
 
@@ -1817,22 +1665,18 @@ HttpResponse Server::handle_systemone(const HttpRequest& req) {
         gens.push_back(std::move(g));
         scores.push_back(std::move(ts));
     }
-    /* The questions handed to the scheduler so far: an early exit retires those and drops the
-     * rest, whose sinks nothing will ever finish. */
+    /* Questions handed to the scheduler so far. An early exit retires those and drops the rest,
+     * whose sinks would never finish. */
     size_t submitted = 0;
     auto fail = [&](const std::string& why) {
         gens.resize(submitted);
         retire(gens);
         release(n);
-        ApiError e;
-        e.status = 500;
-        e.type = "internal_server_error";
-        e.message = why;
-        return error_response(e, req.peer);
+        return error_response(err_internal(why), req.peer);
     };
 
-    /* Questions [first, last) submitted together and waited for. A non-null response is the
-     * call's answer already: the scheduler refused one, the client left, or the server stops. */
+    /* Submits questions [first, last) together and waits for them. Sets `early` to the call's
+     * response when the scheduler refuses one, the client leaves or the server stops. */
     std::unique_ptr<HttpResponse> early;
     auto run = [&](int first, int last) {
         std::vector<Request> part(std::make_move_iterator(rqs.begin() + first),
@@ -1858,23 +1702,10 @@ HttpResponse Server::handle_systemone(const HttpRequest& req) {
                 all = all && g.closed;
             }
             if (all) return;
-            if (req.peer_gone()) {
+            /* Both conditions only ever turn true, so abandoned() answers once either holds. */
+            if (req.peer_gone() || stopping_.load()) {
                 gens.resize(submitted);
-                cancel_all(gens, true);
-                retire(gens);
-                release(n);
-                metrics_.observe_http(499);
-                early = std::make_unique<HttpResponse>(
-                    HttpResponse::text(499, "client closed request\n"));
-                return;
-            }
-            if (stopping_.load()) {
-                gens.resize(submitted);
-                cancel_all(gens, false);
-                retire(gens);
-                release(n);
-                early = std::make_unique<HttpResponse>(
-                    error_response(err_overloaded("the server is shutting down"), req.peer));
+                early = std::make_unique<HttpResponse>(*abandoned(req, gens, n));
                 return;
             }
             for (int i = first; i < last; ++i)
@@ -1941,8 +1772,8 @@ HttpResponse Server::handle_metrics(const HttpRequest&) {
     metrics_.set_queue_depth(in_flight_.load(std::memory_order_relaxed));
     HttpResponse r;
     r.status = 200;
-    /* The exposition format version is part of the content type; Prometheus uses it to decide how
-     * to parse, and omitting it makes some scrapers fall back to OpenMetrics and fail. */
+    /* The exposition format version belongs in the content type: Prometheus parses by it, and
+     * without it some scrapers fall back to OpenMetrics and fail. */
     r.content_type = "text/plain; version=0.0.4; charset=utf-8";
     r.body = metrics_.render();
     return r;

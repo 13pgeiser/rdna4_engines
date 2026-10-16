@@ -1,28 +1,26 @@
 // DFlash2 grouped dynamic depthwise convolution -- device math only.
 //
-// Deliberately free of <hip/hip_runtime.h> so the identical source can be compiled standalone to
-// gfx1201 assembly with a stock clang (no ROCm install) for ISA review, and as part of libr4d.so.
+// Free of <hip/hip_runtime.h> so the same source compiles standalone to gfx1201 assembly with a
+// stock clang (no ROCm) for ISA review, as well as into libr4d.so.
 //
 // The op, per DFlash2's _grouped_conv with taps=2, group_size=16:
 //
 //   out[t,h] = (base[0,h] + delta[t,0,g]) * x[t,h]
 //            + (base[1,h] + delta[t,1,g]) * x[t-1,h] * ((t % block) >= 1)     g = h / group
 //
-// The reference builds this as ~6 full [T,H] elementwise passes plus a materialised
-// [T, taps, num_groups, group] coefficient tensor. Every one of those intermediates is consumed
-// exactly once, so the fused form reads x, delta and base once and writes out once.
+// The reference uses ~6 [T,H] elementwise passes plus a materialised [T, taps, num_groups, group]
+// coefficient tensor; the fused form reads x, delta and base once and writes out once.
 #pragma once
 
 typedef unsigned int   r4d_u32;
 typedef unsigned short r4d_u16;
 typedef r4d_u32 r4d_u32x4 __attribute__((ext_vector_type(4)));
 
-// A 16-byte load addressed both ways. The subscript must come off a union member and never off a
-// vector via __builtin_bit_cast: bit-casting a vector SUBSCRIPT silently yields element 0's bits.
+// A 16-byte load addressed both ways. Subscript the union member, never a bit-cast vector:
+// bit-casting a vector subscript silently yields element 0's bits.
 union R4dV8 { r4d_u32x4 v; r4d_u16 h[8]; };
 
-// Under hipcc these are device functions; the standalone ISA harness compiles the same source with
-// a plain clang targeting amdgcn, where there is no __device__ and everything is already device code.
+// Device functions under hipcc; plain always-inline functions under a standalone amdgcn clang.
 #ifndef R4D_DEV
 #ifdef __HIP__
 #define R4D_DEV __device__ __forceinline__
@@ -41,9 +39,8 @@ R4D_DEV r4d_u16 r4d_f2bf(float f) {
     return (r4d_u16)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 
-// One thread owns 8 contiguous channels: a single dwordx4 in and out. group_size 16 divides that
-// span, so the group index -- and therefore both delta scalars -- are uniform over the thread's 8
-// channels and are loaded once rather than per channel.
+// One thread owns 8 contiguous channels (one dwordx4 in and out). The group size (16) is a multiple
+// of 8, so the group index and both delta scalars are uniform per thread and loaded once.
 template <int TAPS, int GROUP>
 R4D_DEV void r4d_dflash_conv_body(const r4d_u16* __restrict__ x,
                                   const r4d_u16* __restrict__ delta,
@@ -53,16 +50,13 @@ R4D_DEV void r4d_dflash_conv_body(const r4d_u16* __restrict__ x,
                                   int blockmask, int t, int hv) {
     if (hv >= vpr) return;
 
-    // Split every address into a wave-uniform pointer and a lane offset the backend can keep in a
-    // single 32-bit VGPR -- gfx12's saddr form. Two things are load-bearing:
-    //
-    //   * the mask. The backend will only fold a lane offset into saddr if it can prove the
-    //     byte-scaled offset stays inside 32 bits. A lane index built from workgroup_id has no
-    //     known bound, so it widens the address to a 64-bit vector add and pays a
-    //     v_add_co_u32 / v_add_co_ci_u32 pair per load. __builtin_assume does NOT propagate here;
-    //     the AND does, for one cheap VALU op.
-    //   * pointer + offset, NOT a vector-typed array indexed by lane. The array form makes the
-    //     backend materialise a separate 64-bit address per pointer instead of sharing one offset.
+    // Split each address into a wave-uniform pointer and a 32-bit lane offset (gfx12 saddr form).
+    // Do not change either of these:
+    //   * The mask: the backend folds a lane offset into saddr only if it can prove the byte offset
+    //     fits 32 bits. Without it each load pays a 64-bit v_add_co_u32/v_add_co_ci_u32 pair;
+    //     __builtin_assume does not propagate here, the AND does.
+    //   * Pointer + offset, not a vector-typed array indexed by lane, which makes the backend
+    //     materialise a 64-bit address per pointer.
     const unsigned off = ((unsigned)hv & 0xFFFFFu) * 8u;
     const unsigned g   = off / (unsigned)GROUP;
 
@@ -79,17 +73,13 @@ R4D_DEV void r4d_dflash_conv_body(const r4d_u16* __restrict__ x,
     for (int j = 0; j < 8; ++j)
         acc[j] = (r4d_bf2f(b0.h[j]) + d0) * r4d_bf2f(x0.h[j]);
 
-    // Tap `tap` contributes only where the position within the block is at least `tap`. t is the
-    // workgroup's y index, so the predicate is wave-uniform and the skip is a scalar branch --
-    // and on the rows it skips, the shifted load is never issued at all.
+    // Tap `tap` contributes only where the position within the block is >= tap. t is the
+    // workgroup's y index, so this is a scalar branch and skipped rows issue no shifted load.
 #pragma unroll
     for (int tap = 1; tap < TAPS; ++tap) {
-        // Same rule as above, applied to the shifted operands: every uniform term folds into its
-        // own pointer so the only thing left varying per lane is the bounded offset. Adding tap*NG
-        // into the delta INDEX instead of the pointer is enough to lose saddr again. These are
-        // hoisted OUT of the predicate: they are scalar address arithmetic on a path the backend
-        // will not fold into saddr from inside a branch, and an address that is merely formed and
-        // never dereferenced costs nothing.
+        // Same saddr rule: uniform terms go into the pointer (adding tap*NG to the delta index
+        // instead loses saddr). The pointers are formed outside the branch, because the backend
+        // does not fold them into saddr from inside it; an unused address costs nothing.
         const r4d_u16* __restrict__ xprev = xrow - (long)tap * H;
         const r4d_u16* __restrict__ btap  = base + (long)tap * H;
         const r4d_u16* __restrict__ dtap  = drow + (long)tap * NG;

@@ -1,19 +1,16 @@
 #!/bin/sh
-# What a long prefill costs the requests already running beside it, and what the prefill chunk
-# does to both halves of that trade.
+# What a long prefill costs the decoders running beside it.
 #
-# WHY IT CANNOT BE MEASURED ALONE. A bigger prefill chunk holds the device for longer in one
-# go, so every decode step queued behind it waits that much longer. Run by itself a long prompt
-# only shows the good half -- the chunk is worth tens of percent of prefill -- and the bill
-# arrives on other people's sequences. Both halves have to be on the same clock.
+# A bigger prefill chunk speeds up prefill by tens of percent but holds the device longer, so
+# every decode step queued behind it waits longer. A long prompt run alone shows only the gain;
+# both sides must be measured together.
 #
-# WARM FIRST. `expert_tiered` faults its tier in on the first requests, so a cold first pass
-# charges the whole cold tier to the alone arm and comes back with contention making the decoders
-# FASTER. The first pass ("warm") is discarded; each later pass runs both arms back to back.
+# `expert_tiered` faults its tier in on the first requests, so a cold first pass charges the cold
+# tier to the alone arm and makes contention look like a speedup. The first pass ("warm") is
+# discarded; each later pass runs both arms back to back.
 #
-# THE DECODERS USE ignore_eos SO THEIR LENGTH IS FIXED. A decoder that stops early leaves the
-# contended window measuring fewer streams than the alone window did, which reads as contention
-# being free.
+# Decoders use ignore_eos so their length is fixed: one that stopped early would leave the
+# contended window with fewer streams than the alone window, hiding the cost.
 #
 #   P=8100 C=4 DEC=300 PROMPT=24000 scripts/fnconc.sh
 #
@@ -29,8 +26,8 @@ ROOT="${ROOT:-$(dirname "$0")/..}"
 URL="http://$H:$P"
 CORPUS=/dev/shm/fnconc-corpus.txt
 
-# Grown when a later run wants more than the last one did: `head -c` on a corpus that is too
-# short returns what there is rather than failing, so the arm would time a prompt it did not send.
+# Grow the corpus when a run needs more: `head -c` on a short corpus silently returns less, so
+# the arm would time a shorter prompt than intended.
 want=$((PROMPT * BPT + 4096))
 if [ "$(wc -c < "$CORPUS" 2>/dev/null || echo 0)" -lt "$want" ]; then
     : > "$CORPUS"
@@ -55,8 +52,8 @@ long_request() {
     awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.2f", b - a }'
 }
 
-# C decoders, timed. `wait` would also wait on anything else this shell started, so the pids are
-# collected and waited on by name.
+# C decoders, timed. A bare `wait` would also wait on anything else this shell started, so the
+# pids are waited on individually.
 decoders_wall() {
     t0=$(date +%s.%N); pids=
     i=0; while [ "$i" -lt "$C" ]; do decoder "d$1$i" & pids="$pids $!"; i=$((i + 1)); done

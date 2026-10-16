@@ -1,10 +1,9 @@
 /* schema.cpp -- the op-schema registry and the check an architecture plugin's declared parameters
  * go through. spec.md §2.3.
  *
- * Without a schema, a typo and an unimplemented op are the same diagnostic: both are "nothing
- * resolved". With one, a misspelled op fails declare with the near-miss named, and that is the
- * whole reason this file exists -- new ops still need no core change, because the core learns the
- * vocabulary from the plugins rather than carrying a copy of it.
+ * Without a schema, a typo and an unimplemented op give the same "nothing resolved". With one, a
+ * misspelled op fails declare with the near-miss named. The core learns the op vocabulary from
+ * the plugins, so new ops need no core change.
  */
 #include "registry.h"
 
@@ -15,9 +14,7 @@ namespace rad {
 
 namespace {
 
-/* Levenshtein, bounded by the two lengths. The strings are op and parameter names -- a dozen
- * characters against a few hundred candidates, once per failed declare -- so the textbook O(nm)
- * table is already far below anything worth optimising. */
+/* Levenshtein, O(nm). Runs on short names, once per failed declare. */
 int edit_distance(std::string_view a, std::string_view b) {
     const size_t n = b.size();
     std::vector<int> prev(n + 1), cur(n + 1);
@@ -33,10 +30,8 @@ int edit_distance(std::string_view a, std::string_view b) {
     return prev[n];
 }
 
-/* How wrong a name may be and still be worth suggesting. One edit for a short name, up to three
- * for a long one: "gemm_nt" against "gemm_nq" is a typo worth naming, and "rmsnorm" against
- * "softmax" is not -- a suggestion that is wrong is worse than none, because it sends the reader
- * to check something that was never the problem. */
+/* How far a name may be from a known one and still be suggested: one edit for a short name, up
+ * to three for a long one. A wrong suggestion is worse than none. */
 bool close_enough(std::string_view a, std::string_view b, int d) {
     const size_t len = std::max(a.size(), b.size());
     const int budget = len <= 4 ? 1 : (len <= 10 ? 2 : 3);
@@ -54,7 +49,9 @@ std::string suggest(std::string_view want, const std::vector<std::string>& known
     return best;
 }
 
-const char* kind_name(int kind) {
+}  /* namespace */
+
+const char* param_kind_name(int kind) {
     switch (kind) {
         case RAD_P_INT:   return "an integer";
         case RAD_P_STR:   return "a string";
@@ -63,8 +60,6 @@ const char* kind_name(int kind) {
         default:          return "of an unknown kind";
     }
 }
-
-}  /* namespace */
 
 const RadOpSchema* Registry::schema(std::string_view op) const {
     auto it = schemas_.find(std::string(op));
@@ -80,9 +75,8 @@ std::vector<std::string> Registry::op_names() const {
     std::vector<std::string> out;
     out.reserve(schemas_.size());
     for (const auto& kv : schemas_) out.push_back(kv.first);
-    /* Rows may implement an op nobody declared a schema for -- check_complete() calls that out,
-     * but until it is fixed the name should still show up in a near-miss search, or the author of
-     * the broken plugin gets told their own op does not exist. */
+    /* Include ops that have rows but no schema (check_complete() reports those), so a near-miss
+     * search can still name them. */
     for (const KernelRow& r : rows_)
         if (schemas_.find(r.info->op) == schemas_.end()) out.emplace_back(r.info->op);
     std::sort(out.begin(), out.end());
@@ -142,25 +136,24 @@ int Registry::validate(std::string_view op, const RadParam* p, int n_p, std::str
         const bool int_ok = (p[i].kind == RAD_P_INT || p[i].kind == RAD_P_RANGE);
         if (spec->type == RAD_P_INT && !int_ok) {
             *err = fmt("%s: parameter '%s' is %s, but the schema says it is an integer",
-                       name.c_str(), p[i].key, kind_name(p[i].kind));
+                       name.c_str(), p[i].key, param_kind_name(p[i].kind));
             return RAD_E_SCHEMA;
         }
         if (spec->type == RAD_P_STR && p[i].kind != RAD_P_STR) {
             *err = fmt("%s: parameter '%s' is %s, but the schema says it is a string",
-                       name.c_str(), p[i].key, kind_name(p[i].kind));
+                       name.c_str(), p[i].key, param_kind_name(p[i].kind));
             return RAD_E_SCHEMA;
         }
         if (spec->type == RAD_P_STR && !p[i].sval) {
             *err = fmt("%s: string parameter '%s' is null", name.c_str(), p[i].key);
             return RAD_E_SCHEMA;
         }
-        /* A float slot takes a float and nothing else. An integer in it would land in `ival` while
-         * the kernel reads `dval`, which is a zero eps rather than a diagnostic -- exactly the
-         * silent-garbage class the schema exists to catch. Constraints never match on a float
-         * (rad_types.h), so this check is the only thing standing between the two spellings. */
+        /* A float slot takes only a float: an integer would land in `ival` while the kernel
+         * reads `dval` (a silent zero eps). Constraints never match on a float (rad_types.h), so
+         * only this check catches it. */
         if (spec->type == RAD_P_F64 && p[i].kind != RAD_P_F64) {
             *err = fmt("%s: parameter '%s' is %s, but the schema says it is a float -- declare it "
-                       "with RAD_F64()", name.c_str(), p[i].key, kind_name(p[i].kind));
+                       "with RAD_F64()", name.c_str(), p[i].key, param_kind_name(p[i].kind));
             return RAD_E_SCHEMA;
         }
 
@@ -172,9 +165,8 @@ int Registry::validate(std::string_view op, const RadParam* p, int n_p, std::str
             }
             if (++n_ranged == 1) ranged_key = p[i].key;
             else {
-                /* At most one ranged parameter per op. That is what keeps the bucket-table index a
-                 * single integer at issue, and it is a promise the run phase depends on rather
-                 * than a limitation of the table (docs/OPS.md). */
+                /* At most one ranged parameter per op, so the bucket-table index at issue is a
+                 * single integer; the run phase depends on this (docs/OPS.md). */
                 *err = fmt("%s: '%s' and '%s' are both ranges; an op may have at most one ranged "
                            "parameter", name.c_str(), ranged_key.c_str(), p[i].key);
                 return RAD_E_SCHEMA;
@@ -183,10 +175,9 @@ int Registry::validate(std::string_view op, const RadParam* p, int n_p, std::str
     }
 
     for (int j = 0; j < s.n_params; ++j) {
-        /* RAD_REQUIRED and nothing else. RAD_DERIVED is supplied by the KERNEL, so demanding it
-         * from the caller would re-create the circularity it exists to break: the caller cannot
-         * know the block size until a kernel is resolved, and no kernel resolves until the block
-         * size is known (rad_abi.h, spec §7.2). A caller MAY still supply one, which pins it. */
+        /* Only RAD_REQUIRED. RAD_DERIVED is supplied by the kernel: the caller cannot know, e.g.,
+         * the block size before a kernel resolves (rad_abi.h, spec §7.2). A caller may still
+         * supply one, which pins it. */
         if (s.params[j].required != RAD_REQUIRED) continue;
         bool given = false;
         for (int i = 0; i < n_p && !given; ++i) given = (keys[(size_t)j] == p[i].key);

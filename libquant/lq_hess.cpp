@@ -1,5 +1,6 @@
 /* lq_hess.cpp -- reading the calibration Hessians, and D . H. See lq_hess.h. */
 #include "lq_hess.h"
+#include "lq_common.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -15,21 +16,21 @@ namespace {
  * calibration tap writes (arch/common/rad_arch.h, calib_write). The header is 32 bytes. */
 constexpr int kHdr = 32;
 
+/* One file per rank, ranks 0 .. kMaxRanks - 1. */
+constexpr int kMaxRanks = 16;
+
+std::string gram_path(const char* dir, int rank, const std::string& stem) {
+    return std::string(dir) + "/gram.r" + std::to_string(rank) + "." + stem + ".bin";
+}
+
 /* The unnormalised Hadamard of width `n` over every n-wide block of a length-k row, in place. */
 void fwht_row(double* v, int64_t k, int64_t n) {
-    for (int64_t b0 = 0; b0 < k; b0 += n)
-        for (int64_t h = 1; h < n; h *= 2)
-            for (int64_t i = b0; i < b0 + n; i += 2 * h)
-                for (int64_t j = i; j < i + h; ++j) {
-                    const double x = v[j], y = v[j + h];
-                    v[j] = x + y;
-                    v[j + h] = x - y;
-                }
+    for (int64_t b0 = 0; b0 < k; b0 += n) fwht_inplace(v + b0, n);
 }
 
 /* H -> F H F for the block-diagonal Hadamard F of width `n`: every row, then every column. F is
- * symmetric, so the column pass is the row pass over the transpose, and the result stays
- * symmetric to the last bit only because both passes are the same butterflies in the same order. */
+ * symmetric, so the column pass is the row pass over the transpose; the result stays bit-exactly
+ * symmetric only because both passes run the same butterflies in the same order. */
 void rotate_gram(std::vector<double>& h, int64_t k, int64_t n) {
     for (int64_t r = 0; r < k; ++r) fwht_row(h.data() + r * k, k, n);
     std::vector<double> col((size_t)k);
@@ -58,8 +59,8 @@ bool read_gram(const std::string& path, int64_t k, int64_t domain, std::vector<d
         std::fclose(f);
         return false;
     }
-    /* Two domains meet only through the model's own: a file rotated at one width serves a grid
-     * rotated at another by going back first, and either width has to tile K. */
+    /* Domains convert only through the model's own (domain 0): a file rotated at one width is
+     * rotated back before rotating to another. Both widths must tile K. */
     const int64_t from = (int64_t)dom;
     auto tiles = [k](int64_t n) { return n == 0 || (n >= 2 && (n & (n - 1)) == 0 && k % n == 0); };
     if (!tiles(from) || !tiles(domain)) {
@@ -84,9 +85,9 @@ bool read_gram(const std::string& path, int64_t k, int64_t domain, std::vector<d
             for (double& x : h) x *= inv;
         }
         if (domain != 0) rotate_gram(h, k, domain);
-        /* ROUNDED TO WHAT A TAP IN THAT DOMAIN WOULD HAVE STORED: a file is f32, and a Hessian
-         * brought into a domain is then the same bytes as one summed there -- which is what lets a
-         * bf16 model's calibration and a rotated container's quantise a weight identically. */
+        /* Round to f32, as a tap in that domain would have stored it, so a converted Hessian
+         * matches one summed there and a bf16 model's calibration and a rotated container's
+         * quantise a weight identically. */
         for (double& x : h) x = (double)(float)x;
     }
     if (acc->empty()) acc->assign(h.size(), 0.0);
@@ -94,13 +95,11 @@ bool read_gram(const std::string& path, int64_t k, int64_t domain, std::vector<d
     return true;
 }
 
-/* The rows every rank's file for `stem` says it summed, or -1 when `dir` holds none. */
+/* The total rows summed by every rank's file for `stem`, or -1 when `dir` holds none. */
 int64_t calib_rows(const char* dir, const std::string& stem) {
     int64_t total = -1;
-    for (int r = 0; r < 16; ++r) {
-        char path[1024];
-        std::snprintf(path, sizeof path, "%s/gram.r%d.%s.bin", dir, r, stem.c_str());
-        FILE* f = std::fopen(path, "rb");
+    for (int r = 0; r < kMaxRanks; ++r) {
+        FILE* f = std::fopen(gram_path(dir, r, stem).c_str(), "rb");
         if (!f) continue;
         char hdr[kHdr];
         if (std::fread(hdr, 1, kHdr, f) == (size_t)kHdr && std::memcmp(hdr, "RADGRAM2", 8) == 0) {
@@ -134,14 +133,12 @@ GramCache& gram_cache() {
     return c;
 }
 
-/* THE PANEL AND THE BLOCK. A panel is CB columns of H over all K of its rows, PACKED -- copied
- * into a buffer of K rows of CB floats -- so a step of k reads one contiguous line rather than one
- * line K floats from the last, which is what keeps the product at arithmetic speed and not at the
- * cache's (3-5x, measured). A row block is RB rows of D, held as RB*CB accumulators in registers:
- * 8 x 32 under AVX-512 and 4 x 16 under AVX2 are sixteen and eight vector registers. Each
- * accumulator sums its k in ascending order and is stored once, so the panel, the block and the
- * instruction set are a schedule and not a change to any sum. Both are forced inline so that each
- * is compiled inside the instruction set of the run that calls it. */
+/* A panel is CB columns of H over all K rows, packed into a K x CB buffer so each k step reads one
+ * contiguous line instead of striding K floats; this keeps the product compute-bound (3-5x faster
+ * than unpacked). A row block is RB rows of D held as RB*CB register accumulators: 8 x 32 under
+ * AVX-512 and 4 x 16 under AVX2 use sixteen and eight vector registers. Each accumulator sums k in
+ * ascending order and is stored once, so panel, block and instruction set change the schedule, not
+ * any sum. Both functions are forced inline so each compiles under its caller's target ISA. */
 template <int RB, int CB>
 __attribute__((always_inline)) inline void panel(const float* D, int64_t K, const float* P,
                                                  float* G) {
@@ -169,7 +166,7 @@ __attribute__((always_inline)) inline void task(const float* D, int64_t K, const
     for (int64_t b = b0; b < b1; ++b) panel<RB, CB>(D + b * RB * K, K, pack, G + b * RB * K + j0);
 }
 
-/* The edges: what the blocks leave, one element at a time in the same order. */
+/* The edges the blocks leave, one element at a time in the same k order. */
 void edge(const float* D, int64_t K, const float* H, int64_t r0, int64_t r1, int64_t j0,
           int64_t j1, float* G) {
     for (int64_t r = r0; r < r1; ++r)
@@ -238,16 +235,13 @@ std::string calib_stem(const char* name) {
 
 int calib_sum(const char* dir, const std::string& stem, int64_t K, int64_t domain,
               std::vector<double>* acc) {
-    /* EVERY RANK'S FILE, SUMMED. Under expert parallelism a rank's `down` Hessian covers only the
-     * tokens routed to its own experts, so no single file holds the layer's distribution; the
-     * gate_up files are duplicates across ranks, and summing those multiplies H by the rank count,
-     * a positive scale every algorithm here is invariant to. 16 bounds the rank count. */
+    /* Sum every rank's file. Under expert parallelism a rank's `down` Hessian covers only tokens
+     * routed to its own experts, so no single file holds the layer's distribution. The gate_up
+     * files are duplicated across ranks; summing them scales H by the rank count, which every
+     * algorithm here is invariant to. */
     int found = 0;
-    for (int r = 0; r < 16; ++r) {
-        char path[1024];
-        std::snprintf(path, sizeof path, "%s/gram.r%d.%s.bin", dir, r, stem.c_str());
-        if (read_gram(path, K, domain, acc)) ++found;
-    }
+    for (int r = 0; r < kMaxRanks; ++r)
+        if (read_gram(gram_path(dir, r, stem), K, domain, acc)) ++found;
     return found;
 }
 
@@ -303,7 +297,7 @@ void mat_hess(const float* D, int64_t R, int64_t K, const float* H, float* G) {
     if (__builtin_cpu_supports("avx512f")) blocked<8, 32>(D, R, K, H, G, run_avx512, &rf, &cf);
     else if (__builtin_cpu_supports("avx2")) blocked<4, 16>(D, R, K, H, G, run_avx2, &rf, &cf);
     else blocked<4, 8>(D, R, K, H, G, run_base, &rf, &cf);
-    /* the column edge of the blocked rows, then the row edge across every column */
+    /* The column edge of the blocked rows, then the row edge across every column. */
     if (cf < K && rf > 0) {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)

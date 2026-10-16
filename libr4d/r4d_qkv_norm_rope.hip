@@ -1,28 +1,26 @@
 // r4d_qkv_norm_rope.hip - r4d_qkv_norm_rope: the per-head norms and the rotary of separate q, k and
 // v projections in one dispatch -- Gemma 4's attention prologue.
 //
-// WHY.  Between its projections and the cache store a Gemma 4 attention block runs five single-pass
-// kernels over a few dozen heads: the weightless value norm (rmsnorm_p), the q and the k norms
-// (rmsnorm, one row a head) and the two rotaries (rope).  At a decode batch each is a handful of
-// workgroups, so the block pays five dispatches for work the card does in a fraction of one.  This is
-// the five as one, one workgroup a (token, head).
+// Between its projections and the cache store a Gemma 4 attention block runs five single-pass
+// kernels over a few dozen heads: the weightless value norm (rmsnorm_p), the q and k norms
+// (rmsnorm, one row per head) and two rotaries (rope). At decode each is a handful of workgroups,
+// so this fuses the five into one dispatch, one workgroup per (token, head).
 //
-// BYTE-IDENTICAL TO THE FIVE, for the reason r4d_rmsnorm_quant_i8.hip gives.  What makes that hold:
+// Byte-identical to the five (see r4d_rmsnorm_quant_i8.hip for why that matters), because:
 //
-//   * each norm's sum of squares is taken by THE PARTITION ITS STANDALONE KERNEL USES.  rmsnorm runs
-//     one workgroup a row at r4d_act_threads(rows, head_dim) threads and rmsnorm_p at 256; thread t
-//     folds columns t, t+THR, ... in order, the waves are summed in order through LDS.  Here a
+//   * each norm's sum of squares uses its standalone kernel's partition. rmsnorm runs one workgroup
+//     per row at r4d_act_threads(rows, head_dim) threads and rmsnorm_p at 256; thread t folds
+//     columns t, t+THR, ... in order and the waves are summed in order through LDS. Here a
 //     workgroup is head_dim threads, and thread t < min(THR, head_dim) folds the same columns in the
-//     same order while the rest hold zero -- which is what the standalone kernel's surplus waves hold
-//     too, and adding +0.0 to a sum of squares changes no bit;
+//     same order while the rest hold zero, as the standalone kernel's surplus waves do;
 //   * the norm output is rounded to bf16 as the standalone norm stores it, and the rotary reads that;
-//   * the rotary's per-pair arithmetic is rope_kernel's, written the same way (powf ladder,
-//     sincosf, `x0*c - x1*s`, `x0*s + x1*c`), under the library's -ffp-contract=off.
+//   * the rotary's per-pair arithmetic is rope_kernel's (powf ladder, sincosf, `x0*c - x1*s`,
+//     `x0*s + x1*c`), under the library's -ffp-contract=off.
 //
-// `v_from_k` IS GEMMA'S GLOBAL CLASS: k == v, so v is the value norm of the RAW k, taken before the
-// k norm rewrites it -- the order the unfused block issues them in.
+// `v_from_k` is Gemma's global class: k == v, so v is the value norm of the raw k, taken before the
+// k norm overwrites it, in the order the unfused block issues them.
 //
-// Returns a negative code rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
+// Returns a negative code instead of throwing, for the reason given in r4d_gemm_fp8a8.hip.
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_emit.h"
@@ -37,8 +35,8 @@ constexpr uint32_t kWave = 32;
 
 __device__ __forceinline__ float bf2f(uint16_t h) { return __uint_as_float((uint32_t)h << 16); }
 
-// THR threads' partition of one head's sum of squares, reproduced inside a head_dim-wide workgroup:
-// thread t < P = min(THR, HD) folds t, t+P, ...; the waves are then summed in order.
+// THR threads' partition of one head's sum of squares inside a head_dim-wide workgroup: thread
+// t < P = min(THR, HD) folds t, t+P, ...; the waves are then summed in order.
 template <uint32_t HD>
 __device__ __forceinline__ float head_ss(const uint16_t* __restrict__ x, uint32_t P, float* lds) {
     float ss = 0.0f;
@@ -79,13 +77,13 @@ __global__ __launch_bounds__(HD) void qkv_norm_rope_kernel(
     uint16_t* __restrict__ q, uint16_t* __restrict__ k, uint16_t* __restrict__ v,
     const int32_t* __restrict__ pos, const void* __restrict__ qw, const void* __restrict__ kw,
     uint32_t nq, uint32_t nkv, uint32_t pq, uint32_t pk, uint32_t pv,
-    uint32_t q_ld, uint32_t k_ld, uint32_t v_ld, float eps, float wadd, float mult,
+    uint32_t q_ld, uint32_t k_ld, uint32_t v_ld, float eps, float wadd,
     uint32_t rot, uint32_t nfreq, int den, float theta, float rscale, uint32_t n_pos) {
     __shared__ float l1[HD / kWave], l2[HD / kWave];
     __shared__ uint16_t nb[HD];
     const uint32_t m = blockIdx.x, hh = blockIdx.y, t = threadIdx.x;
     const float div = rscale != 0.0f ? rscale : 1.0f;
-    // rope rotates the rows its positions cover; a row past them is normed and left unrotated
+    // rope rotates only the rows its positions cover; a row past them is normed and not rotated
     const float p0 = m < n_pos ? (float)pos[m] / div : 0.0f;
 
     if (hh >= nq + nkv) {   // a value head, in place: rmsnorm_p
@@ -109,7 +107,7 @@ __global__ __launch_bounds__(HD) void qkv_norm_rope_kernel(
     const float s = rsqrtf(head_ss<HD>(x, isq ? pq : pk, l1) / (float)HD + eps);
     for (uint32_t i = t; i < HD; i += HD) {
         const float g = WF32 ? ((const float*)w)[i] : bf2f(((const uint16_t*)w)[i]);
-        nb[i] = f32_to_bf16(bf2f(x[i]) * s * (g + wadd) * mult);
+        nb[i] = f32_to_bf16(bf2f(x[i]) * s * (g + wadd));
     }
     __syncthreads();   // the normed head is complete before any pair reads across it
     if (m < n_pos) rotate<HD>(nb, x, p0, rot, nfreq, den, theta);
@@ -121,7 +119,7 @@ __global__ __launch_bounds__(HD) void qkv_norm_rope_kernel(
 // ============================================================== the plugin ABI entry point
 enum { QN_Q = 0, QN_K, QN_V, QN_POS, QN_QW, QN_KW };
 
-static int rad_qkv_norm_rope_body(const RadArgs* a, const R4dSink& sk) {
+extern "C" int r4d_rad_qkv_norm_rope(const RadArgs* a, RadStream stream) {
     int emit_rc = RAD_OK;
     const RadTensor* q  = r4d_opt(a, QN_Q);
     const RadTensor* k  = r4d_opt(a, QN_K);
@@ -144,7 +142,7 @@ static int rad_qkv_norm_rope_body(const RadArgs* a, const R4dSink& sk) {
     const char* mode = r4d_gets(a, "mode");
     if (mode && std::strcmp(mode, "neox")) return R4D_NO(RAD_E_UNSUPPORTED);
     if (r4d_getf(a, "yarn_factor", 0.0) != 0.0) return R4D_NO(RAD_E_UNSUPPORTED);
-    // rope's ladder, resolved exactly as r4d_rad_rope resolves it
+    // rope's ladder, resolved as r4d_rad_rope resolves it
     const char* lad = r4d_gets(a, "ladder");
     long long den = rot;
     if (lad) {
@@ -162,8 +160,8 @@ static int rad_qkv_norm_rope_body(const RadArgs* a, const R4dSink& sk) {
     const long long Mp = r4d_numel(ps);
     if (Mp <= 0 || M < Mp || Mk != M || Mv != M) return R4D_NO(RAD_E_SHAPE);
 
-    // the standalone kernels' widths, from the same function: rmsnorm one row a head at
-    // r4d_act_threads(rows, head_dim), rmsnorm_p at 256
+    // The standalone kernels' widths, from the same function: rmsnorm (one row per head) at
+    // r4d_act_threads(rows, head_dim), rmsnorm_p at 256.
     const uint32_t pq = (uint32_t)std::min<long long>(r4d_act_threads((int)(M * nq), (int)hd), hd);
     const uint32_t pk = (uint32_t)std::min<long long>(r4d_act_threads((int)(M * nkv), (int)hd), hd);
     const uint32_t pv = (uint32_t)std::min<long long>(256, hd);
@@ -171,13 +169,12 @@ static int rad_qkv_norm_rope_body(const RadArgs* a, const R4dSink& sk) {
     const float wadd  = (float)r4d_getf(a, "wadd", 0.0);
     const float theta = (float)r4d_getf(a, "theta", 10000.0);
     const float rsc   = (float)r4d_getf(a, "scale", 1.0);
-    const float mult  = 1.0f;
     const dim3 grid((uint32_t)M, (uint32_t)(nq + nkv + (vk ? 0 : nkv)));
 
-#define R4D_QNR_T(HD, WF, VK) emit_rc = R4D_EMIT(sk, (qkv_norm_rope_kernel<HD, WF, VK>), grid, dim3(HD), 0, \
+#define R4D_QNR_T(HD, WF, VK) emit_rc = R4D_EMIT(stream, (qkv_norm_rope_kernel<HD, WF, VK>), grid, dim3(HD), 0, \
     (uint16_t*)r4d_wp(q), (uint16_t*)r4d_wp(k), (uint16_t*)r4d_wp(v), (const int32_t*)r4d_p(ps),           \
     r4d_p(qw), r4d_p(kw), (uint32_t)nq, (uint32_t)nkv, pq, pk, pv, (uint32_t)q_ld, (uint32_t)k_ld,          \
-    (uint32_t)v_ld, eps, wadd, mult, (uint32_t)rot_l, (uint32_t)nfreq, (int)den, theta, rsc, (uint32_t)Mp)
+    (uint32_t)v_ld, eps, wadd, (uint32_t)rot_l, (uint32_t)nfreq, (int)den, theta, rsc, (uint32_t)Mp)
 #define R4D_QNR(HD)                                                                                     \
     do { if (qw->dtype == RAD_F32) { if (vk) R4D_QNR_T(HD, true, true);  else R4D_QNR_T(HD, true, false); } \
          else                      { if (vk) R4D_QNR_T(HD, false, true); else R4D_QNR_T(HD, false, false); } } while (0)
@@ -187,4 +184,3 @@ static int rad_qkv_norm_rope_body(const RadArgs* a, const R4dSink& sk) {
 #undef R4D_QNR_T
     return emit_rc;
 }
-R4D_ENTRY(r4d_rad_qkv_norm_rope, rad_qkv_norm_rope_body)

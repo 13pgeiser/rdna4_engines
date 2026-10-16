@@ -1,13 +1,11 @@
 /* stallwatch.h -- naming where a phase that has gone quiet is waiting.
  *
- * A startup that stops printing leaves the hardest report to act on: the log ends on the last line
- * that was printed, and whatever came after it -- a driver call that never returned, a lock inside a
- * runtime library -- leaves no trace. The machine it happens on is often one this project cannot
- * run (a guest kernel, a card passed through to a VM), so where it waits has to come from the
- * process itself.
+ * A hang (a driver call that never returns, a lock inside a runtime library) leaves no trace in
+ * the log, often on machines that cannot be reproduced locally (a guest kernel, a passed-through
+ * card), so the process reports where it waits.
  *
  * A StallWatch is held across a phase by the thread doing it. When nothing has been logged for the
- * quiet interval it says what that thread is doing:
+ * quiet interval it reports what that thread is doing:
  *   - its scheduler state and kernel wait channel;
  *   - the system call it is in, an ioctl with its device and request, and the library that made
  *     the call;
@@ -17,8 +15,9 @@
  *     early;
  *   - the process's other threads that are inside an ioctl, since a lock in a runtime library is
  *     usually held by one of them.
- * It says it again each time the silence doubles, so a later log shows whether the thread moved.
- * The watch reads only its own process's /proc entries and costs one wake-up a second while held.
+ * It reports again each time the silence doubles, showing whether the thread moved. The watch
+ * reads only its own process's /proc entries and wakes every quarter of the quiet interval, at most
+ * once a second, while held.
  */
 #pragma once
 

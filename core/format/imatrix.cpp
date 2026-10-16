@@ -1,8 +1,5 @@
 /* imatrix.cpp -- the two llama.cpp imatrix formats and the small GGUF walker the newer one needs.
- *
- * Little-endian only, like everything else here. Every read is bounds-checked against the mapping
- * before it happens: an imatrix is a file a user was handed by somebody else, and the quantiser
- * that consumes it runs unattended for an hour.
+ * Little-endian only. Every read is bounds-checked against the mapping: the file is untrusted.
  */
 #include "imatrix.h"
 
@@ -16,7 +13,7 @@
 namespace rad {
 namespace {
 
-/* GGUF's value type tags. Only what a walker needs to know how far to step. */
+/* GGUF's value type tags, enough to know how far to step. */
 enum : uint32_t {
     GT_U8 = 0, GT_I8 = 1, GT_U16 = 2, GT_I16 = 3, GT_U32 = 4, GT_I32 = 5, GT_F32 = 6,
     GT_BOOL = 7, GT_STR = 8, GT_ARR = 9, GT_U64 = 10, GT_I64 = 11, GT_F64 = 12
@@ -48,8 +45,7 @@ struct Cursor {
         if (out) out->assign((const char*)q, (size_t)n);
         return true;
     }
-    /* Step over a value of any type without interpreting it. Arrays recurse, which is how
-     * imatrix.datasets (an array of strings) is skipped when we do not want it. */
+    /* Step over a value of any type without interpreting it; arrays recurse. */
     bool skip_value(uint32_t type) {
         switch (type) {
             case GT_U8: case GT_I8: case GT_BOOL:            return take(1);
@@ -154,8 +150,7 @@ int ImatrixFile::read_legacy(const uint8_t* p, uint64_t n) {
             return RAD_E_FORMAT;
         }
 
-        /* Copied, not pointed at: the legacy layout puts floats at an offset that depends on the
-         * name length, so nothing in the file is guaranteed 4-byte aligned. */
+        /* Copied: legacy float offsets depend on the name length, so they may be unaligned. */
         owned_.emplace_back((size_t)nval);
         std::memcpy(owned_.back().data(), vp, (size_t)nval * sizeof(float));
 
@@ -173,9 +168,8 @@ int ImatrixFile::read_legacy(const uint8_t* p, uint64_t n) {
         RAD_ERR("%s: truncated before the first entry", path_.c_str());
         return RAD_E_FORMAT;
     }
-    /* The legacy format cannot express per-expert data at all, and a MoE quantised against it
-     * weights every expert by the layer's aggregate. Say so once rather than let the quality
-     * difference show up as an unexplained regression. */
+    /* The legacy format has no per-expert data, so a MoE quantised with it weights every expert by
+     * the layer's aggregate; warn once. */
     RAD_WARN("%s is the legacy imatrix format: it has no per-expert dimension, so every expert in "
              "a layer will be weighted by the layer's aggregate activations. Re-collect with a "
              "current llama.cpp for per-expert importance.", path_.c_str());
@@ -234,10 +228,8 @@ int ImatrixFile::read_gguf(const uint8_t* p, uint64_t n) {
     }
     if (!c.ok) { RAD_ERR("%s: truncated in the KV block", path_.c_str()); return RAD_E_FORMAT; }
 
-    /* THE TENSOR COUNT IS A NUMBER FROM THE FILE, and it sizes an allocation. Every tensor info
-     * is at least a name length, a dimension count, a type and an offset -- 24 bytes -- so a count
-     * the rest of the file cannot hold is refused here rather than handed to reserve(), where it
-     * is a multi-exabyte request that ends the process. */
+    /* The tensor count comes from the file and sizes an allocation. Each tensor info is at least
+     * 24 bytes, so refuse a count the file cannot hold before reserve(). */
     constexpr uint64_t kMinInfoBytes = 8 + 4 + 4 + 8;
     if (n_tensors > (uint64_t)(c.end - c.p) / kMinInfoBytes) {
         RAD_ERR("%s: the header declares %llu tensors, and the %llu bytes after the KV block "
@@ -274,9 +266,8 @@ int ImatrixFile::read_gguf(const uint8_t* p, uint64_t n) {
         return RAD_E_FORMAT;
     }
 
-    /* Join `<base>.in_sum2` with `<base>.counts`. Insertion order defines entries() order, so a
-     * report over the file reads in the order the collector wrote it. `held` is how many floats
-     * each half actually spans in the file, parallel to entries_, for the extent checks below. */
+    /* Join `<base>.in_sum2` with `<base>.counts`, in file order. `held` (parallel to entries_) is
+     * how many floats each half spans in the file, for the extent checks below. */
     std::unordered_map<std::string, size_t> by_base;
     struct Held { uint64_t sum2 = 0, counts = 0; };
     std::vector<Held> held;
@@ -292,9 +283,8 @@ int ImatrixFile::read_gguf(const uint8_t* p, uint64_t n) {
             continue;
         }
 
-        /* The element count is a product of four numbers from the file, so it is bounded by the
-         * data section BEFORE each multiply: a product that wraps can come out small, pass the
-         * bounds test below and be read at its declared extent. */
+        /* The element count is a product of four file values; bound it by the data section before
+         * each multiply so it cannot wrap. */
         uint64_t numel = 1;
         bool     fits  = true;
         for (uint64_t d : t.dims) if (d == 0) numel = 0;
@@ -332,16 +322,14 @@ int ImatrixFile::read_gguf(const uint8_t* p, uint64_t n) {
         }
     }
 
-    /* THE QUERIES INDEX BY WHAT THE ENTRY CLAIMS, so the claim has to fit what the file holds.
-     * `importance` reads cols floats at expert * cols and `count` reads counts[expert] for every
-     * expert below n_expert -- both taken from the .in_sum2 dims -- so a .counts shorter than the
-     * expert count, or an .in_sum2 whose trailing dims multiply to less than cols x n_expert,
-     * would be read past its own extent. */
+    /* The queries index by the entry's claimed dims (from .in_sum2): `importance` reads cols floats
+     * at expert * cols and `count` reads counts[expert]. Check both halves actually hold that
+     * much. */
     std::vector<ImatrixEntry> kept;
     kept.reserve(entries_.size());
     for (size_t k = 0; k < entries_.size(); ++k) {
         ImatrixEntry& e = entries_[k];
-        /* An entry with counts and no values is a collector bug, not something to weight by. */
+        /* Counts without values is a collector bug. */
         if (!e.sum2 || e.cols <= 0) {
             RAD_WARN("%s: '%s' has counts but no .in_sum2 -- dropped", path_.c_str(),
                      e.name.c_str());
@@ -379,21 +367,9 @@ bool ImatrixFile::importance(const std::string& name, int64_t expert,
 
     const float* src = e->sum2 + expert * e->cols;
 
-    /* NORMALISED TO MEAN 1, and that is the whole of it.
-     *
-     * The row is NOT divided by the expert's activation count first, although that looks like a way
-     * to say "an expert that saw ten times the tokens is not ten times as important". The division
-     * cannot do that: the result is a single expert's row scaled to mean 1, and a uniform divisor
-     * applied to every column of that row is removed exactly by the scaling that follows it. What
-     * it can do is flush small columns to zero against a large count, and an all-zero row then
-     * takes the degenerate branch below -- so its only effect would be to lose weights.
-     *
-     * Popularity ACROSS experts is a different question and has its own query, `count`, which
-     * reports the raw number for exactly this reason.
-     *
-     * Mean 1 is what makes a weighted error comparable with an unweighted one, and therefore what
-     * makes the quantiser's error report mean the same thing with and without an imatrix. A
-     * degenerate (all-zero) row falls back to uniform weights rather than to NaN. */
+    /* Normalise to mean 1 only. Dividing by the expert's count first would be undone by the
+     * normalisation and could only flush small columns to zero. Popularity across experts is
+     * `count`'s job. An all-zero row falls back to uniform weights rather than NaN. */
     out->resize((size_t)e->cols);
     std::memcpy(out->data(), src, (size_t)e->cols * sizeof(float));
     double sum = 0.0;
@@ -404,6 +380,27 @@ bool ImatrixFile::importance(const std::string& name, int64_t expert,
     const float inv = (float)(1.0 / mean);
     for (float& v : *out) v *= inv;
     return true;
+}
+
+bool ImatrixFile::importance_for(const std::string& weight, int64_t cols,
+                                 std::vector<float>* out) const {
+    std::string base = weight;
+    if (base.size() > 7 && base.compare(base.size() - 7, 7, ".weight") == 0)
+        base.resize(base.size() - 7);
+    int64_t expert = 0;
+    if (!find(base)) {
+        /* `<stem>.<expert>`: the last component must be a plain decimal index. */
+        const size_t dot = base.find_last_of('.');
+        if (dot == std::string::npos || dot + 1 == base.size()) return false;
+        for (size_t i = dot + 1; i < base.size(); ++i) {
+            if (base[i] < '0' || base[i] > '9' || expert > ((int64_t)1 << 40)) return false;
+            expert = expert * 10 + (base[i] - '0');
+        }
+        base.resize(dot);
+    }
+    const ImatrixEntry* e = find(base);
+    if (!e || e->cols != cols) return false;
+    return importance(base, expert, out);
 }
 
 double ImatrixFile::count(const std::string& name, int64_t expert) const {

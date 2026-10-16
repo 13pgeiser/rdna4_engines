@@ -1,47 +1,30 @@
 // r4d_gemm_w8a16_nt_m64.hip - r4d_gemm_w8a16_nt_m64: 8-bit-weight skinny GEMM for M up to 64,
 // gfx1201.  C[M,N] = A[M,K] @ dequant(Wq)[N,K]^T, f16 A, bf16 C, fp32 accumulate.
 //
-// WHY THIS EXISTS WHEN THE 4-BIT ONE ALREADY DOES.  One site in the decode step is quantised to
-// eight bits and not four -- lm_head -- because it is the only layer whose error lands on the
-// SAMPLED TOKEN rather than on a residual a later layer can absorb.
+// Used for lm_head, quantised to eight bits rather than four because its error lands on the
+// sampled token rather than on a residual later layers can absorb.
 //
-// A general int8 library GEMM is the wrong shape for it.  Those paths refuse M <= 16, so eight
-// speculative rows are padded to SEVENTEEN, which is two 16-row macro tiles, and a weight-streaming
-// GEMM with two row tiles READS THE WEIGHT TWICE -- well under the ~640 GB/s this part delivers,
-// and the cost only stops rising once M is large enough that the last level absorbs the re-reads.
-// A skinny kernel holds every row of M in registers, so the weight is read once whatever M is and
-// the time does not move with the batch.
+// A skinny kernel holds every row of M in registers, so the weight is read once regardless of M.
+// General int8 GEMMs pad M <= 16 to two 16-row macro tiles and read the weight twice. The scale is
+// applied to the in-register accumulator and stored as bf16, with no separate epilogue launch.
 //
-// It also folds the epilogue.  A library path costs four launches -- quantise the activation, zero
-// a padded buffer, GEMM, then scale an M x N int32 buffer -- and the last of those moves tens of
-// megabytes at eight requests.  Here the scale is applied to the accumulator that is already in
-// registers and the store is bf16.
+// Structure matches r4d_gemm_w4a16_nt_m64: fragment order, 512 B packed block (32 lanes x 16 B),
+// (scale, zero) dword per (row, group), split-K reduction and clamped tiles. Only the bits per
+// element differ, so a packed block covers 32 K instead of 64.
 //
-// STRUCTURE IS r4d_gemm_w4a16_nt_m64's, AND DELIBERATELY SO: same fragment order, same packed-block
-// size (32 lanes x 16 bytes = 512 B), same (scale, zero) dword per (row, group), same split-K
-// reduction, same clamped row and column tiles.  Only the weight's bits per element change, and
-// with them how much K one packed block covers: 64 at four bits, 32 at eight.
+// Dequant: `0x6400 | b` is exactly the f16 for 1024 + b for b in 0..255, so four v_perm_b32 turn
+// two dwords into a 16x16x16 fragment, and one v_pk_add_f16 per pair adds -(1024 + zero). The
+// subtraction is exact (integers below 2048), so the group scale is applied to the f32 accumulator.
 //
-// THE DEQUANT IS THE SAME TRICK AT A WIDER RADIX.  `0x6400 | b` is the f16 for 1024 + b, exactly,
-// for every b in 0..255 -- f16 carries eleven significant bits and 1279 needs eleven -- so four
-// v_perm_b32 turn two dwords of four bytes into a whole 16x16x16 fragment, and one v_pk_add_f16
-// per pair subtracts the constant -(1024 + zero).  That subtraction is exact for the same reason
-// (both operands are integers below 2048 and the difference is small), which is what lets the group
-// scale wait for the f32 accumulator, where the cancellation has already happened.
+// A is f16, not bf16, because bf16's eight significant bits cannot hold 1024 + b. The alternative
+// (raw codes plus a per-group activation sum, as in r4d_gemm_w4a8_asym_nt_m64) gains nothing here:
+// the adds hide under the weight stream. The caller's bf16 -> f16 cast is exact for a post-norm
+// hidden state (O(10)).
 //
-// WHY f16 AND NOT bf16 A.  Reaching 1024 + b is the whole reason the unpack is four instructions,
-// and bf16 has eight significant bits, so 1024 + b is not representable there at all.  The
-// alternative -- keep the raw offset-binary code in the fragment and correct with a per-group
-// activation sum, which r4d_gemm_w4a8_asym_nt_m64 does -- needs that sum computed somewhere, and at
-// this M the four v_pk_add_f16 hide entirely under a weight stream that is 99% of the cost.  The
-// caller casts bf16 to f16, which is exact: bf16's mantissa is a strict prefix of f16's and a
-// post-norm hidden state is O(10).
-//
-// QUANTIZER.  Asymmetric, per output channel, per group of R4D_GEMM_W8_GROUP contiguous K:
-// w ~= scale * (q - zero) with q in 0..255 and an INTEGER zero, so the subtract stays on the
-// integer grid.  Both parameters live in one dword per (row, group): the f16 scale in the low half
-// and the f16 of -(1024 + zero) in the high half.  The group costs 3.1% more bytes than a
-// per-channel scale would and halves the KL divergence against the unquantised layer.
+// Quantiser: asymmetric, per output channel, per group of R4D_GEMM_W8_GROUP contiguous K:
+// w ~= scale * (q - zero), q in 0..255, integer zero. One dword per (row, group): the f16 scale low,
+// the f16 of -(1024 + zero) high. The group costs 3.1% more bytes than a per-channel scale and
+// halves the KL divergence against the unquantised layer.
 #include "r4d.h"
 #include "r4d_gemm_args.h"
 #include "r4d_gdn_wmma.h"
@@ -51,9 +34,6 @@
 #include <stdexcept>
 
 #define R4D_GEMM_W8_MAX_M 64
-#ifndef R4D_GEMM_W8_GROUP
-#define R4D_GEMM_W8_GROUP 128        // K per (scale, zero) pair
-#endif
 #define R4D_GEMM_W8_KPB   32         // K per packed block: 2 k steps, 16 bytes per lane
 #define WAVE32 32
 
@@ -71,10 +51,9 @@ __device__ __forceinline__ v8h fragA8(r4d_gu2 p, int u) {
   return x.f;
 }
 
-// Two dwords of four bytes -> one 16x16x16 f16 B fragment, minus the zero point.  The packer put
-// fragment elements 0..3 in the first dword and 4..7 in the second, in order, so each v_perm_b32
-// pairs two consecutive bytes with the constant high byte 0x64 -- the f16 exponent field for 1024.
-// nz carries -(1024 + zero) in BOTH halves so one v_pk_add_f16 corrects a pair.
+// Two dwords of four bytes -> one 16x16x16 f16 B fragment, minus the zero point. The packer puts
+// fragment elements 0..3 in the first dword and 4..7 in the second, so each v_perm_b32 pairs two
+// bytes with the high byte 0x64 (the f16 exponent for 1024). nz holds -(1024 + zero) in both halves.
 __device__ __forceinline__ v8h dequant8(unsigned w0, unsigned w1, __half2 nz) {
   const unsigned K64 = 0x64646464u;
   union { unsigned u[4]; __half2 h2[4]; v8h f; } x;
@@ -209,12 +188,9 @@ __global__ __launch_bounds__(1024) void r4d_gemm_w8a16_nt_m64_kernel(
 
 void r4d_gemm_w8a16_nt_m64(long a, long wq, long wsz, long c, int M, int K, int N,
                            int WV, int SK, int MB, int NPW, int NT, long stream) {
-  // NO UPPER BOUND ON M.  The row tiles a BLOCK covers are MT, and grid.y covers the rest, with
-  // rows past M clamped on load and masked on the store -- so any M is CORRECT.  What ends at 64
-  // is the band this kernel is the right shape for: past it every extra row-tile group re-reads
-  // the whole weight, and the caller should be on a staged kernel.  max_m() reports that band;
-  // this guard only rejects nonsense, because the alternative is a caller silently getting a
-  // wrong answer from a fallback that was handed a PACKED weight.
+  // Any M is correct (grid.y covers row tiles past MT; rows past M are clamped and masked). 64 is
+  // the band this shape suits, since each extra row-tile group re-reads the weight; max_m()
+  // reports it.
   if (M < 1) throw std::runtime_error("r4d gemm_w8a16_nt_m64: M must be >= 1");
   if (N % 16) throw std::runtime_error("r4d gemm_w8a16_nt_m64: N must be a multiple of 16");
   if (K % (SK * R4D_GEMM_W8_GROUP))
@@ -257,14 +233,13 @@ int r4d_gemm_w8a16_nt_m64_group(void) { return R4D_GEMM_W8_GROUP; }
 
 // ============================================================== the plugin ABI entry points
 //
-// The operand reader and the split law are in r4d_gemm_args.h. See libr4d/r4d_args.h for why there
-// is no adapter directory between the core and these launches.
+// The operand reader and the split law are in r4d_gemm_args.h; see libr4d/r4d_args.h.
 extern "C" int r4d_rad_gemm_w8a16_m64(const RadArgs* a, RadStream s) {
     GemmOps g;
     int rc = gemm_ops(a, &g, 1);
     if (rc != RAD_OK) return rc;
     if (g.N % 16) return R4D_NO(RAD_E_SHAPE);
-    /* An f16 kernel handed any other activation reads plausible numbers that are not the input. */
+    /* Any other activation dtype would read plausible but wrong numbers. */
     if (g.a->dtype != RAD_F16) return R4D_NO(RAD_E_DTYPE);
     if (g.M > r4d_gemm_w8a16_nt_m64_max_m()) return R4D_NO(RAD_E_SHAPE);
     const int group = r4d_gemm_w8a16_nt_m64_group();

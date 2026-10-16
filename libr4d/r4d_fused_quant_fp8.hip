@@ -1,49 +1,34 @@
-// r4d_fused_quant_fp8.hip - the two producers that already have an activation row in registers,
-// with r4d_quant_act_fp8 riding along on the same pass.
+// r4d_fused_quant_fp8.hip - producers that already hold an activation row in registers, fused with
+// r4d_quant_act_fp8's per-(row, 128) E4M3 quantisation.
 //
-// WHY FUSE, AND WHY THESE TWO.  The fp8a8 GEMMs need an E4M3 activation with an f32 scale per
-// (row, 128 columns) in front of EVERY quantised linear, and `activation_scheme: dynamic` means
-// there is no shipped scale to skip it with.  A decode step of this model issues ~300 of those
-// quantisers -- one per activation per layer, on both ranks -- each costing microseconds on a step
-// budgeted in tens of milliseconds.  That is not bandwidth: the row is 8 tokens by 5120 channels,
-// 82 KiB, which is 0.13 us of a 638 GB/s card.  It is a launch, a grid fill and a second pass over
-// a row some other kernel had in registers a moment earlier.
+// The fp8a8 GEMMs need a quantised activation before every linear (`activation_scheme: dynamic`,
+// so no shipped scale). A decode step issues ~300 quantisers; each costs a launch, a grid fill and
+// a second pass over a row another kernel just had in registers, not bandwidth. Fused producers:
 //
-// Two of the three producers hand the quantiser a row they have just computed:
+//   rmsnorm -> quant   the input of every attention, GDN and MLP linear
+//   silu_mul -> quant  down_proj's input
 //
-//   rmsnorm -> quant   the input of every attention, GDN and MLP linear.  ~128 a step.
-//   silu_mul -> quant  down_proj's input.  ~64 a step.
+// A GEMM output feeding the next linear stays a separate launch. The int8 path has the same fusion
+// (r4d_rmsnorm_had_quant_i8, r4d_gated_had_quant_i8), where the rotation is required to survive one
+// scale per row; a 128-wide block scale does not need it.
 //
-// The third (a GEMM's own output feeding the next linear) is not fusable this way and stays a
-// launch of its own.  The int8 path carries the same fusion -- r4d_rmsnorm_had_quant_i8 and
-// r4d_gated_had_quant_i8 -- and this is the fp8 form of it, minus the rotation, which is what the
-// int8 grid needs to survive one scale per row and a 128-wide block scale does not.
+// Bit-identical to the unfused pair it replaces (generated text is compared byte for byte across
+// builds). The pair writes a bf16 norm output and the quantiser reads it back, so amax and codes
+// are taken over bf16-rounded values; these kernels round to bf16 first and quantise the
+// round-tripped float.
 //
-// BIT-IDENTICAL TO THE PAIR IT REPLACES, and that is a hard requirement rather than a nicety,
-// because the engine's generated text is compared byte for byte across builds.  The unfused pair
-// writes a BF16 norm output and the quantiser then reads those bf16 bytes back, so the amax and
-// the codes are taken over
-// bf16-ROUNDED values.  Both kernels here round to bf16 first and quantise the round-tripped float,
-// which costs one v_cvt per element and is the difference between "the same text" and "very nearly
-// the same text".
+// The norm re-reads its row for the second pass, with or without the residual. Unlike
+// r4d_rmsnorm_had_quant_i8 (which normalises the f32 sum), the sum is rounded to bf16 and stored
+// first, matching `add` writing a bf16 residual that `rmsnorm` reads back; the re-read is L1-hot.
 //
-// THE NORM RE-READS ITS ROW FOR THE SECOND PASS rather than keeping it in registers or LDS, and
-// that stays true WITH the residual, which is where this differs from r4d_rmsnorm_had_quant_i8.
-// That kernel keeps the row because it normalises the f32 sum, and re-reading would normalise a
-// bf16-rounded one, which costs thousands of +/-1 codes.  This one rounds the sum to bf16 and
-// stores it FIRST, because that is what the pair it replaces does: `add` writes a bf16 residual and
-// `rmsnorm` reads those bytes back.  So the value normalised here is the value normalised there,
-// the re-read is L1-hot, and the output does not move.  Less accurate than the int8 path's choice,
-// and bit-identical to the pair it replaces, which is the property that matters here.
+// The residual may alias `out_bf16`, and every caller here does so: a block reads the previous
+// block's delta from the shared `h` buffer and writes its norm output back into it. Pass one reads
+// every `x` element before the block_sum barrier and pass two writes `y` after it, so they never
+// race.
 //
-// THE RESIDUAL MAY ALIAS `out_bf16`, and every caller in this tree makes it do so: a block reads
-// the PREVIOUS block's delta out of the shared `h` buffer and writes its own norm output back into
-// it.  Pass one reads every `x` element before the block_sum barrier and pass two writes `y` only
-// after it, so the two never race.
-//
-// `wadd` IS ADDED TO EVERY GAIN IN f32, for the reason r4d_rmsnorm_had_quant_i8 gives at length:
-// Qwen3.5's norms are GemmaRMSNorm over a zero-centred gamma, and forming `1 + w` in bf16 first is
-// a systematic 0.3% per channel.  Pass 0 for a plain RMS norm.
+// `wadd` is added to every gain in f32 (see r4d_rmsnorm_had_quant_i8): Qwen3.5's GemmaRMSNorm uses
+// a zero-centred gamma, and forming `1 + w` in bf16 is a systematic 0.3% error. Pass 0 for a plain
+// RMS norm.
 //
 // Returns a negative code rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
 
@@ -62,16 +47,15 @@ constexpr uint32_t kGroup = 128;
 
 __device__ __forceinline__ float bf2f(uint16_t h) { return __uint_as_float((uint32_t)h << 16); }
 
-// Round-to-nearest-even, the same three lines every bf16 store in this library uses.
+// Round-to-nearest-even, as every bf16 store in this library rounds.
 __device__ __forceinline__ uint16_t f2bf(float f) {
     const uint32_t u = __float_as_uint(f);
     return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 
-// Both reductions exchange through DPP and permlanex16 (r4d_xor_lane, r4d_wave_sum) rather than
-// `__shfl_xor`, which gfx1201 lowers to ds_bpermute_b32 -- an LDS round trip a stage, five a
-// reduction, with nothing else in flight on the wave to hide them. Same partners in the same order,
-// so the same bits.
+// Both reductions use DPP and permlanex16 (r4d_xor_lane, r4d_wave_sum) rather than `__shfl_xor`,
+// which gfx1201 lowers to ds_bpermute_b32, an LDS round trip per stage. Same partners in the same
+// order, so the same bits.
 __device__ __forceinline__ float wave_max(float v) {
     v = fmaxf(v, r4d_xor_lane<16>(v));
     v = fmaxf(v, r4d_xor_lane<8>(v));
@@ -93,15 +77,11 @@ __device__ __forceinline__ float block_sum(float v, float* lds) {
     return s;
 }
 
-// One 128-column group's worth of quantisation, given the four bf16-rounded values a lane owns.
-// Lifted out because both kernels below end the same way, and because getting the clamp wrong is
-// the failure r4d_quant_act_fp8.hip spends a paragraph on: v_cvt_pk_fp8_f32 answers an
-// out-of-range input with a NaN rather than saturating, and `amax * (1/scale)` is 448 in exact
-// arithmetic but can land an ulp above it in float -- so without the fmin every block containing
-// its own maximum produces a NaN.
+// Quantise one 128-column group from the four bf16-rounded values a lane owns. The clamp in
+// q8_pack4 is required (see r4d_q8.h): v_cvt_pk_fp8_f32 returns NaN out of range, and
+// `amax * (1/scale)` can land an ulp above 448.
 //
-// I8 writes int8 codes at amax / 127 instead (r4d_q8.h), the codes quant_act_i8g would take over
-// the same bf16 values: an int8 linear reads them where an fp8 one reads the E4M3 pair.
+// I8 writes int8 codes at amax / 127 instead (r4d_q8.h), the same codes quant_act_i8g produces.
 template <bool I8 = false>
 __device__ __forceinline__ void quant_group(const float v[4], float* __restrict__ s,
                                             uint8_t* __restrict__ q, size_t s_at, uint32_t c0,
@@ -112,17 +92,15 @@ __device__ __forceinline__ void quant_group(const float v[4], float* __restrict_
     if (lane == 0) s[s_at] = sc;
     const float inv = 1.0f / sc;
     const uint32_t pk = q8_pack4<I8>(v[0], v[1], v[2], v[3], inv);
-    // A ragged last group is written zero-padded rather than partially, exactly as
-    // r4d_quant_act_fp8 does, and the caller owns `n` rounded up to 4 bytes of `q`.
+    // A ragged last group is written zero-padded, as in r4d_quant_act_fp8; the caller owns `n`
+    // rounded up to 4 bytes of `q`.
     if (c0 < n) *(uint32_t*)(q + c0) = pk;
 }
 
-// Pass two, shared by every kernel in this file that ends in a block-scaled fp8 activation: give
-// each wave a whole 128-column group and each lane four consecutive columns of it, which is what
-// makes the group's amax a wave reduction and the E4M3 store a single dword.  `nr` is the row the
-// norm was taken OF, already in memory -- rounding it to bf16 and reading it back is the whole
-// bit-identity argument at the top of this file, and it is written once here so that the fused
-// all-reduce below cannot drift from the standalone norm above it.
+// Pass two of every norm kernel here: each wave takes a 128-column group and each lane four
+// consecutive columns, so the group's amax is a wave reduction and the store a single dword. `nr`
+// is the row the norm is taken of, already in memory (see the bit-identity note above). Shared so
+// the fused all-reduce cannot drift from the standalone norm.
 template <bool WF32, uint32_t THR>
 __device__ __forceinline__ void norm_quant_row(
     const uint16_t* __restrict__ nr, const void* __restrict__ w, uint16_t* __restrict__ yr,
@@ -132,10 +110,8 @@ __device__ __forceinline__ void norm_quant_row(
     for (uint32_t kb = wave; kb < nkb; kb += THR / kWave) {
         const uint32_t c0 = kb * kGroup + lane * 4u;
         float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        // ONE BRANCH FOR ALL FOUR COLUMNS. Every launcher refuses an `n` that is not a multiple of
-        // four, so a lane's columns are all in the row or all past it. Guarded one column at a
-        // time, each load sits in its own branch with its use straight after it and the compiler
-        // waits for every one before issuing the next; under one branch they all issue first.
+        // One branch for all four columns: every launcher requires n % 4 == 0, so a lane's columns
+        // are all in or all out. Per-column guards would serialise the loads.
         if (c0 < n) {
             float g[4];
             uint16_t x[4];
@@ -146,8 +122,7 @@ __device__ __forceinline__ void norm_quant_row(
             }
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                // THE BF16 ROUND TRIP IS THE POINT.  The unfused quantiser reads these bytes, not
-                // the f32 that produced them.
+                // The bf16 round trip is deliberate: the unfused quantiser reads these bytes.
                 const uint16_t h = f2bf(bf2f(x[j]) * rs * (g[j] + wadd));
                 if (yr) yr[c0 + j] = h;
                 v[j] = bf2f(h);
@@ -158,9 +133,7 @@ __device__ __forceinline__ void norm_quant_row(
 }
 
 // ---------------------------------------------------------------------------- rmsnorm -> quant
-// One block a row.  Pass one is the sum of squares across all 256 threads; pass two gives each wave
-// a whole 128-column group and each lane four consecutive columns of it, which is what makes the
-// group's amax a wave reduction and the E4M3 store a single dword.
+// One block per row. Pass one is the block-wide sum of squares; pass two is norm_quant_row.
 template <bool WF32, bool RES, uint32_t THR>
 __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
@@ -171,14 +144,12 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(
     const uint32_t row = blockIdx.x;
     const uint16_t* __restrict__ xr = x + (size_t)row * x_ld;
     uint16_t* __restrict__ rr = RES ? res + (size_t)row * r_ld : nullptr;
-    // What the norm is taken OF: the residual once there is one, the input otherwise.
+    // The norm is taken of the residual when there is one, else of the input.
     const uint16_t* __restrict__ nr = RES ? rr : xr;
 
-    // FOUR STRIDES OF THE ROW ARE LOADED BEFORE ANY IS USED. A plain `i += THR` loop waits for
-    // each stride's load before issuing the next, one round trip per stride; here a stride past
-    // the row reloads this thread's first column, which is always in the row, and is skipped
-    // below. The sum still takes this thread's columns in the order `i = tid; i += THR` does,
-    // which is the order every kernel sharing r4d_act_threads' partition takes them in.
+    // Four strides are loaded before any is used, avoiding one round trip per stride. A stride past
+    // the row reloads this thread's first column and is skipped below. The summation order is still
+    // that of `i = tid; i += THR`, shared by every kernel using r4d_act_threads' partition.
     constexpr uint32_t kU = 4;
     float ss = 0.0f;
     for (uint32_t i0 = threadIdx.x; i0 < n; i0 += kU * THR) {
@@ -212,23 +183,16 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(
 }
 
 // ---------------------------------------------------------------------------- gate -> quant
-// silu(gate) * up, or sigmoid(gate) * up, then the same quantiser.  No reduction across the row, so
-// there is no first pass and no barrier: one wave, one group, done.
+// silu(gate) * up or sigmoid(gate) * up, then the same quantiser. No row reduction, so no first
+// pass and no barrier: one wave per group.
 //
-// ROT INSERTS THE WIDTH-128 HADAMARD between the product and the absmax, which is where it has to
-// go: the benefit of a rotation is entirely that the maximum the grid is scaled by gets smaller.
-// It is free here for the same reason it is free in r4d_quant_act_fp8 -- this kernel's mapping,
-// one wave a 128-group and four consecutive values a lane, IS r4d_fwht_wave<128>'s, so the seven
-// stages are register arithmetic and five shuffles on a launch already being paid.
+// ROT inserts the width-128 Hadamard between the product and the absmax, in registers, since this
+// mapping (one wave per group, four values per lane) is r4d_fwht_wave<128>'s. `y` still receives
+// the unrotated product: it is for a bf16 consumer, and the rotation belongs to the quantised pair
+// only.
 //
-// `y` STILL RECEIVES THE UNROTATED PRODUCT, and that is not an inconsistency. `y` exists for a
-// bf16 consumer of the silu output; the rotation is a property of the QUANTISED pair alone, and
-// the weight that undoes it never sees `y`.
-//
-// A WAVE A GROUP, AND NO IDLE WAVES. With no reduction across the row the workgroup's width changes
-// nothing but how many groups run at once, so the launcher sizes it to the row's groups, capped at
-// r4d_act_threads' width, and the kernel reads the width from blockDim. A fixed width leaves most
-// of the waves of a narrow row with nothing to do: at 1024 threads and three groups, 29 of 32.
+// The launcher sizes the workgroup to the row's groups (capped at r4d_act_threads' width) and the
+// kernel reads the width from blockDim, so a narrow row does not leave most waves idle.
 template <int ACT, bool ROT = false, bool I8 = false>
 __global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(
     const uint16_t* __restrict__ gu, uint16_t* __restrict__ y, uint8_t* __restrict__ q,
@@ -243,8 +207,7 @@ __global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(
     for (uint32_t kb = wave; kb < nkb; kb += blockDim.x / kWave) {
         const uint32_t c0 = kb * kGroup + lane * 4u;
         float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        // One branch for all four columns, so all eight loads issue before any is waited on; see
-        // norm_quant_row.
+        // One branch for all four columns; see norm_quant_row.
         if (c0 < n) {
             uint16_t gb[4], ub[4];
 #pragma unroll
@@ -261,8 +224,7 @@ __global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(
                 v[j] = bf2f(h);
             }
         }
-        // The rotated launcher refuses an n that is not a multiple of the group, so no block that
-        // reaches this line mixes real values with the padding zeros above.
+        // The rotated launcher requires n % 128 == 0, so no rotated group contains padding.
         if constexpr (ROT) r4d_fwht_wave<(int)kGroup>(v, (int)lane);
         quant_group<I8>(v, s, qr, (size_t)row * s_ld + kb, c0, n, lane);
     }
@@ -270,15 +232,12 @@ __global__ __launch_bounds__(1024) void gated_quant_fp8_kernel(
 
 // -------------------------------------------------- gate . x -> quant, two source buffers
 //
-// THE SAME EPILOGUE WITH THE GATE SOMEWHERE ELSE.  A gated attention's output gate is not packed
-// beside the thing it scales: `x` is the attention output [T, n_head * head_dim] and the gate is a
-// COLUMN SLICE of the [q|gate] projection, [T * n_head, 2 * head_dim] with the gate half at
-// `g_off`.  So the row is a (token, head) pair rather than a token, which is the whole trick: at
-// that shape `x` is contiguous, the gate is a fixed stride apart, and the fp8 scale plane of
-// [T * n_head, head_dim / 128] is byte-for-byte the [T, n_head * head_dim / 128] the out
-// projection reads.  Three launches an attention layer -- sigmoid, the multiply, the quantiser --
-// become one, and at a decode batch the dispatch gap between those three is comparable to the work
-// they do.
+// The same epilogue with the gate in a separate buffer. For gated attention, `x` is the attention
+// output [T, n_head * head_dim] and the gate is a column slice of the [q|gate] projection,
+// [T * n_head, 2 * head_dim] with the gate half at `g_off`. A row is a (token, head) pair: `x` is
+// then contiguous, the gate a fixed stride apart, and the scale plane [T * n_head, head_dim / 128]
+// is byte-identical to the [T, n_head * head_dim / 128] the out projection reads. Replaces three
+// launches (sigmoid, multiply, quantise) per attention layer.
 template <int ACT, bool I8 = false>
 __global__ __launch_bounds__(1024) void gate_quant_fp8_kernel(
     const uint16_t* __restrict__ g, const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
@@ -294,8 +253,7 @@ __global__ __launch_bounds__(1024) void gate_quant_fp8_kernel(
     for (uint32_t kb = wave; kb < nkb; kb += blockDim.x / kWave) {
         const uint32_t c0 = kb * kGroup + lane * 4u;
         float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        // One branch for all four columns, so all eight loads issue before any is waited on; see
-        // norm_quant_row.
+        // One branch for all four columns; see norm_quant_row.
         if (c0 < n) {
             uint16_t gb[4], xb[4];
 #pragma unroll
@@ -306,13 +264,9 @@ __global__ __launch_bounds__(1024) void gate_quant_fp8_kernel(
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const float gv = bf2f(gb[j]);
-                // THE ACTIVATION IS ROUNDED BEFORE THE MULTIPLY, which is the one place this
-                // differs from gated_quant_fp8 above and it is not an oversight.  That kernel's
-                // unfused reference is silu_mul_bf16, ONE kernel that keeps the activation in f32
-                // through the product.  This one's is `sigmoid` then `mul`, TWO kernels with a
-                // bf16 buffer between them -- so the round trip is part of the arithmetic being
-                // replaced, and skipping it changes the model's output: the emitted text moves and
-                // the drafter's acceptance rate falls.
+                // The activation is rounded to bf16 before the multiply, unlike gated_quant_fp8:
+                // the unfused reference here is `sigmoid` then `mul` with a bf16 buffer between
+                // them (silu_mul_bf16 keeps f32). Skipping the round trip changes the output.
                 const uint16_t ab =
                     f2bf(ACT == 0 ? gv / (1.0f + expf(-gv)) : 1.0f / (1.0f + expf(-gv)));
                 const uint16_t h = f2bf(bf2f(ab) * bf2f(xb[j]));
@@ -326,59 +280,37 @@ __global__ __launch_bounds__(1024) void gate_quant_fp8_kernel(
 
 // -------------------------------------------------------- all-reduce -> rmsnorm -> quant
 //
-// The same norm again, with the tensor-parallel all-reduce that always precedes it folded in.
-// Every row-parallel linear's output is all-reduced and then immediately normalised -- o_proj,
-// out_proj and down_proj, 128 of each on a 64-layer decode step, always adjacent and always in
-// that order. The norm's own body is a small fraction of what the pair costs; the rest is a launch,
-// a dispatch gap and a round trip through memory for a tensor that exists for one kernel. The int8
-// path carries the same fusion (r4d_ar_ln_had_quant_i8); this is the fp8 form of it, minus the
-// rotation.
+// The same norm with the tensor-parallel all-reduce that always precedes it folded in (o_proj,
+// out_proj and down_proj outputs are all-reduced, then normalised). Saves a launch, a dispatch gap
+// and a round trip through memory. The int8 path has the same fusion (r4d_ar_ln_had_quant_i8).
 //
-// THE PARTITION IS BY ROW, for the reason that file gives at length: r4d_ar_oneshot_2rank_exact
-// hands block b a contiguous chunk of 16B WORDS with an independent flag and no grid barrier
-// anywhere, and a norm cannot use that partition because a sum of squares closes only over a whole
-// row -- but rows are contiguous, so a contiguous range of ROWS is a contiguous range of words.
-// Both ranks compute the same range from (M, gridDim.x), so the handshake stays per-block.
+// Partitioned by row: r4d_ar_oneshot_2rank_exact gives block b a contiguous range of 16B words with
+// its own flag and no grid barrier, but a sum of squares needs whole rows. Rows are contiguous, so a
+// row range is a word range; both ranks derive it from (M, gridDim.x), keeping the handshake
+// per block.
 //
-// BIT-IDENTICAL TO THE PAIR IT REPLACES, and by construction rather than by inspection. Pass two
-// is norm_quant_row above, the same code the standalone kernel runs. Pass one reproduces the
-// all-reduce's own arithmetic exactly -- an f32 sum STORED AS BF16 (r4d_ar_oneshot_2rank_exact's
-// vadd) and then read as the norm's input -- and stores it back into `x`, which is not bookkeeping:
-// it is what the kernel this replaces wrote, so a reader of `x` that is not this norm still finds
-// the same bytes. The column partition of the sum of squares is `i = tid; i += THR` on both, which
-// is the agreement r4d_act_threads exists to keep.
+// Bit-identical to the pair it replaces. Pass two is norm_quant_row. Pass one reproduces the
+// all-reduce's arithmetic (an f32 sum stored as bf16, as in r4d_ar_oneshot_2rank_exact's vadd) and
+// stores it back into `x`, as the replaced kernel did, so other readers of `x` see the same bytes.
+// Both sum the squares in r4d_act_threads' `i = tid; i += THR` order.
 //
-// BOTH WIRES ARE SERVED, and the compressed one is why this kernel is worth its size. Above
-// --tp-wire-min-kb the message goes out 6-bit rotated, and that payload is worth more than the
-// launch a fusion saves. A kernel that served only the exact wire would hand every message above
-// the floor back to the standalone pair, and the fusion would run at one sequence and nowhere
-// else -- which is the wrong band, because a step carries n_seq * (1 + n_spec) rows, so the message
-// crosses the floor at the SECOND concurrent sequence and stays across it. Serving WIRE == 6 here
-// is what lets the two wins compose.
+// Both wires are served. Above --tp-wire-min-kb the message is sent 6-bit rotated; a step carries
+// n_seq * (1 + n_spec) rows, so it crosses that floor from the second concurrent sequence on, and
+// an exact-wire-only fusion would rarely apply.
 //
-// The wire is r4d_ar_oneshot_2rank_wht6's format and arithmetic unchanged -- orthonormal
-// Walsh-Hadamard over a group of 64, amax-scaled, 6 uniform bits plus a bf16 scale -- packed at a
-// CHUNK of 512 elements instead of 2048. The chunk size is not numerics: the rotation and the amax
-// close over a GROUP, and a group is 64 elements at either chunking, so the codes and the scales
-// are the same bytes. What it decides is who owns what. A chunk may not straddle a row, or a
-// block's rows would not be a whole number of chunks and the two ranks would disagree about which
-// bytes a block owns; and a wave owns a whole chunk, so a smaller chunk puts more waves to work,
-// which is why a chunk is 8 groups and not 32 (see r4d_ar_ln_had_quant_i8.hip).
+// The compressed wire is r4d_ar_oneshot_2rank_wht6's format (orthonormal Walsh-Hadamard over 64,
+// amax-scaled, 6 uniform bits plus a bf16 scale) packed in chunks of 512 elements instead of 2048.
+// Rotation and amax close over a 64-element group, so the bytes are identical; the chunk size only
+// sets ownership. A chunk may not straddle a row (both ranks must agree on a block's bytes), and a
+// wave owns a whole chunk, so a smaller chunk employs more waves (see r4d_ar_ln_had_quant_i8.hip).
 //
-// THE REDUCED ROW GOES BACK TO GLOBAL `x`, not to an LDS staging slice. The int8 twin stages it,
-// because its norm needs the row again for a rotation it performs in place; this one does not --
-// pass two re-reads the row it just wrote, which is the same re-read the standalone norm does and
-// the same L1-hot argument the top of this file makes. It costs a bf16 round trip that the int8
-// form avoids and buys back all of the LDS.
+// The reduced row goes back to global `x`, not LDS: unlike the int8 twin this norm needs no
+// in-place rotation, and pass two re-reads the row L1-hot as the standalone norm does.
 //
-// AND THIS RANK'S OWN PACKED HALF GOES TO GLOBAL TOO, in the side buffer the standalone kernel
-// already allocates (`loc_pack`), rather than to LDS. LDS cannot hold it, and the failure only a
-// long enough prompt shows: LDS is 64 KiB and a row's packed half is ~4 KiB at n = 5120, so a block
-// holds fifteen rows where a PREFILL chunk is two thousand. The launch is then refused with a shape
-// error, which in this engine aborts the step and fails the requests in it. A bound that depends on
-// the block count is not a bound this op gets to have: the same op serves M = 8 and
-// M = 2048. The side buffer costs 0.75 bytes an element written and read straight back, which is
-// under half a microsecond at decode width and stays in L2.
+// This rank's own packed half also goes to global, in the standalone kernel's side buffer
+// (`loc_pack`). LDS (64 KiB) holds only ~15 rows of ~4 KiB packed halves at n = 5120, while one op
+// serves M = 8 through a 2048-row prefill chunk; a refused launch would abort the step. The side
+// buffer costs 0.75 bytes per element, written and read back from L2.
 #define R4D_ARQ_SPIN_MAX 4000000000ULL
 
 #define ARQ_GROUP 64
@@ -396,8 +328,8 @@ __global__ __launch_bounds__(1024) void gate_quant_fp8_kernel(
 #define ARQ_QMIN (-(1 << (ARQ_BITS - 1)))
 #define ARQ_MASK ((1u << ARQ_BITS) - 1u)
 
-// `lo ? (v + o) : (o - v)` written as `o + (lo ? v : -v)`: the sign flip is one XOR against a mask
-// uniform over the stage, so the select disappears. Bit-identical -- IEEE negation is exact.
+// `lo ? (v + o) : (o - v)` written as `o + (lo ? v : -v)`: the sign flip is one XOR with a mask
+// uniform over the stage, removing the select. Bit-identical, since IEEE negation is exact.
 template <int M>
 __device__ __forceinline__ void arq_xstage(float* v, int lig) {
     const unsigned int sm = (lig & M) ? 0x80000000u : 0u;
@@ -445,8 +377,8 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
     const uint32_t tid = threadIdx.x;
     /* Integer arithmetic only, so both ranks land on the same split. */
     const int r0 = (int)(((long)b * M) / nb), r1 = (int)(((long)(b + 1) * M) / nb);
-    /* Chunks a row spans, and this block's window into the message's global chunk numbering. Both
-     * ranks derive them from the same (M, nb, n), so neither has to be told. */
+    /* Chunks per row and this block's window into the global chunk numbering, derived identically
+     * on both ranks from (M, nb, n). */
     const int cpr = WIRE ? (int)(n / ARQ_CE) : 0;
     const int c00 = r0 * cpr, cpb = (r1 - r0) * cpr;
     const uint32_t lane = tid & (ARQ_WV - 1), wave = tid / ARQ_WV;
@@ -456,34 +388,31 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
     const unsigned int sq = s_seq;
     int4* const ps = peer_base + (size_t)s_slot * slot_stride16;
     const int4* const ms = my_base + (size_t)s_slot * slot_stride16;
-    /* The slot is split exactly as the standalone compressed all-reduce splits it: packed symbols
-     * from the base, bf16 group scales from half way up. Group indices are GLOBAL over the whole
-     * [M][n] message, so a block simply addresses the groups its rows cover. */
+    /* The slot is split as in the standalone compressed all-reduce: packed symbols from the base,
+     * bf16 group scales from half way up. Group indices are global over the [M][n] message. */
     char* const p_pay = (char*)ps;
     const char* const m_pay = (const char*)ms;
     unsigned short* const p_sc =
         (unsigned short*)((char*)ps + (size_t)(slot_stride16 >> 1) * 16);
     const unsigned short* const m_sc =
         (const unsigned short*)((const char*)ms + (size_t)(slot_stride16 >> 1) * 16);
-    /* This rank's own packed half, in the side buffer split exactly as the peer slot is: symbols
-     * from the base, scales from `loc_scale_off`. Indexed by the GLOBAL chunk and group number, so
-     * a block writes and reads only what its own rows cover and no two blocks overlap. */
+    /* This rank's own packed half, laid out like the peer slot (symbols from the base, scales from
+     * `loc_scale_off`) and indexed by global chunk and group, so blocks never overlap. */
     unsigned int* const Lpk = (unsigned int*)loc_pack;
     float* const Lsc = (float*)(loc_pack + loc_scale_off);
 
     if constexpr (WIRE == 0) {
-        /* Push my rows into the peer's slot. `x` is a tight [M][n] of bf16 -- the launcher refuses
-         * a pitched one -- so a row range is a 16B-word range. */
+        /* Push my rows into the peer's slot. `x` is a tight [M][n] of bf16 (the launcher refuses a
+         * pitched one), so a row range is a 16B-word range. */
         const int wpr = (int)(n >> 3);
         const int wend = r1 * wpr;
         const int4* const in4 = (const int4*)x;
         for (int k = r0 * wpr + (int)tid; k < wend; k += (int)THR) ps[k] = in4[k];
     } else {
-        /* Rotate, amax, quantise and pack straight into the peer's slot, keeping the same words in
-         * LDS. A wave owns whole chunks, so every lane emits exactly ARQ_NWORD dwords a chunk and
-         * the flush is lane-uniform. No group is ever partial: n is a whole number of chunks and a
-         * block owns whole rows, so the `live` guard the standalone kernel needs is not needed
-         * here -- which is also why every cross-lane stage below is wholly active. */
+        /* Rotate, amax, quantise and pack straight into the peer's slot. A wave owns whole chunks,
+         * so every lane emits ARQ_NWORD dwords per chunk and the flush is lane-uniform. No group is
+         * partial (n is whole chunks, a block owns whole rows), so the standalone kernel's `live`
+         * guard is unnecessary and every cross-lane stage is fully active. */
         for (int ci = (int)wave; ci < cpb; ci += (int)(THR / ARQ_WV)) {
             const int c = c00 + ci;
             unsigned int acc[ARQ_NWORD];
@@ -536,8 +465,7 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
                 Lpk[((size_t)c * ARQ_NWORD + wi) * ARQ_WV + lane] = acc[wi];
         }
     }
-    /* The drain modes are r4d_ar_oneshot_2rank_exact's, and the variant table picks between them
-     * for the same reasons; the kernel only has to honour them identically. */
+    /* The drain modes are r4d_ar_oneshot_2rank_exact's, selected by the same variant table. */
     if (drain == 1) __threadfence_system();
     else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
     __syncthreads();
@@ -545,8 +473,8 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
         if (drain == 2) __threadfence_system();
         arq_store_rel(&peer_flags[b], sq);
         unsigned long long z = 0;
-        /* A handshake that cannot complete is a lockstep violation: norming a slot the peer never
-         * filled would hand stale bytes on as a sum, so it traps instead. */
+        /* A handshake that cannot complete is a lockstep violation; trap rather than sum a slot the
+         * peer never filled. */
         while (r4d_ar_seq_behind(arq_load_acq(&my_flags[b]), sq)) {
             if (++z > R4D_ARQ_SPIN_MAX) __builtin_trap();
         }
@@ -555,10 +483,8 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
     if (acq) __threadfence_system();
 
     if constexpr (WIRE == 6) {
-        /* REDUCE: unpack both halves of every chunk this block owns, add in fp32, inverse-rotate,
-         * and store the bf16 sum back into `x` -- which is what the standalone compressed
-         * all-reduce wrote, so pass two below reads the bytes it would have read and a reader of
-         * `x` that is not this norm still finds the same ones. */
+        /* Reduce: unpack both halves of every chunk this block owns, add in fp32, inverse-rotate,
+         * and store the bf16 sum into `x`, as the standalone compressed all-reduce does. */
         for (int ci = (int)wave; ci < cpb; ci += (int)(THR / ARQ_WV)) {
             const int c = c00 + ci;
             const char* const pb = m_pay + (size_t)c * ARQ_CBYTES;
@@ -593,9 +519,9 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
                         psy |= pac[wi + 1] << (32 - bo);
                         lsy |= lac[wi + 1] << (32 - bo);
                     }
-                    /* The two ranks fold the identical pair in OPPOSITE order; fp32 add commutes
-                     * exactly, so they stay bit-identical as long as neither product is contracted
-                     * into an FMA. libr4d/CMakeLists.txt passes -ffp-contract=off for exactly this. */
+                    /* The two ranks add the pair in opposite order; fp32 add commutes exactly, so
+                     * they agree bit for bit as long as neither product is contracted into an FMA
+                     * (libr4d/CMakeLists.txt passes -ffp-contract=off for this). */
                     v[i] = (float)((int)(psy & ARQ_MASK) + ARQ_QMIN) * psc
                          + (float)((int)(lsy & ARQ_MASK) + ARQ_QMIN) * lsc;
                 }
@@ -605,12 +531,11 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
                 for (int i = 0; i < ARQ_EPL; ++i) x[off + i] = f2bf(v[i]);
             }
         }
-        /* Pass two reads `x` across the whole row and a wave only wrote its own chunks of it. */
+        /* Pass two reads all of `x`'s row; each wave wrote only its own chunks. */
         __syncthreads();
     }
 
-    /* The peer's rows are now in MY scratch, in the same [M][n] layout as x -- WIRE == 0 only;
-     * the compressed wire has already reduced into `x` above. */
+    /* WIRE == 0: the peer's rows are now in this rank's scratch, in x's [M][n] layout. */
     const uint16_t* __restrict__ P = (const uint16_t*)ms;
 
     for (int row = r0; row < r1; ++row) {
@@ -622,8 +547,8 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
         (void)pr;
         float ss = 0.0f;
         for (uint32_t i = tid; i < n; i += THR) {
-            /* The exact wire reduces HERE, on the norm's own pass; the compressed one has already
-             * reduced into `x` and this reads what it stored. */
+            /* The exact wire reduces here, in the norm's first pass; the compressed one already
+             * reduced into `x`. */
             uint16_t a;
             if constexpr (WIRE == 0) { a = f2bf(bf2f(xr[i]) + bf2f(pr[i])); xr[i] = a; }
             else                     { a = xr[i]; }
@@ -636,26 +561,24 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
         const float rs = rsqrtf(block_sum<THR / kWave>(ss, lds) / (float)n + eps);
         norm_quant_row<WF32, THR>(nr, w, y ? y + (size_t)row * y_ld : nullptr,
                                   q + (size_t)row * q_ld, s, (size_t)row * s_ld, n, nkb, rs, wadd);
-        /* lds is re-used by the next row this block owns, and a thread still reading it for this
-         * row would otherwise race the next row's write. The one-row-a-block kernel above never
-         * needed this barrier and that is the only structural difference between them. */
+        /* lds is reused by this block's next row; without the barrier a thread still reading it
+         * would race the next row's write. */
         __syncthreads();
     }
 }
 
 }  // namespace
 
-// `w` is the norm gain, f32 when `w_f32` and bf16 otherwise -- every gain in this project's
-// architecture plugins is declared f32, and the width is the caller's to state for the reason
-// r4d_model_bf16's rmsnorm gives.  `y` may be null on a layer with no bf16 consumer of the
-// post-norm tensor; every caller in this tree has one, because the fp8a16 matvec reads it at M = 1.
+// `w` is the norm gain, f32 when `w_f32` and bf16 otherwise (see r4d_model_bf16's rmsnorm). `y`
+// may be null when nothing reads the bf16 post-norm tensor; every current caller has a reader (the
+// fp8a16 matvec at M = 1).
 //
-// `res`, when given, is the fused_add_rms_norm form: `res += x` in f32, ROUNDED TO BF16 and stored,
-// and the norm is then taken of the stored value -- which is bit-for-bit the `add` + `rmsnorm` pair
-// this replaces. Pass 0 for the plain form. It may alias `y`; see the note at the top of the file.
+// `res`, when given, is the fused_add_rms_norm form: `res += x` in f32, rounded to bf16 and stored,
+// and the norm is taken of the stored value, bit-identical to `add` + `rmsnorm`. Pass 0 for the
+// plain form. It may alias `y`; see the note at the top of the file.
 //
 //   x    [M][n]              bf16, `x_ld` elements a row (0 = n)
-//   res  [M][n]              bf16, `r_ld` elements a row (0 = n), optional, READ AND WRITTEN
+//   res  [M][n]              bf16, `r_ld` elements a row (0 = n), optional, read and written
 //   w    [n]                 f32 or bf16
 //   y    [M][n]              bf16, `y_ld` elements a row (0 = n), optional
 //   q    [M][n]              E4M3, `q_ld` bytes a row (0 = n), rounded up to 4
@@ -673,16 +596,11 @@ extern "C" int r4d_rmsnorm_quant_fp8(long x, long res, long w, long y, long q, l
     const int nkb = (n + (int)kGroup - 1) / (int)kGroup;
     if (!s_ld) s_ld = nkb;
 
-    // ONE WORKGROUP A ROW, so at a decode batch the grid is 8-72 workgroups on a 64-CU part and
-    // the kernel is latency bound rather than bandwidth bound: it moves ~205 KiB, which is far less
-    // work than the ~2.6 us launch floor costs. Widening the workgroup is the only knob that adds
-    // parallelism without changing the algorithm. r4d_act_threads holds the crossover table, and
-    // the reasoning behind it is written out with it.
+    // One workgroup per row, so a decode batch is 8-72 workgroups and the kernel is latency bound;
+    // the workgroup width is the parallelism knob (crossover table in r4d_act_threads).
     //
-    // rmsnorm_bf16 PICKS THE SAME WIDTH FROM THE SAME FUNCTION, and it has to: the width decides
-    // which columns a thread accumulates into the sum of squares, so two kernels that disagree
-    // about it produce sums that differ in the last bits. This fusion is required to be
-    // byte-identical to the pair it replaces, which is exactly that agreement.
+    // rmsnorm_bf16 must pick the same width from the same function: the width decides which
+    // columns a thread sums, so a different width changes the last bits and breaks bit identity.
     const int thr = r4d_act_threads(M, n);
 #define R4D_RQ_T(wf, rs, T)                                                                     \
     hipLaunchKernelGGL((rmsnorm_quant_fp8_kernel<wf, rs, T>), dim3((uint32_t)M), dim3(T), 0,    \
@@ -701,20 +619,18 @@ extern "C" int r4d_rmsnorm_quant_fp8(long x, long res, long w, long y, long q, l
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
-// `mode` is 0 for silu (down_proj's input) and 1 for sigmoid (a gated attention o_proj's), the same
-// spelling r4d_gated_had_quant_i8 takes.
+// `mode` is 0 for silu (down_proj's input) and 1 for sigmoid (a gated attention o_proj's), as in
+// r4d_gated_had_quant_i8.
 //
 //   gu [M][2n]             bf16, gate first then up, `gu_ld` elements a row (0 = 2n)
 //   y  [M][n]              bf16, `y_ld` elements a row (0 = n), optional
 //   q  [M][n]              E4M3 (int8 when `i8`), `q_ld` bytes a row (0 = n), rounded up to 4
 //   s  [M][ceil(n/128)]    f32,  `s_ld` elements a row (0 = ceil(n/128))
 //
-// `rot` is a STRICTER call, not a flag on the same one: a ragged last group is legal unrotated
-// (it is written zero-padded and the GEMM's bounds guard stops the padding reaching anything) and
-// is not legal rotated, because a butterfly that mixed real values with padding has no matching
-// weight block on the other side.
+// `rot` additionally requires n % 128 == 0: a ragged last group is fine unrotated (zero-padded,
+// masked by the GEMM) but a butterfly mixing real values with padding has no matching weight block.
 static int gated_quant_fp8_launch(long gu, long y, long q, long s, int M, int n, int mode,
-                                  int gu_ld, int y_ld, int q_ld, int s_ld, const R4dSink& sk,
+                                  int gu_ld, int y_ld, int q_ld, int s_ld, RadStream stream,
                                   bool rot, bool i8 = false) {
     int emit_rc = RAD_OK;
     if (!gu || !q || !s) return -1;
@@ -729,13 +645,12 @@ static int gated_quant_fp8_launch(long gu, long y, long q, long s, int M, int n,
     if (!q_ld) q_ld = n;
     const int nkb = (n + (int)kGroup - 1) / (int)kGroup;
     if (!s_ld) s_ld = nkb;
-    // A wave a group, capped at r4d_act_threads' width; see the kernel. There is no cross-row
-    // reduction here, so the width changes nothing numerically -- only how many waves share the
-    // groups. The ROTATION is wave-local too (r4d_fwht.h), so that stays true with it.
+    // One wave per group, capped at r4d_act_threads' width. The width does not affect the numerics:
+    // there is no cross-row reduction and the rotation is wave-local (r4d_fwht.h).
     const int thr = std::min(nkb, r4d_act_threads(M, n) / (int)kWave) * (int)kWave;
 #define R4D_GQ_R(a, R, I)                                                                       \
-    emit_rc = R4D_EMIT(sk, (gated_quant_fp8_kernel<a, R, I>), dim3((uint32_t)M), dim3(thr), 0,  \
-                       (const uint16_t*)gu, (uint16_t*)y, (uint8_t*)q,                         \
+    emit_rc = R4D_EMIT(stream, (gated_quant_fp8_kernel<a, R, I>), dim3((uint32_t)M), dim3(thr),  \
+                       0, (const uint16_t*)gu, (uint16_t*)y, (uint8_t*)q,                      \
                        (float*)s, (uint32_t)n, (uint32_t)nkb, (uint32_t)gu_ld, (uint32_t)y_ld,  \
                        (uint32_t)q_ld, (uint32_t)s_ld)
 #define R4D_GQ(a)                                                                               \
@@ -747,25 +662,24 @@ static int gated_quant_fp8_launch(long gu, long y, long q, long s, int M, int n,
 #undef R4D_GQ
 #undef R4D_GQ_R
     if (emit_rc != RAD_OK) return -4;
-    return (!sk.desc && hipGetLastError() != hipSuccess) ? -4 : 0;
+    return (hipGetLastError() != hipSuccess) ? -4 : 0;
 }
 
 extern "C" int r4d_gated_quant_fp8(long gu, long y, long q, long s, int M, int n, int mode,
                                    int gu_ld, int y_ld, int q_ld, int s_ld, long stream) {
     return gated_quant_fp8_launch(gu, y, q, s, M, n, mode, gu_ld, y_ld, q_ld, s_ld,
-                                  r4d_stream_sink((RadStream)(uintptr_t)stream), false);
+                                  (RadStream)(uintptr_t)stream, false);
 }
 
 extern "C" int r4d_gated_had_quant_fp8(long gu, long y, long q, long s, int M, int n, int mode,
                                        int gu_ld, int y_ld, int q_ld, int s_ld, long stream) {
     return gated_quant_fp8_launch(gu, y, q, s, M, n, mode, gu_ld, y_ld, q_ld, s_ld,
-                                  r4d_stream_sink((RadStream)(uintptr_t)stream), true);
+                                  (RadStream)(uintptr_t)stream, true);
 }
 
-// act . x, with the gate and the thing it scales in DIFFERENT buffers -- see the kernel above for
-// why the row is a (token, head) pair.  `mode` is spelled as r4d_gated_quant_fp8 spells it.  The
-// activation is ROUNDED TO BF16 before the product, because the pair this replaces is two kernels
-// with a bf16 buffer between them -- unlike r4d_gated_quant_fp8, whose reference is one.
+// act . x with the gate and x in separate buffers; see the kernel for why a row is a (token, head)
+// pair and why the activation is rounded to bf16 before the product. `mode` as in
+// r4d_gated_quant_fp8.
 //
 //   g  [M][.]              bf16, `g_ld` elements a row; the gate starts at element 0 of the row,
 //                          so a caller with a [q|gate] projection passes g already offset
@@ -775,7 +689,7 @@ extern "C" int r4d_gated_had_quant_fp8(long gu, long y, long q, long s, int M, i
 //   s  [M][ceil(n/128)]    f32,  `s_ld` elements a row (0 = ceil(n/128))
 static int gate_quant_fp8_emit(long g, long x, long y, long q, long s, int M, int n, int mode,
                                int g_ld, int x_ld, int y_ld, int q_ld, int s_ld,
-                               const R4dSink& sk, bool i8 = false) {
+                               RadStream stream, bool i8 = false) {
     int emit_rc = RAD_OK;
     if (!g || !x || !q || !s) return -1;
     if (M <= 0 || n <= 0) return -2;
@@ -790,7 +704,7 @@ static int gate_quant_fp8_emit(long g, long x, long y, long q, long s, int M, in
     // A wave a group, capped at r4d_act_threads' width, as gated_quant_fp8 above.
     const int thr = std::min(nkb, r4d_act_threads(M, n) / (int)kWave) * (int)kWave;
 #define R4D_GTQ_I(a, I)                                                                         \
-    emit_rc = R4D_EMIT(sk, (gate_quant_fp8_kernel<a, I>), dim3((uint32_t)M), dim3(thr), 0,      \
+    emit_rc = R4D_EMIT(stream, (gate_quant_fp8_kernel<a, I>), dim3((uint32_t)M), dim3(thr), 0,  \
                        (const uint16_t*)g, (const uint16_t*)x,                                 \
                        (uint16_t*)y, (uint8_t*)q, (float*)s, (uint32_t)n, (uint32_t)nkb,        \
                        (uint32_t)g_ld, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)q_ld,          \
@@ -801,27 +715,24 @@ static int gate_quant_fp8_emit(long g, long x, long y, long q, long s, int M, in
 #undef R4D_GTQ
 #undef R4D_GTQ_I
     if (emit_rc != RAD_OK) return -4;
-    return (!sk.desc && hipGetLastError() != hipSuccess) ? -4 : 0;
+    return (hipGetLastError() != hipSuccess) ? -4 : 0;
 }
 
 extern "C" int r4d_gate_quant_fp8(long g, long x, long y, long q, long s, int M, int n, int mode,
                                   int g_ld, int x_ld, int y_ld, int q_ld, int s_ld, long stream) {
-    R4dSink sk; sk.stream = (RadStream)(uintptr_t)stream;
-    return gate_quant_fp8_emit(g, x, y, q, s, M, n, mode, g_ld, x_ld, y_ld, q_ld, s_ld, sk);
+    return gate_quant_fp8_emit(g, x, y, q, s, M, n, mode, g_ld, x_ld, y_ld, q_ld, s_ld,
+                               (RadStream)(uintptr_t)stream);
 }
 
-// The fused all-reduce. The IPC arguments are r4d_ar_oneshot_2rank_exact's -- the same
-// double-buffered scratch, per-block flags and device-resident sequence counters -- and everything
-// after them is r4d_rmsnorm_quant_fp8's, with two differences the caller has to know about:
+// The fused all-reduce. The IPC arguments are r4d_ar_oneshot_2rank_exact's (double-buffered
+// scratch, per-block flags, device-resident sequence counters); the rest are r4d_rmsnorm_quant_fp8's,
+// except:
 //
-//   * `x` HAS NO PITCH. It is the all-reduce's message as well as the norm's input, and a block
-//     pushes its rows as a range of 16B words; a pitched x would make the two ranks disagree about
-//     which bytes a block owns. Refused rather than silently strided.
-//   * `nblocks` IS CLAMPED TO M, because a block owns whole rows. At a decode batch that is 8 to
-//     64 blocks, which is the range the standalone all-reduce asks for anyway.
+//   * `x` has no pitch: it is also the all-reduce message, pushed as a range of 16B words, and a
+//     pitch would make the ranks disagree about a block's bytes.
+//   * `nblocks` is clamped to M, since a block owns whole rows.
 //
-// `res` is the fused_add_rms_norm form and behaves exactly as it does there. Returns 0, or a
-// negative code for a shape it does not serve.
+// `res` behaves as in r4d_rmsnorm_quant_fp8. Returns 0, or a negative code for an unserved shape.
 extern "C" int r4d_ar_rmsnorm_quant_fp8_chunk_elems(void) { return ARQ_CE; }
 
 extern "C" int r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long peer_flags,
@@ -834,11 +745,11 @@ extern "C" int r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long
     if (!x || !w || !q || !s) return -1;
     if (!peer_scratch || !my_scratch || !peer_flags || !my_flags || !seq_ctrs) return -1;
     if (M <= 0 || n <= 0) return -2;
-    if (n % 4) return -3;              // a lane owns four columns; see norm_quant_row
-    if (n % 8) return -5;              // n bf16 is a whole number of 16B words; see the push
+    // n % 8: n bf16 is a whole number of 16B words (see the push), which also gives every lane its
+    // four columns (see norm_quant_row).
+    if (n % 8) return -5;
     if (wire != 0 && wire != 6) return -7;
-    // A chunk may not straddle a row, or a block's rows would not be a whole number of chunks and
-    // the two ranks would disagree about which bytes a block owns.
+    // A chunk may not straddle a row, or the ranks would disagree about a block's bytes.
     if (wire == 6 && (n % ARQ_CE)) return -8;
     if (wire == 6 && (!loc_pack || loc_scale_off <= 0)) return -9;
     if (!r_ld) r_ld = n;
@@ -851,9 +762,7 @@ extern "C" int r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long
     if (nb > M) nb = M;
     const int nbw = r4d_ar_max_blocks();       // the counter capacity; see r4d_ar_seq.h
     if (nb > nbw) nb = nbw;
-    // The width is r4d_act_threads for the reason the standalone norm gives: it decides which
-    // columns a thread accumulates into the sum of squares, so a fused kernel that picked a
-    // different one would produce a different sum in the last bits and a different token stream.
+    // The width must be r4d_act_threads', as for the standalone norm (it fixes the summation order).
     const int thr = nthreads ? nthreads : r4d_act_threads(M, n);
     if (thr != 256 && thr != 512 && thr != 1024) return -6;
 #define R4D_ARQ_T(wf, rs, T, W)                                                                  \
@@ -882,14 +791,11 @@ extern "C" int r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long
 
 // ============================================================== the plugin ABI entry points
 //
-// The shared operand reader is r4d_fp8_args.h. See libr4d/r4d_args.h for why there is no adapter
-// directory between the core and these launches.
+// The shared operand reader is r4d_fp8_args.h; see libr4d/r4d_args.h.
 /* ================================================================== the two fused quantisers
  *
- * The shape rules are the standalone quantiser's, applied to the operand that PRODUCES the row
- * rather than to the row itself, plus the one thing the fusion adds: the bf16 output is optional
- * because a layer with no bf16 consumer of the post-norm tensor should not pay for the store, and
- * every caller in this tree has one anyway (the fp8a16 matvec reads it at M = 1). */
+ * The standalone quantiser's shape rules, applied to the operand that produces the row. The bf16
+ * output is optional so a layer without a bf16 consumer skips the store. */
 
 extern "C" int r4d_rad_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     const RadTensor* x  = r4d_opt(a, RQ_X);
@@ -899,9 +805,9 @@ extern "C" int r4d_rad_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     const RadTensor* sc = r4d_opt(a, RQ_S);
     const RadTensor* y  = r4d_opt(a, RQ_Y);
     if (!x || !w || !q || !sc) return R4D_NO(RAD_E_INVAL);
-    /* Rank 2 on the input too, unlike the standalone quantiser: a norm has a gain per channel, so
-     * "everything after dim 0 is the row" would put one gain across several heads. The GDN block's
-     * rank-3 activation is quantised by the standalone op, and its gated norm by its own kernel. */
+    if (q->dtype != RAD_F8E4M3) return R4D_NO(RAD_E_DTYPE);
+    /* Rank 2 on the input too, unlike the standalone quantiser: a norm has one gain per channel,
+     * and folding trailing dims would spread a gain across heads. */
     if (x->rank != 2 || q->rank != 2 || sc->rank != 2) return R4D_NO(RAD_E_SHAPE);
     if (y && y->rank != 2) return R4D_NO(RAD_E_SHAPE);
     const long long M = x->shape[0], K = x->shape[1];
@@ -913,9 +819,8 @@ extern "C" int r4d_rad_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     if (q->shape[0] != M || q->shape[1] != K) return R4D_NO(RAD_E_SHAPE);
     if (sc->shape[0] != M || sc->shape[1] != nkb) return R4D_NO(RAD_E_SHAPE);
     if (y && (y->shape[0] != M || y->shape[1] != K)) return R4D_NO(RAD_E_SHAPE);
-    /* The residual is the same extent as the input and is READ AND WRITTEN. It is allowed to alias
-     * `out_bf16` -- every caller in this tree makes it do so -- which is safe because pass one
-     * reads all of `x` before the kernel's only barrier and pass two writes `y` after it. */
+    /* The residual has the input's extent and is read and written. It may alias `out_bf16` (see
+     * the note at the top of the file). */
     if (rs && (rs->rank != 2 || rs->shape[0] != M || rs->shape[1] != K)) return R4D_NO(RAD_E_SHAPE);
     const long long xp = r4d_row_pitch(x), qp = r4d_row_pitch(q), sp = r4d_row_pitch(sc);
     const long long yp = y ? r4d_row_pitch(y) : 0, rp = rs ? r4d_row_pitch(rs) : 0;
@@ -929,7 +834,17 @@ extern "C" int r4d_rad_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
-static int rad_gated_quant_fp8(const RadArgs* a, const R4dSink& sk, bool rot) {
+/* The gate's activation: `act` by name overrides `mode` (libr4d's integer: 0 silu, 1 sigmoid) when
+ * both are given, as for r4d_gated_had_quant_i8. Returns -1 for an unknown name. */
+static int act_mode(const RadArgs* a, int dflt) {
+    const char* act = r4d_gets(a, "act");
+    if (!act) return (int)r4d_geti_or(a, "mode", dflt);
+    if (!std::strcmp(act, "silu")) return 0;
+    if (!std::strcmp(act, "sigmoid")) return 1;
+    return -1;
+}
+
+static int rad_gated_quant_fp8(const RadArgs* a, RadStream stream, bool rot) {
     const RadTensor* gu = r4d_opt(a, GQ_GU);
     const RadTensor* q  = r4d_opt(a, GQ_Q);
     const RadTensor* sc = r4d_opt(a, GQ_S);
@@ -944,8 +859,7 @@ static int rad_gated_quant_fp8(const RadArgs* a, const R4dSink& sk, bool rot) {
     const long long grp = r4d_quant_act_fp8_group();
     const long long nkb = (K + grp - 1) / grp;
     if (r4d_geti_or(a, "group", grp) != grp) return R4D_NO(RAD_E_SHAPE);
-    /* The gated operand is [M][2K] and the halves are gate then up -- one buffer, because that is
-     * how the fused gate_up projection writes it and splitting would be a copy. */
+    /* The gated operand is [M][2K], gate then up, as the fused gate_up projection writes it. */
     if (gu->shape[1] != 2 * K) return R4D_NO(RAD_E_SHAPE);
     if (q->shape[0] != M) return R4D_NO(RAD_E_SHAPE);
     if (sc->shape[0] != M || sc->shape[1] != nkb) return R4D_NO(RAD_E_SHAPE);
@@ -953,60 +867,45 @@ static int rad_gated_quant_fp8(const RadArgs* a, const R4dSink& sk, bool rot) {
     const long long gp = r4d_row_pitch(gu), qp = r4d_row_pitch(q), sp = r4d_row_pitch(sc);
     const long long yp = y ? r4d_row_pitch(y) : 0;
     if (gp < 0 || qp < 0 || sp < 0 || yp < 0) return R4D_NO(RAD_E_STRIDE);
-    /* `act` is the vocabulary's name and `mode` is libr4d's integer spelling of the same choice;
-     * `act` wins where both are given, which is what r4d_gated_had_quant_i8's row promises. */
-    const char* act = r4d_gets(a, "act");
-    int mode = (int)r4d_geti_or(a, "mode", 0);
-    if (act) {
-        if (!std::strcmp(act, "silu")) mode = 0;
-        else if (!std::strcmp(act, "sigmoid")) mode = 1;
-        else return R4D_NO(RAD_E_UNSUPPORTED);
-    }
+    const int mode = act_mode(a, 0);                 /* silu: the gated MLP */
+    if (mode < 0) return R4D_NO(RAD_E_UNSUPPORTED);
     const int e = gated_quant_fp8_launch(r4d_addr(gu), y ? r4d_addr(y) : 0, r4d_addr(q),
                                          r4d_addr(sc), (int)M, (int)K, mode, (int)gp, (int)yp,
-                                         (int)qp, (int)sp, sk, rot, q->dtype == RAD_I8);
+                                         (int)qp, (int)sp, stream, rot, q->dtype == RAD_I8);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
-static int rad_gated_quant_fp8_body(const RadArgs* a, const R4dSink& sk) {
-    return rad_gated_quant_fp8(a, sk, false);
+extern "C" int r4d_rad_gated_quant_fp8(const RadArgs* a, RadStream stream) {
+    return rad_gated_quant_fp8(a, stream, false);
 }
-R4D_ENTRY(r4d_rad_gated_quant_fp8, rad_gated_quant_fp8_body)
 
-/* THE ROTATED FORM, a different op for the same reason had_quant_act_fp8 is: the codes it writes
- * are not the codes the other one writes, so a graph with one substituted for the other is a
- * different model that still runs and still answers. It pairs with a down-projection weight
- * stored at dtype w4a8h and with nothing else. */
-static int rad_gated_had_quant_fp8_body(const RadArgs* a, const R4dSink& sk) {
-    return rad_gated_quant_fp8(a, sk, true);
+/* The rotated form is a separate op for the same reason as had_quant_act_fp8 (different codes in
+ * the same shape). It pairs only with a down-projection weight stored at dtype w4a8h. */
+extern "C" int r4d_rad_gated_had_quant_fp8(const RadArgs* a, RadStream stream) {
+    return rad_gated_quant_fp8(a, stream, true);
 }
-R4D_ENTRY(r4d_rad_gated_had_quant_fp8, rad_gated_had_quant_fp8_body)
 
-/* Elements between consecutive `width`-wide rows, the same rule r4d_gdn.cpp's gn_row_pitch uses:
- * a [.., heads, width] operand steps a row with the stride of the axis above the last, and a
- * flattened one is contiguous and steps by `width`. It is the only way to read a column view of
- * an interleaved projection, which is what a gated attention's gate is. */
+/* Elements between consecutive `width`-wide rows, as r4d_gdn.cpp's gn_row_pitch: a
+ * [.., heads, width] operand steps by the stride of the second-to-last axis; a flattened one is
+ * contiguous and steps by `width`. This reads a column view of an interleaved projection (a gated
+ * attention's gate). */
 static long long tq_pitch(const RadTensor* t, long long width) {
     if (!t || t->rank < 1) return -1;
     if (t->shape[t->rank - 1] != width) return r4d_contig(t) ? width : -1;
     if (t->stride[t->rank - 1] != 1) return -1;
     if (t->rank == 1) return width;
-    /* AND THE ROWS HAVE TO BE UNIFORMLY THAT FAR APART, which the width test alone does not say.
-     * A [T, n_head, head_dim] column view of the [q|gate] projection flattens to T * n_head rows
-     * only if T's stride is exactly n_head of them -- true here, because the narrowing shrank the
-     * last axis and left every stride alone, and false for anything that also sliced an axis
-     * above it. Refusing is the only safe answer: a wrong pitch reads the next head's gate. */
+    /* Rows must also be uniformly spaced: a [T, n_head, head_dim] column view flattens to
+     * T * n_head rows only if T's stride is n_head of them, which fails if an outer axis was also
+     * sliced. Refuse otherwise; a wrong pitch would read the next head's gate. */
     for (int i = (int)t->rank - 2; i >= 1; --i)
         if (t->stride[i - 1] != t->shape[i] * t->stride[i]) return -1;
     return t->stride[t->rank - 2];
 }
 
-/* THE SAME EPILOGUE WITH THE GATE SOMEWHERE ELSE. A gated attention's output gate is not packed
- * beside the thing it scales -- `x` is the attention output [M][n] and the gate is a COLUMN SLICE
- * of the [q|gate] projection -- so this takes two operands where gated_quant_fp8 takes one. The
- * caller narrows the gate to its own columns with a column view and the shim reads the offset off
- * the tensor, which is why there is no `gate_offset` parameter. */
-static int rad_gate_quant_fp8_body(const RadArgs* a, const R4dSink& sk) {
+/* Two-operand form of gated_quant_fp8 for gated attention: `x` is the attention output and the
+ * gate a column view of the [q|gate] projection. The gate offset comes from the view, so there is
+ * no `gate_offset` parameter. */
+extern "C" int r4d_rad_gate_quant_fp8(const RadArgs* a, RadStream stream) {
     const RadTensor* g  = r4d_opt(a, TQ_G);
     const RadTensor* x  = r4d_opt(a, TQ_X);
     const RadTensor* q  = r4d_opt(a, TQ_Q);
@@ -1014,12 +913,8 @@ static int rad_gate_quant_fp8_body(const RadArgs* a, const R4dSink& sk) {
     const RadTensor* y  = r4d_opt(a, TQ_Y);
     if (!g || !x || !q || !sc) return R4D_NO(RAD_E_INVAL);
     if (q->dtype != RAD_F8E4M3 && q->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
-    /* M IS COUNTED OFF `x`, NOT READ OUT OF THE PARAMETERS. `M` is the row's RANGED parameter, so
-     * what arrives here is the band's declared maximum and not the issue -- a shim that trusts it
-     * refuses every real step. And shape[0] is no better: the row here is a (token, head) pair and
-     * neither operand spells it that way, the gate being a [T, n_head, head_dim] column view of
-     * the [q|gate] projection and x a flat [T, n_head * head_dim]. The element count over the
-     * known width is the one reading both agree on. */
+    /* M is numel(x) / n. The `M` parameter is the band's declared maximum, not this issue's, and
+     * shape[0] counts tokens while a row here is a (token, head) pair. */
     const long long K = r4d_geti_or(a, "n", 0);
     const long long grp = r4d_quant_act_fp8_group();
     if (K <= 0 || r4d_numel(x) % K) return R4D_NO(RAD_E_SHAPE);
@@ -1034,18 +929,12 @@ static int rad_gate_quant_fp8_body(const RadArgs* a, const R4dSink& sk) {
     const long long qp = tq_pitch(q, K), sp = tq_pitch(sc, nkb);
     const long long yp = y ? tq_pitch(y, K) : 0;
     if (gp < 0 || xp < 0 || qp < 0 || sp < 0 || yp < 0) return R4D_NO(RAD_E_STRIDE);
-    const char* act = r4d_gets(a, "act");
-    int mode = (int)r4d_geti_or(a, "mode", 1);
-    if (act) {
-        if (!std::strcmp(act, "silu")) mode = 0;
-        else if (!std::strcmp(act, "sigmoid")) mode = 1;
-        else return R4D_NO(RAD_E_UNSUPPORTED);
-    }
+    const int mode = act_mode(a, 1);                 /* sigmoid: gated attention */
+    if (mode < 0) return R4D_NO(RAD_E_UNSUPPORTED);
     const int e = gate_quant_fp8_emit(r4d_addr(g), r4d_addr(x), y ? r4d_addr(y) : 0,
                                       r4d_addr(q), r4d_addr(sc), (int)M, (int)K, mode,
-                                      (int)gp, (int)xp, (int)yp, (int)qp, (int)sp, sk,
+                                      (int)gp, (int)xp, (int)yp, (int)qp, (int)sp, stream,
                                       q->dtype == RAD_I8);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
-R4D_ENTRY(r4d_rad_gate_quant_fp8, rad_gate_quant_fp8_body)
 

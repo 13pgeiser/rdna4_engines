@@ -1,12 +1,9 @@
-/* avx_hc.cpp -- the GATED RESIDUAL pair and the MTP head's entry.
+/* avx_hc.cpp -- the gated residual pair (hc_read / hc_write) and the MTP head's entry.
  *
- * ============================== WHAT THE GATED RESIDUAL IS ==============================
- *
- * Qwen4-Exp's replacement for a pre-norm and a residual add. The residual stream is `hc` times as
- * wide as the model -- hidden 2560 at hc 4 is a 10240-wide stream carried through every layer,
- * entered as hc identical copies of the embedding and collapsed once at the end. Every block reads
- * a 2560 mix of the four and writes its output back into all four, and BOTH the read's mix and the
- * write's per-stream gain are data-dependent, which is what "gated" means here.
+ * Gated residual: Qwen4-Exp's replacement for pre-norm + residual add. The residual stream is `hc`
+ * times the model width (hidden 2560 at hc 4 is a 10240-wide stream), entered as hc copies of the
+ * embedding and collapsed once at the end. Each block reads a mix of the streams and writes its
+ * output back into all of them; both the mix and the per-stream write gain are data-dependent.
  *
  *   hc_read    N       = grouped_rmsnorm(h)              one rsqrt per n-wide stream, one gain of
  *                                                        hc*n over all of them, `1 + w`
@@ -15,86 +12,51 @@
  *              inj[s]  = 2 * sigmoid(W_inj[s] . N / hc)
  *   hc_write   h[s]   += inj[s] * y
  *
- * THREE FACTS THAT ARE NOT DERIVABLE FROM THE OTHERS, and a second implementation has to match all
- * three (docs/OPS.md states them and they are restated here because each is a silent failure):
+ * Three independent facts any implementation must match (docs/OPS.md); each fails silently:
+ *   - The write updates the unnormed `h`, not `N`. Writing into `N` re-normalises the residual at
+ *     every connection and diverges within a few layers while still producing fluent text.
+ *   - The mix is a mean over the hc dimension, not a sum.
+ *   - Each gate argument has its own `/ hc` (before the silu and before the inject sigmoid).
  *
- *   THE WRITE READS THE UNNORMED `h`, NOT `N`. The normalisation is consumed by the block input
- *   and the gates and never enters the stream. Writing into `N` instead re-normalises the residual
- *   at every one of 96 connections, diverges within a few layers, and still produces fluent text.
+ * Rounding: the reference model's grouped norm returns `.type_as(x)`, so both matrix products and
+ * the final multiply read a bf16 `N`. As in libref, N is rounded through h's dtype (per row here,
+ * via the row converter); likewise the silu output, the sigmoid gate, and `x` before the optional
+ * fp8 quantiser reads it back.
  *
- *   THE MIX IS A MEAN, NOT A SUM -- `.mean(dim=-2)` over the hc dimension.
- *
- *   THERE IS A SEPARATE `/ hc` INSIDE EACH GATE ARGUMENT, before the silu and before the inject
- *   sigmoid. Three divisions by hc in total, none implied by the others.
- *
- * ============================== THE ROUNDING IS PART OF THE OP ==============================
- *
- * The arithmetic here is f32, but the REFERENCE MODEL's is not: torch's grouped norm returns
- * `.type_as(x)`, so both matrix products and the final multiply read a bf16 `N`. libref rounds
- * once per element for that reason and so does this -- through the row converter rather than
- * element by element, which is the same value and one pass. The same applies to the silu output,
- * the sigmoid gate, and to `x` before the optional fp8 quantiser reads it back.
- *
- * ============================== THE WEIGHTS ARE WIDENED ONCE PER LAUNCH ==============================
- *
- * This is the structural change from libref, and it is worth more here than vectorisation. Every
- * product below contracts a WEIGHT against a per-token vector -- `down` is [lowrank, hc*n], `up` is
- * [hc*n, lowrank], `inject_w` is [hc, hc*n] -- and libref reads those weights through `ldt` inside
- * the token loop, so a 2048-row prefill chunk converts the same 10240-wide weight row 2048 times.
- * Widening all three into one scratch block before the token loop makes every dot product a
- * straight f32 vector reduction and converts each weight element exactly once.
- *
- * ONE scratch_raw CALL FOR ALL OF THEM, because the arena grows: a second call at a larger size
- * frees the first block, and every worker thread would then be reading a dangling weight.
+ * hc_read runs as three parallel passes over the mixing matrices' rows, each row decoded in the
+ * kernel (E4M3 codes times their scales, or a plain row widened) into the thread's own buffer and
+ * met by every token row before the next: `down` [lowrank, hc*n] over its rows, then `up` [hc*n,
+ * lowrank] over the n output columns (hc rows each). A decode step reads each matrix once, spread
+ * over the team, and no widened copy of either is written. The token rows' norms, gates and mixes
+ * live in one scratch_raw block between the passes, since a second scratch_raw call may
+ * reallocate the first while workers read it.
  */
 #include "avx_vec.h"
 #include "avx_common.h"
+#include "avx_planes.h"
 
 using namespace avx;
 
 #include "avx_had.h"
 
-/* A single value narrowed to a tensor's dtype and read back -- the scalar form of the rounding
- * rule above, for the handful of places where it lands on one number rather than a row. */
-static inline float narrow1(uint32_t dt, float v) {
-    uint32_t buf[2] = { 0, 0 };
-    rad_store_f32(buf, dt, 0, v);
-    return rad_load_f32(buf, dt, 0);
-}
-
-/* A weight plane widened into f32, row-major and contiguous. `rows` x `cols` of the operand read
- * the way libref reads it (rowoff / laststride), so a strided or rank-3 weight lands correctly. */
-static void widen_plane(const RadTensor* t, int64_t rows, int64_t cols, float* dst) {
-    const int64_t st = laststride(t);
-    for (int64_t r = 0; r < rows; ++r) {
-        const int64_t b = rowoff(t, r, cols);
-        if (st == 1) row_to_f32(t->dtype, byte_at(t->data, t->dtype, b), dst + r * cols, cols);
-        else for (int64_t i = 0; i < cols; ++i) dst[r * cols + i] = ldt(t, b + i * st);
+/* Row r of a weight plane `cols` wide as f32, addressed as libref does (rowoff / laststride) so
+ * strided or rank-3 weights work. A joined plane (codes and a scale, avx_planes.h) decodes; `jr`
+ * is its view. */
+static void plane_row(const RadTensor* t, const avxp::ScaledRows* jr, int64_t r, int64_t cols,
+                      float* dst) {
+    if (jr) {
+        scaled_row(*jr, r, cols, dst);
+        return;
     }
+    const int64_t st = laststride(t), b = rowoff(t, r, cols);
+    if (st == 1) row_to_f32(t->dtype, byte_at(t->data, t->dtype, b), dst, cols);
+    else for (int64_t i = 0; i < cols; ++i) dst[i] = ldt(t, b + i * st);
 }
 
-static inline float dotf(const float* a, const float* b, int64_t n) {
-    vf a0 = vf_zero(), a1 = vf_zero(), a2 = vf_zero(), a3 = vf_zero();
-    int64_t i = 0;
-    for (; i + 4 * VF_N <= n; i += 4 * VF_N) {
-        a0 = vf_fma(vf_loadu(a + i), vf_loadu(b + i), a0);
-        a1 = vf_fma(vf_loadu(a + i + VF_N), vf_loadu(b + i + VF_N), a1);
-        a2 = vf_fma(vf_loadu(a + i + 2 * VF_N), vf_loadu(b + i + 2 * VF_N), a2);
-        a3 = vf_fma(vf_loadu(a + i + 3 * VF_N), vf_loadu(b + i + 3 * VF_N), a3);
-    }
-    for (; i + VF_N <= n; i += VF_N) a0 = vf_fma(vf_loadu(a + i), vf_loadu(b + i), a0);
-    float s = vf_hsum(vf_add(vf_add(a0, a1), vf_add(a2, a3)));
-    for (; i < n; ++i) s += a[i] * b[i];
-    return s;
-}
 
-/* THE SUM OF SQUARES IS ACCUMULATED IN f64 HERE AND IN f32 IN avx_norm.cpp, and that is libref's
- * split reproduced rather than an inconsistency. `rmsnorm` accumulates in f32 because it is the
- * op every fast kernel is checked against and an oracle tighter than the thing it certifies turns
- * a tolerance into a guess; the gated residual's norm is an INTERNAL step of a fused op that no
- * kernel computes separately, so libref takes the tighter accumulation there and this matches it.
- * Not vectorised: it is one reduction per stream against two matrix products that dominate, and a
- * vector f64 path would be a fifth numeric convention in the file. */
+/* Sum of squares in f64, unlike avx_norm.cpp's f32, matching libref's split: `rmsnorm` is checked
+ * against fast kernels and accumulates in f32, while this norm is an internal step of a fused op.
+ * Scalar: one reduction per stream, dominated by the two matrix products. */
 static float rsqrt_meansq_f64(const float* v, int64_t n, float eps) {
     double ss = 0.0;
     for (int64_t i = 0; i < n; ++i) ss += (double)v[i] * (double)v[i];
@@ -102,11 +64,9 @@ static float rsqrt_meansq_f64(const float* v, int64_t n, float eps) {
 }
 
 /* ------------------------------------------------------------------ hc_enter */
-/* THE WIDE STREAM'S FIRST VALUE: hc identical copies of the embedding. One launch for the whole
- * step. It exists rather than being folded into the embedding lookup because the lookup's weight
- * is [vocab, n] and its output width is n -- a wide output would be a different op with a
- * different weight shape. The streams are identical here and diverge at the first connection,
- * because each block writes into all of them with a different per-branch gain. */
+/* The wide stream's initial value: hc identical copies of the embedding, one launch per step. A
+ * separate op because the embedding lookup's output width is n. The streams diverge at the first
+ * connection, where each gets its own write gain. */
 AVX_KERNEL(hc_enter) {
     if (!rad_args_have(a, 2)) return RAD_E_INVAL;
     const RadTensor* x = &a->t[0];
@@ -123,9 +83,7 @@ AVX_KERNEL(hc_enter) {
         const int64_t hs = laststride(h);
         float* buf = scratch_f32((size_t)n);
         const float* v = in_row(x, xb, n, buf);
-        /* The copy is per STREAM and contiguous, where libref's inner loop is over i with the
-         * stream inside it -- which writes with a stride of n and defeats the store buffer. Same
-         * bytes, one stream at a time. */
+        /* One contiguous stream at a time (libref interleaves streams, writing at stride n). */
         if (hs == 1) for (int64_t c = 0; c < hc; ++c) out_row(h, hb + c * n, n, v);
         else for (int64_t c = 0; c < hc; ++c)
                  for (int64_t i = 0; i < n; ++i) stt(h, hb + (c * n + i) * hs, v[i]);
@@ -135,8 +93,8 @@ AVX_KERNEL(hc_enter) {
 
 /* ------------------------------------------------------------------ hc_read */
 AVX_KERNEL(hc_read) {
-    /* NOT `rad_args_have(a, 6)`: operand 4 is the OPTIONAL inject weight, and a prefix test would
-     * refuse the final mixer -- the one connection that has none. The required ones are 0..3 and 5. */
+    /* Not `rad_args_have(a, 6)`: operand 4 (the inject weight) is optional and absent on the
+     * final mixer. Operands 0..3 and 5 are required. */
     if (a->n_t < 6) return RAD_E_INVAL;
     if (!rad_arg_in(a, 0) || !rad_arg_in(a, 1) || !rad_arg_in(a, 2) || !rad_arg_in(a, 3) ||
         !rad_arg_in(a, 5)) return RAD_E_INVAL;
@@ -149,7 +107,7 @@ AVX_KERNEL(hc_read) {
     const RadTensor* inj = rad_arg_in(a, 6);
     const RadTensor* q = rad_arg_in(a, 7);
     const RadTensor* s = rad_arg_in(a, 8);
-    const RadTensor* rq = rad_arg_in(a, 9);     /* the ROTATED fp8 form, for a w4a8h consumer */
+    const RadTensor* rq = rad_arg_in(a, 9);     /* rotated fp8 form, for a w4a8h consumer */
     const RadTensor* rs = rad_arg_in(a, 10);
 
     const int64_t n = p_int(a, "n", 0);
@@ -161,11 +119,24 @@ AVX_KERNEL(hc_read) {
     const int64_t hn = hc * n;
 
     const int64_t rows = numel(h) / hn;
-    if (rows <= 0 || numel(x) < rows * n || numel(w) < hn ||
-        numel(down) < lr * hn || numel(up) < hn * lr) return RAD_E_SHAPE;
+    if (rows <= 0 || numel(x) < rows * n || numel(w) < hn) return RAD_E_SHAPE;
+    /* Plain mixing matrices, or codes and a scale joined (`mix` e4m3), libref's reading: a plain
+     * matrix's dtype is what its gate is narrowed to, a joined one's gates are narrowed to h's. */
+    avxp::ScaledRows jd, ju;
+    const bool jdown = avxp::is_joined(down), jup = avxp::is_joined(up);
+    if (jdown) {
+        if (const int st = avxp::scaled_rows(down, lr, hn, &jd); st != RAD_OK) return st;
+    } else if (numel(down) < lr * hn) {
+        return RAD_E_SHAPE;
+    }
+    if (jup) {
+        if (const int st = avxp::scaled_rows(up, hn, lr, &ju); st != RAD_OK) return st;
+    } else if (numel(up) < hn * lr) {
+        return RAD_E_SHAPE;
+    }
+    const uint32_t ddt = jdown ? h->dtype : down->dtype, udt = jup ? h->dtype : up->dtype;
     if (injw && numel(injw) < hc * hn) return RAD_E_SHAPE;
-    /* `inj` is what the paired hc_write consumes, so an inject WEIGHT with no inject OUTPUT is a
-     * caller that computed hc scalars and threw them away -- refused rather than ignored. */
+    /* An inject weight without an `inj` output (consumed by hc_write) is a caller error. */
     if (injw && (!inj || !inj->data || numel(inj) < rows * hc)) return RAD_E_SHAPE;
 
     int64_t g = 0, ngrp = 0;
@@ -175,10 +146,8 @@ AVX_KERNEL(hc_read) {
         ngrp = (n + g - 1) / g;
         if (numel(q) < rows * n || !s || !s->data || numel(s) < rows * ngrp) return RAD_E_SHAPE;
     }
-    /* The rotated form rotates each scale group whole, so the group must tile the row exactly and
-     * be a power of two: a block that straddled the end of the row would mix real values with
-     * padding, and no weight block was rotated that way. It is had_quant_act_fp8 of the stored `x`
-     * -- the operand's consumer cannot tell which op wrote it. */
+    /* The rotated form is had_quant_act_fp8 of the stored `x`: each scale group is rotated whole,
+     * so the group must be a power of two that tiles the row. */
     int64_t rg = 0;
     if (rq && rq->data) {
         rg = p_int(a, "group", 0);
@@ -188,40 +157,40 @@ AVX_KERNEL(hc_read) {
         if (rg > AVX_HAD_MAX) return RAD_E_UNSUPPORTED;
     }
 
-    /* The gain and all three weight planes, widened once. See the header on why this is one call. */
+    /* The gain, the inject rows (hc of them, widened once), and the token rows' norms N [rows][hn],
+     * gates D [rows][lr] and mixes X [rows][n], in one scratch_raw block (see header). */
     auto pad = [](size_t v) { return (v + 15) & ~(size_t)15; };
     const size_t o_gain = 0;
-    const size_t o_down = pad(o_gain + (size_t)hn);
-    const size_t o_up   = pad(o_down + (size_t)lr * (size_t)hn);
-    const size_t o_inj  = pad(o_up + (size_t)hn * (size_t)lr);
-    const size_t total  = o_inj + (injw ? (size_t)hc * (size_t)hn : 0) + 16;
+    const size_t o_inj  = pad(o_gain + (size_t)hn);
+    const size_t o_N    = pad(o_inj + (injw ? (size_t)hc * (size_t)hn : 0));
+    const size_t o_D    = pad(o_N + (size_t)rows * (size_t)hn);
+    const size_t o_X    = pad(o_D + (size_t)rows * (size_t)lr);
+    const size_t total  = o_X + (size_t)rows * (size_t)n + 16;
     float* blk = (float*)scratch_raw(total * sizeof(float));
     float* gain = blk + o_gain;
-    float* dn = blk + o_down;
-    float* upw = blk + o_up;
     float* iw = blk + o_inj;
+    float* NP = blk + o_N;
+    float* DP = blk + o_D;
+    float* XP = blk + o_X;
     {
         const int64_t ws = laststride(w);
         if (ws == 1) row_to_f32(w->dtype, w->data, gain, hn);
         else for (int64_t i = 0; i < hn; ++i) gain[i] = ldt(w, i * ws);
         if (wadd != 0.0f) for (int64_t i = 0; i < hn; ++i) gain[i] += wadd;
     }
-    widen_plane(down, lr, hn, dn);
-    widen_plane(up, hn, lr, upw);
-    if (injw) widen_plane(injw, hc, hn, iw);
+    if (injw)
+        for (int64_t c = 0; c < hc; ++c) plane_row(injw, nullptr, c, hn, iw + c * hn);
+    const avxp::ScaledRows* jdp = jdown ? &jd : nullptr;
+    const avxp::ScaledRows* jup_p = jup ? &ju : nullptr;
+    const float invhc = 1.0f / (float)hc;
 
+    /* ---- grouped norm: one rsqrt per stream, the full-width gain, then one round trip through
+     * h's dtype for the whole wide row. */
     AVX_PARALLEL_FOR_IF(rows >= 2)
     for (int64_t r = 0; r < rows; ++r) {
-        const int64_t hb = rowoff(h, r, hn), xb = rowoff(x, r, n);
-        const int64_t xs = laststride(x);
-        float* N = scratch_f32((size_t)hn);
-        float* tmp = scratch_f32_b((size_t)hn);
-        float* dv = scratch_f32_c((size_t)(lr + n) + 16);
-        float* xv = dv + lr + 8;
-
-        /* ---- the grouped norm: one rsqrt per stream over its own n, then the full-width gain,
-         * then a single round trip through h's dtype for the whole wide row. */
-        const float* hv = in_row(h, hb, hn, tmp);
+        float* N = NP + r * hn;
+        float* tmp = scratch_f32((size_t)hn);
+        const float* hv = in_row(h, rowoff(h, r, hn), hn, tmp);
         for (int64_t c = 0; c < hc; ++c) {
             const float sc = rsqrt_meansq_f64(hv + c * n, n, eps);
             const vf vs = vf_set1(sc);
@@ -235,68 +204,71 @@ AVX_KERNEL(hc_read) {
             row_from_f32(h->dtype, N, tmp, hn);
             row_to_f32(h->dtype, tmp, N, hn);
         }
+    }
 
-        /* ---- the read gate: hc*n -> lowrank -> hc*n, silu between and sigmoid after. */
-        for (int64_t j = 0; j < lr; ++j) {
-            const float t = dotf(N, dn + j * hn, hn) / (float)hc;
-            dv[j] = narrow1(down->dtype, t / (1.0f + std::exp(-t)));    /* silu */
+    /* ---- the read gate's first product, hc*n -> lowrank, and the silu, one row of `down` at a
+     * time against every token row. */
+    AVX_PARALLEL_FOR_IF(rows * lr * hn >= 65536)
+    for (int64_t j = 0; j < lr; ++j) {
+        float* wr = scratch_f32((size_t)hn);
+        plane_row(down, jdp, j, hn, wr);
+        for (int64_t r = 0; r < rows; ++r) {
+            const float t = dotf(NP + r * hn, wr, hn) / (float)hc;
+            DP[r * lr + j] = narrow1(ddt, t / (1.0f + sc_exp(-t)));    /* silu */
         }
+    }
 
-        /* ---- the mix, and the MEAN over the streams. */
-        const float invhc = 1.0f / (float)hc;
-        for (int64_t i = 0; i < n; ++i) {
+    /* ---- the second product, lowrank -> hc*n, its sigmoid, and the mix: the mean over the
+     * streams. Output column i reads `up` rows c*n + i of every stream c. */
+    AVX_PARALLEL_FOR_IF(rows * lr * hn >= 65536)
+    for (int64_t i = 0; i < n; ++i) {
+        float* ur = scratch_f32((size_t)(hc * lr));
+        for (int64_t c = 0; c < hc; ++c) plane_row(up, jup_p, c * n + i, lr, ur + c * lr);
+        for (int64_t r = 0; r < rows; ++r) {
+            const float* N = NP + r * hn;
             float acc = 0.0f;
             for (int64_t c = 0; c < hc; ++c) {
-                const int64_t row = c * n + i;
-                const float gv = dotf(dv, upw + row * lr, lr);
-                acc += narrow1(up->dtype, 1.0f / (1.0f + std::exp(-gv))) * N[row];
+                const float gv = dotf(DP + r * lr, ur + c * lr, lr);
+                acc += narrow1(udt, 1.0f / (1.0f + sc_exp(-gv))) * N[c * n + i];
             }
-            xv[i] = acc * invhc;
+            XP[r * n + i] = acc * invhc;
         }
-        if (xs == 1) out_row(x, xb, n, xv);
-        else for (int64_t i = 0; i < n; ++i) stt(x, xb + i * xs, xv[i]);
+    }
+
+    AVX_PARALLEL_FOR_IF(rows >= 2)
+    for (int64_t r = 0; r < rows; ++r) {
+        float* N = NP + r * hn;
+        float* xv = XP + r * n;
+        float* tmp = scratch_f32((size_t)hn);
+        out_row(x, rowoff(x, r, n), n, xv);
 
         /* ---- the per-branch write gates. */
         if (injw && inj) {
             const int64_t ib = rowoff(inj, r, hc), is = laststride(inj);
             for (int64_t c = 0; c < hc; ++c) {
                 const float acc = dotf(N, iw + c * hn, hn) * invhc;
-                stt(inj, ib + c * is, 2.0f / (1.0f + std::exp(-acc)));
+                stt(inj, ib + c * is, 2.0f / (1.0f + sc_exp(-acc)));
             }
         }
 
-        /* ---- the optional fp8 form of x, READ BACK FROM WHAT WAS STORED. `x` is narrowed to its
-         * own dtype first and the codes come from the narrowed value, not from the accumulator,
-         * because that is what a fused kernel necessarily does and the two have to agree bit for
-         * bit. The round trip is done in this buffer rather than by re-reading the operand: same
-         * arithmetic, and it does not depend on the store having retired. */
+        /* ---- optional fp8 form of x, taken from the stored (narrowed) value rather than the
+         * accumulator, as a fused kernel must, so the two agree bit for bit. */
         if (((q && q->data) || rg) && x->dtype != RAD_F32) {
             row_from_f32(x->dtype, xv, tmp, n);
             row_to_f32(x->dtype, tmp, xv, n);
         }
         if (q && q->data) {
-            const int64_t qb = rowoff(q, r, n), qs = laststride(q);
-            float* qv = N;     /* N is dead from here; the codes reuse its storage. */
+            float* qv = N;     /* the row's norm is dead here; its storage takes the codes. */
             for (int64_t gi = 0; gi < ngrp; ++gi) {
                 const int64_t k0 = gi * g, k1 = (k0 + g < n) ? k0 + g : n;
-                const float amax = row_amax(xv + k0, k1 - k0);
-                const float sc = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
-                const float invs = 1.0f / sc;
-                const vf vi = vf_set1(invs), hi = vf_set1(448.0f), lo = vf_set1(-448.0f);
-                int64_t i = k0;
-                for (; i + VF_N <= k1; i += VF_N)
-                    vf_storeu(qv + i, vf_min(vf_max(vf_mul(vf_loadu(xv + i), vi), lo), hi));
-                for (; i < k1; ++i) {
-                    float v = xv[i] * invs;
-                    qv[i] = v > 448.0f ? 448.0f : (v < -448.0f ? -448.0f : v);
-                }
+                float sc;
+                fp8_group(xv, qv, k0, k1, &sc);
                 stt(s, rowoff(s, r, ngrp) + gi * laststride(s), sc);
             }
-            if (qs == 1) out_row(q, qb, n, qv);
-            else for (int64_t i = 0; i < n; ++i) stt(q, qb + i * qs, qv[i]);
+            out_row(q, rowoff(q, r, n), n, qv);
         }
 
-        /* ---- the optional ROTATED fp8 form of x, from the same stored values. */
+        /* ---- optional rotated fp8 form of x, from the same stored values. */
         if (rg) {
             float* rv = N;     /* N and tmp are dead once the plain codes are stored. */
             float* rc = tmp;
@@ -308,17 +280,15 @@ AVX_KERNEL(hc_read) {
                 fp8_group(rv, rc, gi * rg, gi * rg + rg, &sc);
                 stt(rs, rowoff(rs, r, rgrp) + gi * laststride(rs), sc);
             }
-            const int64_t qb = rowoff(rq, r, n), qs = laststride(rq);
-            if (qs == 1) out_row(rq, qb, n, rc);
-            else for (int64_t i = 0; i < n; ++i) stt(rq, qb + i * qs, rc[i]);
+            out_row(rq, rowoff(rq, r, n), n, rc);
         }
     }
     return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ hc_write */
-/* `h[s] += inj[s] * y` for each of the hc streams, in place. `h` is the only output and it is the
- * stream the paired read was handed, UNNORMED and unchanged by it. */
+/* h[s] += inj[s] * y for each of the hc streams, in place, on the unnormed stream the paired read
+ * received. */
 AVX_KERNEL(hc_write) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const RadTensor* y = &a->t[0];
@@ -363,36 +333,27 @@ AVX_KERNEL(hc_write) {
 
 /* ================================================================== mtp_enter
  *
- * THE MULTI-TOKEN-PREDICTION HEAD'S ENTRY, for a model whose residual stream is `hc` wide.
+ * Entry of the multi-token-prediction head for a model with an `hc`-wide residual stream.
  *
- * A pre-norm MTP head joins the trunk's hidden state and the next token's embedding with ONE `fc`
- * over their concatenation. Qwen4-Exp's cannot: its hidden state is the WIDE stream and the
- * checkpoint carries TWO square matrices, so the hidden half is `fc_h` applied to EACH of the hc
- * sub-streams and the embedding half is one n-wide product added into all of them.
+ * A pre-norm MTP head usually joins the trunk's hidden state and the next token's embedding with one
+ * `fc` over their concatenation. Qwen4-Exp's hidden state is the wide stream and the checkpoint has
+ * two square matrices: `fc_h` is applied to each of the hc sub-streams, and one n-wide embedding
+ * product is added into all of them.
  *
  *     ne[j]     = e[j] * rsqrt(mean(e^2) + eps) * (w_e[j] + wadd)
  *     fe[i]     = sum_j fc_e[i][j] * ne[j]
  *     nh[k][j]  = h[k*n+j] * rs[k] * (w_h[k*n+j] + wadd)
  *     x[k*n+i]  = sum_j fc_h[i][j] * nh[k][j] + fe[i]
  *
- * `ngroup` IS THE ONE THING THE CHECKPOINT DOES NOT SAY: a [hc*n] gain fits both a grouped norm
- * (hc rsqrts) and a flat one (a single rsqrt over the wide row). Both are self-consistent and no
- * per-op oracle can tell them apart; the cheap empirical answer is the draft acceptance rate, so
- * the choice is carried as a parameter and asked once at declare.
+ * `ngroup` is not determined by the checkpoint: a [hc*n] gain fits both a grouped norm (hc rsqrts)
+ * and a flat one (one rsqrt over the wide row). No per-op oracle distinguishes them (the draft
+ * acceptance rate does), so it is a parameter fixed at declare.
  *
- * ============================== IT IS A GEMM AND IS RUN AS ONE ==============================
- *
- * libref computes this token by token, converting `fc_h` and `fc_e` out of their stored dtype
- * inside the innermost loop -- so an [n, n] weight is converted `rows * hc` times. Restructured
- * here as what it is: the norms are materialised into a PANEL first ([rows*hc, n] for the hidden
- * half, [rows, n] for the embedding), and then the loop runs over the OUTPUT COLUMN i, packing
- * `fc_h` row i and `fc_e` row i once and contracting them against every panel row.
- *
- * That is the same choice avx_gemm.cpp makes and for the same reason -- but note what it does NOT
- * do: it does not pre-widen the whole [n, n] weight, which at n = 2560 would be 26 MiB per matrix.
- * One row at a time, thread-local, is bounded by n floats and the weight is still read exactly
- * once. The panel is the thing that had to be materialised, and it is rows*hc*n -- 328 KiB on a
- * draft round, which is what this op is for.
+ * Run as a GEMM. libref converts `fc_h` and `fc_e` inside the innermost loop, `rows * hc` times.
+ * Here the norms are first materialised into panels ([rows*hc, n] hidden, [rows, n] embedding),
+ * then each output column i widens row i of `fc_h` and `fc_e` once and contracts it against every
+ * panel row. The whole [n, n] weight is never widened (26 MiB per matrix at n = 2560); each weight
+ * element is still converted once.
  */
 AVX_KERNEL(mtp_enter) {
     if (!rad_args_have(a, 7)) return RAD_E_INVAL;
@@ -416,7 +377,19 @@ AVX_KERNEL(mtp_enter) {
     const int64_t rows = numel(h) / hn;
     if (rows <= 0 || numel(e) < rows * n || numel(x) < rows * hn) return RAD_E_SHAPE;
     if (numel(w_h) < hn || numel(w_e) < n) return RAD_E_SHAPE;
-    if (numel(fc_h) < n * n || numel(fc_e) < n * n) return RAD_E_SHAPE;
+    /* Plain fc matrices, or codes and a scale joined (`fc` e4m3), as hc_read's. */
+    avxp::ScaledRows jh, je;
+    const bool jfh = avxp::is_joined(fc_h), jfe = avxp::is_joined(fc_e);
+    if (jfh) {
+        if (const int st = avxp::scaled_rows(fc_h, n, n, &jh); st != RAD_OK) return st;
+    } else if (numel(fc_h) < n * n) {
+        return RAD_E_SHAPE;
+    }
+    if (jfe) {
+        if (const int st = avxp::scaled_rows(fc_e, n, n, &je); st != RAD_OK) return st;
+    } else if (numel(fc_e) < n * n) {
+        return RAD_E_SHAPE;
+    }
 
     auto pad = [](size_t v) { return (v + 15) & ~(size_t)15; };
     const size_t o_gh = 0;
@@ -441,8 +414,8 @@ AVX_KERNEL(mtp_enter) {
         }
     }
 
-    /* Phase one: the two norms, into the panel. Both are rounded to their source tensor's dtype,
-     * which is what `.type_as(x)` does in the reference model and what the products then read. */
+    /* Phase one: both norms into the panels, rounded to their source tensor's dtype (the
+     * reference model's `.type_as(x)`). */
     AVX_PARALLEL_FOR_IF(rows * hn >= AVX_PAR_MIN)
     for (int64_t r = 0; r < rows; ++r) {
         float* buf = scratch_f32((size_t)hn);
@@ -470,17 +443,19 @@ AVX_KERNEL(mtp_enter) {
         }
     }
 
-    /* Phase two: one output column at a time, so each weight row is widened exactly once. */
+    /* Phase two: one output column at a time, so each weight row is widened once. */
     const int64_t xs = laststride(x);
     AVX_PARALLEL_FOR_IF(rows * hc * n >= AVX_PAR_MIN)
     for (int64_t i = 0; i < n; ++i) {
         float* fh = scratch_f32((size_t)n);
         float* fe = scratch_f32_b((size_t)n);
-        const int64_t fhb = rowoff(fc_h, i, n), fhs = laststride(fc_h);
-        const int64_t feb = rowoff(fc_e, i, n), fes = laststride(fc_e);
-        if (fhs == 1) row_to_f32(fc_h->dtype, byte_at(fc_h->data, fc_h->dtype, fhb), fh, n);
+        const int64_t fhb = jfh ? 0 : rowoff(fc_h, i, n), fhs = laststride(fc_h);
+        const int64_t feb = jfe ? 0 : rowoff(fc_e, i, n), fes = laststride(fc_e);
+        if (jfh) scaled_row(jh, i, n, fh);
+        else if (fhs == 1) row_to_f32(fc_h->dtype, byte_at(fc_h->data, fc_h->dtype, fhb), fh, n);
         else for (int64_t j = 0; j < n; ++j) fh[j] = ldt(fc_h, fhb + j * fhs);
-        if (fes == 1) row_to_f32(fc_e->dtype, byte_at(fc_e->data, fc_e->dtype, feb), fe, n);
+        if (jfe) scaled_row(je, i, n, fe);
+        else if (fes == 1) row_to_f32(fc_e->dtype, byte_at(fc_e->data, fc_e->dtype, feb), fe, n);
         else for (int64_t j = 0; j < n; ++j) fe[j] = ldt(fc_e, feb + j * fes);
 
         for (int64_t r = 0; r < rows; ++r) {

@@ -1,32 +1,28 @@
 // r4d_gemm_w5a16_nt_m64.hip - r4d_gemm_w5a16_nt_m64: 5-bit-weight skinny GEMM for M up to 64,
 // gfx1201.  C[M,N] = A[M,K] @ dequant(Wq)[N,K]^T, f16 A, bf16 C, fp32 accumulate.
 //
-// r4d_gemm_w4a16_nt_m64 with a fifth bit per weight, for ParoQuant's int5 (asymmetric, an f16 scale
-// and a 5-bit integer zero per 128 of K, the rotation done on the activation in front of it).  The
-// reading of that kernel's header holds word for word -- weight-streaming, memory-bound, f16
-// because 1024 + n is exact -- and this file only says what the fifth bit changes.
+// r4d_gemm_w4a16_nt_m64 with a fifth bit per weight, for ParoQuant's int5 (asymmetric: an f16 scale
+// and a 5-bit integer zero per 128 of K, with the rotation applied to the activation beforehand).
+// That kernel's header applies; this one covers only what the fifth bit changes.
 //
-// THE WEIGHT BLOB IS TWO PLANES.  The low four bits of every code are w4's fragment order exactly
-// (offset binary here: the nibble is q & 15, no sign flip).  The fifth bits follow as a second
-// plane of 32-bit words, ONE A (n-tile, 64-wide k block, lane):
+// The weight blob is two planes. The low four bits of each code are in w4's fragment order (offset
+// binary: the nibble is q & 15, no sign flip). The fifth bits follow as 32-bit words, one per
+// (n-tile, 64-wide k block, lane):
 //
 //     hi[(t * (K/64) + kb) * 32 + lane]     byte s = k step s of the block, bit e = element e
 //
-// element e of a lane's fragment being the same one nibble 2e / 2(e-4)+1 of dword s holds.  So a
-// lane's 16 bytes of nibbles and its 4 bytes of fifth bits cover the same 32 weights, and the
-// second load is one dword a block.
+// where element e is the one nibble 2e / 2(e-4)+1 of dword s holds. A lane's 16 bytes of nibbles and
+// 4 bytes of fifth bits cover the same 32 weights; the second load is one dword per block.
 //
-// THE UNPACK ADDS TWO MULTIPLIES TO w4's.  The even elements' fifth bits are the byte's low nibble,
-// the odd elements' its high one; a 4-bit mask n becomes one bit a byte by n * 0x00204081 (bit j
-// lands at 8j and nothing else lands on a multiple of eight below bit 32), masked with 0x01010101
-// and shifted to the 16s place of the nibble's byte.  The 5-bit code is then 0..31, 1024 + q is
-// exact in f16, and the zero point -- an integer 0..31 in the scale dword's high half as
-// -(1024 + zero) -- subtracts exactly.
+// The unpack adds two multiplies to w4's. The even elements' fifth bits are the byte's low nibble,
+// the odd elements' its high one. n * 0x00204081 moves bit j of a 4-bit mask to bit 8j (no other
+// term lands on a multiple of eight below bit 32); masking with 0x01010101 and shifting by 4 puts
+// it at the 16s place. The code is then 0..31, 1024 + q is exact in f16, and the integer zero
+// (0..31, stored as -(1024 + zero)) subtracts exactly.
 //
-// The dispatcher takes M past 64 as chunks of 64 rows (the weight is re-read per chunk, which at a
-// 2048-row prefill chunk is near the compute bound of the f16 matrix instruction anyway), and
-// partitioned weights (ParoQuant's gate|up: `pb1`/`pb2`, see r4d_gemm_args.h) as one launch per
-// part over windows of the planes.
+// The dispatcher runs M past 64 as chunks of 64 rows, re-reading the weight per chunk (near the f16
+// compute bound at a 2048-row prefill chunk anyway), and partitioned weights (ParoQuant's gate|up:
+// `pb1`/`pb2`, see r4d_gemm_args.h) as one launch per part.
 #include "r4d.h"
 #include "r4d_gemm_args.h"
 #include "r4d_gdn_wmma.h"
@@ -37,34 +33,16 @@
 #include <stdexcept>
 
 #define R4D_GEMM_W4_MAX_M 64
-#ifndef R4D_GEMM_W4_GROUP
-#define R4D_GEMM_W4_GROUP 128        // K per (scale, zero) pair
-#endif
 #define R4D_GEMM_W4_KPB   64         // K per packed block: 4 k steps, 16 bytes per lane
 #define WAVE32 32
 
 typedef _Float16 v8h  __attribute__((ext_vector_type(8)));
 typedef unsigned uint4v __attribute__((ext_vector_type(4)));
 
-// NT reads the weight non-temporally. The weight is streamed once per step and never reused, while
-// the activation is re-read once per column tile and wants to stay resident, so telling the cache
-// not to keep the weight decides which of the two occupies the last level. It is a gain at M=8 and
-// M=16 and a LOSS from M=24 up on the shapes with the longest K, so it is per-call, like every
-// other geometry parameter, and the table in radiance_w4.py carries the value per M band.
-//
-// One copy of any of these weights fits this part's 64 MiB last level, so a bench that streams a
-// SINGLE buffer in a loop measures a cache-resident machine and cannot see this effect at all; a
-// pooled working set is what makes the difference visible.
+// NT and NPW: see r4d_gemm_w4a16_nt_m64.hip. Only NPW 1 and 4 are instantiated.
 
-// NPW (column tiles per WAVE) is a template parameter because it sizes the accumulator array, and a
-// launch argument because the right value is a property of M: at M=8 the kernel is at the DRAM
-// roofline and NPW>1 only costs blocks, while at M=64 the activation re-read is four times the
-// weight and NPW=4 is what claws it back. Instantiated only for the two values that win in
-// practice; anything else is rejected rather than silently rounded.
-
-// Address-space-qualified so the loads stay global_load rather than flat_load: on gfx12 a flat
-// load increments dscnt as well as loadcnt, so a later LDS wait would also wait on HBM.  See the
-// same declaration in r4d_gemm_bf16_nt_m64.hip for why the element type is a scalar there.
+// Address-space-qualified so loads stay global_load, not flat_load (on gfx12 a flat load also
+// increments dscnt). See r4d_gemm_bf16_nt_m64.hip for why the element type is a scalar.
 typedef __attribute__((address_space(1))) const uint4v*          r4d_gw4;
 typedef __attribute__((address_space(1))) const unsigned long long* r4d_gu2;
 typedef __attribute__((address_space(1))) const unsigned*        r4d_gu1;
@@ -76,18 +54,12 @@ __device__ __forceinline__ v8h fragA(r4d_gu2 p, int u) {
   return x.f;
 }
 
-// DO NOT FOLD THE GROUP SCALE INTO THE B FRAGMENT.  One v_pk_mul_f16 per pair on the finished
-// integer q is exact in f16, removes the second accumulator array entirely and takes the M=64 shape
-// from 192 VGPRs to 135 -- and it is SLOWER on most of the drafter's shapes.  The multiply lands
-// inside the per-fragment dependent chain between the unpack and the WMMA, where the per-group
-// epilogue it replaces sits outside it; this kernel is stall-bound, not register-bound.
+// Do not fold the group scale into the B fragment; see r4d_gemm_w4a16_nt_m64.hip.
 
 // One dword of eight nibbles plus the byte of their fifth bits -> one 16x16x16 f16 B fragment,
-// minus the zero point.  Nibble 2e (e < 4) / 2(e-4)+1 is fragment element e, so bits 0..3 of `hb`
-// are the fifth bits of the even nibbles' elements and bits 4..7 the odd nibbles'.  Each v_perm_b32
-// pairs two code bytes with the constant high byte 0x64, the f16 exponent field for 1024, so a half
-// is 1024 + code; nz carries -(1024 + zero) in BOTH halves, so one v_pk_add_f16 corrects a pair.
-// The codes are offset binary (0..31, or 0..15 without the fifth bit): no sign flip.
+// minus the zero point. Bits 0..3 of `hb` are the even nibbles' fifth bits, bits 4..7 the odd
+// nibbles'. Each v_perm_b32 pairs two code bytes with the high byte 0x64 (1024 + code); nz holds
+// -(1024 + zero) in both halves. Codes are offset binary (0..31, or 0..15 without the fifth bit).
 __device__ __forceinline__ unsigned spread16(unsigned n) {      // 4 bits -> bit 4 of each byte
   return ((n * 0x00204081u) & 0x01010101u) << 4;
 }
@@ -109,9 +81,8 @@ __device__ __forceinline__ v8f mmah(v8h a, v8h b, v8f c) {
   return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
 }
 
-// MT = row tiles per BLOCK, as in the bf16 kernel: more of them amortise the weight fragment and
-// its unpack over more WMMA, fewer put more blocks on the machine.
-// HI false is the 4-bit asymmetric grid (z-lab's plain int4): the same kernel with no fifth-bit plane.
+// MT = row tiles per block, as in the bf16 kernel. HI false is the 4-bit asymmetric grid (z-lab's
+// plain int4), with no fifth-bit plane.
 template <int MT, int NPW, bool NT, bool HI>
 __global__ __launch_bounds__(1024) void r4d_gemm_w5a16_nt_m64_kernel(
     const unsigned short* __restrict__ A, const unsigned* __restrict__ Wq,
@@ -134,8 +105,7 @@ __global__ __launch_bounds__(1024) void r4d_gemm_w5a16_nt_m64_kernel(
     for (int i = 0; i < MT; i++) acc[j][i] = (v8f)(0.f);
 
   if (n0 < N) {
-    // Activation: rows clamped, never masked -- a tile past M re-reads the last valid row and
-    // computes a result nobody stores.
+    // Activation rows are clamped, not masked; results past M are never stored.
     unsigned aoff[MT];
 #pragma unroll
     for (int i = 0; i < MT; i++)
@@ -144,8 +114,8 @@ __global__ __launch_bounds__(1024) void r4d_gemm_w5a16_nt_m64_kernel(
 #pragma unroll
     for (int i = 0; i < MT; i++) pa[i] = (r4d_gu2)(const unsigned long long*)(A + aoff[i]);
 
-    // Weight: one uint4 per lane per four k steps, tiles already permuted, so the whole k loop is
-    // global_load_b128 with a constant stride and no address arithmetic per step.
+    // Weight: one uint4 per lane per four k steps, already permuted, so the k loop is
+    // global_load_b128 at a constant stride.
     const int kpb = K / R4D_GEMM_W4_KPB;                  // packed blocks in a full row of tiles
     const int nsz = K / R4D_GEMM_W4_GROUP;                // (scale, zero) dwords per row of tiles
     r4d_gw4 pw[NPW];
@@ -154,15 +124,14 @@ __global__ __launch_bounds__(1024) void r4d_gemm_w5a16_nt_m64_kernel(
     const int ntlast = N / 16 - 1;
 #pragma unroll
     for (int j = 0; j < NPW; j++) {
-      // Clamped, like the row tiles: a wave whose last column tiles run past N re-reads the last
-      // real tile and computes a result the store discards, rather than reading memory it does not
-      // own or diverging the whole k loop on a mask.
+      // Column tiles past N are clamped to the last real tile; the store discards them.
       const int t = (nt0 + j) < ntlast ? (nt0 + j) : ntlast;
       pw[j] = (r4d_gw4)(const uint4v*)(Wq) +
               (size_t)(t * kpb + kbase / R4D_GEMM_W4_KPB) * WAVE32 + lane;
-      // Quantizer parameters: 16 distinct dwords per group, read by the 16 lanes that own the rows.
+      // Fifth-bit plane: one dword per lane per packed block (unused when !HI).
       ph[j] = (r4d_gu1)(const unsigned*)(HI ? Whi : Wq) +
               (size_t)(t * kpb + kbase / R4D_GEMM_W4_KPB) * WAVE32 + lane;
+      // Quantiser parameters: 16 dwords per group, read by the 16 lanes that own the rows.
       ps[j] = (r4d_gu1)(const unsigned*)(Wsz) +
               (size_t)(t * nsz + kbase / R4D_GEMM_W4_GROUP) * 16 + (lane & 15);
     }
@@ -179,8 +148,7 @@ __global__ __launch_bounds__(1024) void r4d_gemm_w5a16_nt_m64_kernel(
         nz[j] = __half2half2(__ushort_as_half((unsigned short)(sz >> 16)));
       }
 
-      // The first WMMA of a group takes an inline zero for C, so the group accumulator costs no
-      // instruction to clear.
+      // The first WMMA of a group takes an inline zero for C, so no clear is needed.
       v8f g_acc[NPW][MT];
 #pragma unroll
       for (int b = 0; b < bpg; b++) {
@@ -219,9 +187,8 @@ __global__ __launch_bounds__(1024) void r4d_gemm_w5a16_nt_m64_kernel(
     }
   }
 
-  // Split-K reduction and store: identical to r4d_gemm_bf16_nt_m64, one row tile at a time so the
-  // LDS is WV*SK KiB whatever MT is, and in a fixed order over splits so the result does not depend
-  // on how the waves were scheduled.
+  // Split-K reduction and store as in r4d_gemm_bf16_nt_m64: one row tile at a time, fixed split
+  // order.
   const int ncols = WV * NPW;
   const int nthreads = WV * SK * WAVE32;
 #pragma unroll
@@ -295,8 +262,7 @@ int r4d_gemm_w5a16_nt_m64_group(void) { return R4D_GEMM_W4_GROUP; }
 
 // ============================================================== the plugin ABI entry points
 //
-// The operand reader and the split law are in r4d_gemm_args.h. See libr4d/r4d_args.h for why there
-// is no adapter directory between the core and these launches.
+// The operand reader and the split law are in r4d_gemm_args.h; see libr4d/r4d_args.h.
 /* ------------------------------------------------------------------ f16-activation grids */
 
 static int w5_dispatch(const RadArgs* a, RadStream s, bool hi5) {
@@ -304,21 +270,21 @@ static int w5_dispatch(const RadArgs* a, RadStream s, bool hi5) {
     int rc = gemm_ops(a, &g, 1, /*parts=*/1);
     if (rc != RAD_OK) return rc;
     if (g.N % 16) return R4D_NO(RAD_E_SHAPE);
+    /* Any other activation dtype would read plausible but wrong numbers. */
+    if (g.a->dtype != RAD_F16) return R4D_NO(RAD_E_DTYPE);
     MxParts mp;
     rc = mx_parts(a, &g, &mp);
     if (rc != RAD_OK) return rc;
     if (g.K % R4D_GEMM_W4_GROUP) return R4D_NO(RAD_E_SHAPE);
     const int group = r4d_gemm_w5a16_nt_m64_group();
-    // The row's M is the step's, not the kernel's: rows past 64 are chunks of 64, each its own pass
-    // over the weight, so a prefill chunk costs the weight's bytes once a 64 rows.
+    // Rows past 64 run as chunks of 64, each a pass over the weight.
     const long long mc = std::min<long long>(g.M, r4d_gemm_w5a16_nt_m64_max_m());
     Cfg c;
     rc = cfg_for(a, g.K, mc, group, BR_FLAT, &c);
     if (rc != RAD_OK) return rc;
-    /* cfg_for pins MB = 1 across the decode band (the grid, not the weight, is the cost for the bf16 and
-     * mxfp4 skinny kernels). Here the dequantise is: one block per row tile unpacks each weight fragment
-     * once PER TILE, so three streams (M = 24, two tiles) pay it twice. Cover every row tile in one block
-     * unless the tuner pinned MB; same split, so the output bits are unchanged. */
+    /* cfg_for pins MB = 1 in the decode band, but here the dequantise is the cost: with one block per
+     * row tile, each weight fragment is unpacked once per tile. Cover every row tile in one block
+     * unless the tuner pinned MB; the split is unchanged, so the output bits are too. */
     R4dGemmCfg tuned;
     r4d_cfg_gemm(a, &tuned);
     if (tuned.mb <= 0) c.mb = std::min<long long>(4, (mc + 15) / 16);

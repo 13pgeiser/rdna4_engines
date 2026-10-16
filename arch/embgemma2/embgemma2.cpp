@@ -1,11 +1,10 @@
 /* embgemma2 -- EmbeddingGemma 2, a bidirectional Gemma encoder that pools a whole input into one
  * vector. bf16 weights and bf16 activations.
  *
- * AN EMBEDDING MODEL, NOT A GENERATIVE ONE. It declares a pooled output (rad_declare_pooled) and
- * no logits, so the engine runs it with no sampler and no KV cache, carries every input whole in
- * one step and hands each sequence's pooled row back as its answer. Attention is BIDIRECTIONAL on
- * every layer, which is why nothing is paged: a token attends to the tokens after it, so there is
- * nothing a cache could carry from one step to the next.
+ * An embedding model: it declares a pooled output (rad_declare_pooled) and no logits, so the
+ * engine runs it with no sampler and no KV cache, carries every input whole in one step, and
+ * returns each sequence's pooled row. Attention is bidirectional on every layer, so nothing is
+ * paged: a token attends to later tokens, and there is nothing to carry between steps.
  *
  * ============================== THE SHAPE ==============================
  *
@@ -13,27 +12,26 @@
  *   layer_types: five `sliding_attention` then one `full_attention`, four times over
  *     sliding: 4 heads / 2 kv heads / head_dim 256, rope theta 1e4, |i - j| <= 512
  *     full:    4 heads / 1 kv head  / head_dim 512, rope theta 1e6, the whole input
- *   attention scale 1.0 (the q/k norms carry the temperature); q, k AND v are RMS-normed per head,
+ *   attention scale 1.0 (the q/k norms carry the temperature); q, k and v are RMS-normed per head,
  *   v with no gain
- *   Gemma's sandwich norms: a norm before AND after attention and the feed-forward, all plain
+ *   Gemma's sandwich norms: a norm before and after attention and the feed-forward, all plain
  *   RMSNorm gains (x_hat * w, not 1 + w)
  *   a gated gelu-tanh feed-forward
- *   PER-LAYER EMBEDDINGS, projection-only: the token embedding projected to 24 x 512, normed, and
+ *   per-layer embeddings, projection-only: the token embedding projected to 24 x 512, normed, and
  *   each layer's slice gating that layer's residual through a 512 -> 512 -> 512 bottleneck
  *   a learned scalar per layer, multiplying the residual stream at the layer's end
  *   final norm, then the mean over every token of the input, then 512 -> 768
  *
  * The reference is transformers' modeling_embedding_gemma2 (model_type embedding_gemma2, which
  * rad-convert spells `embeddinggemma2`). Its mean pooling and normalisation are
- * sentence-transformers' modules on top; the normalisation is the server's (it truncates to
+ * sentence-transformers' modules on top; normalisation is the server's (it truncates to
  * `dimensions` first), so the pooled row here is the unnormalised mean.
  *
- * ============================== WHAT THIS PLUGIN DOES NOT YET DECLARE ==============================
- *
- * Nothing the checkpoint carries: the text model, the vision tower and the audio encoder are all
- * below.
+ * Everything the checkpoint carries is declared: the text model, the vision tower
+ * (rad_block_gemma4_vision.h) and the audio encoder.
  */
 #include <arch/rad_arch.h>
+#include <arch/rad_block_gemma4_vision.h>
 
 #include <cmath>
 #include <cstdint>
@@ -67,285 +65,6 @@ struct Layer {
     rad_op op_post_ple = 0, op_add_ple = 0, op_scale = 0;
 };
 
-/* ============================== THE VISION TOWER (Gemma 4's) ==============================
- *
- *   a patch is 16 x 16 x 3, staged by the processor as 2 * (u / 255) - 1 in bf16, (y, x, channel)
- *   patch embedding: a 768 x 768 linear, plus a learned row for the patch's column and one for its
- *   row (a [2, 10240, 768] table), the two summed first
- *   16 layers: Gemma's sandwich norms, q/k RMS-normed with a gain and v without one, a 2-D rotary
- *   (theta 100) with x over the first half of each 64-wide head and y over the second, each half a
- *   rotary of its own; bidirectional attention within an image at scale 1; a gated gelu-tanh MLP
- *   pooling: the mean of each 3 x 3 window -- the processor lays a window's nine patches out
- *   consecutively -- times sqrt(768), then the multimodal embedder: an RMS norm with no gain and a
- *   768 -> 512 linear. Its rows take the place of the image's placeholder tokens BEFORE the
- *   per-layer inputs are projected, so the per-layer inputs of an image token are its image row's.
- *
- * One encoder pass carries RadBuildCtx::max_enc_patches patches over any number of segments (an
- * image, or one frame of a video). */
-struct Vision {
-    struct Layer {
-        rad_weight in_norm = 0, qkv = 0, q_norm = 0, k_norm = 0, o = 0, post_attn = 0;
-        rad_weight pre_ff = 0, gate_up = 0, down = 0, post_ff = 0;
-        rad_op op_in = 0, op_qkv = 0, op_qk = 0, op_attn = 0, op_o = 0, op_pa = 0, op_add1 = 0;
-        rad_op op_pf = 0, op_gu = 0, op_act = 0, op_down = 0, op_pff = 0, op_add2 = 0;
-    };
-    bool on = false;
-    int64_t P = 0, R = 0, width = 0, heads = 0, hd = 0, ff = 0, patch_dim = 0, pool = 0;
-    int64_t npos = 0, n_embd = 0;
-    rad_weight w_in = 0, w_px = 0, w_py = 0, w_proj = 0;
-    rad_op op_patch = 0, op_px = 0, op_py = 0, op_padd = 0, op_add = 0, op_pool = 0, op_norm = 0;
-    rad_op op_out = 0;
-    rad_buf b_x = 0, b_h = 0, b_o = 0, b_qkv = 0, b_att = 0, b_gu = 0, b_ff = 0, b_px = 0,
-            b_py = 0, b_pool = 0, b_pn = 0, b_out = 0;
-    std::vector<Layer> L;
-
-    static bool present(const RadModelMeta* m) {
-        const char* t = rad_meta_gets(m, "vision_config.model_type", "");
-        return t && !std::strcmp(t, "gemma4_vision");
-    }
-
-    int declare(RadBuilder* b, const RadModelMeta* m, const RadBuildCtx* ctx, Names& nm,
-                int64_t model_embd, int first_group) {
-        on = false;
-        if (!present(m) || ctx->max_enc_patches <= 0) return RAD_OK;
-        width = rad_meta_geti(m, "vision_config.hidden_size", 0);
-        heads = rad_meta_geti(m, "vision_config.num_attention_heads", 0);
-        hd    = rad_meta_geti(m, "vision_config.head_dim", 0);
-        ff    = rad_meta_geti(m, "vision_config.intermediate_size", 0);
-        pool  = rad_meta_geti(m, "vision_config.pooling_kernel_size", 0);
-        npos  = rad_meta_geti(m, "vision_config.position_embedding_size", 0);
-        const int64_t depth = rad_meta_geti(m, "vision_config.num_hidden_layers", 0);
-        const int64_t patch = rad_meta_geti(m, "vision_config.patch_size", 0);
-        const int64_t kvh   = rad_meta_geti(m, "vision_config.num_key_value_heads", heads);
-        const double  eps   = rad_meta_getf(m, "vision_config.rms_norm_eps", 1e-6);
-        const double  theta = rad_meta_getf(m, "vision_config.rope_parameters.rope_theta", 0.0);
-        const char*   rt    = rad_meta_gets(m, "vision_config.rope_parameters.rope_type", "");
-        const char*   act   = rad_meta_gets(m, "vision_config.hidden_activation", "");
-        if (width <= 0 || heads <= 0 || hd <= 0 || ff <= 0 || pool <= 0 || npos <= 0 ||
-            depth <= 0 || patch <= 0 || !(theta > 0) || heads * hd != width || kvh != heads ||
-            hd % 4) {
-            fprintf(stderr, "radiance: embgemma2: the container's vision_config is incomplete or "
-                            "not the shape this plugin serves (hidden %lld, heads %lld x %lld, kv "
-                            "%lld, ff %lld, pooling %lld, layers %lld)\n", (long long)width,
-                    (long long)heads, (long long)hd, (long long)kvh, (long long)ff,
-                    (long long)pool, (long long)depth);
-            return RAD_E_INVAL;
-        }
-        /* What this tower does not carry is refused by name: clipped linears (their bounds are
-         * buffers the vision checkpoint states as infinite), feature standardisation, and any
-         * rotary or activation other than the axial one and gelu-tanh. */
-        if (rad_meta_geti(m, "vision_config.use_clipped_linears", 0) ||
-            rad_meta_geti(m, "vision_config.standardize", 0) || std::strcmp(rt, "axial") ||
-            std::strcmp(act, "gelu_pytorch_tanh")) {
-            fprintf(stderr, "radiance: embgemma2: this vision tower uses clipped linears, "
-                            "standardisation, a '%s' rotary or a '%s' activation, which this "
-                            "plugin does not serve\n", rt, act);
-            return RAD_E_UNSUPPORTED;
-        }
-        n_embd = model_embd;
-        patch_dim = 3 * patch * patch;
-        const int64_t kk = pool * pool;
-        P = ctx->max_enc_patches;
-        if (P % kk) P -= P % kk;
-        R = P / kk;
-        const int A = RAD_ACCESS_PER_REQUEST, N = RAD_SHARD_NONE;
-        const char* V = "vision_tower";
-
-        /* ---- weights: the stem, the position tables and the embedder are model-level; each
-         * tower layer is its own group, past every text layer. */
-        RAD_ARCH_TRY(map_copy(b, nm.f("v.patch.weight"), nm.ckpt("%s.patch_embedder.input_proj.weight", V)));
-        RAD_ARCH_TRY(map_slice(b, nm.f("v.pos_x.weight"),
-                               nm.ckpt("%s.patch_embedder.position_embedding_table", V), 0));
-        RAD_ARCH_TRY(map_slice(b, nm.f("v.pos_y.weight"),
-                               nm.ckpt("%s.patch_embedder.position_embedding_table", V), 1));
-        RAD_ARCH_TRY(map_copy(b, nm.f("v.embed.weight"), nm.ckpt("embed_vision.embedding_projection.weight")));
-        w_in   = decl_w(b, nm.f("v.patch.weight"), RAD_BF16, {width, patch_dim}, A, N, grp_model());
-        w_px   = decl_w(b, nm.f("v.pos_x.weight"), RAD_BF16, {npos, width}, A, N, grp_model());
-        w_py   = decl_w(b, nm.f("v.pos_y.weight"), RAD_BF16, {npos, width}, A, N, grp_model());
-        w_proj = decl_w(b, nm.f("v.embed.weight"), RAD_BF16, {n_embd, width}, A, N, grp_model());
-        L.assign((size_t)depth, Layer{});
-        for (int64_t i = 0; i < depth; ++i) {
-            Layer& l = L[(size_t)i];
-            const long long li = (long long)i;
-            const RadWeightGroup g = grp_layer(first_group + (int)i);
-            auto src = [&](const char* s) { return nm.ckpt("%s.encoder.layers.%lld.%s", V, li, s); };
-            RAD_ARCH_TRY(map_copy(b, nm.f("v.blk.%lld.in_norm", li), src("input_layernorm.weight")));
-            RAD_ARCH_TRY(map_concat(b, nm.f("v.blk.%lld.qkv", li),
-                                    {src("self_attn.q_proj.linear.weight"),
-                                     src("self_attn.k_proj.linear.weight"),
-                                     src("self_attn.v_proj.linear.weight")}));
-            RAD_ARCH_TRY(map_copy(b, nm.f("v.blk.%lld.q_norm", li), src("self_attn.q_norm.weight")));
-            RAD_ARCH_TRY(map_copy(b, nm.f("v.blk.%lld.k_norm", li), src("self_attn.k_norm.weight")));
-            RAD_ARCH_TRY(map_copy(b, nm.f("v.blk.%lld.o", li), src("self_attn.o_proj.linear.weight")));
-            RAD_ARCH_TRY(map_copy(b, nm.f("v.blk.%lld.post_attn", li), src("post_attention_layernorm.weight")));
-            RAD_ARCH_TRY(map_copy(b, nm.f("v.blk.%lld.pre_ff", li), src("pre_feedforward_layernorm.weight")));
-            RAD_ARCH_TRY(map_concat(b, nm.f("v.blk.%lld.gate_up", li),
-                                    {src("mlp.gate_proj.linear.weight"),
-                                     src("mlp.up_proj.linear.weight")}));
-            RAD_ARCH_TRY(map_copy(b, nm.f("v.blk.%lld.down", li), src("mlp.down_proj.linear.weight")));
-            RAD_ARCH_TRY(map_copy(b, nm.f("v.blk.%lld.post_ff", li), src("post_feedforward_layernorm.weight")));
-            l.in_norm   = decl_w(b, nm.f("v.blk.%lld.in_norm", li),   RAD_BF16, {width}, A, N, g);
-            l.qkv       = decl_w(b, nm.f("v.blk.%lld.qkv", li),       RAD_BF16, {3 * width, width}, A, N, g);
-            l.q_norm    = decl_w(b, nm.f("v.blk.%lld.q_norm", li),    RAD_BF16, {hd}, A, N, g);
-            l.k_norm    = decl_w(b, nm.f("v.blk.%lld.k_norm", li),    RAD_BF16, {hd}, A, N, g);
-            l.o         = decl_w(b, nm.f("v.blk.%lld.o", li),         RAD_BF16, {width, width}, A, N, g);
-            l.post_attn = decl_w(b, nm.f("v.blk.%lld.post_attn", li), RAD_BF16, {width}, A, N, g);
-            l.pre_ff    = decl_w(b, nm.f("v.blk.%lld.pre_ff", li),    RAD_BF16, {width}, A, N, g);
-            l.gate_up   = decl_w(b, nm.f("v.blk.%lld.gate_up", li),   RAD_BF16, {2 * ff, width}, A, N, g);
-            l.down      = decl_w(b, nm.f("v.blk.%lld.down", li),      RAD_BF16, {width, ff}, A, N, g);
-            l.post_ff   = decl_w(b, nm.f("v.blk.%lld.post_ff", li),   RAD_BF16, {width}, A, N, g);
-        }
-
-        /* ---- activations, sized by the pass. */
-        b_x    = decl_b(b, nm.f("v.x"),    RAD_BF16, {P, width});
-        b_h    = decl_b(b, nm.f("v.h"),    RAD_BF16, {P, width});
-        b_o    = decl_b(b, nm.f("v.o"),    RAD_BF16, {P, width});
-        b_qkv  = decl_b(b, nm.f("v.qkv"),  RAD_BF16, {P, 3 * width});
-        b_att  = decl_b(b, nm.f("v.att"),  RAD_BF16, {P, width});
-        b_gu   = decl_b(b, nm.f("v.gu"),   RAD_BF16, {P, 2 * ff});
-        b_ff   = decl_b(b, nm.f("v.ff"),   RAD_BF16, {P, ff});
-        b_px   = decl_b(b, nm.f("v.px"),   RAD_BF16, {P, width});
-        b_py   = decl_b(b, nm.f("v.py"),   RAD_BF16, {P, width});
-        b_pool = decl_b(b, nm.f("v.pool"), RAD_BF16, {R, width});
-        b_pn   = decl_b(b, nm.f("v.pn"),   RAD_BF16, {R, width});
-        b_out  = decl_b(b, nm.f("v.out"),  RAD_BF16, {R, n_embd});
-
-        auto rms = [&](int64_t rows, rad_weight w) {
-            if (!w)
-                return RAD_OP(b, "rmsnorm", RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", width),
-                                                       RAD_F64("eps", eps), RAD_F64("wadd", 0.0),
-                                                       RAD_STR("dtype", "bf16")),
-                              RAD_NOWEIGHTS);
-            return RAD_OP(b, "rmsnorm", RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", width),
-                                                   RAD_F64("eps", eps), RAD_F64("wadd", 0.0),
-                                                   RAD_STR("dtype", "bf16")),
-                          RAD_WEIGHTS(w));
-        };
-        auto gemm = [&](int64_t rows, int64_t Nn, int64_t K, rad_weight w) {
-            return RAD_OP(b, "gemm_nt", RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", Nn),
-                                                   RAD_INT("K", K), RAD_STR("dtype", "bf16")),
-                          RAD_WEIGHTS(w));
-        };
-        auto add = [&](int64_t rows) {
-            return RAD_OP(b, "add", RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", width),
-                                               RAD_STR("dtype", "bf16")),
-                          RAD_NOWEIGHTS);
-        };
-        auto lookup = [&](rad_weight w) {
-            return RAD_OP(b, "embed_lookup",
-                          RAD_PARAMS(RAD_RANGE("M", 1, P), RAD_INT("n_embd", width),
-                                     RAD_INT("n_vocab", npos), RAD_STR("dtype", "bf16"),
-                                     RAD_INT("vocab_offset", 0), RAD_F64("mult", 1.0)),
-                          RAD_WEIGHTS(w));
-        };
-        op_patch = rw(b, gemm(P, width, patch_dim, w_in), {}, {b_x});
-        op_px    = rw(b, lookup(w_px), {}, {b_px});
-        op_py    = rw(b, lookup(w_py), {}, {b_py});
-        op_padd  = rw(b, add(P), {b_px, b_py}, {b_px});
-        op_add   = rw(b, add(P), {b_x, b_px}, {b_x});
-        char sec[48];
-        std::snprintf(sec, sizeof sec, "%lld %lld", (long long)(hd / 4), (long long)(hd / 4));
-        for (Layer& l : L) {
-            l.op_in   = rw(b, rms(P, l.in_norm), {b_x}, {b_h});
-            l.op_qkv  = rw(b, gemm(P, 3 * width, width, l.qkv), {b_h}, {b_qkv});
-            /* x is the column (plane 1 of the staged coordinates), y the row (plane 0). */
-            l.op_qk   = rw(b, RAD_OP(b, "qk_norm_rope",
-                                     RAD_PARAMS(RAD_RANGE("M", 1, P), RAD_INT("head_dim", hd),
-                                                RAD_INT("n_head", heads), RAD_INT("n_head_kv", heads),
-                                                RAD_F64("theta", theta), RAD_F64("eps", eps),
-                                                RAD_STR("mode", "blocks"), RAD_INT("v_norm", 1),
-                                                RAD_STR("sections", sec), RAD_STR("comps", "1 0")),
-                                     RAD_WEIGHTS(l.q_norm, l.k_norm)),
-                           {b_qkv}, {b_qkv});
-            l.op_attn = rw(b, RAD_OP(b, "attn_dense",
-                                     RAD_PARAMS(RAD_RANGE("M", 1, P), RAD_INT("head_dim", hd),
-                                                RAD_INT("gqa", 1), RAD_INT("causal", 0),
-                                                RAD_STR("dtype", "bf16"), RAD_F64("scale", 1.0),
-                                                RAD_INT("max_seqlen", P), RAD_INT("window", 0)),
-                                     RAD_NOWEIGHTS),
-                           {b_qkv}, {b_att});
-            l.op_o    = rw(b, gemm(P, width, width, l.o), {b_att}, {b_o});
-            l.op_pa   = rw(b, rms(P, l.post_attn), {b_o}, {b_o});
-            l.op_add1 = rw(b, add(P), {b_x, b_o}, {b_x});
-            l.op_pf   = rw(b, rms(P, l.pre_ff), {b_x}, {b_h});
-            l.op_gu   = rw(b, gemm(P, 2 * ff, width, l.gate_up), {b_h}, {b_gu});
-            l.op_act  = rw(b, RAD_OP(b, "act_mul",
-                                     RAD_PARAMS(RAD_RANGE("M", 1, P), RAD_INT("n", ff),
-                                                RAD_STR("act", "gelu_tanh"), RAD_STR("dtype", "bf16")),
-                                     RAD_NOWEIGHTS),
-                           {b_gu}, {b_ff});
-            l.op_down = rw(b, gemm(P, width, ff, l.down), {b_ff}, {b_o});
-            l.op_pff  = rw(b, rms(P, l.post_ff), {b_o}, {b_o});
-            l.op_add2 = rw(b, add(P), {b_x, b_o}, {b_x});
-        }
-        op_pool = rw(b, RAD_OP(b, "pool_rows",
-                               RAD_PARAMS(RAD_RANGE("M", 1, P), RAD_INT("n", width),
-                                          RAD_INT("k", kk), RAD_F64("mult", std::sqrt((double)width)),
-                                          RAD_STR("dtype", "bf16")),
-                               RAD_NOWEIGHTS),
-                     {b_x}, {b_pool});
-        op_norm = rw(b, rms(R, 0), {b_pool}, {b_pn});
-        op_out  = rw(b, gemm(R, n_embd, width, w_proj), {b_pn}, {b_out});
-
-        RadEncoderDecl e{};
-        e.name        = "vision";
-        e.modalities  = RAD_MM_IMAGE | RAD_MM_VIDEO;
-        e.patch_dim   = patch_dim;
-        e.merge       = kk;
-        e.max_patches = P;
-        e.n_embd      = n_embd;
-        e.out         = b_out;
-        RAD_ARCH_TRY(rad_declare_encoder(b, &e));
-        rad_note(b, "vision tower: %lld layers of %lld (%lld heads x %lld), ff %lld, patch %lld, "
-                    "pooled %lldx%lld; %lld patches a pass -> %lld rows of %lld",
-                 (long long)depth, (long long)width, (long long)heads, (long long)hd, (long long)ff,
-                 (long long)patch, (long long)pool, (long long)pool, (long long)P, (long long)R,
-                 (long long)n_embd);
-        on = true;
-        return RAD_OK;
-    }
-
-    void step(RadCtx* c, const RadBatch* batch) const {
-        const int64_t Pn = batch->enc_n_patch, S = batch->enc_n_seg, kk = pool * pool;
-        if (!on || Pn <= 0 || Pn > P || Pn % kk || S <= 0) {
-            rad_step_fail(c, "an encoder pass this program's vision tower cannot serve: no tower, "
-                             "more patches than it was declared for, or not whole pooling windows");
-            return;
-        }
-        const int64_t Rn = Pn / kk;
-        const int32_t* crd = batch->enc_coord;
-        const RadOperand pix = praw2(batch->enc_pixels, RAD_BF16, Pn, patch_dim);
-        const RadOperand rc  = praw2(crd, RAD_I32, 2, Pn);
-        const RadOperand cu  = praw(batch->enc_cu, RAD_I32, S + 1);
-
-        RAD_ISSUE_N(c, op_patch, Pn, pix, RAD_W(w_in), brows(b_x, Pn));
-        RAD_ISSUE_N(c, op_px, Pn, praw(crd + Pn, RAD_I32, Pn), RAD_W(w_px), brows(b_px, Pn));
-        RAD_ISSUE_N(c, op_py, Pn, praw(crd, RAD_I32, Pn), RAD_W(w_py), brows(b_py, Pn));
-        RAD_ISSUE_N(c, op_padd, Pn, brows(b_px, Pn), brows(b_py, Pn), brows(b_px, Pn));
-        RAD_ISSUE_N(c, op_add, Pn, brows(b_x, Pn), brows(b_px, Pn), brows(b_x, Pn));
-        for (const Layer& l : L) {
-            RAD_ISSUE_N(c, l.op_in, Pn, brows(b_x, Pn), RAD_W(l.in_norm), brows(b_h, Pn));
-            RAD_ISSUE_N(c, l.op_qkv, Pn, brows(b_h, Pn), RAD_W(l.qkv), brows(b_qkv, Pn));
-            RAD_ISSUE_N(c, l.op_qk, Pn, brows(b_qkv, Pn), rc, RAD_W(l.q_norm), RAD_W(l.k_norm));
-            RAD_ISSUE_N(c, l.op_attn, Pn, bcol(b_qkv, 0, width, Pn), bcol(b_qkv, width, width, Pn),
-                        bcol(b_qkv, 2 * width, width, Pn), cu, brows(b_att, Pn));
-            RAD_ISSUE_N(c, l.op_o, Pn, brows(b_att, Pn), RAD_W(l.o), brows(b_o, Pn));
-            RAD_ISSUE_N(c, l.op_pa, Pn, brows(b_o, Pn), RAD_W(l.post_attn), brows(b_o, Pn));
-            RAD_ISSUE_N(c, l.op_add1, Pn, brows(b_x, Pn), brows(b_o, Pn), brows(b_x, Pn));
-            RAD_ISSUE_N(c, l.op_pf, Pn, brows(b_x, Pn), RAD_W(l.pre_ff), brows(b_h, Pn));
-            RAD_ISSUE_N(c, l.op_gu, Pn, brows(b_h, Pn), RAD_W(l.gate_up), brows(b_gu, Pn));
-            RAD_ISSUE_N(c, l.op_act, Pn, bcol(b_gu, 0, ff, Pn), bcol(b_gu, ff, ff, Pn),
-                        brows(b_ff, Pn));
-            RAD_ISSUE_N(c, l.op_down, Pn, brows(b_ff, Pn), RAD_W(l.down), brows(b_o, Pn));
-            RAD_ISSUE_N(c, l.op_pff, Pn, brows(b_o, Pn), RAD_W(l.post_ff), brows(b_o, Pn));
-            RAD_ISSUE_N(c, l.op_add2, Pn, brows(b_x, Pn), brows(b_o, Pn), brows(b_x, Pn));
-        }
-        RAD_ISSUE_N(c, op_pool, Pn, brows(b_x, Pn), brows(b_pool, Rn));
-        RAD_ISSUE_N(c, op_norm, Rn, brows(b_pool, Rn), RAD_NONE, brows(b_pn, Rn));
-        RAD_ISSUE_N(c, op_out, Rn, brows(b_pn, Rn), RAD_W(w_proj), brows(b_out, Rn));
-    }
-};
-
 /* ============================== THE AUDIO ENCODER (Gemma 4's USM conformer) ==============================
  *
  *   a frame is 128 log-mel bins (the processor's), four frames an output row
@@ -355,12 +74,12 @@ struct Vision {
  *   12 conformer blocks: a feed-forward at half weight, local attention (11 frames back, a
  *   relative-position term, a softplus per-dimension query scale, a softcap of 50), a gated
  *   depthwise causal convolution, a second half-weight feed-forward, a norm; their linears are
- *   CLIPPED, input and output clamped to bounds the checkpoint stores
+ *   clipped: input and output clamped to bounds the checkpoint stores
  *   1024 -> 1536 with a bias, then the multimodal embedder: an RMS norm with no gain, 1536 -> 512.
  *
- * The blocks' clamps at +-1e10 ("gradient clipping") are left out: they bound activations ten
- * orders of magnitude past anything bf16 holds near them, so they change nothing a pass computes.
- * One clip is one segment; a pass carries up to RadBuildCtx::max_audio_frames frames. */
+ * The blocks' clamps at +-1e10 ("gradient clipping") are omitted: they are ten orders of magnitude
+ * beyond the activations' range and change nothing. One clip is one segment; a pass carries up to
+ * RadBuildCtx::max_audio_frames frames. */
 struct Audio {
     /* A clipped linear: the weight and its four bounds. */
     struct Clip {
@@ -607,9 +326,8 @@ struct Audio {
                           RAD_WEIGHTS(wt));
         };
         /* A clipped linear over rows of `in` into `out`: the input clamp writes a copy (the input
-         * is shared by the projections it feeds, each with its own bounds), the output clamp is in
-         * place. The copy is a whole [R, n_in] buffer: a GEMM's input must be contiguous, and a
-         * column slice of a wider one is not. */
+         * feeds several projections, each with its own bounds), the output clamp is in place. The
+         * copy is a whole [R, n_in] buffer, since a GEMM's input must be contiguous. */
         auto clipped = [&](Clip& c, int64_t n_out, int64_t n_in, rad_buf in, rad_buf tmp,
                            rad_buf out) {
             c.op_in  = rw(b, clamp(R, n_in, c.in_lo, c.in_hi), {in}, {tmp});
@@ -790,25 +508,15 @@ struct Model {
     rad_op op_mm = 0;           /* the media rows over their placeholders' embeddings */
 
     std::vector<Layer> layers;
-    Vision vis;
+    Gemma4Vision vis;
     Audio aud;
 };
 
 static Model g_model[MAX_RANKS];
 
-/* A value as a bf16 tensor holds it: round to nearest even on the top 16 bits of the f32. */
-static double bf16_round(double v) {
-    float f = (float)v;
-    uint32_t u;
-    std::memcpy(&u, &f, 4);
-    u = (u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u;
-    std::memcpy(&f, &u, 4);
-    return (double)f;
-}
-
-/* The layer schedule, read and not derived: layer_types is the checkpoint's statement of which
- * layers attend to the whole input, and a pattern assumed from the model card would build a model
- * that runs and pools the wrong function if a sibling checkpoint moved one. */
+/* The layer schedule, read rather than derived: layer_types states which layers attend to the
+ * whole input, and an assumed pattern would silently be wrong for a sibling checkpoint that
+ * differs. */
 static int read_schedule(const RadModelMeta* meta, int64_t n_layer, std::vector<int>* full) {
     const char* s = rad_meta_gets(meta, "layer_types", nullptr);
     if (!s || !*s) {
@@ -842,8 +550,8 @@ static int read_schedule(const RadModelMeta* meta, int64_t n_layer, std::vector<
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
     if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
-    /* A 270M encoder is a fraction of one card; splitting it would cost an all-reduce a layer to
-     * save nothing, so it is not offered. */
+    /* A 270M encoder fits easily on one card; tensor parallelism would only add an all-reduce per
+     * layer, so it is not offered. */
     if (ctx->world_size > 1) {
         fprintf(stderr, "radiance: embgemma2 runs on one card (--tp 1); the text model is 270M "
                         "parameters\n");
@@ -862,14 +570,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(read_schedule(meta, g.n_layer, &full));
 
     /* The two attention kinds. The sliding one is the config's top-level geometry; the full one
-     * overrides head width and KV heads per layer (per_layer_config), and every full layer of
-     * this checkpoint states the same override -- checked below, layer by layer. */
+     * overrides head width and KV heads per layer (per_layer_config), and every full layer must
+     * state the same override (checked below). */
     m.ks.head_dim  = g.head_dim;
     m.ks.n_head    = g.n_head;
     m.ks.n_head_kv = g.n_head_kv;
     m.ks.theta     = rad_meta_getf(meta, "rope_parameters.sliding_attention.rope_theta", 0.0);
-    /* A RADIUS in the reference (|i - j| <= sliding_window), and attn_dense's window is the
-     * strict bound, so one more. */
+    /* The reference's window is a radius (|i - j| <= sliding_window) and attn_dense's is a strict
+     * bound, so one more. */
     const int64_t radius = meta_int2(meta, "", "sliding_window", 0);
     m.ks.window = radius + 1;
     m.kf.n_head = g.n_head;
@@ -901,12 +609,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return RAD_E_INVAL;
     }
     const int64_t P = m.n_ple * g.n_layer;
-    /* ONE INPUT IS AT MOST ONE STEP (Request::embed), so the longest attention segment is the
+    /* One input is at most one step (Request::embed), so the longest attention segment is the
      * step's token budget. */
     const int64_t max_seg = T;
 
-    /* ---- activations. ple holds every layer's per-layer input for the whole step, read a
-     * column slice a layer. */
+    /* ---- activations. ple holds every layer's per-layer input for the whole step, read as one
+     * column slice per layer. */
     m.b_x     = decl_b(b, nm.f("x"),       RAD_BF16, {T, E});
     m.b_h     = decl_b(b, nm.f("h"),       RAD_BF16, {T, E});
     m.b_o     = decl_b(b, nm.f("o"),       RAD_BF16, {T, E});
@@ -923,9 +631,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_pooled= decl_b(b, nm.f("pooled"),  RAD_F32,  {g.max_seqs, m.n_out}, RAD_BUF_PERSIST);
     RAD_ARCH_TRY(rad_declare_pooled(b, m.b_pooled));
 
-    /* ---- the model-level weights. Every one at the checkpoint's own bf16, the norm gains
-     * included: the reference widens a gain to f32 at use, which is exact, so storing it wider
-     * buys nothing and costs reading it in place on the host backend. */
+    /* ---- the model-level weights, all at the checkpoint's bf16, norm gains included: the
+     * reference widens a gain to f32 at use, which is exact, and a wider stored copy could not be
+     * read in place on the host backend. */
     const char* L = "language_model";
     RAD_ARCH_TRY(map_copy(b, nm.f("token_embd.weight"), nm.ckpt("%s.embed_tokens.weight", L)));
     RAD_ARCH_TRY(map_copy(b, nm.f("ple_proj.weight"),
@@ -974,23 +682,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                       RAD_NOWEIGHTS);
     };
 
-    /* The embedding, scaled by sqrt(hidden) AS THE REFERENCE ROUNDS IT: the scale is a bf16
-     * buffer, so sqrt(512) = 22.6274 multiplies as 22.625. */
-    const double escale = bf16_round(std::sqrt((double)E));
+    /* The embedding, scaled by sqrt(hidden) rounded as the reference rounds it (a bf16 buffer):
+     * sqrt(512) = 22.6274 multiplies as 22.625. */
+    const double escale = rad_bf16_to_f32(rad_f32_to_bf16((float)std::sqrt((double)E)));
     m.op_embed = rw(b, RAD_OP(b, "embed_lookup",
                         RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n_embd", E),
                                    RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
                                    RAD_INT("vocab_offset", 0), RAD_F64("mult", escale)),
                         RAD_WEIGHTS(m.w_tok)),
                     {}, {m.b_x});
-    /* THE PER-LAYER INPUTS: the embedding projected to n_layer x n_ple and RMS-normed per layer.
-     * The reference scales the projection by hidden^-0.5 before the norm; an RMS norm of s*x with
-     * eps is exactly the norm of x with eps / s^2, which is what this declares, so the scale is
-     * applied without the extra bf16 rounding of s*x the reference pays. */
-    /* A media part's rows over its placeholders' embeddings, before anything reads them: the
-     * per-layer inputs are projected from what the model embeds, and for an image token that is
-     * its image row (declared only when a tower is). */
-    if ((Vision::present(meta) && ctx->max_enc_patches > 0) ||
+    /* The per-layer inputs: the embedding projected to n_layer x n_ple and RMS-normed per layer.
+     * The reference scales the projection by hidden^-0.5 before the norm; the RMS norm of s*x with
+     * eps equals the norm of x with eps / s^2, which is what is declared, avoiding the bf16
+     * rounding of s*x. */
+    /* A media part's rows overwrite its placeholders' embeddings before anything reads them, so an
+     * image token's per-layer inputs come from its image row (declared only with a tower). */
+    if ((Gemma4Vision::present(meta) && ctx->max_enc_patches > 0) ||
         (Audio::present(meta) && ctx->max_audio_frames > 0))
         m.op_mm = rw(b, RAD_OP(b, "scatter_rows",
                                RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E),
@@ -1106,7 +813,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                              RAD_NOWEIGHTS),
                    {m.b_proj}, {m.b_pooled});
 
-    RAD_ARCH_TRY(m.vis.declare(b, meta, ctx, nm, E, (int)g.n_layer));
+    RAD_ARCH_TRY(m.vis.declare(b, meta, ctx, nm, E, (int)g.n_layer, "", "embgemma2"));
     RAD_ARCH_TRY(m.aud.declare(b, meta, ctx, nm, E,
                                (int)g.n_layer + (int)m.vis.L.size()));
 
@@ -1123,11 +830,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     return RAD_OK;
 }
 
-/* Before declare: the vision tower's pooling window, so a pass size the core picks itself is a
- * whole number of them. */
+/* Before declare: the vision tower's pooling window, so a pass size the core picks is a whole
+ * number of windows. */
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
-    if (Vision::present(meta)) {
+    if (Gemma4Vision::present(meta)) {
         const int64_t k = rad_meta_geti(meta, "vision_config.pooling_kernel_size", 0);
         if (k > 0) out->enc_merge = k * k;
     }

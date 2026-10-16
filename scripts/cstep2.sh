@@ -1,10 +1,10 @@
 #!/bin/sh
-# STEADY-STATE decode step time at concurrency, against a LIVE server (no restart).
+# Steady-state decode step time at each concurrency, against a running server.
 #
-# ignore_eos pins every sequence to the same length so none retires mid-window; we wait until
-# exactly C are RUNNING, sample the counters across a window in the middle, and re-check the
-# count at the end -- a window whose edges carry fewer than C sequences reports a step time that
-# is not any concurrency's. Model-agnostic: P= picks the port.
+# ignore_eos fixes every sequence's length so none retires mid-window. The script waits until
+# exactly C are running, samples the counters over a window in the middle and re-checks the count
+# at the end; a window with fewer than C sequences at either edge measures no single concurrency.
+# Model-agnostic; P= picks the port.
 P=${P:-8100}
 U="http://127.0.0.1:$P"
 LEVELS="${LEVELS:-1 2 3 4 5 6 8}"

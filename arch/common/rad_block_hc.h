@@ -1,13 +1,12 @@
-/* rad_block_hc.h -- the GATED RESIDUAL, which is what Qwen4-Exp has instead of a pre-norm and a
- * residual add.
+/* rad_block_hc.h -- the gated residual (hyper-connection) Qwen4-Exp uses instead of a pre-norm
+ * and a residual add.
  *
  * ============================== THE RESIDUAL STREAM IS `hc` TIMES AS WIDE ==============================
  *
- * hidden_size 2560 at hc_count 4 is a 10240-wide stream. It is entered as FOUR IDENTICAL COPIES of
- * the embedding, carried through all 48 layers, and collapsed once at the end by a connection with
- * no write half. Every block -- attention or delta net, then the feed-forward, so 96 of them --
- * reads a 2560 mix of the four streams and writes its output back into all four, and both halves
- * are data-dependent:
+ * hidden_size 2560 at hc_count 4 gives a 10240-wide stream, entered as four identical copies of
+ * the embedding, carried through all 48 layers, and collapsed at the end by a connection with no
+ * write half. Each of the 96 blocks (attention or delta net, then feed-forward) reads a 2560 mix
+ * of the four streams and writes its output back into all four; both halves are data-dependent:
  *
  *     read    N      = grouped_rmsnorm(h)    one rsqrt per 2560 stream, one 10240 gain, `1 + w`
  *             g      = sigmoid(mix_up @ silu(mix_down @ N / hc))
@@ -15,37 +14,21 @@
  *             inj[s] = 2 * sigmoid(inject_w[s] . N / hc)              -> four scalars in (0, 2)
  *     write   h[s]  += inj[s] * y                                     for each stream s
  *
- * docs/OPS.md's `hc_read` / `hc_write` rows carry the same statement and name the three choices a
- * second implementation has to match (the mix is a MEAN; each gate argument has its own `/ hc`;
- * the write adds into the UNNORMED stream).
+ * docs/OPS.md's `hc_read` / `hc_write` rows state the same and name what a second implementation
+ * must match: the mix is a mean, each gate argument has its own `/ hc`, and the write adds into
+ * the unnormed stream.
  *
- * ============================== WHY IT IS A BLOCK AND NOT TWO CALLS ==============================
+ * One struct declares both halves because they share weights and buffers and must pair: each
+ * write consumes the `inj` of its own read.
  *
- * Because the two halves share a weight set and a buffer set, and because the pairing is the
- * invariant: a read whose `inj` nothing consumes is a bug, and a write whose `inj` came from a
- * different read is a worse one. One struct declares both, holds the four weights once, and gives
- * the plugin a `read()` and a `write()` that cannot be mismatched.
+ * Cost: the arithmetic is small (2 x 10240 x 320 + 4 x 10240 = 6.6M MACs per token, about one
+ * expert pair); the cost is launches, 96 connections per step. So the read emits the fp8 form of
+ * `x` itself instead of a following `quant_act_fp8`, and the write could later be folded into the
+ * producing block's epilogue.
  *
- * ============================== WHAT IT COSTS, AND WHERE THAT GOES ==============================
- *
- * The arithmetic is nothing: 2 x 10240 x 320 plus 4 x 10240 is 6.6M MACs a token against the 5.9M
- * of one expert pair. The LAUNCHES are the cost. A kernel costs a dispatch whatever it computes,
- * and there are 96 connections a step, so every extra op in a connection is 96 more dispatches --
- * a real share of a decode budget measured in tens of milliseconds.
- *
- * That is why the read emits the fp8 form of `x` itself rather than leaving a `quant_act_fp8`
- * behind it, and it is why the write is a candidate to be FOLDED INTO THE PRODUCING BLOCK'S
- * EPILOGUE later (this tree's own rule: fold the quantiser into the producer, and quantise the
- * bf16 that was written). Neither the read's five ops nor the write's one are on the table as
- * separate launches.
- *
- * ============================== WHAT IS NOT SHARDED ==============================
- *
- * Nothing here. The residual stream is replicated on every rank (spec §9) and so is every weight
- * in this file: 6.7 MB a connection at bf16, 1.3 GB over the model, which is the price of not
- * putting a collective inside the connection. A sharded low-rank gate would need an all-reduce
- * between `mix_down` and `mix_up` -- 96 more collectives a step, on 1280 bytes each, and a decode
- * all-reduce is mostly fixed cost whatever the message.
+ * Nothing is sharded: the residual stream is replicated (spec §9), and so are these weights
+ * (6.7 MB per connection at bf16, 1.3 GB over the model). Sharding the low-rank gate would add an
+ * all-reduce between `mix_down` and `mix_up`, 96 more small collectives per step.
  */
 #ifndef RAD_BLOCK_HC_H
 #define RAD_BLOCK_HC_H
@@ -55,12 +38,9 @@
 namespace rad {
 namespace arch {
 
-/* THE WIDE STREAM'S FIRST VALUE: hc identical copies of the embedding.
- *
- * One launch for the whole step, and it is its own op rather than part of the embedding lookup
- * because that op's weight is [vocab, n_embd] and its output width is n_embd -- a wide output
- * would be a different weight shape. The copies are identical here and diverge at the first
- * connection, since every block writes into all hc streams with a DIFFERENT per-branch gain. */
+/* Initialises the wide stream with hc identical copies of the embedding, one launch per step.
+ * Separate from the embedding lookup, whose output width is n_embd. The copies diverge at the
+ * first write, which uses a different gain per stream. */
 struct HcEnter {
     Geom    g{};
     int64_t hc = 0;
@@ -87,31 +67,32 @@ struct HyperConn {
     struct Config {
         int64_t hc      = 0;    /* streams; the reference refuses hc <= 1 and so does this */
         int64_t lowrank = 0;    /* the read gate's waist */
-        /* Whether this connection has a WRITE half. The final mixer does not: it collapses the
-         * wide stream into the one hidden state the lm_head reads and nothing follows it. */
+        /* Whether the connection has a write half. The final mixer does not: it collapses the
+         * stream into the hidden state the lm_head reads. */
         int     inject  = 1;
-        /* Whether the read also emits the block input's fp8 codes. The trunk connections all do;
-         * the mixer does not, because its consumer is the lm_head, which reads a bf16 input. */
+        /* Whether the read also emits the block input's fp8 codes. Not for the final mixer, whose
+         * consumer (the lm_head) reads bf16. */
         int     quant   = 1;
-        /* Whether the WRITE also carries the all-reduce of the block's output, which the block in
-         * front then skips on every step takes_ar() answers yes to. The block's partial sum and the
-         * write's input are the same buffer, so the reduction moves into the write's kernel and
-         * the pair's second launch disappears. */
+        /* Whether the write also performs the all-reduce of the block's output; the block then
+         * skips its own on every step takes_ar() accepts. The block's partial sum is the write's
+         * input buffer, so this saves a launch. */
         int     reduce  = 0;
-        /* Whether the read also emits the HADAMARD-ROTATED fp8 codes of the block input, for a
-         * consumer whose weight carries the rotation (MoeFP8's rotated expert plane). They ride in
-         * the plain codes' finisher, so this needs `quant`, and the consumer then declares no
-         * quantiser of its own -- one dependent launch fewer a connection. */
+        /* Whether the read also emits Hadamard-rotated fp8 codes of the block input, for a
+         * consumer whose weight carries the rotation (MoeFP8's rotated expert plane). Produced in
+         * the plain codes' finisher, so requires `quant`; the consumer declares no quantiser. */
         int     rotate  = 0;
-        /* Whether those codes are INT8 (the input's q8/s8 pair) rather than E4M3 (q/s): a model
-         * whose trunk linears are int8 (LinearFP8::i8) reads them there, so the read writing them
-         * is one quantiser launch fewer a consumer. The rotated twin stays E4M3 either way -- it
-         * is the routed experts' operand. */
+        /* Whether the plain codes are int8 (q8/s8) rather than E4M3 (q/s), for int8 trunk linears
+         * (LinearFP8::i8). The rotated codes stay E4M3, the routed experts' operand. */
         int     codes_i8 = 0;
+        /* The most rows one read is declared for, 0 for max_tok; a wider step reads in pieces
+         * (read_pieces). The read's scratch is sized for its band (some 22 KiB a row at
+         * Flash-Next's shape, on every lane with a scratch region), so a model that reads a wider
+         * step in pieces anyway declares the band no wider than a piece. */
+        int64_t read_rows = 0;
     };
 
     struct Wire {
-        rad_buf h   = 0;    /* [max_tok, hc * n_embd]  THE WIDE STREAM, in place */
+        rad_buf h   = 0;    /* [max_tok, hc * n_embd]  the wide stream, updated in place */
         ActFP8  x{};        /* [max_tok, n_embd]       the block input; q/s unused if !quant */
         rad_buf inj = 0;    /* [max_tok, hc]           the per-branch write gains */
         rad_buf rq  = 0;    /* [max_tok, n_embd]       the rotated codes, when `rotate` */
@@ -130,21 +111,20 @@ struct HyperConn {
     Wire   w{};
 
     rad_weight w_norm = 0, w_down = 0, w_up = 0, w_inj = 0;
-    /* Whether the two mixing matrices are E4M3 rows with a scale a group of each row rather than
-     * bf16 -- OPS.md's `mix` -- which is their encoding's to say, read at declare. */
+    /* Whether the mixing matrices are E4M3 rows with a per-group scale rather than bf16 (OPS.md's
+     * `mix`), read from their encoding at declare. */
     bool       mix_e4m3 = false;
     rad_op     op_read = 0, op_write = 0;
-    /* The write with the all-reduce folded in; 0 when not asked for or when no kernel serves it.
-     * `op_ar_write6` is the same write on the ROTATED 6-BIT wire, declared only where a step can
-     * reach that wire -- an install that accepts a lossy payload -- and issued on exactly the steps
-     * ar_wire_is_exact answers no to: at a prefill chunk that is every all-reduce the trunk makes,
-     * and the payload is 2.6x smaller than the exact one. */
+    /* The write with the all-reduce folded in; 0 when not requested or not served.
+     * `op_ar_write6` is the same on the rotated 6-bit wire, declared only when a lossy payload is
+     * accepted and issued on the steps ar_wire_is_exact rejects (every trunk all-reduce at a
+     * prefill chunk); its payload is 2.6x smaller. */
     rad_op     op_ar_write = 0;
     rad_op     op_ar_write6 = 0;
-    /* AND WITH THE MoE GATHER FOLDED IN FRONT OF THAT: the block behind this write leaves its
-     * routed experts' rows unsummed, and the reduction's message is their sum. Declared by
-     * declare_gather() after the block, whose buffers it reads; `gather_rows` is the bound it serves
-     * and 0 when it was not declared or no kernel serves it (see gather_taken). */
+    /* The same with the MoE gather folded in front: the block leaves its routed experts' rows
+     * unsummed, and the reduction's message is their sum. Declared by declare_gather() after the
+     * block, whose buffers it reads; `gather_rows` is its bound, 0 when not declared or not
+     * served (see gather_taken). */
     struct GatherSrc {
         rad_buf ye = 0, ew = 0, sorted = 0, sh = 0, sg = 0;   /* sh and sg: the shared arm, or 0 */
         int64_t top_k = 0;
@@ -155,17 +135,17 @@ struct HyperConn {
     int64_t    gather_rows = 0, gather_rows6 = 0;
 
     int64_t hn() const { return c.hc * g.n_embd; }
-    /* THE REDUCING WRITE THIS STEP ISSUES, on the wire its message goes out on; 0 where that wire
-     * has no fused form, and the block's own collective then runs in front of the plain write. At
-     * four ranks there is no rotated form, so a step ar_exact_write_takes declines gets 0. */
+    /* The reducing write for this step's wire, or 0 when that wire has no fused form (then the
+     * block's own collective runs before the plain write). At four ranks there is no rotated
+     * form, so steps ar_exact_write_takes declines get 0. */
     rad_op ar_write(int64_t T) const {
         return ar_exact_write_takes(g, T) ? op_ar_write : op_ar_write6;
     }
-    /* WHETHER THIS STEP'S WRITE REDUCES THE BLOCK'S OUTPUT. The block in front asks the same
-     * question of the same T -- ar_taken with ar_take() -- before skipping its own collective. */
+    /* Whether this step's write reduces the block's output. The block asks the same of the same T
+     * (ar_taken with ar_take()) before skipping its own collective. */
     bool takes_ar(int64_t T) const { return ar_write(T) != 0; }
-    /* What that block is told: which wires this write takes. The rotated form is declared only
-     * beside the exact one, so the two together take every message. */
+    /* Which wires this write takes, for the block. The rotated form exists only beside the exact
+     * one, so together they take every message. */
     int ar_take() const { return op_ar_write6 ? kArOutBoth : kArOutExact; }
     bool takes_gather(int64_t T) const {
         return takes_ar(T) && gather_taken(g, T, gather_rows, gather_rows6);
@@ -179,6 +159,16 @@ struct HyperConn {
 
     void read (RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const;
     void write(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const;
+    /* The read over rows [0, T), in pieces of Config::read_rows where it is set; one read
+     * otherwise. The read's down product splits K by how many row tiles it is handed
+     * (hc_down_kchunk in libr4d), so one read over twice the rows sums in a different order than
+     * two reads over half of them; reading a wide step in pieces computes what the narrower steps
+     * did. */
+    void read_pieces(RadCtx* c_, int64_t T) const {
+        const int64_t piece = c.read_rows;
+        if (piece <= 0 || T <= piece) { read(c_, T, 0, T); return; }
+        for (int64_t r0 = 0; r0 < T; r0 += piece) read(c_, T, r0, T - r0 < piece ? T - r0 : piece);
+    }
 };
 
 inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const char* name,
@@ -191,9 +181,7 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
         return RAD_E_INVAL;
     }
     if (!src.norm || !src.mix_down || !src.mix_up) return RAD_E_INVAL;
-    /* An inject WEIGHT with no `inj` buffer, or the reverse, is a connection whose two halves
-     * disagree about whether there is a write. Refused here rather than discovered as an
-     * all-rejected draft three stages later. */
+    /* The inject weight and the `inj` buffer must both be present or both absent. */
     if (c.inject && (!src.inject_w || !w.inj)) {
         fprintf(stderr, "radiance: %s: inject is on but %s is missing\n", name,
                 src.inject_w ? "the inj buffer" : "block_inject_weight");
@@ -214,7 +202,7 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
 
     const int64_t HN = hn();
 
-    /* The name maps first: they are how the model is asked what each weight is. */
+    /* Maps first: weight encodings are looked up through them. */
     const char* nn = nm.f("%s_norm.weight", name);
     const char* dn = nm.f("%s_down.weight", name);
     const char* un = nm.f("%s_up.weight", name);
@@ -224,10 +212,9 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
     RAD_ARCH_TRY(map_copy(b, un, src.mix_up));
     if (c.inject) RAD_ARCH_TRY(map_copy(b, in, src.inject_w));
 
-    /* THE MIXING MATRICES ARE WHATEVER THEIR ENCODING IS: bf16, or E4M3 rows with a scale a
-     * group of each row -- lowrank 320 is 2.5 scale blocks, so a 128x128 tile cannot cover them.
-     * Each is declared over every plane it has, at the codes' dtype, and the read's kernel takes
-     * codes and scales together. The two are one format or the read has no kernel. */
+    /* The mixing matrices are bf16 or E4M3 rows with a per-group scale (lowrank 320 is 2.5 scale
+     * blocks, so 128x128 tiles do not fit). Each is declared over all its planes at the codes'
+     * dtype; both must share one format for the read kernel. */
     const uint32_t mdt = weight_codes_dtype(b, dn, RAD_BF16);
     if (weight_codes_dtype(b, un, RAD_BF16) != mdt || (mdt != RAD_BF16 && mdt != RAD_F8E4M3)) {
         fprintf(stderr, "radiance: %s: the mixing matrices are %s and %s; a connection reads both "
@@ -237,8 +224,7 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
     }
     mix_e4m3 = mdt == RAD_F8E4M3;
 
-    /* F32 like every other norm gain in this tree: 10240 numbers read once a connection, and the
-     * norm's arithmetic is f32 regardless, so narrowing them buys nothing. */
+    /* F32 like every norm gain in this tree. */
     w_norm = decl_w(b, nn, RAD_F32, {HN}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
     w_down = decl_w(b, dn, mdt, {c.lowrank, HN}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
                     grp_model());
@@ -249,21 +235,16 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
                        grp_model());
     if (!w_norm || !w_down || !w_up || (c.inject && !w_inj)) return RAD_E_INVAL;
 
-    /* `inject` and `group` are declared even when off, with the value 0, because a kernel row
-     * bands on them: a fused read that writes four gates is a different kernel from one that does
-     * not, and the resolver needs to be able to say so. An ABSENT key fails a constraint, so
-     * leaving them out would make both rows unselectable rather than one. */
-    /* RAD_WEIGHTS expands to TWO arguments -- the array and its length -- so it cannot sit in a
-     * ternary, and the four-or-three choice is made by building the array. The absent inject
-     * weight is a SHORTER list and not a zero handle: rad_plugin.h's absent-operand rule is about
-     * the launch, but a declared weight of 0 is a declaration failure here. */
+    /* `inject` and `group` are declared as 0 when off, not omitted: kernel rows constrain them, and
+     * an absent key fails every constraint.
+     *
+     * RAD_WEIGHTS expands to two arguments, so the weight list is built as an array. A missing
+     * inject weight shortens the list; a zero weight handle would be a declaration failure. */
     const rad_weight wts[4] = { w_norm, w_down, w_up, w_inj };
     const int n_wts = c.inject ? 4 : 3;
 
-    /* The write set is positional and the optional OUTPUTS are the tail, so an absent one shortens
-     * the list exactly as an absent weight does. The read's outputs are x, inj?, q?, scale? and
-     * both switches drop a suffix, never a middle -- which is why the schema puts inj before the
-     * quantiser's pair rather than after. */
+    /* Outputs are x, inj?, codes?, scales?, rotated pair?. The write set is positional with
+     * optional outputs at the tail, so an absent one shortens the list. */
     rad_buf wr[6] = { w.x.x, 0, 0, 0, 0, 0 };
     int n_wr = 1;
     if (c.inject) wr[n_wr++] = w.inj;
@@ -271,7 +252,9 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
     if (c.rotate) { wr[n_wr++] = w.rq;  wr[n_wr++] = w.rs; }
 
     op_read = RAD_OP(b, "hc_read",
-                  RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                  RAD_PARAMS(RAD_RANGE("M", 1, c.read_rows > 0 && c.read_rows < g.max_tok
+                                                   ? c.read_rows : g.max_tok),
+                             RAD_INT("n", g.n_embd),
                              RAD_INT("hc", c.hc), RAD_INT("lowrank", c.lowrank),
                              RAD_F64("eps", g.eps), RAD_STR("dtype", g.dtype),
                              RAD_F64("wadd", g.wadd), RAD_INT("inject", c.inject ? 1 : 0),
@@ -293,12 +276,9 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
                          RAD_NOWEIGHTS),
                      {w.x.x, w.inj, w.h}, {w.h});
         if (!op_write) return RAD_E_INVAL;
-        /* A handle that did not resolve is 0 and not an error: a backend without the fused kernel
-         * keeps the pair, and takes_ar() then answers no on every step. At four ranks only the
-         * exact form exists, declared over the decode and verify steps' rows and taken where
-         * ar_wide_write_exact says so. The exact form states `wire` 0 rather than leaving it out:
-         * a row that serves one wire only says so with a constraint on `wire`, and a constraint on
-         * an absent key does not hold. */
+        /* An unresolved handle is 0, not an error: without the fused kernel the pair runs and
+         * takes_ar() always answers no. At four ranks only the exact form exists, declared over the
+         * decode and verify rows. `wire` 0 is stated, not omitted, because rows constrain it. */
         const int64_t ar_rows = ar_exact_write_rows(g);
         if (c.reduce && ar_rows >= 1)
             op_ar_write = rw(b, RAD_OP(b, "ar_hc_write",
@@ -307,9 +287,9 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
                                            RAD_STR("dtype", g.dtype), RAD_INT("wire", 0)),
                                 RAD_NOWEIGHTS),
                              {w.x.x, w.inj, w.h}, {w.x.x, w.h});
-        /* The rotated form at two ranks only: the op has no four-rank form on that wire
-         * (docs/OPS.md), and an op declared that nothing resolves is reported at startup as a
-         * band a request cannot run in. */
+        /* The rotated form at two ranks only: there is no four-rank form on that wire
+         * (docs/OPS.md), and an unresolvable op would be reported at startup as an unservable
+         * band. */
         if (op_ar_write && !g.wire_exact && g.world == 2)
             op_ar_write6 = rw(b, RAD_OP(b, "ar_hc_write",
                                  RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
@@ -323,26 +303,22 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
 
 inline int HyperConn::declare_gather(RadBuilder* b, const GatherSrc& src) {
     if (!op_ar_write || src.top_k <= 0 || !src.ye || !src.ew || !src.sorted) return RAD_OK;
-    /* Two ranks, and four on the exact wire: there the fused write exists in its exact form only,
-     * so the gather does too -- op_ar_write6 is 0 at four and the rotated form below is never
-     * declared. Any other width keeps its gather and both bounds stay 0. */
+    /* Two or four ranks. At four only the exact form exists (op_ar_write6 is 0). Other widths keep
+     * the block's own gather and both bounds stay 0. */
     if (g.world != 2 && g.world != 4) return RAD_OK;
     const bool shared = src.sh && src.sg;
     gsrc = src;
-    /* EVERY ROW COUNT ONE PASS CARRIES, up to the rows the write itself was declared for
-     * (ar_exact_write_rows): prefill chunks included at two ranks, the decode and verify steps at
-     * four. The kernel reads its slots from an LDS table at a decode step and from an inverse
-     * table at a chunk, where the gather's reads then run beside the reduction's push instead of
-     * in a launch of their own. */
+    /* Up to one pass's rows, capped at the write's own bound (ar_exact_write_rows): prefill chunks
+     * at two ranks, decode and verify steps at four. The kernel reads its slots from an LDS table
+     * at decode and from an inverse table at a chunk. */
     int64_t rows = src.rows;
     const int64_t ar_rows = ar_exact_write_rows(g);
     if (rows > ar_rows) rows = ar_rows;
     if (rows < 1) return RAD_OK;
     const rad_buf rd[8] = { src.ye, src.ew, src.sorted, w.x.x, w.inj, w.h, src.sh, src.sg };
     const rad_buf wr[2] = { w.x.x, w.h };
-    /* One op a wire, as the write itself: the rotated form beside the rotated write only. A handle
-     * that did not resolve is 0 and not an error: the block keeps its gather and this write keeps
-     * the reduction alone, and that wire's bound stays 0 so both say so. */
+    /* One op per wire, the rotated form only beside the rotated write. An unresolved handle is 0:
+     * the block keeps its gather and that wire's bound stays 0. */
     op_ar_gather_write = RAD_OP(b, "ar_gather_hc_write",
                                 RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", g.n_embd),
                                            RAD_INT("hc", c.hc), RAD_INT("top_k", src.top_k),
@@ -389,9 +365,9 @@ inline void HyperConn::read(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) con
                 c.rotate ? brow_slice(w.rs, r0, rows, fp8_blocks(g.n_embd)) : RAD_NONE);
 }
 
-/* `y` is the block's output, and it is `w.x.x` -- the same buffer the read wrote the block's INPUT
- * into. Every block in this tree leaves its delta in the activation its norm produced, so the
- * write reads it there; the input is dead by then. */
+/* The block's output `y` is read from `w.x.x`, the buffer the read wrote the block's input to:
+ * every block leaves its delta in the activation its norm produced, and the input is dead by
+ * then. */
 inline void HyperConn::write(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const {
     if (!op_write) return;
     if (takes_gather(T)) {

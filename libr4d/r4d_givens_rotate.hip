@@ -1,30 +1,27 @@
-// ParoQuant's rotation, to f16: the channel scale and Givens stages applied to a bf16 activation, for the
-// 16-bit-activation GEMMs (w5a16 / w4a16_asym, rows up to 64 -- decode). The weight it pairs with is stored
-// as v = w . D . G_1 ... G_S (abi/rad_encoding.h, "givens"), so the product <v, x'> with
-// x' = x . D^-1 . G_1 ... G_S is <w, x>: the rotation is the activation's to do, once a token, and the
-// weight is read by the GEMM unchanged. The quantising form, for prefill-sized rows and for MXFP4, is
+// ParoQuant's rotation to f16: the channel scale and Givens stages applied to a bf16 activation,
+// for the 16-bit-activation GEMMs (w5a16 / w4a16_asym, rows up to 64, i.e. decode). The weight is
+// stored as v = w . D . G_1 ... G_S (abi/rad_encoding.h, "givens"), so with
+// x' = x . D^-1 . G_1 ... G_S, <v, x'> = <w, x>: the activation is rotated once a token and the
+// GEMM reads the weight unchanged. The quantising form, for prefill-sized rows and MXFP4, is
 // r4d_givens_dense.hip.
 //
-// WHY THE ROTATION IS A GROUP AT A TIME. ParoQuant's pairs never leave a group of 128 columns -- that is
-// how the checkpoint is trained, and the converter and the loader (r4d_rad_relayout_givens_pairs) refuse
-// one that does -- so a group is a closed system:
-// its 128 values are rotated by S stages of 64 disjoint pairs. A wave owns a group. The values sit in LDS
-// (128 floats a wave, no barrier needed: a wave's LDS accesses are in order, and the pairs of a stage are
-// disjoint so no two lanes touch one address) and each lane takes two pairs a stage.
+// A group at a time: ParoQuant's pairs never leave a group of 128 columns (the checkpoint is
+// trained that way, and the converter and loader, r4d_rad_relayout_givens_pairs, refuse one that
+// does), so a group's 128 values are rotated by S stages of 64 disjoint pairs. A wave owns a group,
+// held in LDS (128 floats a wave). No block barrier is needed: a wave's LDS accesses are in order
+// and a stage's pairs are disjoint, so no two lanes touch one address. Each lane takes two pairs
+// per stage.
 //
-// PARTS. A fused projection (gate|up, q|k|v) was rotated per piece, so a row yields `parts` rotated
-// copies, side by side: y is [M, parts * K]. A (part, group) pair is one unit of work, one wave's (a row
-// is several blocks, grid.y). The tables stack the parts as the "givens" encoding does -- stages rows each
-// of pairs and angle, one row of channel scales.
+// Parts: a fused projection (gate|up, q|k|v) is rotated per piece, so a row yields `parts` rotated
+// copies side by side: y is [M, parts * K]. A (part, group) is one wave's work (a row spans several
+// blocks, grid.y). The tables stack the parts as the "givens" encoding does: `stages` rows each of
+// pairs and angle, one row of channel scales.
 //
-// THE CHANNEL SCALE IS A DIVIDE, because the encoding's t.scale is the factor the stored row was
-// multiplied by (D), and the activation takes its inverse. A true IEEE divide on both sides: the
-// reference (libref) divides in f32 too, so the two agree on this step exactly.
+// The channel scale is a true IEEE divide: t.scale is the factor D the stored row was multiplied
+// by, and libref also divides in f32, so the two agree exactly on this step. Cos and sin are
+// computed here in f32 from the stored angle (sincosf, an ulp or two, as libref's libm).
 //
-// COS AND SIN ARE COMPUTED HERE, in f32, from the stored angle: sincosf is accurate to an ulp or two,
-// which is also what libref's libm is.
-//
-// Returns a negative code rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
+// Returns a negative code instead of throwing, for the reason given in r4d_gemm_fp8a8.hip.
 
 #include "r4d.h"
 #include "r4d_emit.h"
@@ -39,10 +36,9 @@ constexpr uint32_t kWaves = kThreads / kWave;
 constexpr uint32_t kGroup = 128;
 constexpr uint32_t kPairsPerLane = kGroup / 2 / kWave;      // 2
 
-// kPre stages' tables are loaded and their angles' sine and cosine taken BEFORE the first of them is
-// applied, so the dependent chain a stage would otherwise be -- table load, LDS read, rotate, LDS
-// write -- overlaps its neighbours' loads. At decode (M of a handful of rows) the kernel is latency
-// and not bandwidth: a row is 40 groups of 128 and each group is eight serial stages.
+// kPre stages' tables are loaded and their sines and cosines taken before the first is applied, so
+// each stage's dependent chain (table load, LDS read, rotate, LDS write) overlaps its neighbours'
+// loads. At decode it is latency bound: a row is 40 groups of 128, each eight serial stages.
 constexpr uint32_t kPre = 8;
 
 __device__ __forceinline__ void wave_sync() {
@@ -51,10 +47,10 @@ __device__ __forceinline__ void wave_sync() {
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
 }
 
-// One wave rotates one (part, group) of one row: grid.x is the row, and grid.y spreads a row's
-// `parts * nkb` groups over blocks of kWaves waves -- one group a wave, so a row is several blocks and a
-// decode step of a few rows still fills the part. A wave that has no group returns at once; nothing in
-// the kernel is a block barrier. The rotated row is written as f16 into `y`, y_ld elements a row.
+// One wave rotates one (part, group) of one row: grid.x is the row and grid.y spreads the row's
+// `parts * nkb` groups over blocks of kWaves waves, so a decode step of a few rows still fills the
+// part. A wave with no group returns at once; there is no block barrier. The rotated row is
+// written as f16 into `y`, y_ld elements a row.
 __global__ __launch_bounds__(kThreads) void givens_rotate_kernel(
     const uint16_t* __restrict__ x, const int32_t* __restrict__ pairs,
     const float* __restrict__ angle, const float* __restrict__ rscale, uint16_t* __restrict__ y,
@@ -119,8 +115,8 @@ __global__ __launch_bounds__(kThreads) void givens_rotate_kernel(
 
     const float4 r = *(const float4*)(buf + lane * 4u);
     const float v[4] = { r.x, r.y, r.z, r.w };
-    // f16 holds +-65504; a rotated post-norm row is orders below that, and the clamp keeps an outlier
-    // finite instead of inf
+    // f16 holds +-65504; a rotated post-norm row is far below that, and the clamp keeps an outlier
+    // finite.
     union { __half h[4]; uint2 u; } o;
 #pragma unroll
     for (int j = 0; j < 4; ++j) o.h[j] = __float2half(fminf(fmaxf(v[j], -65504.0f), 65504.0f));
@@ -136,7 +132,7 @@ __global__ __launch_bounds__(kThreads) void givens_rotate_kernel(
 //   y       [M][parts*K]         f16
 enum { GV_X = 0, GV_PAIRS = 1, GV_ANGLE = 2, GV_RSCALE = 3, GV_Y = 4 };
 
-static int givens_rotate_body(const RadArgs* a, const R4dSink& sk) {
+extern "C" int r4d_rad_givens_rotate(const RadArgs* a, RadStream stream) {
     const RadTensor* x  = r4d_opt(a, GV_X);
     const RadTensor* pr = r4d_opt(a, GV_PAIRS);
     const RadTensor* an = r4d_opt(a, GV_ANGLE);
@@ -159,16 +155,16 @@ static int givens_rotate_body(const RadArgs* a, const R4dSink& sk) {
     if (pr->shape[0] != parts * stages || pr->shape[1] != K) return R4D_NO(RAD_E_SHAPE);
     if (an->shape[0] != parts * stages || an->shape[1] != K / 2) return R4D_NO(RAD_E_SHAPE);
     if (rs->shape[0] != parts || rs->shape[1] != K) return R4D_NO(RAD_E_SHAPE);
-    if (!r4d_aligned(rs->data, 16) || !r4d_aligned(pr->data, 8) || !r4d_aligned(y->data, 4))
+    // A lane stores four f16 (8 bytes) at a time, so y's base and row pitch keep 8-byte alignment.
+    if (!r4d_aligned(rs->data, 16) || !r4d_aligned(pr->data, 8) || !r4d_aligned(y->data, 8))
         return R4D_NO(RAD_E_ALIGN);
     const long long xp = r4d_row_pitch(x), yp = r4d_row_pitch(y);
     if (xp < 0 || yp < 0) return R4D_NO(RAD_E_STRIDE);
+    if (yp % 4) return R4D_NO(RAD_E_ALIGN);
     const uint32_t gy = ((uint32_t)(parts * nkb) + kWaves - 1) / kWaves;
-    const int rc = R4D_EMIT(sk, givens_rotate_kernel, dim3((uint32_t)M, gy), dim3(kThreads), 0,
-                            (const uint16_t*)x->data, (const int32_t*)pr->data, (const float*)an->data,
-                            (const float*)rs->data, (uint16_t*)y->data, (uint32_t)K, (uint32_t)nkb,
-                            (uint32_t)parts, (uint32_t)stages, (uint32_t)(xp ? xp : K), (uint32_t)(yp ? yp : parts * K));
-    if (rc != RAD_OK) return rc;
-    return (!sk.desc && hipGetLastError() != hipSuccess) ? RAD_E_DEVICE : RAD_OK;
+    return R4D_EMIT(stream, givens_rotate_kernel, dim3((uint32_t)M, gy), dim3(kThreads), 0,
+                    (const uint16_t*)x->data, (const int32_t*)pr->data, (const float*)an->data,
+                    (const float*)rs->data, (uint16_t*)y->data, (uint32_t)K, (uint32_t)nkb,
+                    (uint32_t)parts, (uint32_t)stages, (uint32_t)(xp ? xp : K),
+                    (uint32_t)(yp ? yp : parts * K));
 }
-R4D_ENTRY(r4d_rad_givens_rotate, givens_rotate_body)

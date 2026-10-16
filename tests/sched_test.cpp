@@ -1,10 +1,5 @@
-/* sched_test.cpp -- the scheduler, the chunker, the step batch, the derivations and the draft
- * controller, against fakes for core/mem and for the device layer.
- *
- * The device fakes are WEAK, so wherever core/device/ is linked in its host backend wins at link
- * time and this file needs no edit; without it they are what lets a scheduler test run at all. The
- * KV manager and prefix cache are ordinary implementations of the interfaces in
- * core/sched/mem_iface.h -- see that header for what has to be reconciled with core/mem.
+/* sched_test.cpp -- the scheduler, chunker, step batch, derivations and draft controller, against
+ * fakes for core/mem and the device layer (sched_fakes.h).
  */
 #include "rad_test.h"
 
@@ -26,8 +21,8 @@ using namespace rad;
 
 /* ================================================================== allocation counter */
 /* The step path must not allocate. Counting through a replaced global operator new is the only
- * way to assert that and mean it: a review can miss a vector that grows on the ten-thousandth
- * request, and that is exactly the one that shows up as a latency spike nobody can reproduce. */
+ * reliable check: review can miss a vector that grows on the ten-thousandth request, which shows
+ * up as an unreproducible latency spike. */
 static long g_allocs = 0;
 static bool g_counting = false;
 
@@ -45,432 +40,33 @@ void* operator new(size_t n) {
     return p;
 }
 void* operator new[](size_t n) { return operator new(n); }
+/* The nothrow forms too (std::get_temporary_buffer uses them): left to the runtime, their blocks
+ * would reach the free() below, a mismatch under ASan, and their allocations would go uncounted. */
+void* operator new(size_t n, const std::nothrow_t&) noexcept {
+    if (g_counting) ++g_allocs;
+    return std::malloc(n ? n : 1);
+}
+void* operator new[](size_t n, const std::nothrow_t& t) noexcept { return operator new(n, t); }
+void  operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
+void  operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
 void  operator delete(void* p) noexcept { std::free(p); }
 void  operator delete[](void* p) noexcept { std::free(p); }
 void  operator delete(void* p, size_t) noexcept { std::free(p); }
 void  operator delete[](void* p, size_t) noexcept { std::free(p); }
 
-/* ================================================================== the device fakes */
-/* Weak, so a linked-in real host backend replaces them. Device memory is host memory here,
- * which is what makes the batch's device arrays readable below -- the assertions on cu_seqlens and
- * the slot mapping are reading exactly the bytes a kernel would. */
-extern "C" {
+#include "sched_fakes.h"
 
-__attribute__((weak)) void* rad_dev_alloc(int64_t bytes, int) {
-    return std::calloc(1, (size_t)(bytes > 0 ? bytes : 1));
-}
-__attribute__((weak)) void rad_dev_free(void* p, int) { std::free(p); }
+using namespace sched_fake;
 
-/* The builder binds a card before it allocates that rank's staging slab, because rad_dev_alloc has
- * no device argument. Stubbed here for the same reason the rest is -- and stubbed at all because a
- * MISSING one is worse than a wrong one: the linker would pull dispatch.cpp.o in to resolve it,
- * and that object's STRONG rad_dev_alloc/rad_memcpy_async would replace every weak fake above,
- * putting this test on the real HIP backend with the null stream it hands the scheduler. */
-__attribute__((weak)) int rad_dev_set(int) { return RAD_OK; }
-
-__attribute__((weak)) int rad_memcpy_async(void* d, const void* s, int64_t n, RadStream) {
-    if (n > 0) std::memcpy(d, s, (size_t)n);
-    return RAD_OK;
-}
-/* The builder zeroes the encoder rows of every rank but the first. */
-__attribute__((weak)) int rad_memset_async(void* d, int v, int64_t n, RadStream) {
-    if (n > 0) std::memset(d, v, (size_t)n);
-    return RAD_OK;
-}
-__attribute__((weak)) int rad_memcpy_ranges_async(void* d, const void* s, int64_t prefix,
-                                                  const RadCopyRange* r, int n, RadStream) {
-    if (prefix > 0) std::memcpy(d, s, (size_t)prefix);
-    for (int i = 0; i < n; ++i)
-        std::memcpy((char*)d + r[i].dst, (const char*)s + r[i].src, (size_t)r[i].bytes);
-    return RAD_OK;
-}
-__attribute__((weak)) int rad_memcpy_list_async(const RadCopySeg* g, int n, unsigned, RadStream) {
-    for (int i = 0; i < n; ++i)
-        if (g[i].bytes > 0) std::memcpy(g[i].dst, g[i].src, (size_t)g[i].bytes);
-    return RAD_OK;
-}
-__attribute__((weak)) int rad_link_hold(RadStream, int) { return RAD_OK; }
-__attribute__((weak)) void* rad_link_gate(RadStream) { return nullptr; }
-
-static int g_fake_event;
-__attribute__((weak)) int  rad_event_create(RadEvent* e) { *e = &g_fake_event; return RAD_OK; }
-__attribute__((weak)) int  rad_event_create_local(RadEvent* e) { *e = &g_fake_event; return RAD_OK; }
-__attribute__((weak)) int  rad_event_create_as(RadEvent* e, unsigned) { *e = &g_fake_event; return RAD_OK; }
-__attribute__((weak)) void rad_event_destroy(RadEvent) {}
-__attribute__((weak)) int  rad_event_record(RadEvent, RadStream) { return RAD_OK; }
-__attribute__((weak)) int  rad_event_sync(RadEvent) { return RAD_OK; }
-
-}  /* extern "C" */
-
-/* ================================================================== fake core/mem */
 namespace {
 
-/* A small but faithful block manager: a free list per group, refcounted blocks so an adopted
- * prefix-cache block is not returned to the pool while the cache still names it, and per-sequence
- * state slots for the linear and conv groups. Mirrors core/mem/kv.h's shape (sequence-keyed, the
- * manager owns the block tables) so the reconciliation is a rename and not a redesign. */
-struct FakeKV : IKVManager {
-    std::vector<KVGroupInfo> gs;
-    KVGeom geom;
-    int64_t max_ctx = 0;
-
-    std::vector<std::vector<int32_t>> freelist;    /* per group */
-    std::vector<std::vector<int32_t>> refcnt;      /* per group, per block */
-    std::vector<int64_t> total;
-    std::vector<std::vector<int32_t>> state_free;  /* per group */
-
-    struct Seq {
-        std::vector<std::vector<int32_t>> blocks;  /* per group */
-        std::vector<int32_t> state;                /* per group, -1 when not stateful */
-        int64_t n = 0;
-        /* Per group, the lowest table entry changed since take_table_changes last read it, kept
-         * as the real manager keeps it so the builder's partial restage is what these tests run. */
-        mutable std::vector<int64_t> dirty;
-    };
-    std::unordered_map<uint64_t, Seq> seqs;
-    static inline const std::vector<int32_t> kNone{};
-
-    void setup(const std::vector<KVGroupInfo>& groups, int64_t ctx,
-               int64_t blocks_per_paged_group, int64_t n_states) {
-        gs = groups;
-        geom = KVGeom::of(gs);
-        max_ctx = ctx;
-        freelist.assign(gs.size(), {});
-        refcnt.assign(gs.size(), {});
-        total.assign(gs.size(), 0);
-        state_free.assign(gs.size(), {});
-        for (size_t i = 0; i < gs.size(); ++i) {
-            if (geom.g[i].paged) {
-                total[i] = blocks_per_paged_group;
-                refcnt[i].assign((size_t)blocks_per_paged_group, 0);
-                for (int64_t b = blocks_per_paged_group - 1; b >= 0; --b)
-                    freelist[i].push_back((int32_t)b);
-            } else {
-                for (int64_t k = n_states - 1; k >= 0; --k) state_free[i].push_back((int32_t)k);
-            }
-        }
-    }
-
-    void retain(int32_t g, int32_t b) { ++refcnt[(size_t)g][(size_t)b]; }
-    void release(int32_t g, int32_t b) {
-        if (--refcnt[(size_t)g][(size_t)b] == 0) freelist[(size_t)g].push_back(b);
-    }
-    int32_t grab(int32_t g) {
-        int32_t b = freelist[(size_t)g].back();
-        freelist[(size_t)g].pop_back();
-        refcnt[(size_t)g][(size_t)b] = 1;
-        return b;
-    }
-
-    int64_t rows_for(int gi, int64_t n) const {
-        const KVGeom::G& e = geom.g[(size_t)gi];
-        return e.paged ? (n + e.block_size - 1) / e.block_size : 1;
-    }
-
-    int add_sequence(uint64_t id) override {
-        if (seqs.count(id)) return RAD_OK;
-        Seq q;
-        q.blocks.assign(gs.size(), {});
-        q.state.assign(gs.size(), -1);
-        q.dirty.assign(gs.size(), 0);
-        seqs.emplace(id, std::move(q));
-        return RAD_OK;
-    }
-    bool has_sequence(uint64_t id) const override { return seqs.count(id) != 0; }
-
-    void free_sequence(uint64_t id) override {
-        auto it = seqs.find(id);
-        if (it == seqs.end()) return;
-        for (size_t i = 0; i < gs.size(); ++i) {
-            if (geom.g[i].paged)
-                for (int32_t b : it->second.blocks[i]) release((int32_t)i, b);
-            it->second.blocks[i].clear();
-            if (it->second.state[i] >= 0) {
-                state_free[i].push_back(it->second.state[i]);
-                it->second.state[i] = -1;
-            }
-        }
-        seqs.erase(it);
-    }
-
-    int ensure(uint64_t id, int64_t n) override {
-        auto it = seqs.find(id);
-        if (it == seqs.end()) return RAD_E_NOTFOUND;
-        Seq& q = it->second;
-        /* All or nothing: a partial grow would leave the sequence holding blocks it cannot use
-         * and the caller unable to tell whether preempting would help. */
-        for (size_t i = 0; i < gs.size(); ++i) {
-            if (!geom.g[i].paged) continue;
-            int64_t need = rows_for((int)i, n) - (int64_t)q.blocks[i].size();
-            if (need > 0 && need > (int64_t)freelist[i].size()) return RAD_E_FULL;
-        }
-        for (size_t i = 0; i < gs.size(); ++i) {
-            if (geom.g[i].paged) {
-                int64_t need = rows_for((int)i, n) - (int64_t)q.blocks[i].size();
-                if (need > 0) q.dirty[i] = std::min<int64_t>(q.dirty[i], (int64_t)q.blocks[i].size());
-                for (int64_t k = 0; k < need; ++k) q.blocks[i].push_back(grab((int32_t)i));
-            } else if (q.state[i] < 0) {
-                if (state_free[i].empty()) return RAD_E_FULL;
-                q.state[i] = state_free[i].back();
-                state_free[i].pop_back();
-                q.blocks[i].assign(1, q.state[i]);
-            }
-        }
-        if (n > q.n) q.n = n;
-        return RAD_OK;
-    }
-
-    int adopt(uint64_t id, int32_t g, const std::vector<int32_t>& blocks, int64_t n) override {
-        auto it = seqs.find(id);
-        if (it == seqs.end()) return RAD_E_NOTFOUND;
-        if (n % geom.g[(size_t)g].block_size != 0) return RAD_E_INVAL;
-        Seq& q = it->second;
-        q.blocks[(size_t)g] = blocks;
-        q.dirty[(size_t)g] = 0;
-        for (int32_t b : blocks) retain(g, b);
-        if (n > q.n) q.n = n;
-        return RAD_OK;
-    }
-
-    int preempt(uint64_t id) override {
-        auto it = seqs.find(id);
-        if (it == seqs.end()) return RAD_E_NOTFOUND;
-        for (size_t i = 0; i < gs.size(); ++i) {
-            if (geom.g[i].paged)
-                for (int32_t b : it->second.blocks[i]) release((int32_t)i, b);
-            it->second.blocks[i].clear();
-            it->second.dirty[i] = 0;
-            if (it->second.state[i] >= 0) {
-                state_free[i].push_back(it->second.state[i]);
-                it->second.state[i] = -1;
-            }
-        }
-        it->second.n = 0;
-        return RAD_OK;
-    }
-
-    int rollback(uint64_t id, int64_t n) override {
-        auto it = seqs.find(id);
-        if (it == seqs.end()) return RAD_E_NOTFOUND;
-        for (size_t i = 0; i < gs.size(); ++i) {
-            if (!geom.g[i].paged) continue;   /* linear state is NOT rolled back (spec §10) */
-            int64_t keep = rows_for((int)i, n);
-            std::vector<int32_t>& bl = it->second.blocks[i];
-            while ((int64_t)bl.size() > keep) { release((int32_t)i, bl.back()); bl.pop_back(); }
-            it->second.dirty[i] = std::min<int64_t>(it->second.dirty[i], (int64_t)bl.size());
-        }
-        it->second.n = n;
-        return RAD_OK;
-    }
-
-    bool can_ever_fit(int64_t n) const override {
-        for (size_t i = 0; i < gs.size(); ++i)
-            if (geom.g[i].paged && rows_for((int)i, n) > total[i]) return false;
-        return true;
-    }
-
-    const std::vector<int32_t>& block_table(uint64_t id, int32_t g) const override {
-        auto it = seqs.find(id);
-        return it == seqs.end() ? kNone : it->second.blocks[(size_t)g];
-    }
-    int32_t state_slot(uint64_t id, int32_t g) const override {
-        auto it = seqs.find(id);
-        return it == seqs.end() ? -1 : it->second.state[(size_t)g];
-    }
-    /* One column, the state itself: this fake has no kernel asking for scratch beside it. */
-    int64_t state_index_width(int32_t) const override { return 1; }
-    int state_index_row(uint64_t id, int32_t g, int32_t* out, int max) const override {
-        if (!out || max <= 0) return 0;
-        out[0] = state_slot(id, g);
-        return 1;
-    }
-    int64_t first_block_pos(uint64_t, int32_t) const override { return 0; }
-    int64_t take_table_changes(uint64_t id, int32_t g) const override {
-        auto it = seqs.find(id);
-        if (it == seqs.end()) return 0;
-        const int64_t d = it->second.dirty[(size_t)g];
-        it->second.dirty[(size_t)g] = INT64_MAX;
-        return d;
-    }
-    /* Snapshot slots the store has given back; every other slot is held. */
-    std::vector<int32_t> ck_gone;
-    bool checkpoint_held(int32_t slot) const override {
-        return std::find(ck_gone.begin(), ck_gone.end(), slot) == ck_gone.end();
-    }
-    /* Blocks an elastic pool has handed back to the card: still carved and free, but not
-     * available to hand out until the pool grows again. free_blocks() is bounded by that and
-     * held_blocks() is not, which is the difference an elastic pool presents. */
-    int64_t unbacked = 0;
-    int64_t free_blocks(int32_t g) const override {
-        const int64_t n = (int64_t)freelist[(size_t)g].size() - unbacked;
-        return n > 0 ? n : 0;
-    }
-    int64_t total_blocks(int32_t g) const override { return total[(size_t)g]; }
-    int64_t held_blocks(int32_t g) const override {
-        return total[(size_t)g] - (int64_t)freelist[(size_t)g].size();
-    }
-    /* A BYTE SIZE PER OBJECT SO THE SUM IS CHECKABLE. The real manager reads these off the carved
-     * plan; here they are whatever the test set, and a group left at zero contributes nothing --
-     * which is what a group the fixture does not care about should do. */
-    std::vector<int64_t> block_bytes, state_bytes;
-    int64_t pool_bytes(int32_t g) const override {
-        const KVGeom::G& gg = geom.g[(size_t)g];
-        return gg.paged ? total[(size_t)g] * bb(g)
-                        : (int64_t)(state_free[(size_t)g].size() + n_states_out(g)) * sb(g);
-    }
-    int64_t pool_bytes_used(int32_t g) const override {
-        const KVGeom::G& gg = geom.g[(size_t)g];
-        return gg.paged ? (total[(size_t)g] - free_blocks(g)) * bb(g) : n_states_out(g) * sb(g);
-    }
-    /* This pool is not elastic, so what it was carved to address is what it is holding. */
-    int64_t pool_bytes_carved(int32_t g) const override { return pool_bytes(g); }
-    int64_t bb(int32_t g) const {
-        return g < (int32_t)block_bytes.size() ? block_bytes[(size_t)g] : 0;
-    }
-    int64_t sb(int32_t g) const {
-        return g < (int32_t)state_bytes.size() ? state_bytes[(size_t)g] : 0;
-    }
-    /* States handed out, which the fake tracks only through the sequences holding them. */
-    int64_t n_states_out(int32_t g) const {
-        int64_t n = 0;
-        for (const auto& kv : seqs) if (kv.second.state[(size_t)g] >= 0) ++n;
-        return n;
-    }
-    int64_t block_tokens(int32_t g) const override {
-        const KVGeom::G& gg = geom.g[(size_t)g];
-        return gg.paged ? gg.block_size : 0;
-    }
-};
-
-struct FakePC : IPrefixCache {
-    FakeKV* kv = nullptr;
-    int32_t attn = 0, lin = 0, src = -1;
-    int32_t next_slot = 0;
-    int32_t reserved = 0;
-    int64_t evicted = 0, ckpt_evicted = 0;
-    int64_t held = 0;            /* what the cache would report holding now */
-    int64_t interval = 256;
-    std::vector<int32_t> groups;                     /* the paged groups this cache indexes */
-    std::vector<std::vector<int32_t>> seeded;        /* blocks the cache holds a reference on */
-
-    /* Pretend an earlier request filled the cache: take `n_tokens` worth of blocks out of the pool
-     * and hold a reference on them, which is what makes a hit safe -- a block the cache names is
-     * never in the free list. */
-    void seed(int32_t n_tokens) {
-        attn = n_tokens;
-        seeded.assign(groups.size(), {});
-        for (size_t i = 0; i < groups.size(); ++i) {
-            int32_t g = groups[i];
-            int64_t nb = n_tokens / kv->geom.g[(size_t)g].block_size;
-            for (int64_t b = 0; b < nb; ++b) seeded[i].push_back(kv->grab(g));
-        }
-    }
-
-    std::vector<uint64_t> restores;
-    void restore(const Request& r) override { restores.push_back(r.id); }
-
-    mutable int64_t lookups = 0;
-    /* A cap (HitCap) as prefix.cpp applies one: attention ends at a block at or below it, the
-     * linear state at the deepest checkpoint under that -- checkpoints at multiples of `interval`,
-     * none below `ckpt_lo` -- and the whole hit stands if that gives back too much. */
-    int64_t ckpt_lo = 0;
-    CacheHit lookup(const Request&, std::vector<std::vector<int32_t>>* out,
-                    const HitCap* cap) const override {
-        ++lookups;
-        if (out) {
-            out->resize(groups.size());
-            for (size_t i = 0; i < groups.size() && i < seeded.size(); ++i)
-                (*out)[i] = seeded[i];
-        }
-        CacheHit h{ attn, lin, src };
-        const int64_t whole = src >= 0 ? lin : 0;
-        if (cap && attn > cap->tokens / 16 * 16 && whole > cap->tokens) {
-            const int64_t a = cap->tokens / 16 * 16;
-            int64_t l = std::min<int64_t>(lin, a) / interval * interval;
-            if (l < ckpt_lo) l = 0;
-            if (whole - l <= cap->max_give_back) {
-                h.n_attn_tokens = (int32_t)a;
-                h.n_linear_tokens = (int32_t)l;
-                h.checkpoint_slot = l > 0 ? src : -1;
-                h.given_back = (int32_t)(whole - l);
-                if (out)
-                    for (auto& b : *out)
-                        if ((int64_t)b.size() > a / 16) b.resize((size_t)(a / 16));
-            }
-        }
-        return h;
-    }
-    const std::vector<int32_t>& cached_groups() const override { return groups; }
-
-    /* What the scheduler published, and what it asked to be evicted. Recorded rather than acted
-     * on: these tests are about whether the scheduler publishes before it frees and evicts before
-     * it preempts, not about the cache's own indexing, which prefix.cpp's tests cover. */
-    struct Published { uint64_t seq; int64_t n_tokens; size_t n_groups; };
-    std::vector<Published> published;
-    int64_t evict_calls = 0, evict_grant = 0;
-
-    int insert(const Request& r, const std::vector<std::vector<int32_t>>& blocks,
-               int64_t n_tokens) override {
-        published.push_back({ r.id, n_tokens, blocks.size() });
-        return RAD_OK;
-    }
-    /* Grants only what a test asked it to, so "the cache had nothing to give" is reachable and
-     * the preemption path below it still gets exercised. */
-    int64_t evict(int64_t n) override {
-        ++evict_calls;
-        if (evict_grant <= 0) return 0;
-        int64_t took = n < evict_grant ? n : evict_grant;
-        if (evict_frees) {
-            /* An entry is one block in every cached group: give that many back to the pool. */
-            int64_t have = seeded.empty() ? 0 : (int64_t)seeded[0].size();
-            took = std::min(took, have);
-            for (size_t i = 0; i < groups.size() && i < seeded.size(); ++i)
-                for (int64_t k = 0; k < took; ++k) {
-                    kv->release(groups[i], seeded[i].back());
-                    seeded[i].pop_back();
-                }
-        }
-        evict_grant -= took;
-        evicted += took;
-        return took;
-    }
-    bool evict_frees = false;    /* evict() returns the seeded blocks to the pool */
-    std::vector<uint64_t> holds, releases;
-    void hold(const Request& r) override { holds.push_back(r.id); }
-    void release(const Request& r) override { releases.push_back(r.id); }
-    /* What the reserve asked for, call by call. */
-    std::vector<int64_t> trims;
-    int64_t trim(int64_t n) override {
-        trims.push_back(n);
-        return 0;
-    }
-    /* Cumulative, like the real cache's: the scheduler publishes it as a counter and the
-     * server takes deltas, so a fake that reported per-call would read as a cache that
-     * never evicts. */
-    int64_t evictions() const override { return evicted; }
-    int64_t ckpt_evictions() const override { return ckpt_evicted; }
-    int64_t held_tokens() const override { return held; }
-    int64_t next_checkpoint_after(int64_t pos) const override {
-        return ((pos / interval) + 1) * interval;
-    }
-    std::vector<int64_t> committed;
-    void commit_checkpoint(const Request&, int64_t pos) override { committed.push_back(pos); }
-    int reserve_checkpoint(const Request&, int64_t, int32_t* slot_out) override {
-        ++reserved;
-        *slot_out = next_slot++;
-        return RAD_OK;
-    }
-};
-
 /* ------------------------------------------------------------------ a declared program */
-/* Two paged groups would be redundant here; what matters is that a paged group and a linear one
- * coexist, because the whole chunk geometry is the reconciliation between them.
+/* A paged group beside a linear one: the chunk geometry reconciles the two, so a second paged
+ * group would add nothing.
  *
- * THE OP CARRIES A SCHEMA because that is where the chunk parameter is identified
- * (RAD_PROLE_SEQ_CHUNK), rather than by matching a list of spellings. The geometry and the
- * kernel's constraint must name the SAME key -- a constraint whose key the op's geometry does not
- * carry does not hold at all (rad_abi.h) -- so declaring "chunk" here and constraining on
- * "chunk_size" would be a pair the real system cannot produce. */
+ * The op carries a schema because that is where the chunk parameter is identified
+ * (RAD_PROLE_SEQ_CHUNK). The geometry and the kernel's constraint must name the same key, since a
+ * constraint on a key the geometry lacks does not hold (rad_abi.h). */
 static const RadParamSpec g_gdn_ps[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
     { "chunk", RAD_P_INT, RAD_DERIVED,  RAD_PROLE_SEQ_CHUNK },
@@ -524,18 +120,16 @@ struct Fixture {
         conv.decl.conv_width = 4;
         prog.kv_groups.push_back(conv);
 
-        /* A WINDOWED paged group — the second half of the pair a sliding-window model declares
-         * (windowed layers + a full group; qwen35/llama windowed checkpoints declare these).
-         * Paged, block-aligned, and deliberately NOT prefix-cached: prefix.cpp indexes only the
-         * groups whose blocks below the window stay put. Tests that want a prefix cache over a
-         * WINDOW+FULL pair trim pc.groups to the cached ones. */
+        /* A windowed paged group, as sliding-window checkpoints pair with a full group. Not
+         * prefix-cached: prefix.cpp indexes only groups whose blocks below the window stay put.
+         * Tests wanting a prefix cache over a WINDOW+FULL pair trim pc.groups to the cached ones. */
         if (windowed) {
             KVGroupInfo win;
             win.name = "swa";
             win.decl.kind = RAD_KV_WINDOW;
             win.decl.window = 64;
             win.block_size = 16;
-            win.layers = { 2 };   /* bound to a TRUNK layer — the group a trunk attention reads;
+            win.layers = { 2 };   /* bound to a trunk layer, the group a trunk attention reads;
                                    * a drafter's own group is bound at the trunk's layer count and
                                    * above (rad_bind_layer_kv at the drafter declare) */
             prog.kv_groups.push_back(win);
@@ -549,9 +143,9 @@ struct Fixture {
         Band b;
         b.hi = 4096;
         b.dom[RAD_DOMAIN_DEVICE].row = &g_gdn_row;
-        /* The architecture plugin's own declared geometry, in arch/common/rad_block_gdn.h's
-         * spelling, which is the key its schema marks RAD_PROLE_SEQ_CHUNK. Both this and the
-         * kernel's constraint contribute. */
+        /* The architecture plugin's declared geometry, in arch/common/rad_block_gdn.h's spelling,
+         * the key its schema marks RAD_PROLE_SEQ_CHUNK. Both this and the kernel's constraint
+         * contribute. */
         b.dom[RAD_DOMAIN_DEVICE].geom.set_i("chunk", 64);
         op.bands.push_back(b);
         prog.ops.push_back(op);
@@ -565,10 +159,9 @@ struct Fixture {
         cfg.max_ctx = max_ctx;
         cfg.checkpoint_interval = 256;
         cfg.prefix_cache = true;
-        /* `Config::n_spec` defaults to -1, which is `auto`: a REQUEST that engine_bringup resolves
-         * against rad_arch_probe once the plugin is selected. This fixture builds a Scheduler
-         * directly and so never runs that resolution, and DraftController::configure rightly
-         * refuses a negative depth. The cases that are about speculation set their own depth. */
+        /* Config::n_spec defaults to -1 (`auto`), which engine_bringup resolves; this fixture
+         * skips that, and DraftController::configure refuses a negative depth. Speculation tests
+         * set their own depth. */
         cfg.n_spec = 0;
 
         kv.setup(prog.kv_groups, cfg.max_ctx, blocks, states);
@@ -607,63 +200,86 @@ struct Fixture {
     }
 
     uint64_t next_id = 1;
-    uint64_t submit(int n_prompt, int max_tokens = 64, int priority = 0, bool ignore_eos = false) {
+    /* A request for prompt tokens 1000, 1001, ... */
+    std::unique_ptr<Request> request(int n_prompt, int max_tokens) {
         auto r = std::make_unique<Request>();
         r->id = next_id++;
-        r->priority = priority;
-        r->ignore_eos = ignore_eos;
         r->max_tokens = max_tokens;
         r->prompt.resize((size_t)n_prompt);
         for (int i = 0; i < n_prompt; ++i) r->prompt[(size_t)i] = 1000 + i;
-        uint64_t id = r->id;
-        if (sch.add(std::move(r)) < 0) return 0;
-        return id;
+        return r;
+    }
+    /* Its id, or 0 when the scheduler refused it. */
+    uint64_t add(std::unique_ptr<Request> r) {
+        const uint64_t id = r->id;
+        return sch.add(std::move(r)) < 0 ? 0 : id;
+    }
+
+    uint64_t submit(int n_prompt, int max_tokens = 64, int priority = 0, bool ignore_eos = false) {
+        auto r = request(n_prompt, max_tokens);
+        r->priority = priority;
+        r->ignore_eos = ignore_eos;
+        return add(std::move(r));
     }
 
     /* One whose prompt carries a picture the encoder has not run yet: it waits in the queue until
      * `*item` says it is encoded. */
     uint64_t submit_unencoded(int n_prompt, int max_tokens, std::shared_ptr<mm::Item>* item) {
-        auto r = std::make_unique<Request>();
-        r->id = next_id++;
-        r->max_tokens = max_tokens;
-        r->prompt.resize((size_t)n_prompt);
-        for (int i = 0; i < n_prompt; ++i) r->prompt[(size_t)i] = 1000 + i;
+        auto r = request(n_prompt, max_tokens);
         *item = std::make_shared<mm::Item>();
         r->media = std::make_shared<mm::PromptMedia>();
         r->media->items.push_back(mm::Placed{*item, 0});
-        uint64_t id = r->id;
-        if (sch.add(std::move(r)) < 0) return 0;
-        return id;
+        return add(std::move(r));
     }
 
     /* The same, with the server's sink attached, for what a request tells its client. */
     uint64_t submit_to(server::Sink* sink, int n_prompt, int max_tokens) {
-        auto r = std::make_unique<Request>();
-        r->id = next_id++;
-        r->max_tokens = max_tokens;
+        auto r = request(n_prompt, max_tokens);
         r->sink = sink;
-        r->prompt.resize((size_t)n_prompt);
-        for (int i = 0; i < n_prompt; ++i) r->prompt[(size_t)i] = 1000 + i;
-        uint64_t id = r->id;
-        if (sch.add(std::move(r)) < 0) return 0;
-        return id;
+        return add(std::move(r));
+    }
+
+    /* Commit the planned step: every entry sampled `token`, ended when `eos`, and accepted
+     * `acc(entry)` drafts (none when `acc` is empty). */
+    int commit(int32_t token, uint8_t eos = 0,
+               const std::function<int32_t(const StepEntry&)>& acc = nullptr) {
+        const StepPlan& p = sch.plan();
+        std::vector<int32_t> a(p.e.size(), 0), t(p.e.size(), token);
+        std::vector<uint8_t> e(p.e.size(), eos);
+        if (acc)
+            for (size_t i = 0; i < p.e.size(); ++i) a[i] = acc(p.e[i]);
+        Scheduler::StepResult r;
+        r.n_seq = (int)p.e.size();
+        r.n_accepted = a.data();
+        r.token = t.data();
+        r.eos = e.data();
+        return sch.commit(r);
     }
 
     /* Commit a step in which every sequence produced one token and none ended. */
-    void commit_plain(int32_t token = 7) {
-        const StepPlan& p = sch.plan();
-        std::vector<int32_t> acc((size_t)p.e.size(), 0), tok((size_t)p.e.size(), token);
-        std::vector<uint8_t> eos((size_t)p.e.size(), 0);
-        Scheduler::StepResult r;
-        r.n_seq = (int)p.e.size();
-        r.n_accepted = acc.data();
-        r.token = tok.data();
-        r.eos = eos.data();
-        CHECK_OK(sch.commit(r));
-    }
+    void commit_plain(int32_t token = 7) { CHECK_OK(commit(token)); }
 };
 
+/* A uniformly random number of `e`'s drafts accepted, 0..n_spec, from an LCG. */
+int32_t random_accept(uint32_t& rng, const StepEntry& e) {
+    rng = rng * 1664525u + 1013904223u;
+    return e.n_spec > 0 ? (int32_t)((rng >> 16) % (uint32_t)(e.n_spec + 1)) : 0;
+}
+
 }  /* namespace */
+
+/* ================================================================== the fakes are linked */
+/* Every check below reads device memory as host memory through the weak fakes. One device call
+ * core/ makes and the fakes lack pulls the real backend's dispatch.cpp.o into the link, which
+ * replaces every fake; the binary then still runs, on another backend, and proves something
+ * else. */
+TEST(the_device_fakes_are_the_ones_linked) {
+    g_fake_device = false;
+    void* p = rad_dev_alloc(16, RAD_MEM_DEVICE);
+    CHECK(p != nullptr);
+    CHECK(g_fake_device);
+    rad_dev_free(p, RAD_MEM_DEVICE);
+}
 
 /* ================================================================== geometry + chunking */
 TEST(chunk_geometry_is_computed_not_configured) {
@@ -686,7 +302,7 @@ TEST(chunk_geometry_rounds_the_checkpoint_interval_up_to_a_legal_chunk) {
     CHECK_EQ(f.sch.geometry().checkpoint_interval, 256);
 }
 
-/* A MODEL WITH NO LINEAR STATE CHECKPOINTS ONLY FOR A TRUNK WINDOW: the snapshot of the window
+/* A model with no linear state checkpoints only for a trunk window: the snapshot of the window
  * behind a prompt's tail is what a prefix hit resumes from. A drafter's own window is recomputed
  * by draft refill, so it takes no checkpoint and leaves the hit at any block. */
 TEST(chunk_geometry_snapshots_a_trunk_window_and_not_a_drafters) {
@@ -733,17 +349,16 @@ TEST(prefill_chunks_split_at_the_checkpoint_interval) {
     CHECK_OK(f.start());
 
     int64_t ck = -1;
-    /* The budget would allow 512 tokens; the split takes 256 so the chunk ENDS on the interval. */
+    /* The budget would allow 512 tokens; the split takes 256 so the chunk ends on the interval. */
     CHECK_EQ(f.sch.plan_chunk(0, 1000, 512, &ck), 256);
     CHECK_EQ(ck, 256);
 
     CHECK_EQ(f.sch.plan_chunk(256, 1000, 512, &ck), 256);
     CHECK_EQ(ck, 512);
 
-    /* The final chunk ends at the prompt's last quantum boundary and writes a checkpoint there:
+    /* The final chunk ends at the prompt's last quantum boundary and writes a checkpoint there, so
      * the next turn of a conversation resumes from it instead of from 768. The remainder, under a
-     * quantum, is the chunk after it and writes none -- that is the accepted cost of owning the
-     * boundaries. */
+     * quantum, is the next chunk and writes none: the accepted cost of owning the boundaries. */
     CHECK_EQ(f.sch.plan_chunk(768, 1000, 512, &ck), 192);
     CHECK_EQ(ck, 960);
     CHECK_EQ(f.sch.plan_chunk(960, 1000, 512, &ck), 40);
@@ -766,8 +381,8 @@ TEST(prefill_chunks_split_at_the_checkpoint_interval) {
     CHECK_EQ(f.sch.plan_chunk(0, 1000, 50, &ck), 0);
 }
 
-/* A REQUEST'S OWN CHECKPOINT (Request::checkpoint_at): the end of a head other requests share,
- * on the quantum below it. It splits a chunk the way the interval does and gives way to nothing. */
+/* A request's own checkpoint (Request::checkpoint_at): the end of a head other requests share, on
+ * the quantum below it. It splits a chunk as the interval does and gives way to nothing. */
 TEST(prefill_chunks_split_where_the_request_asks_for_a_checkpoint) {
     Fixture f;
     f.build();
@@ -798,6 +413,245 @@ TEST(prefill_chunks_split_where_the_request_asks_for_a_checkpoint) {
     CHECK_EQ(ck, 128);
 }
 
+TEST(prefill_chunks_span_intervals_on_the_same_pieces) {
+    Fixture f;
+    f.build();                            /* interval 256, budget 512 */
+    f.cfg.prefill_span = 2;
+    CHECK_OK(f.start());
+    CHECK_EQ(f.sch.geometry().span, 2);
+
+    int64_t ck = -1;
+    /* The first interval is never spanned. */
+    CHECK_EQ(f.sch.plan_chunk(0, 2000, 512, &ck), 256);
+    CHECK_EQ(ck, 256);
+    /* From a boundary past it, two intervals and a checkpoint at the end; the one between them
+     * is not written. */
+    CHECK_EQ(f.sch.plan_chunk(256, 2000, 512, &ck), 512);
+    CHECK_EQ(ck, 768);
+    CHECK_EQ(f.sch.plan_chunk(1280, 2000, 512, &ck), 512);
+    CHECK_EQ(ck, 1792);
+    /* The tail checkpoint where a span of 1 puts it. */
+    CHECK_EQ(f.sch.plan_chunk(1792, 2000, 512, &ck), 192);
+    CHECK_EQ(ck, 1984);
+    /* A last chunk that reaches the prompt's end runs through to its tail checkpoint: the pieces
+     * are [512, 768) and [768, 960), as a span of 1 cuts them. */
+    CHECK_EQ(f.sch.plan_chunk(512, 1000, 512, &ck), 448);
+    CHECK_EQ(ck, 960);
+    /* And without one, it stops on the last boundary it crosses, where a span of 1 writes the
+     * prompt's deepest checkpoint; the rest is the next chunk. */
+    CHECK_EQ(f.sch.plan_chunk(512, 830, 512, &ck), 256);
+    CHECK_EQ(ck, 768);
+    CHECK_EQ(f.sch.plan_chunk(768, 830, 512, &ck), 62);
+    CHECK_EQ(ck, -1);
+    /* A budget short of the span steps back to the last boundary it crosses. */
+    CHECK_EQ(f.sch.plan_chunk(256, 2000, 500, &ck), 256);
+    CHECK_EQ(ck, 512);
+    /* Off the interval (a resume from a tail checkpoint) the chunk ends at the next boundary. */
+    CHECK_EQ(f.sch.plan_chunk(960, 3000, 512, &ck), 64);
+    CHECK_EQ(ck, 1024);
+}
+
+/* A span moves no checkpoint and no piece, from a prompt's start or from any checkpoint a turn
+ * resumes from: every chunk end and checkpoint it makes is one a span of 1 makes, and the deepest
+ * checkpoint (where the next turn resumes) is the same. */
+TEST(a_span_writes_a_subset_of_the_checkpoints_and_the_same_deepest_one) {
+    struct Walk { std::vector<int64_t> ends, cks; };
+    auto walk = [](Fixture& f, int64_t from, int64_t target) {
+        Walk w;
+        for (int64_t n = from; n < target; ) {
+            int64_t ck = -1;
+            const int64_t c = f.sch.plan_chunk(n, target, f.cfg.max_tok, &ck);
+            if (c <= 0) break;
+            n += c;
+            w.ends.push_back(n);
+            if (ck >= 0) w.cks.push_back(ck);
+        }
+        return w;
+    };
+    Fixture one;
+    one.build();                          /* interval 256, budget 512, quantum 64 */
+    CHECK_OK(one.start());
+    Fixture two;
+    two.build();
+    two.cfg.prefill_span = 2;
+    CHECK_OK(two.start());
+    int bad_end = 0, bad_ck = 0, bad_deep = 0, spanned = 0;
+    for (int64_t target = 1; target <= 2600; target += 7) {
+        const Walk ref = walk(one, 0, target);
+        /* From the start, and from every checkpoint a span of 1 leaves to resume from. */
+        std::vector<int64_t> from = { 0 };
+        for (int64_t c : ref.cks) if (c < target) from.push_back(c);
+        for (int64_t s0 : from) {
+            const Walk a = walk(one, s0, target);
+            const Walk b = walk(two, s0, target);
+            for (int64_t e : b.ends)
+                bad_end += std::find(a.ends.begin(), a.ends.end(), e) == a.ends.end();
+            for (int64_t c : b.cks)
+                bad_ck += std::find(a.cks.begin(), a.cks.end(), c) == a.cks.end();
+            const int64_t da = a.cks.empty() ? -1 : a.cks.back();
+            const int64_t db = b.cks.empty() ? -1 : b.cks.back();
+            bad_deep += da != db;
+            spanned += b.ends.size() < a.ends.size();
+        }
+    }
+    CHECK_EQ(bad_end, 0);
+    CHECK_EQ(bad_ck, 0);
+    CHECK_EQ(bad_deep, 0);
+    CHECK(spanned > 0);
+
+    /* One prompt by hand: the first interval alone, then two a chunk, and the last chunk to the
+     * tail checkpoint a span of 1 writes (1664) with the rest, under a quantum, after it. */
+    int64_t ck = -1;
+    CHECK_EQ(two.sch.plan_chunk(0, 1700, 512, &ck), 256);    CHECK_EQ(ck, 256);
+    CHECK_EQ(two.sch.plan_chunk(256, 1700, 512, &ck), 512);  CHECK_EQ(ck, 768);
+    CHECK_EQ(two.sch.plan_chunk(768, 1700, 512, &ck), 512);  CHECK_EQ(ck, 1280);
+    CHECK_EQ(two.sch.plan_chunk(1280, 1700, 512, &ck), 384); CHECK_EQ(ck, 1664);
+    CHECK_EQ(two.sch.plan_chunk(1664, 1700, 512, &ck), 36);  CHECK_EQ(ck, -1);
+}
+
+/* A span is for a prefill alone in its step. Alone it takes two intervals; while another request
+ * is in the engine (admitted, prefilling or decoding) no step is longer than the shared budget, one
+ * interval here; alone again it spans again from the next boundary. */
+TEST(a_span_is_taken_only_by_a_prefill_alone_in_its_step) {
+    Fixture f;
+    f.build();                            /* interval 256, budget 512 */
+    f.cfg.prefill_span = 2;
+    CHECK_OK(f.start());
+    CHECK_EQ(f.sch.geometry().shared_tok, 256);
+    const uint64_t a = f.submit(3000, 4);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e[0].n_tokens, 256);           /* the first interval */
+    f.commit_plain();
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e[0].n_tokens, 512);           /* alone: a span */
+    f.commit_plain();
+    const uint64_t b = f.submit(100, 3);
+    int with_b = 0, wide_with_b = 0, spans_after = 0;
+    for (int k = 0; k < 40; ++k) {
+        if (!f.sch.step()) break;
+        const StepPlan& p = f.sch.plan();
+        bool has_b = false;
+        int64_t a_tok = 0;
+        for (const StepEntry& e : p.e) {
+            if (e.seq == b) has_b = true;
+            if (e.seq == a) a_tok = e.n_tokens;
+        }
+        if (has_b) {
+            ++with_b;
+            if (p.n_tok > 256 || a_tok > 256) ++wide_with_b;
+        } else if (with_b > 0 && a_tok > 256) {
+            ++spans_after;                /* b has finished: a is alone again */
+        }
+        f.commit_plain();
+    }
+    CHECK(with_b >= 3);
+    CHECK_EQ(wide_with_b, 0);
+    CHECK(spans_after >= 1);
+}
+
+/* With a shortest spanning prefill set (set_span_min), a shorter prompt alone in the engine takes
+ * one interval a step, and a longer one spans through to its last intervals. */
+TEST(a_span_min_keeps_a_short_prompt_at_one_interval) {
+    Fixture f;
+    f.build();                            /* interval 256, budget 512 */
+    f.cfg.prefill_span = 2;
+    CHECK_OK(f.start());
+    f.sch.set_span_min(2048);
+    const uint64_t a = f.submit(1500, 2);
+    int wide = 0, steps = 0;
+    for (int k = 0; k < 40; ++k) {
+        if (!f.sch.step()) break;
+        for (const StepEntry& e : f.sch.plan().e)
+            if (e.seq == a && e.is_prefill) { ++steps; wide += e.n_tokens > 256; }
+        f.commit_plain();
+    }
+    CHECK(steps >= 5);
+    CHECK_EQ(wide, 0);
+    const uint64_t b = f.submit(3000, 2);
+    int spans = 0, last_pf = 0;
+    for (int k = 0; k < 40; ++k) {
+        if (!f.sch.step()) break;
+        for (const StepEntry& e : f.sch.plan().e)
+            if (e.seq == b && e.is_prefill) { spans += e.n_tokens > 256; last_pf = e.n_tokens; }
+        f.commit_plain();
+    }
+    CHECK(spans >= 4);
+    CHECK(last_pf > 0);
+}
+
+/* A shared step under a span is planned as a deployment without one plans it: with two requests
+ * from the start, every step they share is the same, entry for entry, at budget 512 with a span of
+ * two as at budget 256 with none, --busy-prefill-chunk's shares included. */
+TEST(a_shared_step_under_a_span_is_planned_as_without_one) {
+    std::vector<std::vector<std::pair<uint64_t, int32_t>>> plans[2];
+    for (int m = 0; m < 2; ++m) {
+        Fixture f;
+        f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/m == 0 ? 512 : 256);
+        if (m == 0) f.cfg.prefill_span = 2;
+        CHECK_OK(f.start());
+        const uint64_t a = f.submit(3000, 4);
+        const uint64_t b = f.submit(300, 6);
+        (void)a;
+        for (int k = 0; k < 40; ++k) {
+            if (!f.sch.step()) break;
+            std::vector<std::pair<uint64_t, int32_t>> row;
+            bool has_b = false;
+            for (const StepEntry& e : f.sch.plan().e) {
+                row.push_back({ e.seq, e.n_tokens });
+                has_b = has_b || e.seq == b;
+            }
+            if (!has_b) break;            /* b has finished: from here a is alone */
+            plans[m].push_back(row);
+            f.commit_plain();
+        }
+    }
+    CHECK(plans[0].size() >= 4);
+    CHECK(plans[0] == plans[1]);
+}
+
+/* No interval grid, no span: a window snapshot splits no chunk, and a model without checkpoints
+ * has no interval. The shared budget still follows the flag, as the engine states it to the plugin
+ * (RadBuildCtx::max_mixed_tok), and steps that share it admit as before. */
+TEST(a_span_needs_an_interval_grid) {
+    Program prog;
+    prog.meta.n_layers = 16;
+    prog.kv_groups.emplace_back();
+    KVGroupInfo attn;
+    attn.name = "attn";
+    attn.decl.kind = RAD_KV_FULL;
+    attn.block_size = 16;
+    attn.layers = { 0 };
+    prog.kv_groups.push_back(attn);
+    KVGroupInfo win;
+    win.name = "swa";
+    win.decl.kind = RAD_KV_WINDOW;
+    win.decl.window = 64;
+    win.block_size = 16;
+    win.layers = { 1 };
+    prog.kv_groups.push_back(win);
+    Config cfg;
+    cfg.max_tok = 512;
+    cfg.checkpoint_interval = 256;
+    cfg.prefix_cache = true;
+    cfg.prefill_span = 2;
+    ChunkGeometry g;
+    CHECK_OK(chunk_geometry_resolve(prog, cfg, &g));
+    CHECK(g.window_ckpt);
+    CHECK_EQ(g.span, 1ll);
+    CHECK_EQ(g.shared_tok, 256ll);
+
+    Fixture f;
+    f.build();
+    f.cfg.checkpoint_interval = 0;
+    f.cfg.prefill_span = 2;
+    CHECK_OK(f.start());
+    CHECK_EQ(f.sch.geometry().span, 1ll);
+    f.submit(100, 3);
+    f.submit(100, 3);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int64_t)f.sch.plan().e.size(), 2ll);
+}
+
 TEST(a_chunk_ending_on_a_checkpoint_carries_it_into_the_batch) {
     Fixture f;
     f.build();
@@ -808,8 +662,8 @@ TEST(a_chunk_ending_on_a_checkpoint_carries_it_into_the_batch) {
     CHECK(b != nullptr);
     CHECK_EQ(b->n_tok, 256);
     CHECK_EQ(b->n_checkpoints, 1);
-    /* The snapshot is the state after the LAST token of the chunk, and the split put that token
-     * at the interval boundary. */
+    /* The snapshot is the state after the chunk's last token, which the split put at the interval
+     * boundary. */
     CHECK_EQ(b->checkpoint_tok[0], 255);
     CHECK_EQ(b->checkpoint_slot[0], 0);
     CHECK_EQ(b->phase, RAD_PHASE_PREFILL);
@@ -837,7 +691,7 @@ TEST(admission_refuses_when_the_kv_pool_is_short) {
 }
 
 /* An observer reads the copy the engine thread published, never the live state, so what it sees
- * moves only at a publication -- and a publication carries exactly what the live readers say. */
+ * changes only at a publication, and a publication carries exactly what the live readers say. */
 TEST(observers_read_what_the_engine_thread_published) {
     Fixture f;
     f.build(/*blocks=*/20, /*states=*/64);
@@ -875,8 +729,8 @@ TEST(observers_read_what_the_engine_thread_published) {
     CHECK_EQ(f.sch.observed_requests(seen.data(), 8), 4);
 }
 
-/* The sequences of one API request go in under one hold of the lock, each accepted or refused on
- * its own terms: a duplicate id is refused without taking its neighbours with it. */
+/* The sequences of one API request are added under one lock hold, each accepted or refused on its
+ * own: a duplicate id is refused without taking its neighbours with it. */
 TEST(add_all_queues_a_set_under_one_lock_and_refuses_members_singly) {
     Fixture f;
     f.build(/*blocks=*/20, /*states=*/64);
@@ -942,7 +796,7 @@ TEST(a_prefix_hit_starts_the_request_at_the_last_usable_checkpoint) {
     const RadBatch* b = f.sch.step();
     CHECK(b != nullptr);
     /* Recompute resumes from the checkpoint rather than replaying only the linear layers over
-     * (256, 300], because RadBatch carries ONE query length for every KV group. The chunk still
+     * (256, 300], because RadBatch carries one query length for every KV group. The chunk still
      * ends on the next interval, so the next checkpoint is still written. */
     CHECK_EQ(f.sch.find(a)->n_computed, 256);
     CHECK_EQ(b->ctx_lens[0], 256);
@@ -950,16 +804,14 @@ TEST(a_prefix_hit_starts_the_request_at_the_last_usable_checkpoint) {
     CHECK_EQ(b->n_checkpoints, 1);
     CHECK_EQ(b->checkpoint_tok[0], 255);
 
-    /* THE RECURRENT HALF OF THE HIT IS CARRIED, and it is carried exactly once. The adopted blocks
-     * describe the attention layers; the linear ones resume from this slot and from nothing
-     * else, so an entry that skipped 256 tokens without naming a snapshot would be a sequence
-     * continuing from whatever the slot last held. */
+    /* The recurrent half of the hit is carried exactly once. The adopted blocks describe the
+     * attention layers; the linear ones resume from this slot alone, so an entry that skipped 256
+     * tokens without naming a snapshot would continue from whatever the slot last held. */
     CHECK_EQ(f.sch.plan().e[0].ckpt_restore, 3);
 
-    /* The hit is CLAIMED, not merely counted: the sequence adopted the cache's 16 blocks, which
-     * cost the pool nothing because the cache already held them, and then allocated only the 16
-     * new blocks its 256-token chunk needs. A hit that is not adopted is a sequence attending to
-     * blocks it does not own. */
+    /* The hit is claimed, not merely counted: the sequence adopted the cache's 16 blocks, which
+     * cost the pool nothing since the cache already held them, then allocated only the 16 new
+     * blocks its 256-token chunk needs. An unadopted hit would attend to blocks it does not own. */
     CHECK_EQ((int)f.kv.block_table(a, 0).size(), 32);
     CHECK_EQ(f.kv.block_table(a, 0)[0], f.pc.seeded[0][0]);
     CHECK_EQ(f.kv.free_blocks(0), free_before - 16);
@@ -969,17 +821,20 @@ TEST(a_prefix_hit_starts_the_request_at_the_last_usable_checkpoint) {
     CHECK_EQ(m.attn_cached_tokens, 304);     /* what the block cache matched */
     CHECK_EQ(m.linear_cached_tokens, 256);   /* what was actually skipped */
     CHECK_EQ(m.checkpoints_written, 1);
+    /* The checkpoint shortfall: the 48 cached tokens above the snapshot are computed again. */
+    CHECK_EQ(m.hit_cut_tokens, 48);
+    CHECK_EQ(m.hit_cut_no_snapshot, 0);
 
-    /* ...and the snapshot this step takes is not offered to anyone until the step has run. The
-     * reservation happened when the chunk was planned; the state exists only afterwards. */
+    /* The snapshot this step takes is not offered to anyone until the step has run: the
+     * reservation happens when the chunk is planned, the state exists only afterwards. */
     CHECK(f.pc.committed.empty());
     f.commit_plain();
     CHECK_EQ((int)f.pc.committed.size(), 1);
     CHECK_EQ(f.pc.committed[0], 512);        /* ctx_len 256 + ckpt_tok 255 + 1 */
 }
 
-/* A hit that skipped tokens with no snapshot to resume from is the corruption this whole mechanism
- * exists to prevent, so it is refused outright rather than served with a zeroed state. */
+/* A hit that skipped tokens with no snapshot to resume from would corrupt the linear state, so it
+ * is refused outright rather than served with a zeroed state. */
 TEST(a_hit_with_no_checkpoint_slot_reuses_nothing) {
     Fixture f;
     f.build();
@@ -992,12 +847,14 @@ TEST(a_hit_with_no_checkpoint_slot_reuses_nothing) {
     CHECK(f.sch.step() != nullptr);
     CHECK_EQ(f.sch.find(a)->n_computed, 0);
     CHECK_EQ(f.sch.metrics().linear_cached_tokens, 0);
+    /* Counted once, with its reason and the whole hit as the shortfall. */
+    CHECK_EQ(f.sch.metrics().hit_cut_no_snapshot, 1);
+    CHECK_EQ(f.sch.metrics().hit_cut_tokens, 304);
 }
 
-/* A RESTORE FROM A SLOT THE STORE GAVE BACK IS NEVER BUILT. The cache keeps a handed-out snapshot
- * until the step that restores it has run, so this is a guard: a step that finds one is abandoned,
- * the request gives its hit back and goes to the queue, and the next step prefills it from a fresh
- * lookup rather than the engine stopping on the restore. */
+/* A restore from a slot the store gave back is never built. The cache keeps a handed-out snapshot
+ * until the restoring step has run, so this is a guard: the step is abandoned, the request gives
+ * its hit back and requeues, and the next step prefills it from a fresh lookup. */
 TEST(a_restore_from_a_slot_the_store_gave_back_is_prefilled_again) {
     Fixture f;
     f.build();
@@ -1036,26 +893,20 @@ TEST(a_hit_that_no_checkpoint_covers_replays_from_zero) {
     CHECK_EQ(f.sch.metrics().linear_cached_tokens, 0);
 }
 
-/* THE PREFIX CACHE CANNOT COVER A MODEL WITH A PAGED GROUP IT DOES NOT INDEX. The fixture's
- * groups are FULL, LINEAR, CONV, WINDOW — the windowed group is paged, bound to a trunk layer,
- * and a real cache skips it (prefix.cpp: its blocks below the window are recycled, so no block
- * list describes them), which is what pc.groups = {0} reproduces: three paged groups, one
- * cached. The cache below is seeded to a DEEP, checkpoint-covered hit — 304 attention blocks,
- * the linear state at 256, a slot to restore from — the most legitimate hit there is: every
- * clamp above the trunk one lets it through untouched. The adopted blocks cover group 0 ONLY,
- * while used = ctx_len + n_tok makes the windowed trunk layers read the positions below ctx_len
- * this sequence never wrote — and the pool hands out the most recently freed blocks, i.e. the
- * previous tenant's. That is reading ANOTHER REQUEST'S KV AS YOUR OWN PREFIX: fluent text
- * carrying the last request's content. No tail-recompute repairs a trunk hole (a drafter's own
- * hole is another matter, and the refill tests above keep theirs); the hit is refused. */
+/* A hit is refused on a model with a paged group the prefix cache does not index. Here the
+ * windowed group is paged, bound to a trunk layer, and skipped by the cache (prefix.cpp recycles
+ * its blocks below the window), which pc.groups = {0} reproduces. The hit is deep and
+ * checkpoint-covered, so every other clamp passes it. Adopting it would cover group 0 only, while
+ * the windowed trunk layers read positions below ctx_len this sequence never wrote: the previous
+ * request's KV, read as this one's prefix. No tail recompute repairs a trunk hole. */
 TEST(a_hit_on_a_model_with_a_windowed_group_reuses_nothing) {
     Fixture f;
     f.build(4096, 64, 512, 4096, /*windowed=*/true);
-    f.pc.groups = {0};    /* a cache that indexes the FULL group only — windowed groups are not
-                           * prefix-cacheable; must precede start(), which reads it once */
+    f.pc.groups = {0};    /* a cache over the FULL group only (windowed groups are not
+                           * prefix-cacheable); must precede start(), which reads it once */
     CHECK_OK(f.start());
     f.pc.seed(304);       /* a deep, block-aligned attention hit: 19 blocks */
-    f.pc.lin = 256;       /* its linear state checkpoints at 256 — the resume point exists */
+    f.pc.lin = 256;       /* its linear state checkpoints at 256: the resume point exists */
     f.pc.src = 3;         /* and names a snapshot, so no checkpoint clamp applies */
 
     uint64_t a = f.submit(300, 8);
@@ -1068,22 +919,21 @@ TEST(a_hit_on_a_model_with_a_windowed_group_reuses_nothing) {
     CHECK_EQ(b->ctx_lens[0], 0);
     CHECK_EQ(f.sch.plan().e[0].ckpt_restore, -1);
 
-    /* NOTHING IS ADOPTED — the 16 blocks covering the 256-token chunk are all freshly grabbed. */
+    /* Nothing is adopted: the 16 blocks covering the 256-token chunk are all freshly grabbed. */
     CHECK_EQ((int)f.kv.block_table(a, 0).size(), 16);
     CHECK(std::find(f.pc.seeded[0].begin(), f.pc.seeded[0].end(),
                     f.kv.block_table(a, 0)[0]) == f.pc.seeded[0].end());
 
-    /* THE CACHE STILL REPORTED THE MATCH, and the metrics say so: this is a real hit the
+    /* The cache still reported the match, and the metrics say so: this is a real hit the
      * scheduler refused, not a lookup that found nothing. */
     SchedMetrics m = f.sch.metrics();
     CHECK_EQ(m.attn_cached_tokens, 304);
     CHECK_EQ(m.linear_cached_tokens, 0);
 }
 
-/* ================================================================== preemption */
-/* A REQUEST WHOSE MEDIA IS NOT ENCODED YET WAITS, AND ONLY IT DOES. It is not admitted without
- * its rows, and it does not hold up the queue: the request behind it is asked and runs. Once its
- * items are encoded, it is admitted where it stood. */
+/* A request whose media is not encoded yet waits, and only it does: it is not admitted without
+ * its rows, and the request behind it is asked and runs. Once its items are encoded it is
+ * admitted where it stood. */
 TEST(a_request_waiting_on_its_encoder_lets_the_queue_past_it) {
     Fixture f;
     f.build();
@@ -1125,6 +975,7 @@ TEST(a_request_waiting_on_its_encoder_lets_the_queue_past_it) {
     CHECK_EQ(f.sch.metrics().admitted, 3);
 }
 
+/* ================================================================== preemption */
 TEST(preemption_takes_the_lowest_priority_victim_and_requeues_it_to_the_front) {
     Fixture f;
     f.build(/*blocks=*/20, /*states=*/64);
@@ -1140,21 +991,20 @@ TEST(preemption_takes_the_lowest_priority_victim_and_requeues_it_to_the_front) {
     CHECK_EQ(s1->n_seq, 2);
     f.commit_plain();
 
-    /* Both are now decoding at position 160, which is a block boundary: the next token needs a
-     * new block and the pool has none. The victim must be A -- lowest priority, and the one that
-     * would be re-admitted last anyway -- not the head-of-line B. */
+    /* Both now decode at position 160, a block boundary: the next token needs a new block and
+     * the pool has none. The victim must be A (lowest priority, and re-admitted last anyway),
+     * not the head-of-line B. */
     const RadBatch* s2 = f.sch.step();
     CHECK(s2 != nullptr);
     CHECK_EQ(s2->n_seq, 1);
 
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Preempted);
     CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
-    CHECK_EQ(f.sch.find(a)->n_computed, 0);      /* preemption is by RECOMPUTE */
+    CHECK_EQ(f.sch.find(a)->n_computed, 0);      /* preemption is by recompute */
     CHECK_EQ(f.sch.find(a)->state_slot, -1);
 
-    /* Re-queued to the FRONT: it keeps its original arrival, so it sits ahead of C, which arrived
-     * later at the same priority. It has already been served once and its blocks were taken from
-     * it; sending it to the back would charge it twice. */
+    /* Requeued to the front: it keeps its original arrival, so it sits ahead of C, which arrived
+     * later at the same priority. */
     uint64_t q[8];
     int n = f.sch.queue_snapshot(q, 8);
     CHECK_EQ(n, 2);
@@ -1195,7 +1045,7 @@ TEST(a_mixed_step_has_the_right_boundaries_and_slot_mapping) {
     CHECK_EQ(s2->ctx_lens[0], 100);
     CHECK_EQ(s2->ctx_lens[1], 0);
     CHECK_EQ(s2->max_q_len, 64);
-    /* A CEILING ON A COARSE GRID, not the exact longest context: 100 rounds up to the 1024-token
+    /* A ceiling on a coarse grid, not the exact longest context: 100 rounds up to the 1024-token
      * floor, so the step's arguments stay put while the context grows under it. */
     CHECK_EQ(s2->max_ctx_len, 1024);
 
@@ -1214,10 +1064,9 @@ TEST(a_mixed_step_has_the_right_boundaries_and_slot_mapping) {
     CHECK_EQ(g0.slot_mapping[0], bta[6] * 16 + 4);
     /* B's first prefill token is the first slot of its first block. */
     CHECK_EQ(g0.slot_mapping[1], btb[0] * 16);
-    /* Block tables are one row per sequence, pitched from the step's context bound so the two
-     * move together: the 1024-token bound, plus the longest query (64) and the draft lookahead
-     * (2), is 1090 tokens, 69 blocks of 16, rounded up to the bound's 1024-token grid of 64
-     * blocks -- 128. The columns past a row's own blocks read -1. */
+    /* Block tables are one row per sequence, pitched from the step's context bound: 1024 tokens
+     * plus the longest query (64) and the draft lookahead (2) is 1090 tokens, 69 blocks of 16,
+     * rounded up to the bound's 64-block grid: 128. Columns past a row's own blocks read -1. */
     CHECK_EQ(g0.block_table_pitch, 128);
     CHECK_EQ(g0.block_table[0], bta[0]);
     CHECK_EQ(g0.block_table[6], bta[6]);
@@ -1253,9 +1102,9 @@ TEST(derived_metadata_is_computed_once_per_step_into_the_arena) {
     CHECK_EQ(ss[1], 1);
     CHECK_EQ(ss[2], 65);
 
-    /* Chunk bounds never cross a sequence, and split on ABSOLUTE multiples of the chunk length.
-     * The decode row spans position 100..100 and the prefill row 0..63, so neither crosses 64 --
-     * one chunk each, boundaries at 0, 1, 65. */
+    /* Chunk bounds never cross a sequence and split on absolute multiples of the chunk length.
+     * The decode row spans 100..100 and the prefill row 0..63, so neither crosses 64: one chunk
+     * each, boundaries at 0, 1, 65. */
     const int32_t* cb = f.derived("chunk_bounds");
     CHECK(cb != nullptr);
     CHECK_EQ(cb[0], 0);
@@ -1313,9 +1162,9 @@ TEST(cancellation_frees_blocks_immediately) {
     CHECK_EQ(f.kv.free_blocks(0), before - 10);
     f.commit_plain();
 
-    /* Not at completion, and not at the next step: now. A cancelled request that keeps its pool
-     * share until it would have finished is a pool that shrinks under exactly the load that
-     * generates cancellations. */
+    /* Freed now, not at completion or at the next step: a cancelled request that kept its pool
+     * share until it would have finished would shrink the pool under exactly the load that
+     * produces cancellations. */
     CHECK_OK(f.sch.cancel(a));
     CHECK_EQ(f.kv.free_blocks(0), before);
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Cancelled);
@@ -1323,9 +1172,9 @@ TEST(cancellation_frees_blocks_immediately) {
     CHECK_EQ(f.sch.metrics().cancelled, 1);
     CHECK_OK(f.sch.reap(a));
 
-    /* A step that is still on the device is the one exception, and it is a one-step deferral and
-     * not a one-request one: releasing a block a running kernel is writing hands it to a new
-     * sequence mid-step, and that presents as a model quality problem rather than as a crash. */
+    /* The one exception is a step still on the device, and it defers by one step, not one
+     * request: releasing a block a running kernel is writing hands it to a new sequence
+     * mid-step, which shows up as a quality problem rather than a crash. */
     uint64_t b = f.submit(160, 64);
     CHECK(f.sch.step() != nullptr);
     CHECK_EQ(f.kv.free_blocks(0), before - 10);
@@ -1335,19 +1184,16 @@ TEST(cancellation_frees_blocks_immediately) {
     CHECK_EQ(f.kv.free_blocks(0), before - 10);    /* but the blocks are still the device's */
     f.commit_plain();
     CHECK_EQ(f.kv.free_blocks(0), before);
-    /* And it is not resurrected: the commit must not append the token the step sampled for a
-     * request that was cancelled while that step was running. */
+    /* The commit must not append the token the step sampled for a request cancelled while that
+     * step was running. */
     CHECK_EQ((int)f.sch.find(b)->output.size(), 0);
     CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Cancelled);
 }
 
-/* A REAP THAT ARRIVES WHILE THE STEP IS STILL ON THE DEVICE, which is not a corner case: the
- * server reaps a generation as soon as its sink is finished, and cancelling a request finishes the
- * sink at once, so EVERY client that disconnects mid-decode arrives here. Releasing the Request
- * there destroys it under commit(), which then reads `r.state` off a null unique_ptr and takes the
- * process down. Returning the SLOT there is the worse half of the same failure and leaves no
- * trace: a request admitted before the commit lands is handed the entry, and one client's sampled
- * token is appended to another client's output. */
+/* A reap while the step is still on the device. Common: the server reaps as soon as a sink
+ * finishes, and cancelling finishes it, so every mid-decode disconnect lands here. Releasing the
+ * Request now would destroy it under commit(); returning its slot now would let a newly admitted
+ * request take the entry and receive another client's sampled token. */
 TEST(a_reap_during_the_open_step_is_deferred_to_commit) {
     Fixture f;
     f.build(/*blocks=*/20, /*states=*/64);
@@ -1362,8 +1208,8 @@ TEST(a_reap_during_the_open_step_is_deferred_to_commit) {
     CHECK_OK(f.sch.cancel(a));
     CHECK_OK(f.sch.reap(a));
 
-    /* The Request outlives the reap by exactly one commit, and so does its slot: neither the id
-     * nor the blocks are released while a StepEntry still points at them. */
+    /* The Request and its slot outlive the reap by exactly one commit: neither the id nor the
+     * blocks are released while a StepEntry still points at them. */
     CHECK(f.sch.find(a) != nullptr);
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Cancelled);
     CHECK_EQ(f.kv.free_blocks(0), before - 10);
@@ -1376,7 +1222,7 @@ TEST(a_reap_during_the_open_step_is_deferred_to_commit) {
     CHECK(f.sch.find(a) == nullptr);              /* released now, and exactly once */
     CHECK_EQ(f.kv.free_blocks(0), before);
 
-    /* And the request admitted in the window is untouched by the commit that reaped the other. */
+    /* The request admitted in the window is untouched by the commit that reaped the other. */
     CHECK(f.sch.find(b) != nullptr);
     CHECK_EQ((int)f.sch.find(b)->output.size(), 0);
     CHECK(f.sch.step() != nullptr);
@@ -1395,10 +1241,8 @@ TEST(a_prefix_hit_does_not_stop_a_full_attention_drafter) {
     f.cfg.n_spec = 7;                 /* copied into the scheduler at init, so it goes first */
     CHECK_OK(f.start());
 
-    /* A REAL HIT, both halves of it: the attention blocks AND the linear checkpoint have to
-     * reach the same depth or the scheduler recomputes from 0 and ctx_len is 0 -- which is a
-     * test that passes whatever this code does. Seeding only the paged half takes no hit and
-     * makes this case vacuous. */
+    /* A real hit, both halves: the attention blocks and the linear checkpoint must reach the same
+     * depth, or the scheduler recomputes from 0, ctx_len is 0 and the test passes vacuously. */
     f.pc.seed(256);
     f.pc.lin = 256;
     f.pc.src = 3;
@@ -1409,18 +1253,14 @@ TEST(a_prefix_hit_does_not_stop_a_full_attention_drafter) {
     f.commit_plain();
     CHECK(f.sch.step() != nullptr);                    /* 256..272, and this one yields a token */
     CHECK_EQ(f.sch.find(a)->n_computed, 272);
-    /* Non-zero is the whole point: this is the floor the guard would take after a hit. */
+    /* Non-zero is the point: this is the floor the guard would take after a hit. */
     CHECK(f.sch.plan().e[0].ctx_len > 0);
     f.commit_plain(11);
 
-    /* window 0 is a drafter that attends over its whole history, so "wait for the window to
-     * slide past the hit" is a condition that can never come true. Every paged group here IS
-     * prefix-cached, so the hit handed over blocks the previous sequence's own context pass
-     * wrote: there is no hole and the floor is 0. Taking the floor to be the hit position
-     * instead stops a windowless drafter from ever drafting again after a hit.
-     *
-     * THE OTHER SIDE -- a windowed drafter whose group the cache SKIPS, so a hit leaves a hole
-     * -- is the draft-refill cases below. */
+    /* Window 0 is a drafter attending over its whole history, so it can never wait for the window
+     * to slide past the hit. Every paged group here is prefix-cached, so the adopted blocks were
+     * written by the previous sequence's own context pass: no hole, floor 0. A windowed drafter
+     * whose group the cache skips is the draft-refill cases below. */
     Scheduler::BlockRow rows[4];
     CHECK_EQ(f.sch.block_begin(/*block=*/8, /*depth=*/7, /*window=*/0, /*mask=*/99, rows, 4), 1);
     CHECK_EQ((int)rows[0].seq, (int)a);
@@ -1428,9 +1268,8 @@ TEST(a_prefix_hit_does_not_stop_a_full_attention_drafter) {
 
 /* ====================================== a prefix hit and a windowed block drafter (draft refill)
  * The drafter's own windowed KV group is not prefix-cached, so a hit leaves it without K and V for
- * the cached tokens, and block_begin declines the sequence until the window has slid past the hole.
- * The scheduler ends such a hit one drafter window before the end of the prompt, at a checkpoint,
- * so the recompute covers the window and the drafter drafts from the first decode step. */
+ * the cached tokens. The scheduler ends such a hit one drafter window before the prompt's end, at
+ * a checkpoint, so the recompute covers the window and the drafter drafts from the first decode. */
 namespace {
 struct RefillRun {
     int64_t n_after_first = 0;     /* n_computed after the admitting step */
@@ -1443,11 +1282,10 @@ RefillRun refill_run(int n_prompt, int32_t seeded, int64_t ckpt_lo = 0) {
     f.cfg.n_spec = 7;
     f.prog.drafter.kind = RAD_DRAFT_BLOCK;
     f.prog.drafter.window = 512;
-    KVGroupInfo w;                 /* the drafter's own group: paged, windowed, not prefix-cached.
-                                    * UNBOUND, and a drafter group bound at the trunk's layer count
-                                    * and above is the same — the trunk clamp reads bound TRUNK
-                                    * layers (scheduler.h, hit_holes_trunk_) and does not fire on a
-                                    * drafter hole: the refill below is exactly its repair. */
+    KVGroupInfo w;                 /* the drafter's own group: paged, windowed, not prefix-cached,
+                                    * unbound. The trunk clamp reads bound trunk layers only
+                                    * (scheduler.h, hit_holes_trunk_), so it leaves this hole to
+                                    * the refill. */
     w.name = "draft";
     w.decl.kind = RAD_KV_WINDOW;
     w.decl.window = 512;
@@ -1485,7 +1323,7 @@ TEST(a_prefix_hit_ends_a_drafter_window_before_the_prompt_and_the_drafter_drafts
 }
 
 TEST(a_prefix_hit_already_a_window_back_is_kept_whole) {
-    /* 5000 - 512 is past the 1024-token hit: the drafter's window is recomputed anyway. */
+    /* 5000 - 512 is past the 1024-token hit, so the drafter's window is recomputed anyway. */
     const RefillRun r = refill_run(5000, 1024);
     CHECK_EQ(r.n_after_first, 1024);
     CHECK_EQ(r.m.draft_refills, (int64_t)0);
@@ -1534,12 +1372,8 @@ TEST(rejection_rolls_back_paged_kv_and_moves_the_linear_read_offset) {
     int32_t cursor_before = f.sch.plan().e[0].conv_cursor;
 
     /* Two of the four drafts survive. */
-    int32_t acc[1] = { 2 };
-    int32_t tok[1] = { 99 };
-    uint8_t eos[1] = { 0 };
-    Scheduler::StepResult r;
-    r.n_seq = 1; r.n_accepted = acc; r.token = tok; r.eos = eos;
-    CHECK_OK(f.sch.commit(r));
+    CHECK_EQ((int)f.sch.plan().e.size(), 1);
+    CHECK_OK(f.commit(99, 0, [](const StepEntry&) { return 2; }));
 
     const Request* ra = f.sch.find(a);
     /* Three tokens committed: the two accepted drafts and the bonus. */
@@ -1549,25 +1383,21 @@ TEST(rejection_rolls_back_paged_kv_and_moves_the_linear_read_offset) {
     CHECK_EQ(ra->output[3], 99);
     CHECK_EQ(ra->n_computed, 163);
     CHECK_EQ(ra->n_accepted, 2);
-    /* Paged KV gave blocks back for the rejected tail; the state slot did not move, because a
-     * linear rollback is a read offset and not a free. */
+    /* Paged KV gave back blocks for the rejected tail; the state slot did not move, since a linear
+     * rollback is a read offset, not a free. */
     CHECK(f.kv.free_blocks(0) >= blocks_before);
     CHECK(f.kv.state_slot(a, 1) >= 0);
 
     /* The conv cursor advanced by 1 + accepted, modulo the rolling window. */
-    f.submit(1, 1);   /* nothing; just to force a plan rebuild below */
+    f.submit(1, 1);   /* only to force a plan rebuild below */
     const RadBatch* b2 = f.sch.step();
     CHECK(b2 != nullptr);
     int32_t W = 4 - 1 + 4 + 1;
     CHECK_EQ(f.sch.plan().e[0].conv_cursor, (cursor_before + 3) % W);
 }
 
-/* A decode measurement needs the request to last as long as the harness asked for; otherwise the
- * model decides how many steps are measured, one prompt ending after eight tokens and the next
- * running for hundreds, so the window measures the prompt rather than the change under test. Both
- * halves are pinned here -- that EOS stops the ordinary request, and that max_tokens still stops
- * the one ignoring it, because a flag that suppressed BOTH would be an endless generation rather
- * than a benchmark. */
+/* A decode benchmark needs the request to last as long as asked, not as long as the model
+ * chooses. EOS still stops an ordinary request, and max_tokens still stops one ignoring EOS. */
 TEST(ignore_eos_runs_to_max_tokens_and_nothing_else_changes) {
     Fixture f;
     f.build();
@@ -1579,41 +1409,26 @@ TEST(ignore_eos_runs_to_max_tokens_and_nothing_else_changes) {
     f.commit_plain(7);                  /* both prefilled, one token each */
 
     /* Every sequence emits end-of-generation on this step. */
-    const StepPlan& p = f.sch.plan();
-    CHECK_EQ((int)p.e.size(), 2);
-    std::vector<int32_t> acc((size_t)p.e.size(), 0), tok((size_t)p.e.size(), 9);
-    std::vector<uint8_t> eos((size_t)p.e.size(), 1);
+    CHECK_EQ((int)f.sch.plan().e.size(), 2);
     CHECK(f.sch.step() != nullptr);
-    Scheduler::StepResult r;
-    r.n_seq = (int)p.e.size();
-    r.n_accepted = acc.data(); r.token = tok.data(); r.eos = eos.data();
-    CHECK_OK(f.sch.commit(r));
+    CHECK_OK(f.commit(9, 1));
 
     CHECK_EQ((int)f.sch.find(plain)->state, (int)ReqState::Finished);
     CHECK_EQ(f.sch.find(plain)->finish_reason, std::string("stop"));
     CHECK_EQ((int)f.sch.find(keep)->state, (int)ReqState::Running);
 
     /* It ends on the budget instead, and says so. */
-    while (f.sch.find(keep)->state == ReqState::Running && f.sch.step() != nullptr) {
-        const StepPlan& q = f.sch.plan();
-        std::vector<int32_t> a2((size_t)q.e.size(), 0), t2((size_t)q.e.size(), 9);
-        std::vector<uint8_t> e2((size_t)q.e.size(), 1);
-        Scheduler::StepResult r2;
-        r2.n_seq = (int)q.e.size();
-        r2.n_accepted = a2.data(); r2.token = t2.data(); r2.eos = e2.data();
-        CHECK_OK(f.sch.commit(r2));
-    }
+    while (f.sch.find(keep)->state == ReqState::Running && f.sch.step() != nullptr)
+        CHECK_OK(f.commit(9, 1));
     const Request* rk = f.sch.find(keep);
     CHECK_EQ((int)rk->state, (int)ReqState::Finished);
     CHECK_EQ(rk->finish_reason, std::string("length"));
     CHECK_EQ((int)rk->output.size(), 4);
 }
 
-/* A block that wants to treat the two kinds of row differently can only do it if each kind is a
- * contiguous run of sequences, because cu_seqlens is read as cu[n] and cu[n+1]. The scheduler
- * walks `running_` in PRIORITY order, so without the sort a high-priority request part way
- * through its prompt lands ahead of a low-priority one that is decoding -- which is exactly the
- * arrangement built here. */
+/* Decode rows come first in a mixed step: a block that treats the two kinds differently needs each
+ * as a contiguous run, since cu_seqlens is read as cu[n] and cu[n+1]. `running_` is walked in
+ * priority order, so without the sort a high-priority prefill lands ahead of a decoding row. */
 TEST(a_mixed_step_puts_its_decode_rows_first) {
     Fixture f;
     f.build(/*blocks=*/4096, /*states=*/64);
@@ -1644,23 +1459,22 @@ TEST(a_mixed_step_puts_its_decode_rows_first) {
     CHECK_EQ(s1->max_q_len_prefill, 256);
     CHECK_EQ(s1->max_q_len, 256);
 
-    /* AND THE ENTRY INDEX FOLLOWED THE ROW. `entry` is how a request finds its own result, so a
-     * sort that leaves it behind hands one request another's token. */
+    /* The entry index followed the row. `entry` is how a request finds its own result, so a sort
+     * that leaves it behind hands one request another's token. */
     f.commit_plain(12);
     CHECK_EQ((int)f.sch.find(a)->output.size(), 2);    /* 11 from the prefill, 12 from the decode */
     CHECK_EQ(f.sch.find(a)->output[1], 12);
     CHECK_EQ((int)f.sch.find(b)->output.size(), 0);    /* still prefilling: no token yet */
 }
 
-/* A STEP THAT CARRIES A PREFILL CHUNK STILL TAKES A DRAFT. Issuing the chunked path for every
- * sequence in a mixed step would force the draft to be refused, because that path has no
- * num_accepted operand to roll a rejection back with; the blocks issue the recurrent path over the
- * decode half instead. These are the two shapes such a refusal would fire on. */
+/* A step carrying a prefill chunk still takes a draft: the blocks issue the recurrent path over
+ * the decode half, because the chunked path has no num_accepted operand to roll a rejection back
+ * with. These are the two shapes a refusal would fire on. */
 TEST(a_queued_request_does_not_suppress_the_draft) {
     Fixture f;
     f.build(/*blocks=*/4096, /*states=*/64);
     f.cfg.n_spec = 4;
-    f.cfg.max_seqs = 3;                      /* a slot is free, so the queue WILL be admitted */
+    f.cfg.max_seqs = 3;                      /* a slot is free, so the queue will be admitted */
     CHECK_OK(f.start());
 
     uint64_t a = f.submit(160, 64);
@@ -1686,8 +1500,8 @@ TEST(a_queued_request_does_not_suppress_the_draft) {
     CHECK_EQ(f.sch.plan().e[0].n_spec, 4);
     CHECK_EQ(f.sch.plan().e[1].n_spec, 4);
     CHECK_EQ(f.sch.plan().e[2].n_spec, 0);
-    /* Two decode rows of 1 + 4, so the split the blocks issue over is 10 tokens and then the
-     * chunk. Getting this wrong is how a per-token op reaches into the other half. */
+    /* Two decode rows of 1 + 4, so the blocks split after 10 tokens and then the chunk. A wrong
+     * split lets a per-token op reach into the other half. */
     CHECK_EQ(s->n_tok_decode, 10);
     CHECK_EQ(s->max_q_len_decode, 5);
     CHECK_EQ(s->max_q_len_prefill, 160);
@@ -1718,17 +1532,17 @@ TEST(a_running_prefill_does_not_suppress_the_draft) {
 }
 
 /* ================================================================== a prefill sharing a step */
-/* --busy-prefill-chunk. The shape that starves: the checkpoint interval as large as the step
- * budget, so a long prefill's chunk can take the whole step every step. Here 512 and 512, the
- * quantum 64; the sequence is long enough for many full chunks. */
+/* --busy-prefill-chunk. The starving shape: a checkpoint interval as large as the step budget,
+ * so a long prefill's chunk can take the whole step every step. Here 512 and 512, quantum 64; the
+ * sequence is long enough for many full chunks. */
 static void share_fixture(Fixture& f, int64_t mode) {
     f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/4096);
     f.cfg.checkpoint_interval = 512;
     f.cfg.busy_prefill_chunk = mode;
 }
 
-/* What 1.3.0 did, and `off` still does: once the long prefill owns the step, a request that
- * arrives is not even admitted until it ends. */
+/* With `off`, once the long prefill owns the step a newly arriving request is not even admitted
+ * until it ends. */
 TEST(off_a_long_prefill_keeps_a_new_request_out_of_every_step) {
     Fixture f;
     share_fixture(f, /*off=*/0);
@@ -1750,14 +1564,14 @@ TEST(off_a_long_prefill_keeps_a_new_request_out_of_every_step) {
     CHECK_EQ(f.sch.metrics().prefill_chunks_capped, 0);
 }
 
-/* auto: the same arrival is admitted in the very next step, and its prompt finishes in two. */
+/* auto: the same arrival is admitted in the next step, and its prompt finishes in two. */
 TEST(auto_a_request_arriving_during_a_long_prefill_is_admitted_at_once) {
     Fixture f;
     share_fixture(f, /*auto=*/-1);
     CHECK_OK(f.start());
     uint64_t a = f.submit(3500, 64);
     CHECK(f.sch.step() != nullptr);
-    CHECK_EQ(f.sch.plan().e[0].n_tokens, 512);       /* alone: the whole step, as before */
+    CHECK_EQ(f.sch.plan().e[0].n_tokens, 512);       /* alone: the whole step */
     f.commit_plain();
     uint64_t b = f.submit(100, 64);
     CHECK(f.sch.step() != nullptr);
@@ -1784,7 +1598,7 @@ TEST(auto_a_request_arriving_during_a_long_prefill_is_admitted_at_once) {
     CHECK((int)f.sch.find(b)->output.size() >= 2);
 }
 
-/* A decode row BEHIND a long prefill in running_ (the prefill outranks it) is planned every step
+/* A decode row behind a long prefill in running_ (the prefill outranks it) is planned every step
  * under auto; under off it is left out of every step that begins on an interval boundary. */
 static int decode_rows_seen(int64_t mode) {
     Fixture f;
@@ -1808,8 +1622,8 @@ TEST(auto_a_decode_row_behind_a_long_prefill_gets_every_step) {
     CHECK(decode_rows_seen(0) < 8);
 }
 
-/* Nothing else wants in: the cap does not apply, and a lone prefill is planned chunk for chunk
- * as before -- which is what keeps every single-request gate unchanged. */
+/* With nothing else waiting the cap does not apply, and a lone prefill is planned chunk for chunk
+ * the same under both modes, which keeps every single-request gate unchanged. */
 TEST(auto_a_lone_prefill_is_planned_as_before) {
     std::vector<int32_t> plans[2];
     for (int m = 0; m < 2; ++m) {
@@ -1842,8 +1656,120 @@ TEST(an_explicit_busy_prefill_chunk_holds_the_chunk_to_it) {
         if (e.seq == a) CHECK_EQ(e.n_tokens, 128);
 }
 
-/* The arithmetic, at the shape of a real deployment: a 2048-token step and interval, the stager
- * arming at 1025 tokens (so a held-back chunk keeps 1024 and its step-mates make up the rest). */
+/* ================================================================== decode-only steps between chunks */
+/* --prefill-interleave. A sequence decodes while a 2000-token prompt prefills in 256-token chunks
+ * (the checkpoint interval). Each step's shape is 'C' when it carries a chunk of the prompt and
+ * 'D' when it carries decode rows only; `staged` records prefill_continues() after each step,
+ * which arms the prefill stager for the next one. */
+struct Interleaved {
+    std::string shape;
+    std::string staged;
+    int64_t steps_held = 0;
+};
+
+static Interleaved interleave_run(int64_t n, bool decoder, int steps) {
+    Fixture f;
+    f.build();
+    f.cfg.prefill_interleave = n;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(64);
+    if (decoder) {
+        f.submit(100, 512);
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain(11);
+    }
+    const uint64_t p = f.submit(2000, 4);
+    Interleaved out;
+    for (int k = 0; k < steps; ++k) {
+        if (!f.sch.step()) break;
+        bool chunk = false;
+        for (const StepEntry& e : f.sch.plan().e) if (e.seq == p && e.is_prefill) chunk = true;
+        out.shape += chunk ? 'C' : 'D';
+        out.staged += f.sch.prefill_continues() ? '+' : '-';
+        f.commit_plain(12);
+    }
+    out.steps_held = f.sch.metrics().steps_held;
+    return out;
+}
+
+TEST(interleave_off_puts_a_chunk_in_every_step) {
+    const Interleaved r = interleave_run(0, /*decoder=*/true, 8);
+    CHECK_EQ(r.shape, std::string("CCCCCCCC"));
+    CHECK_EQ(r.staged, std::string("+++++++-"));      /* the eighth chunk is the last */
+    CHECK_EQ(r.steps_held, 0);
+}
+
+/* N decode-only steps after each chunk, which admit nothing, and the stager is not armed for a
+ * chunk the next step will hold: its staged experts would be dropped. */
+TEST(interleave_runs_n_decode_only_steps_after_each_chunk) {
+    const Interleaved r = interleave_run(2, /*decoder=*/true, 10);
+    CHECK_EQ(r.shape, std::string("CDDCDDCDDC"));
+    CHECK_EQ(r.staged, std::string("----------"));
+    CHECK_EQ(r.steps_held, 6);
+}
+
+/* Nothing decodes beside a lone prefill, so nothing is held. */
+TEST(interleave_leaves_a_lone_prefill_alone) {
+    const Interleaved r = interleave_run(2, /*decoder=*/false, 8);
+    CHECK_EQ(r.shape, std::string("CCCCCCCC"));
+    CHECK_EQ(r.steps_held, 0);
+}
+
+/* After a prompt's last chunk there is nothing to interleave: the next request is admitted in the
+ * next step. */
+TEST(interleave_does_not_hold_after_a_prompts_last_chunk) {
+    Fixture f;
+    f.build();
+    f.cfg.prefill_interleave = 2;
+    CHECK_OK(f.start());
+    f.submit(100, 512);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    f.submit(200, 4);                      /* one chunk, beside the decoder */
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    f.commit_plain(12);
+    const uint64_t q = f.submit(300, 4);
+    CHECK(f.sch.step() != nullptr);
+    bool admitted = false;
+    for (const StepEntry& e : f.sch.plan().e) if (e.seq == q && e.is_prefill) admitted = true;
+    CHECK(admitted);
+    CHECK_EQ(f.sch.metrics().steps_held, 0);
+}
+
+/* A decode-only step of the hold may be issued ahead; it counts toward N and as a held step, and
+ * once the hold is spent the next step is a full one that carries the chunk. */
+TEST(interleave_counts_steps_issued_ahead_and_then_serves_the_chunk) {
+    Fixture f;
+    f.build();
+    f.cfg.prefill_interleave = 2;
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 512);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    f.sch.find(d)->speculation_fixed = true;
+    const uint64_t p = f.submit(2000, 4);
+    CHECK(f.sch.step() != nullptr);                     /* chunk beside the decoder */
+    CHECK(f.sch.step_next() == nullptr);                /* a prompt continues: no issuing ahead */
+    f.commit_plain(12);
+
+    CHECK(f.sch.step() != nullptr);                     /* held: the decoder alone */
+    CHECK_EQ((int)f.sch.plan().e.size(), 1);
+    CHECK(f.sch.step_next() != nullptr);                /* the hold's second step, ahead */
+    f.commit_plain(12);
+    f.sch.promote_next();
+    CHECK_EQ(f.sch.metrics().steps_held, 2);
+    CHECK(f.sch.step_next() == nullptr);                /* the hold is spent */
+    f.commit_plain(12);
+
+    CHECK(f.sch.step() != nullptr);
+    bool chunk = false;
+    for (const StepEntry& e : f.sch.plan().e) if (e.seq == p && e.is_prefill) chunk = true;
+    CHECK(chunk);
+}
+
+/* The arithmetic at a real deployment's shape: a 2048-token step and interval, the stager arming
+ * at 1025 tokens (so a held-back chunk keeps 1024 and its step-mates take the rest). */
 TEST(busy_cap_keeps_the_stager_floor_and_never_leaves_a_runt) {
     Fixture f;
     f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/2048, /*max_ctx=*/8192);
@@ -1864,17 +1790,17 @@ TEST(busy_cap_keeps_the_stager_floor_and_never_leaves_a_runt) {
     CHECK_EQ(f.sch.plan_chunk(0, 1500, f.sch.busy_cap(0, 1500, 2048, 272), nullptr), 1500);
     /* a budget already under the floor: never more than the budget */
     CHECK_EQ(f.sch.busy_cap(0, 100000, 512, 64), 512);
-    /* decode rows alone behind it (2 rows x (1 + 3 drafts)): no split -- the chunk ends a quantum
+    /* decode rows alone behind it (2 rows x (1 + 3 drafts)): no split; the chunk ends a quantum
      * short of the boundary (1984) and the next step takes the remaining 64, the pair a prefill
-     * already runs with decode rows AHEAD of it */
+     * already runs with decode rows ahead of it */
     CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 8, false, /*rows_only=*/true), 2040);
     CHECK_EQ(f.sch.plan_chunk(0, 100000, f.sch.busy_cap(0, 100000, 2048, 8, false, true), nullptr), 1984);
     /* the same reserve with a share in it splits the interval */
     CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 8 + 256, false, false), 1024);
 }
 
-/* The share left for a request that then does not start (here its media is not encoded yet) goes
- * back to the chunk that made room for it: the step is planned as if nothing had waited. */
+/* The share left for a request that then does not start (its media is not encoded yet) goes back
+ * to the chunk that made room for it: the step is planned as if nothing had waited. */
 TEST(auto_a_share_nobody_takes_goes_back_to_the_prefill) {
     Fixture f;
     share_fixture(f, -1);
@@ -1892,8 +1818,8 @@ TEST(auto_a_share_nobody_takes_goes_back_to_the_prefill) {
     CHECK_EQ(f.sch.metrics().queue_depth, 1);
 }
 
-/* An explicit N also holds a chunk back for rows planned AHEAD of it -- the operator's trade of
- * prefill speed for every other row's latency; auto leaves those alone. */
+/* An explicit N also holds a chunk back for rows planned ahead of it (the operator trades prefill
+ * speed for every other row's latency); auto leaves those alone. */
 TEST(an_explicit_busy_prefill_chunk_applies_to_rows_ahead_auto_does_not) {
     for (int64_t mode : { (int64_t)-1, (int64_t)128 }) {
         Fixture f;
@@ -1933,6 +1859,17 @@ TEST(busy_cap_is_the_budget_when_off) {
     CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 1500), 2048);
 }
 
+namespace {
+/* A small deterministic coin: true with probability `pr`. */
+struct Coin {
+    uint64_t s = 12345;
+    bool operator()(double pr) {
+        s = s * 6364136223846793005ull + 1442695040888963407ull;
+        return ((double)((s >> 33) & 0xFFFFFF) / (double)0x1000000) < pr;
+    }
+};
+}  /* namespace */
+
 TEST(the_draft_depth_is_the_configured_one_whatever_the_acceptance_trace) {
     DraftController c;
     DraftController::Params p;
@@ -1941,12 +1878,8 @@ TEST(the_draft_depth_is_the_configured_one_whatever_the_acceptance_trace) {
     CHECK_EQ(c.next_depth(), 8);
 
     /* A workload that rejects almost everything. A dynamic policy would collapse the depth here;
-     * this one does not move, which is the property being asserted -- the depth is the flag. */
-    uint64_t rng = 12345;
-    auto coin = [&](double pr) {
-        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
-        return ((double)((rng >> 33) & 0xFFFFFF) / (double)0x1000000) < pr;
-    };
+     * this one does not move: the depth is the flag. */
+    Coin coin;
     for (int t = 0; t < 4000; ++t) {
         int d = c.next_depth();
         CHECK_EQ(d, 8);
@@ -1957,8 +1890,8 @@ TEST(the_draft_depth_is_the_configured_one_whatever_the_acceptance_trace) {
     CHECK_EQ(c.next_depth(), 8);
     CHECK(c.acceptance() > 0.0f && c.acceptance() < 0.3f);
 
-    /* The accounting is exact and is charged per DRAFTED token, not per step: it is the number a
-     * scraped acceptance rate divides by. */
+    /* The accounting is exact and charged per drafted token, not per step: it is what a scraped
+     * acceptance rate divides by. */
     DraftController d2;
     DraftController::Params q;
     q.max_depth = 8;
@@ -1985,15 +1918,6 @@ TEST(the_draft_depth_is_the_configured_one_whatever_the_acceptance_trace) {
  * program declares one and whose Config asks for the window. */
 
 namespace {
-/* A small deterministic coin, the one the static case above uses. */
-struct Coin {
-    uint64_t s = 12345;
-    bool operator()(double pr) {
-        s = s * 6364136223846793005ull + 1442695040888963407ull;
-        return ((double)((s >> 33) & 0xFFFFFF) / (double)0x1000000) < pr;
-    }
-};
-
 DraftController adaptive_controller(int max_depth) {
     DraftController c;
     DraftController::Params p;
@@ -2031,26 +1955,12 @@ void adaptive_fixture(Fixture& f, int depth) {
     f.prog.drafter.depth = depth;
 }
 
-/* Everything written to stderr while `fn` runs: the log lines a case checks for. */
-template <class F> std::string stderr_of(F fn) {
-    std::string text;
-    FILE* tmp = std::tmpfile();
-    if (!tmp) return text;
+/* What `fn` logs at Info and above: the log lines a case checks for. */
+std::string info_of(const std::function<void()>& fn) {
     const Log level = log_level();
     log_set_level(Log::Info);
-    std::fflush(stderr);
-    const int saved = dup(2);
-    dup2(fileno(tmp), 2);
-    fn();
-    std::fflush(stderr);
-    dup2(saved, 2);
+    std::string text = stderr_of(fn);
     log_set_level(level);
-    close(saved);
-    std::rewind(tmp);
-    char buf[4096];
-    size_t n;
-    while ((n = std::fread(buf, 1, sizeof buf, tmp)) > 0) text.append(buf, n);
-    std::fclose(tmp);
     return text;
 }
 }  /* namespace */
@@ -2094,7 +2004,7 @@ TEST(the_adaptive_window_follows_each_sequences_own_acceptance) {
     CHECK_EQ(c.verified_at(1) + c.verified_at(2) + c.verified_at(3) + c.verified_at(4) +
              c.verified_at(5) + c.verified_at(6), (int64_t)1200);
 
-    /* And a stop that went shallow comes back when the text changes: the positions it stopped
+    /* A stop that went shallow comes back when the text changes: the positions it stopped
      * drafting drift toward the deepest it still drafts, so a text the drafter predicts again is
      * found without anyone drafting deep first. */
     for (int t = 0; t < 600; ++t) {
@@ -2106,9 +2016,9 @@ TEST(the_adaptive_window_follows_each_sequences_own_acceptance) {
     CHECK_EQ(c.window_for(summary), 6);
 }
 
-/* A STOP MOVES ONLY PAST THE HOLD: it is the sequence's share of the step's pass shape, and a shape
- * that followed every flicker of its estimate would re-record its passes for nothing
- * (runtime/ctx.h). And it never goes below one draft, or the estimate could never recover. */
+/* A stop moves only past the hold: it is the sequence's share of the step's pass shape, and a
+ * shape following every flicker of its estimate would re-record its passes for nothing
+ * (runtime/ctx.h). It never goes below one draft, or the estimate could never recover. */
 TEST(the_adaptive_window_moves_only_past_its_hold_and_never_below_one_draft) {
     DraftController c = adaptive_controller(6);
     DraftAdapt s;
@@ -2139,10 +2049,9 @@ TEST(the_adaptive_window_moves_only_past_its_hold_and_never_below_one_draft) {
     CHECK(!zero.adaptive());
 }
 
-/* THE STEP COST IS MEASURED. A key -- the step's deepest window and its class of running
- * sequences -- with samples is its own mean; one without borrows the nearest measured key's,
- * scaled by the prior's shape; nothing measured is the prior. The same times give the same
- * choice, which is what makes the policy a function of what it was shown. */
+/* The step cost is measured. A key (the step's deepest window, its class of running sequences)
+ * with samples is its own mean; one without borrows the nearest measured key's, scaled by the
+ * prior's shape; with nothing measured it is the prior. Same times, same choice. */
 TEST(the_adaptive_window_prices_a_step_from_measured_step_times) {
     DraftController c = adaptive_controller(6);
     CHECK_NEAR(c.step_cost(1, 1), 1.06, 1e-12);                /* the prior */
@@ -2196,9 +2105,9 @@ TEST(the_adaptive_window_prices_a_step_from_measured_step_times) {
     CHECK_EQ(m2.plan_step(mu2, 1, 1), 3);
 }
 
-/* THE HEAD DEPTH IS THE STEP'S. A serial head runs as many rounds as the deepest window in the
- * step, so a sequence that accepts deep is worth deep rounds only while what its neighbours lose
- * to them -- every round is a pass over every drafting row -- does not outweigh it. */
+/* The head depth is the step's. A serial head runs as many rounds as the step's deepest window,
+ * so a sequence that accepts deep is worth deep rounds only while its neighbours' loss to them
+ * (every round is a pass over every drafting row) does not outweigh it. */
 TEST(the_adaptive_window_chooses_the_head_depth_over_the_whole_batch) {
     DraftController c = adaptive_controller(6);
     DraftAdapt deep = estimate(c, 0.95, 0.95);
@@ -2214,8 +2123,8 @@ TEST(the_adaptive_window_chooses_the_head_depth_over_the_whole_batch) {
     CHECK_EQ(c.window_for(shallow), 1);
 
     /* The same deep sequence among seven shallow ones, at a class whose steps were measured to
-     * grow by three units a round: what the rounds cost is paid by eight rows, and the one
-     * that gains from them does not repay it. Every window comes down to one. */
+     * grow by three units per round: eight rows pay for the rounds, and the one that gains does not
+     * repay it. Every window comes down to one. */
     DraftController b = adaptive_controller(6);
     for (int d = 1; d <= 6; ++d) b.step_time(d, 8, 10.0 + 3.0 * d);
     DraftAdapt bd = estimate(b, 0.95, 0.95);
@@ -2245,7 +2154,7 @@ TEST(the_adaptive_window_chooses_the_head_depth_over_the_whole_batch) {
     const int alone = r2.plan_step(rone2, 1, 1);    /* class 1 unmeasured: borrows class 4-7 */
     CHECK(with_plain <= alone);
 
-    /* D MOVES PAST A HOLD AND A HYSTERESIS. The first step that drafts takes the best outright;
+    /* D moves past a hold and a hysteresis. The first step that drafts takes the best outright;
      * after that a better depth waits kHold steps. */
     DraftController h = adaptive_controller(6);
     DraftAdapt hs = estimate(h, 0.95, 0.95);
@@ -2258,7 +2167,7 @@ TEST(the_adaptive_window_chooses_the_head_depth_over_the_whole_batch) {
     CHECK_EQ(h.plan_step(hone, 0, 3), 2);
 }
 
-/* THE FLAG, FOR A DRAFTING HEAD -- SERIAL OR BLOCK. --draft-window adaptive with prompt lookup
+/* The flag, for a drafting head (serial or block). --draft-window adaptive with prompt lookup
  * alone, or with no speculation, keeps the configured depth and says so at startup; the proposal
  * then reaches the step uncut. The default is the fixed window. */
 TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_none) {
@@ -2266,10 +2175,10 @@ TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_no
         Fixture f;
         adaptive_fixture(f, 4);
         int st = RAD_E_STATE;
-        const std::string log = stderr_of([&] { st = f.start(); });
+        const std::string log = info_of([&] { st = f.start(); });
         CHECK_OK(st);
         CHECK(f.sch.draft().adaptive());
-        CHECK(log.find("ADAPTIVE") != std::string::npos);
+        CHECK(log.find("draft depth: adaptive") != std::string::npos);
     }
     {
         Fixture f;
@@ -2280,18 +2189,18 @@ TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_no
         Config d;
         CHECK(d.draft_window == kDraftWindowDefault);      /* the default */
     }
-    /* A BLOCK DRAFTER TAKES THE POLICY WITH ITS ROUNDS FIXED. It proposes its whole block in one
-     * pass, and each sequence verifies the first of it up to its own window: the whole block while
-     * its estimate is the prior, one draft once its drafts stop being taken. Startup says so. */
+    /* A block drafter takes the policy with its rounds fixed. It proposes its whole block in one
+     * pass, and each sequence verifies the block's prefix up to its own window: the whole block
+     * while its estimate is the prior, one draft once its drafts stop being taken. Startup says so. */
     {
         Fixture f;
         adaptive_fixture(f, 4);
         f.prog.drafter.kind = RAD_DRAFT_BLOCK;
         int st = RAD_E_STATE;
-        const std::string log = stderr_of([&] { st = f.start(); });
+        const std::string log = info_of([&] { st = f.start(); });
         CHECK_OK(st);
         CHECK(f.sch.draft().adaptive());
-        CHECK(log.find("ADAPTIVE") != std::string::npos);
+        CHECK(log.find("draft depth: adaptive") != std::string::npos);
         CHECK(log.find("with a block drafter") != std::string::npos);
         CHECK(log.find("the window is fixed") == std::string::npos);
 
@@ -2319,7 +2228,7 @@ TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_no
         f.prog.drafter.kind = RAD_DRAFT_NONE;
         f.prog.drafter.depth = 0;
         int st = RAD_E_STATE;
-        const std::string log = stderr_of([&] { st = f.start(); });
+        const std::string log = info_of([&] { st = f.start(); });
         CHECK_OK(st);
         CHECK(!f.sch.draft().adaptive());
         CHECK(log.find("--draft-window adaptive: the window is fixed at 4") != std::string::npos);
@@ -2337,15 +2246,15 @@ TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_no
         Fixture f;
         adaptive_fixture(f, 4);
         f.cfg.n_spec = 0;
-        const std::string log = stderr_of([&] { CHECK_OK(f.start()); });
+        const std::string log = info_of([&] { CHECK_OK(f.start()); });
         CHECK(!f.sch.draft().adaptive());
         CHECK(log.find("does not speculate") != std::string::npos);
     }
 }
 
-/* EACH SEQUENCE ITS OWN STOP, AND THE ROUNDS FOLLOW THE DEEPEST. The step issued ahead of a commit
- * verifies, for each sequence, the first of those rounds up to its own window -- and the drafter's
- * longer proposal is taken cut to that count rather than refused as a mismatch. */
+/* Each sequence has its own stop, and the rounds follow the deepest. The step issued ahead of a
+ * commit verifies, per sequence, the first rounds up to its own window, and the drafter's longer
+ * proposal is cut to that count rather than refused as a mismatch. */
 TEST(the_adaptive_window_is_per_sequence_and_the_rounds_follow_the_deepest) {
     Fixture f;
     adaptive_fixture(f, 4);
@@ -2360,16 +2269,7 @@ TEST(the_adaptive_window_is_per_sequence_and_the_rounds_follow_the_deepest) {
     /* `a`'s drafts are never taken and `b`'s always are. */
     int32_t draft[4] = { 21, 22, 23, 24 };
     auto commit_ab = [&]() {
-        const StepPlan& pl = f.sch.plan();
-        std::vector<int32_t> acc(pl.e.size(), 0), tok(pl.e.size(), 9);
-        std::vector<uint8_t> eos(pl.e.size(), 0);
-        for (size_t i = 0; i < pl.e.size(); ++i) acc[i] = pl.e[i].seq == b ? pl.e[i].n_spec : 0;
-        Scheduler::StepResult r;
-        r.n_seq = (int)pl.e.size();
-        r.n_accepted = acc.data();
-        r.token = tok.data();
-        r.eos = eos.data();
-        CHECK_OK(f.sch.commit(r));
+        CHECK_OK(f.commit(9, 0, [&](const StepEntry& e) { return e.seq == b ? e.n_spec : 0; }));
     };
     for (int t = 0; t < 64; ++t) {
         CHECK_OK(f.sch.set_draft(a, draft, 4));
@@ -2420,10 +2320,9 @@ TEST(the_adaptive_window_is_per_sequence_and_the_rounds_follow_the_deepest) {
     CHECK(f.sch.metrics().draft_verify_depth[4] > 0);
 }
 
-/* A NEW SEQUENCE STARTS FROM THE SEQUENCES THAT FINISHED, ONE VOTE EACH. Pooled over verifies, a
- * deep position is measured almost only on the texts good enough to be given a window that
- * reaches it; here two texts the head predicts and two it does not, and the deep positions start
- * a new sequence from all four. Until four have finished, the fixed prior. */
+/* A new sequence starts from the finished sequences, one vote each. Pooled verifies measure deep
+ * positions almost only on texts good enough to reach them; here two texts the head predicts and
+ * two it does not set the prior together. Until four have finished, the fixed prior applies. */
 TEST(the_adaptive_window_starts_a_sequence_from_finished_sequences_not_pooled_verifies) {
     DraftController c = adaptive_controller(6);
     /* The pooled counts a deep-drafting good text leaves: position 5 accepted 95 % of the times
@@ -2478,8 +2377,8 @@ TEST(the_adaptive_window_starts_a_sequence_from_finished_sequences_not_pooled_ve
     }
     CHECK_EQ(f.sch.metrics().finished, (int64_t)4);
     CHECK(f.sch.draft().prior_at(0) < 0.2);
-    /* The step depth came down with them; a fresh sequence that started at the fixed prior would
-     * take it back to four at its first cycle (the hold has long passed), and this one does not. */
+    /* The step depth came down with them; a fresh sequence starting at the fixed prior would take
+     * it back to four at its first cycle (the hold has long passed), and this one does not. */
     CHECK_EQ(f.sch.draft().step_depth(), 1);
     const uint64_t e = f.submit(160, 48);
     REQUIRE(f.sch.step() != nullptr);
@@ -2492,10 +2391,9 @@ TEST(the_adaptive_window_starts_a_sequence_from_finished_sequences_not_pooled_ve
     CHECK_EQ(f.sch.find(e)->n_draft, 1);
 }
 
-/* PROMPT LOOKUP IS NOT THE HEAD. When the head declines and the n-gram fallback proposes, the
- * outcome is counted in the reported acceptance like any other draft and kept out of the
- * sequence's estimate, which prices the head's next window. A run of lookups that are all refused
- * leaves the head's window where it was; the same run of refusals from the head brings it down. */
+/* Prompt lookup is not the head. An n-gram fallback draft counts in the reported acceptance but
+ * stays out of the sequence's estimate, which prices the head's next window: refused lookups leave
+ * the window alone, refused head drafts bring it down. */
 TEST(the_adaptive_window_is_not_fed_by_prompt_lookup) {
     Fixture f;
     adaptive_fixture(f, 4);
@@ -2542,10 +2440,9 @@ TEST(the_adaptive_window_is_not_fed_by_prompt_lookup) {
     CHECK_NEAR(f.sch.metrics().draft_depth_adaptive, 1.0, 1e-6);
 }
 
-/* THE SCHEDULER'S HALF OF THE COST: a decode step that verified drafts is timed at its deepest
- * window and its row count when it finishes, and the head depth the next cycle chooses reads it.
- * Measured dear past one round at two rows, both sequences' windows come down to one, and the
- * rounds with them. */
+/* The scheduler's half of the cost: a decode step that verified drafts is timed at its deepest
+ * window and row count, and the next cycle's head depth reads it. Measured dear past one round at
+ * two rows, both windows (and the rounds) come down to one. */
 TEST(the_adaptive_window_times_its_steps_and_the_next_cycle_reads_them) {
     Fixture f;
     adaptive_fixture(f, 4);
@@ -2556,16 +2453,7 @@ TEST(the_adaptive_window_times_its_steps_and_the_next_cycle_reads_them) {
     const uint64_t b = f.submit(160, 2000);
     /* Every draft taken, so both stops stay at the whole window and only the cost moves D. */
     auto commit_all = [&]() {
-        const StepPlan& pl = f.sch.plan();
-        std::vector<int32_t> acc(pl.e.size(), 0), tok(pl.e.size(), 9);
-        std::vector<uint8_t> eos(pl.e.size(), 0);
-        for (size_t i = 0; i < pl.e.size(); ++i) acc[i] = pl.e[i].is_prefill ? 0 : pl.e[i].n_spec;
-        Scheduler::StepResult r;
-        r.n_seq = (int)pl.e.size();
-        r.n_accepted = acc.data();
-        r.token = tok.data();
-        r.eos = eos.data();
-        CHECK_OK(f.sch.commit(r));
+        CHECK_OK(f.commit(9, 0, [](const StepEntry& e) { return e.is_prefill ? 0 : e.n_spec; }));
     };
     REQUIRE(f.sch.step() != nullptr);                  /* both prompts */
     commit_all();
@@ -2611,8 +2499,8 @@ TEST(the_step_path_does_not_allocate) {
 
     for (int i = 0; i < 6; ++i) f.submit(64, 4096);
 
-    /* Warm up: the first steps grow the request's block vector and its output, both of which are
-     * sized once and never again. What must be zero is the STEADY-STATE step. */
+    /* Warm up: the first steps grow the request's block vector and its output, each sized once.
+     * What must be zero is the steady-state step. */
     for (int i = 0; i < 12; ++i) {
         CHECK(f.sch.step() != nullptr);
         f.commit_plain();
@@ -2634,17 +2522,53 @@ TEST(the_step_path_does_not_allocate) {
     }
     g_counting = false;
 
-    /* Not "few". None: an allocator call here is a declare-phase bug (IMPLEMENTATION.md), and
-     * this is the assertion that finds it the day it is written. */
+    /* Zero, not "few": an allocator call here is a declare-phase bug (IMPLEMENTATION.md). */
     CHECK_EQ(g_allocs, 0L);
 }
 
-/* THE CARD'S BLOCK TABLES ARE STAGED AS THE ENTRIES THAT CHANGED, so they are checked whole after
- * every build: every row of a paged group reads the manager's table and then -1 to the pitch,
- * and a state group's row reads the slot. The run moves the tables every way a real one does --
- * appends at block crossings, rejected drafts rolled back, requests ending and their rows taken
- * by the next, a late arrival's prefill -- and a row staged from a stale picture of the card
- * reads a block the sequence no longer holds, or a -1 where it holds one. */
+/* The same for a mixed step: decode rows beside a prefill chunk, which the step reorders (decode
+ * rows first) and checkpoints. A reordering through a temporary buffer reaches the allocator on
+ * every such step. */
+TEST(a_mixed_step_does_not_allocate) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    CHECK_OK(f.start());
+    for (int i = 0; i < 6; ++i) f.submit(64, 4096);
+    for (int i = 0; i < 4; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    /* A long prompt behind them, admitted before the count starts: the fakes' own bookkeeping
+     * (the cache's checkpoint log) is sized here too. */
+    f.pc.committed.reserve(64);
+    f.submit(3000, 8, /*priority=*/5);             /* ahead of them, so the step reorders */
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+
+    g_allocs = 0;
+    g_counting = true;
+    int mixed = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (!f.sch.step()) break;
+        mixed += f.sch.plan().phase == RAD_PHASE_MIXED;
+        const StepPlan& p = f.sch.plan();
+        Scheduler::StepResult r;
+        static int32_t acc[64], tok[64];
+        static uint8_t eos[64];
+        for (size_t k = 0; k < p.e.size(); ++k) { acc[k] = 0; tok[k] = 5; eos[k] = 0; }
+        r.n_seq = (int)p.e.size();
+        r.n_accepted = acc; r.token = tok; r.eos = eos;
+        f.sch.commit(r);
+    }
+    g_counting = false;
+    CHECK_EQ(mixed, 8);
+    CHECK_EQ(g_allocs, 0L);
+}
+
+/* The card's block tables are staged as changed entries, so they are checked whole after every
+ * build: a paged row reads the manager's table then -1 to the pitch, a state row reads the slot.
+ * The run exercises appends at block crossings, rollbacks of rejected drafts, rows reused after a
+ * request ends, and a late prefill; a row staged from a stale picture would read a wrong block. */
 TEST(the_cards_block_tables_match_the_manager_after_every_build) {
     Fixture f;
     f.build(/*blocks=*/4096, /*states=*/64);
@@ -2682,29 +2606,16 @@ TEST(the_cards_block_tables_match_the_manager_after_every_build) {
                 ++checked;
             }
         }
-        Scheduler::StepResult r;
-        static int32_t acc[64], tok[64];
-        static uint8_t eos[64];
-        for (size_t k = 0; k < p.e.size(); ++k) {
-            rng = rng * 1664525u + 1013904223u;
-            acc[k] = p.e[k].n_spec > 0 ? (int32_t)((rng >> 16) % (uint32_t)(p.e[k].n_spec + 1)) : 0;
-            tok[k] = 5;
-            eos[k] = 0;
-        }
-        r.n_seq = (int)p.e.size();
-        r.n_accepted = acc; r.token = tok; r.eos = eos;
-        CHECK_OK(f.sch.commit(r));
+        CHECK_OK(f.commit(5, 0, [&](const StepEntry& e) { return random_accept(rng, e); }));
     }
     /* The run reached steady decode with rows to compare, not an empty loop. */
     CHECK(checked > 100);
 }
 
-/* A SEQUENCE THAT LEAVES A ROW AND COMES BACK TO IT. Its change marks are taken wherever it is
- * written, so the copy it left behind stops being current the moment it is staged elsewhere: a
- * builder that still trusted that row would restage only what changed after the marks were taken,
- * and keep the entries a rollback replaced before them. The scheduler's own passes change the
- * rows a sequence sits in (a draft round without the sequences that did not draft), so this drives
- * the builder directly with the row orders written out. */
+/* A sequence that leaves a row and returns to it is restaged whole. Its change marks are taken
+ * wherever it is written, so the old row's copy goes stale; restaging only later changes would
+ * keep entries a rollback replaced earlier. The scheduler's own passes reorder rows, so this
+ * drives the builder directly with explicit row orders. */
 TEST(a_sequence_back_in_a_row_it_left_is_restaged_whole) {
     Fixture f;
     f.build();
@@ -2761,19 +2672,11 @@ TEST(a_sequence_back_in_a_row_it_left_is_restaged_whole) {
     bb.fini();
 }
 
-/* TWO CONV GROUPS, AND EACH ONE'S DERIVATION READS ITS OWN WINDOW.
- *
- * Held as ONE slot array and ONE window number, both would be filled for whichever RAD_KV_CONV
- * group was declared LAST, and a second group's row would stay -1.
- *
- * WHAT THAT COSTS IS NARROWER THAN IT LOOKS: these two feed `DeriveInput` and nothing else, and
- * the only derivation that reads them -- `conv_state_index` -- is called by no architecture plugin
- * at present. A conv kernel takes its slot from RadKVGroupBatch::state_index, which is per group.
- * So the failure is wrong values in a buffer nobody reads, not a convolution reading no history.
- *
- * The two groups here have DIFFERENT WIDTHS on purpose: `conv_state_index` returns
- * `slot * window + cursor % window`, so a derivation served the wrong group's depth returns a
- * plausible number and the only way to tell is to make the two depths disagree.
+/* Two conv groups, each derivation reading its own window. With one shared slot array and window,
+ * only the last-declared RAD_KV_CONV group would be filled and the other's row would stay -1.
+ * (Today only `conv_state_index` reads these, and no architecture calls it; conv kernels use the
+ * per-group RadKVGroupBatch::state_index.) The widths differ because `conv_state_index` returns
+ * `slot * window + cursor % window`, and only differing depths expose the wrong group's.
  */
 TEST(each_conv_group_derives_against_its_own_window) {
     auto two_groups = [](Fixture& f) {
@@ -2785,12 +2688,12 @@ TEST(each_conv_group_derives_against_its_own_window) {
         f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
     };
 
-    /* ---- an UNNAMED group is refused, not guessed at ----------------------------------------- */
+    /* ---- an unnamed group is refused, not guessed at ----------------------------------------- */
     {
         Fixture f;
         f.build();                       /* declares `conv_idx` with no group -- fine at one */
         two_groups(f);
-        /* The refusal logs at Error and that is the point of it; the line is expected here. */
+        /* The refusal logs at Error by design; the line is expected here. */
         CHECK_EQ(f.start(), RAD_E_INVAL);
     }
 
@@ -2810,27 +2713,19 @@ TEST(each_conv_group_derives_against_its_own_window) {
     const int32_t* c = f.derived("conv_idx_deep");
     CHECK(a != nullptr);
     CHECK(c != nullptr);
-    /* NEITHER IS -1. Under one shared slot array the group that is not the last-declared one gets
-     * -1 for every sequence, which is what this pins -- so that the first architecture to call
-     * this derivation finds it working. */
+    /* Neither is -1. Under one shared slot array the group that is not last-declared gets -1 for
+     * every sequence, so this keeps the derivation working for the first architecture to call it. */
     if (a && c) {
         CHECK(a[0] >= 0);
         CHECK(c[0] >= 0);
     }
 }
 
-
 /* ================================================================== the derivation registry
  *
- * A DERIVATION NAMED IN A SCHEMA AND NOT IN THIS TABLE IS A DECLARE-TIME REFUSAL BY NAME, with
- * the known list printed beside it -- the same treatment a misspelled op gets (spec §2.3). The
- * alternative is a buffer the step loop leaves untouched, which a kernel then reads as whatever
- * the arena last held: on a decode step that is another sequence's index row, and the output is
- * fluent and wrong.
- *
- * So the registry itself has a property worth pinning: every row is reachable by its own name,
- * every row has a function, and a name that is not in it resolves to nothing rather than to row
- * zero.
+ * A derivation named in a schema but missing here is refused by name at declare, with the known
+ * list printed (spec §2.3); otherwise a kernel would read whatever the arena last held. So every
+ * row is reachable by name and has a function, and an unknown name resolves to -1, not row 0.
  */
 TEST(every_derivation_is_reachable_by_name_and_an_unknown_one_is_not) {
     const int n = derive_count();
@@ -2841,27 +2736,26 @@ TEST(every_derivation_is_reachable_by_name_and_an_unknown_one_is_not) {
         CHECK(r != nullptr);
         if (!r) continue;
         CHECK(r->name && *r->name);
-        CHECK(r->fn != nullptr);          /* a row with no function is a name that resolves and
-                                           * then writes nothing, which is the failure above */
+        CHECK(r->fn != nullptr);          /* a row with no function would resolve and then write
+                                           * nothing, the failure above */
         CHECK(r->doc && *r->doc);         /* it is printed in the refusal's known list */
         CHECK_EQ(derive_index(r->name), i);
     }
 
-    /* NAMES ARE UNIQUE, or derive_index answers with whichever row came first and the second one
-       can never be selected. */
+    /* Names are unique, or derive_index would answer with the first row and the second could
+       never be selected. */
     for (int i = 0; i < n; ++i)
         for (int j = i + 1; j < n; ++j)
             CHECK(std::strcmp(derive_row(i)->name, derive_row(j)->name) != 0);
 
-    /* -1 for a name the core does not know, rather than 0 -- which is a valid index. */
+    /* -1 for a name the core does not know, not 0, which is a valid index. */
     CHECK_EQ(derive_index("not_a_derivation"), -1);
     CHECK_EQ(derive_index(""), -1);
     CHECK_EQ(derive_index(nullptr), -1);
-    /* A near miss on a real name is still a miss: the point of the table is that a typo is
-       reported rather than approximated. */
+    /* A near miss on a real name is still a miss: a typo is reported, not approximated. */
     CHECK_EQ(derive_index("seq_start_idx"), -1);
 
-    /* And an index outside the table is null rather than a read past it. */
+    /* An index outside the table gives null, not a read past it. */
     CHECK(derive_row(-1) == nullptr);
     CHECK(derive_row(n) == nullptr);
     CHECK(derive_row(n + 1000) == nullptr);
@@ -2869,10 +2763,9 @@ TEST(every_derivation_is_reachable_by_name_and_an_unknown_one_is_not) {
 
 /* ================================================================== request lifetime */
 
-/* THE SAMPLER SIZES ITS ROWS FROM Request::n_draft, and a drafter can set it for a step that
- * preemption then takes away. The request comes back as a prefill with one logits row, and a
- * stale window of four would have the sampler stage five -- every request after it in the step
- * then samples from its neighbour's row. */
+/* A preempted request loses its draft window. The sampler sizes rows from Request::n_draft, and
+ * the request returns as a one-row prefill; a stale window of four would stage five rows and shift
+ * every later request onto its neighbour's row. */
 TEST(a_preempted_request_comes_back_with_no_draft_window) {
     Fixture f;
     f.build(/*blocks=*/20, /*states=*/64);
@@ -2895,7 +2788,7 @@ TEST(a_preempted_request_comes_back_with_no_draft_window) {
     CHECK(f.sch.find(a)->draft == nullptr);
     f.commit_plain();
 
-    /* And when it is admitted again, the window it carries is the one its entry has. */
+    /* When it is admitted again, the window it carries is its entry's. */
     CHECK_OK(f.sch.cancel(b));
     CHECK_OK(f.sch.reap(b));
     REQUIRE(f.sch.step() != nullptr);
@@ -2904,10 +2797,9 @@ TEST(a_preempted_request_comes_back_with_no_draft_window) {
     CHECK_EQ(f.sch.find(a)->n_draft, 0);
 }
 
-/* EACH TERMINAL ID IS HANDED OVER ONCE. take_completed swaps the list out under the lock. A
- * reference into scheduler storage that nothing clears would have every finished request walked
- * again on every step for the life of the process -- and walked without the lock while an HTTP
- * thread's cancel appends to it. */
+/* Each terminal id is handed over once: take_completed swaps the list out under the lock. A
+ * reference into scheduler storage that nothing cleared would have every finished request walked
+ * again on every step, without the lock, while an HTTP thread's cancel appends to it. */
 TEST(terminal_requests_are_taken_once) {
     Fixture f;
     f.build();
@@ -2928,10 +2820,9 @@ TEST(terminal_requests_are_taken_once) {
     CHECK_EQ((int)done.size(), 0);
 }
 
-/* EVERY ROW NAMES ONE OF THE CARD'S STEP SLOTS. A slot is taken on arrival, so requests queued
- * behind the admission limit are numbered past max_seqs, and so are requests arriving while
- * finished ones are still held for their reap. The advance indexes max_seqs StepSlots by the
- * row's card index; a slot number there reads and writes past the end of them. */
+/* Every row names one of the card's step slots. Slots are taken on arrival, so queued requests
+ * and arrivals during a pending reap are numbered past max_seqs; the advance indexes max_seqs
+ * StepSlots by the row's card index, never by that slot number. */
 TEST(every_row_names_one_of_the_cards_step_slots) {
     Fixture f;
     f.build();
@@ -2953,10 +2844,9 @@ TEST(every_row_names_one_of_the_cards_step_slots) {
     CHECK_EQ(f.sch.metrics().queue_depth, 0);
 }
 
-/* THE CONTEXT PASS IS A MIRROR OF THE TRUNK STEP, ROW FOR ROW. The drafter reads the trunk's
- * hidden states positionally, so a sequence the commit finished still needs its rows -- left out,
- * every sequence after it drafts from its neighbour's hidden states. It stores nothing: its KV is
- * gone, so its slots are padding. */
+/* The context pass mirrors the trunk step row for row: the drafter reads hidden states
+ * positionally, so a sequence the commit finished keeps its rows (as padding that stores nothing),
+ * or every later sequence would draft from its neighbour's states. */
 TEST(a_block_drafter_context_pass_keeps_the_rows_of_a_finished_sequence) {
     Fixture f;
     f.build();
@@ -2988,10 +2878,8 @@ TEST(a_block_drafter_context_pass_keeps_the_rows_of_a_finished_sequence) {
     f.sch.block_end();
 }
 
-/* A CANCEL BETWEEN TWO DRAFTER PASSES. The passes are built one at a time with the lock released
- * between them, so the cancel lands after the context pass was built and before the query pass
- * is. Freeing then would build the query pass over a sequence with no blocks: a block-table row
- * of -1 under a non-zero length, which attention reads as block -1. */
+/* A cancel between two drafter passes (built one at a time, lock released between) must not free
+ * the blocks: the query pass would get a block-table row of -1 under a non-zero length. */
 TEST(a_cancel_between_drafter_passes_keeps_the_blocks_until_the_passes_are_built) {
     Fixture f;
     f.build(/*blocks=*/4096, /*states=*/64);
@@ -3016,8 +2904,8 @@ TEST(a_cancel_between_drafter_passes_keeps_the_blocks_until_the_passes_are_built
     CHECK(qb->kv[0].block_table[0] >= 0);            /* a real block, not -1 */
     f.sch.block_end();
 
-    /* The drafter is done with it, so it goes -- at the next commit, or here for an engine that
-     * has gone idle and runs none. */
+    /* The drafter is done with it, so it is released at the next commit, or here for an idle
+     * engine that runs none. */
     CHECK(f.sch.has_deferred());
     f.sch.release_deferred();
     CHECK(!f.kv.has_sequence(a));
@@ -3027,10 +2915,9 @@ TEST(a_cancel_between_drafter_passes_keeps_the_blocks_until_the_passes_are_built
     CHECK(f.sch.find(a) == nullptr);
 }
 
-/* A HIT THAT RESUMES FROM A SNAPSHOT IS NOT CARRIED ACROSS A FAILED ADMISSION. The slot is named
- * by id only; between two attempts it can be retired and handed to another sequence's checkpoint,
- * and an attempt that trusted the old id would restore that sequence's recurrent state. The next
- * attempt has to look the prompt up again -- and the accounting counts the admission once. */
+/* A failed admission gives back its checkpoint hit. The slot is named by id only and may be
+ * reassigned between attempts, so trusting the old id would restore another sequence's recurrent
+ * state. The next attempt looks the prompt up again, and the admission is counted once. */
 TEST(a_failed_admission_gives_back_its_checkpoint_hit) {
     Fixture f;
     f.build(/*blocks=*/40, /*states=*/64);
@@ -3046,7 +2933,7 @@ TEST(a_failed_admission_gives_back_its_checkpoint_hit) {
     f.pc.src = 3;
 
     /* A adopts the 16 cached blocks and needs 16 more for its first chunk; 13 are left. */
-    uint64_t a = f.submit(1000, 8);
+    uint64_t a = f.submit(600, 8);
     CHECK(f.sch.step() != nullptr);
     CHECK_EQ((int)f.sch.plan().e.size(), 1);
     CHECK_EQ(f.pc.lookups, 2);
@@ -3066,15 +2953,14 @@ TEST(a_failed_admission_gives_back_its_checkpoint_hit) {
     CHECK_EQ(f.sch.find(a)->n_computed, 256);
     CHECK_EQ(f.sch.plan().e[0].ckpt_restore, 5);
     SchedMetrics m = f.sch.metrics();
-    CHECK_EQ(m.prompt_tokens, 160 + 1000);
+    CHECK_EQ(m.prompt_tokens, 160 + 600);
     CHECK_EQ(m.attn_cached_tokens, 256);
     CHECK_EQ(m.linear_cached_tokens, 256);
 }
 
-/* A LOOKAHEAD THE POOL REFUSES IS A REASON NOT TO DRAFT, NOT A REASON TO SKIP THE ROW. The history
- * pass writes the draft head's K and V for positions the sequence already holds blocks for; a row
- * dropped here leaves them unwritten for good, because the next step's history starts at its own
- * context. */
+/* A refused lookahead stops drafting, not the row: the history pass writes the draft head's K and
+ * V for positions the sequence already holds, and a dropped row would leave them unwritten for
+ * good, since the next step's history starts at its own context. */
 TEST(a_refused_lookahead_still_runs_the_history_pass) {
     Fixture f;
     f.build(/*blocks=*/10, /*states=*/64);          /* exactly the prompt; nothing to look ahead into */
@@ -3094,10 +2980,9 @@ TEST(a_refused_lookahead_still_runs_the_history_pass) {
     f.sch.serial_end(0);
 }
 
-/* DRAFT ROUND 1 RIDES THE HISTORY PASS. A verifying sequence that drafts owes the head's history at
- * all 1 + n_spec verified positions, and the card repeats the last committed one in the rows past
- * it, so the run's last row is round 1's whole input: the pass names that row, one a drafting
- * sequence, and round 1 has no pass of its own. */
+/* Draft round 1 rides the history pass. A drafting verifier owes the head's history at all
+ * 1 + n_spec verified positions, and the card repeats the last committed one past it, so the
+ * run's last row is round 1's input: the pass names that row, and round 1 has no pass of its own. */
 TEST(the_history_pass_carries_draft_round_one) {
     Fixture f;
     f.build(/*blocks=*/4096, /*states=*/64);
@@ -3134,11 +3019,10 @@ TEST(the_history_pass_carries_draft_round_one) {
     f.sch.serial_end(2);
 }
 
-/* THE SERIAL DRIVER'S TWO SHAPES, side by side over one verify step. A head with a cache of its own
- * (every drafter but one) owes the history of every verified position and steps one position a
- * round; a head that reads the trunk's cache and keeps none (rad_drafter_shared_kv) owes nothing,
- * runs one row a drafting sequence, and does not step. The first half of this is the old path and
- * must not move: it is what Qwen's MTP head is staged with. */
+/* The serial driver's two shapes over one verify step. A head with its own cache owes the history
+ * of every verified position and steps one position per round; a head reading the trunk's cache
+ * (rad_drafter_shared_kv) owes nothing, runs one row per drafting sequence and does not step.
+ * Qwen's MTP head uses the first shape, which must not change. */
 namespace {
 struct SerialShape {
     int     hist_tok = 0, hist_out = 0, hist_dout = 0;
@@ -3209,8 +3093,8 @@ TEST(a_head_with_no_cache_of_its_own_runs_one_row_and_stays_put) {
     CHECK_EQ(s.round_ctx[3], 164);
 }
 
-/* A HEAD WITH NO CACHE OF ITS OWN IS OWED NO HISTORY: a prefill chunk that drafts nothing runs no
- * pass for it at all, where a head with its own cache is given the whole chunk. */
+/* A head with no cache of its own is owed no history: a prefill chunk that drafts nothing runs no
+ * pass for it, while a head with its own cache is given the whole chunk. */
 TEST(a_head_with_no_cache_of_its_own_runs_no_pass_when_nothing_drafts) {
     for (int shared = 0; shared < 2; ++shared) {
         Fixture f;
@@ -3237,103 +3121,9 @@ TEST(a_head_with_no_cache_of_its_own_runs_no_pass_when_nothing_drafts) {
     }
 }
 
-/* WHAT THE CARD WRITES INTO A DRAFT PASS, row by row (advance_impl.h), for both shapes. One verify
- * step at positions 101..105 accepted two drafts, so the committed position is 103 and the trunk
- * chose token 7003 there; the block table maps position p to slot p. A head with a cache of its own
- * gets the verified run with its tail repeated and a context that runs to its end; a head with no
- * cache of its own gets the committed position and a context that ends there, in every round. */
-namespace {
-struct AdvSlab {
-    alignas(16) int32_t w[512] = {};
-    rad::StepSlot st{};
-    int32_t src[8] = { 7001, 7002, 7003, 7004, 7005, 0, 0, 0 };
-    rad::AdvanceArgs a;
-
-    /* word offsets */
-    enum { ROWS = 0, TOK = 8, POS = 16, CTX = 24, ACC = 28, OUT = 32, SID = 40, CU = 44, Q = 48,
-           GRP = 64, SLOT = 96, USED = 104, BT = 112, FIRST = 128 };
-
-    AdvSlab(int mode, int n_rows, int round, bool shared, int shift) {
-        a.mode = mode;
-        a.round = round;
-        a.n_seq = 1;
-        a.n_groups = 1;
-        a.slab = reinterpret_cast<char*>(w);
-        a.row_off = ROWS * 4;  a.row_pitch = 1;
-        a.tok_off = TOK * 4;   a.pos_off = POS * 4; a.ctx_off = CTX * 4; a.acc_off = ACC * 4;
-        a.out_off = OUT * 4;   a.sid_off = SID * 4; a.cu_off = CU * 4;   a.q_off = Q * 4;
-        a.grp_off = GRP * 4;
-        a.st = &st;
-        a.src = src;
-        a.shared_kv = shared ? 1 : 0;
-        a.rot_shift = shift;
-        w[ROWS + 0] = 1;     /* a device row */
-        w[ROWS + 1] = 0;     /* its first verified token row */
-        w[ROWS + 2] = 0;     /* its first sampled row */
-        w[ROWS + 3] = 0;     /* no history before the verified positions */
-        w[SID] = 0; w[CU] = 0; w[Q] = n_rows;
-        w[OUT] = 40;         /* the host staged the run's first trunk row */
-        rad::AdvGroup g{};
-        g.block_size = 16; g.paged = 1; g.pitch = 16;
-        g.slot_off = SLOT * 4; g.used_off = USED * 4; g.bt_off = BT * 4; g.first_off = FIRST * 4;
-        std::memcpy(&w[GRP], &g, sizeof g);
-        for (int i = 0; i < 16; ++i) w[BT + i] = i;   /* block i holds positions 16i.. */
-        w[FIRST] = 0;
-        st.head = 103; st.acc = 2; st.ctx = 104; st.n_acc = 3; st.tok[0] = 7003;
-    }
-};
-}  /* namespace */
-
-TEST(the_card_stages_a_cacheless_head_at_the_committed_position) {
-    /* The history pass. */
-    {
-        AdvSlab o(rad::ADV_HIST, 5, 0, false, 0);
-        rad::adv_row(o.a, 0);
-        const int32_t pos[5] = { 101, 102, 103, 103, 103 }, tok[5] = { 7001, 7002, 7003, 7003, 7003 };
-        for (int j = 0; j < 5; ++j) {
-            CHECK_EQ(o.w[AdvSlab::POS + j], pos[j]);
-            CHECK_EQ(o.w[AdvSlab::TOK + j], tok[j]);
-            CHECK_EQ(o.w[AdvSlab::OUT + j], 40 + (j < 2 ? j : 2));
-            CHECK_EQ(o.w[AdvSlab::SLOT + j], pos[j]);
-        }
-        CHECK_EQ(o.w[AdvSlab::USED], 106);        /* the verify step's whole run */
-        CHECK_EQ(o.w[AdvSlab::CTX], 101);
-    }
-    for (int shift = 0; shift < 2; ++shift) {
-        AdvSlab s(rad::ADV_HIST, 1, 0, true, shift);
-        rad::adv_row(s.a, 0);
-        CHECK_EQ(s.w[AdvSlab::POS], 103 + shift);
-        CHECK_EQ(s.w[AdvSlab::TOK], 7003);
-        CHECK_EQ(s.w[AdvSlab::OUT], 42);
-        CHECK_EQ(s.w[AdvSlab::USED], 104);        /* the committed positions and no more */
-        CHECK_EQ(s.w[AdvSlab::CTX], 103);
-    }
-    /* Round 3: the old head two positions on, the cacheless one where it was. */
-    {
-        AdvSlab o(rad::ADV_ROUND, 1, 3, false, 0);
-        o.src[0] = 9001;
-        rad::adv_row(o.a, 0);
-        CHECK_EQ(o.w[AdvSlab::POS], 105);
-        CHECK_EQ(o.w[AdvSlab::USED], 106);
-        CHECK_EQ(o.w[AdvSlab::TOK], 9001);
-        CHECK_EQ(o.st.tok[2], 9001);
-    }
-    for (int shift = 0; shift < 2; ++shift) {
-        AdvSlab s(rad::ADV_ROUND, 1, 3, true, shift);
-        s.src[0] = 9001;
-        rad::adv_row(s.a, 0);
-        CHECK_EQ(s.w[AdvSlab::POS], 103 + shift);
-        CHECK_EQ(s.w[AdvSlab::USED], 104);
-        CHECK_EQ(s.w[AdvSlab::CTX], 103);
-        CHECK_EQ(s.w[AdvSlab::TOK], 9001);
-        CHECK_EQ(s.st.tok[2], 9001);
-    }
-}
-
-/* A STEP IS ISSUED AHEAD OF A COMMIT ONLY FOR A REQUEST WHOSE SPECULATION THAT COMMIT CANNOT
- * CHANGE. The ahead step is sized before the commit in front of it, so a request the sampler has
- * not started yet -- whose grammar, if any, nobody has asked -- is not issued ahead; one whose
- * grammar rewinds is, grammar or not. */
+/* A step is issued ahead of a commit only once the commit cannot change the request's
+ * speculation: a request the sampler has not started (grammar unchecked) is not issued ahead; one
+ * with a rewinding grammar, or none, is. */
 TEST(a_step_is_issued_ahead_only_once_the_requests_speculation_is_fixed) {
     Fixture f;
     f.build();
@@ -3352,9 +3142,9 @@ TEST(a_step_is_issued_ahead_only_once_the_requests_speculation_is_fixed) {
     CHECK(f.sch.step_next() != nullptr);
 }
 
-/* THE CONTEXT BOUNDS A SEQUENCE WHATEVER max_tokens SAYS, "no limit" included. Nothing past the
- * last position the deployment can address has a rotary row or a block-table column; a sequence
- * allowed to run into it corrupts memory instead of stopping. */
+/* The context bounds a sequence whatever max_tokens says, "no limit" included. Positions past the
+ * last one the deployment can address have no rotary row or block-table column; a sequence
+ * running into them would corrupt memory instead of stopping. */
 TEST(a_sequence_stops_at_the_context_whatever_max_tokens_says) {
     Fixture f;
     f.build();
@@ -3372,13 +3162,8 @@ TEST(a_sequence_stops_at_the_context_whatever_max_tokens_says) {
         REQUIRE(f.sch.step() != nullptr);
         const StepEntry& e = f.sch.plan().e[0];
         CHECK(e.ctx_len + e.n_tokens <= 170);           /* no position at or past the end */
-        /* Every draft accepted: the most a step can emit, so the bound has to cut it short. */
-        int32_t acc[1] = { e.n_spec };
-        int32_t tok[1] = { 9 };
-        uint8_t eos[1] = { 0 };
-        Scheduler::StepResult r;
-        r.n_seq = 1; r.n_accepted = acc; r.token = tok; r.eos = eos;
-        CHECK_OK(f.sch.commit(r));
+        /* Every draft accepted, the most a step can emit, so the bound must cut it short. */
+        CHECK_OK(f.commit(9, 0, [](const StepEntry& x) { return x.n_spec; }));
     }
     const Request* ra = f.sch.find(a);
     CHECK_EQ((int)ra->state, (int)ReqState::Finished);
@@ -3390,14 +3175,14 @@ TEST(a_sequence_stops_at_the_context_whatever_max_tokens_says) {
     CHECK(f.sch.step() == nullptr);
     CHECK_EQ((int)f.sch.find(full)->state, (int)ReqState::Failed);
 
-    /* And asking for more than the context holds reserves only what it can hold. */
+    /* Asking for more than the context holds reserves only what it can hold. */
     uint64_t big = f.submit(8, 2147483647);
     CHECK(f.sch.find(big)->output.capacity() <= (size_t)(170 + RAD_SCHED_MAX_SPEC));
 }
 
-/* THE CACHE'S RESERVE IS MEASURED AGAINST WHAT IS HELD, NOT AGAINST WHAT IS BACKED. An elastic
- * pool that has handed its unused top back to the card reads almost no free blocks however little
- * anything holds, and trimming against that drains the whole cache after every request. */
+/* The cache's reserve is measured against what is held, not what is backed. An elastic pool that
+ * has handed its unused top back to the card reads almost no free blocks however little is held,
+ * and trimming against that would drain the whole cache after every request. */
 TEST(the_cache_trim_does_not_mistake_released_vram_for_occupancy) {
     Fixture f;
     f.build(/*blocks=*/40, /*states=*/64);
@@ -3413,9 +3198,9 @@ TEST(the_cache_trim_does_not_mistake_released_vram_for_occupancy) {
     CHECK(f.pc.trims.empty());
 }
 
-/* WHEN LIVE SEQUENCES HOLD MORE THAN THE RESERVE ALLOWS, THE TRIM ASKS FOR THE SHORTFALL ONCE.
- * Nothing the cache can give closes it entirely, and a loop that kept evicting until it did would
- * take the conversation this close has just published along with everything else on the list. */
+/* When live sequences hold more than the reserve allows, the trim asks for the shortfall once.
+ * Nothing the cache can give closes it entirely, and a loop evicting until it did would also take
+ * the conversation this close has just published. */
 TEST(the_cache_trim_asks_for_the_shortfall_and_not_for_the_whole_cache) {
     Fixture f;
     f.build(/*blocks=*/40, /*states=*/64);
@@ -3434,9 +3219,9 @@ TEST(the_cache_trim_asks_for_the_shortfall_and_not_for_the_whole_cache) {
     CHECK_EQ(f.pc.evict_calls, 0);
 }
 
-/* THE CACHE GIVES WAY TO A NEW REQUEST AS IT DOES TO A RUNNING ONE. With nothing running, no
- * other path takes blocks back from the cache, and a pool full of finished conversations would
- * keep the request waiting for good. */
+/* The cache gives way to a new request as it does to a running one. With nothing running no other
+ * path takes blocks back from the cache, so a pool full of finished conversations would keep the
+ * request waiting forever. */
 TEST(an_admission_short_of_blocks_takes_them_from_the_cache) {
     Fixture f;
     f.build(/*blocks=*/20, /*states=*/64);
@@ -3452,7 +3237,7 @@ TEST(an_admission_short_of_blocks_takes_them_from_the_cache) {
     CHECK(f.pc.holds.empty());
 }
 
-/* A REFUSED ADMISSION HOLDS WHAT ITS RESTORE BROUGHT BACK, and lets go once the request is gone,
+/* A refused admission holds what its restore brought back and lets go once the request is gone,
  * so the next attempt finds the chain on the card instead of copying it again. */
 TEST(a_refused_admission_holds_its_chain_until_the_request_goes) {
     Fixture f;
@@ -3469,7 +3254,7 @@ TEST(a_refused_admission_holds_its_chain_until_the_request_goes) {
     CHECK(std::find(f.pc.releases.begin(), f.pc.releases.end(), a) != f.pc.releases.end());
 }
 
-/* AN ENGINE THAT HAS STOPPED ANSWERS EVERY REQUEST IT HELD AND REFUSES NEW ONES, rather than
+/* An engine that has stopped answers every request it held and refuses new ones, rather than
  * leaving their connections waiting on a step that will never come. */
 TEST(shutdown_fails_what_is_queued_and_refuses_what_follows) {
     Fixture f;
@@ -3489,9 +3274,8 @@ TEST(shutdown_fails_what_is_queued_and_refuses_what_follows) {
     CHECK(f.sch.step() == nullptr);
 }
 
-/* AND EACH OF THOSE REQUESTS SAYS WHAT STOPPED IT. The sink carries the status and the sentence
- * the server puts in the 500: without them a client read "the engine failed this request: ok"
- * after a step failed as unsupported. */
+/* Each of those requests says what stopped it: the sink carries the status and the sentence the
+ * server puts in the 500, rather than a generic "ok". */
 TEST(shutdown_fails_each_sink_with_the_status_that_stopped_the_engine) {
     server::Sink running, waiting, late;
     Fixture f;
@@ -3512,10 +3296,9 @@ TEST(shutdown_fails_each_sink_with_the_status_that_stopped_the_engine) {
     }
 }
 
-/* A REQUEST'S OWN SPECULATION AND ITS ADMISSION REACH ITS SINK, which is what lets a response say
- * how many tokens were drafted for it and when its prefill started: the aggregate counters cannot
- * be split between requests that overlap. The count is the drafts each verify step proposed for
- * this request and the ones it accepted -- the same numbers /metrics sums. */
+/* A request's own draft counts and admission time reach its sink, so a response can report them
+ * (aggregate counters cannot be split between overlapping requests). The counts are the same
+ * proposed/accepted numbers /metrics sums. */
 TEST(a_sink_carries_its_requests_admission_and_draft_counts) {
     server::Sink sink;
     Fixture f;
@@ -3534,27 +3317,1229 @@ TEST(a_sink_carries_its_requests_admission_and_draft_counts) {
         const RadBatch* b = f.sch.step();
         if (!b) break;
         CHECK(sink.t_admitted_ns() >= 0);
-        const StepPlan& p = f.sch.plan();
-        Scheduler::StepResult r;
-        static int32_t acc[64], tok[64];
-        static uint8_t eos[64];
-        for (size_t k = 0; k < p.e.size(); ++k) {
-            rng = rng * 1664525u + 1013904223u;
-            acc[k] = p.e[k].n_spec > 0 ? (int32_t)((rng >> 16) % (uint32_t)(p.e[k].n_spec + 1)) : 0;
-            tok[k] = 5;
-            eos[k] = 0;
-            if (!p.e[k].is_prefill && p.e[k].n_spec > 0) {
-                drafted += p.e[k].n_spec;
-                accepted += acc[k];
+        CHECK_OK(f.commit(5, 0, [&](const StepEntry& e) {
+            const int32_t acc = random_accept(rng, e);
+            if (!e.is_prefill && e.n_spec > 0) {
+                drafted += e.n_spec;
+                accepted += acc;
             }
-        }
-        r.n_seq = (int)p.e.size();
-        r.n_accepted = acc; r.token = tok; r.eos = eos;
-        CHECK_OK(f.sch.commit(r));
+            return acc;
+        }));
     }
     CHECK(drafted > 0);
     CHECK_EQ(sink.n_drafted(), drafted);
     CHECK_EQ(sink.n_draft_accepted(), accepted);
 }
 
+/* ================================================================== the step issued ahead */
+/* A scripted model both pipelines follow. Entry i of step t accepts ahead_acc(seq, t) of its
+ * drafts, then draws ahead_tok(seq, t); the drafts verified at step t are ahead_draft(seq, t, j).
+ * Every token is distinct from every other and from the prompts, so prompt lookup proposes
+ * nothing and a misplaced token cannot match by accident. */
+namespace {
+uint32_t ahead_mix(uint64_t a, uint64_t b) {
+    uint64_t x = a * 0x9E3779B97F4A7C15ull ^ (b + 0x632BE59BD9B4E019ull);
+    x ^= x >> 29; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 32;
+    return (uint32_t)x;
+}
+int32_t ahead_tok(uint64_t seq, int t) { return 20000 + (int32_t)seq * 1000 + t; }
+int32_t ahead_draft(uint64_t seq, int t, int j) {
+    return 100000 + (int32_t)seq * 10000 + t * 10 + j;
+}
+int32_t ahead_acc(uint64_t seq, int t, int n_spec) {
+    return n_spec > 0 ? (int32_t)(ahead_mix(seq, (uint64_t)t) % (uint32_t)(n_spec + 1)) : 0;
+}
+
+/* A build's per-row arrays as the card holds them (device memory is host memory here). Each
+ * slot is checked against the build's own block table, since two runs that allocated blocks in
+ * a different order hold different block ids for the same position. */
+struct BatchRows {
+    std::vector<uint64_t> seq;
+    std::vector<int32_t>  tok, pos, cu, q, ctx, acc, used;
+    int bad_slots = 0;
+    bool operator==(const BatchRows& o) const {
+        return seq == o.seq && tok == o.tok && pos == o.pos && cu == o.cu && q == o.q &&
+               ctx == o.ctx && acc == o.acc && used == o.used;
+    }
+};
+
+BatchRows read_rows(const RadBatch* b, const StepPlan& p, const FakeKV& kv) {
+    BatchRows r;
+    for (int64_t i = 0; i < b->n_seq; ++i) {
+        r.seq.push_back(p.e[(size_t)i].seq);
+        r.q.push_back(b->q_lens[i]);
+        r.ctx.push_back(b->ctx_lens[i]);
+        r.acc.push_back(b->num_accepted ? b->num_accepted[i] : 1);
+    }
+    for (int64_t i = 0; i <= b->n_seq; ++i) r.cu.push_back(b->cu_seqlens[i]);
+    for (int64_t t = 0; t < b->n_tok; ++t) {
+        r.tok.push_back(b->token_ids[t]);
+        r.pos.push_back(b->positions[t]);
+    }
+    for (int g = 0; g < b->n_kv_groups; ++g) {
+        const RadKVGroupBatch& G = b->kv[g];
+        for (int64_t i = 0; i < b->n_seq; ++i) {
+            r.used.push_back(G.seqused[i]);
+            const int32_t* bt = G.block_table + i * G.block_table_pitch;
+            for (int32_t t = b->cu_seqlens[i]; t < b->cu_seqlens[i + 1]; ++t) {
+                const int64_t p_ = b->positions[t];
+                int64_t want = -1;
+                if (kv.geom.g[(size_t)g].paged) {
+                    const int64_t bi = p_ / G.block_size;
+                    if (bi < G.block_table_pitch && bt[bi] >= 0)
+                        want = bt[bi] * G.block_size + p_ % G.block_size;
+                } else {
+                    want = kv.state_slot(r.seq[(size_t)i], g);
+                }
+                if (want < 0 || G.slot_mapping[t] != want) ++r.bad_slots;
+            }
+        }
+    }
+    return r;
+}
+
+struct AheadRun {
+    std::vector<BatchRows> steps;
+    std::vector<std::vector<int32_t>> out;
+    std::vector<int64_t> held;      /* paged blocks each sequence holds at the end */
+    int ahead = 0;                  /* steps that ran issued ahead */
+    int card_host_disagree = 0;
+};
+
+void ahead_setup(Fixture& f, int n_spec, std::vector<uint64_t>& ids) {
+    f.build();
+    f.cfg.n_spec = n_spec;
+    CHECK_OK(f.start());
+    for (int n : { 40, 56, 72 }) {
+        auto r = f.request(n, 0);
+        r->speculation_fixed = true;     /* no grammar: the commit cannot change speculation */
+        ids.push_back(f.add(std::move(r)));
+    }
+}
+
+int ahead_commit(Fixture& f, int t) {
+    const StepPlan& p = f.sch.plan();
+    std::vector<int32_t> a(p.e.size()), tok(p.e.size());
+    std::vector<uint8_t> eos(p.e.size(), 0);
+    for (size_t i = 0; i < p.e.size(); ++i) {
+        a[i] = ahead_acc(p.e[i].seq, t, p.e[i].n_spec);
+        tok[i] = ahead_tok(p.e[i].seq, t);
+    }
+    Scheduler::StepResult r;
+    r.n_seq = (int)p.e.size();
+    r.n_accepted = a.data();
+    r.token = tok.data();
+    r.eos = eos.data();
+    return f.sch.commit(r);
+}
+
+void ahead_publish(Fixture& f, const std::vector<uint64_t>& ids, int n_spec, int t) {
+    for (uint64_t id : ids) {
+        int32_t d[8];
+        for (int j = 0; j < n_spec; ++j) d[j] = ahead_draft(id, t, j);
+        if (n_spec > 0) CHECK_OK(f.sch.set_draft(id, d, n_spec));
+    }
+}
+
+void ahead_finish(Fixture& f, const std::vector<uint64_t>& ids, AheadRun& run) {
+    for (uint64_t id : ids) {
+        run.out.push_back(f.sch.find(id)->output);
+        run.held.push_back((int64_t)f.kv.block_table(id, 0).size());
+    }
+}
+
+/* Every step built by step() after the commit. */
+AheadRun ahead_reference(int n_spec, int steps) {
+    Fixture f;
+    std::vector<uint64_t> ids;
+    ahead_setup(f, n_spec, ids);
+    AheadRun run;
+    const RadBatch* b = f.sch.step();
+    if (!b) return run;
+    run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+    for (int t = 0; t < steps; ++t) {
+        CHECK_OK(ahead_commit(f, t));
+        ahead_publish(f, ids, n_spec, t + 1);
+        b = f.sch.step();
+        if (!b) break;
+        run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+    }
+    ahead_finish(f, ids, run);
+    return run;
+}
+
+/* The engine's order with a step issued ahead (Engine::step_loop): the step's sampler, the card's
+ * acceptance into the StepSlots, the draft head's proposals into them, expect_draft and
+ * step_next, the trunk advance on the new build, then the commit, the drafter's set_draft and
+ * promote_next. */
+AheadRun ahead_pipelined(int n_spec, int steps) {
+    Fixture f;
+    std::vector<uint64_t> ids;
+    ahead_setup(f, n_spec, ids);
+    AheadRun run;
+    std::vector<StepSlot> slots((size_t)f.cfg.max_seqs);
+    const RadBatch* b = f.sch.step();
+    if (!b) return run;
+    run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+    for (int t = 0; t < steps; ++t) {
+        /* The sampler's rows for step t: the drafts it agrees with, then its own token. */
+        const StepPlan& p = f.sch.plan();
+        std::vector<int32_t> y((size_t)b->n_out + 1, -1);
+        for (const StepEntry& e : p.e) {
+            if (e.dev_out < 0) continue;
+            const int32_t a = ahead_acc(e.seq, t, e.n_spec);
+            for (int j = 0; j <= e.n_spec; ++j)
+                y[(size_t)(e.dev_out + j)] = j < a ? ahead_draft(e.seq, t, j) : ahead_tok(e.seq, t);
+        }
+        AdvanceArgs acc = f.sch.advance_args(0);
+        acc.mode = ADV_ACCEPT;
+        acc.st = slots.data();
+        acc.src = y.data();
+        for (int i = 0; i < acc.n_seq; ++i) adv_row(acc, i);
+        for (const StepEntry& e : p.e) {
+            const StepSlot& S = slots[(size_t)e.card];
+            if (S.acc != ahead_acc(e.seq, t, e.n_spec) || S.tok[0] != ahead_tok(e.seq, t))
+                ++run.card_host_disagree;
+            /* The draft head's proposals for step t + 1 (ADV_ROUND / ADV_TAKE on a card). */
+            for (int j = 0; j < n_spec; ++j)
+                slots[(size_t)e.card].tok[1 + j] = ahead_draft(e.seq, t + 1, j);
+            if (n_spec > 0) f.sch.expect_draft(e.seq, n_spec);
+        }
+        const RadBatch* nb = f.sch.step_next();
+        if (nb) {
+            AdvanceArgs tr = f.sch.advance_args(0);
+            tr.mode = ADV_TRUNK;
+            tr.st = slots.data();
+            for (int i = 0; i < tr.n_seq; ++i) adv_row(tr, i);
+        }
+        CHECK_OK(ahead_commit(f, t));
+        ahead_publish(f, ids, n_spec, t + 1);
+        if (nb) {
+            f.sch.promote_next();
+            b = nb;
+            ++run.ahead;
+        } else {
+            b = f.sch.step();
+            if (!b) break;
+        }
+        run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+    }
+    ahead_finish(f, ids, run);
+    return run;
+}
+}  /* namespace */
+
+/* A step issued ahead is the step the scheduler would have built after the commit: the same
+ * tokens, positions, slots (each through its own table), lengths, context and num_accepted on
+ * every row, once the card's advance has filled in what the host only bounded. The host sizes
+ * such a step at the furthest context it can reach and the card's acceptance places it; a
+ * disagreement puts K/V at wrong positions or reads the wrong token, and the output is silently
+ * wrong. Run with drafts (a serial head's pipeline) and without (no drafter). */
+TEST(a_step_issued_ahead_equals_the_step_built_after_the_commit) {
+    for (int n_spec : { 0, 4 }) {
+        const int T = 24;
+        const AheadRun a = ahead_reference(n_spec, T);
+        const AheadRun b = ahead_pipelined(n_spec, T);
+        CHECK_EQ(b.ahead, T);                       /* every step after the first ran ahead */
+        CHECK_EQ(b.card_host_disagree, 0);
+        REQUIRE_EQ(a.steps.size(), b.steps.size());
+        REQUIRE_EQ(a.steps.size(), (size_t)T + 1);
+        for (size_t t = 0; t < a.steps.size(); ++t) {
+            const bool same = a.steps[t] == b.steps[t];
+            CHECK(same);
+            if (!same) std::fprintf(stderr, "    n_spec %d: step %zu differs\n", n_spec, t);
+            CHECK_EQ(a.steps[t].bad_slots, 0);
+            CHECK_EQ(b.steps[t].bad_slots, 0);
+        }
+        CHECK(a.out == b.out);
+        /* The pipelined run holds blocks up to the furthest position a step issued ahead could
+         * reach, and gives back rejected drafts' blocks only on a commit nothing runs ahead of:
+         * never fewer than the reference, and at most one block more. */
+        REQUIRE_EQ(a.held.size(), b.held.size());
+        for (size_t i = 0; i < a.held.size(); ++i) {
+            CHECK(b.held[i] >= a.held[i]);
+            CHECK(b.held[i] <= a.held[i] + 1);
+        }
+    }
+}
+
+/* ================================================================== the token budget per token */
+/* A verify step emits up to 1 + n_spec tokens at once. The budget (max_tokens, and the context)
+ * is applied token by token before each reaches the sink: trimming `output` afterwards would leave
+ * the overshoot already streamed, and the same prompt at the same max_tokens would come back
+ * longer with speculation on. `output` alone cannot show this; the sink is the client's view. */
+TEST(a_verify_step_at_the_max_tokens_edge_streams_exactly_max_tokens) {
+    server::Sink sink;
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+    const uint64_t id = f.submit_to(&sink, 40, /*max_tokens=*/3);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(5);
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    CHECK_OK(f.sch.set_draft(id, draft, 4));
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e[0].n_spec, 4);
+    CHECK_OK(f.commit(9, 0, [](const StepEntry& e) { return e.n_spec; }));   /* all accepted */
+
+    CHECK_EQ(sink.n_produced(), (int64_t)3);
+    server::SinkToken got[8];
+    REQUIRE_EQ(sink.read(got, 8), (size_t)3);
+    CHECK_EQ(got[0].token, 5); CHECK_EQ(got[1].token, 21); CHECK_EQ(got[2].token, 22);
+    CHECK_EQ((int)sink.finish_reason(), (int)server::Finish::Length);
+    const Request* r = f.sch.find(id);
+    CHECK_EQ((int)r->output.size(), 3);
+    CHECK_EQ(r->finish_reason, std::string("length"));
+}
+
+/* The context bounds the stream the same way, with no max_tokens at all. */
+TEST(a_verify_step_at_the_context_edge_streams_exactly_the_room_left) {
+    server::Sink sink;
+    Fixture f;
+    f.build();
+    f.cfg.max_ctx = 170;
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+    const uint64_t id = f.submit_to(&sink, 160, /*max_tokens=*/0);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(5);
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    for (int guard = 0; guard < 8 && !sink.done(); ++guard) {
+        CHECK_OK(f.sch.set_draft(id, draft, 4));
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_OK(f.commit(9, 0, [](const StepEntry& e) { return e.n_spec; }));
+    }
+    CHECK(sink.done());
+    CHECK_EQ(sink.n_produced(), (int64_t)10);           /* 170 - 160 */
+    CHECK_EQ((int)f.sch.find(id)->output.size(), 10);
+    CHECK_EQ((int)sink.finish_reason(), (int)server::Finish::Length);
+}
+
+/* An end-of-generation token ends an ordinary request after its accepted drafts and the token are
+ * streamed; with ignore_eos the request runs on, and the same tokens reach the client. */
+TEST(an_end_of_generation_token_after_accepted_drafts_ends_the_request_after_them) {
+    for (int ignore = 0; ignore < 2; ++ignore) {
+        server::Sink sink;
+        Fixture f;
+        f.build();
+        f.cfg.n_spec = 4;
+        CHECK_OK(f.start());
+        auto r = f.request(40, 64);
+        r->sink = &sink;
+        r->ignore_eos = ignore != 0;
+        const uint64_t id = f.add(std::move(r));
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(5);
+        int32_t draft[4] = { 21, 22, 23, 24 };
+        CHECK_OK(f.sch.set_draft(id, draft, 4));
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_OK(f.commit(9, /*eos=*/1, [](const StepEntry&) { return 2; }));
+        CHECK_EQ(sink.n_produced(), (int64_t)4);          /* 5, then 21 22 9 */
+        if (ignore) {
+            CHECK(!sink.done());
+            CHECK_EQ((int)f.sch.find(id)->state, (int)ReqState::Running);
+        } else {
+            CHECK_EQ((int)sink.finish_reason(), (int)server::Finish::Stop);
+            CHECK_EQ(f.sch.find(id)->finish_reason, std::string("stop"));
+        }
+    }
+}
+
+/* ================================================================== a recycled slot */
+/* Slots are recycled, and every piece of drafter state must start over with the request in it. A
+ * serial head's history watermark left from the slot's last tenant empties the next prompt's
+ * history pass, so the head drafts against another request's K/V and greedy output varies from
+ * request to request with speculation on. */
+TEST(a_request_in_a_recycled_slot_runs_its_serial_heads_whole_history) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 4;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 4;
+    CHECK_OK(f.start());
+
+    auto history = [&](int expect_rows) {
+        int rounds = 4;
+        Scheduler::SerialRow rows[4];
+        (void)f.sch.serial_begin(&rounds, rows, 4);
+        const RadBatch* hb = f.sch.serial_batch(0, 1);
+        if (expect_rows >= 0) {
+            CHECK(hb != nullptr);
+            if (hb) CHECK_EQ(hb->n_tok, expect_rows);
+        }
+    };
+    const uint64_t a = f.submit(160, 2);
+    REQUIRE(f.sch.step() != nullptr);
+    history(160);
+    f.commit_plain(11);
+    f.sch.serial_end(1);
+    REQUIRE(f.sch.step() != nullptr);              /* the decode that finishes it */
+    history(-1);
+    f.commit_plain(12);
+    f.sch.serial_end(1);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+    CHECK_OK(f.sch.reap(a));
+
+    f.submit(96, 8);                               /* takes the slot A left */
+    REQUIRE(f.sch.step() != nullptr);
+    history(96);
+    f.commit_plain(13);
+    f.sch.serial_end(1);
+}
+
+/* The same for a block drafter's filled range: a range left from the slot's last tenant (here a
+ * prefix hit's floor at 512) would keep the next request's drafter waiting for a window that
+ * never slides past it. */
+TEST(a_request_in_a_recycled_slot_starts_its_block_drafters_cache_from_nothing) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/8192);
+    f.cfg.n_spec = 7;
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    f.prog.drafter.window = 512;
+    KVGroupInfo w;                                 /* the drafter's own group, not prefix-cached */
+    w.name = "draft";
+    w.decl.kind = RAD_KV_WINDOW;
+    w.decl.window = 512;
+    w.block_size = 16;
+    f.prog.kv_groups.push_back(w);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+    f.pc.groups = { 0 };
+    CHECK_OK(f.start());
+
+    /* A: a hit resumed at 512 leaves its drafter's cache starting there. */
+    f.pc.seed(1024); f.pc.lin = 1024; f.pc.src = 3;
+    const uint64_t a = f.submit(1100, 1);
+    Scheduler::BlockRow rows[4];
+    for (int st = 0; st < 8 && f.sch.find(a)->state != ReqState::Finished; ++st) {
+        REQUIRE(f.sch.step() != nullptr);
+        if (st == 0) CHECK_EQ(f.sch.plan().e[0].ctx_len, 512);
+        f.commit_plain(11);
+        (void)f.sch.block_begin(8, 7, 512, 99, rows, 4);
+        f.sch.block_end();
+    }
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+    CHECK_OK(f.sch.reap(a));
+
+    /* B, no hit, in A's slot: its drafter's cache starts at its own first row. */
+    f.pc.attn = 0; f.pc.lin = 0; f.pc.src = -1;
+    const uint64_t b = f.submit(96, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_EQ(f.sch.block_begin(8, 7, 512, 99, rows, 4), 1);
+    CHECK_EQ((int)rows[0].seq, (int)b);
+    f.sch.block_end();
+}
+
+/* ================================================================== num_accepted */
+/* num_accepted is one-based on every row and staged on every step: 1 on every prefill row (first
+ * chunk, warm chunk, or admission), the previous verify's accepted count + 1 on a decode row, and
+ * the card's array equal to the plan whether or not the step drafted. A prefill row at 0 has a
+ * warm chunk read its rolling windows at -1 (a foreign token, or the slot before); an array
+ * staged only on drafting steps leaves the linear kernels a stale count. Both are silent. */
+TEST(num_accepted_is_one_based_on_every_row_and_staged_on_every_step) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+    const uint64_t big = f.submit(600, 4);          /* three chunks: 256, 256, 88 */
+    const uint64_t spec = f.submit(40, 200);
+    const uint64_t plain = f.submit(48, 200);
+    auto r = f.sch.find(plain);
+    r->may_speculate = false;
+    std::unordered_map<uint64_t, int32_t> last_acc;
+    uint32_t rng = 777;
+    int prefill_rows = 0, verify_rows = 0, plain_rows = 0;
+    for (int step = 0; step < 30; ++step) {
+        int32_t draft[4] = { 31, 32, 33, 34 };
+        if (f.sch.find(spec) && f.sch.find(spec)->n_computed > 0) (void)f.sch.set_draft(spec, draft, 4);
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        REQUIRE(b->num_accepted != nullptr);
+        const StepPlan& p = f.sch.plan();
+        for (size_t i = 0; i < p.e.size(); ++i) {
+            const StepEntry& e = p.e[i];
+            CHECK(e.n_accepted >= 1);
+            CHECK_EQ(b->num_accepted[i], e.n_accepted);
+            if (e.is_prefill) {
+                CHECK_EQ(e.n_accepted, 1);
+                ++prefill_rows;
+            } else {
+                CHECK_EQ(e.n_accepted, last_acc[e.seq] + 1);
+                if (e.n_spec > 0) ++verify_rows; else ++plain_rows;
+            }
+        }
+        CHECK_OK(f.commit(7, 0, [&](const StepEntry& e) {
+            const int32_t a = random_accept(rng, e);
+            if (!e.is_prefill) last_acc[e.seq] = a;
+            return a;
+        }));
+    }
+    (void)big;
+    CHECK(prefill_rows >= 5);
+    CHECK(verify_rows > 5);
+    CHECK(plain_rows > 5);
+}
+
+/* ================================================================== an embedding input */
+/* An embedding input is admitted whole in one step even on a model that checkpoints its linear
+ * state: the checkpoint splits do not apply to an input that never resumes. Split there, the
+ * whole-or-nothing rule refused it every step, and as the head of the queue it held back every
+ * request behind it for good. */
+TEST(an_embedding_input_longer_than_the_checkpoint_interval_is_admitted_whole) {
+    Fixture f;
+    f.build();                                     /* linear state, interval 256, max_tok 512 */
+    CHECK_OK(f.start());
+    auto r = f.request(300, 1);
+    r->embed = true;
+    const uint64_t e = f.add(std::move(r));
+    const uint64_t n = f.submit(40, 4);
+    REQUIRE(e != 0);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ((int)f.sch.find(e)->state, (int)ReqState::Running);
+    CHECK_EQ((int)f.sch.find(n)->state, (int)ReqState::Running);
+    bool whole = false;
+    for (const StepEntry& x : f.sch.plan().e)
+        if (x.seq == e) whole = x.n_tokens == 300 && x.produces_token && x.ckpt_slot < 0;
+    CHECK(whole);
+}
+
+/* ================================================================== speculation gates */
+/* A request that may not speculate (a constraining grammar that cannot snapshot) gets no draft
+ * from either drafter: set_draft takes nothing and prompt lookup proposes nothing, though its
+ * text repeats. A draft for it makes the sampler refuse the step. */
+TEST(a_request_that_may_not_speculate_gets_no_draft_from_either_drafter) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+    auto r = std::make_unique<Request>();
+    r->id = f.next_id++;
+    r->max_tokens = 200;
+    r->may_speculate = false;
+    r->prompt.resize(160);
+    for (int i = 0; i < 160; ++i) r->prompt[(size_t)i] = 100 + i % 8;
+    const uint64_t a = r->id;
+    CHECK_OK(f.sch.add(std::move(r)));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(100);
+    int32_t draft[4] = { 101, 102, 103, 104 };
+    for (int t = 0; t < 20; ++t) {
+        CHECK_OK(f.sch.set_draft(a, draft, 4));
+        CHECK_EQ(f.sch.find(a)->n_draft, 0);
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.plan().e[0].n_spec, 0);
+        CHECK_EQ(f.sch.plan().e[0].n_draft, 0);
+        f.commit_plain(100 + (t + 1) % 8);           /* the pattern goes on */
+    }
+    CHECK_EQ(f.sch.metrics().draft_tokens, (int64_t)0);
+}
+
+/* ================================================================== the step issued ahead, ends */
+/* A request carried by a step issued ahead outlives its end by that step: a cancel and reap keep
+ * its blocks and its Request until the step ahead has committed, and take_completed withholds its
+ * id until then, because that step still writes its blocks and its sampler is staged after this
+ * commit. Released early, a block the step ahead writes goes to a new sequence (cross-request KV
+ * corruption) and the sampler state goes away under a staged step. */
+TEST(a_cancel_while_a_step_runs_ahead_keeps_the_request_until_that_step_commits) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    const int64_t before = f.kv.free_blocks(0);
+    auto r = f.request(40, 64);
+    r->speculation_fixed = true;
+    const uint64_t a = f.add(std::move(r));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    REQUIRE(f.sch.step() != nullptr);
+    REQUIRE(f.sch.step_next() != nullptr);
+    const int64_t held = f.kv.free_blocks(0);
+    CHECK(held < before);
+
+    CHECK_OK(f.sch.cancel(a));
+    CHECK_OK(f.sch.reap(a));
+    std::vector<uint64_t> done, all;
+    f.sch.take_completed(&done);
+    all.insert(all.end(), done.begin(), done.end());
+    CHECK(done.empty());
+    CHECK(f.sch.find(a) != nullptr);
+    CHECK_EQ(f.kv.free_blocks(0), held);
+
+    f.commit_plain();                              /* the step in flight */
+    f.sch.take_completed(&done);
+    all.insert(all.end(), done.begin(), done.end());
+    CHECK(done.empty());
+    CHECK_EQ(f.kv.free_blocks(0), held);           /* the step ahead still writes them */
+    CHECK(f.sch.find(a) != nullptr);
+
+    f.sch.promote_next();
+    f.commit_plain();                              /* the step ahead */
+    CHECK(f.sch.find(a) == nullptr);
+    CHECK_EQ(f.kv.free_blocks(0), before);
+    f.sch.take_completed(&done);
+    all.insert(all.end(), done.begin(), done.end());
+    f.sch.take_completed(&done);
+    all.insert(all.end(), done.begin(), done.end());
+    CHECK_EQ(all.size(), (size_t)1);
+    CHECK(!all.empty() && all[0] == a);
+}
+
+/* A request that finishes at the commit of a step whose successor is already issued keeps its
+ * blocks for that successor, which writes them, and returns them at its commit. */
+TEST(a_request_finishing_under_a_step_issued_ahead_keeps_its_blocks_for_that_step) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    const int64_t before = f.kv.free_blocks(0);
+    auto r = f.request(40, /*max_tokens=*/2);
+    r->speculation_fixed = true;
+    const uint64_t a = f.add(std::move(r));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    REQUIRE(f.sch.step() != nullptr);
+    REQUIRE(f.sch.step_next() != nullptr);
+    const int64_t held = f.kv.free_blocks(0);
+    f.commit_plain();                              /* the second token: finished */
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+    CHECK_EQ(f.kv.free_blocks(0), held);
+    f.sch.promote_next();
+    f.commit_plain();
+    CHECK_EQ(f.kv.free_blocks(0), before);
+    CHECK_EQ((int)f.sch.find(a)->output.size(), 2);   /* the step ahead emitted nothing */
+}
+
+/* ================================================================== terminal paths */
+/* A lone request that outgrows the whole pool fails with the reason the client sees and gives its
+ * blocks back; nothing is preempted, since there is nobody to preempt and preempting itself would
+ * loop. */
+TEST(a_request_no_pool_can_hold_fails_kv_exhausted_and_frees_its_blocks) {
+    server::Sink sink;
+    Fixture f;
+    f.build(/*blocks=*/10, /*states=*/64);         /* 160 tokens */
+    CHECK_OK(f.start());
+    const int64_t before = f.kv.free_blocks(0);
+    const uint64_t a = f.submit_to(&sink, 150, 64);
+    for (int t = 0; t < 20 && !sink.done(); ++t) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+    }
+    CHECK(sink.done());
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Failed);
+    CHECK_EQ(f.sch.find(a)->finish_reason, std::string("kv_exhausted"));
+    CHECK_EQ(sink.status(), (int)RAD_E_FULL);
+    CHECK_EQ(f.kv.free_blocks(0), before);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+    CHECK(f.sch.step() == nullptr);
+}
+
+/* The lowest-priority running request that cannot grow while the requests ahead of it hold the
+ * pool is preempted by recompute and waits for them, rather than failed: it fits the pool on its
+ * own, so failing it returns an error for a request the engine can serve. It re-enters at the
+ * front of the queue and runs once they finish. Only a request running alone is failed. */
+TEST(the_last_request_short_of_a_block_yields_to_the_requests_ahead_of_it) {
+    server::Sink sink;
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);         /* 320 tokens */
+    CHECK_OK(f.start());
+    std::vector<uint64_t> ahead;
+    for (int i = 0; i < 3; ++i) ahead.push_back(f.submit(70, 2));   /* 5 blocks, room to 80 */
+    const uint64_t last = f.submit_to(&sink, 80, 4);                /* 5 blocks, full at 80 */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e.size(), (size_t)4);
+    CHECK_EQ(f.kv.free_blocks(0), (int64_t)0);
+    f.commit_plain();
+
+    /* The last needs a sixth block for position 80 and the pool has none. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e.size(), (size_t)3);
+    CHECK_EQ((int)f.sch.find(last)->state, (int)ReqState::Preempted);
+    CHECK(f.sch.find(last)->finish_reason.empty());
+    CHECK(!sink.done());
+    CHECK_EQ(f.sch.metrics().preemptions, 1);
+    uint64_t q[4];
+    CHECK_EQ(f.sch.queue_snapshot(q, 4), 1);
+    CHECK_EQ(q[0], last);
+    for (uint64_t id : ahead) CHECK_EQ((int)f.sch.find(id)->state, (int)ReqState::Running);
+    f.commit_plain();                              /* the three finish (max_tokens 2) */
+
+    for (int t = 0; t < 8 && !sink.done(); ++t) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+    }
+    CHECK(sink.done());
+    CHECK_EQ((int)sink.finish_reason(), (int)server::Finish::Length);
+    CHECK_EQ(sink.n_produced(), (int64_t)4);
+}
+
+/* A prompt the KV pool cannot hold even alone is refused when it is submitted, with the sink
+ * failed and the reason naming the pool's size, and the queue behind it moves on. Admitted, it
+ * would wait at the head of the queue forever (admission takes only what the pool holds), and
+ * its client would get no reply at all. A prompt of exactly the pool's size runs. */
+TEST(a_prompt_the_kv_pool_can_never_hold_is_refused_when_submitted) {
+    server::Sink refused, fits;
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);         /* 320 tokens, under the 4096 context */
+    CHECK_OK(f.start());
+    auto r = f.request(321, 8);
+    r->sink = &refused;
+    CHECK_EQ(f.sch.add(std::move(r)), (int)RAD_E_FULL);
+    CHECK(refused.done());
+    CHECK_EQ((int)refused.finish_reason(), (int)server::Finish::Error);
+    CHECK_EQ(refused.status(), (int)RAD_E_FULL);
+    CHECK(has(refused.why() ? refused.why() : "", "maximum context length is 320 tokens"));
+
+    const uint64_t ok = f.submit_to(&fits, 320, 1);
+    REQUIRE(ok != 0);
+    for (int t = 0; t < 4 && !fits.done(); ++t) {      /* two chunks: 256, then 64 */
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.plan().e[0].seq, ok);
+        f.commit_plain();
+    }
+    CHECK(fits.done());
+    CHECK_EQ(fits.n_produced(), (int64_t)1);
+    CHECK_EQ((int)fits.finish_reason(), (int)server::Finish::Length);
+}
+
+/* A client that hung up is closed Cancelled at the next commit, and its blocks go back then. */
+TEST(a_client_hang_up_closes_the_request_cancelled_at_the_next_commit) {
+    server::Sink sink;
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    const int64_t before = f.kv.free_blocks(0);
+    const uint64_t a = f.submit_to(&sink, 40, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    sink.request_cancel();
+    f.commit_plain();
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Cancelled);
+    CHECK_EQ((int)sink.finish_reason(), (int)server::Finish::Cancelled);
+    CHECK_EQ(f.kv.free_blocks(0), before);
+}
+
+/* A sink the client stopped draining fails the request rather than drop tokens from the middle of
+ * the stream, and the request's blocks go back. */
+TEST(a_sink_overflow_fails_the_request_and_returns_its_blocks) {
+    server::Sink sink(16);                         /* the smallest ring: 16 tokens */
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    const int64_t before = f.kv.free_blocks(0);
+    const uint64_t a = f.submit_to(&sink, 40, 64);
+    for (int t = 0; t < 30 && !sink.done(); ++t) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    CHECK(sink.overflowed());
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Failed);
+    CHECK_EQ(f.sch.find(a)->finish_reason, std::string("sink_overflow"));
+    CHECK_EQ((int)sink.finish_reason(), (int)server::Finish::Error);
+    CHECK_EQ(f.kv.free_blocks(0), before);
+}
+
+/* A token whose requested logprobs could not be computed fails the request, and neither it nor
+ * anything after it reaches the client: a token without the logprobs it was asked for would be a
+ * silently incomplete answer. Both the prefill's token and an accepted draft's. */
+TEST(a_token_whose_logprobs_failed_fails_the_request_and_is_not_sent) {
+    for (int verify = 0; verify < 2; ++verify) {
+        server::Sink sink;
+        Fixture f;
+        f.build();
+        f.cfg.n_spec = 4;
+        CHECK_OK(f.start());
+        auto r = f.request(40, 64);
+        r->sink = &sink;
+        r->sp.n_probs = 0;
+        const uint64_t id = f.add(std::move(r));
+        REQUIRE(f.sch.step() != nullptr);
+        if (verify) {
+            f.commit_plain(5);
+            int32_t draft[4] = { 21, 22, 23, 24 };
+            CHECK_OK(f.sch.set_draft(id, draft, 4));
+            REQUIRE(f.sch.step() != nullptr);
+        }
+        /* Rows: the first emitted token's logprobs are good; the second's failed. */
+        TokenLogprobs lp[6];
+        for (auto& x : lp) { x.token = 1; x.logprob = -0.5f; }
+        lp[1].token = -1;
+        if (!verify) lp[0].token = -1;
+        int32_t acc = 3, tok = 9, first = 0;
+        uint8_t eos = 0;
+        Scheduler::StepResult res;
+        res.n_seq = 1;
+        res.n_accepted = &acc;
+        res.token = &tok;
+        res.eos = &eos;
+        res.lp = lp;
+        res.first_row = &first;
+        const int64_t had = sink.n_produced();
+        CHECK_OK(f.sch.commit(res));
+        CHECK_EQ(sink.n_produced(), had + (verify ? 1 : 0));   /* only the good one */
+        CHECK_EQ((int)f.sch.find(id)->state, (int)ReqState::Failed);
+        CHECK_EQ(sink.status(), (int)RAD_E_STATE);
+    }
+}
+
+/* Priority before arrival: a later, higher-priority request is admitted first. */
+TEST(a_later_higher_priority_request_is_admitted_first) {
+    Fixture f;
+    f.build();
+    f.cfg.max_seqs = 1;
+    CHECK_OK(f.start());
+    const uint64_t lo = f.submit(40, 4, /*priority=*/0);
+    const uint64_t hi = f.submit(40, 4, /*priority=*/3);
+    uint64_t q[4];
+    REQUIRE_EQ(f.sch.queue_snapshot(q, 4), 2);
+    CHECK_EQ(q[0], hi);
+    CHECK_EQ(q[1], lo);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e.size(), (size_t)1);
+    CHECK_EQ(f.sch.plan().e[0].seq, hi);
+    CHECK_EQ((int)f.sch.find(lo)->state, (int)ReqState::Waiting);
+}
+
+/* The head of the queue blocks admission behind it: a smaller request that would fit waits too,
+ * so a large request cannot be starved by a stream of small ones. */
+TEST(the_head_of_the_queue_blocks_admission_behind_it) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    const uint64_t x = f.submit(160, 64);          /* 10 of 20 blocks */
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    const uint64_t head = f.submit(200, 4);        /* 13 blocks: does not fit beside x */
+    const uint64_t small = f.submit(16, 4);        /* 1 block: would */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(x)->state, (int)ReqState::Running);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Waiting);
+    CHECK_EQ((int)f.sch.find(small)->state, (int)ReqState::Waiting);
+    CHECK_EQ(f.sch.plan().e.size(), (size_t)1);
+}
+
+/* ================================================================== preemption continues */
+/* Preemption by recompute is the one path that re-prefills output tokens. The re-admitted request
+ * stages prompt ++ output at positions 0.., its conv cursor starts over, and its client's stream
+ * goes on with no token repeated or skipped. */
+TEST(a_preempted_request_continues_its_stream_exactly) {
+    server::Sink sink;
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    auto r = f.request(160, 64);
+    r->sink = &sink;
+    const uint64_t a = f.add(std::move(r));
+    const uint64_t b = f.submit(160, 64, /*priority=*/5);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(100);
+    CHECK_EQ(sink.n_produced(), (int64_t)1);
+    REQUIRE(f.sch.step() != nullptr);              /* both need a block at 160: a is preempted */
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Preempted);
+    f.commit_plain(101);
+    CHECK_EQ(sink.n_produced(), (int64_t)1);
+    CHECK_OK(f.sch.cancel(b));
+    CHECK_OK(f.sch.reap(b));
+
+    const RadBatch* rb = f.sch.step();
+    REQUIRE(rb != nullptr);
+    REQUIRE_EQ(f.sch.plan().e.size(), (size_t)1);
+    const StepEntry& e = f.sch.plan().e[0];
+    CHECK_EQ(e.seq, a);
+    CHECK_EQ(e.ctx_len, 0);
+    CHECK_EQ(e.n_tokens, 161);
+    CHECK_EQ(e.conv_cursor, 0);
+    CHECK(e.produces_token);
+    REQUIRE_EQ(rb->n_tok, (int64_t)161);
+    bool staged = true;
+    for (int i = 0; i < 160; ++i)
+        staged = staged && rb->token_ids[i] == 1000 + i && rb->positions[i] == i;
+    CHECK(staged);
+    CHECK_EQ(rb->token_ids[160], 100);
+    CHECK_EQ(rb->positions[160], 160);
+    f.commit_plain(102);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(103);
+    CHECK_EQ(sink.n_produced(), (int64_t)3);
+    server::SinkToken got[4];
+    REQUIRE_EQ(sink.read(got, 4), (size_t)3);
+    CHECK_EQ(got[0].token, 100); CHECK_EQ(got[1].token, 102); CHECK_EQ(got[2].token, 103);
+    const std::vector<int32_t> want = { 100, 102, 103 };
+    CHECK(f.sch.find(a)->output == want);
+}
+
+/* ================================================================== media rows across chunks */
+/* A prompt whose tokens 50..149 are one picture's 100 encoder rows, prefilled in 64-token chunks:
+ * each chunk stages exactly the rows of the picture it covers, at the batch rows of those tokens,
+ * and a history pass (which reads one token on) the rows one further. A wrong offset gives the
+ * model another part of the picture while the output stays fluent. Row r of the item holds the
+ * value r * 4 + column, so a misplaced row reads as a wrong number. */
+TEST(media_rows_are_staged_by_chunk_at_the_tokens_that_take_them) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/64);
+    f.prog.encoder.modalities = RAD_MM_IMAGE;
+    f.prog.encoder.n_embd = 4;
+    f.prog.encoder.patch_dim = 4;
+    f.prog.encoder.merge = 1;
+    f.prog.encoder.max_patches = 128;
+    f.cfg.n_spec = 4;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 4;
+    CHECK_OK(f.start());
+
+    auto item = std::make_shared<mm::Item>();
+    item->n_seg = 1;
+    item->seg_rows = 100;
+    item->encoded = true;
+    item->embd.resize(100 * 4);
+    for (int r = 0; r < 100; ++r)
+        for (int c = 0; c < 4; ++c) item->embd[(size_t)(r * 4 + c)] = (uint16_t)(r * 4 + c);
+    auto req = f.request(200, 4);
+    req->media = std::make_shared<mm::PromptMedia>();
+    req->media->items.push_back(mm::Placed{ item, 50 });
+    mm::RopeLayout::Run run;
+    run.tok = 50; run.n = 100; run.w = 10; run.base = 50; run.shift = -40; run.item = 0;
+    req->media->rope.runs.push_back(run);
+    f.add(std::move(req));
+
+    /* Batch row q of a pass: the item row it must carry, or -1 for a text row. */
+    auto check_pass = [&](const RadBatch* b, int64_t first_tok, int64_t shift, int64_t n) {
+        int64_t want = 0;
+        for (int64_t q = 0; q < n; ++q) {
+            const int64_t ti = first_tok + q + shift;
+            if (ti < 50 || ti >= 150) continue;
+            REQUIRE(want < b->n_mm_rows);
+            CHECK_EQ(b->mm_rows[want], (int32_t)q);
+            const uint16_t* e = static_cast<const uint16_t*>(b->mm_embd) + want * 4;
+            for (int c = 0; c < 4; ++c) CHECK_EQ((int)e[c], (int)((ti - 50) * 4 + c));
+            ++want;
+        }
+        CHECK_EQ(b->n_mm_rows, want);
+    };
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        const RadBatch* b = f.sch.step();
+        REQUIRE(b != nullptr);
+        REQUIRE_EQ(b->n_tok, (int64_t)(chunk < 3 ? 64 : 8));
+        check_pass(b, 64 * chunk, 0, b->n_tok);
+        if (chunk == 0) {
+            /* M-RoPE: a picture token at its grid cell, a text token before it at its index. */
+            CHECK_EQ(b->rope_mixed, 1);
+            const int64_t n = b->n_tok;
+            CHECK_EQ(b->rope_pos[61], 50); CHECK_EQ(b->rope_pos[n + 61], 51);
+            CHECK_EQ(b->rope_pos[2 * n + 61], 51);
+            CHECK_EQ(b->rope_pos[49], 49); CHECK_EQ(b->rope_pos[2 * n + 49], 49);
+            int rounds = 4;
+            Scheduler::SerialRow rows[4];
+            (void)f.sch.serial_begin(&rounds, rows, 4);
+            const RadBatch* hb = f.sch.serial_batch(0, 1);
+            REQUIRE(hb != nullptr);
+            REQUIRE_EQ(hb->n_tok, (int64_t)64);
+            check_pass(hb, 0, /*shift=*/1, 64);
+            f.sch.serial_end(0);
+        }
+        f.commit_plain();
+    }
+}
+
+/* ================================================================== scored rows (KL mode) */
+/* In KL mode a scored prompt names a logits row at every position it prefills, after the
+ * sampler's rows and in entry order, which is the order Engine::score_rows maps back. A row
+ * miscounted here scores the wrong position against the reference and biases every comparison
+ * the instrument makes. */
+TEST(scored_prompt_rows_follow_the_sampler_rows_in_entry_order) {
+    Fixture f;
+    f.build();
+    f.cfg.kld_record = "/nonexistent";             /* only kld() is read here */
+    CHECK_OK(f.start());
+    auto x = f.request(600, 4);
+    x->score = true;
+    const uint64_t xid = f.add(std::move(x));
+    const uint64_t y = f.submit(40, 8);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    /* X's first chunk (0..255, no token) then Y's whole prompt (256..295, one sampled row). */
+    REQUIRE_EQ(f.sch.plan().e.size(), (size_t)2);
+    CHECK_EQ(f.sch.plan().e[0].seq, xid);
+    REQUIRE_EQ(b->n_out, (int64_t)(1 + 256));
+    CHECK_EQ(b->out_ids[0], 295);
+    bool ok = true;
+    for (int j = 0; j < 256; ++j) ok = ok && b->out_ids[1 + j] == j;
+    CHECK(ok);
+    f.commit_plain();
+
+    /* Y decodes first (decode rows lead), then X's second chunk. */
+    b = f.sch.step();
+    REQUIRE(b != nullptr);
+    REQUIRE_EQ(f.sch.plan().e.size(), (size_t)2);
+    CHECK_EQ(f.sch.plan().e[0].seq, y);
+    REQUIRE_EQ(b->n_out, (int64_t)(1 + 256));
+    CHECK_EQ(b->out_ids[0], 0);
+    ok = true;
+    for (int j = 0; j < 256; ++j) ok = ok && b->out_ids[1 + j] == 1 + j;
+    CHECK(ok);
+}
+
+/* ================================================================== the linear-state chunk walk */
+/* state_chunk_bounds and state_chunk_seq against a per-token definition: tokens belong to the same
+ * chunk exactly when they are in the same sequence and the same absolute multiple of C. A chunk
+ * crossing a sequence or a multiple carries a partial tile's state into the next chunk, which
+ * corrupts the recurrent state silently. A cap one short is refused without a write past it. */
+TEST(the_state_chunk_walk_matches_a_per_token_definition) {
+    const DeriveRow* bounds = derive_row(derive_index("state_chunk_bounds"));
+    const DeriveRow* seqs = derive_row(derive_index("state_chunk_seq"));
+    REQUIRE(bounds && seqs);
+    const uint32_t seed = 0xC4A11u;
+    uint32_t rng = seed;
+    auto next = [&](uint32_t n) { rng = rng * 1664525u + 1013904223u; return (rng >> 8) % n; };
+    int bad = 0;
+    for (int c = 0; c < 2000 && !bad; ++c) {
+        const int64_t C = (int64_t)1 << (2 * next(4));          /* 1, 4, 16, 64 */
+        const int n_seq = 1 + (int)next(6);
+        std::vector<int32_t> cu(1, 0), pos;
+        for (int s = 0; s < n_seq; ++s) {
+            const int32_t p0 = (int32_t)next(300), len = (int32_t)next(5) == 0 ? 0 : (int32_t)next(80);
+            for (int32_t j = 0; j < len; ++j) pos.push_back(p0 + j);
+            cu.push_back(cu.back() + len);
+        }
+        /* The definition: a new chunk wherever (sequence, position / C) changes. */
+        std::vector<int32_t> want_b(1, 0), want_s;
+        for (int s = 0; s < n_seq; ++s)
+            for (int32_t t = cu[(size_t)s]; t < cu[(size_t)s + 1]; ++t) {
+                const bool last = t + 1 == cu[(size_t)s + 1] ||
+                                  pos[(size_t)t + 1] / C != pos[(size_t)t] / C;
+                if (last) { want_b.push_back(t + 1); want_s.push_back(s); }
+            }
+        DeriveInput in;
+        in.cu_seqlens = cu.data();
+        in.positions = pos.data();
+        in.n_tok = (int64_t)pos.size();
+        in.n_seq = n_seq;
+        in.state_chunk = C;
+        for (int which = 0; which < 2 && !bad; ++which) {
+            const DeriveRow* row = which ? seqs : bounds;
+            const std::vector<int32_t>& want = which ? want_s : want_b;
+            const int64_t need = (int64_t)want.size();
+            std::vector<int32_t> out((size_t)need + 8, 0x7ead);
+            int64_t n = -1;
+            const int st = row->fn(in, out.data(), need, &n);
+            bool ok = st == RAD_OK && n == need &&
+                      std::equal(want.begin(), want.end(), out.begin());
+            if (need > 0) {
+                std::vector<int32_t> canary((size_t)need + 8, 0x7ead);
+                int64_t m = -1;
+                ok = ok && row->fn(in, canary.data(), need - 1, &m) == RAD_E_FULL;
+                for (size_t k = (size_t)need - 1; k < canary.size(); ++k)
+                    ok = ok && canary[k] == 0x7ead;
+            }
+            if (!ok) {
+                bad = 1;
+                std::fprintf(stderr, "    seed 0x%x case %d: %s, C %lld, %d sequences, %zu tokens\n",
+                             seed, c, row->name, (long long)C, n_seq, pos.size());
+            }
+        }
+    }
+    CHECK_EQ(bad, 0);
+}
+
+/* ================================================================== the pass's host bounds */
+/* Every row of every build, issued ahead or not, has a block-table column for every position it
+ * can write: the card writes slot -1 past the pitch, which silently drops a verified token's K/V.
+ * And the two host-side bounds a recorded pass is keyed by, max_ctx_len and the pitch, cross
+ * their buckets on the same builds; apart, each crossing re-records every pass twice. */
+TEST(every_row_has_a_table_column_and_the_pass_bounds_cross_buckets_together) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/16384);
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+    auto r = f.request(1000, 0);
+    r->speculation_fixed = true;
+    const uint64_t id = f.add(std::move(r));
+    uint32_t rng = 4242;
+    int32_t last_ctx = -1;
+    int64_t last_pitch = -1;
+    int ahead_builds = 0, crossings = 0, bad_cover = 0, apart = 0;
+    auto check = [&](const RadBatch* b) {
+        const RadKVGroupBatch& g = b->kv[0];
+        for (int64_t i = 0; i < b->n_seq; ++i) {
+            if (g.block_table_pitch * g.block_size < (int64_t)b->ctx_lens[i] + b->q_lens[i]) ++bad_cover;
+            if (b->ctx_lens[i] > b->max_ctx_len) ++bad_cover;
+        }
+        if (b->n_seq == 1 && b->q_lens[0] == 5) {        /* steady decode: one shape */
+            if (last_ctx >= 0 && (b->max_ctx_len != last_ctx) != (g.block_table_pitch != last_pitch))
+                ++apart;
+            if (last_ctx >= 0 && b->max_ctx_len != last_ctx) ++crossings;
+            last_ctx = b->max_ctx_len;
+            last_pitch = g.block_table_pitch;
+        }
+    };
+    int32_t draft[4] = { 31, 32, 33, 34 };
+    bool open = false;                               /* a step issued ahead is current */
+    for (int t = 0; t < 3000; ++t) {
+        const RadBatch* b = nullptr;
+        if (!open) {
+            (void)f.sch.set_draft(id, draft, 4);
+            b = f.sch.step();
+            REQUIRE(b != nullptr);
+            check(b);
+        }
+        open = false;
+        const bool ahead = t % 3 == 0 && f.sch.plan().e[0].produces_token;
+        const RadBatch* nb = nullptr;
+        if (ahead) {
+            f.sch.expect_draft(id, 4);
+            nb = f.sch.step_next();
+            if (nb) { check(nb); ++ahead_builds; }
+        }
+        CHECK_OK(f.commit(5, 0, [&](const StepEntry& e) { return random_accept(rng, e); }));
+        if (nb) {
+            CHECK_OK(f.sch.set_draft(id, draft, 4));
+            f.sch.promote_next();
+            open = true;
+        }
+    }
+    CHECK_EQ(bad_cover, 0);
+    CHECK_EQ(apart, 0);
+    CHECK(crossings >= 4);
+    CHECK(ahead_builds > 500);
+}
+
+/* ================================================================== a wider state index */
+/* A state group whose kernel reads more than one column per sequence (the anchor scheme's
+ * committed and scratch slots) gets the manager's whole row at the group's pitch on every build,
+ * through rows reused after a request ends and sequences moving between rows. A stale or
+ * misaligned column reads another sequence's recurrent state. */
+TEST(a_wider_state_index_row_is_the_managers_row_on_every_build) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.kv.sidx_width = 2;
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+    std::vector<uint64_t> ids;
+    ids.push_back(f.submit(40, 9));
+    ids.push_back(f.submit(70, 200));
+    ids.push_back(f.submit(17, 90));
+    uint32_t rng = 2468;
+    int checked = 0;
+    for (int step = 0; step < 80; ++step) {
+        if (step == 6) ids.push_back(f.submit(33, 120));
+        if (step == 20) ids.push_back(f.submit(90, 60));
+        for (uint64_t id : ids) {
+            int32_t draft[4] = { 31, 32, 33, 34 };
+            (void)f.sch.set_draft(id, draft, 4);
+        }
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        const StepPlan& p = f.sch.plan();
+        for (int gi = 0; gi < b->n_kv_groups; ++gi) {
+            const RadKVGroupBatch& g = b->kv[gi];
+            if (f.kv.geom.g[(size_t)gi].paged) continue;
+            REQUIRE_EQ(g.state_index_pitch, (int64_t)2);
+            for (int64_t i = 0; i < b->n_seq; ++i) {
+                int32_t want[2] = { -2, -2 };
+                CHECK_EQ(f.kv.state_index_row(p.e[(size_t)i].seq, gi, want, 2), 2);
+                CHECK_EQ(g.state_index[i * 2], want[0]);
+                CHECK_EQ(g.state_index[i * 2 + 1], want[1]);
+                CHECK(want[0] >= 0);
+                ++checked;
+            }
+        }
+        CHECK_OK(f.commit(5, 0, [&](const StepEntry& e) { return random_accept(rng, e); }));
+    }
+    CHECK(checked > 100);
+}
+
 RAD_TEST_MAIN()
+
+/* ================================================================== the plan without a span */
+namespace {
+
+/* A 64-bit FNV-1a fingerprint of a step: every plan entry the batch builder reads and every array
+ * of the RadBatch it built, each over the extent the step fills. */
+struct StepFp {
+    uint64_t h = 1469598103934665603ull;
+    void raw(const void* p, size_t n) {
+        const auto* c = (const unsigned char*)p;
+        for (size_t i = 0; i < n; ++i) { h ^= c[i]; h *= 1099511628211ull; }
+    }
+    void i(int64_t v) { raw(&v, sizeof v); }
+    void arr(const int32_t* p, int64_t n) {
+        i(p ? n : -1);
+        if (p) for (int64_t k = 0; k < n; ++k) i(p[k]);
+    }
+    void step(const StepPlan& p, const RadBatch& b) {
+        i((int64_t)p.e.size());
+        for (const StepEntry& e : p.e) {
+            i((int64_t)e.seq); i(e.n_tokens); i(e.ctx_len); i(e.n_spec); i(e.is_prefill);
+            i(e.ckpt_tok); i(e.ckpt_slot); i(e.ckpt_restore);
+        }
+        i(b.phase); i(b.n_tok); i(b.n_seq); i(b.n_out); i(b.n_ahead); i(b.max_q_len);
+        i(b.max_ctx_len); i(b.n_seq_decode); i(b.n_tok_decode); i(b.n_checkpoints);
+        arr(b.token_ids, b.n_tok + b.n_ahead);
+        arr(b.positions, b.n_tok);
+        arr(b.cu_seqlens, b.n_seq + 1);
+        arr(b.q_lens, b.n_seq);
+        arr(b.ctx_lens, b.n_seq);
+        arr(b.out_ids, b.n_out);
+        arr(b.checkpoint_tok, b.n_checkpoints);
+        arr(b.checkpoint_slot, b.n_checkpoints);
+        i(b.n_kv_groups);
+        for (int g = 0; g < b.n_kv_groups; ++g) {
+            const RadKVGroupBatch& k = b.kv[g];
+            arr(k.slot_mapping, k.slot_mapping ? b.n_tok : 0);
+            arr(k.seqused, k.seqused ? b.n_seq : 0);
+            i(k.block_table_pitch);
+            arr(k.block_table, k.block_table ? b.n_seq * k.block_table_pitch : 0);
+            i(k.state_index_pitch);
+            arr(k.state_index, k.state_index ? b.n_seq * std::max<int64_t>(k.state_index_pitch, 1)
+                                             : 0);
+        }
+    }
+};
+
+/* Long and short prompts arriving while others prefill and decode, every step fingerprinted. */
+uint64_t scripted_steps(int64_t max_tok, int64_t interval, int64_t busy, int* n_steps) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, max_tok, /*max_ctx=*/8192);
+    f.cfg.checkpoint_interval = interval;
+    f.cfg.busy_prefill_chunk = busy;
+    CHECK_OK(f.start());
+    struct Arrival { int at, n_prompt, max_tokens; };
+    const Arrival arrivals[] = { { 0, 3000, 6 }, { 0, 200, 9 }, { 3, 1500, 4 }, { 5, 40, 20 },
+                                 { 9, 2600, 3 }, { 12, 700, 5 }, { 30, 5000, 2 } };
+    StepFp fp;
+    *n_steps = 0;
+    for (int k = 0; k < 600; ++k) {
+        for (const Arrival& a : arrivals)
+            if (a.at == k) CHECK(f.submit(a.n_prompt, a.max_tokens) != 0);
+        const RadBatch* b = f.sch.step();
+        if (!b) {
+            if (k > 30) break;
+            continue;
+        }
+        fp.step(f.sch.plan(), *b);
+        ++*n_steps;
+        f.commit_plain();
+    }
+    return fp.h;
+}
+
+}  /* namespace */
+
+/* Without a span the scheduler plans and stages the pinned steps: the fingerprints of a scripted
+ * workload's every step (plan entries and RadBatch arrays) at budgets of one, two and four
+ * intervals, with --busy-prefill-chunk auto, off and fixed, taken from the scheduler as it was
+ * before --prefill-span. */
+TEST(without_a_span_the_scheduler_plans_and_stages_the_pinned_steps) {
+    struct Case { int64_t max_tok, interval, busy; uint64_t want; };
+    const Case cases[] = {
+        { 256, 256, -1, 0x17b8231a20db9d46ull }, { 512, 256, -1, 0xe155e72b6a4cc94full }, { 1024, 256, -1, 0x54ba52dac3f4f61cull },
+        { 1024, 256, 0, 0x54ba52dac3f4f61cull }, { 1024, 256, 128, 0x3d9cbbf533e3c4b5ull }, { 2048, 512, -1, 0x400205b7b9afcf12ull },
+    };
+    for (const Case& c : cases) {
+        int n = 0;
+        const uint64_t h = scripted_steps(c.max_tok, c.interval, c.busy, &n);
+        fprintf(stderr, "    pin: max_tok %lld interval %lld busy %lld: %d steps, 0x%016llxull\n",
+                (long long)c.max_tok, (long long)c.interval, (long long)c.busy, n,
+                (unsigned long long)h);
+        CHECK(n > 20);
+        CHECK_EQ(h, c.want);
+    }
+}

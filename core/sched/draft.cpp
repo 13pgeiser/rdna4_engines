@@ -1,5 +1,5 @@
-/* draft.cpp -- the static draft-depth policy, and the adaptive one `--draft-window adaptive` turns
- * on. See draft.h for why the first is the default and what the second changes.
+/* draft.cpp -- the static draft-depth policy and the adaptive one (`--draft-window adaptive`).
+ * See draft.h.
  */
 #include "draft.h"
 
@@ -11,33 +11,33 @@ namespace rad {
 
 namespace {
 
-/* THE STEP-COST PRIOR, a shape and not a measurement: every draft adds six percent to a step --
- * one round of a serial head and one more verify row against a weight-bound step. It prices a
- * depth nothing has measured yet, and only its RATIOS are read once anything has been measured:
- * an unmeasured depth is the nearest measured one scaled by prior(d) / prior(d'). */
+/* Step-cost prior, a shape rather than a measurement: each draft adds 6% to a step (one serial
+ * head round plus one verify row on a weight-bound step). Once anything is measured only its
+ * ratios are used: an unmeasured depth is the nearest measured one scaled by prior(d) / prior(d'). */
 constexpr double kCostSlope = 0.06;
 double cost_prior(int d) { return 1.0 + kCostSlope * (double)d; }
 
-/* A STEP TIME'S MEAN IS A RUNNING MEAN FOR ITS FIRST STEPS AND THEN A MOVING AVERAGE WITH A
- * HALF-LIFE OF 32 STEPS. Long enough that the scatter of one step against the next -- a tier
- * copy, a recording, a prefix-cache trim -- averages out; short enough to follow a context that
- * grows by a few thousand tokens over a reply. */
+/* A step-time mean is a running mean for the first steps, then a moving average with a half-life
+ * of 32 steps: long enough to average out one-off costs (a tier copy, a recording, a prefix-cache
+ * trim), short enough to follow a context growing by a few thousand tokens over a reply. */
 constexpr double kCostHalfLife = 32.0;
-/* AND ONE STEP COUNTS FOR AT MOST FOUR TIMES THE KEY'S MEAN, once the mean is over four steps. A
- * step that waited on something other than its own work -- a first recording, an allocation, a
- * host stall -- says nothing about what its depth costs, and one such step would otherwise move a
- * short mean by more than any depth. A mean over fewer steps is not yet a reference to clip
- * against: its first step may itself be the odd one. */
+/* Once a key has 4 samples, one step counts for at most 4x its mean. A step that waited on
+ * something else (a first recording, an allocation, a host stall) says nothing about its depth's
+ * cost. Below 4 samples the mean is not a trustworthy reference to clip against. */
 constexpr double kCostOutlier = 4.0;
 constexpr int64_t kCostClipAfter = 4;
 
-/* THE PRIOR WEIGHS AS MUCH AS THIS MANY VERIFIES. The (n+1)-th real one moves an estimate by
- * 1 / (n + k + 1) -- a running mean over the prior and the evidence -- until that step falls below
- * the half-life's, and from then on it is the moving average it is meant to be. Without it a
- * sequence would spend its first ~16 verifies at whatever window the prior chose, which is most of
- * a short answer. */
+/* The prior weighs as much as this many verifies. The (n+1)-th verify moves an estimate by
+ * 1 / (n + k + 1), a running mean over prior and evidence, until that falls below the half-life's
+ * step and the moving average takes over. Without it a sequence would spend its first ~16
+ * verifies at the prior's window, most of a short answer. */
 constexpr double kPriorWeight = 4.0;
 
+/* The weight of the (n+1)-th sample in an estimate that is a running mean until 1 / (n + 1)
+ * falls below a moving average's step at half-life `h` samples, and that average after. */
+double settle_weight(double h, int64_t n) {
+    return std::fmax(1.0 - std::exp2(-1.0 / h), 1.0 / (double)(n + 1));
+}
 
 }  /* namespace */
 
@@ -64,10 +64,8 @@ int DraftController::configure(const Params& p) {
         for (int c = 0; c < kCostClasses; ++c) { cost_ms_[d][c] = 0.0; cost_n_[d][c] = 0; }
     }
     if (adapt_)
-        RAD_INFO("draft depth: ADAPTIVE (--draft-window adaptive), %d..%d -- the step's head depth "
-                 "maximises the tokens its sequences are expected to emit over the step's measured "
-                 "cost, and a sequence stops at the first draft emitted less than %.0f%% of the "
-                 "time; moves at +%.0f%% and at most every %d steps",
+        RAD_INFO("draft depth: adaptive, %d..%d; a sequence stops at the first draft emitted less "
+                 "than %.0f%% of the time, and the depth moves at +%.0f%% at most every %d steps",
                  kMinDepth, p_.max_depth, 100.0 * kDraftMinChance, 100.0 * kHyst, kHold);
     return RAD_OK;
 }
@@ -80,9 +78,9 @@ void DraftController::observe(int drafted, int accepted) {
     tot_drafted_  += drafted;
     tot_accepted_ += accepted;
 
-    /* Position j was EVALUATED only if every position before it was accepted, so this verify
-     * produces exactly: 0..accepted-1 evaluated and accepted, and -- when the prefix was not the
-     * whole draft -- position `accepted` evaluated and rejected. Nothing past that was reached. */
+    /* Position j is evaluated only if every earlier position was accepted: 0..accepted-1 are
+     * evaluated and accepted, position `accepted` (if drafted) evaluated and rejected, and nothing
+     * past it is reached. */
     const int last = accepted < drafted ? accepted : drafted - 1;
     for (int j = 0; j <= last; ++j) {
         ++reach_[j];
@@ -107,7 +105,7 @@ void DraftController::step_time(int depth, int n_rows, double ms) {
     double&  m = cost_ms_[depth][c];
     int64_t& n = cost_n_[depth][c];
     if (n >= kCostClipAfter && ms > kCostOutlier * m) ms = kCostOutlier * m;
-    const double w = std::fmax(1.0 - std::exp2(-1.0 / kCostHalfLife), 1.0 / (double)(n + 1));
+    const double w = settle_weight(kCostHalfLife, n);
     m = n ? m + w * (ms - m) : ms;
     ++n;
 }
@@ -121,10 +119,9 @@ double DraftController::step_cost(int depth, int n_rows) const {
     if (depth < 1 || depth > RAD_SCHED_MAX_SPEC) return 0.0;
     const int c = n_rows >= 1 ? cost_class(n_rows) : 0;
     if (cost_n_[depth][c] > 0) return cost_ms_[depth][c];
-    /* THE NEAREST MEASURED KEY: in this class first, the nearest depth and the shallower on a
-     * tie; then the nearest class. Only its ratio to the prior is borrowed, so a class whose steps
-     * are twice as dear prices every depth twice as dear, and the comparison D makes -- depths at
-     * ONE class -- reads the prior's shape until its own depths are measured. */
+    /* Nearest measured key: this class first (nearest depth, shallower on a tie), then the
+     * nearest class. Only its ratio to the prior is borrowed, so D's comparison across depths in
+     * one class follows the prior's shape until those depths are measured. */
     for (int dc = 0; dc < kCostClasses; ++dc) {
         for (int sgn = 0; sgn < 2; ++sgn) {
             const int k = sgn ? c + dc : c - dc;
@@ -158,8 +155,7 @@ double DraftController::prior_at(int j) const {
 }
 
 void DraftController::start(DraftAdapt& s) const {
-    /* Each position from the sequences that finished before it once there are enough of them
-     * (adapt_retire); otherwise from the fixed prior, which is optimistic on purpose (kPrior). */
+    /* From finished sequences once there are enough (adapt_retire), else the fixed kPrior. */
     for (int j = 0; j < p_.max_depth; ++j) {
         s.a[j] = (float)prior_at(j);
         s.n[j] = 0;
@@ -170,8 +166,7 @@ void DraftController::start(DraftAdapt& s) const {
 
 void DraftController::adapt_retire(const DraftAdapt& s) {
     if (!adapt_ || s.depth <= 0 || (double)s.n[0] < kHalfLife) return;
-    const double w = std::fmax(1.0 - std::exp2(-1.0 / kPriorHalfLifeSeqs),
-                               1.0 / (double)(prior_n_ + 1));
+    const double w = settle_weight(kPriorHalfLifeSeqs, prior_n_);
     for (int j = 0; j < p_.max_depth; ++j)
         prior_[j] = prior_n_ ? (float)((double)prior_[j] + w * ((double)s.a[j] - (double)prior_[j]))
                              : s.a[j];
@@ -207,9 +202,8 @@ int DraftController::adapt_observe(DraftAdapt& s, int drafted, int accepted) con
     if (accepted < 0) accepted = 0;
     if (accepted > drafted) accepted = drafted;
 
-    /* THE POSITIONS THIS VERIFY EVALUATED, by observe()'s rule: every one before the first
-     * rejection, taken, and the rejected one, refused. A position behind the rejection was drafted
-     * and never looked at, and says nothing either way. */
+    /* The positions this verify evaluated, by observe()'s rule. Positions past the first
+     * rejection were never evaluated and are not updated here. */
     const int last = accepted < drafted ? accepted : drafted - 1;
     for (int j = 0; j <= last; ++j) {
         const double w = std::fmax(alpha_, 1.0 / ((double)s.n[j] + kPriorWeight + 1.0));
@@ -217,17 +211,15 @@ int DraftController::adapt_observe(DraftAdapt& s, int drafted, int accepted) con
         s.a[j] = (float)((double)s.a[j] + w * (x - (double)s.a[j]));
         if (s.n[j] < UINT16_MAX) ++s.n[j];
     }
-    /* AND THE POSITIONS THE WINDOW DID NOT REACH DRIFT TOWARD THE DEEPEST ONE IT DID. Nothing is
-     * learned about them while the window is shorter -- and a sequence held at three by prose that
-     * turns into code would otherwise keep pricing positions four and up at whatever they read
-     * before, and never draft deep enough to find out. The guess is that acceptance decays with
-     * position rather than falling off a cliff, so the window's edge stands in for what lies past
-     * it. Where that is wrong it costs a move out, the verifies that refute it, and a move back. */
+    /* Positions past the window drift toward its deepest one. Otherwise a sequence held shallow
+     * by prose that turns into code would keep its stale deep estimates and never draft deep
+     * enough to update them. Assumes acceptance decays smoothly with position; when wrong it costs
+     * a move out and back. */
     const double edge = (double)s.a[drafted - 1];
     for (int j = drafted; j < D; ++j)
         s.a[j] = (float)((double)s.a[j] + alpha_ * (edge - (double)s.a[j]));
 
-    /* THE STOP MOVES ONLY PAST THE HOLD: it is this sequence's share of the step's shape. */
+    /* The stop moves only past the hold: it is this sequence's share of the step's shape. */
     if (s.held < INT32_MAX) ++s.held;
     if (s.held < kHold) return s.depth;
     const int d = stop_of(s.a);
@@ -244,9 +236,8 @@ int DraftController::plan_step(DraftAdapt* const* seq, int n_seq, int n_rows) {
     if (n_rows < n_seq) n_rows = n_seq;
     const int M = p_.max_depth;
 
-    /* THE STEP'S EXPECTED TOKENS AT EVERY HEAD DEPTH: sum_i E_i(min(D, stop_i)), plus one for
-     * every row that does not draft. A depth past every stop is the deepest stop's step -- no
-     * sequence drafts further and the head runs no further -- so the candidates end there. */
+    /* Expected tokens at each head depth: sum_i E_i(min(D, stop_i)), plus one per non-drafting
+     * row. Candidates end at the deepest stop, since a deeper D changes nothing. */
     double tok[RAD_SCHED_MAX_SPEC + 1] = {};
     int top = kMinDepth;
     for (int i = 0; i < n_seq; ++i) {
@@ -269,8 +260,8 @@ int DraftController::plan_step(DraftAdapt* const* seq, int n_seq, int n_rows) {
         if (g > best_g) { best_g = g; best = d; }
     }
 
-    /* THE MOVE, rate-limited twice: not within kHold steps of the last one, and only for a depth
-     * worth kHyst more than the one in force. The first step that drafts takes the best outright. */
+    /* Move only after kHold steps and only for kHyst more yield than the current depth. The
+     * first drafting step takes the best outright. */
     if (step_d_ <= 0) {
         step_d_ = best;
         step_held_ = 0;

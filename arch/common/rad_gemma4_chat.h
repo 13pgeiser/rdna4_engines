@@ -1,9 +1,8 @@
-/* rad_gemma4_chat.h -- how Gemma 4 spells a turn: its reasoning and its tool calls, as data.
+/* rad_gemma4_chat.h -- Gemma 4's reply format (reasoning and tool calls) as data.
  *
- * The chat template is one llama.cpp reads with a hand-written handler, so the template analysis
- * finds nothing in it, and the engine would serve the model with no reasoning split and refuse
- * every request that sends tools. The model's own tokenizer_config.json states the format instead
- * (`response_template`), and this is that statement in the engine's terms:
+ * Template analysis finds nothing in Gemma 4's chat template (llama.cpp uses a hand-written
+ * handler), so without this the model would get no reasoning split and refuse tool requests.
+ * This restates the model's tokenizer_config.json `response_template` in the engine's terms:
  *
  *   thinking      <|channel>thought\n ... <channel|>
  *   tool calls    <|tool_call>call:NAME{key:<|"|>text<|"|>,n:3,flag:true}<tool_call|>, repeated
@@ -12,14 +11,12 @@
  *   the turn      ends at <turn|>; after its calls the model writes <|tool_response> and stops
  *                 (generation_config.json names it beside <eos> and <turn|>)
  *
- * llama.cpp's handler records two habits of the model beyond that: an extra thought channel after
- * the answer, and a lone <channel|>. `reasoning_anywhere` reads the first as reasoning and drops
- * the second, so neither reaches the content.
+ * The model also emits an extra thought channel after the answer and a lone <channel|>.
+ * `reasoning_anywhere` reads the first as reasoning and drops the second.
  *
- * Here rather than in one plugin because two plugins serve Gemma 4 -- arch/gemma4 (bf16 and fp8
- * experts) and arch/gemma4_bf16 (the CT-INT4 dense release) -- and the format is the model's, not
- * the weights'. One declaration, so the two cannot drift apart, and so the reply-format tests read
- * the declaration the plugins export rather than a copy of it. */
+ * Shared because two plugins serve Gemma 4 (arch/gemma4 with bf16 and fp8 experts, arch/gemma4_bf16
+ * for the CT-INT4 dense release) and the format belongs to the model; the reply-format tests read
+ * this same declaration. */
 #pragma once
 #include "rad_builder.h"
 
@@ -38,8 +35,8 @@ inline const RadChatFormat* gemma4_chat_format() {
         /* A call that starts inside an unclosed thought ends it there. */
         c.reasoning_breaks    = kBreaks;
         c.n_reasoning_breaks  = 1;
-        /* Thinking off, the template closes an empty channel in the generation prompt; on, the
-         * model opens its own -- or, after a tool response, the prompt has opened it. */
+        /* Thinking off: the template closes an empty channel in the generation prompt. On: the
+         * model opens its own, or the prompt has opened it after a tool response. */
         c.reasoning_in_prompt = RAD_CHAT_THINK_FROM_PROMPT;
         c.reasoning_anywhere  = 1;
 

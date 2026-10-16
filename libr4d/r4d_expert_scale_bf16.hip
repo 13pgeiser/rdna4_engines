@@ -1,16 +1,14 @@
 /* r4d_expert_scale_bf16.hip -- expert_scale: each routing weight times its expert's own scale, in place.
  *
- * Gemma 4's router renormalises its top-k and then multiplies each weight by per_expert_scale of
- * the expert it chose. Said in the conventional vocabulary that is two launches a MoE layer -- an
- * `embed_lookup` of the [n_expert, 1] scale table by the expert ids, then a `mul` into the weights
- * -- each a few dozen elements behind a full dispatch at decode. This is the pair as one:
+ * Gemma 4's router renormalises its top-k, then multiplies each weight by its expert's
+ * per_expert_scale. Unfused that is two launches per MoE layer (`embed_lookup` of the [n_expert, 1]
+ * scale table by expert id, then `mul`), each a few dozen elements at decode. Fused:
  *
  *     ew[t, k] = bf16( ew[t, k] * scale[ids[t, k]] )
  *
- * THE CHAIN'S VALUE, BIT FOR BIT: the lookup copies a bf16 scale and the multiply is one f32
- * product rounded once to nearest even, which is all this does. An id outside the table reads a
- * zero scale, as embed_lookup writes a zero row for an id it does not hold, and the product's sign
- * survives it the same way. One thread an element; a decode step is a handful of rows.
+ * Bit-identical to the pair: one f32 product of two bf16 values, rounded once to nearest even. An
+ * id outside the table reads a zero scale, as embed_lookup writes a zero row, so the product's
+ * sign matches too. One thread per element.
  */
 #include <hip/hip_runtime.h>
 

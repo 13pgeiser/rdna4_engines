@@ -5,15 +5,14 @@
 
 namespace rad {
 
-/* Hangul, per UAX #15. 11172 syllables that would otherwise be 11172 table rows. */
+/* Hangul syllables are (de)composed arithmetically per UAX #15 instead of with 11172 table rows. */
 static constexpr uint32_t k_s_base = 0xAC00, k_l_base = 0x1100, k_v_base = 0x1161,
                           k_t_base = 0x11A7, k_l_count = 19, k_v_count = 21, k_t_count = 28,
                           k_n_count = k_v_count * k_t_count,          /* 588 */
                           k_s_count = k_l_count * k_n_count;          /* 11172 */
 
 uint32_t unorm_ccc(uint32_t cpt) {
-    /* Binary search over runs. Class 0 is the common case and is not in the table, so the
-     * miss path is the fast path -- which is what a run of ASCII wants. */
+    /* Binary search over runs. Class 0, the common case, is not in the table. */
     size_t lo = 0, hi = k_ccc_n;
     while (lo < hi) {
         size_t mid = (lo + hi) / 2;
@@ -35,9 +34,8 @@ static const DecompRow* decomp_row(uint32_t cpt) {
     return nullptr;
 }
 
-/* Canonical ordering: a stable sort of each run of non-starters by combining class. Written as
- * an insertion sort over the run rather than std::stable_sort because the runs are almost always
- * length 0 or 1 and the comparison is the whole cost. */
+/* Canonical ordering: a stable sort of each run of non-starters by combining class. Insertion
+ * sort rather than std::stable_sort, because runs are almost always of length 0 or 1. */
 static void canonical_order(std::vector<uint32_t>& v) {
     for (size_t i = 1; i < v.size(); ++i) {
         const uint32_t ccc_i = unorm_ccc(v[i]);
@@ -65,7 +63,7 @@ void unorm_decompose(std::vector<uint32_t>& cpts, bool compat) {
             continue;
         }
         const DecompRow* r = decomp_row(c);
-        /* The pool holds fully-expanded sequences, so this is one lookup and not a fixed point.
+        /* The pool holds fully expanded sequences, so one lookup suffices (no fixed-point loop).
          * A row with only a canonical decomposition serves the K forms too. */
         const uint32_t off = (compat && r && r->len_k) ? r->off_k : (r ? r->off_c : 0);
         const uint32_t len = (compat && r && r->len_k) ? r->len_k : (r ? r->len_c : 0);
@@ -77,7 +75,7 @@ void unorm_decompose(std::vector<uint32_t>& cpts, bool compat) {
 }
 
 static bool compose_pair(uint32_t a, uint32_t b, uint32_t* out) {
-    /* Hangul first: arithmetic beats a lookup and it is the only algorithmic composition. */
+    /* Hangul, the only algorithmic composition, is computed before the table lookup. */
     if (a - k_l_base < k_l_count && b - k_v_base < k_v_count) {
         *out = k_s_base + ((a - k_l_base) * k_v_count + (b - k_v_base)) * k_t_count;
         return true;
@@ -106,16 +104,15 @@ void unorm_compose(std::vector<uint32_t>& cpts) {
     out.push_back(cpts[0]);
     size_t starter = 0;                 /* index in `out` of the last starter */
     uint32_t last_ccc = unorm_ccc(cpts[0]);
-    /* A leading non-starter is not a starter and can never be a composition target; marking it
-     * with a ccc that blocks everything is how the standard says to say that. */
+    /* A leading non-starter is never a composition target (the standard treats it as blocked). */
     bool have_starter = (last_ccc == 0);
 
     for (size_t i = 1; i < cpts.size(); ++i) {
         const uint32_t c = cpts[i];
         const uint32_t ccc = unorm_ccc(c);
         uint32_t composed = 0;
-        /* Blocked when a character of equal or greater combining class already sits between the
-         * starter and this one -- that is the whole of the blocking rule. */
+        /* Blocked when a character of equal or greater combining class sits between the starter
+         * and this one. */
         const bool blocked = (last_ccc != 0 && last_ccc >= ccc) || (ccc == 0 && last_ccc != 0);
         if (have_starter && !blocked && compose_pair(out[starter], c, &composed)) {
             out[starter] = composed;
@@ -128,23 +125,9 @@ void unorm_compose(std::vector<uint32_t>& cpts) {
     cpts.swap(out);
 }
 
-std::vector<uint32_t> unorm_nfd(const std::vector<uint32_t>& in) {
-    std::vector<uint32_t> v = in; unorm_decompose(v, false); return v;
-}
-std::vector<uint32_t> unorm_nfkd(const std::vector<uint32_t>& in) {
-    std::vector<uint32_t> v = in; unorm_decompose(v, true); return v;
-}
-std::vector<uint32_t> unorm_nfc(const std::vector<uint32_t>& in) {
-    std::vector<uint32_t> v = in; unorm_decompose(v, false); unorm_compose(v); return v;
-}
-std::vector<uint32_t> unorm_nfkc(const std::vector<uint32_t>& in) {
-    std::vector<uint32_t> v = in; unorm_decompose(v, true); unorm_compose(v); return v;
-}
-
 std::string unorm_utf8(const std::string& in, bool compat, bool compose) {
-    /* ASCII is in every normalisation form already, and it is most of every prompt. Skipping the
-     * decode/normalise/encode round trip for it is the difference between normalisation costing
-     * nothing and costing a pass over the prompt. */
+    /* ASCII is unchanged by every normalisation form and is most of every prompt, so pure-ASCII
+     * text skips the decode/normalise/encode round trip. */
     bool ascii = true;
     for (unsigned char ch : in) { if (ch >= 0x80) { ascii = false; break; } }
     if (ascii) return in;

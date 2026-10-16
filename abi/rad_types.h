@@ -15,9 +15,8 @@ extern "C" {
 #endif
 
 /* ------------------------------------------------------------------ status */
-/* Zero is success. Negative is failure, and the value names the class of failure so a caller
- * can report something better than "it returned -1". A kernel returning negative at issue is a
- * bug in selection, not a runtime condition -- spec.md §17. */
+/* Zero is success. Negative is failure, and the value names its class so a caller can report it.
+ * A kernel returning negative at issue is a selection bug, not a runtime condition (spec.md §17). */
 enum {
     RAD_OK              =  0,
     RAD_E_SHAPE         = -1,   /* geometry this instantiation does not serve */
@@ -42,24 +41,19 @@ enum {
     RAD_E_CANCELLED     = -20
 };
 
-/* ------------------------------------------------------------------ the helpers, INLINE
+/* ------------------------------------------------------------------ the helpers, inline
  *
- * WHY EVERY FREE FUNCTION IN THIS HEADER IS A DEFINITION AND NOT A DECLARATION.
+ * Every free function in this header is a `static inline` definition, not a declaration. A plugin
+ * links these headers and nothing of the engine's, so a function defined in the core would
+ * resolve at dlopen only if the host happened to export it (ENABLE_EXPORTS/-rdynamic); otherwise
+ * RTLD_NOW fails the plugin.
  *
- * A plugin links these headers and nothing of the engine's. A function merely DECLARED here and
- * defined inside the core is therefore not linkable from a plugin, which is the only caller that
- * wants it -- and whether it happens to resolve at dlopen time is a property of the HOST, not of
- * the ABI: a host that links the core with ENABLE_EXPORTS/-rdynamic exports the symbol and one
- * that does not fails the plugin under RTLD_NOW. A capability that depends on a link flag of
- * whoever dlopens you is not a capability.
+ * The helpers are therefore part of the ABI by value: a plugin carries the dtype table it was
+ * built against, and RAD_ABI_VERSION enforces the match (the loader refuses a mismatch by name,
+ * with both versions printed).
  *
- * So they are `static inline` and the plugin compiles its own. That makes them part of the ABI
- * BY VALUE rather than by linkage: a plugin carries the dtype table it was built against. That
- * is the correct trade here, and RAD_ABI_VERSION is what enforces it -- the loader refuses a
- * plugin built against a different one, by name, with both versions printed.
- *
- * Everything here is pure, small and total. Nothing allocates, nothing has state, and nothing
- * may ever acquire either. */
+ * Everything here is pure, small and total: nothing allocates or holds state, and nothing may
+ * start to. */
 static inline const char* rad_strerror(int status) {
     switch (status) {
         case RAD_OK:            return "ok";
@@ -88,14 +82,12 @@ static inline const char* rad_strerror(int status) {
 }
 
 /* ------------------------------------------------------------------ dtypes */
-/* The core understands dtypes. Spec §19.6 asked whether it had to; it does -- libref has to
- * interpret a tensor to compute on it, rad-kbench has to compare two of them elementwise, the
- * buffer planner has to size a buffer from its shape, and rad-convert has to write bytes. An
- * opaque dtype would push all four back into the plugin, which is the opposite of the point.
+/* The core understands dtypes (spec §19.6): libref computes on tensors, rad-kbench compares them
+ * elementwise, the buffer planner sizes buffers from shapes, and rad-convert writes bytes.
  *
  * The enum is open at the top: values >= RAD_DT_PLUGIN_BASE are kernel-plugin private, sized by
- * the plugin's own layout hook, and never interpreted by the core. That is where a format
- * invented for one kernel lives (spec §4.3) without the core learning about it. */
+ * the plugin's own layout hook and never interpreted by the core. A format invented for one kernel
+ * lives there (spec §19.6). */
 enum {
     RAD_DT_INVALID = 0,
 
@@ -115,11 +107,10 @@ enum {
     RAD_U32   = 13,
     RAD_BOOL  = 14,
 
-    /* SUB-BYTE CODES AND THE EXPONENT SCALE. The element count is the count of LOGICAL elements
-     * and the byte size comes from rad_dtype_bits(), which is why it is expressed in bits. They
-     * pack along a row, lowest bits first -- element 2j of a 4-bit row in bits 0-3 of byte j --
-     * and a row starts on a byte (rad_encoding.h). What a code MEANS is its encoding's business;
-     * these say only how many bits it is and whether it is signed. */
+    /* Sub-byte codes and the exponent scale. Element counts are logical elements; byte sizes
+     * come from rad_dtype_bits(). They pack along a row, lowest bits first (element 2j of a 4-bit
+     * row in bits 0-3 of byte j), and a row starts on a byte (rad_encoding.h). What a code means
+     * is its encoding's business; these give only its width and signedness. */
     RAD_I4      = 16,   /* two's complement, -8..7 */
     RAD_I2      = 17,   /* two's complement, -2..1 */
     RAD_FP4E2M1 = 18,   /* OCP FP4: 1-2-1, no inf or nan, max 6 */
@@ -145,10 +136,10 @@ enum {
 
     RAD_DT_PLUGIN_BASE = 256
 };
-/* THE DTYPE TABLE, and it lives in the header for the reason the block above rad_strerror gives.
+/* The dtype table, in the header for the reason given above rad_strerror.
  *
  * Sub-byte formats carry their packed width here. A shared scale is never folded into a code's
- * width: it is a plane of its own (rad_encoding.h), so every width below is exact. */
+ * width (it is a plane of its own, rad_encoding.h), so every width below is exact. */
 typedef struct RadDtRow { uint32_t dt; const char* name; int bits; } RadDtRow;
 
 static const RadDtRow rad_dt_table[] = {
@@ -202,8 +193,8 @@ static inline const char* rad_dtype_name(uint32_t dtype) {
     return dtype >= RAD_DT_PLUGIN_BASE ? "plugin-private" : "invalid";
 }
 
-/* RAD_DT_INVALID if unknown. The alternate spellings are the ones that appear in checkpoints and
- * in kernel dtype strings; a converter reading safetensors meets every one of them. */
+/* RAD_DT_INVALID if unknown. The alternate spellings are those found in checkpoints (safetensors)
+ * and kernel dtype strings. */
 static inline uint32_t rad_dtype_parse(const char* name) {
     if (!name) return RAD_DT_INVALID;
     for (int i = 0; i < RAD_DT_TABLE_N; ++i)
@@ -228,8 +219,8 @@ static inline int64_t rad_dtype_bytes(uint32_t dtype, int64_t n) {
 /* ------------------------------------------------------------------ tensors */
 enum { RAD_MAX_RANK = 6 };
 
-/* Strides are in ELEMENTS, not bytes -- the convention that survives contact with sub-byte
- * dtypes, where a byte stride would be fractional. */
+/* Strides are in elements, not bytes, since a byte stride would be fractional for sub-byte
+ * dtypes. */
 typedef struct RadTensor {
     void*    data;
     uint32_t dtype;
@@ -245,9 +236,8 @@ static inline int64_t rad_tensor_numel(const RadTensor* t) {
     return n;
 }
 
-/* A rank-0 tensor and a tensor whose only non-unit axes are already dense are both contiguous.
- * The unit-extent test matters: a shape-1 axis may carry any stride at all and still describe the
- * same bytes, so demanding the packed value there rejects tensors that are in fact dense. */
+/* A rank-0 tensor and a tensor whose non-unit axes are dense are both contiguous. A shape-1 axis
+ * may carry any stride and still describe the same bytes, so its stride is not checked. */
 static inline int rad_tensor_is_contiguous(const RadTensor* t) {
     if (!t || t->rank == 0) return 1;
     int64_t acc = 1;
@@ -267,8 +257,8 @@ static inline void rad_tensor_pack(RadTensor* t) {
 
 /* ------------------------------------------------------------------ parameters */
 /* An op's parameters are named scalars: the geometry the selector matches constraints against.
- * A parameter may be a fixed value or a RANGE, which is what turns one declared op into a
- * bucket table (spec §2.2). At most one parameter per op may be ranged. */
+ * A parameter may be a fixed value or a range, which turns one declared op into a bucket table
+ * (spec §2.2). At most one parameter per op may be ranged. */
 enum { RAD_P_INT = 1, RAD_P_STR = 2, RAD_P_RANGE = 3, RAD_P_F64 = 4 };
 
 typedef struct RadParam {
@@ -277,11 +267,10 @@ typedef struct RadParam {
     long long   ival;      /* RAD_P_INT, and the low bound of RAD_P_RANGE */
     long long   ihi;       /* RAD_P_RANGE: the high bound, inclusive */
     const char* sval;      /* RAD_P_STR */
-    double      dval;      /* RAD_P_F64 -- eps, rope theta, an attention scale. Carried as a
-                            * double rather than round-tripped through a "%.9g" string, which is
-                            * exact for an IEEE single but unreadable in a graph dump. Constraints
-                            * do not match on a float: a tolerance is not a predicate, and a kernel
-                            * that cares about eps to that precision is a kernel with a bug. */
+    double      dval;      /* RAD_P_F64: eps, rope theta, an attention scale. A double rather
+                            * than a "%.9g" string, which would be exact for an IEEE single but
+                            * unreadable in a graph dump. Constraints never match on a float:
+                            * a tolerance is not a predicate. */
 } RadParam;
 
 /* Builders. RAD_PARAMS below wraps these into a positional list. */
@@ -291,9 +280,9 @@ typedef struct RadParam {
 #define RAD_RANGE(k, lo, hi) ((RadParam){ (k), RAD_P_RANGE, (long long)(lo), (long long)(hi), 0, 0.0 })
 
 /* ------------------------------------------------------------------ constraints */
-/* A kernel's necessary condition on a geometry. Deliberately NOT sufficient: strides,
- * contiguity, alignment and buffer sizes are properties of a call rather than of a model, and
- * they stay in the entry point, which still rejects what it cannot run -- spec §2.1. */
+/* A kernel's necessary condition on a geometry, deliberately not sufficient: strides,
+ * contiguity, alignment and buffer sizes are properties of a call rather than of a model, and the
+ * entry point still rejects what it cannot run (spec §2.1). */
 enum { RAD_C_EQ = 0, RAD_C_LE = 1, RAD_C_GE = 2, RAD_C_DIV = 3, RAD_C_IN = 4 };
 
 typedef struct RadConstraint {
@@ -303,13 +292,11 @@ typedef struct RadConstraint {
     const char* sval;   /* IN: space-separated set of admissible strings */
 } RadConstraint;
 
-/* A CONSTRAINT ON THE MACHINE rather than on the geometry. A key that starts "device." is matched
- * against what the engine measured about the ranks' devices at launch, not against the op's
- * parameters: a capability such as reaching another card's memory belongs to the machine, and
- * carrying it as a parameter would have every architecture plugin declare it on every op and
- * every schema grow a field for it. Such a key is in no geometry, so it changes no tuning key
- * and no selection fold. Where nothing measured it -- a tool selecting without an engine -- it is
- * absent, and a constraint on an absent key does not hold.
+/* A constraint on the machine rather than the geometry. A key starting "device." is matched
+ * against what the engine measured about the ranks' devices at launch, not against op parameters,
+ * so architecture plugins and schemas need not carry machine capabilities. Such a key is in no
+ * geometry, so it changes no tuning key and no selection fold. Where nothing measured it (a tool
+ * selecting without an engine) it is absent, and a constraint on an absent key does not hold.
  *
  *   device.p2p   1 when every rank's device can read and write every other rank's memory
  *                directly; 0 when some pair cannot. One rank has no peer to reach, and is 1. */
@@ -329,46 +316,19 @@ typedef struct RadConstraint {
 typedef uint32_t rad_weight;
 typedef uint32_t rad_buf;
 typedef uint32_t rad_op;
-/* A KV group handle. It lives here with the other handles because a declaration in rad_builder.h
- * carries one: a derived buffer names the KV group its derivation is about. */
+/* A KV group handle. Here with the other handles because RadBufDecl in rad_builder.h carries
+ * one. */
 typedef uint32_t rad_kvgroup;
 
 #define RAD_NULL_HANDLE 0u
 
 /* ------------------------------------------------------------------ streams */
-/* Opaque to the core in the sense that it never dereferences one. On a card it is a queue of the
- * engine's own, NOT a hipStream_t: a kernel plugin launches onto it with hipLaunchKernel (and so
- * <<<>>>), hipMemcpyAsync, hipMemcpy2DAsync and hipMemsetAsync, which the engine answers itself,
- * and hands it to nothing else in HIP (docs/PLUGIN.md, "What a launch may do"). Under the host
- * backend it is a queue the host kernels ignore. */
+/* Opaque: the core never dereferences one. On a card it is the engine's own queue, not a
+ * hipStream_t. A kernel plugin may use it only with hipLaunchKernel (and so <<<>>>),
+ * hipMemcpyAsync, hipMemcpy2DAsync and hipMemsetAsync, which the engine implements itself, and
+ * must pass it to nothing else in HIP (docs/PLUGIN.md, "What a launch may do"). Under the host
+ * backend the host kernels ignore it. */
 typedef void* RadStream;
-
-enum { RAD_MAX_KPARAMS = 24, RAD_KPARAM_BLOB = 256 };
-
-typedef struct RadLaunchDesc {
-    /* The entry symbol, as the launch API takes it. A template instantiation resolves to its own
-     * symbol, which is the point: `heads` picking a different instantiation moves the FUNCTION,
-     * not just an argument, and a node whose function moved has to be rebuilt rather than
-     * updated. The runtime compares this across steps and recaptures when it changes. */
-    const void* func;
-    uint32_t    grid[3];
-    uint32_t    block[3];
-    uint32_t    shared_bytes;
-    uint32_t    n_params;
-    /* Pointers to the argument values, in the kernel's declared order -- the `kernelParams`
-     * convention, so slot i is parameter i and the runtime can rewrite exactly the ones that
-     * moved. */
-    void*       params[RAD_MAX_KPARAMS];
-    /* The width of each slot, which the runtime needs for two things it cannot otherwise do:
-     * compare a slot against the previous step's to see whether it moved, and recognise a slot
-     * that holds an OPERAND ADDRESS by matching its value against the operands it just passed in.
-     * That second one is what lets a replay update ten pointers without re-entering the shim --
-     * the mapping is inferred, so no kernel has to declare it and no out-of-tree author has to
-     * know it exists. */
-    uint16_t    param_size[RAD_MAX_KPARAMS];
-    /* Where the values live. The shim writes into this and points `params` here. */
-    unsigned char blob[RAD_KPARAM_BLOB];
-} RadLaunchDesc;
 
 #ifdef __cplusplus
 }   /* extern "C" */

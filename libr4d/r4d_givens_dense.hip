@@ -1,30 +1,27 @@
 // r4d_givens_dense.hip -- ParoQuant's rotation as a dense per-group matrix on the matrix cores.
 //
 // The Givens stages of a 128-column group compose to one orthogonal 128 x 128 matrix T, so
-// y = T (x / D) is a small GEMM: out[m][j] = sum_i T[j][i] * (x[m][i] / D[i]).  The sequential kernel
-// (r4d_givens_rotate.hip) does the same job in `stages` dependent LDS rounds a group and is
-// latency bound (~100-130 GB/s of ~640); this one spends ~8x the multiply-adds on the f16 WMMA, which
-// is 5 us of math for a 2048-row part, and quantises in the epilogue -- int8 (scale amax / 127, for the
-// int8 prefill GEMMs) or E4M3 (amax / 448, for the mxfp4a8 GEMMs), the same scale grid as the
-// sequential producer's.  About 3x faster at prefill sizes and no slower at decode.
+// y = T (x / D) is a small GEMM: out[m][j] = sum_i T[j][i] * (x[m][i] / D[i]). The sequential
+// kernel (r4d_givens_rotate.hip) runs `stages` dependent LDS rounds per group and is latency bound
+// (~100-130 GB/s of ~640); this one spends ~8x the multiply-adds on f16 WMMA (5 us of math for
+// 2048 rows) and quantises in the epilogue: int8 (scale amax / 127, for the int8 prefill GEMMs) or
+// E4M3 (amax / 448, for the mxfp4a8 GEMMs), the sequential producer's scale grid. About 3x faster
+// at prefill sizes and no slower at decode.
 //
-// THE MATRICES ARE THE WEIGHT: rad-convert composes them from the Givens stages and stores them as the
+// The matrices are the weight: rad-convert composes them from the Givens stages into the
 // encoding's `t.dense` table, [parts * K / 128][128 (j)][128 (i)] f16, which the layout
-// (r4d_layout.cpp, r4d.givens.dense) takes as it is, so the serving side never walks a Givens network.  The channel scale stays a separate table (`rscale`), a
-// divide on the way in: folding 1/D into T would put entries of very different magnitude in one f16
-// matrix.
+// (r4d_layout.cpp, r4d.givens.dense) takes as is. The channel scale stays a separate table
+// (`rscale`), divided on the way in: folding 1/D into T would mix very different magnitudes in one
+// f16 matrix.
 //
-// ONE BLOCK A (part, group) x row chunk.  The group's T (32 KiB of f16) is staged in LDS once and each
-// of the block's four waves takes 16-row tiles: per k step one B fragment (the activation row's
-// eight k, divided by D, as f16) meets the eight j tiles of T.  The accumulators are C[j][m]: lane l
-// holds column m = l & 15 and rows j = 8 * (l >> 4) + e, so a row's 128 outputs are split over lane m
-// and lane m + 16 and its amax is a max over 64 registers and one xor-16 shuffle.
+// One block per (part, group) x row chunk. The group's T (32 KiB of f16) is staged in LDS once and
+// each of the four waves takes 16-row tiles: per k step one B fragment (the activation row's eight
+// k, divided by D, as f16) meets the eight j tiles of T. The accumulators are C[j][m]: lane l holds
+// column m = l & 15 and rows j = 8 * (l >> 4) + e, so a row's 128 outputs are split over lanes m
+// and m + 16 and its amax is a max over 64 registers and one xor-16 shuffle.
 //
-// WHAT MOVED THE TIME (selftest, 2048 rows x K 5120): the first version waited on one activation load a
-// k step and spilled ~190 registers (186 us).  A tile's eight loads are now issued together and the
-// issue order is pinned per k step (sched_barrier), which is what keeps the A fragments from being
-// hoisted whole into registers: 137 VGPRs, no spills, ~100 us.  Double-buffering the next tile and
-// coalescing the stores through LDS were tried and did not move it.
+// A tile's eight activation loads are issued together and the issue order is pinned per k step
+// (sched_barrier), so the A fragments are not hoisted whole into registers: 137 VGPRs, no spills.
 #include "r4d.h"
 #include "r4d_emit.h"
 #include "r4d_fp8_args.h"
@@ -40,8 +37,8 @@ namespace {
 constexpr uint32_t kGroup = 128;
 constexpr uint32_t kThreads = 128;
 constexpr uint32_t kWaves = kThreads / 32;
-constexpr uint32_t kTStride = kGroup + 8;
-static_assert(kThreads == kGroup, "a thread stages one channel scale of the group (invd[tid])");           // f16 per LDS row of T: 16 B pad, conflict-free b128 reads
+constexpr uint32_t kTStride = kGroup + 8;   // T row pitch in f16: 16 B pad for conflict-free b128
+static_assert(kThreads == kGroup, "a thread stages one channel scale of the group (invd[tid])");
 
 typedef _Float16 v8h_t __attribute__((ext_vector_type(8)));
 
@@ -73,9 +70,8 @@ __global__ __launch_bounds__(kThreads) void givens_dense_kernel(
     const uint32_t Mt = (M + 15) >> 4;
     const uint32_t step = gridDim.y * kWaves;
     for (uint32_t tile = blockIdx.y * kWaves + wave; tile < Mt; tile += step) {
-        // The activation row a lane reads: lane (col, h) takes columns 8h .. 8h+7 of every 16-wide k step of
-        // row (tile * 16 + col).  All eight k steps of a tile are loaded at once, so a tile costs one load
-        // latency and not eight.
+        // Lane (col, h) reads columns 8h .. 8h+7 of every 16-wide k step of row tile * 16 + col.
+        // All eight k steps are loaded at once: one load latency per tile.
         uint32_t m = tile * 16 + col;
         const bool live = m < M;
         if (!live) m = M - 1;
@@ -133,7 +129,7 @@ __global__ __launch_bounds__(kThreads) void givens_dense_kernel(
 //   s       [M][parts * K/128]           f32, `s_ld` elements a row (0 = parts * K/128)
 enum { GD_X = 0, GD_T = 1, GD_RSCALE = 2, GD_Q = 3, GD_S = 4 };
 
-static int givens_dense_body(const RadArgs* a, const R4dSink& sk) {
+extern "C" int r4d_rad_givens_dense_quant(const RadArgs* a, RadStream stream) {
     const RadTensor* x  = r4d_opt(a, GD_X);
     const RadTensor* t  = r4d_opt(a, GD_T);
     const RadTensor* rs = r4d_opt(a, GD_RSCALE);
@@ -162,12 +158,10 @@ static int givens_dense_body(const RadArgs* a, const R4dSink& sk) {
     const long long mt = (M + 15) / 16;
     const uint32_t gy = (uint32_t)std::max<long long>(1, (mt + 4 * kWaves - 1) / (4 * kWaves));
     const dim3 grid((uint32_t)(parts * nkb), gy);
-#define GD_EMIT(I8_) R4D_EMIT(sk, (givens_dense_kernel<I8_>), grid, dim3(kThreads), 0, \
+#define GD_EMIT(I8_) R4D_EMIT(stream, (givens_dense_kernel<I8_>), grid, dim3(kThreads), 0, \
         (const uint16_t*)x->data, (const uint16_t*)t->data, (const float*)rs->data, (uint8_t*)q->data, \
         (float*)sc->data, (uint32_t)M, (uint32_t)K, (uint32_t)nkb, (uint32_t)xp, (uint32_t)qp, (uint32_t)sp)
     const int rc = i8 ? GD_EMIT(true) : GD_EMIT(false);
 #undef GD_EMIT
-    if (rc != RAD_OK) return rc;
-    return (!sk.desc && hipGetLastError() != hipSuccess) ? RAD_E_DEVICE : RAD_OK;
+    return rc;
 }
-R4D_ENTRY(r4d_rad_givens_dense_quant, givens_dense_body)

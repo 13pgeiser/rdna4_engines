@@ -1,40 +1,35 @@
 #!/bin/sh
-# hfget.sh -- fetch a Hugging Face repo with curl and jq, and nothing else.
+# hfget.sh -- fetch a Hugging Face repo with only curl and jq.
 #
 # The engine and its tooling do not depend on Python, so `huggingface-cli` is not assumed. The API
-# gives a file listing as JSON and every file has a stable resolve/ URL, which is all a downloader
-# needs.
+# returns a JSON file listing and every file has a stable resolve/ URL.
 #
 #   scripts/hfget.sh <repo-id> [dest-dir] [revision]
 #
-# Set HF_TOKEN for a gated or private repo. Re-running resumes: a file whose local size already
-# matches the listing is skipped and a short one is continued with `curl -C -`, so an interrupted
-# transfer of a 300 GB checkpoint costs only what it had not finished.
+# Set HF_TOKEN for a gated or private repo. Re-running resumes: a file whose local size matches the
+# listing is skipped and a short one is continued with `curl -C -`.
 #
-# A CHANGED FILE IS FETCHED AGAIN even at the same size. A complete run records each file's content
+# A changed file is fetched again even at the same size. A complete run records each file's content
 # key (the LFS sha256, or the size for a small file) in <dest>/.hfget-manifest, and a later run
 # compares the listing against it. The manifest is written only when every file arrived, so its
 # presence means the directory is a complete copy of some revision.
 #
 # Exit status: 0 complete; 3 nothing on disk was changed (the listing could not be read, or what is
 # still to fetch does not fit), so a complete earlier copy is intact; anything else, a transfer
-# failed and a file may be partial -- re-run to resume. `radiance --model <repo-id>` serves the
+# failed and a file may be partial (re-run to resume). `radiance --model <repo-id>` serves the
 # earlier copy on 3 and refuses on the rest.
 #
-# WEIGHT DUPLICATES ARE SKIPPED. Many repos carry the same tensors several times over -- safetensors
-# beside the older pickle .bin, an ONNX export, a GGUF conversion -- and on a large checkpoint each
-# copy is hundreds of gigabytes of the same numbers. When the listing holds any .safetensors, every
-# other weight format is left behind.
+# Duplicate weight formats are skipped: when the listing holds any .safetensors, other weight
+# formats (pickle .bin, ONNX, GGUF, ...) are not fetched.
 #
 # HFGET_JOBS concurrent transfers, default 4. These are long sequential reads: a few streams
-# saturate the link and more only makes the destination seek.
+# saturate the link and more only make the destination seek.
 set -e
 
 # ---- child mode: one file, named by "<size><tab><oid><tab><path>" in $1, everything else inherited.
-# Size first: a non-LFS file has no oid, and busybox `xargs -I` strips the leading blanks of a line,
-# so a line that began with its empty oid field would reach the child one tab short.
-# sh cannot export a function, so parallelism is one re-entry of this script per file under
-# `xargs -P` rather than a worker pool.
+# Size comes first because a non-LFS file has no oid and busybox `xargs -I` strips leading blanks,
+# so a line starting with an empty oid field would arrive one tab short.
+# sh cannot export a function, so each file is a re-entry of this script under `xargs -P`.
 if [ -n "$HFGET_CHILD" ]; then
     size=${1%%	*}; rest=${1#*	}; oid=${rest%%	*}; path=${rest#*	}
     key=${oid:-$size}                                  # LFS: sha256, non-LFS: size
@@ -47,7 +42,7 @@ if [ -n "$HFGET_CHILD" ]; then
             printf '%s\t%s\n' "$key" "$path" >> "$HFGET_MAN_OUT"
             exit 0
         fi
-        rm -f "$out"                                   # SAME SIZE, NEW CONTENT: resume is size-based and useless -> fresh
+        rm -f "$out"                                   # same size, new content: resume is size-based, so start fresh
         echo "  ~ $path (same size, new content)"
     elif [ -f "$out" ]; then
         echo "  + $path (resuming at $(wc -c < "$out") of $size)"
@@ -79,18 +74,16 @@ command -v jq >/dev/null || { echo "hfget: jq is required" >&2; exit 2; }
 command -v curl >/dev/null || { echo "hfget: curl is required" >&2; exit 2; }
 
 echo "hfget: listing $repo@$rev"
-# THE LISTING IS PAGINATED AND THE PAGE SIZE IS SMALL. A large checkpoint runs to a hundred-odd
-# shards and the API returns fifty entries with a `Link: ...; rel="next"` header. Taking only the
-# first page is the worst possible failure here: every file it did fetch is the right length, so
-# the size check passes and the converter is handed a checkpoint missing two thirds of its
-# tensors. Follow the cursor until there is no next link.
+# The listing is paginated (fifty entries per page, next page in a `Link: ...; rel="next"`
+# header). Reading only the first page would silently yield an incomplete checkpoint whose files
+# all pass the size check, so follow the cursor until there is no next link.
 api="https://huggingface.co/api/models/$repo/tree/$rev?recursive=true&expand=true"
 listing='[]'
 page=0
 while [ -n "$api" ]; do
     hdr=$(mktemp "${TMPDIR:-/tmp}/hfhdr.XXXXXX")
-    # A failed request is reported here rather than by set -e, which would exit with curl's status
-    # and say nothing; and with 3, since nothing has been written yet.
+    # Report a failed request here rather than letting set -e exit silently with curl's status;
+    # exit 3, since nothing has been written yet.
     st=0
     if [ -n "$HF_TOKEN" ]; then
         body=$(curl -sSL --fail-with-body -D "$hdr" -H "Authorization: Bearer $HF_TOKEN" "$api") \
@@ -125,12 +118,12 @@ n=$(wc -l < "$list")
 need=$(awk -F'\t' '{s += $1} END {printf "%.1f", s / 1073741824}' "$list")
 mkdir -p "$dest"
 : > "$dest/.hfget-manifest.tmp"
-# WHAT IS STILL TO FETCH, not the repo's size: a warm cache of a model larger than the free space
-# left beside it must not read as a download that does not fit. A file is counted from its local
-# length, and whole when the manifest says its content changed.
+# Count what is still to fetch, not the repo's size, so a mostly complete copy larger than the free
+# space does not read as a download that does not fit. A file counts from its local length, or in
+# full when the manifest says its content changed.
 todo=0
-# Split by expansion, as the child does: a tab is IFS whitespace, so `read` would merge the empty
-# key of a non-LFS file into the next field.
+# Split by expansion, as the child does: a tab is IFS whitespace, so `read` would merge a non-LFS
+# file's empty key into the next field.
 while IFS= read -r line; do
     size=${line%%	*}; rest=${line#*	}; oid=${rest%%	*}; path=${rest#*	}
     cur=0
@@ -141,8 +134,8 @@ while IFS= read -r line; do
     fi
     if [ "$cur" -lt "$size" ]; then todo=$((todo + size - cur)); fi
 done < "$list"
-# Free space in KiB from POSIX `df -Pk` (one line per filesystem, 1024-byte blocks): GNU's
-# `-BG --output=avail` is not in busybox, which is the df the container image has.
+# Free space in KiB from POSIX `df -Pk` (1024-byte blocks); the container image's busybox df lacks
+# GNU's `-BG --output=avail`.
 free=$(df -Pk "$dest" | awk 'NR == 2 { print $4 }')
 echo "hfget: $n file(s), $need GiB -> $dest"
 [ "$have_st" -gt 0 ] && echo "hfget: safetensors present, pickle weight formats skipped"

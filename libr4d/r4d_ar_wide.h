@@ -1,14 +1,13 @@
 #pragma once
-// r4d_ar_wide.h: the wide (ws>2) all-reduce family's shared transport. Every wide kernel --
-// one-shot exact, two-shot exact, two-shot ti8 -- publishes in the 2*seq flag space (the
-// two-shots add the 2s-1 half-step), advances seq_ctrs[b] once per AR, and lays scratch out
-// as 2*ws slots of one stride (parity x source rank). The parity is the launch's, from the
-// counters r4d_ar_seq.h keeps beside the handshake ones, so seq_ctrs is 2 * R4D_AR_WIDE_MAX_BLOCKS
-// words. The constants that size that shared flag/seq/scratch set live here exactly once, a
-// safety against drift over time across them.
+// r4d_ar_wide.h: shared transport of the wide (ws>2) all-reduce family. Every wide kernel
+// (one-shot exact, two-shot exact, two-shot ti8) publishes in the 2*seq flag space (the two-shots
+// add the 2s-1 half-step), advances seq_ctrs[b] once per AR, and lays scratch out as 2*ws slots of
+// one stride (parity x source rank). The parity is the launch's, from the parity counters in
+// r4d_ar_seq.h, so seq_ctrs is 2 * R4D_AR_WIDE_MAX_BLOCKS words. The constants sizing the shared
+// flag/seq/scratch set are defined only here so they cannot drift apart.
 //
-// The 2-rank pair is deliberately NOT here: it has its own flag layout (one word per block,
-// no ws stride), an acquire-on-load spin, and its own block ceiling.
+// The 2-rank pair is not here: it has its own flag layout (one word per block, no ws stride), an
+// acquire-on-load spin and its own block ceiling.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
@@ -60,10 +59,10 @@ __device__ __forceinline__ void r4d_ar_acquire(int acq) {
   else if (acq != 2) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
 }
 
-// publish `val` to every peer's flag word [b][rank], then wait until every one of this block's
-// own words has reached or passed it (peers may already be a step ahead; the counter only
-// grows). One spin lane per source, wrap-safe monotonic compare, never equality. Every rank
-// publishes before it waits, so there is no cycle; a handshake that cannot complete traps.
+// Publish `val` to every peer's flag word [b][rank], then wait until each of this block's own
+// words has reached or passed it (peers may be a step ahead; counters only grow). One spin lane
+// per source, wrap-safe monotonic compare, never equality. Every rank publishes before it waits,
+// so there is no cycle; a handshake that cannot complete traps.
 template <int WS, typename S, int NPEERS>
 __device__ __forceinline__ void r4d_ar_handshake(const R4DArWidePeers<S, NPEERS>& peers,
                                                  unsigned int* __restrict__ my_flags, int b,
@@ -75,8 +74,8 @@ __device__ __forceinline__ void r4d_ar_handshake(const R4DArWidePeers<S, NPEERS>
   if (tid == 0) {
     if (drain == 2) __threadfence_system();
     if (pub) {
-      // One system writeback for the whole publish, then relaxed stores: the extra writebacks
-      // a per-peer release store inserts add no ordering, since the flags go to different peers.
+      // One system writeback for the whole publish, then relaxed stores. Per-peer release stores
+      // would add writebacks that order nothing, since the flags go to different peers.
       __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
 #pragma unroll
       for (int p = 0; p < NPEERS; ++p)
@@ -99,10 +98,9 @@ __device__ __forceinline__ void r4d_ar_handshake(const R4DArWidePeers<S, NPEERS>
   r4d_ar_acquire(acq);
 }
 
-// Host side. The stride and grid are enforced against the real allocations, not trusted:
-// every scratch, flag, and seq pointer came from hipMalloc / hipIpcOpenMemHandle, so the
-// runtime can report the extent behind it. A pointer the runtime cannot size is refused
-// rather than assumed.
+// Host side: checks stride and grid against the real allocations. Every scratch, flag and seq
+// pointer comes from hipMalloc / hipIpcOpenMemHandle, so the runtime can report its extent; a
+// pointer it cannot size is refused.
 inline void r4d_ar_check_extent(long p, long need, const char* prefix, const char* what) {
   hipDeviceptr_t base = nullptr;
   size_t sz = 0;

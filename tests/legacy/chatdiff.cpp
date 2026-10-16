@@ -98,6 +98,7 @@ int Bench::bind(const ChatRequest& rq, const ojson& tools, std::string* why) {
     req_ = rq;
     tools_ = tools;
     prompt_ = ChatPrompt{};
+    replies_.clear();
     const ChatOptions opt = options_for(rq);
     if (tmpl_->apply(user_turn(), rq.tools ? tools_ : ojson(), opt, &prompt_) < 0) {
         *why = "render failed: " + prompt_.error;
@@ -127,17 +128,26 @@ ReplyMessage Bench::new_parse(const std::string& text, bool* strict) const {
 }
 
 std::string Bench::render_reply(const ojson& assistant) const {
+    /* A render is a function of the template, the request and the message, and the first two are
+     * fixed for a bench; the corpora render the same messages many times. */
+    std::string key = assistant.dump();
+    auto it = replies_.find(key);
+    if (it != replies_.end()) return it->second;
+    return replies_[std::move(key)] = render_reply_uncached(assistant);
+}
+
+std::string Bench::render_reply_uncached(const ojson& assistant) const {
+    /* The head is bind()'s render: the same user turn, tools and options. */
+    const std::string& head = prompt_.prompt;
     ChatOptions opt = options_for(req_);
-    ChatPrompt head, whole;
-    if (tmpl_->apply(user_turn(), req_.tools ? tools_ : ojson(), opt, &head) < 0) return "";
+    ChatPrompt whole;
     ojson msgs = user_turn();
     msgs.push_back(assistant);
     opt.add_generation_prompt = false;
     if (tmpl_->apply(msgs, req_.tools ? tools_ : ojson(), opt, &whole) < 0) return "";
-    if (whole.prompt.size() < head.prompt.size() ||
-        whole.prompt.compare(0, head.prompt.size(), head.prompt) != 0)
+    if (whole.prompt.size() < head.size() || whole.prompt.compare(0, head.size(), head) != 0)
         return "";
-    std::string reply = whole.prompt.substr(head.prompt.size());
+    std::string reply = whole.prompt.substr(head.size());
     while (!reply.empty() && reply.back() == '\n') reply.pop_back();
     for (const std::string& t : model_.terminators)
         if (reply.size() >= t.size() && reply.compare(reply.size() - t.size(), t.size(), t) == 0) {
@@ -191,16 +201,15 @@ Verdict compare(const Bench& b, const std::string& text) {
                             o.content.find(f.call_open.substr(a, e - a)) != std::string::npos;
     }
     v.same = o.content == m.content && o.reasoning == m.reasoning && o.calls.size() == m.calls.size();
-    /* ARGUMENTS THE OLD READER LEFT AS NO JSON AT ALL are not a reading to agree with: it passed a
-     * typed value's text through bare (`"verbose":True`, `"extra":}`), which no client can parse,
-     * and the new reader makes every complete such value JSON (chatparse.cpp, ValueOut). So the
-     * arguments are compared only where the old object is JSON, and there byte for byte; the new
-     * reader's own reading of the rest is held by the decided shapes and the streaming checks. */
+    /* Arguments are compared only where the old object is JSON, and then byte for byte. The old
+     * reader can pass a typed value's text through bare (`"verbose":True`, `"extra":}`), while the
+     * new one makes every complete value JSON (chatparse.cpp, ValueOut); the decided shapes and
+     * streaming checks cover the new reader there. */
     auto args_agree = [](const std::string& old_a, const std::string& new_a) {
         if (old_a == new_a || !nlohmann::json::accept(old_a)) return true;
-        /* NOR IS A NEWLINE THE OLD READER TOOK OFF A VALUE'S FRONT that the tag before it had
-         * already ended with -- Qwen's `<parameter=NAME>\n` -- the newline the template writes
-         * when the value itself starts with one. Every other byte must agree. */
+        /* One allowed difference: a leading newline the old reader stripped from a value after
+         * a tag that already ends with one (Qwen's `<parameter=NAME>\n`), which the template
+         * writes when the value itself starts with a newline. Every other byte must agree. */
         const ojson o = ojson::parse(old_a, nullptr, false);
         const ojson n = ojson::parse(new_a, nullptr, false);
         if (!o.is_object() || !n.is_object() || o.size() != n.size()) return false;
@@ -309,8 +318,8 @@ std::string check_stream(const ReplyParser& p, const std::string& text,
     if (!err.empty()) return err;
     if (!same(got, expect)) return "the deltas add up to\n      " + show(got);
     if (!same(s->message(), expect)) return "the message is\n      " + show(s->message());
-    /* Where each call begins in the reply, which an open call's text is read back from, is a
-     * fact of the reply, not of how it was cut. */
+    /* Where each call begins (an open call's text is read back from there) depends on the reply,
+     * not on how it was cut. */
     for (size_t i = 0; i < expect.calls.size(); ++i) {
         const ReplyCall& a = s->message().calls[i];
         const ReplyCall& b = expect.calls[i];
@@ -320,9 +329,8 @@ std::string check_stream(const ReplyParser& p, const std::string& text,
         if (b.at >= text.size() || (i > 0 && b.at <= expect.calls[i - 1].at))
             return "call " + std::to_string(i) + " begins at " + std::to_string(b.at) + ", outside the reply";
     }
-    /* A closed call is one a client is handed to run: its arguments are JSON, whatever the
-     * model wrote into them -- in a reply that is UTF-8, as every reply is once the decoder has
-     * sanitised it. */
+    /* A closed call is handed to a client to run, so its arguments are JSON whatever the model
+     * wrote, for any valid UTF-8 reply (the decoder sanitises every reply). */
     if (sanitize(text) == text)
         for (const ReplyCall& c : expect.calls)
             if (c.closed && !nlohmann::json::accept(c.arguments))
@@ -401,7 +409,6 @@ std::vector<ojson> rendered_corpus() {
     return v;
 }
 
-
 std::string qcall(const std::string& name,
                          const std::vector<std::pair<std::string, std::string>>& args) {
     std::string s = "<tool_call>\n<function=" + name + ">\n";
@@ -420,7 +427,6 @@ std::string C(const Model& m, const std::string& name,
                      const std::vector<std::pair<std::string, std::string>>& args) {
     return is_qwen(m) ? qcall(name, args) : mcall(name, args);
 }
-
 
 std::vector<Adversarial> adversarial(const Model& m) {
     const std::string T = "Thinking it over.\n</think>\n\n";
@@ -537,7 +543,6 @@ std::vector<Adversarial> adversarial(const Model& m) {
     return v;
 }
 
-
 std::vector<std::string> fragments(const Model& m) {
     std::vector<std::string> f = {
         "</think>\n\n", "<think>\n", "ls -la", "30", "-1.5e3", "[1,2]", "{\"a\":true}", "{'a': 1}",
@@ -576,7 +581,6 @@ std::string mutate(std::mt19937& rng, std::string s, const std::vector<std::stri
     return s;
 }
 
-
 std::string long_reply(const Model& m, size_t target) {
     std::string think, file, prose;
     while (think.size() < target / 4) think += "Considering the failing assertion in test_add again. ";
@@ -585,9 +589,6 @@ std::string long_reply(const Model& m, size_t target) {
     return think + "\n</think>\n\n" + prose + "\n" +
            C(m, "write", { { "path", "/work/big.py" }, { "content", file } });
 }
-
-
-
 
 }  /* namespace chatdiff */
 }  /* namespace rad */

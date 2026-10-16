@@ -7,9 +7,10 @@
  * M<=16, M<=64 and unconstrained -- which is spec.md §2.2's worked example, so the test can assert
  * the exact band table and the paragraph becomes a regression test.
  *
- * One source, six .so files, selected by -D: two kernel plugins that load, two that must be
- * refused, and two architecture plugins that claim one id between them. The rows are worth reading
- * side by side, and six near-copies of this file would drift.
+ * One source, several .so files, selected by -D: kernel plugins that load, kernel plugins that must
+ * be refused or that decline the machine, and architecture plugins that claim one id between them
+ * or one family at several quantisations. The rows are worth reading side by side, and near-copies
+ * of this file would drift.
  *
  * The extension is .cc, not .cpp, and that is load-bearing: core/CMakeLists.txt globs
  * every core/plugin .cpp file into the rad_core static library, and a plugin's exports
@@ -17,18 +18,20 @@
  * exclusion rule in a file this component does not own.
  */
 #include "rad_abi.h"
+#include "rad_planes.h"
 
 #include <cstdlib>
 #include <cstring>
 
-#if defined(RADTEST_ARCH) || defined(RADTEST_ARCH2)
+#if defined(RADTEST_ARCH) || defined(RADTEST_ARCH2) || defined(RADTEST_ARCHQ)
 #define RADTEST_IS_ARCH 1
 #include "rad_builder.h"
 #include "rad_runtime.h"
 #endif
 
 #if !defined(RADTEST_BASE) && !defined(RADTEST_OVER) && !defined(RADTEST_CONFLICT) && \
-    !defined(RADTEST_BADABI) && !defined(RADTEST_IS_ARCH)
+    !defined(RADTEST_BADABI) && !defined(RADTEST_IS_ARCH) && !defined(RADTEST_EXTRA) && \
+    !defined(RADTEST_BADTUNE) && !defined(RADTEST_DECLINE)
 #define RADTEST_BASE 1
 #endif
 
@@ -88,7 +91,15 @@ int radtest_init_calls(void) { return g_init_calls; }
 int radtest_fini_calls(void) { return g_fini_calls; }
 long long radtest_instance_m(void* inst) { return inst ? ((TestInstance*)inst)->m : -1; }
 
-int rad_plugin_open(void) { ++g_open_calls; return RAD_OK; }
+/* radtest_decline is a library for another machine: it declines this one at open. */
+int rad_plugin_open(void) {
+    ++g_open_calls;
+#if defined(RADTEST_DECLINE)
+    return RAD_E_UNSUPPORTED;
+#else
+    return RAD_OK;
+#endif
+}
 
 /* ------------------------------------------------------------------ operands */
 /* Roles matter to the core (a weight operand is resolved through a handle, an output feeds the
@@ -333,6 +344,177 @@ static const RadPluginInfo kInfo = {
 extern "C" int rad_plugin_reference(void) { return 1; }
 #endif
 
+/* ================================================================== radtest_extra */
+/* Rows for rules the base plugin's ops do not reach: a constraint on the ranged key that is not an
+ * interval, a tunable axis with a cross-axis test, a kernel that relayouts its weight, and a
+ * capacity parameter. In testkernels/extra, so loading testkernels/ alone is unchanged. */
+#elif defined(RADTEST_EXTRA)
+
+static const RadOperandSpec kOpdCap[] = {
+    { "x", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec kPCap[] = {
+    { "M", RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
+    { "cap", RAD_P_INT, RAD_REQUIRED, RAD_PROLE_CAPACITY },
+    { "n", RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
+};
+
+static const RadOpSchema kSchemas[] = {
+    { "t_div",  kPTie,  NELEM(kPTie),  kOpdNorm, NELEM(kOpdNorm),
+      "IN and DIV on the ranged key" },
+    { "t_tune", kPGemm, NELEM(kPGemm), kOpdGemm, NELEM(kOpdGemm),
+      "a tunable axis with a cross-axis test" },
+    { "t_lay",  kPGemm, NELEM(kPGemm), kOpdGemm, NELEM(kOpdGemm),
+      "a kernel that stores its weight in its own layout" },
+    { "t_join", kPGemm, NELEM(kPGemm), kOpdGemm, NELEM(kOpdGemm),
+      "a weight of several planes: a device kernel's own form, a host kernel's joined one" },
+    { "t_cap",  kPCap,  NELEM(kPCap),  kOpdCap,  NELEM(kOpdCap),
+      "a capacity a sizing declare may shrink" },
+};
+
+/* M in {8, 24}, and M divisible by 16 up to 64. */
+static const RadConstraint kCDivIn[]  = { RAD_CIN("M", "8 24") };
+static const RadConstraint kCDivM16[] = { RAD_CDIV("M", 16), RAD_CLE("M", 64) };
+
+/* bn = 128 only where the output has at least 128 columns. */
+static int t_tune_valid(const RadParam* p, int n_p, const RadParam* choice, int n_choice) {
+    long long n = 0, bn = 0;
+    for (int i = 0; i < n_p; ++i)
+        if (p[i].key && std::strcmp(p[i].key, "N") == 0) n = p[i].ival;
+    for (int i = 0; i < n_choice; ++i)
+        if (choice[i].key && std::strcmp(choice[i].key, "bn") == 0) bn = choice[i].ival;
+    return bn <= n ? 1 : 0;
+}
+
+/* Stores a bf16 weight, or fp8 codes with their scales, in a "tiled" form of its own, and reads no
+ * other encoding (plain fp8 among them). */
+static int t_lay_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                        const int* sel, const RadTensor* planes, int n_planes, RadLayout* out) {
+    (void)p; (void)n_p; (void)operand;
+    if (!enc || !sel || !planes || n_planes < 1 || !out) return RAD_E_INVAL;
+    const uint32_t codes = enc->plane[sel[0]].dtype;
+    const bool bf16 = n_planes == 1 && codes == RAD_BF16;
+    const bool fp8 = n_planes == 2 && codes == RAD_F8E4M3;
+    if (!bf16 && !fp8) return RAD_E_DTYPE;
+    out->tag = bf16 ? "tiled" : "tiled-fp8";
+    out->dtype = codes;
+    out->rank = 2;
+    out->shape[0] = planes[0].shape[0];
+    out->shape[1] = planes[0].shape[1];
+    out->align = 4096;
+    int64_t bytes = 0;
+    for (int i = 0; i < n_planes; ++i)
+        bytes += rad_dtype_bytes(planes[i].dtype, rad_tensor_numel(&planes[i]));
+    out->bytes = bytes > 0 ? bytes : 1;
+    return RAD_OK;
+}
+
+/* The joined form every host library shares (abi/rad_planes.h). */
+static int t_join_host_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                              const int* sel, const RadTensor* planes, int n_planes,
+                              RadLayout* out) {
+    (void)p; (void)n_p; (void)operand;
+    return rad_planes_layout(enc, sel, planes, n_planes, out);
+}
+
+static const RadConstraint kCLayTiled[] = { RAD_CLE("M", 16) };
+static const RadConstraint kCLayPlain[] = { RAD_CLE("M", 4096) };
+
+static const RadKernelInfo kKernels[] = {
+    { .name = "t_div_in", .op = "t_div", .family = "norm",
+      .computes = "nothing; a registry row", .shape = "M in {8, 24}", .dtypes = "any",
+      .domain = RAD_DOMAIN_DEVICE, .priority = 40,
+      .constraints = kCDivIn, .n_constraints = NELEM(kCDivIn), .launch = t_launch },
+    { .name = "t_div_m16", .op = "t_div", .family = "norm",
+      .computes = "nothing; a registry row", .shape = "M <= 64, M divisible by 16",
+      .dtypes = "any", .domain = RAD_DOMAIN_DEVICE, .priority = 30,
+      .constraints = kCDivM16, .n_constraints = NELEM(kCDivM16), .launch = t_launch },
+    { .name = "t_div_any", .op = "t_div", .family = "norm",
+      .computes = "nothing; a registry row", .shape = "any", .dtypes = "any",
+      .domain = RAD_DOMAIN_DEVICE, .priority = 10, .launch = t_launch },
+
+    { .name = "t_tune_picky", .op = "t_tune", .family = "gemm",
+      .computes = "nothing; a registry row", .shape = "any", .dtypes = "any",
+      .domain = RAD_DOMAIN_DEVICE, .priority = 10,
+      .tunables = kTGemmM64, .n_tunables = NELEM(kTGemmM64), .tune_valid = t_tune_valid,
+      .launch = t_launch },
+
+    { .name = "t_lay_tiled", .op = "t_lay", .family = "gemm",
+      .computes = "nothing; a registry row", .shape = "M <= 16", .dtypes = "bf16 / fp8 + scale",
+      .domain = RAD_DOMAIN_DEVICE, .priority = 20,
+      .constraints = kCLayTiled, .n_constraints = NELEM(kCLayTiled),
+      .launch = t_launch, .layout = t_lay_layout },
+    { .name = "t_lay_plain", .op = "t_lay", .family = "gemm",
+      .computes = "nothing; a registry row", .shape = "M <= 4096", .dtypes = "as stored",
+      .domain = RAD_DOMAIN_DEVICE, .priority = 10,
+      .constraints = kCLayPlain, .n_constraints = NELEM(kCLayPlain), .launch = t_launch },
+    { .name = "t_lay_host", .op = "t_lay", .family = "gemm",
+      .computes = "nothing; a registry row", .shape = "any", .dtypes = "as stored",
+      .domain = RAD_DOMAIN_HOST, .priority = 10, .launch = t_launch },
+
+    { .name = "t_join_tiled", .op = "t_join", .family = "gemm",
+      .computes = "nothing; a registry row", .shape = "M <= 16", .dtypes = "fp8 + scale",
+      .domain = RAD_DOMAIN_DEVICE, .priority = 20,
+      .constraints = kCLayTiled, .n_constraints = NELEM(kCLayTiled),
+      .launch = t_launch, .layout = t_lay_layout },
+    { .name = "t_join_host", .op = "t_join", .family = "gemm",
+      .computes = "nothing; a registry row", .shape = "any", .dtypes = "planes joined",
+      .domain = RAD_DOMAIN_HOST, .priority = 10, .launch = t_launch,
+      .layout = t_join_host_layout },
+
+    { .name = "t_cap_any", .op = "t_cap", .family = "norm",
+      .computes = "nothing; a registry row", .shape = "any", .dtypes = "any",
+      .domain = RAD_DOMAIN_DEVICE, .priority = 10, .launch = t_launch },
+};
+
+static const RadPluginInfo kInfo = {
+    RAD_PLUGIN_KERNEL, "radtest_extra", "0.1",
+    "non-interval ranged constraints, a cross-axis tune test, layout hooks, a capacity", "host",
+};
+
+/* ================================================================== radtest_badtune_* */
+/* A tunable axis the loader must refuse: a default that is not one of its values
+ * (RADTEST_BADTUNE=1), or one axis declared twice (2). */
+#elif defined(RADTEST_BADTUNE)
+
+static const RadOpSchema kSchemas[] = {
+    { "t_gemm", kPGemm, NELEM(kPGemm), kOpdGemm, NELEM(kOpdGemm), "never registered" },
+};
+#if RADTEST_BADTUNE == 1
+static const RadTunable kTBad[] = {
+    { "bn", kBnValues, NELEM(kBnValues), 96, "a default the axis does not offer" },
+};
+#else
+static const RadTunable kTBad[] = {
+    { "bn", kBnValues, NELEM(kBnValues), 64, "the axis" },
+    { "bn", kBnValues, NELEM(kBnValues), 128, "the same axis again" },
+};
+#endif
+static const RadKernelInfo kKernels[] = {
+    { .name = "t_badtune_gemm", .op = "t_gemm", .family = "gemm",
+      .computes = "nothing; a registry row", .shape = "any", .dtypes = "any",
+      .domain = RAD_DOMAIN_DEVICE, .priority = 10,
+      .tunables = kTBad, .n_tunables = NELEM(kTBad), .launch = t_launch },
+};
+static const RadPluginInfo kInfo = {
+    RAD_PLUGIN_KERNEL, "radtest_badtune", "0.1", "a tunable axis the loader refuses", "host",
+};
+
+/* ================================================================== radtest_decline */
+#elif defined(RADTEST_DECLINE)
+
+static const RadOpSchema kSchemas[] = {
+    { "t_gemm", kPGemm, NELEM(kPGemm), kOpdGemm, NELEM(kOpdGemm), "never registered" },
+};
+static const RadKernelInfo kKernels[] = {
+    { .name = "t_decline_gemm", .op = "t_gemm", .family = "gemm",
+      .computes = "nothing; a registry row", .shape = "any", .dtypes = "any",
+      .domain = RAD_DOMAIN_DEVICE, .priority = 1000, .launch = t_launch },
+};
+static const RadPluginInfo kInfo = {
+    RAD_PLUGIN_KERNEL, "radtest_decline", "0.1", "declines this machine at open", "host",
+};
+
 /* ================================================================== radtest_over */
 #elif defined(RADTEST_OVER)
 
@@ -384,14 +566,26 @@ static const RadPluginInfo kInfo = {
  * how the loader learns that an arch plugin is not a kernel plugin with missing exports. */
 #elif defined(RADTEST_IS_ARCH)
 
-static const RadPluginInfo kInfo = {
-    RAD_PLUGIN_ARCH,
-#if defined(RADTEST_ARCH)
-    "radtest_arch",
+/* RADTEST_ARCHQ plugins are one family at several quantisations, each named, with its
+ * quantisation, by -D. */
+#if defined(RADTEST_ARCHQ)
+#define RADTEST_ARCH_NAME RADTEST_ARCHQ_NAME
+#define RADTEST_ARCH_ID "radtest.q"
+#define RADTEST_ARCH_QUANT RADTEST_ARCHQ_QUANT
+#elif defined(RADTEST_ARCH)
+#define RADTEST_ARCH_NAME "radtest_arch"
 #else
-    "radtest_arch2",
+#define RADTEST_ARCH_NAME "radtest_arch2"
 #endif
-    "0.1", "claims architecture id 'radtest.v1'", "host",
+#ifndef RADTEST_ARCH_ID
+#define RADTEST_ARCH_ID "radtest.v1"
+#endif
+#ifndef RADTEST_ARCH_QUANT
+#define RADTEST_ARCH_QUANT ""
+#endif
+
+static const RadPluginInfo kInfo = {
+    RAD_PLUGIN_ARCH, RADTEST_ARCH_NAME, "0.1", "claims an architecture id", "host",
 };
 
 /* ================================================================== radtest_badabi */
@@ -426,10 +620,9 @@ uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
 const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
 
 #if defined(RADTEST_IS_ARCH)
-const char* rad_arch_id(void) { return "radtest.v1"; }
-/* The other half of the selection key (spec §2.4). This plugin serves an unquantised container,
- * which is what "" means. */
-const char* rad_arch_quant(void) { return ""; }
+const char* rad_arch_id(void) { return RADTEST_ARCH_ID; }
+/* The other half of the selection key (spec §2.4); "" is an unquantised container. */
+const char* rad_arch_quant(void) { return RADTEST_ARCH_QUANT; }
 /* The core loads and identifies architecture plugins; the build component drives them. Neither
  * hook is called by anything this test exercises, and declare refuses rather than pretending. */
 int  rad_arch_declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {

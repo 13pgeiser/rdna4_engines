@@ -1,30 +1,24 @@
 /* tokenizer.h -- the tokeniser, driven by the step chain baked into the .rad.
  *
- * spec §12: "The tokenizer is the one place llama.cpp's answer is Python." Their vocab is
- * GGUF-shaped, the tokenizer.json -> vocab mapping lives in convert_hf_to_gguf.py, and at RUNTIME
- * they identify the pre-tokeniser by HASHING tokenizer.json against a hardcoded enum. An
- * unrecognised model therefore gets the default split, and the symptom of that is plausible text
- * with wrong token boundaries -- the hardest kind of wrong to notice, because nothing crashes and
- * the perplexity moves by a few percent.
+ * spec §12. llama.cpp identifies a pre-tokeniser at runtime by hashing tokenizer.json against a
+ * hardcoded enum, so an unrecognised model silently gets the default split: plausible text with
+ * wrong token boundaries. Here the chain is declared instead. rad-convert reads tokenizer.json's
+ * normalizer / pre_tokenizer / decoder sections and emits them as RadVocabStep rows, which this
+ * file executes in order. A chain that cannot be expressed fails at convert time with the step
+ * named.
  *
- * So the chain is DECLARED rather than recognised. rad-convert reads tokenizer.json's
- * normalizer / pre_tokenizer / decoder sections and emits them as RadVocabStep rows; this file
- * executes those rows in order. A model nobody has ever seen tokenises correctly if its
- * tokenizer.json is honest, and a model whose chain we cannot express fails at CONVERT time with
- * the step named, which is a diagnosis rather than a silent 2% regression.
+ * A `Split` step's regex is compiled at load (tokenizer_regex.h) into a DFA that reproduces what
+ * HuggingFace tokenizers' Oniguruma reports, over Oniguruma's own Unicode tables. A pattern
+ * outside that dialect does not load; the refusal names the construct and there is no fallback
+ * matcher.
  *
- * A `Split` step is a regex, and it is COMPILED at load (tokenizer_regex.h) into a DFA that
- * reproduces what HuggingFace tokenizers' Oniguruma reports for it, over Oniguruma's own Unicode
- * tables. A pattern outside the dialect that compiler implements does not load: the refusal names
- * the construct, and there is no second matcher behind it.
- *
- * What is lifted from llama.cpp (06938ac12, MIT -- see vendor/UPSTREAM):
+ * Lifted from llama.cpp (06938ac12, MIT -- see vendor/UPSTREAM):
  *   - the byte-level alphabet and the unicode category tables the non-regex steps read
  *                                                                        (vendor/llama/src/unicode*)
  *   - the shape of the BPE bigram queue and the UGM Viterbi              (src/llama-vocab.cpp)
- * The last of those is re-expressed here rather than vendored: llama-vocab.cpp is welded to
- * llama_model_loader, GGML_ASSERT and the llama_vocab class, so it is a file we would have had
- * to modify heavily, and spec §12 says such a file belongs in core/ under our own name.
+ * The latter is re-expressed rather than vendored: llama-vocab.cpp depends on
+ * llama_model_loader, GGML_ASSERT and llama_vocab, and spec §12 puts a heavily modified file in
+ * core/ under our own name.
  */
 #pragma once
 #include "rad_internal.h"
@@ -46,15 +40,31 @@ struct TokEncoder;
 
 /* One row of the declared chain, in the form rad-convert builds and the .rad bakes.
  *
- * `kind` is a RAD_NORM_* / RAD_PRE_* / RAD_DEC_* value from rad_format.h and its numeric range
- * says which of the three chains the row belongs to, so the three are ONE list in declared order
- * and no reader has to reassemble them. Per-kind meaning of flags/args is documented at
- * `step_describe()` in tokenizer.cpp; it is the contract rad-convert writes against. */
+ * `kind` is a RAD_NORM_* / RAD_PRE_* / RAD_DEC_* value from rad_format.h; its numeric range says
+ * which of the three chains the row belongs to, so all three are one list in declared order.
+ * The per-kind meaning of flags/args is documented at `step_describe()` in tokenizer.cpp, the
+ * contract rad-convert writes against. */
 struct VocabStep {
     uint32_t    kind = 0;
     uint32_t    flags = 0;
     std::string arg0, arg1;
     int64_t     iarg = 0;
+};
+
+/* RAD_PRE_WHITESPACE's flags: which of HuggingFace's whitespace pre-tokenisers the step is.
+ * Whitespace is 0, so a container written before the other two had flags reads as what it ran. */
+enum : uint32_t {
+    kPreWhitespace      = 0,   /* the matches of \w+|[^\w\s]+, the rest removed */
+    kPreWhitespaceSplit = 1,   /* split on whitespace, removed */
+    kPreBert            = 2    /* WhitespaceSplit, then every punctuation character isolated */
+};
+
+/* RAD_DEC_REPLACE's flags: 0 is a plain Replace of arg0 by arg1 in every token. The others are the
+ * HuggingFace decoders converted to it, which also read the token's place in the list. */
+enum : uint32_t {
+    kDecWordPiece        = 1,  /* arg0 is the continuation prefix; other words join with a space */
+    kDecWordPieceCleanup = 2,  /* with kDecWordPiece: WordPiece's `cleanup` of spaced punctuation */
+    kDecBpeSuffix        = 4   /* arg0 is the end-of-word suffix: a space, none after the last */
 };
 
 /* Kind ranges, matching the enum blocks in rad_format.h. */
@@ -64,10 +74,9 @@ inline bool step_is_dec (uint32_t k) { return k >= 64 && k < 96; }
 
 /* Everything the tokeniser needs, in a form that can be built, inspected, written and read.
  *
- * The engine could bind directly to the mmapped .rad and save copying 248K token strings, and
- * deliberately does not: one construction path means the tokeniser that rad-convert tests with is
- * byte-for-byte the tokeniser the server runs. The cost is a few megabytes and a few tens of
- * milliseconds at load, against a model measured in gigabytes -- which is not a cost. */
+ * The engine copies this out of the mmapped .rad instead of binding to it, so rad-convert and the
+ * server share one construction path and run byte-for-byte the same tokeniser. The copy costs a
+ * few megabytes and a few tens of milliseconds at load. */
 struct VocabBuild {
     uint32_t kind = RAD_TOK_BPE;
     bool     ignore_merges = false;           /* BPE: a whole pre-token in the vocab is not merged */
@@ -87,9 +96,9 @@ struct VocabBuild {
     /* Diagnostics only: what rad-convert thought it was reading. Not baked. */
     std::string source;
 
-    /* The ids the checkpoint's generation_config.json names as eos_token_id, which the container
-     * carries as metadata (`generation.eos_token_id`) rather than in the vocabulary section. The
-     * engine fills it from there before load(); not baked. */
+    /* generation_config.json's eos_token_id ids, carried as container metadata
+     * (`generation.eos_token_id`) rather than in the vocab section. The engine fills them before
+     * load(); not baked. */
     std::vector<int32_t> eos_ids;
 };
 
@@ -107,10 +116,9 @@ public:
     uint8_t            type(int32_t id) const;
     float              score(int32_t id) const;
     bool               is_eog(int32_t id) const;       /* eos, eot, or a declared extra */
-    /* Every one of them, by id. The server needs the SPELLINGS: a chat format can fold the turn
-     * terminator into its last marker, so the decoder has to render it for the reply parser --
-     * and then whatever the parser did not consume has to come back off the content, because a
-     * terminator is never something the user asked to read. */
+    /* All end-of-generation ids. The server needs their spellings: a chat format can fold the
+     * turn terminator into its last marker, so the decoder renders it for the reply parser, and
+     * whatever the parser does not consume is stripped from the content. */
     const std::vector<int32_t>& eog() const { return eog_; }
 
     /* -1 when the exact text is not a token. */
@@ -132,7 +140,8 @@ public:
     const VocabBuild&             build() const { return b_; }
 
     /* The byte a RAD_TT_BYTE token stands for, or -1. Both spellings are recognised: SPM's
-     * "<0xF0>" and byte-level BPE's single mapped codepoint. */
+     * "<0xF0>" and byte-level BPE's single mapped codepoint. Under a ByteFallback decoder a NORMAL
+     * "<0xNN>" token is a byte too. */
     int32_t token_byte(int32_t id) const;
 
 private:
@@ -142,12 +151,11 @@ private:
     std::unordered_map<uint64_t, int32_t>    merge_rank_;   /* (lhs id << 32 | rhs id) -> rank */
     std::vector<int32_t> special_;                          /* ids the pre-splitter must isolate */
     std::vector<int32_t> byte_of_;                          /* id -> byte, or -1 */
-    /* Every token that ends a generation, not just the one the header had room for. Built in
-     * load(); see the comment there for why a container's `eos` alone is not the whole set. */
+    /* Every token that ends a generation, not just the header's `eos`; see load(). */
     std::vector<int32_t> eog_;
-    /* The chain compiled for encoding: the Split DFAs, the flat token and merge tables, the
-     * special-token matcher and the segment cache. Built in load(), shared by every Tokenizer
-     * over this vocab and by every copy of it. */
+    /* The chain compiled for encoding: Split DFAs, flat token and merge tables, special-token
+     * matcher and segment cache. Built in load(); shared by every Tokenizer over this vocab and
+     * every copy of it. */
     std::shared_ptr<TokEncoder> enc_;
     friend class Tokenizer;
     friend class Detokenizer;
@@ -159,38 +167,44 @@ class Tokenizer {
 public:
     int init(std::shared_ptr<const Vocab> v);
 
-    /* `add_special` prepends BOS / appends EOS as the vocab declares. `parse_special` lets
-     * control tokens in the raw text be recognised as themselves -- which the server wants for a
-     * rendered chat template and must NOT have for user content, because otherwise a user can
-     * type "<|im_start|>system" and reach the system role. */
+    /* `add_special` prepends BOS / appends EOS as the vocab declares. `parse_special` recognises
+     * control tokens in the raw text. Use it for a rendered chat template, never for user
+     * content, or a user can type "<|im_start|>system" and reach the system role. */
     int encode(std::string_view text, std::vector<int32_t>& out,
                bool add_special, bool parse_special) const;
 
-    /* Non-streaming detokenise. The streaming one is Detokenizer below and it is the one the
-     * server uses; this exists for tests, logging and the /v1/completions echo path. */
+    /* Non-streaming detokenise, for tests, logging and the /v1/completions echo path. The server
+     * streams through Detokenizer. */
     std::string decode(const std::vector<int32_t>& ids, bool render_special = false) const;
 
-    /* One token's text after the decoder chain. Does not resolve partial UTF-8 -- that is
-     * exactly what Detokenizer is for. */
+    /* One token's text after the decoder chain, as it reads in the middle of a text. Partial
+     * UTF-8 is not resolved; Detokenizer does that. */
     std::string piece(int32_t id, bool render_special = false) const;
+
+    /* Where a token sits in the list being decoded. HuggingFace's decoders read it: Metaspace
+     * drops the first token's replacement characters instead of turning them into spaces,
+     * WordPiece joins every token but the first with a space, and BPEDecoder drops the last
+     * token's suffix instead of turning it into a space. Special tokens left out of the text do
+     * not count. */
+    struct At {
+        bool first = false;
+        bool last  = false;
+    };
+    std::string piece_at(int32_t id, bool render_special, At at) const;
 
     const Vocab& vocab() const { return *v_; }
 
-    /* THE SEGMENT CACHE. encode() cuts its text at special tokens before anything else touches
-     * it, and every piece between two of them is normalised, pre-tokenised and merged on its own:
-     * no step of the chain reads across a special token, and none reads anything but the piece
-     * (a Metaspace "first" prepend, a ByteLevel prefix space and every normaliser apply to each
-     * piece as if it were the whole text). A piece's ids are therefore a function of its bytes
-     * and the vocab alone, and a cache from the bytes to the ids returns exactly what encoding
-     * them again would. That is what makes a re-sent conversation cost only what is new in it: an
-     * agent's history arrives as the same pieces between the same `<|im_start|>` markers, turn
-     * after turn.
+    /* Segment cache. encode() first cuts the text at special tokens, and each piece between them
+     * is normalised, pre-tokenised and merged on its own: no step reads across a special token,
+     * and a ByteLevel prefix space and every normaliser treat each piece as the whole text. A
+     * piece's ids are therefore a function of its bytes and the vocab, so a re-sent conversation
+     * only pays for its new pieces. The one exception is a Metaspace "first" prepend, which as in
+     * HuggingFace applies only to the piece that starts the text; that piece is not cached.
      *
-     * The cache belongs to the vocab, so every Tokenizer over it shares it. It is keyed on the
-     * whole piece (the hash only picks the bucket), bounded in bytes with least-recently-used
-     * eviction, and locked for concurrent encodes. Pieces under kSegmentCacheMin bytes are not
-     * cached: re-encoding them costs less than the lookup. `set_segment_cache(false)` makes this
-     * Tokenizer bypass it, which is how the tests and rad-tokcheck compare the two. */
+     * The cache belongs to the vocab and is shared by every Tokenizer over it. It is keyed on the
+     * whole piece (the hash only picks the bucket), bounded in bytes with LRU eviction, and locked
+     * for concurrent encodes. Pieces under kSegmentCacheMin bytes are cheaper to re-encode than to
+     * look up. `set_segment_cache(false)` bypasses it, for tests and rad-tokcheck to compare. */
     static constexpr size_t kSegmentCacheMin     = 64;
     static constexpr size_t kSegmentCacheDefault = size_t(64) << 20;
     void set_segment_cache(bool on) { use_cache_ = on; }
@@ -209,42 +223,32 @@ private:
 
 /* ================================================================== streaming decode */
 
-/* Replace every byte that is not part of a well-formed UTF-8 sequence with U+FFFD, and leave
- * everything else alone. A byte-fallback vocab can emit a byte that no continuation completes --
- * `<0xC1>` is a lead byte for an encoding that is overlong and therefore never legal -- and the
- * generated text goes straight into a JSON string, where an invalid byte is not a mojibake
- * character but a 500: nlohmann::json::dump throws type_error.316 on it and the client gets an
- * engine error instead of the model's answer. Sanitising is the only option that keeps the
- * response: the bytes cannot be held back (nothing will complete them) and dropping them silently
- * would hide that the model produced something undecodable. Well-formed input is returned byte for
- * byte, so this is a no-op on every normal completion. */
+/* Replace every byte that is not part of a well-formed UTF-8 sequence with U+FFFD; well-formed
+ * input is returned unchanged. A byte-fallback vocab can emit a byte no continuation completes
+ * (`<0xC1>` only starts overlong, never-legal encodings), and nlohmann::json::dump throws
+ * type_error.316 on it, failing the whole response. Such bytes cannot be held back, and dropping
+ * them would hide that the model produced something undecodable. */
 std::string utf8_sanitize(std::string_view s);
-/* How much of `s` is well-formed UTF-8 from its start, by the same rules: what a JSON string can
- * carry of a byte-level token that ends inside a character. */
+/* Length of the well-formed UTF-8 prefix of `s`, by the same rules: how much of a byte-level
+ * token that ends inside a character a JSON string can carry. */
 size_t utf8_valid_prefix(std::string_view s);
 
 
-/* Byte-level BPE emits partial UTF-8 sequences -- a single token can be one byte of a
- * three-byte codepoint -- and a stop string can straddle a chunk boundary. Both are buffered
- * until they resolve (spec §12). Emitting either one early is a visible bug: the first puts a
- * replacement character in the user's stream, the second leaks "</to" before the server notices
- * it was "</tool_call>".
+/* Streaming detokeniser (spec §12). Byte-level BPE emits partial UTF-8 (one token can be one byte
+ * of a three-byte codepoint), and a stop string can straddle a chunk boundary; both are buffered
+ * until they resolve, so the stream never shows a stray U+FFFD or leaks "</to" of "</tool_call>".
  *
- * The contract: push() returns text that is FINAL. It will never be retracted, it is always
- * WELL-FORMED UTF-8, and it is never a prefix of a stop string. Whatever is still ambiguous stays
- * inside until a later push resolves it or flush() gives up on it. A sequence that turns out to be
- * malformed rather than merely unfinished -- a byte-fallback vocab can emit one -- leaves as
- * U+FFFD (utf8_sanitize above) instead of as raw bytes, since the raw bytes cannot be put into a
- * JSON string and would cost the client the whole response. */
+ * Contract: push() returns final text. It is never retracted, always well-formed UTF-8, and never
+ * a prefix of a stop string. Ambiguous text stays inside until a later push resolves it or
+ * flush() gives up on it. A sequence that is malformed rather than unfinished leaves as U+FFFD
+ * (utf8_sanitize), since raw invalid bytes cannot go into a JSON string. */
 class Detokenizer {
 public:
     Detokenizer() = default;
-    /* `preserved` is the tokens that must reach the caller as TEXT even though they are CONTROL.
-     * A tool-calling format is MADE of them -- MiniCPM5 writes its calls with `<function`,
-     * `<param`, `</param>`, `</function>`, every one a control token -- so suppressing them the
-     * way a control token is normally suppressed hands the reply parser the arguments with the
-     * structure removed, and the call comes back to the client as prose. The chat template says
-     * which ones it needs (common_chat_params::preserved_tokens); nothing else is unsuppressed. */
+    /* `preserved`: control tokens rendered as text anyway. Some tool-call formats are built from
+     * control tokens (MiniCPM5: `<function`, `<param`, `</param>`, `</function>`); suppressing
+     * them would strip the call's structure and hand the reply parser prose. The chat template
+     * names them (common_chat_params::preserved_tokens); nothing else is unsuppressed. */
     Detokenizer(std::shared_ptr<const Vocab> v, std::vector<std::string> stops = {},
                 bool render_special = false, const std::vector<std::string>& preserved = {});
 
@@ -256,24 +260,19 @@ public:
     bool               stopped() const { return stopped_; }
     const std::string& stop_hit() const { return stop_hit_; }
 
-    /* STOP STRINGS ARE THE ANSWER'S, NOT THE REASONING'S. A generation that starts inside its
-     * reasoning block is matched against its stop strings only after `marker` -- the block's
-     * closer -- has been generated, and only in the text after it. Otherwise a stop string the
-     * model happens to write while thinking ends the request with the reasoning cut short and no
-     * answer at all: a few-shot harness that stops on "Q:" loses every reply whose reasoning
-     * restates the question. "" = match from the first token, the behaviour of every request that
-     * does not start in a block. */
+    /* Stop strings apply to the answer, not the reasoning. For a generation that starts inside its
+     * reasoning block, stops are matched only in the text after `marker` (the block's closer).
+     * Otherwise a stop string written while thinking (e.g. a few-shot "Q:") ends the request with
+     * no answer. "" matches from the first token. */
     void defer_stops_until(std::string marker) {
         arm_after_ = std::move(marker);
         armed_ = arm_after_.empty();
         arm_scanned_ = 0;
     }
 
-    /* Everything pushed so far, stop string included. The scheduler wants this to decide whether
-     * a request finished on a stop or on a length limit. */
+    /* Everything pushed so far, stop string included; the scheduler uses it to tell a stop from
+     * a length limit. */
     const std::string& text() const { return all_; }
-
-    void reset();
 
 private:
     std::shared_ptr<const Vocab> v_;
@@ -285,7 +284,14 @@ private:
     bool        stopped_ = false;
     std::string stop_hit_;
     size_t      max_stop_ = 0;
-    bool        first_ = true;
+    bool        first_ = true;     /* no token has counted as the first yet */
+    /* A Strip after Fuse in the decoder chain strips the text as a whole: up to `strip_left_`
+     * copies of `strip_` at its start. */
+    std::string strip_;
+    int         strip_left_ = 0;
+    /* BPEDecoder turns a suffix into a space except on the last token, which a stream cannot
+     * know, so a trailing space is held until the next token and dropped by flush(). */
+    bool        hold_space_ = false;
     std::string arm_after_;        /* see defer_stops_until */
     bool        armed_ = true;
     size_t      arm_scanned_ = 0;  /* how far into all_ the search for arm_after_ has reached */
@@ -297,9 +303,9 @@ private:
 
 /* ================================================================== sources and sinks */
 
-/* rad-convert owns the .rad's single string blob; the vocab section only needs to intern into
- * it. Passing the interner rather than a blob keeps the two writers from disagreeing about who
- * owns offset 0. */
+/* rad-convert owns the .rad's single string blob; the vocab section only interns into it.
+ * Passing the interner rather than a blob keeps the two writers from disagreeing about who owns
+ * offset 0. */
 struct StringSink {
     virtual ~StringSink() = default;
     virtual rad_stroff intern(std::string_view s) = 0;
@@ -307,27 +313,24 @@ struct StringSink {
 
 /* Build a VocabBuild from a HuggingFace tokenizer.json.
  *
- * This is the function spec §12 is about: it INTERPRETS the declared normalizer / pre_tokenizer /
- * decoder chain instead of hashing the file. Returns RAD_OK, or a negative RAD_E_*; in
- * particular RAD_E_UNSUPPORTED when the file declares a component we cannot express as a
- * RadVocabStep, with the component named in the log. Failing there is the point -- a chain we
- * cannot express must not become a chain we silently approximate. */
+ * Interprets the declared normalizer / pre_tokenizer / decoder chain (spec §12). Returns RAD_OK
+ * or a negative RAD_E_*, notably RAD_E_UNSUPPORTED, with the component named in the log, for a
+ * component that has no RadVocabStep form. Such a chain is refused, never approximated. */
 int parse_tokenizer_json(const char* path, VocabBuild& out);
 /* Same, from an in-memory buffer, for a tokenizer.json that arrived some other way. */
 int parse_tokenizer_json_buf(std::string_view json, const char* origin, VocabBuild& out);
 
 /* Build a VocabBuild from a GGUF's tokenizer.ggml.* metadata.
  *
- * GGUF has no declared chain -- it has `tokenizer.ggml.pre`, a name llama.cpp derived by hashing
- * the original tokenizer.json. So this reconstructs the chain from that name against a table of
- * the ones we know, and returns RAD_E_UNSUPPORTED for a name we do not, rather than falling back
- * to a default split. That refusal is the whole difference from llama.cpp's behaviour, and it is
- * why converting from the original tokenizer.json is the preferred path. */
+ * GGUF has no declared chain, only `tokenizer.ggml.pre`, a name llama.cpp derived by hashing the
+ * original tokenizer.json. The chain is reconstructed from a table of known names; an unknown
+ * name returns RAD_E_UNSUPPORTED instead of a default split. Converting from tokenizer.json is
+ * the preferred path. */
 int vocab_from_gguf(const GgufFile& g, VocabBuild& out);
 
 /* Serialise into the .rad's vocab section. `section_file_off` is where rad-convert will place
- * the section; every offset written into the RadVocabHeader is absolute from the start of the
- * file, per rad_format.h's rule that "every offset is from the start of the file". */
+ * the section; every offset in the RadVocabHeader is absolute from the start of the file, per
+ * rad_format.h. */
 int vocab_serialize(const VocabBuild& in, StringSink& strings, uint64_t section_file_off,
                     std::vector<uint8_t>& section_out);
 /* Read it back. `file_base` is the mmapped .rad; `h` points inside it. */

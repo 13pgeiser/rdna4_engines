@@ -1,24 +1,16 @@
 /* host.cpp -- the host device backend.
  *
- * This is a primary development target, not a fallback. On a machine with no ROCm the builder, the
- * planner, the mover, the scheduler, the KV manager, the tokeniser, the sampler's host reference
- * chain and the server all run and are tested through these fourteen calls
- * (docs/IMPLEMENTATION.md). It is also the code path a RAD_DOMAIN_HOST kernel runs on when the
- * planner puts a layer on the CPU, which is the fourth row of spec §5.1's table.
+ * A primary development target, not a fallback: without ROCm the whole engine (builder, planner,
+ * mover, scheduler, KV manager, tokeniser, sampler host reference, server) runs and is tested
+ * through these calls (docs/IMPLEMENTATION.md). It is also where RAD_DOMAIN_HOST kernels run when
+ * the planner puts a layer on the CPU (spec §5.1).
  *
- * The one design decision worth defending: **the streams are real.** Each stream is an in-order
- * work queue with its own worker thread, and an event is a sequence number that a stream reaches.
- * A backend whose "async" calls execute inline would let ordering bugs -- a missing
- * rad_event_wait, a buffer reused before the mover's copy landed -- pass every test here and
- * corrupt weights on a real device. The cost is one thread per stream and one condition-variable
- * wake per enqueue, which is nothing against the value of exercising the contract the HIP backend
- * actually has.
+ * The streams are real: each is an in-order queue with its own worker thread, and an event is a
+ * sequence number the stream reaches. Inline "async" calls would let ordering bugs (a missing
+ * rad_event_wait, a buffer reused before a copy landed) pass here and corrupt a real device.
  *
- * The second: **no allocation on the step path.** The mover enqueues a transfer per weight per
- * layer dispatch, so the queue is a fixed-capacity ring of POD tasks sized at stream creation, not
- * a deque of std::function. A std::function holding a destination, a source and a length does not
- * fit libstdc++'s small-object buffer and would call operator new inside rad_memcpy_async, which
- * is exactly the thing docs/IMPLEMENTATION.md forbids on the step path.
+ * No allocation on the step path: the queue is a fixed-capacity ring of POD tasks, not
+ * std::function, which would heap-allocate inside rad_memcpy_async.
  */
 #include "device.h"
 #include "../rad_internal.h"
@@ -41,36 +33,27 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-/* Every allocation kind maps to page-aligned host memory. 4096 is not arbitrary: it is
- * RAD_ALIGN_UNIT, the .rad container's movement unit, and it is what O_DIRECT demands of a buffer
- * (directio.cpp), so a pinned pool allocated here is directly usable as a file-tier landing zone
- * with no bounce. */
+/* Every allocation kind is page-aligned host memory. 4096 is RAD_ALIGN_UNIT and the O_DIRECT
+ * buffer alignment (directio.cpp), so pools here are file-tier targets without a bounce. */
 constexpr int64_t kAlign = 4096;
 
-/* A stream's queue depth. Deep enough that a layer dispatch's worth of mover transfers plus the
- * compute stream's issues never touch the backpressure path; shallow enough that the ring is a
- * few tens of KiB. Enqueue onto a full ring blocks, which is honest -- a saturated hardware queue
- * does the same thing -- and it is the only place in this file a caller can be made to wait. */
+/* Per-stream queue depth: enough that a layer's mover transfers plus compute issues never hit
+ * backpressure, small enough for a ring of a few tens of KiB. Enqueue onto a full ring blocks, as
+ * on a saturated hardware queue. */
 constexpr size_t kQueueDepth = 1024;
 
-/* Tensor-parallel world sizes past 8 are not served: libr4d supplies 2/4/8-rank all-reduce and
- * nothing wider (spec §9), so a fake host backend that claimed 16 cards would only ever produce a
- * declare-time miss further down. */
+/* libr4d all-reduce supports at most 8 ranks (spec §9), so more fake devices are useless. */
 constexpr int kMaxFakeDevices = 8;
 
 /* ------------------------------------------------------------------ events */
 
-/* An event is a pair of sequence numbers. `recorded` advances on the host, at the moment
- * rad_event_record is called; `completed` advances on the stream's worker, when the queue reaches
- * that record. The event is complete when the second has caught the first, which is exactly HIP's
- * rule that re-recording an event makes it pending again.
+/* An event is two sequence numbers: `recorded` advances on the host at rad_event_record,
+ * `completed` on the stream worker when it reaches that record. Complete when completed has caught
+ * up, so re-recording makes it pending again, as in HIP.
  *
- * `refs` is one for the caller's handle plus one for every queued task that names the event.
- * HIP lets a caller destroy an event whose record or wait is still queued -- the call returns and
- * the resources go once the queue is past them -- and teardown code written against a card does
- * exactly that. Freeing the object at rad_event_destroy instead leaves those tasks pointing at
- * freed memory, and the worker that reaches one locks a mutex whose bytes the allocator has
- * overwritten: the stream wedges and the rad_stream_destroy behind it never returns. */
+ * `refs` counts the handle plus every queued task naming the event. HIP allows destroying an event
+ * whose record or wait is still queued; freeing it at destroy would leave the worker locking a
+ * freed mutex and wedge the stream. */
 struct HostEvent {
     std::mutex              m;
     std::condition_variable cv;
@@ -83,7 +66,7 @@ struct HostEvent {
 
 void event_retain(HostEvent* e) { e->refs.fetch_add(1, std::memory_order_relaxed); }
 
-/* The last reference out frees it, whether that is the handle or the last task naming it. */
+/* The last reference, handle or task, frees it. */
 void event_release(HostEvent* e) {
     if (e->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) delete e;
 }
@@ -116,17 +99,23 @@ struct HostStream {
 
     uint64_t submitted = 0;            /* tasks ever pushed */
     uint64_t retired   = 0;            /* tasks ever finished executing */
+    int      gates     = 0;            /* closed gates (rad_stream_gate) queued on this stream */
 
     std::thread worker;
 };
 
 void stream_run(HostStream* s);
 
-/* Push one task, blocking while the ring is full; see kQueueDepth. Always succeeds -- there is no
- * "stream is closing" state to report, because rad_stream_destroy queues its stop behind the work
- * already submitted rather than racing it. */
+/* Push one task, blocking while the ring is full. Fails only behind a closed gate: the ring cannot
+ * drain until the host opens it, and the host is the caller. Destroy queues its stop behind
+ * submitted work, so there is no closing state. */
 int stream_push(HostStream* s, const Task& t) {
     std::unique_lock<std::mutex> lk(s->m);
+    if (s->count >= s->ring.size() && s->gates > 0) {
+        device_set_error("a submission onto a full stream behind a closed gate: open the gate "
+                         "(rad_gate_open) first");
+        return RAD_E_STATE;
+    }
     s->cv_room.wait(lk, [s] { return s->count < s->ring.size(); });
     s->ring[s->tail] = t;
     s->tail = (s->tail + 1) % s->ring.size();
@@ -156,9 +145,7 @@ void stream_run(HostStream* s) {
                 break;
 
             case Task::Copy2D:
-                /* a = dpitch, b = spitch, c = width bytes, d = height rows. Row by row, because
-                 * the pitches are what make a 2D copy a 2D copy: a KV block's rows are strided by
-                 * the pool's row pitch, not packed. */
+                /* a = dpitch, b = spitch, c = width bytes, d = height rows. */
                 for (int64_t r = 0; r < t.d; ++r)
                     std::memcpy((uint8_t*)t.dst + r * t.a, (const uint8_t*)t.src + r * t.b,
                                 (size_t)t.c);
@@ -189,10 +176,8 @@ void stream_run(HostStream* s) {
             }
 
             case Task::Wait: {
-                /* The worker blocks here, which is the whole point: no host thread synchronises,
-                 * the *stream* does (spec §5.4). A wait whose event is only ever recorded later on
-                 * this same stream wedges the stream -- which is precisely what the same construction
-                 * does to a hardware queue, so it is a bug to catch, not a case to smooth over. */
+                /* The stream blocks, not a host thread (spec §5.4). Waiting on an event recorded
+                 * later on this same stream wedges it, as it would a hardware queue. */
                 std::unique_lock<std::mutex> lk(t.ev->m);
                 t.ev->cv.wait(lk, [&t] { return t.ev->completed >= t.seq; });
                 break;
@@ -202,7 +187,7 @@ void stream_run(HostStream* s) {
                 done = true;
                 break;
         }
-        /* After the task's lock has gone out of scope: this may be the last reference. */
+        /* After the event lock is released: this may be the last reference. */
         if (t.ev) event_release(t.ev);
 
         {
@@ -228,33 +213,24 @@ std::unordered_map<void*, AllocRec>&      alloc_table() {
     return t;
 }
 
-/* Per-device VRAM accounting, so rad_dev_props reports a vram_free that moves. The placement
- * planner's "did it fit" path is one of the things the host backend exists to exercise, and a
- * constant vram_free would let a plan that overcommits a real card pass here (spec §5.3). */
+/* Per-device VRAM accounting, so vram_free moves and the planner's fit checks are exercised
+ * (spec §5.3). */
 std::atomic<int64_t> g_used[kMaxFakeDevices];
 
-/* A map lookup under a mutex on every alloc and free is fine and stays fine: allocation happens at
- * load and at pool construction, never inside rad_arch_step. If that ever changes, it is a
- * declare-phase bug and this mutex is where it will show up. */
+/* A mutex-guarded map is fine: allocation happens at load and pool construction, never inside
+ * rad_arch_step. */
 void alloc_note(void* p, int64_t bytes, int kind, int device) {
     std::lock_guard<std::mutex> lk(alloc_mutex());
     alloc_table()[p] = AllocRec{bytes, kind, device};
 }
 
-bool alloc_take(void* p, AllocRec* out) {
+/* The record of allocation `p`, removed from the table when `take`. */
+bool alloc_find(void* p, AllocRec* out, bool take = false) {
     std::lock_guard<std::mutex> lk(alloc_mutex());
     auto it = alloc_table().find(p);
     if (it == alloc_table().end()) return false;
     *out = it->second;
-    alloc_table().erase(it);
-    return true;
-}
-
-bool alloc_find(void* p, AllocRec* out) {
-    std::lock_guard<std::mutex> lk(alloc_mutex());
-    auto it = alloc_table().find(p);
-    if (it == alloc_table().end()) return false;
-    *out = it->second;
+    if (take) alloc_table().erase(it);
     return true;
 }
 
@@ -273,9 +249,8 @@ int64_t env_i64(const char* key, int64_t dflt) {
 }
 
 int host_count() {
-    /* Memoised: the device count must not change under a rank thread that already called
-     * rad_dev_set. RADIANCE_HOST_DEVICES is how tensor-parallel code gets tested without two
-     * cards -- two ranks, two budgets, one address space (spec §9). */
+    /* Memoised so the count cannot change under a rank thread. RADIANCE_HOST_DEVICES fakes
+     * several devices in one address space for testing tensor parallel without cards (spec §9). */
     static int n = [] {
         int64_t v = env_i64("RADIANCE_HOST_DEVICES", 1);
         if (v < 1) v = 1;
@@ -289,9 +264,7 @@ int host_count() {
     return n;
 }
 
-/* Per-thread, matching hipSetDevice: spec §1 gives one thread per tensor-parallel rank, each
- * owning one device, so the current device is a property of the rank thread and never of the
- * process. */
+/* Per-thread, matching hipSetDevice: one thread per rank, one device per rank (spec §1). */
 thread_local int t_device = 0;
 
 int64_t physical_ram() {
@@ -300,12 +273,8 @@ int64_t physical_ram() {
     return (int64_t)pages * (int64_t)page;
 }
 
-/* The budget the placement planner plans against. Read on every call rather than memoised: props
- * is not on the step path, and re-reading is what lets a test set the budget and see it.
- *
- * The default is half of physical RAM, divided by the fake device count -- a two-"card" host
- * backend that each claimed half the machine would let a plan pass here that cannot be loaded, and
- * the planner is exactly the component this budget exists to falsify. */
+/* The fake per-device VRAM budget. Read on every call so a test can change it. Default: half of
+ * physical RAM, split across the fake devices so their sum is loadable. */
 int64_t host_vram_bytes() {
     int64_t mib = env_i64("RADIANCE_HOST_VRAM_MIB", 0);
     if (mib > 0) return mib << 20;
@@ -358,30 +327,23 @@ int h_props(int device, RadDeviceProps* out) {
     snprintf(out->arch, sizeof out->arch, "host");
     out->device_id = device;
 
-    /* Threads, divided the same way the budget is: a fake two-device backend on a 32-core box is
-     * two 16-"CU" devices, so a kernel plugin's occupancy arithmetic sees a coherent machine
-     * rather than two copies of the whole one. */
+    /* Hardware threads split across fake devices, like the budget. */
     unsigned hw = std::thread::hardware_concurrency();
     out->n_cu = (int)((hw ? hw : 1u) / (unsigned)host_count());
     if (out->n_cu < 1) out->n_cu = 1;
 
-    /* A host lane is one element wide. Any code that divides a tile by warp_size gets the honest
-     * answer for a scalar backend. */
+    /* A host lane is one element wide. */
     out->warp_size = 1;
 
     out->vram_bytes = host_vram_bytes();
     int64_t used = g_used[device].load(std::memory_order_relaxed);
     out->vram_free = out->vram_bytes > used ? out->vram_bytes - used : 0;
 
-    /* There is no LDS on a CPU, and this is a stand-in with one job. Budget arithmetic of the
-     * form "how many tiles fit in LDS" divides by this, and a zero would trap on the backend
-     * whose whole purpose is to run that arithmetic on a machine with no card. The figure is a
-     * conventional per-workgroup scratch budget, not a property of this machine: host kernels are
-     * not LDS-bound and must not read it as a limit. */
+    /* A CPU has no LDS. Nonzero because budget arithmetic divides by it; a conventional
+     * per-workgroup figure, not a limit host kernels should honour. */
     out->lds_bytes = 64 * 1024;
 
-    /* Every fake device shares one address space, so peer access is not merely available, it is
-     * the only thing there is. */
+    /* All fake devices share one address space. */
     out->supports_p2p = 1;
     out->is_host_backend = 1;
     return RAD_OK;
@@ -406,13 +368,9 @@ void* h_alloc(int64_t bytes, int kind) {
         return nullptr;
     }
     void* p = nullptr;
-    /* All four kinds are the same aligned host memory here. The distinction still matters and is
-     * still recorded, because the planner reasons in kinds and on a real device rad_dev_free has
-     * to give the right one back; the host backend's job is to make that code run, not to make the
-     * distinction vanish. */
-    /* Rounded up to a whole page as well as aligned to one, so a buffer handed to DirectFile can
-     * receive the aligned superset of a misaligned extent without overrunning. That is the same
-     * reason .rad pads its movement units to RAD_ALIGN_UNIT. */
+    /* All kinds are the same memory here, but the kind is recorded so mismatched frees are
+     * caught. The size is rounded up to whole pages so DirectFile can read an aligned superset
+     * into it without overrunning. */
     if (posix_memalign(&p, (size_t)kAlign, (size_t)align_up(bytes, kAlign)) != 0 || !p) {
         device_set_error("rad_dev_alloc(%lld, kind=%d): out of host memory",
                          (long long)bytes, kind);
@@ -427,9 +385,8 @@ void* h_alloc(int64_t bytes, int kind) {
 void h_free(void* p, int kind) {
     if (!p) return;
     AllocRec r;
-    if (!alloc_take(p, &r)) {
-        /* Not ours. Freeing it would be a heap corruption three frames later, which is the class of
-         * bug the plugin ABI's C-only rule exists to avoid; refuse loudly instead. */
+    if (!alloc_find(p, &r, /*take=*/true)) {
+        /* Not ours: freeing it would corrupt the heap, so refuse and warn. */
         RAD_WARN("rad_dev_free(%p, kind=%d): pointer was not allocated by the device layer",
                  p, kind);
         return;
@@ -440,10 +397,8 @@ void h_free(void* p, int kind) {
     std::free(p);
 }
 
-/* Both views are the same pointer: on this backend the zero-copy execution site of spec §5.1 is
- * degenerate, and that is the correct answer rather than a shortcut -- the bytes really are
- * reachable from both sides without a transfer. Null for a pointer the layer did not allocate,
- * which is what the ABI's "null if the kind has no such view" means here. */
+/* Host and device views are the same pointer (spec §5.1 zero-copy is trivial here). Null for a
+ * pointer the device layer did not allocate. */
 void* h_host_ptr(void* p) {
     if (!p) return nullptr;
     AllocRec r;
@@ -453,10 +408,8 @@ void* h_device_ptr(void* p) { return h_host_ptr(p); }
 
 int h_stream_create(RadStream* out, int high_priority) {
     if (!out) return RAD_E_INVAL;
-    /* Priority is accepted and ignored. The mover and the compute stream ask for different
-     * priorities on a real device and the same code has to run here; raising a thread's scheduling
-     * class needs privileges this process does not have and would buy nothing on a queue that is
-     * one thread deep. */
+    /* Priority is ignored: raising a thread's scheduling class needs privileges and buys nothing
+     * on a one-thread queue. */
     (void)high_priority;
     auto* s = new (std::nothrow) HostStream();
     if (!s) { device_set_error("rad_stream_create: out of memory"); return RAD_E_NOMEM; }
@@ -471,9 +424,7 @@ void h_stream_destroy(RadStream st) {
     auto* s = (HostStream*)st;
     Task t;
     t.kind = Task::Stop;
-    /* Queued behind everything already submitted, so destroy drains rather than discards -- the
-     * mover's last transfer must land before its stream goes away, or a weight is half-written and
-     * nothing says so. */
+    /* Queued behind submitted work, so destroy drains rather than discards. */
     stream_push(s, t);
     if (s->worker.joinable()) s->worker.join();
     delete s;
@@ -486,16 +437,20 @@ int h_stream_sync(RadStream st) {
     }
     auto* s = (HostStream*)st;
     std::unique_lock<std::mutex> lk(s->m);
-    /* Snapshot: sync waits for work submitted *before* this call, not for work another thread
-     * pushes while we wait. That is hipStreamSynchronize's contract and the scheduler depends on
-     * it -- a sync that could never return under a busy mover would be a step-path stall. */
+    if (s->gates > 0) {
+        device_set_error("rad_stream_sync: the stream waits at a closed gate, which only "
+                         "rad_gate_open releases");
+        return RAD_E_STATE;
+    }
+    /* Waits only for work submitted before this call, as hipStreamSynchronize does; the
+     * scheduler relies on sync returning while another thread keeps pushing. */
     const uint64_t target = s->submitted;
     s->cv_done.wait(lk, [s, target] { return s->retired >= target; });
     return RAD_OK;
 }
 
-/* RAD_EVENT_LOCAL means nothing in one memory; RAD_EVENT_HOST_WAIT is kept, so a host sync on an
- * event made without it is refused here as it is on a card. */
+/* RAD_EVENT_LOCAL is meaningless here; RAD_EVENT_HOST_WAIT is kept so event_sync refuses events
+ * created without it, as on a card. */
 int h_event_create(RadEvent* out, unsigned flags) {
     if (!out) return RAD_E_INVAL;
     auto* e = new (std::nothrow) HostEvent();
@@ -505,8 +460,7 @@ int h_event_create(RadEvent* out, unsigned flags) {
     return RAD_OK;
 }
 
-/* Drops the handle. A record or wait still queued keeps the event alive until the worker is past
- * it -- see HostEvent. */
+/* Drops the handle; queued tasks keep the event alive (see HostEvent). */
 void h_event_destroy(RadEvent ev) { if (ev) event_release((HostEvent*)ev); }
 
 int h_event_record(RadEvent ev, RadStream st) {
@@ -539,9 +493,8 @@ int h_event_wait(RadStream st, RadEvent ev) {
         std::lock_guard<std::mutex> lk(e->m);
         target = e->recorded;
     }
-    /* Waiting on an event that was never recorded is a no-op, matching hipStreamWaitEvent. The
-     * mover relies on it: a weight with no transfer in flight has an event nobody recorded, and
-     * making that case an error would put a branch on the issue path for nothing. */
+    /* Waiting on a never-recorded event is a no-op, matching hipStreamWaitEvent; the mover relies
+     * on it. */
     if (target == 0) return RAD_OK;
     Task t;
     t.kind = Task::Wait;
@@ -576,29 +529,23 @@ int h_event_sync(RadEvent ev) {
 
 int h_event_elapsed_ms(RadEvent a, RadEvent b, float* out) {
     if (!a || !b || !out) return RAD_E_INVAL;
-    auto* ea = (HostEvent*)a;
-    auto* eb = (HostEvent*)b;
+    /* An event's stamp, if it was recorded and has completed. */
+    auto stamp = [](RadEvent ev, Clock::time_point* t) {
+        auto* e = (HostEvent*)ev;
+        std::lock_guard<std::mutex> lk(e->m);
+        if (e->recorded == 0 || e->completed < e->recorded) return false;
+        *t = e->stamp;
+        return true;
+    };
     Clock::time_point ta, tb;
-    {
-        std::lock_guard<std::mutex> lk(ea->m);
-        if (ea->recorded == 0 || ea->completed < ea->recorded) return RAD_E_STATE;
-        ta = ea->stamp;
-    }
-    {
-        std::lock_guard<std::mutex> lk(eb->m);
-        if (eb->recorded == 0 || eb->completed < eb->recorded) return RAD_E_STATE;
-        tb = eb->stamp;
-    }
+    if (!stamp(a, &ta) || !stamp(b, &tb)) return RAD_E_STATE;
     *out = std::chrono::duration<float, std::milli>(tb - ta).count();
     return RAD_OK;
 }
 
-/* A null stream is refused on both backends, and that is a decision rather than an oversight.
- * HIP's stream 0 carries legacy implicit-synchronisation semantics: work on it serialises against
- * every other blocking stream in the process. That is the exact opposite of spec §5.4's
- * requirement that a transfer involve no host synchronisation and not serialise the step, so the
- * engine never wants it, and letting it through here would let a caller pick it up by accident and
- * only find out on a real device. */
+/* A null stream is refused on both backends. HIP's stream 0 implicitly synchronises with every
+ * blocking stream, which spec §5.4 forbids for transfers; accepting it here would hide such a
+ * caller until it ran on a card. */
 int check_stream(RadStream s, const char* who) {
     if (s) return RAD_OK;
     device_set_error("%s: null stream -- radiance does not use the default stream, "
@@ -647,12 +594,20 @@ int h_memcpy_2d_async(void* dst, int64_t dpitch, const void* src, int64_t spitch
 int h_memcpy_ranges_async(void* dst, const void* src, int64_t prefix, const RadCopyRange* ranges,
                           int n, RadStream st) {
     RAD_TRY(check_stream(st, "rad_memcpy_ranges_async"));
-    if (!dst || !src || prefix < 0 || n < 0 || (n > 0 && !ranges)) {
-        device_set_error("rad_memcpy_ranges_async(%p <- %p, prefix %lld, %d ranges): invalid "
-                         "argument", dst, src, (long long)prefix, n);
+    /* The card's copy kernel moves 16-byte pieces (aql.cpp, a_memcpy_ranges_async), so the same
+     * calls are refused here: a caller passing the host suite must run on a card. Whether the
+     * memory is pinned cannot be told on this backend. */
+    if (!dst || !src || prefix < 0 || (prefix & 15) || n < 0 || (n > 0 && !ranges)) {
+        device_set_error("rad_memcpy_ranges_async(%p <- %p, prefix %lld (a multiple of 16), %d "
+                         "ranges): invalid argument", dst, src, (long long)prefix, n);
         return RAD_E_INVAL;
     }
     if (prefix == 0 && n == 0) return RAD_OK;
+    if (((uintptr_t)dst | (uintptr_t)src) & 15) {
+        device_set_error("rad_memcpy_ranges_async(%p <- %p): both bases must be 16-byte aligned",
+                         dst, src);
+        return RAD_E_UNSUPPORTED;
+    }
     Task t;
     t.kind = Task::Ranges;
     t.dst = dst;
@@ -663,8 +618,7 @@ int h_memcpy_ranges_async(void* dst, const void* src, int64_t prefix, const RadC
     return stream_push((HostStream*)st, t);
 }
 
-/* A copy a segment, queued in list order: this stream has no dispatch to save, and a task holds
- * no list, so the list is read here, at the call, as the device backend reads it. */
+/* One copy task per segment, in list order. The list is read at the call, as on the device. */
 int h_memcpy_list_async(const RadCopySeg* segs, int n, unsigned, RadStream st) {
     RAD_TRY(check_stream(st, "rad_memcpy_list_async"));
     if (n < 0 || (n > 0 && !segs)) {
@@ -690,17 +644,81 @@ int h_memset_async(void* dst, int value, int64_t bytes, RadStream st) {
     return stream_push((HostStream*)st, t);
 }
 
+/* ------------------------------------------------------------------ gates */
+/* A gate is a wait task on an event whose one record only the host completes: recorded is 1 from
+ * the start and rad_gate_open sets completed. The task holds a reference, so the event outlives
+ * the handle until the worker has passed it. */
+struct HostGate {
+    HostEvent*  e = nullptr;
+    HostStream* s = nullptr;
+};
+
+int h_stream_gate(RadStream st, void** out) {
+    RAD_TRY(check_stream(st, "rad_stream_gate"));
+    if (!out) return RAD_E_INVAL;
+    auto* s = (HostStream*)st;
+    auto* e = new (std::nothrow) HostEvent();
+    auto* g = new (std::nothrow) HostGate();
+    if (!e || !g) {
+        delete e;
+        delete g;
+        device_set_error("rad_stream_gate: out of memory");
+        return RAD_E_NOMEM;
+    }
+    e->recorded = 1;
+    Task t;
+    t.kind = Task::Wait;
+    t.ev   = e;
+    t.seq  = 1;
+    event_retain(e);
+    const int rc = stream_push(s, t);
+    if (rc < 0) {
+        event_release(e);
+        event_release(e);
+        delete g;
+        return rc;
+    }
+    {
+        std::lock_guard<std::mutex> lk(s->m);
+        ++s->gates;
+    }
+    g->e = e;
+    g->s = s;
+    *out = g;
+    return RAD_OK;
+}
+
+int h_gate_open(void* p) {
+    auto* g = (HostGate*)p;
+    if (!g || !g->e) return RAD_E_INVAL;
+    {
+        std::lock_guard<std::mutex> lk(g->e->m);
+        g->e->completed = 1;
+    }
+    g->e->cv.notify_all();
+    {
+        std::lock_guard<std::mutex> lk(g->s->m);
+        --g->s->gates;
+    }
+    event_release(g->e);
+    delete g;
+    return RAD_OK;
+}
+
+int64_t h_gate_room(RadStream st) {
+    if (!st) return 0;
+    auto* s = (HostStream*)st;
+    std::lock_guard<std::mutex> lk(s->m);
+    return (int64_t)(s->ring.size() - s->count);
+}
+
 /* ------------------------------------------------------------------ elastic memory */
-/* mmap is the host backend's answer to the card's virtual memory manager, and it is the same
- * mechanism rather than a simulation of one: PROT_NONE takes address space and no pages, MAP_FIXED
- * over it backs a granule, and PROT_NONE over that hands the pages back to the kernel. What a test
- * proves here -- that a decommitted range comes back zeroed, that the addresses never move, that
- * committing over a commit is the caller's bug -- is true of the HIP path for the same reasons.
+/* Elastic memory via mmap, the same mechanism as the card's VMM: PROT_NONE reserves address space
+ * without pages, MAP_FIXED read/write backs a granule, and PROT_NONE over it returns the pages.
+ * Decommitted ranges come back zeroed and addresses never move, as on the HIP path.
  *
- * THE GRANULE IS THE POOL ALIGNMENT AND NOT THE PAGE SIZE. A host page is 4 KiB and a card's
- * allocation granularity is 2 MiB, so rounding to the page here would let a pool size that only
- * works on this backend pass its tests and then strand up to 2 MiB per stripe on the card. Matching
- * the coarser number is what makes the host suite able to hold the arithmetic down. */
+ * The granule is the pool alignment (the card's 2 MiB), not the 4 KiB page, so pool sizing that
+ * passes here does not strand memory on a card. */
 constexpr int64_t kVmemGranule = RAD_ALIGN_POOL;
 
 int64_t h_vmem_granularity(void) { return kVmemGranule; }
@@ -708,10 +726,8 @@ int64_t h_vmem_granularity(void) { return kVmemGranule; }
 void* h_vmem_reserve(int64_t bytes, int64_t align) {
     if (bytes <= 0) return nullptr;
     if (align < kVmemGranule) align = kVmemGranule;
-    /* Over-reserve by one alignment, then give back the head and the tail, so the range that
-     * remains is exactly [base, base+bytes) and release() is a single munmap of what it was
-     * handed. The alternative -- remembering the raw mapping in a side table -- is a table whose
-     * only purpose is to survive until teardown. */
+    /* Over-reserve by one alignment and unmap the head and tail, so the range is exactly
+     * [base, base+bytes) and release is one munmap with no side table. */
     const size_t raw_len = (size_t)(bytes + align);
     void* raw = ::mmap(nullptr, raw_len, PROT_NONE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -745,9 +761,8 @@ int h_vmem_commit(void* addr, int64_t bytes) {
 
 int h_vmem_decommit(void* addr, int64_t bytes) {
     if (!addr || bytes <= 0) return RAD_E_INVAL;
-    /* MAP_FIXED over the same range rather than munmap: munmap would leave a HOLE in the
-     * reservation that an unrelated mmap could be handed, and the whole promise of this primitive
-     * is that the address range stays the caller's until it releases it. */
+    /* MAP_FIXED rather than munmap: a hole in the reservation could be handed to an unrelated
+     * mmap. */
     void* p = ::mmap(addr, (size_t)bytes, PROT_NONE,
                      MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p != addr) {
@@ -758,11 +773,8 @@ int h_vmem_decommit(void* addr, int64_t bytes) {
     return RAD_OK;
 }
 
-/* The host backend's commit already maps readable and writable, so this has nothing to grant. It
- * is implemented rather than left null because the run VMem computes for it is the same run the
- * card is handed, and a path that only ever runs on the machine with the card is a path whose
- * arithmetic the host suite cannot hold down. mprotect over an anonymous mapping that already has
- * these bits is a permission check and a no-op. */
+/* Commit already maps read/write, so this is a no-op mprotect. It is implemented anyway so the
+ * host suite exercises the ranges VMem computes for the card. */
 int h_vmem_protect(void* addr, int64_t bytes) {
     if (!addr || bytes <= 0) return RAD_E_INVAL;
     if (::mprotect(addr, (size_t)bytes, PROT_READ | PROT_WRITE) != 0) {
@@ -773,7 +785,7 @@ int h_vmem_protect(void* addr, int64_t bytes) {
 }
 
 int h_vram_used(int device, int64_t* out) {
-    if (!out || device < 0 || device >= kMaxFakeDevices) return RAD_E_INVAL;
+    if (!out || device < 0 || device >= host_count()) return RAD_E_INVAL;
     *out = g_used[device].load(std::memory_order_relaxed);
     return RAD_OK;
 }
@@ -789,15 +801,21 @@ const DeviceBackend g_host = {
     h_memcpy_async, h_memcpy_2d_async, h_memset_async, h_memcpy_ranges_async,
     h_memcpy_list_async,
     nullptr, nullptr,   /* no DMA engine, so no link to hold */
-    /* No recorded passes: a host stream runs its work as it is issued, so there is no queue to
-     * write a recording into, and every pass is issued. */
+    /* No recorded passes: host streams run work as issued. */
     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
 
-    /* Elastic memory, which the host backend DOES have: see above. */
+    /* Elastic memory: see above. */
     h_vmem_granularity, h_vmem_reserve, h_vmem_release, h_vmem_commit, h_vmem_decommit,
     h_vmem_protect,
 
     h_vram_used,
+    nullptr, nullptr,            /* no device code to register */
+    nullptr, nullptr,            /* not integrated graphics; one address space */
+    nullptr, nullptr, nullptr,   /* no PCI address, runtime or DMA engine */
+    /* No expert prefetch. */
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+
+    h_stream_gate, h_gate_open, h_gate_room,
 };
 
 }  /* namespace */

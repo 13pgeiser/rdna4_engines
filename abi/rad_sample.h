@@ -1,22 +1,17 @@
-/* rad_sample.h -- the per-sequence sampling row, and why it is part of the ABI.
+/* rad_sample.h -- the per-sequence sampling row.
  *
- * Every sampler op takes `params` as an OPERAND: an array of the struct below, one row per sampled
- * position, uploaded once per step. That makes its layout a wire format between the core and every
- * kernel plugin, so it belongs here beside RadTensor rather than in core/sample/ where it started
- * -- a kernel plugin cannot include a core header, and a struct the host writes and the device
- * reads is a struct whose layout has to be STATED, not inferred.
+ * Every sampler op takes `params` as an operand: an array of the struct below, one row per sampled
+ * position, uploaded once per step. Its layout is therefore a wire format between the core and
+ * every kernel plugin, stated here because a plugin cannot include a core header.
  *
  * ============================== WHY NOT PARAMETERS ==============================
  *
- * `rep`, `freq`, `pres`, `k` and `p` read like op PARAMETERS, and docs/OPS.md names them that way.
- * They cannot be. Parameters are geometry: the selector matches constraints against them and they
- * are frozen at declare (spec §2.2). A per-sequence value cannot live there, and the failure is
- * not subtle -- two requests in one batch with different top_p would be two different geometries
- * and therefore two different resolutions of the same op, which is not something a batch can
- * contain. A deployment would have one top_p.
- *
- * So the values are DATA and they travel as an operand. `seed` and `offset`, which docs/OPS.md
- * gives `sample_pick` as two more operands, are fields of the row for the same reason.
+ * `rep`, `freq`, `pres`, `k` and `p` read like op parameters, and docs/OPS.md names them that way,
+ * but parameters are geometry: the selector matches constraints against them and they are frozen
+ * at declare (spec §2.2). Two requests in one batch with different top_p would need two
+ * resolutions of the same op. So the values are data and travel as an operand. `seed` and
+ * `offset`, which docs/OPS.md gives `sample_pick` as two more operands, are row fields for the
+ * same reason.
  *
  * core/sample/sampler.h carries the full schema table this implies; libref implements it.
  */
@@ -29,16 +24,15 @@
 extern "C" {
 #endif
 
-/* Flags, so a kernel can skip a stage for a sequence without reading five floats to discover they
- * are the identity. One integer test beats five float comparisons per row per stage.
+/* Flags, so a kernel can skip a stage for a sequence with one integer test instead of reading
+ * five floats to find they are the identity.
  *
- * RAD_SP_GREEDY OWNS THE ROW'S TOKEN. `sample_argmax` writes it, and every candidate stage after
- * it -- `sample_topk`, the narrowing stages, `sample_merge_topk` and `sample_pick` -- treats the
- * row as having no candidates and leaves `token` alone. A batch mixing greedy and sampled rows
- * issues both paths over every row, so a stage that ignored the flag would overwrite the argmax
- * with a draw. A greedy row that has to go through the candidate chain instead -- a split
- * vocabulary, where the argmax's column is not a token id -- is staged at top_k = 1 WITHOUT this
- * flag. */
+ * RAD_SP_GREEDY owns the row's token. `sample_argmax` writes it, and every later candidate stage
+ * (`sample_topk`, the narrowing stages, `sample_merge_topk`, `sample_pick`) treats the row as
+ * having no candidates and leaves `token` alone. A batch mixing greedy and sampled rows issues
+ * both paths over every row, so a stage that ignored the flag would overwrite the argmax with a
+ * draw. A greedy row that must go through the candidate chain (a split vocabulary, where the
+ * argmax column is not a token id) is staged at top_k = 1 without this flag. */
 enum {
     RAD_SP_GREEDY  = 1 << 0,   /* argmax path; the candidate chain is not run for this sequence */
     RAD_SP_PENALTY = 1 << 1,   /* any of rep / freq / pres is non-identity */
@@ -51,14 +45,14 @@ enum {
 /* One row per sampled position. Laid out so the 8-byte fields are aligned and the struct has no
  * padding anywhere, including at the tail.
  *
- * THE HISTORY WINDOW. `hist_off` and `hist_len` address the row's OWN row of the history plane,
- * [M, max_hist] int32 with row m belonging to sampled position m: the window is
- * history[m][hist_off .. hist_off + hist_len), clamped to the row. Token ids in it are GLOBAL
+ * History window: `hist_off` and `hist_len` address the row's own row of the history plane,
+ * [M, max_hist] int32 with row m belonging to sampled position m; the window is
+ * history[m][hist_off .. hist_off + hist_len), clamped to the row. Token ids in it are global
  * vocabulary ids; a stage over a vocabulary shard subtracts its `vocab_off` parameter.
  *
- * `penalty_last_n` and `dry_penalty_last_n` window the TAIL of that span: 0 turns the stage off
- * for the row, a negative value takes the whole span, and n > 0 takes the last n tokens -- the
- * meaning llama.cpp gives `repeat_last_n` and `dry_penalty_last_n`.
+ * `penalty_last_n` and `dry_penalty_last_n` window the tail of that span: 0 turns the stage off
+ * for the row, a negative value takes the whole span, and n > 0 the last n tokens (llama.cpp's
+ * meaning for `repeat_last_n` and `dry_penalty_last_n`).
  *
  * `dry_rep_limit` is the longest repeat DRY may count for the row, fixed by the most recent
  * sequence breaker in the DRY window (llama.cpp's `rep_limit`), or 0 when no breaker occurs there
@@ -104,15 +98,14 @@ static_assert(offsetof(RadSampleParams, dry_rep_limit) + sizeof(int32_t) == size
               "RadSampleParams must pack without a tail hole");
 #endif
 
-/* THE RANDOM DRAW IS SPECIFIED, not left to a library, because the same stream has to come out of
- * a host reference, a device kernel and a rerun (spec §17). splitmix64 over
- * (seed * golden ratio + pos), taking 24 bits as a float in [0, 1) -- exactly f32's mantissa, so
- * the draw is representable without a double anywhere in the chain.
+/* The random draw is specified here, not left to a library, because a host reference, a device
+ * kernel and a rerun must produce the same stream (spec §13). splitmix64 over
+ * (seed * golden ratio + pos), taking 24 bits as a float in [0, 1): exactly f32's mantissa, so no
+ * double is needed anywhere.
  *
- * INDEPENDENT DRAWS AT ONE POSITION TAKE INDEPENDENT STREAMS, and a stream is the request's seed
- * XORed with a key before the draw: `rad_sample_uniform01(seed ^ key, pos)`. The pick draws on the
- * seed itself. XTC's "does it fire" coin has its own key, so a row whose XTC fired is not a row
- * whose pick is correlated with that fact; speculative acceptance and its residual draw have
+ * Independent draws at one position use independent streams: the request's seed XORed with a key,
+ * `rad_sample_uniform01(seed ^ key, pos)`. The pick uses the seed itself. XTC's firing coin has its
+ * own key so the pick is not correlated with it; speculative acceptance and its residual draw have
  * theirs. Every implementation of a stage takes its key from here. */
 #define RAD_SAMPLE_KEY_PICK   0x0ull
 #define RAD_SAMPLE_KEY_XTC    0x58544311ull

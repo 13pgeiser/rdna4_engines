@@ -1,95 +1,83 @@
-/* oracle.cpp -- run the HOST kernel beside the device one, on the same bytes, every issue.
+/* oracle.cpp -- run the host kernel beside the device one, on the same bytes, at every issue.
  *
  * ================================================================= why this exists
  *
- * rad-kbench falsifies one op at a time against libref, with operands rad-kbench invented. A build
- * can pass nearly every configuration it knows while the engine answers the same token to every
- * prompt. That gap is structural and not a gap in coverage: rad-kbench's operands are ITS shapes, dense and
- * rank-2 and freshly filled, and the engine's are row slices of a max_tok buffer, column slices of
- * a fused projection, rank-3 views a scan kernel required, and weights that came off a file. An op
- * can be correct at every shape rad-kbench knows and wrong at the one shape the model issues.
+ * rad-kbench checks one op at a time against libref with operands it invents: dense, rank-2,
+ * freshly filled. The engine's operands are row slices of a max_tok buffer, column slices of a
+ * fused projection, rank-3 views and weights read from a file, so an op can be right at every
+ * shape rad-kbench knows and wrong at the one the model issues. This checks the issued shape. For
+ * a matching op it
  *
- * So this checks the shape the model actually issued. For a matching op it
- *
- *   1. copies every operand to the host BEFORE the launch -- inputs, outputs, weights, all of it;
+ *   1. copies every operand (inputs, outputs, weights) to the host before the launch;
  *   2. lets the device kernel run and synchronises;
  *   3. copies every operand back into a second host buffer;
- *   4. puts every weight the device row stores RELAID back through that row's own
- *      RadUnrelayoutFn, because the kernel rearranged it at load and a dense reference reads the
- *      canonical planes (see oracle_unrelayout -- this step is not optional, it is the
- *      difference between checking a kernel and comparing a permutation against itself);
- *   5. runs the HOST kernel for the same (op, band) on the copy from step 1 -- same RadTensor
- *      shapes, same strides, same parameters, only the pointers differ;
- *   6. compares, per operand, the host result against the device result.
+ *   4. passes every weight the device row stores re-laid through that row's RadUnrelayoutFn, so
+ *      the dense reference reads canonical planes (see oracle_unrelayout; without this it would
+ *      compare a permuted plane against itself);
+ *   5. runs the host kernel for the same (op, band) on the step-1 copy, with the same shapes,
+ *      strides and parameters;
+ *   6. compares each operand's host result against the device result.
  *
- * Step 5 is the part that has no substitute. The host row is libref's, resolved by the same
- * selector into the same bucket table -- `issue_table_[plan_off + band*RAD_N_DOMAINS + HOST]` is
- * already sitting there beside the device plan, filled in at prepare and never used, because the
- * placement planner put every op on the device. It is a second implementation of the op, against
- * the same schema, and it is free.
+ * The host row is the reference library's (the plugin flagged `reference`, as rad-kbench resolves
+ * it): the band's own host row when the reference library won it, otherwise the reference row the
+ * registry selects at the band's geometry (oracle_reference). A band's host winner may be another
+ * host library under test (libavx), and on the host backend it is the kernel being checked.
  *
- * ================================================================= what it costs
+ * ================================================================= cost
  *
- * Everything. Two device-to-host copies of every operand -- a fused gate_up weight is 170 MiB --
- * a host synchronisation per issue, and a reference kernel that is not trying to be fast. A step
- * with the oracle on takes minutes. It is a debugging instrument and it is off unless asked.
+ * Two device-to-host copies of every operand (a fused gate_up weight is 170 MiB), a host sync per
+ * issue and a slow reference kernel. A step takes minutes. Off unless requested.
  *
- * ================================================================= how to ask
+ * ================================================================= usage
  *
  *   RADIANCE_OP_ORACLE=gemm_nt_q,rmsnorm   op names, comma separated; `*` for every op
  *   RADIANCE_OP_ORACLE_MAX=32              stop after this many checks (default 32)
- *   RADIANCE_OP_ORACLE_FROM=0              first ISSUE INDEX to consider (default 0)
+ *   RADIANCE_OP_ORACLE_FROM=0              first issue index to consider (default 0)
  *   RADIANCE_OP_ORACLE_TO=100000           last issue index to consider
  *   RADIANCE_OP_ORACLE_TOL=0.02            relative tolerance below which an operand is silent
  *   RADIANCE_OP_ORACLE_MAXBYTES            the largest operand a check will copy (default 4 GiB)
  *
- * The issue index is the same counter Ctx tracks internally and the same order --debug-graph
- * prints, so a failure names a position in the graph and not just an op.
+ * The issue index is Ctx's internal counter, in the order --debug-graph prints, so a failure names
+ * a position in the graph.
  *
- * ================================================================= the repeat mode
+ * ================================================================= repeat mode
  *
- * RADIANCE_OP_REPEAT asks a different question with the same machinery: not "does this kernel
- * agree with libref" but "does this kernel agree with ITSELF". It snapshots the operands, lets
- * the device kernel run, puts the operands back exactly as they were, runs the SAME DEVICE KERNEL
- * again, and byte-compares the two results.
- *
- * That is the one fault class every other instrument here is structurally blind to. The oracle,
- * rad-kbench and the residual probe all run an op ONCE per side, so a kernel with an unordered
- * reduction, a workgroup reading what another workgroup is writing, or a workspace it assumed was
- * zeroed passes them at exactly the rate it happens to be right. Byte-exact, no tolerance: the
- * same kernel on the same bytes has no licence to move, and one mantissa bit is a different token
- * a few hundred greedy steps later.
+ * RADIANCE_OP_REPEAT asks whether a kernel agrees with itself: it snapshots the operands, runs the
+ * device kernel, restores the operands, runs the same device kernel again and byte-compares. This
+ * catches unordered reductions, cross-workgroup races and unzeroed workspaces, which instruments
+ * that run an op once per side pass whenever the kernel happens to be right. No tolerance: one
+ * mantissa bit becomes a different token a few hundred greedy steps later.
  *
  *   RADIANCE_OP_REPEAT=*                   op names, comma separated; `*` for every op
  *   RADIANCE_OP_REPEAT_MAX=1000000         stop after this many checks
  *   RADIANCE_OP_REPEAT_FROM / _TO          issue index window
  *   RADIANCE_OP_REPEAT_MAXBYTES=8388608    operands above this are not copied, restored or
- *                                          compared -- which is what keeps a 170 MiB fused weight
- *                                          from making the mode unaffordable, and is right only
- *                                          because such an operand is read-only.
+ *                                          compared; valid only because such operands (fused
+ *                                          weights) are read-only.
  *
- * ================================================================= what it cannot see
+ * ================================================================= blind spots
  *
- * An op ISSUED ON A LANE THE SNAPSHOT DOES NOT SYNCHRONISE -- fixed for lane 1, which is the only
- * one the ABI has, and a third would need the same line.
- *
- * An op with no host kernel for the band -- the oracle skips it and says so once. An op whose
- * dtype the core cannot size (a plugin-private one) -- skipped, since a byte span is the one thing
- * this needs to know. An op whose device row re-lays a weight and publishes no inverse -- skipped
- * BY NAME, because the alternative is a page of false mismatches that drowns the true ones. And
- * an op that is wrong in the SAME WAY on both sides, which is what a shared misreading of the
- * schema would look like; that is what rad-kbench's independent operands
- * are for, and the two instruments are complementary rather than redundant.
+ * - Ops issued on a lane the snapshot does not synchronise. Lane 1, the only one the ABI has, is
+ *   handled; a third lane would need the same line.
+ * - Ops the reference library does not serve in the band (skipped, logged once).
+ * - Operands whose dtype the core cannot size (plugin-private) and that are not a sized weight.
+ * - Device rows that re-lay a weight without publishing an inverse (skipped by name, to avoid
+ *   false mismatches).
+ * - Ops wrong the same way on both sides (a shared misreading of the schema); rad-kbench's
+ *   independent operands cover that.
  */
 #include "ctx.h"
 #include "format/encoding.h"
+#include "plugin/registry.h"
 #include "rad_plugin.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace rad {
@@ -102,30 +90,32 @@ struct Ctx::OracleState {
     double  tol = 2e-2;
     int64_t checked = 0, skipped_nohost = 0;
     bool    said_nohost = false;
-    /* ---- repeat mode. `maxbytes` is what makes it affordable: a fused gate_up operand is 170 MiB
-     * and a weight is read-only, so an operand past the cap is not snapshotted, not restored and
-     * not compared. Every activation this graph carries at decode is far below it. */
+    /* Reference host plans resolved for bands another library's host row won, keyed by
+     * (op << 16) | band, -1 for a band the reference library does not serve. Deques: an
+     * IssuePlan's parameters point into its Resolved's geometry. */
+    std::unordered_map<uint64_t, int> ref_at;
+    std::deque<Resolved>              ref_res;
+    std::deque<IssuePlan>             ref_plans;
+    /* ---- repeat mode. Operands over `maxbytes` (read-only weights, e.g. a 170 MiB fused gate_up)
+     * are not snapshotted, restored or compared. Decode activations are far below it. */
     bool    repeat = false;
     int64_t maxbytes = 8 << 20;
-    /* ---- AN OPERAND THE HOST CANNOT HOLD, which is the oracle mode's own cap and not the one
-     * above. A snapshot is two host copies of every operand, plus a third for a weight stored
-     * re-laid, so an operand of tens of gigabytes does not make a check slow -- it ends the
-     * process with nothing reported. Four gibibytes clears a routed layer's whole expert table,
-     * which is the largest operand a check has to hold. */
+    /* ---- oracle-mode cap. A snapshot is two host copies of every operand (three for a re-laid
+     * weight), so a huge operand would OOM the process. 4 GiB covers a routed layer's whole
+     * expert table, the largest operand a check needs. */
     int64_t maxopd = 4LL << 30;
     int64_t differed = 0, unchecked = 0;
     int     skip[MAX_OPERANDS] = {0};
 
     std::vector<uint8_t>              scratch;    /* the host kernel's, sized per launch */
-    /* A re-laid weight inverted back into the form a dense reference reads, one buffer per
-     * operand that needed it, and which operands those were. See oracle_unrelayout. */
+    /* Re-laid weights inverted to the form a dense reference reads; see oracle_unrelayout. */
     std::vector<std::vector<uint8_t>> logical;
     int                               unlaid[MAX_OPERANDS] = {0};
     std::vector<std::vector<uint8_t>> pre, post;  /* one snapshot per operand */
     int64_t                           span[MAX_OPERANDS] = {0};   /* elements, stacked */
-    int64_t                           ent [MAX_OPERANDS] = {0};   /* bytes, ONE entry */
-    /* Entries when the operand is a weight TABLE and 0 when it is a plane. See oracle_size: a
-     * table is materialised stacked, because the operand itself is an array of pointers. */
+    int64_t                           ent [MAX_OPERANDS] = {0};   /* bytes, one entry */
+    /* Entry count for a weight table, 0 for a plane. A table is materialised stacked because the
+     * operand is an array of pointers; see oracle_size. */
     int64_t                           tab [MAX_OPERANDS] = {0};
     int                               alias[MAX_OPERANDS] = {0};   /* which operand owns the copy */
     RadTensor                         ht[MAX_OPERANDS]{};
@@ -133,9 +123,8 @@ struct Ctx::OracleState {
 
 namespace {
 
-/* The number of ELEMENTS a tensor's strides can reach, which is what has to be copied. Not
- * numel: a row slice of a [max_tok, n] buffer is dense, but a column slice of a fused projection
- * is not, and copying numel elements of one of those copies the wrong bytes. */
+/* Elements a tensor's strides can reach, which is what must be copied. Not numel: a column slice
+ * of a fused projection is not dense. */
 int64_t span_of(const RadTensor* t) {
     if (!t->data || t->rank == 0) return 0;
     int64_t s = 1;
@@ -147,47 +136,12 @@ int64_t span_of(const RadTensor* t) {
     return s;
 }
 
-float f8e4m3_to_f32(uint8_t b) {
-    const uint32_t sgn = (uint32_t)(b & 0x80u) << 24;
-    const int      e   = (b >> 3) & 0x0F;
-    const uint32_t m   = b & 0x07u;
-    float f;
-    uint32_t u;
-    if (e == 0) {                                   /* subnormal: m * 2^-9 */
-        if (!m) { u = sgn; std::memcpy(&f, &u, 4); return f; }
-        int ex = -6; uint32_t mm = m;
-        while (!(mm & 0x08u)) { mm <<= 1; --ex; }   /* normalise into 1.mmm */
-        u = sgn | ((uint32_t)(ex + 127) << 23) | ((mm & 0x07u) << 20);
-    } else if (e == 0x0F && m == 0x07) {            /* the two NaN encodings */
-        u = sgn | 0x7FC00000u;
-    } else {
-        u = sgn | ((uint32_t)(e - 7 + 127) << 23) | (m << 20);
-    }
-    std::memcpy(&f, &u, 4);
-    return f;
-}
-
-/* One element as a double, by dtype. Returns false for a dtype with no meaningful value -- the
- * comparison then falls back to a byte compare, which is the right answer for an index plane. */
+/* One element as a double. False for a dtype with no scalar value; the caller then byte-compares. */
 bool elem(const uint8_t* p, uint32_t dt, int64_t i, double* out) {
     switch (dt) {
-    case RAD_F32:  { float v;    std::memcpy(&v, p + i * 4, 4); *out = v; return true; }
-    case RAD_BF16: { uint32_t u = (uint32_t)((uint16_t)(p[i * 2] | (p[i * 2 + 1] << 8))) << 16;
-                     float v; std::memcpy(&v, &u, 4); *out = v; return true; }
-    case RAD_F16:  { uint16_t h = (uint16_t)(p[i * 2] | (p[i * 2 + 1] << 8));
-                     const uint32_t s = (uint32_t)(h & 0x8000u) << 16;
-                     const int      e = (h >> 10) & 0x1F;
-                     const uint32_t m = h & 0x3FFu;
-                     uint32_t u;
-                     if (e == 0)        u = s | (m ? ((uint32_t)(127 - 15 + 1) << 23) | (m << 13) : 0u);
-                     else if (e == 31)  u = s | 0x7F800000u | (m << 13);
-                     else               u = s | ((uint32_t)(e - 15 + 127) << 23) | (m << 13);
-                     float v; std::memcpy(&v, &u, 4); *out = v; return true; }
-    case RAD_F8E4M3: *out = f8e4m3_to_f32(p[i]); return true;
-    case RAD_I8:   *out = (double)(int8_t)p[i];  return true;
-    case RAD_U8:
-    case RAD_BOOL: *out = (double)p[i];          return true;
-    case RAD_I16:  { int16_t v; std::memcpy(&v, p + i * 2, 2); *out = v; return true; }
+    case RAD_F32: case RAD_BF16: case RAD_F16: case RAD_F8E4M3: case RAD_F8E5M2:
+    case RAD_I8:  case RAD_U8:   case RAD_BOOL: case RAD_I16:
+        *out = rad_load_f32(p, dt, i); return true;
     case RAD_I32:  { int32_t v; std::memcpy(&v, p + i * 4, 4); *out = v; return true; }
     case RAD_U32:  { uint32_t v; std::memcpy(&v, p + i * 4, 4); *out = v; return true; }
     case RAD_I64:  { int64_t v; std::memcpy(&v, p + i * 8, 8); *out = (double)v; return true; }
@@ -201,24 +155,14 @@ double row_at(const uint8_t* p, uint32_t dt, int64_t base, int64_t k, int64_t n)
     return v;
 }
 
-std::string shape_str(const RadTensor* t) {
-    std::string s = "[";
-    for (uint32_t d = 0; d < t->rank; ++d)
-        s += fmt("%s%lld", d ? "," : "", (long long)t->shape[d]);
-    s += "]/[";
-    for (uint32_t d = 0; d < t->rank; ++d)
-        s += fmt("%s%lld", d ? "," : "", (long long)t->stride[d]);
-    return s + "]";
-}
 
 }  /* namespace */
 
 /* ------------------------------------------------------------------ open / close */
 void Ctx::oracle_open() {
-    /* REPEAT MODE IS THE SAME MACHINERY WITH THE SECOND SIDE SWAPPED, so it shares the arming,
-     * the op filter and the snapshot and differs only in what it runs and how it compares. Named
-     * separately because the two answer different questions: the oracle asks whether a kernel is
-     * RIGHT, this asks whether it is a FUNCTION. */
+    /* Repeat mode shares arming, filtering and snapshots with the oracle and differs only in the
+     * second run and the comparison: the oracle asks whether a kernel is right, repeat whether it
+     * is deterministic. */
     const char* spec = std::getenv("RADIANCE_OP_REPEAT");
     const bool  rep  = spec && *spec;
     if (!rep) spec = std::getenv("RADIANCE_OP_ORACLE");
@@ -252,10 +196,9 @@ void Ctx::oracle_open() {
                  (long long)oracle_->budget, (long long)oracle_->maxbytes);
         return;
     }
-    RAD_WARN("op oracle ARMED for {%s}: issues [%lld,%lld], at most %lld checks, tolerance %.3g, "
-             "operands up to %lld MiB. Every matching issue copies all its operands to the host "
-             "twice and runs the host kernel beside the device one -- this run is not a "
-             "measurement of anything.",
+    RAD_WARN("op oracle armed for {%s}: issues [%lld,%lld], at most %lld checks, tolerance %.3g, "
+             "operands up to %lld MiB; every matching issue also runs on the host, so this run "
+             "measures nothing",
              spec, (long long)oracle_->from, (long long)oracle_->to,
              (long long)oracle_->budget, oracle_->tol, (long long)(oracle_->maxopd >> 20));
 }
@@ -263,13 +206,13 @@ void Ctx::oracle_open() {
 void Ctx::oracle_close() {
     if (!oracle_) return;
     if (oracle_->repeat)
-        RAD_WARN("op REPEAT: %lld issue(s) run twice, %lld of them ANSWERED DIFFERENTLY; %lld "
-                 "more were NOT JUDGED because an operand was over the copy cap (raise "
-                 "RADIANCE_OP_REPEAT_MAXBYTES to cover those)",
+        RAD_WARN("op repeat: %lld issue(s) run twice, %lld of them answered differently; %lld "
+                 "more were not judged because an operand was over the copy cap "
+                 "(RADIANCE_OP_REPEAT_MAXBYTES)",
                  (long long)oracle_->checked, (long long)oracle_->differed,
                  (long long)oracle_->unchecked);
     else
-        RAD_WARN("op oracle: %lld op(s) checked, %lld skipped for want of a host kernel",
+        RAD_WARN("op oracle: %lld op(s) checked, %lld skipped for want of a reference kernel",
                  (long long)oracle_->checked, (long long)oracle_->skipped_nohost);
     delete oracle_;
     oracle_ = nullptr;
@@ -288,31 +231,21 @@ bool Ctx::oracle_arm(rad_op h) const {
 
 /* ------------------------------------------------------------------ sizing the snapshot
  *
- * WHAT IS BEING SIZED IS NOT ALWAYS WHAT THE OPERAND POINTS AT, and a routed mixture is where the
- * difference is total. A grouped GEMM's weight operand is a TABLE (Ctx::WeightTable): after
- * placement a layer's experts are in different places, so the operand handed to the kernel is a
- * device array of POINTERS with a zero leading stride, and `base + e*stride` describes only the
- * all-in-VRAM case, which stops being true the moment anything is offloaded.
+ * A grouped GEMM's weight operand is a table (Ctx::WeightTable): after placement a layer's experts
+ * live in different places, so the operand is a device array of pointers with a zero leading
+ * stride. Copied as a plane it would read far past the pointer array and the host kernel would
+ * dereference device pointers. Instead every entry is copied into one contiguous host buffer with
+ * a non-zero leading stride, the stacked form libref's expert_entry() also accepts.
  *
- * Read as a plane that operand is n*8 bytes pretending to be N*K of weight. Copying it as one
- * reads far past the pointer array, and the host kernel then dereferences DEVICE pointers -- so
- * the largest weight in the model would be the one the instrument cannot be pointed at without
- * reading out of bounds. What it gets instead is the STACKED form: every entry copied into one
- * contiguous host buffer behind a non-zero leading stride, which is the other reading libref's
- * expert_entry() already accepts and the one a fixture uses.
- *
- * A PLUGIN-PRIVATE DTYPE HAS NO BYTE COUNT IN THE CORE, by design -- a 4-bit expert plane is two
- * elements to a byte and the core deliberately knows nothing about the packing (spec 4.2). The
- * container does: the layout pass wrote the resolved kernel's own answer into WeightInfo, so an
- * operand the core cannot size is sized from the weight it is bound to, and only an operand that
- * is neither sizeable nor a weight is declined. */
+ * A plugin-private dtype has no byte count in the core by design (spec 19.6). Such an operand is
+ * sized from the weight it is bound to (the layout pass records the stored size in WeightInfo);
+ * only an operand that is neither sizeable nor a weight is declined. */
 void Ctx::oracle_size(rad_op h, int n_opd) {
     OracleState& o = *oracle_;
     const OpInfo& oi = *plans_[h].info;
 
-    /* The stored byte count of the weight at each operand position, from the layout pass. Every
-     * entry of a table maps to one position and they are proven identical at first issue, so the
-     * last writer and the first agree. */
+    /* Stored byte count of the weight at each operand position, from the layout pass. All entries
+     * of a table map to one position and are proven identical at first issue. */
     int64_t wb[MAX_OPERANDS] = {0};
     int     wlaid[MAX_OPERANDS] = {0};
     if (program_)
@@ -327,38 +260,31 @@ void Ctx::oracle_size(rad_op h, int n_opd) {
 
     for (int i = 0; i < n_opd; ++i) {
         const RadTensor& t = tbuf_[i];
-        /* A ZERO LEADING STRIDE IS THE MARKER. resolve_weight_table() prepends the expert axis
-         * that way precisely to say "this axis is not addressable by arithmetic". */
+        /* A zero leading stride marks a table: resolve_weight_table() prepends the expert axis
+         * that way to say it is not addressable by arithmetic. */
         o.tab[i] = (t.data && t.rank >= 2 && t.stride[0] == 0 && t.shape[0] > 0) ? t.shape[0] : 0;
         const int64_t es = span_of(&t);           /* one entry, or the whole plane when not a table */
         o.span[i] = o.tab[i] ? es * o.tab[i] : es;
         o.ent[i]  = es > 0 ? rad_dtype_bytes(t.dtype, es) : 0;
         if (o.ent[i] <= 0 && es > 0) o.ent[i] = wb[i];
-        /* A RE-LAID WEIGHT IS AS BIG AS THE CONTAINER SAYS, NOT AS BIG AS ITS DECLARED PLANE, and
-         * the two differ even where the dtype has a byte count. The fp8 lm_head pads each stored
-         * row to a 16-byte boundary and carries that row's block scales inside it, so the plane
-         * is 2608 bytes a row where n_embd * 1 says 2560 -- and the inverse, which checks the
-         * byte count it is handed against the stride it wrote, refuses a snapshot sized from the
-         * declared plane. The layout pass records the resolved kernel's own answer for exactly
-         * this; where a weight is stored re-laid, it wins. */
+        /* A re-laid weight's size is the stored size, not the declared plane's. E.g. the fp8
+         * lm_head pads each row to 16 bytes and embeds its block scales (2608 bytes per row, not
+         * n_embd = 2560), and the inverse rejects a buffer of the wrong size. */
         if (wlaid[i] && wb[i] > 0) o.ent[i] = wb[i];
         o.ht[i] = t;
         /* The stacked reading: the expert axis becomes addressable and its stride is one entry. */
         if (o.tab[i]) o.ht[i].stride[0] = es;
 
-        /* ALIASED OPERANDS SHARE ONE HOST BUFFER. A residual add is issued {x, h} -> {x}: two
-         * of its three operands are the same device bytes, and giving each its own copy makes
-         * the host kernel write into a buffer the device kernel's own read-modify-write also
-         * wrote -- which reports the op as a mismatch of exactly the size of the addend, every
-         * time, on an op that is correct. The first operand with a given pointer owns the
-         * copy and the rest point into it, which is what the device sees. */
+        /* Aliased operands share one host buffer, as on the device. A residual add {x, h} -> {x}
+         * with separate copies would report a false mismatch the size of the addend. The first
+         * operand with a given pointer owns the copy. */
         o.alias[i] = i;
         for (int j = 0; j < i; ++j)
             if (t.data && tbuf_[j].data == t.data) { o.alias[i] = o.alias[j]; break; }
     }
 }
 
-/* Bytes the snapshot of operand `i` occupies, which for a table is every entry of it. */
+/* Bytes the snapshot of operand `i` occupies; for a table, all entries. */
 int64_t Ctx::oracle_opd_bytes(int i) const {
     const OracleState& o = *oracle_;
     if (o.span[i] <= 0 || o.ent[i] <= 0) return 0;
@@ -370,44 +296,29 @@ void Ctx::oracle_snap(int n_opd, bool post) {
     std::vector<std::vector<uint8_t>>& into = post ? o.post : o.pre;
     into.resize(MAX_OPERANDS);
     std::vector<void*> ptr;
-    /* THE SECOND LANE IS DRAINED FIRST, AND THE ORDER IS THE WHOLE POINT. An architecture may
-     * issue on lane 1 -- the MoE shared expert does -- and the copies below go on `stream_`, which
-     * is not ordered against it. Draining lane 1 AFTER them leaves the copy racing the kernel
-     * that writes what it is copying, which is not a fix: the copy has already returned its bytes.
-     *
-     * Both snapshots need it and for different reasons. In `post` the race reads an OUTPUT before
-     * its kernel wrote it, and a correct kernel reports as having produced nothing. In `pre` it
-     * reads an INPUT before its producer wrote it, and then the two sides are not even given the
-     * same problem -- the host kernel gets a half-written operand, the device kernel gets the
-     * whole one, and the operand the oracle prints is an INPUT that disagrees with itself. The
-     * oracle already costs a host synchronisation per issue; one more stream is free. */
+    /* Drain lane 1 before the copies. Ops may run on lane 1 (the MoE shared expert does), and the
+     * copies below go on `stream_`, which is not ordered against it. Otherwise `post` could read an
+     * output before it is written, and `pre` an input before its producer wrote it. */
     if (lane1_) rad_stream_sync(lane1_);
     for (int i = 0; i < n_opd; ++i) {
         const RadTensor& t = tbuf_[i];
         if (o.alias[i] != i) continue;
         const int64_t bytes = oracle_opd_bytes(i);
-        /* THE CAP IS A REPEAT-MODE THING ONLY. The oracle has to see every operand or its host
-         * kernel has nothing to read; the repeat re-launches the device kernel on the operands
-         * still in place, so an operand it declines to copy is simply one it cannot restore and
-         * will not compare -- which is right for a weight and would be wrong for an output. */
+        /* The maxbytes cap applies to repeat mode only: the oracle's host kernel needs every
+         * operand, while repeat re-launches on the device operands in place and just skips
+         * restoring and comparing the capped ones. */
         if (!post) o.skip[i] = o.repeat && bytes > o.maxbytes;
         if (o.skip[i]) { into[(size_t)i].clear(); continue; }
-        /* A SLOT KEEPS THE HIGH-WATER CAPACITY OF EVERY OPERAND THAT EVER LANDED IN IT, and on a
-         * large model that is not a rounding error: operand 2 of one op is a 170 MiB fused weight
-         * and operand 2 of the next is a few kilobytes, so thirty-two slots across `pre`, `post`
-         * and `logical` hold the sum of the largest thing each has ever seen -- on a container
-         * of well over a hundred GiB, enough for the host OOM killer to end a sweep part way
-         * through. Shrinking when the slot is grossly oversized bounds the footprint by the
-         * largest SINGLE issue instead of by the sum over the graph; the reallocation costs
-         * nothing against a synchronised copy. */
+        /* Shrink a grossly oversized slot. Otherwise each slot in `pre`, `post` and `logical`
+         * keeps the high-water capacity of every operand it ever held, which on a large model
+         * can OOM the host. This bounds the footprint by the largest single issue. */
         into[(size_t)i].assign((size_t)bytes, 0);
         if (into[(size_t)i].capacity() > (size_t)bytes * 2 + (1u << 20))
             into[(size_t)i].shrink_to_fit();
         if (bytes <= 0) continue;
         if (!o.tab[i]) { rad_memcpy_async(into[(size_t)i].data(), t.data, bytes, stream_); continue; }
-        /* The entries are wherever placement put them, so their pointers come back first and the
-         * copies are issued against those. An entry may be device- or host-resident and the
-         * direction is inferred from the pointer, which is what makes one call serve both. */
+        /* Fetch the entry pointers first, then copy each entry. An entry may be device- or
+         * host-resident; the copy infers the direction from the pointer. */
         ptr.assign((size_t)o.tab[i], nullptr);
         rad_memcpy_async(ptr.data(), t.data, o.tab[i] * (int64_t)sizeof(void*), stream_);
         rad_stream_sync(stream_);
@@ -424,35 +335,28 @@ void Ctx::oracle_snap(int n_opd, bool post) {
 
 /* ------------------------------------------------------------------ the stored layout
  *
- * THE HOST KERNEL READS A WEIGHT CANONICALLY AND THE ENGINE DOES NOT HOLD IT THAT WAY.
+ * A kernel may rearrange a weight's canonical planes at load (spec §4.3); libr4d's fp8a8 GEMMs
+ * store WMMA fragment order, the same N*K bytes permuted so a wave's 16 rows arrive in lane order
+ * from one coalesced load. libref reads [N, K] row-major, so passing the stored bytes unchanged
+ * compares uncorrelated tensors (rel error ~1.35 on a correct kernel).
  *
- * A container holds each weight's encoding as canonical planes, and the kernel that reads it may
- * rearrange them at load (spec §4.3): libr4d's fp8a8 GEMMs claim WMMA FRAGMENT ORDER, the same N*K
- * bytes permuted so a wave's sixteen rows arrive in lane order off one coalesced load. libref
- * declares no layout for anything and reads [N, K] row-major. Handing it the operand pointer
- * unchanged therefore compares two readings of one permuted plane, which are uncorrelated tensors
- * -- a relative error around 1.35 on every operand from element zero, on a kernel that is not
- * wrong.
+ * The stored bytes therefore go through the device row's inverse back to canonical planes, then to
+ * the form the host row reads: one plane converted element-wise (e.g. int4 expert codes as
+ * integers), or a whole encoding decoded by the core (e.g. an lm_head of codes and scales).
  *
- * So the stored bytes go back through the device row's own inverse to the canonical planes, and
- * from those to the form the HOST row reads: a single plane converted element by element -- an
- * expert's int4 codes as the integers the reference multiplies -- or a whole encoding decoded by
- * the core's decoder, which is what a reference reading an lm_head of codes and scales together
- * wants. Both sides then see the same values, expressed the way each of them reads.
+ * No inverse means no check: returns false, logs a named skip, and the issue is not counted.
  *
- * NO INVERSE MEANS NO CHECK, and it is a named skip rather than a tolerance: a comparison that
- * cannot be made honestly is worse than one not made, because a page of false failures drowns the
- * true ones. Returns false in that case, and the issue is not counted as checked.
+ * The logical shape comes from the host row's `opd_shape` first, the device row's as fallback:
+ * `opd_shape` describes the operand the kernel is handed, which for the device row is the stored
+ * form being inverted. libref describes every op in docs/OPS.md. Extents come from this issue's
+ * parameters, not the weight declaration, so a tensor-parallel shard uses per-rank N and K.
  *
- * WHICH LOGICAL FORM, AND WHO SAYS SO. `opd_shape` describes the operand the kernel is HANDED --
- * for a relayed weight that is the stored form, which is the thing being inverted and cannot also
- * be the answer. The form wanted here is the one the READER reads, so the host row is asked first
- * and the device row is the fallback. libref publishes a shape for the whole conventional
- * vocabulary, so an op inside docs/OPS.md is describable even when the kernel under test
- * describes nothing.
- *
- * The extents come from the parameters AT THIS ISSUE, not from the weight's declaration: a
- * tensor-parallel shard's op carries the per-rank N and K. */
+ * Two forms skip the description. A host row whose layout hook joins the planes
+ * (abi/rad_planes.h: a quantised lm head, a zero-point grid's scale and zero) is handed its own
+ * stored form of the inverted planes, as the engine would hand it, at the weight's declared shape.
+ * A single plane the host reads as stored, where no description exists (a zero-point grid's codes),
+ * is handed the canonical plane itself. A weight table, or a plane widened at load, takes the
+ * description. */
 bool Ctx::oracle_unrelayout(rad_op h, const IssuePlan& hip, const IssuePlan& dip, int64_t seq,
                             int n_opd) {
     OracleState& o = *oracle_;
@@ -481,10 +385,56 @@ bool Ctx::oracle_unrelayout(rad_op h, const IssuePlan& hip, const IssuePlan& dip
                      w.layout_tag.c_str(), ki->unrelayout ? "RadShapeFn" : "RadUnrelayoutFn");
             return false;
         }
+        if (!o.tab[i] && hk && !w.widen) {
+            RadTensor pt[RAD_ENC_MAX_PLANES];
+            weight_planes(w, pt);
+            RadLayout hl{};
+            const int hst = hk->layout ? hk->layout(hip.args.p, hip.args.n_p, i, &w.enc, w.sel,
+                                                    pt, w.n_sel, &hl)
+                                       : RAD_E_UNSUPPORTED;
+            RadOpdDesc probe{};
+            const bool described =
+                shape(dip.args.p, dip.args.n_p, i, &probe) == RAD_OK && probe.rank > 0;
+            const bool joins = hst == RAD_OK && hk->relayout && hl.bytes > 0;
+            const bool as_stored = hst == RAD_E_UNSUPPORTED && w.n_sel == 1 && !described;
+            if (joins || as_stored) {
+                std::vector<std::vector<uint8_t>> pl((size_t)w.n_sel);
+                for (int k = 0; k < w.n_sel; ++k) {
+                    pl[(size_t)k].assign((size_t)(w.sel_rows[k] *
+                                                  rad_enc_row_bytes(pt[k].dtype, w.sel_cols[k])), 0);
+                    pt[k].data = pl[(size_t)k].data();
+                }
+                const std::vector<uint8_t>& src = o.pre[(size_t)o.alias[i]];
+                int rc = ki->unrelayout(dip.args.p, dip.args.n_p, i, &w.enc, w.sel, src.data(),
+                                        (int64_t)src.size(), pt, w.n_sel);
+                if (rc >= 0 && joins) {
+                    o.logical[(size_t)i].assign((size_t)hl.bytes, 0);
+                    rc = hk->relayout(hip.args.p, hip.args.n_p, i, &w.enc, w.sel, pt, w.n_sel,
+                                      o.logical[(size_t)i].data(), hl.bytes);
+                } else if (rc >= 0) {
+                    o.logical[(size_t)i] = pl[0];
+                }
+                if (rc < 0) {
+                    RAD_WARN("oracle #%lld op '%s': NOT CHECKED. '%s' could not be brought from "
+                             "%s's stored form to %s's (%s).", (long long)seq, oi.op.c_str(),
+                             w.name.c_str(), ki->name, hk->name, rad_strerror(rc));
+                    return false;
+                }
+                RadTensor lg{};
+                lg.dtype = joins ? hl.dtype : pt[0].dtype;
+                lg.rank = w.decl.rank;
+                for (uint32_t k = 0; k < w.decl.rank && k < RAD_MAX_RANK; ++k)
+                    lg.shape[k] = w.decl.shape[k];
+                rad_tensor_pack(&lg);
+                lg.data = o.logical[(size_t)i].data();
+                o.ht[i] = lg;
+                o.unlaid[i] = 1;
+                continue;
+            }
+        }
         RadOpdDesc d{};
         if (shape(dip.args.p, dip.args.n_p, i, &d) != RAD_OK || d.rank == 0) {
-            /* A shape hook declines without a reason (RadShapeFn), so the geometry it declined is
-             * printed, the dtype with it -- a description refuses a dtype it knows no grid for. */
+            /* RadShapeFn gives no reason when it declines, so log the geometry. */
             RAD_WARN("oracle #%lld op '%s': NOT CHECKED. nothing could describe the logical form "
                      "of '%s' at this geometry {%s}, so there is nothing to invert its layout "
                      "into.", (long long)seq, oi.op.c_str(), w.name.c_str(),
@@ -499,9 +449,8 @@ bool Ctx::oracle_unrelayout(rad_op h, const IssuePlan& hip, const IssuePlan& dip
         for (int k = (int)d.rank - 1; k >= 0; --k) { lg.stride[k] = acc; acc *= lg.shape[k]; }
         const int64_t bytes = rad_dtype_bytes(lg.dtype, n);
         if (bytes <= 0) return false;
-        /* A TABLE'S DESCRIPTION MUST BE THE STACKED PLANE. The two agree on every other axis, so
-         * a disagreement here is a description that answered for one expert where the operand
-         * carries the layer's whole set -- and inverting into it would write past the buffer. */
+        /* A table's logical form must be the stacked plane; a single-expert description would
+         * make the inverse write past the buffer. */
         if (o.tab[i] && (d.rank < 2 || lg.shape[0] != o.tab[i])) {
             RAD_WARN("oracle #%lld op '%s': NOT CHECKED. '%s' is a table of %lld experts and the "
                      "logical form offered for it leads with %lld, so the two are not the same "
@@ -514,10 +463,8 @@ bool Ctx::oracle_unrelayout(rad_op h, const IssuePlan& hip, const IssuePlan& dip
             o.logical[(size_t)i].shrink_to_fit();
         lg.data = o.logical[(size_t)i].data();
 
-        /* ONE CALL PER ENTRY FOR A TABLE. The hook answers for a weight, and an expert IS the
-         * weight -- the table is the engine's way of saying where the experts ended up, not a
-         * shape the plugin ever agreed to. So each entry's stored bytes are inverted on their own
-         * and land at their own offset in the stacked tensor. */
+        /* One inverse call per table entry: the hook describes one weight (one expert), and the
+         * table is an engine construct. Each entry lands at its offset in the stacked tensor. */
         const std::vector<uint8_t>& src = o.pre[(size_t)o.alias[i]];
         const int64_t n_ent = o.tab[i] ? o.tab[i] : 1;
         const int64_t ent_bytes = o.tab[i] ? o.ent[i] : (int64_t)src.size();
@@ -543,9 +490,7 @@ bool Ctx::oracle_unrelayout(rad_op h, const IssuePlan& hip, const IssuePlan& dip
                                        lg.dtype, ent_n, dst, &why);
         }
         if (rc < 0) {
-            /* THE TWO NUMBERS IT DISAGREED ABOUT. An inverse refuses on a shape far more often
-             * than on anything else, and "shape this kernel does not serve" without them says
-             * only that one of the two sides is wrong -- which is the whole question. */
+            /* Inverses mostly refuse on size, so log both sizes. */
             RAD_WARN("oracle #%lld op '%s': NOT CHECKED. %s could not invert its own layout for "
                      "'%s' (%s%s%s): %lld stored bytes into %lld %s elements, so the reference has "
                      "nothing it can read.",
@@ -565,8 +510,7 @@ void Ctx::oracle_run(rad_op h, const IssuePlan& hip, int64_t seq, int n_opd) {
     OracleState& o = *oracle_;
     const OpInfo& oi = *plans_[h].info;
 
-    /* The host kernel writes into the PRE copy: same shapes, same strides, same parameters, and
-     * pointers that are the only thing about the call that differs from the device's. */
+    /* The host kernel writes into the `pre` copy; only the pointers differ from the device call. */
     RadArgs a = hip.args;
     a.t   = o.ht;
     a.n_t = n_opd;
@@ -575,28 +519,23 @@ void Ctx::oracle_run(rad_op h, const IssuePlan& hip, int64_t seq, int n_opd) {
 
     const int rc = hip.launch(&a, nullptr);
     if (rc < 0) {
-        /* RAD_E_UNSUPPORTED IS NOT A FINDING. It is the reference saying "not this contract" --
-         * an op whose parameters name a form it does not implement, which `gdn_recurrent_update`'s
-         * two state layouts are the live example of. Reported as the coverage gap it is, because
-         * the alternative is a reader treating a declined comparison as a passed one. Any OTHER
-         * code is the reference refusing shapes it claims to serve, and that is about the engine's
-         * operands rather than about the oracle. */
+        /* RAD_E_UNSUPPORTED: the reference does not implement this form (e.g. one of
+         * `gdn_recurrent_update`'s two state layouts); a coverage gap, logged as not checked. Any
+         * other code is the reference refusing shapes it claims to serve: a finding about the
+         * engine's operands. */
         if (rc == RAD_E_UNSUPPORTED)
             RAD_WARN("oracle #%lld op '%s': NOT CHECKED. the host kernel (%s) does not implement "
                      "what these parameters ask for {%s}, so there is no comparison to make.",
                      (long long)seq, oi.op.c_str(),
                      hip.row && hip.row->info ? hip.row->info->name : "?", oi.base.str().c_str());
         else {
-            /* AND THE SHAPES IT REFUSED, since that is what this line says the finding is about.
-             * An error name on its own leaves no way to tell an engine operand the reference
-             * genuinely cannot serve from a geometry it was handed wrongly, which is the whole
-             * thing a reader comes to this line for. */
+            /* Log the refused shapes along with the error. */
             std::string sh;
             for (int i = 0; i < n_opd; ++i)
                 if (o.ht[i].data)
-                    sh += fmt("%s%d:%s", sh.empty() ? "" : " ", i, shape_str(&o.ht[i]).c_str());
-            RAD_WARN("oracle #%lld op '%s': the host kernel (%s) REFUSED the engine's own operands "
-                     "with %s. That is a finding about the shapes, not about the oracle: {%s} %s",
+                    sh += fmt("%s%d:%s", sh.empty() ? "" : " ", i, tensor_shape_str(o.ht[i]).c_str());
+            RAD_WARN("oracle #%lld op '%s': the host kernel (%s) refused the engine's own operands "
+                     "with %s: {%s} %s",
                      (long long)seq, oi.op.c_str(),
                      hip.row && hip.row->info ? hip.row->info->name : "?", rad_strerror(rc),
                      oi.base.str().c_str(), sh.c_str());
@@ -604,22 +543,18 @@ void Ctx::oracle_run(rad_op h, const IssuePlan& hip, int64_t seq, int n_opd) {
         return;
     }
 
-    /* Per operand: the largest disagreement, scaled by the device side's own magnitude. A pure
-     * input comes out at zero because neither side touched it, which is the check that the
-     * snapshot itself is sound. */
+    /* Per operand: the largest disagreement relative to the device side's max magnitude. A pure
+     * input must come out at zero, which validates the snapshot itself. */
     std::string line;
     bool bad = false;
     for (int i = 0; i < n_opd; ++i) {
         if (o.span[i] <= 0) continue;
-        /* AN INVERTED WEIGHT IS NOT COMPARED. `pre` holds the stored plane and `post` the device's
-         * copy of the same read-only bytes, so there is nothing here the two sides could disagree
-         * about -- what the host kernel actually read is the separate logical buffer, in a form
-         * neither of those two holds. Printed rather than dropped, so that a reader can see the
-         * operand was handled and know which shape the host side saw. */
+        /* An inverted weight is read-only and the host read a separate logical buffer, so there is
+         * nothing to compare. It is still printed, with the shape the host saw. */
         if (o.unlaid[i]) {
             line += fmt("  opd%d~ %-6s %-22s  read through %s's own inverse; not compared\n",
-                        i, rad_dtype_name(o.ht[i].dtype), shape_str(&o.ht[i]).c_str(),
-                        ip_kernel_name(h) ? ip_kernel_name(h) : "?");
+                        i, rad_dtype_name(o.ht[i].dtype), tensor_shape_str(o.ht[i]).c_str(),
+                        ip_kernel_name(h));
             continue;
         }
         const uint32_t dt = o.ht[i].dtype;
@@ -634,25 +569,15 @@ void Ctx::oracle_run(rad_op h, const IssuePlan& hip, int64_t seq, int n_opd) {
         if (!elem(hp, dt, 0, &x)) {
             const bool same = std::memcmp(hp, dp, o.pre[(size_t)o.alias[i]].size()) == 0;
             line += fmt("  opd%d %-6s %s %s\n", i, rad_dtype_name(dt),
-                        shape_str(&o.ht[i]).c_str(), same ? "bytes equal" : "BYTES DIFFER");
+                        tensor_shape_str(o.ht[i]).c_str(), same ? "bytes equal" : "bytes differ");
             bad = bad || !same;
             continue;
         }
-        /* ONE CODE STEP IN AN fp8 PLANE IS THE FORMAT, NOT A DISAGREEMENT.
-         *
-         * E4M3 has three mantissa bits, so the gap between neighbouring codes is between 1/16 and
-         * 1/8 of the value -- four to eight times the tolerance a comparison of continuous values
-         * is held to. Any difference at all in the bf16 the quantiser reads, down to a single ulp
-         * from a different summation order, moves an element that sits near a rounding boundary
-         * onto the next code, and the reported relative error is then a whole quantum on a kernel
-         * that is right -- typically a handful of elements in ten thousand, one code apart (host
-         * 176, device 192), on an fp8 output plane such as rmsnorm_quant_fp8's or hc_read's.
-         *
-         * So the two sides are compared in CODE space for these dtypes, where adjacent is a
-         * question with an exact answer: same sign bit, magnitude codes one apart. Those are
-         * COUNTED and reported and do not set the verdict; anything further apart is a real
-         * disagreement and is measured like any other. A kernel whose arithmetic is actually
-         * wrong does not land one code away on six elements in ten thousand. */
+        /* fp8 planes are compared in code space. E4M3's code gap is 1/16 to 1/8 of the value, well
+         * above the tolerance, so a one-ulp bf16 difference before quantisation can move an element
+         * to the adjacent code (e.g. host 176, device 192) on a correct kernel. Codes with the same
+         * sign and magnitudes one apart are counted and reported but do not fail the check;
+         * anything further apart is measured normally. */
         const bool fp8 = (dt == RAD_F8E4M3 || dt == RAD_F8E5M2);
         int64_t ulp1 = 0;
         for (int64_t k = 0; k < n; ++k) {
@@ -669,8 +594,8 @@ void Ctx::oracle_run(rad_op h, const IssuePlan& hip, int64_t seq, int n_opd) {
                 worst = std::isnan(x) != std::isnan(y) ? INFINITY : d;
                 at = k; hv = x; dv = y;
             }
-            /* The individually bad elements, not just the worst: WHERE they sit says whether a
-             * whole operand is wrong or one lane of it is, and those are different bugs. */
+            /* Record the first few bad indices too: their positions tell a wrong operand from a
+             * wrong lane. */
             if (d > 1e-30 && (std::isnan(x) != std::isnan(y) || d > o.tol * std::fabs(x))) {
                 if (nbad < 4) badix[nbad] = k;
                 ++nbad;
@@ -680,11 +605,8 @@ void Ctx::oracle_run(rad_op h, const IssuePlan& hip, int64_t seq, int n_opd) {
         if (rel > o.tol) bad = true;
         double f[4] = {0, 0, 0, 0};
         for (int64_t k = 0; k < 4 && k < n; ++k) elem(dp, dt, k, &f[k]);
-        /* PER-ROW SUMS, up to three rows. A whole-tensor sum is a weak fingerprint and the first
-         * four values only ever describe row 0, so between them they can say "token 0 is exactly
-         * right and the total is wrong" -- a statement about the OTHER tokens that neither column
-         * can localise. A row here is dim 0, which is the token for every activation the graph
-         * carries. */
+        /* Per-row sums for up to three rows (dim 0, the token for activations), to localise errors
+         * beyond row 0 that the head values and whole-tensor sum cannot. */
         std::string rows;
         if (o.ht[i].rank >= 2 && o.ht[i].shape[0] > 1 && o.ht[i].stride[0] > 0) {
             const int64_t nr = o.ht[i].shape[0] < 3 ? o.ht[i].shape[0] : 3;
@@ -700,19 +622,16 @@ void Ctx::oracle_run(rad_op h, const IssuePlan& hip, int64_t seq, int n_opd) {
                 const int64_t last = (r + 1) * w < n ? (r + 1) * w : n;
                 for (int j = 0; j < 3; ++j)
                     if (last - 3 + j >= r * w) elem(dp, dt, last - 3 + j, &t[j]);
-                /* HEAD AND TAIL OF EVERY ROW, which is exactly what llama.cpp's eval-callback
-                 * prints -- three at each end and an ellipsis. A sum agrees between two vectors
-                 * that are not the same vector, which is the shape these mismatches take. */
+                /* Three values at each end of the row, as llama.cpp's eval-callback prints, since
+                 * equal sums do not imply equal vectors. */
                 rows += fmt("\n      row%lld sum %.6g head [%.5g %.5g %.5g] tail [%.5g %.5g %.5g]",
                             (long long)r, rs,
                             row_at(dp, dt, r * w, 0, n), row_at(dp, dt, r * w, 1, n),
                             row_at(dp, dt, r * w, 2, n), t[0], t[1], t[2]);
             }
         }
-        /* WHERE the worst element is, and what each side said there. Without it a mismatch is a
-         * number: "rel 2 on a gate cumsum" cannot distinguish a whole tensor that is wrong from
-         * one padding lane that is, and those want different fixes. The index is flat over the
-         * operand, which is the same order the row sums above walk. */
+        /* The worst element's flat index and both values, to tell a wrong tensor from one wrong
+         * padding lane. */
         std::string at_s;
         if (at >= 0 && rel > o.tol) {
             at_s = fmt("\n      worst at [%lld]: host %.9g  device %.9g  (diff %.4g)"
@@ -721,14 +640,12 @@ void Ctx::oracle_run(rad_op h, const IssuePlan& hip, int64_t seq, int n_opd) {
                        (long long)at, hv, dv, worst, (long long)nbad, (long long)n, hsum, sum);
             for (int b = 0; b < 4 && badix[b] >= 0; ++b) at_s += fmt(" %lld", (long long)badix[b]);
         }
-        /* The one-code-step count is PRINTED whether or not anything else disagreed. Silently
-         * absorbing them would make the operand look byte-equal, and a reader comparing two runs
-         * of the same build wants to see that six elements moved. */
+        /* The one-code-step count is always printed, so absorbed differences stay visible. */
         const std::string u1 = ulp1 ? fmt("  %lld at one fp8 code step", (long long)ulp1)
                                     : std::string();
         line += fmt("  opd%d %-6s %-22s n=%-9lld amax %.4g sum %.6g [%.5g %.5g %.5g %.5g]%s"
                     "  rel %.4g%s%s%s\n",
-                    i, rad_dtype_name(dt), shape_str(&o.ht[i]).c_str(), (long long)n, scale,
+                    i, rad_dtype_name(dt), tensor_shape_str(o.ht[i]).c_str(), (long long)n, scale,
                     sum, f[0], f[1], f[2], f[3], rows.c_str(), rel, u1.c_str(),
                     rel > o.tol ? "  <-- MISMATCH" : "", at_s.c_str());
     }
@@ -751,58 +668,32 @@ const char* Ctx::ip_kernel_name(rad_op h) const {
     return "?";
 }
 
-/* The one entry point issue() calls. Returns the host plan to check against, or null. */
 /* ------------------------------------------------------------------ the repeat check */
-/* RUN THE DEVICE KERNEL A SECOND TIME ON THE BYTES THE FIRST ONE SAW, AND COMPARE.
- *
- * The oracle above asks whether a kernel agrees with libref. This asks a question no two-sided
- * comparison can: whether the kernel agrees with ITSELF. A kernel with an unordered reduction, a
- * workgroup that reads what another workgroup is writing, or a workspace it assumed was zeroed is
- * CORRECT on the run the oracle happens to look at and wrong on the next one, and every
- * instrument in this tree that runs an op once is blind to it.
- *
- * BYTE-EXACT AND NO TOLERANCE, deliberately. "Within 2%" is the right question for an
- * implementation and the wrong one here: the same kernel on the same bytes has no licence to move
- * at all, and a difference in the last mantissa bit is the finding, because greedy decoding
- * amplifies it into a different token a few hundred steps later.
- *
- * WHAT IT CANNOT SEE. A race between the two ranks of a tensor-parallel step: both Ctxs walk the
- * same graph and both re-launch, so a collective still meets itself and does not deadlock, but
- * what the second launch measures is the pair re-running together rather than either one alone.
- * And a kernel whose output depends on a buffer this declined to restore -- see the cap. */
+/* Runs the device kernel a second time on the bytes the first saw and byte-compares (see the file
+ * header). Blind spots: under tensor parallelism both ranks re-launch together, so a collective
+ * does not deadlock but the pair is measured, not either rank alone; and outputs that depend on an
+ * operand over the restore cap. */
 void Ctx::oracle_repeat(rad_op h, const IssuePlan& dip, int64_t seq, int n_opd) {
     OracleState& o = *oracle_;
 
-    /* AN OPERAND THIS COULD NOT COPY MAKES THE WHOLE ISSUE UNJUDGEABLE, and saying so is the
-     * difference between an instrument and a rumour. The cap exists for read-only weights, but
-     * nothing here knows that an operand IS a weight -- and a GDN recurrent state is both an input
-     * and an output and is far over the default cap. Left unrestored it hands the second launch a
-     * state the first one already advanced, and every GDN issue in the model then reports as
-     * non-deterministic when what actually happened is that it was asked a different question.
-     * Raise RADIANCE_OP_REPEAT_MAXBYTES to check those ops; do not guess about them. */
+    /* Any uncopied operand makes the issue unjudgeable: it is counted, not guessed at. The cap is
+     * meant for read-only weights, but e.g. a GDN recurrent state is in/out and far over it; left
+     * unrestored, the second launch would see an advanced state. Raise
+     * RADIANCE_OP_REPEAT_MAXBYTES to cover such ops. */
     for (int i = 0; i < n_opd; ++i)
         if (o.skip[i]) { ++o.unchecked; return; }
 
-    /* The first result, before anything is put back. oracle_snap writes `post`, so it is moved
-     * aside rather than copied: the second launch needs the same destination. */
+    /* First result; moved aside because oracle_snap writes `post` again for the second launch. */
     oracle_snap(n_opd, true);
     std::vector<std::vector<uint8_t>> first;
     first.swap(o.post);
 
-    /* PUT BACK ONLY WHAT THE KERNEL ACTUALLY CHANGED, and decide that by comparing rather than by
-     * believing the schema. An op issued {x, h} -> {x} has already overwritten one of its own
-     * inputs, so without a restore the second launch is not given the same problem and every
-     * in-place op in the graph reports as non-deterministic.
+    /* Restore only operands whose bytes actually changed (decided by comparison, not the schema).
+     * In-place ops such as {x, h} -> {x} must be restored or they report as non-deterministic,
+     * while restoring everything would segfault writing a Tier::Mapped weight (a read-only mmap).
      *
-     * Restoring everything SEGFAULTS instead: a small weight is a perfectly ordinary operand under
-     * the size cap, and a weight on Tier::Mapped is the container's read-only mmap. A kernel never
-     * writes an operand it only reads, so "changed" is both the safe test and the cheap one.
-     *
-     * A WEIGHT TABLE IS NEVER RESTORED WHATEVER THE COMPARISON SAYS. Its snapshot is the STACKED
-     * plane behind an array of pointers (oracle_size), so a byte-for-byte write back would put
-     * gigabytes of expert weight over a few kilobytes of pointers. No op writes one, which is
-     * why the comparison alone is enough; if one ever did, a write back would take every weight
-     * in the graph off its address. */
+     * Never restore a weight table: its snapshot is the stacked plane, and writing it back would
+     * overwrite the pointer array with expert weights. */
     bool wrote[MAX_OPERANDS] = {false};
     for (int i = 0; i < n_opd; ++i) {
         if (o.alias[i] != i || o.skip[i] || o.span[i] <= 0 || o.tab[i]) continue;
@@ -815,13 +706,13 @@ void Ctx::oracle_repeat(rad_op h, const IssuePlan& dip, int64_t seq, int n_opd) 
     }
     rad_stream_sync(stream_);
 
-    /* THE SAME PLAN, THE SAME ARGS, THE SAME STREAM. dip.args.t still points at tbuf_ -- the
-     * device pointers -- because the oracle's rebinding only ever touched its own `ht`. */
+    /* Same plan, args and stream; dip.args.t still points at the device tbuf_ (the oracle only
+     * rebinds its own `ht`). */
     RadArgs a = dip.args;
     a.n_t = n_opd;
     const int rc = dip.launch(&a, cur_stream());
     if (rc < 0) {
-        RAD_WARN("repeat #%lld op '%s': the second launch was REFUSED with %s, so this issue says "
+        RAD_WARN("repeat #%lld op '%s': the second launch was refused with %s, so this issue says "
                  "nothing about determinism", (long long)seq, plans_[h].info->op.c_str(),
                  rad_strerror(rc));
         return;
@@ -830,17 +721,15 @@ void Ctx::oracle_repeat(rad_op h, const IssuePlan& dip, int64_t seq, int n_opd) 
 
     std::string line;
     for (int i = 0; i < n_opd; ++i) {
-        /* ONLY THE OPERANDS THE KERNEL WROTE. One it merely read is equal by construction, and
-         * saying so for every input on every issue buries the finding. */
+        /* Only operands the kernel wrote; read-only ones are equal by construction. */
         if (!wrote[i]) continue;
         const std::vector<uint8_t>& A = first[(size_t)i];
         const std::vector<uint8_t>& B = o.post[(size_t)i];
         if (A.size() != B.size() || A.empty()) continue;
         if (std::memcmp(A.data(), B.data(), A.size()) == 0) continue;
 
-        /* WHICH ELEMENTS AND BY HOW MUCH. One lane apart at the last bit and a whole tensor of
-         * garbage are both "BYTES DIFFER", and they are different bugs: the first is a reduction
-         * order, the second is a read of memory another workgroup owns. */
+        /* Count and locate differing elements: a last-bit difference points to reduction order,
+         * widespread garbage to a cross-workgroup read. */
         const uint32_t dt = o.ht[i].dtype;
         const int64_t  n  = o.span[i];
         int64_t nbad = 0, at = -1;
@@ -855,22 +744,74 @@ void Ctx::oracle_repeat(rad_op h, const IssuePlan& dip, int64_t seq, int n_opd) 
             scale = std::max(scale, std::fabs(y));
         }
         if (nbad < 0)
-            line += fmt("  opd%d %-6s %s BYTES DIFFER (dtype not scalar)\n", i,
-                        rad_dtype_name(dt), shape_str(&o.ht[i]).c_str());
+            line += fmt("  opd%d %-6s %s bytes differ (dtype not scalar)\n", i,
+                        rad_dtype_name(dt), tensor_shape_str(o.ht[i]).c_str());
         else
             line += fmt("  opd%d %-6s %s  %lld of %lld element(s) differ; worst at [%lld] "
                         "run1 %.9g run2 %.9g (diff %.4g, rel %.3g)\n",
-                        i, rad_dtype_name(dt), shape_str(&o.ht[i]).c_str(),
+                        i, rad_dtype_name(dt), tensor_shape_str(o.ht[i]).c_str(),
                         (long long)nbad, (long long)n, (long long)at, av, bv, worst,
                         worst / (scale > 0 ? scale : 1.0));
     }
     if (line.empty()) return;
     ++o.differed;
-    RAD_ERR("REPEAT #%lld op '%s' (kernel %s) IS NOT A FUNCTION OF ITS INPUTS: two launches on the "
+    RAD_ERR("repeat #%lld op '%s' (kernel %s) is not a function of its inputs: two launches on the "
             "same bytes disagreed.\n%s", (long long)seq, plans_[h].info->op.c_str(),
-            ip_kernel_name(h) ? ip_kernel_name(h) : "?", line.c_str());
+            ip_kernel_name(h), line.c_str());
 }
 
+const IssuePlan* Ctx::oracle_reference(rad_op h, int band) {
+    OracleState& o = *oracle_;
+    const OpPlan& p = plans_[h];
+    const IssuePlan& hip =
+        issue_table_[(size_t)p.plan_off + (size_t)band * RAD_N_DOMAINS + RAD_DOMAIN_HOST];
+    if (hip.launch && hip.row && hip.row->reference) return &hip;
+    if (!registry_) return nullptr;
+
+    const uint64_t key = ((uint64_t)h << 16) | (uint64_t)(uint16_t)band;
+    if (const auto it = o.ref_at.find(key); it != o.ref_at.end())
+        return it->second >= 0 ? &o.ref_plans[(size_t)it->second] : nullptr;
+    o.ref_at[key] = -1;
+
+    /* The question the bucket table asked of this band (Registry::build_bands), with every row
+     * but a reference library's refused. */
+    const OpInfo& oi = *p.info;
+    Geometry g = oi.base;
+    if (!oi.ranged_key.empty()) g.set_i(oi.ranged_key, oi.bands[(size_t)band].hi);
+    const Registry::RowFilter only_reference = [](const KernelRow& r, const Geometry&) {
+        return r.reference ? std::string() : std::string("not a reference library");
+    };
+    Resolved r = registry_->resolve(oi.op, g, RAD_DOMAIN_HOST, nullptr, &only_reference);
+    if (!r || !r.row->info || !r.row->info->launch) return nullptr;
+    if (r.row->info->scratch) {
+        RadArgs a{};
+        a.p          = r.geom.params();
+        a.n_p        = r.geom.n_params();
+        a.rank       = rank_;
+        a.world_size = world_size_;
+        const int64_t s = r.row->info->scratch(&a);
+        if (s < 0) return nullptr;
+        r.scratch_bytes = s;
+    }
+    if (registry_->init_instance(r, rank_, world_size_) < 0) return nullptr;
+
+    o.ref_res.push_back(std::move(r));
+    const Resolved& kept = o.ref_res.back();
+    IssuePlan ip{};
+    ip.row                = kept.row;
+    ip.launch             = kept.row->info->launch;
+    ip.args.p             = kept.geom.params();
+    ip.args.n_p           = kept.geom.n_params();
+    ip.args.scratch_bytes = kept.scratch_bytes;
+    ip.args.instance      = kept.instance;
+    ip.args.rank          = rank_;
+    ip.args.world_size    = world_size_;
+    o.ref_plans.push_back(ip);
+    o.ref_at[key] = (int)o.ref_plans.size() - 1;
+    return &o.ref_plans.back();
+}
+
+/* The entry point issue() calls. Returns the host plan to check against, or null. */
 const IssuePlan* Ctx::oracle_before(rad_op h, int band, int n_opd) {
     if (!oracle_ || !oracle_arm(h)) return nullptr;
     oracle_size(h, n_opd);
@@ -878,33 +819,27 @@ const IssuePlan* Ctx::oracle_before(rad_op h, int band, int n_opd) {
         for (int i = 0; i < n_opd; ++i)
             if (tbuf_[i].data && oracle_opd_bytes(i) <= 0) return nullptr;
         oracle_snap(n_opd, false);
-        /* REPEAT MODE NEEDS NO HOST KERNEL, and the issue path carries this pointer back only to
-         * say "armed". oracle_after re-launches the DEVICE plan it is handed instead. */
+        /* Repeat mode needs no host kernel; this pointer only signals "armed". oracle_after
+         * re-launches the device plan. */
         static const IssuePlan kRepeatArmed{};
         return &kRepeatArmed;
     }
-    /* NOT GATED ON THE DEVICE DOMAIN. On the host backend the launch IS the host kernel,
-     * so the comparison is host against host and agrees by construction -- but the per-operand
-     * lines are still the only ordered trace of what the graph computed, and diffing those
-     * against another engine's is what the whole-model reference exists for. */
-    const OpPlan& p = plans_[h];
-    const IssuePlan& hip =
-        issue_table_[(size_t)p.plan_off + (size_t)band * RAD_N_DOMAINS + RAD_DOMAIN_HOST];
-    if (!hip.launch) {
+    /* Not gated on the device domain: on the host backend this checks the host library that
+     * serves the op (libavx) against the reference library. */
+    const IssuePlan* ref = oracle_reference(h, band);
+    if (!ref) {
         ++oracle_->skipped_nohost;
         if (!oracle_->said_nohost) {
             oracle_->said_nohost = true;
-            RAD_WARN("oracle: op '%s' has no host kernel in this band, so it cannot be checked. "
-                     "A library with host kernels -- a reference one, or the host library -- "
-                     "must be on the kernel search path for the oracle to see anything.", plans_[h].info->op.c_str());
+            RAD_WARN("oracle: op '%s' has no reference library row in this band, so it cannot be "
+                     "checked. A reference kernel library (libref) must be on the kernel search "
+                     "path for the oracle to see anything.", plans_[h].info->op.c_str());
         }
         return nullptr;
     }
-    /* AN OPERAND WITH NO BYTE COUNT IS A NAMED SKIP, not a silent one. The count is missing when
-     * the dtype is plugin-private and the operand is not a weight the layout pass sized -- a
-     * packed plane the core is not meant to understand (spec 4.2). Dropping the whole issue
-     * without saying so would report a routed model's expert GEMM as "0 checked" beside a page of
-     * agreements, which reads as nothing to check rather than as a gap. */
+    const IssuePlan& hip = *ref;
+    /* An operand with no byte count (plugin-private dtype, not a sized weight; spec 19.6) is a
+     * logged skip, so a gap is not mistaken for nothing to check. */
     for (int i = 0; i < n_opd; ++i) {
         if (!tbuf_[i].data || oracle_opd_bytes(i) > 0) continue;
         RAD_WARN("oracle #%lld op '%s': NOT CHECKED. operand %d is %s and the core cannot size "
@@ -914,11 +849,8 @@ const IssuePlan* Ctx::oracle_before(rad_op h, int band, int n_opd) {
                  rad_dtype_name(tbuf_[i].dtype));
         return nullptr;
     }
-    /* AND AN OPERAND THE HOST CANNOT HOLD IS A NAMED SKIP TOO. The snapshot is two host copies
-     * of every operand and a third for a weight stored re-laid, so an operand of tens of
-     * gigabytes is not a slow check -- it is the process being killed with nothing reported, and
-     * no reason in the log because there is no chance to write one. A 47 GiB n-gram table read
-     * at decode is such an operand. */
+    /* An operand over maxopd is a logged skip: snapshotting it (e.g. a 47 GiB n-gram table) would
+     * get the process OOM-killed with nothing logged. */
     for (int i = 0; i < n_opd; ++i) {
         if (!tbuf_[i].data || oracle_->alias[i] != i) continue;
         const int64_t b = oracle_opd_bytes(i);
@@ -949,9 +881,8 @@ void Ctx::oracle_after(rad_op h, const IssuePlan& hip, const IssuePlan& dip, int
         return;
     }
     oracle_snap(n_opd, true);
-    /* The pre snapshot's tensors still point into `pre`, which oracle_snap(false) bound -- except
-     * for a weight the device row stores re-laid, which this repoints at its own inverse. A row
-     * that cannot be inverted is not checked at all, and not counted as checked either. */
+    /* `ht` still points into `pre`, except re-laid weights, which oracle_unrelayout repoints at
+     * their inverse. An issue that cannot be inverted is neither checked nor counted. */
     if (!oracle_unrelayout(h, hip, dip, n_issues_, n_opd)) return;
     oracle_run(h, hip, n_issues_, n_opd);
     --oracle_->budget;

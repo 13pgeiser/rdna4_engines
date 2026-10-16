@@ -1,13 +1,10 @@
 /* dispatch.cpp -- picks a backend once, then forwards.
  *
- * The only definition of every rad_dev_* / rad_stream_* / rad_event_* symbol in the engine.
- * host.cpp and hip.cpp export vtables and nothing else, so there is no #ifdef anywhere above this
- * file and no way for the two to end up implementing different contracts.
+ * The only definition of every rad_dev_* / rad_stream_* / rad_event_* symbol. host.cpp and hip.cpp
+ * export vtables only, so there is no #ifdef above this file and both backends share one contract.
  *
- * The selection rule: a build with HIP still runs the host backend when the machine shows no
- * device. Having ROCm installed and having a card are separate facts -- a CI container with the
- * headers and no `/dev/kfd` is the normal case -- and the honest response is to say which backend
- * won at Info and carry on, not to fail at the first hipMalloc.
+ * A build with HIP still runs the host backend when no device is visible (e.g. a CI container
+ * with ROCm headers and no /dev/kfd); the chosen backend is logged at Info.
  */
 #include "device.h"
 #include "../rad_internal.h"
@@ -18,6 +15,7 @@
 #include <cstring>
 #include <atomic>
 #include <cstdlib>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <string>
@@ -27,9 +25,8 @@
 namespace rad {
 
 /* ------------------------------------------------------------------ the error slot */
-/* Thread-local and drained by reading, which is the ABI's own contract. One thread per rank plus
- * the mover (spec §1), so a fault reported on the wrong thread would name the wrong half of the
- * engine to an operator who has to decide whether to restart. */
+/* Thread-local and cleared by reading, per the ABI. Each rank and the mover run on their own
+ * thread (spec §1), so an error must stay on the thread that raised it. */
 static thread_local std::string t_last_error;
 
 void device_set_error(const char* f, ...) {
@@ -39,23 +36,16 @@ void device_set_error(const char* f, ...) {
     vsnprintf(buf, sizeof buf, f, ap);
     va_end(ap);
     t_last_error.assign(buf);
-    /* Debug rather than Error: most of these are answered by the caller (a pool that tries an
-     * allocation, finds it does not fit and asks the planner for a smaller one). The ones that are
-     * fatal are reported by whoever decided they were fatal, with context this layer does not have. */
+    /* Debug, not Error: callers often recover (e.g. a pool retrying smaller), and fatal ones are
+     * reported by the caller with more context. */
     RAD_DEBUG("device: %s", buf);
 }
 
 /* ------------------------------------------------------------------ selection */
 
-/* One line, listing every visible device by index and arch.
- *
- * This is not decoration. A machine reports more devices than it has accelerators: a workstation
- * with two discrete cards and an APU reports three, and the integrated one claims tens of GiB of
- * "VRAM" that is really system RAM. A --tp matching that count, or a planner that sums vram_bytes
- * across devices, is wrong in a way that shows up as a memory error much later -- and the arch
- * printed here is what tells the two kinds apart. The device layer does not filter -- which
- * devices are usable is the engine's decision and it has rad_dev_props to make it with -- but it
- * does not let the inventory go unsaid either (spec §16). */
+/* The startup line's list of every visible device by index and arch. A machine may report more
+ * devices than accelerators: an APU shows up beside discrete cards and claims system RAM as
+ * "VRAM". The arch tells them apart. Filtering is the engine's decision (via rad_dev_props). */
 static std::string device_inventory(const DeviceBackend* b) {
     std::string s;
     const int n = b->count();
@@ -68,15 +58,12 @@ static std::string device_inventory(const DeviceBackend* b) {
 }
 
 #if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
-/* COMPUTE WAVE SAVE/RESTORE OFF IS A GPU HANG WAITING FOR AN EVICTION. The driver evicts a
- * process's queues whenever host memory the card maps is moved or reclaimed under memory pressure,
- * and a serve with a host pool or a host KV tier maps gigabytes of it. With
- * amdgpu.cwsr_enable=0 it cannot preempt a running queue and waits for it to drain, which a queue
- * a serve keeps fed never does: the queue stops inside whatever kernel it was running, MES fails
- * REMOVE_QUEUE, and the driver resets the card. Said at startup because nothing later can tell
- * that hang from a kernel bug -- and said here, as the backend comes up, and not only in the
- * startup report: a hang during the load ends the process before the report prints, and the
- * tools that bring a backend up (rad-kbench, rad-tune) print no report at all. */
+/* With amdgpu.cwsr_enable=0 (compute wave save/restore off) a queue eviction hangs the GPU. The
+ * driver evicts a process's queues when card-mapped host memory is moved or reclaimed, and a serve
+ * maps gigabytes of it. Without CWSR the driver waits for the queue to drain, a busy queue never
+ * does, MES fails REMOVE_QUEUE and the card resets. Warned here as the backend comes up, not only
+ * in the startup report: a hang during load kills the process first, and rad-kbench and rad-tune
+ * print no report. */
 static void warn_cwsr_off() {
     FILE* f = std::fopen("/sys/module/amdgpu/parameters/cwsr_enable", "r");
     if (!f) return;
@@ -90,11 +77,10 @@ static void warn_cwsr_off() {
                  "amdgpu.cwsr_enable=1 (module option, then rebuild the initramfs and reboot)");
 }
 
-/* THE HOST BACKEND IN A BUILD THAT HAS HIP STILL COUNTS THE GPU CODE PLUGINS BRING. The
- * registration hooks are this build's own exported symbols and see every dlopen'ed kernel
- * library's fat binaries, card or no card, so the plugin loader can bracket each dlopen and know
- * which library brought device code. An engine serving here leaves that library's device rows out
- * of selection (Registry::set_no_device_code); a tool that only selects keeps them. */
+/* The host backend in a HIP build still counts plugin GPU code. This build's fat-binary
+ * registration hooks see every dlopen'ed kernel library, card or no card, so the plugin loader can
+ * tell which library brought device code. A serving engine drops those device rows from selection
+ * (Registry::set_no_device_code); a selection-only tool keeps them. */
 static DeviceBackend g_host_beside_hip;
 #endif
 
@@ -117,9 +103,7 @@ static const DeviceBackend* select_backend() {
     return b;
 }
 
-/* std::call_once rather than a function-local static, because the answer is read from every rank
- * thread and the guard variable's acquire load is the cheaper of the two on the paths that matter
- * -- and because a backend chosen twice would be a backend chosen differently twice. */
+/* Selected exactly once, under std::call_once; read from every rank thread. */
 static const DeviceBackend* g_backend = nullptr;
 static std::once_flag       g_once;
 
@@ -135,36 +119,22 @@ const char* device_backend_name() { return dev()->name; }
 
 /* ------------------------------------------------------------------ the ledger
  *
- * EVERY DEVICE ALLOCATION THIS ENGINE MAKES, COUNTED, because without it an unaccounted allocation
- * can only be found by sampling /sys/class/drm through startup and correlating the steps against
- * the log by eye.
+ * Counts every device allocation the engine makes. The VRAM budget (core/mem/vram_budget.cpp)
+ * spends the card down to --gpu-headroom-mib, so whatever lands outside the two pools and is not
+ * derived from the buffer plan or run configuration must be counted here.
  *
- * The VRAM budget (core/mem/vram_budget.cpp) spends the card down to --gpu-headroom-mib, which
- * only works if what lands outside the two pools is known. Most of it is known by construction:
- * the activation arena is computed from the buffer plan, the step batch staging from the run
- * configuration. Everything else has to be counted here, because an allocation nobody counts is an
- * allocation that eats the headroom and then fails somebody else's.
+ * Not seen: plugins that call hipMalloc directly (libr4d's split-tail workspaces and all-reduce
+ * peer scratch). Engine::start reads the card back after allocation for that reason.
  *
- * WHAT THIS DOES NOT SEE, and it is stated here because the number is only honest with the caveat
- * attached: a kernel plugin that calls hipMalloc itself goes nowhere near this file. libr4d does,
- * for its split-tail workspaces and its all-reduce peer scratch, and the engine's own accounting
- * cannot include them. Engine::start reads the card back after everything has allocated for
- * exactly that reason -- the ledger says what the core spent, the card says what was spent.
+ * RADIANCE_TRACE_ALLOC=N logs each allocation of at least N bytes.
  *
- * RADIANCE_TRACE_ALLOC=N logs every allocation of at least N bytes as it happens. That is the
- * instrument; the counters are the summary.
- *
- * RADIANCE_DEBUG_POISON_ALLOC=B fills every fresh DEVICE allocation with byte B (0..255) before
- * it is handed out, so a buffer that is read before anything wrote it shows up as garbage rather
- * than as the zeros a wiped card hands back by luck. A card that has just been through a driver
- * reset ("VRAM is lost") is that garbage for real, which is where such a read is otherwise first
- * seen. A correct engine serves the same output with it set. RADIANCE_DEBUG_POISON_RANGE=lo:hi
- * narrows the fill to device allocations with ordinal in [lo, hi) -- ordinals count from 1 in
- * allocation order ON THE ALLOCATING THREAD, the `#n on this thread` the trace prints -- to bisect
- * to the one allocation that matters. Both are instruments: the fill is synchronous, through one
- * stream per thread and device that lives until exit (a stream is a hardware queue, and creating
- * and destroying one per allocation is both slow and the queue churn ROCr's Trim path faults on).
- * A byte outside 0..255 or a range that does not parse is refused at the first allocation. */
+ * RADIANCE_DEBUG_POISON_ALLOC=B fills every fresh DEVICE allocation with byte B (0..255), so a
+ * read-before-write shows up as garbage instead of lucky zeros (as after a driver reset, "VRAM is
+ * lost"). A correct engine serves the same output with it set. RADIANCE_DEBUG_POISON_RANGE=lo:hi
+ * limits the fill to device allocations with ordinal in [lo, hi), counted from 1 per allocating
+ * thread (the trace's `#n on this thread`), for bisecting. The fill is synchronous on one stream
+ * per thread and device, kept until exit: a stream is a hardware queue, and per-allocation queue
+ * churn is slow and faults in ROCr's Trim path. Bad values abort at the first allocation. */
 namespace rad {
 namespace {
 
@@ -172,12 +142,14 @@ struct Ledger {
     std::atomic<int64_t> bytes{0};
     std::atomic<int64_t> count{0};
 };
-Ledger g_ledger[4];        /* indexed by RAD_MEM_*; see rad_dev_alloc below for the bound check */
+Ledger g_ledger[4];        /* indexed by RAD_MEM_*; rad_dev_alloc bounds the kind */
 
-/* Event handles, counted here and not in a backend so the number means the same on both. An
- * event a component forgets at teardown is reclaimed at exit and reported by nothing else, so
- * this is the one place such a leak shows. */
+/* Live event handles, counted here so the number is backend-independent; the only place an
+ * event leaked at teardown shows. */
 std::atomic<int64_t> g_live_events{0};
+/* Host blocks through the ABI (rad_event_sync, rad_stream_sync), counted here so a test can
+ * assert that a path never stops the host, whichever backend runs it. */
+std::atomic<int64_t> g_host_blocks{0};
 
 int64_t trace_floor() {
     static const int64_t v = [] {
@@ -232,17 +204,21 @@ const char* kind_name(int kind) {
 }  /* namespace */
 
 void rad_dev_alloc_totals(int kind, int64_t* bytes, int64_t* count) {
-    if (kind < 0 || kind >= 4) { if (bytes) *bytes = 0; if (count) *count = 0; return; }
+    if (kind < 0 || kind >= (int)std::size(g_ledger)) {
+        if (bytes) *bytes = 0;
+        if (count) *count = 0;
+        return;
+    }
     if (bytes) *bytes = g_ledger[kind].bytes.load(std::memory_order_relaxed);
     if (count) *count = g_ledger[kind].count.load(std::memory_order_relaxed);
 }
 
 int64_t rad_dev_live_events(void) { return g_live_events.load(std::memory_order_relaxed); }
+int64_t rad_dev_host_blocks(void) { return g_host_blocks.load(std::memory_order_relaxed); }
 
 
 /* ------------------------------------------------------------------ elastic memory */
-/* See device.h for what this is for. What is here is the interval arithmetic and the two
- * roundings; the backends do the mapping. */
+/* See device.h. Interval arithmetic and rounding here; the backends do the mapping. */
 
 namespace {
 std::atomic<int64_t> g_vmem_committed{0};
@@ -250,10 +226,8 @@ std::atomic<int64_t> g_vmem_committed{0};
 
 int64_t rad_dev_vmem_committed(void) { return g_vmem_committed.load(std::memory_order_relaxed); }
 
-/* BOTH HALVES OF THE QUESTION. A backend can carry the entries and still be running on a device
- * whose driver has no virtual memory manager -- d_vmem_granularity answers 0 there -- and a pool
- * that asked only whether the function pointers existed would reserve an address range it could
- * never back, then fail at the first commit instead of sizing itself whole at startup. */
+/* Both checks: a backend may have the entries on a driver with no virtual memory manager
+ * (granularity 0). Checking only the pointers would reserve a range that can never be backed. */
 bool    VMem::supported()   { return dev()->vmem_reserve != nullptr && VMem::granularity() > 0; }
 int64_t VMem::granularity() {
     if (!dev()->vmem_granularity) return 0;
@@ -271,8 +245,7 @@ int VMem::reserve(int64_t bytes, int64_t align) {
     const int64_t g = granularity();
     if (g <= 0) return RAD_E_UNSUPPORTED;
     if (align <= 0) align = g;
-    /* ROUNDED UP TO A GRANULE, because the last granule of a range that is not a whole number of
-     * them can never be committed and the bytes in it are then reserved and unreachable. */
+    /* Round up to a granule: a partial last granule could never be committed. */
     const int64_t want = align_up(bytes, g);
     void* p = dev()->vmem_reserve(want, align);
     if (!p) return RAD_E_NOMEM;
@@ -285,9 +258,8 @@ int VMem::reserve(int64_t bytes, int64_t align) {
 
 void VMem::release() {
     if (!base_) { size_ = 0; committed_ = 0; ext_.clear(); return; }
-    /* A range released with pages still in it leaks the pages and, on some drivers, refuses the
-     * address free as well -- so the teardown order is fixed here rather than asked of callers.
-     * Granule at a time, because that is how each of them was mapped. */
+    /* Decommit before release: releasing a range with pages still mapped leaks them, and some
+     * drivers refuse the free. One granule at a time, as each was mapped. */
     const int64_t g = granularity();
     for (const auto& e : ext_) {
         if (dev()->vmem_decommit && g > 0)
@@ -309,29 +281,20 @@ bool VMem::is_committed(int64_t off, int64_t bytes) const {
         if (off >= e.first && off + bytes <= e.first + e.second) return true;
     return false;                       /* extents are merged, so one of them covers it or none does */
 }
-/* WHAT TO MAP IS COMPUTED BEFORE ANYTHING IS MAPPED, and that is not a style choice. add_extent
- * MERGES, so the list this walk is reading rearranges itself under the walk the moment a gap is
- * filled -- the cursor then lands past the end of a list that just got shorter and the tail of the
- * request is mapped a second time. On the host backend a double map silently succeeds and only
- * the accounting is wrong; on a card the driver refuses it and a pool fails to grow.
+/* The granules to map are gathered before mapping any: add_extent merges, so walking ext_ while
+ * mapping would skip entries and map the tail twice (the driver refuses a double map).
  *
- * ONE GRANULE PER CALL, AND THE ACCESS OVER THE RUN. Both halves of that are the driver's rule
- * rather than a preference, and they pull in opposite directions:
- *
- *   A mapping can only be unbacked exactly as it was backed, so a run mapped in one call is a run
- *   that can only be released whole. Mapping the granules separately is what lets a pool hand back
- *   the top of its range while it keeps the rest, which is the entire purpose of an elastic pool.
- *
- *   Access, though, cannot be granted per granule: a granule that sits against an already-
- *   accessible one is refused on its own and accepted as part of the contiguous run containing
- *   both. So the maps are named one at a time and the access is named once, over every extent the
- *   new granules ended up part of -- which add_extent has already merged by then. Re-granting
- *   access over a range that has it is free and is what makes that simple. */
+ * Driver rules:
+ *   - A mapping can only be unbacked exactly as it was backed, so each granule is mapped
+ *     separately; that lets the pool hand back the top of its range.
+ *   - Access cannot be granted per granule: a granule adjacent to an accessible one is refused on
+ *     its own. Access is granted once per merged extent the new granules belong to; re-granting
+ *     access to a range is free. */
 int VMem::commit(int64_t off, int64_t bytes) {
     if (!base_ || bytes <= 0) return bytes <= 0 ? RAD_OK : RAD_E_INVAL;
     const int64_t g = granularity();
     if (g <= 0) return RAD_E_UNSUPPORTED;
-    /* OUTWARD: the caller asked for these bytes and must get all of them. */
+    /* Round outward: every requested byte must be committed. */
     const int64_t lo = (off < 0 ? 0 : off / g * g);
     int64_t hi = align_up(off + bytes, g);
     if (hi > size_) hi = size_;
@@ -343,9 +306,8 @@ int VMem::commit(int64_t off, int64_t bytes) {
         if (!is_committed(o, g)) want.push_back(o);
     if (want.empty()) return RAD_OK;
 
-    /* A failure part way through leaves what already mapped mapped AND RECORDED. Half a grow is a
-     * smaller pool, which the caller can live with; half a grow the bookkeeping has forgotten is
-     * memory this process can neither use nor return. */
+    /* On a failure part way, what already mapped stays mapped and recorded: a partial grow is
+     * usable, untracked mappings are not. */
     int rc = RAD_OK;
     size_t took = 0;
     for (; took < want.size(); ++took) {
@@ -354,9 +316,7 @@ int VMem::commit(int64_t off, int64_t bytes) {
         add_extent(want[took], g);
     }
 
-    /* AND THE ACCESS IS GRANTED EVEN WHEN THE GROW STOPPED SHORT, for the same reason. A pool that
-     * got half of what it asked for is one the caller can live with; one whose new granules are
-     * mapped and unreachable is not, and the granules that did map are in the run either way. */
+    /* Grant access even if the grow stopped short, so the granules that did map are usable. */
     int prc = RAD_OK;
     if (took > 0 && dev()->vmem_protect) {
         for (const auto& e : ext_) {
@@ -366,9 +326,8 @@ int VMem::commit(int64_t off, int64_t bytes) {
         }
     }
     if (prc < 0) {
-        /* MAPPED BUT UNREACHABLE IS WORSE THAN NOT MAPPED: the VRAM is spent and the first kernel
-         * to touch it faults. Give back exactly what this call took and leave the rest, which is
-         * reachable and was before. */
+        /* Mapped but inaccessible memory faults the first kernel that touches it. Undo exactly
+         * what this call mapped; earlier extents were already accessible. */
         for (size_t i = 0; i < took; ++i) {
             if (dev()->vmem_decommit) (void)dev()->vmem_decommit((char*)base_ + want[i], g);
             drop_extent(want[i], g);
@@ -382,14 +341,13 @@ int VMem::decommit(int64_t off, int64_t bytes) {
     if (!base_ || bytes <= 0) return bytes <= 0 ? RAD_OK : RAD_E_INVAL;
     const int64_t g = granularity();
     if (g <= 0) return RAD_E_UNSUPPORTED;
-    /* INWARD: a granule holding one byte the caller still wants stays. */
+    /* Round inward: a granule holding any byte outside the range stays. */
     const int64_t lo = align_up(off < 0 ? 0 : off, g);
     int64_t hi = (off + bytes) / g * g;
     if (hi > size_) hi = size_;
     if (lo >= hi) return RAD_OK;
 
-    /* Gathered first, for the same reason as commit, and unmapped one granule at a time because
-     * that is how each was mapped. */
+    /* Gathered first and unmapped per granule, as in commit. */
     std::vector<int64_t> drop;
     for (int64_t o = lo; o < hi; o += g)
         if (is_committed(o, g)) drop.push_back(o);
@@ -405,9 +363,8 @@ int VMem::decommit(int64_t off, int64_t bytes) {
 void VMem::add_extent(int64_t off, int64_t bytes) {
     committed_ += bytes;
     g_vmem_committed.fetch_add(bytes, std::memory_order_relaxed);
-    /* Insert in order, then absorb any neighbour it touches. Merging is not cosmetic: an extent
-     * list that grows by one per commit turns is_committed() into a scan of every call ever made,
-     * and the pool that uses this grows a granule at a time. */
+    /* Insert in order, then merge touching neighbours, so is_committed() stays a short scan
+     * although pools grow one granule at a time. */
     size_t i = 0;
     while (i < ext_.size() && ext_[i].first < off) ++i;
     ext_.insert(ext_.begin() + (long)i, { off, bytes });
@@ -423,9 +380,8 @@ void VMem::add_extent(int64_t off, int64_t bytes) {
     }
 }
 
-/* The inverse, and it takes a piece that lies WHOLLY INSIDE one extent by construction -- decommit
- * clips every part it gathers to the extent it came from. What is left of that extent is nothing,
- * a head, a tail, or both. */
+/* Precondition: the piece lies wholly inside one extent (decommit only drops committed granules).
+ * What remains of that extent is nothing, a head, a tail, or both. */
 void VMem::drop_extent(int64_t off, int64_t bytes) {
     committed_ -= bytes;
     g_vmem_committed.fetch_sub(bytes, std::memory_order_relaxed);
@@ -460,12 +416,11 @@ int  rad_dev_props(int device, RadDeviceProps* o)  { return dev()->props(device,
 int  rad_dev_enable_peer(int self, int peer)      { return dev()->enable_peer(self, peer); }
 
 void* rad_dev_alloc(int64_t bytes, int kind) {
-    /* The poison range is over THIS THREAD's device allocations, because a rank brings itself up on
-     * its own thread in a fixed order while the threads interleave freely: a process-wide ordinal
-     * would name a different allocation on every run, and a bisect over it would not converge. */
+    /* Poison ordinals are per thread: each rank allocates in a fixed order on its own thread, but
+     * threads interleave, so a process-wide ordinal would not be repeatable. */
     thread_local int64_t t_device_ordinal = 0;
     void* p = dev()->alloc(bytes, kind);
-    if (p && kind >= 0 && kind < 4) {
+    if (p && kind >= 0 && kind < (int)std::size(rad::g_ledger)) {
         rad::g_ledger[kind].bytes.fetch_add(bytes, std::memory_order_relaxed);
         const int64_t total = rad::g_ledger[kind].count.fetch_add(1, std::memory_order_relaxed) + 1;
         const int64_t ordinal = kind == RAD_MEM_DEVICE ? ++t_device_ordinal : total;
@@ -475,8 +430,7 @@ void* rad_dev_alloc(int64_t bytes, int kind) {
                      rad::kind_name(kind), rad::humanb(bytes).c_str(), (long long)ordinal,
                      (long long)rad::g_ledger[kind].bytes.load(std::memory_order_relaxed),
                      (long long)total);
-        /* The poison fill (see the top of this file). Through the backend's own stream so it
-         * holds on both backends; synchronous, so the bytes are there before the caller sees p. */
+        /* Poison fill (see the ledger header): synchronous, so it lands before p is returned. */
         const int poison = rad::poison_byte();
         if (poison >= 0 && kind == RAD_MEM_DEVICE && rad::poison_in_range(ordinal)) {
             RadStream& s = t_poison_stream[t_device];
@@ -493,9 +447,8 @@ void* rad_dev_alloc(int64_t bytes, int kind) {
     return p;
 }
 void  rad_dev_free(void* p, int kind) {
-    /* The ledger tracks what was TAKEN, not what is live: rad_dev_free has no size and the
-     * backends do not keep one. Every caller in this engine frees at teardown and nowhere else,
-     * so the two numbers differ only after the run is over. */
+    /* The ledger counts allocations, not live bytes: rad_dev_free has no size. The engine frees
+     * only at teardown, so the two agree while running. */
     dev()->free(p, kind);
 }
 void* rad_dev_host_ptr(void* p)                   { return dev()->host_ptr(p); }
@@ -503,7 +456,10 @@ void* rad_dev_device_ptr(void* p)                 { return dev()->device_ptr(p);
 
 int  rad_stream_create(RadStream* out, int hi)    { return dev()->stream_create(out, hi); }
 void rad_stream_destroy(RadStream s)              { dev()->stream_destroy(s); }
-int  rad_stream_sync(RadStream s)                 { return dev()->stream_sync(s); }
+int  rad_stream_sync(RadStream s) {
+    rad::g_host_blocks.fetch_add(1, std::memory_order_relaxed);
+    return dev()->stream_sync(s);
+}
 
 }  /* extern "C" */
 
@@ -537,38 +493,29 @@ int     tape_set_overlap(RadTape t, int i, bool on) {
     return dev()->tape_set_overlap ? dev()->tape_set_overlap(t, i, on ? 1 : 0) : RAD_E_UNSUPPORTED;
 }
 bool    dev_integrated(int device) { return dev()->integrated && dev()->integrated(device) > 0; }
-/* A FAILURE ANSWERED HERE, as "", is not one for the next reader of rad_dev_last_error: that
- * reader is reporting a failure of its own and would name this one instead. The slot is put back
- * as the call found it. */
-std::string dev_pci_address(int device) {
-    char buf[64] = { 0 };
-    if (!dev()->pci_address) return std::string();
+/* These getters answer "" on failure and restore the error slot, so the next
+ * rad_dev_last_error reader does not see an unrelated error. `get` fills a buffer of `n` bytes. */
+template <class Get> static std::string dev_string(int n, Get get) {
+    std::string buf((size_t)n, '\0');
     const std::string before = t_last_error;
-    if (dev()->pci_address(device, buf, (int)sizeof buf) < 0) {
+    if (get(buf.data(), n) < 0) {
         t_last_error = before;
         return std::string();
     }
+    buf.resize(std::strlen(buf.c_str()));
     return buf;
+}
+std::string dev_pci_address(int device) {
+    if (!dev()->pci_address) return std::string();
+    return dev_string(64, [&](char* b, int n) { return dev()->pci_address(device, b, n); });
 }
 std::string dev_dma_lane(int device) {
-    char buf[256] = { 0 };
     if (!dev()->dma_lane) return std::string();
-    const std::string before = t_last_error;
-    if (dev()->dma_lane(device, buf, (int)sizeof buf) < 0) {
-        t_last_error = before;
-        return std::string();
-    }
-    return buf;
+    return dev_string(256, [&](char* b, int n) { return dev()->dma_lane(device, b, n); });
 }
 std::string dev_runtime_version() {
-    char buf[128] = { 0 };
     if (!dev()->runtime_version) return std::string();
-    const std::string before = t_last_error;
-    if (dev()->runtime_version(buf, (int)sizeof buf) < 0) {
-        t_last_error = before;
-        return std::string();
-    }
-    return buf;
+    return dev_string(128, [&](char* b, int n) { return dev()->runtime_version(b, n); });
 }
 int     dev_peer_access(int self, int peer) {
     if (self == peer) return 1;
@@ -604,7 +551,10 @@ void rad_event_destroy(RadEvent e) {
 int  rad_event_record(RadEvent e, RadStream s)    { return dev()->event_record(e, s); }
 int  rad_event_wait(RadStream s, RadEvent e)      { return dev()->event_wait(s, e); }
 int  rad_event_query(RadEvent e)                  { return dev()->event_query(e); }
-int  rad_event_sync(RadEvent e)                   { return dev()->event_sync(e); }
+int  rad_event_sync(RadEvent e) {
+    rad::g_host_blocks.fetch_add(1, std::memory_order_relaxed);
+    return dev()->event_sync(e);
+}
 void rad_dev_host_wrote(void)                     { dev()->host_wrote(); }
 int  rad_event_elapsed_ms(RadEvent a, RadEvent b, float* out) {
     return dev()->event_elapsed_ms(a, b, out);
@@ -673,9 +623,22 @@ void* rad_dev_alloc_uncached(int64_t bytes) {
 void rad_dev_free_uncached(void* p) {
     if (const auto f = dev()->free_uncached) f(p);
 }
+int rad_stream_gate(RadStream s, void** gate) {
+    if (gate) *gate = nullptr;
+    if (const auto f = dev()->stream_gate) return f(s, gate);
+    rad::device_set_error("rad_stream_gate: the %s backend has no gates", dev()->name);
+    return RAD_E_UNSUPPORTED;
+}
+int rad_gate_open(void* gate) {
+    if (const auto f = dev()->gate_open) return f(gate);
+    return RAD_E_UNSUPPORTED;
+}
+int64_t rad_gate_room(RadStream s) {
+    if (const auto f = dev()->gate_room) return f(s);
+    return 0;
+}
 
-/* Cleared by reading it, per the header. Never null: a caller printing "%s" on a path where
- * nothing failed should get an empty line, not a segfault. */
+/* Cleared by reading. Never null; "" when nothing failed. */
 const char* rad_dev_last_error(void) {
     static thread_local std::string drained;
     drained.swap(rad::t_last_error);

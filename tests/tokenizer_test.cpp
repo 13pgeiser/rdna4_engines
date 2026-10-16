@@ -1,16 +1,15 @@
 /* tokenizer_test.cpp -- the encoder against its reference, and the parts under it.
  *
- * THE REFERENCE is tools/tokref: an encoder built on llama.cpp's structural splitters, std::regex
- * for every other pattern and a string-keyed merge. It shares no code with what it checks. The
- * differential tests here hold the engine's splitter and encoder (`encode_new`) to it over tens of
- * thousands of random strings, and every place the two are ALLOWED to differ is a place the
- * reference is wrong about HuggingFace -- tokref.h lists them -- so each one has its own test
- * saying exactly what the difference is and that the engine's side is HuggingFace's answer.
+ * The reference is tools/tokref: an encoder built on llama.cpp's structural splitters, std::regex
+ * for every other pattern and a string-keyed merge; it shares no code with the engine. The
+ * differential tests hold the engine's splitter and encoder (`encode_new`) to it over tens of
+ * thousands of random strings. Every allowed difference is a place the reference is wrong about
+ * HuggingFace (listed in tokref.h), and each has its own test showing the engine gives
+ * HuggingFace's answer.
  *
- * Then the parts: the merge on small vocabularies whose answers are worked out by hand, the linear
- * and heap merges against each other, special-token priority, the NFC shortcut against the full
- * normaliser, and the segment cache -- cold, warm, evicted, across a growing conversation, and
- * under concurrent encodes.
+ * Then the parts: the merge on small vocabularies worked out by hand, the linear and heap merges
+ * against each other, special-token priority, the NFC shortcut against the full normaliser, and
+ * the segment cache (cold, warm, evicted, across a growing conversation, under concurrent encodes).
  */
 #include "rad_test.h"
 #include "tokenizer_fixture.h"
@@ -19,13 +18,16 @@
 #include "rad_internal.h"
 #include "text/tokenizer_bpe.h"
 #include "text/tokenizer_nfc.h"
+#include "text/token_view.h"
 #include "text/unicode_norm.h"
+#include "sample/gbnf.h"
 #include "llama/src/unicode.h"
 
 #include <atomic>
 #include <cstring>
 #include <cstdio>
 #include <map>
+#include <set>
 #include <thread>
 
 using namespace rad;
@@ -35,8 +37,8 @@ namespace {
 
 /* ------------------------------------------------------------------ helpers */
 
-/* Compiled once per pattern: compiling is a load-time cost and the tests split thousands of
- * strings with each one. */
+/* Compiled once per pattern: compiling is a load-time cost, and the tests split thousands of
+ * strings with each pattern. */
 const TokRegex* compiled(const char* pattern) {
     static std::map<std::string, std::unique_ptr<TokRegex>> cache;
     auto it = cache.find(pattern);
@@ -146,15 +148,15 @@ const VocabBuild& trained() {
 
 /* ================================================================== splits against the reference */
 
-/* THE SPLITTER AGAINST THE REFERENCE, on every pattern the reference implements: its structural
- * splitters (GPT-2, Llama-3, Qwen2, Qwen3.5, in both spellings llama.cpp keys them on,
- * and "[^\n]+|[\n]+") and patterns it runs through std::regex (MiniCPM5's two, the GGUF defaults,
- * the gpt-4o adaptation). The text has every general category, marks and ZWJ sequences, CJK,
- * Hangul and RTL, digit runs of every length, every kind of whitespace including CRLF and the
- * Unicode spaces, contractions in mixed case, and bytes that are not UTF-8.
+/* The splitter against the reference on every pattern the reference implements: its structural
+ * splitters (GPT-2, Llama-3, Qwen2, Qwen3.5, in both spellings llama.cpp keys them on, and
+ * "[^\n]+|[\n]+") and patterns it runs through std::regex (MiniCPM5's two, the GGUF defaults, the
+ * gpt-4o adaptation). The text covers every general category, marks and ZWJ sequences, CJK,
+ * Hangul and RTL, digit runs of every length, every whitespace kind including CRLF and the
+ * Unicode spaces, mixed-case contractions, and invalid UTF-8.
  *
- * Two inputs are held out, each with its own test below: the codepoints the two category tables
- * disagree on, and -- for the `(?i)` spelling only -- an apostrophe before U+017F. */
+ * Two inputs are held out, each tested below: codepoints the two category tables disagree on,
+ * and (for the `(?i)` spelling only) an apostrophe before U+017F. */
 TEST(splits_match_the_reference_splitters) {
     struct P { const char* pattern; bool ci; };
     const P patterns[] = {
@@ -180,7 +182,7 @@ TEST(splits_match_the_reference_splitters) {
         TextGen g(1234);
         int bad = 0;
         /* Few long strings rather than many short ones: the reference builds a std::regex per
-         * call for the patterns it has no splitter for. */
+         * call for patterns it has no splitter for. */
         for (int i = 0; i < 160; ++i) {
             const std::string s = g.text(1 + g.pick(i < 80 ? 40 : 1200), /*junk=*/true, tables_disagree);
             if (p.ci && s.find(long_s) != std::string::npos) continue;
@@ -193,7 +195,7 @@ TEST(splits_match_the_reference_splitters) {
         }
         CHECK_EQ(bad, 0);
     }
-    CHECK(compared > (size_t)15 << 20 >> 4);
+    CHECK(compared > (size_t)960 * 1024);   /* the run compared ~1 MB, not an empty loop */
 }
 
 /* Digit runs of every length and whitespace of every shape, exhaustively, since the structural
@@ -226,9 +228,9 @@ TEST(splits_match_the_reference_on_every_digit_run_and_whitespace_run) {
 
 /* ================================================================== where the reference is wrong */
 
-/* THE REFERENCE REWRITES `(?i:'s|...)` INTO `'[sS]|...`, which loses U+017F: Oniguruma folds
- * LATIN SMALL LETTER LONG S to 's', so "'ſ" is a contraction to HuggingFace. The pieces below are
- * HuggingFace's. Only the (?i) spelling is affected; llama.cpp's expanded one has no ſ in it. */
+/* The reference rewrites `(?i:'s|...)` as `'[sS]|...`, which loses U+017F: Oniguruma folds LATIN
+ * SMALL LETTER LONG S to 's', so "'ſ" is a contraction to HuggingFace. The expected pieces are
+ * HuggingFace's. Only the (?i) spelling is affected; llama.cpp's expanded one has no ſ. */
 TEST(long_s_is_a_contraction_under_case_folding_as_in_huggingface) {
     const std::string s = "x'\xc5\xbfy it'S";
     const std::vector<std::string> want = { "x", "'\xc5\xbf", "y", " it", "'S" };
@@ -239,10 +241,10 @@ TEST(long_s_is_a_contraction_under_case_folding_as_in_huggingface) {
     CHECK(new_split(expanded, s) == tokref::split(expanded, s));
 }
 
-/* THE TWO CATEGORY TABLES DIFFER BY UNICODE 16.0 AND BY NOTHING ELSE: every codepoint they
- * disagree on is unassigned in llama.cpp's and assigned in Oniguruma's, and there are 5185 of
- * them. A split over one of them follows Oniguruma's category, as HuggingFace does -- U+10D40 GARAY
- * DIGIT ZERO is a digit and U+10D6E GARAY HYPHEN is punctuation. */
+/* The two category tables differ only by Unicode 16.0: each of the 5185 codepoints they disagree
+ * on is unassigned in llama.cpp's and assigned in Oniguruma's. A split follows Oniguruma's
+ * category, as HuggingFace does: U+10D40 GARAY DIGIT ZERO is a digit and U+10D6E GARAY HYPHEN is
+ * punctuation. */
 TEST(the_category_tables_differ_only_by_what_unicode_16_assigned) {
     size_t n = 0, bad = 0;
     for (uint32_t c = 0; c < 0x110000; ++c) {
@@ -259,8 +261,8 @@ TEST(the_category_tables_differ_only_by_what_unicode_16_assigned) {
     CHECK(tokref::split(k_qwen35, s) != want);
 }
 
-/* `\p{Han}+` IS NOT KIMI-K2's PATTERN, it is llama.cpp's key for a splitter approximating it.
- * The GGUF table carries the real pattern, whose letter classes split camel case. */
+/* `\p{Han}+` is not Kimi-K2's pattern but llama.cpp's key for a splitter approximating it. The
+ * GGUF table carries the real pattern, whose letter classes split camel case. */
 TEST(the_kimi_k2_entry_is_the_real_pattern) {
     const char* k2 =
         "[\\p{Han}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
@@ -288,9 +290,9 @@ TEST(a_wide_lookahead_is_refused_where_the_reference_approximated_it) {
 
 namespace {
 
-/* A byte-level vocabulary small enough to work every answer out on paper. "c c" merges to text
+/* A byte-level vocabulary small enough to work every answer out by hand. "c c" merges to text
  * that is not a token, which blocks "c ab" -> "cab" behind it; "Ġab" is a user-defined token the
- * raw text can only reach through the byte-level mapping. */
+ * raw text reaches only through the byte-level mapping. */
 const char* k_tiny = R"JSON({
   "added_tokens": [ {"id": 12, "content": "<|end|>", "special": true},
                     {"id": 13, "content": "Ġab", "special": false} ],
@@ -349,10 +351,10 @@ TEST(bpe_merges_as_worked_out_by_hand) {
     }
 }
 
-/* `ignore_merges`: "abc" is a vocabulary entry the one merge cannot reach, so the flag is the only
- * way to get it. It applies to each pre-token after the declared chain (the Lowercase normalizer
- * and the whitespace split run first), and on both ByteLevel paths: the deferred one that merges
- * raw bytes, and the materialised one a later Split forces. */
+/* `ignore_merges`: "abc" is a vocabulary entry the one merge cannot reach, so only the flag
+ * produces it. It applies to each pre-token after the declared chain (the Lowercase normalizer
+ * and whitespace split run first), on both ByteLevel paths: the deferred one that merges raw
+ * bytes, and the materialised one a later Split forces. */
 TEST(bpe_ignore_merges_takes_a_whole_pretoken) {
     const char* chains[] = {
         R"({"type":"WhitespaceSplit"})",
@@ -385,7 +387,7 @@ TEST(bpe_ignore_merges_takes_a_whole_pretoken) {
 }
 
 /* A control token read as text stays text: the flag must not turn its spelling back into the
- * marker when the caller asked for specials not to be parsed. */
+ * marker when specials are not parsed. */
 TEST(bpe_ignore_merges_leaves_unparsed_control_tokens_as_text) {
     auto v = from_json(R"JSON({
       "added_tokens":[{"id":4,"content":"abc","special":true}],
@@ -420,9 +422,9 @@ TEST(byte_fallback_and_unk_follow_the_declared_chain) {
     }
 }
 
-/* THE LINEAR AND HEAP MERGES PICK THE SAME PAIR AT EVERY STEP: lowest rank, then leftmost. Held
- * to each other on random words over a random merge table dense enough that most words merge
- * many times, with results that are and are not tokens. */
+/* The linear and heap merges pick the same pair at every step: lowest rank, then leftmost.
+ * Checked on random words over a random merge table dense enough that most words merge many
+ * times, with results that are and are not tokens. */
 TEST(linear_and_heap_merges_agree) {
     std::mt19937 rng(99);
     MergeTable mt;
@@ -450,11 +452,11 @@ TEST(linear_and_heap_merges_agree) {
 
 /* ================================================================== the whole encoder against the reference */
 
-/* Trained vocabularies, every chain shape the encoder takes a different route through: the
- * byte-level fast path (Split then ByteLevel, merged on raw bytes), two Splits, ByteLevel with
- * its own regex and prefix space, ByteLevel before a Split (the mapped text is split and merged),
- * NFC, special and user-defined tokens including one that is a prefix of another, SentencePiece's
- * Metaspace with byte fallback, WordPiece and Unigram. */
+/* Trained vocabularies over every chain shape the encoder routes differently: the byte-level fast
+ * path (Split then ByteLevel, merged on raw bytes), two Splits, ByteLevel with its own regex and
+ * prefix space, ByteLevel before a Split (the mapped text is split and merged), NFC, special and
+ * user-defined tokens including one that prefixes another, SentencePiece Metaspace with byte
+ * fallback, WordPiece and Unigram. */
 TEST(the_encoder_matches_the_reference_on_trained_vocabularies) {
     const std::vector<std::pair<std::string, uint8_t>> specials = {
         { "<|im_start|>", RAD_TT_CONTROL }, { "<|im_end|>", RAD_TT_CONTROL }, { "<|im", RAD_TT_CONTROL },
@@ -568,9 +570,8 @@ TEST(the_encoder_matches_the_reference_on_trained_vocabularies) {
     }
 }
 
-/* A TEXT THAT OPENS WITH BOS GETS NO SECOND ONE. A client rendering its own chat template writes
- * the BOS into the prompt; one the text spells anywhere else, or a second one at the start, is
- * the client's and stays. */
+/* A text that opens with BOS gets no second one: a client rendering its own chat template writes
+ * the BOS itself. A BOS spelled anywhere else, or a second one at the start, is kept. */
 TEST(a_text_that_opens_with_bos_gets_no_second_one) {
     VocabBuild vb;
     REQUIRE(parse_tokenizer_json_buf(k_tiny, "test.json", vb) >= 0);
@@ -594,7 +595,7 @@ TEST(a_text_that_opens_with_bos_gets_no_second_one) {
     CHECK(enc("<|end|>x", true, false) == (std::vector<int32_t>{ 12, 11 }));
 }
 
-/* SPECIAL TOKENS ARE CLAIMED LONGEST FIRST, not leftmost: "bcde" wins over "ab" in "abcde" even
+/* Special tokens are claimed longest first, not leftmost: "bcde" beats "ab" in "abcde" even
  * though "ab" starts earlier, and "<|im_start|>" is never cut by its prefix "<|im". */
 TEST(special_tokens_are_claimed_by_priority) {
     VocabBuild vb = trained();
@@ -620,9 +621,9 @@ TEST(special_tokens_are_claimed_by_priority) {
 
 /* ================================================================== NFC */
 
-/* NORMALISING ONLY AROUND WHAT CAN CHANGE IS NORMALISING THE WHOLE TEXT. Every codepoint on its
- * own, then random runs of starters, marks in and out of canonical order, Hangul jamo, composed
- * and decomposed forms, and bytes that are not UTF-8. */
+/* Normalising only around what can change equals normalising the whole text. Checked on every
+ * codepoint alone, then random runs of starters, marks in and out of canonical order, Hangul
+ * jamo, composed and decomposed forms, and invalid UTF-8. */
 TEST(nfc_between_boundaries_is_the_whole_text_normalised) {
     size_t bad = 0;
     for (uint32_t c = 0; c < 0x110000; ++c) {
@@ -723,8 +724,8 @@ TEST(the_cache_returns_what_encoding_returns_cold_warm_and_evicted) {
     cached.set_cache_limit(Tokenizer::kSegmentCacheDefault);
 }
 
-/* A GROWING CONVERSATION costs its new turn: every earlier message is a hit, and the ids of every
- * turn are the uncached ids. */
+/* A growing conversation costs its new turn: every earlier message is a hit, and every turn's
+ * ids equal the uncached ids. */
 TEST(the_cache_serves_a_growing_conversation_exactly) {
     auto v = chat_vocab();
     REQUIRE(v != nullptr);
@@ -748,8 +749,7 @@ TEST(the_cache_serves_a_growing_conversation_exactly) {
     CHECK_EQ(cached.cache_stats().entries, (size_t)0);
 }
 
-/* CONCURRENT ENCODES, sharing prefixes and evicting under each other, each get the uncached
- * answer. */
+/* Concurrent encodes that share prefixes and evict each other each get the uncached answer. */
 TEST(the_cache_is_exact_under_concurrent_encodes) {
     auto v = chat_vocab();
     REQUIRE(v != nullptr);
@@ -784,6 +784,240 @@ TEST(the_cache_is_exact_under_concurrent_encodes) {
     CHECK(s.bytes <= s.limit);
     CHECK(s.hits > 0);
     shared.set_cache_limit(Tokenizer::kSegmentCacheDefault);
+}
+
+/* ================================================================== the character-class pre-tokenisers */
+
+/* HuggingFace's Whitespace, WhitespaceSplit, BertPreTokenizer, Punctuation under every behaviour
+ * and Digits both ways: the engine (their equivalent patterns through the Split machinery)
+ * against the reference (each written from HuggingFace's character predicate), on random text
+ * over every general category. The WordPiece vocabulary holds every character of the texts alone
+ * and as a "##" continuation, so the ids spell out exactly where each pre-token starts. text_test
+ * holds both to HuggingFace's own answers on one line. */
+TEST(character_class_pre_tokenizers_match_the_reference) {
+    TextGen gen(900);
+    std::vector<std::string> texts;
+    std::set<uint32_t> cps;
+    for (int i = 0; i < 300; ++i) {
+        texts.push_back(gen.text(1 + gen.pick(40)));
+        for (uint32_t c : unicode_cpts_from_utf8(texts.back())) cps.insert(c);
+    }
+    VocabBuild base;
+    base.kind = RAD_TOK_WORDPIECE;
+    base.tokens = { "[UNK]" };
+    for (uint32_t c : cps) {
+        base.tokens.push_back(cp_utf8(c));
+        base.tokens.push_back("##" + cp_utf8(c));
+    }
+    base.unk = 0;
+    auto with = [&](std::vector<VocabStep> steps) {
+        VocabBuild vb = base;
+        vb.steps = std::move(steps);
+        return load(std::move(vb));
+    };
+    auto step = [](uint32_t kind, uint32_t flags, int64_t iarg) {
+        VocabStep s;
+        s.kind = kind;
+        s.flags = flags;
+        s.iarg = iarg;
+        return s;
+    };
+    struct Chain { const char* name; std::shared_ptr<const Vocab> v; };
+    std::vector<Chain> chains = {
+        { "Whitespace",        with({ step(RAD_PRE_WHITESPACE, kPreWhitespace, 0) }) },
+        { "WhitespaceSplit",   with({ step(RAD_PRE_WHITESPACE, kPreWhitespaceSplit, 0) }) },
+        { "Bert",              with({ step(RAD_PRE_WHITESPACE, kPreBert, 0) }) },
+        { "Digits",            with({ step(RAD_PRE_DIGITS, 0, 0) }) },
+        { "Digits individual", with({ step(RAD_PRE_DIGITS, 1, 0) }) },
+    };
+    static const char* behaviours[] = { "Punctuation Removed", "Punctuation Isolated",
+                                        "Punctuation MergedWithPrevious",
+                                        "Punctuation MergedWithNext", "Punctuation Contiguous" };
+    for (int b = 0; b < 5; ++b)
+        chains.push_back({ behaviours[b], with({ step(RAD_PRE_PUNCTUATION, 0, b) }) });
+    for (const Chain& c : chains) {
+        REQUIRE(c.v != nullptr);
+        CHECK_EQ(compare_encoders(c.name, c.v, (int)texts.size(),
+                                  [&](int i) { return texts[(size_t)i]; }, false), 0);
+    }
+}
+
+/* ================================================================== the streaming decoder */
+
+namespace {
+
+/* A byte-level vocabulary for the streaming cases: every byte, merges trained on mixed text, and
+ * two control tokens. */
+std::shared_ptr<const Vocab> stream_vocab() {
+    static std::shared_ptr<const Vocab> v = [] {
+        TextGen gen(41);
+        std::string corpus;
+        for (int i = 0; i < 40; ++i) corpus += gen.text(80) + " </tool_call> Q: ";
+        VocabBuild vb = train_bytelevel(corpus, k_qwen35, 300);
+        VocabStep dec;
+        dec.kind = RAD_DEC_BYTELEVEL;
+        vb.steps = { split_step(k_qwen35), bytelevel_step(), dec };
+        add_specials(vb, { { "<|im_start|>", RAD_TT_CONTROL }, { "<|im_end|>", RAD_TT_CONTROL } });
+        return load(std::move(vb));
+    }();
+    return v;
+}
+
+}  /* namespace */
+
+/* What a stream emits is final text: for random id streams (single bytes that leave characters
+ * unfinished or malformed, merged pieces, control tokens), every push() is well-formed UTF-8, the
+ * pushes plus flush() are the whole decode with broken bytes replaced, and with a stop string
+ * drawn from that decode what has been emitted at every point is text before the stop's first
+ * occurrence, and at the end all of it. Seeded; the failing seed and stream are printed. */
+TEST(a_stream_emits_well_formed_final_text_and_never_a_stop_string) {
+    auto v = stream_vocab();
+    REQUIRE(v != nullptr);
+    Tokenizer t;
+    CHECK_OK(t.init(v));
+    std::mt19937 rng(2024);
+    const int32_t n = v->n_tokens();
+    int stopped = 0;
+    for (int trial = 0; trial < 2000; ++trial) {
+        std::vector<int32_t> ids;
+        const int len = 1 + (int)(rng() % 24);
+        for (int i = 0; i < len; ++i)
+            ids.push_back(rng() % 3 ? (int32_t)(rng() % 256) : (int32_t)(rng() % (uint32_t)n));
+        const std::string whole = t.decode(ids);
+
+        Detokenizer d(v);
+        std::string got;
+        bool ok = true;
+        for (int32_t id : ids) {
+            const std::string out = d.push(id);
+            ok = ok && utf8_valid_prefix(out) == out.size();
+            got += out;
+        }
+        got += d.flush();
+        ok = ok && got == utf8_sanitize(whole);
+
+        /* A stop string drawn from the decode itself, so it occurs. It is matched against the
+         * decoded bytes, so one holding a replacement character, which only sanitising
+         * produced, could never occur: draw again. */
+        const std::string clean = utf8_sanitize(whole);
+        std::string stop;
+        for (int attempt = 0; attempt < 16 && stop.empty() && clean.size() >= 3; ++attempt) {
+            const size_t at = rng() % (clean.size() - 2), len_s = 2 + rng() % 3;
+            stop = clean.substr(at, len_s);
+            if (utf8_valid_prefix(stop) != stop.size() ||
+                stop.find("\xef\xbf\xbd") != std::string::npos)
+                stop.clear();
+        }
+        if (!stop.empty()) {
+            /* Everything before the stop's first occurrence, and nothing of it or after it, at
+             * every point of the stream. */
+            const size_t at = clean.find(stop);
+            const std::string before = clean.substr(0, at);
+            Detokenizer s(v, { stop });
+            std::string emitted;
+            for (int32_t id : ids) {
+                emitted += s.push(id);
+                ok = ok && before.compare(0, emitted.size(), emitted) == 0;
+                if (s.stopped()) break;
+            }
+            emitted += s.flush();
+            ok = ok && s.stopped() == (at != std::string::npos) && emitted == before;
+            stopped += s.stopped();
+        }
+        if (!ok) {
+            CHECK(ok);
+            fprintf(stderr, "    seed 2024 trial %d: ids %s, stop '%s'\n      streamed '%s'\n"
+                    "      decoded  '%s'\n", trial, show_ids(ids, 0, ids.size()).c_str(),
+                    escaped(stop).c_str(), escaped(got).c_str(), escaped(clean).c_str());
+            break;
+        }
+    }
+    std::fprintf(stderr, "    %d of 2000 streams met their stop string\n", stopped);
+    CHECK(stopped > 1000);
+}
+
+/* A SentencePiece byte-fallback vocabulary spells a character it has no piece for as its bytes,
+ * which its ByteFallback decoder turns back into bytes: the stream holds them until the character
+ * is whole, and a byte no continuation can complete
+ * (0xC1 only starts overlong forms) comes out as U+FFFD at the end rather than as raw invalid
+ * UTF-8. Metaspace's prepended space is dropped on the stream's first token only. */
+TEST(a_byte_fallback_stream_holds_bytes_until_the_character_is_whole) {
+    auto v = from_json(R"JSON({
+      "pre_tokenizer": { "type": "Metaspace", "replacement": "▁", "prepend_scheme": "always", "split": false },
+      "decoder": { "type": "Sequence", "decoders": [
+          { "type": "Metaspace", "replacement": "▁", "prepend_scheme": "always" },
+          { "type": "ByteFallback" } ] },
+      "model": { "type": "BPE", "byte_fallback": true,
+        "vocab": {"<unk>": 0, "▁": 1, "h": 2, "i": 3, "▁h": 4, "▁hi": 5, "<0xE2>": 6, "<0x82>": 7,
+                  "<0xAC>": 8, "<0xC1>": 9},
+        "merges": ["▁ h", "▁h i"] }
+    })JSON");
+    REQUIRE(v != nullptr);
+    Detokenizer d(v);
+    CHECK_EQ(d.push(5), std::string("hi"));
+    CHECK_EQ(d.push(5), std::string(" hi"));
+    CHECK_EQ(d.push(6), std::string());
+    CHECK_EQ(d.push(7), std::string());
+    CHECK_EQ(d.push(8), std::string("\xe2\x82\xac"));
+    CHECK_EQ(d.push(9), std::string());
+    CHECK_EQ(d.flush(), std::string("\xef\xbf\xbd"));
+
+    /* Malformed in the middle: the orphan is replaced as soon as what follows shows it cannot
+     * complete. */
+    Detokenizer e(v);
+    CHECK_EQ(e.push(9), std::string());
+    CHECK_EQ(e.push(2), std::string("\xef\xbf\xbdh"));
+}
+
+/* ================================================================== the grammar's view */
+
+/* TokenView is what grammars walk: each token's decoded output bytes, not the vocabulary's own
+ * encoding. Over the byte-level alphabet a space is 'Ġ' and a newline 'Ċ' in the table, and a
+ * grammar reading those would refuse every token with a space or newline in it. A byte token is
+ * its byte, a control token renders literally (an empty piece would satisfy any grammar
+ * position), and special tokens tokenise as themselves. */
+TEST(the_token_view_gives_grammars_the_decoded_bytes) {
+    auto v = stream_vocab();
+    REQUIRE(v != nullptr);
+    TokenView tv;
+    CHECK_OK(tv.init(v));
+    Tokenizer t;
+    CHECK_OK(t.init(v));
+    for (int32_t id = 0; id < v->n_tokens(); ++id) CHECK_EQ(tv.token_piece(id), t.piece(id, true));
+    CHECK_EQ(tv.token_piece(v->find("\xc4\xa0")), std::string(" "));
+    CHECK_EQ(tv.token_piece(v->find("\xc4\x8a")), std::string("\n"));
+    const int32_t start = v->find("<|im_start|>");
+    CHECK_EQ(tv.token_piece(start), std::string("<|im_start|>"));
+    std::vector<int32_t> ids;
+    CHECK_OK(tv.tokenize_special("<|im_start|>", &ids));
+    CHECK(ids == (std::vector<int32_t>{ start }));
+
+    auto spm = from_json(R"JSON({
+      "pre_tokenizer": { "type": "Metaspace", "replacement": "▁", "prepend_scheme": "always", "split": false },
+      "decoder": { "type": "Sequence", "decoders": [
+          { "type": "Metaspace", "replacement": "▁", "prepend_scheme": "always" },
+          { "type": "ByteFallback" } ] },
+      "model": { "type": "BPE", "byte_fallback": true,
+        "vocab": {"<unk>": 0, "▁": 1, "h": 2, "<0x0A>": 3, "▁h": 4}, "merges": ["▁ h"] }
+    })JSON");
+    REQUIRE(spm != nullptr);
+    TokenView sv;
+    CHECK_OK(sv.init(spm));
+    CHECK_EQ(sv.token_piece(3), std::string("\n"));
+    CHECK_EQ(sv.token_piece(4), std::string(" h"));
+
+    /* A grammar over the view admits the token that carries the space. */
+    std::vector<int32_t> hello, world;
+    CHECK_OK(t.encode("hello", hello, false, false));
+    CHECK_OK(t.encode(" world", world, false, false));
+    std::unique_ptr<GbnfGrammar> g;
+    std::string err;
+    REQUIRE(GbnfGrammar::create("root ::= \"hello world\"", "root", &tv, false, {}, {}, &g, &err) >= 0);
+    for (int32_t id : hello) REQUIRE(g->accept_token(id) >= 0);
+    std::vector<uint32_t> mask((size_t)bitmask_words(v->n_tokens()));
+    CHECK_OK(g->fill_mask(mask.data(), (int64_t)mask.size()));
+    CHECK((mask[(size_t)world[0] >> 5] >> (world[0] & 31)) & 1u);
+    CHECK_EQ(tv.token_piece(world[0])[0], ' ');
 }
 
 RAD_TEST_MAIN()

@@ -11,28 +11,20 @@
 //     gate           g = -exp(A_log) . softplus(a + dt_bias), beta = sigmoid(b)
 //     cumsum         g summed along the chunk, which is what the scan actually consumes
 //
-// It replaces causal_conv1d_fn + fused_post_conv_prep + chunk_local_cumsum. The pair it replaces
-// spends most of its time moving the conv output: causal_conv1d_fn writes all conv_dim channels of
-// every token to HBM and fused_post_conv_prep reads every one of them straight back, which at this
-// model's shape is 34 MB out and 34 MB in per layer per rank for a tensor that is dead two
-// microseconds later. Here the conv output only ever exists in registers.
+// Replaces causal_conv1d_fn + fused_post_conv_prep + chunk_local_cumsum. The unfused pair writes
+// the whole conv output to HBM and reads it straight back (34 MB each way per layer per rank at
+// this model's shape); here it stays in registers.
 //
-// The layout falls out of the l2norm. A workgroup is HPB waves, one wave per 128-dim head, one
-// lane per four dims -- so the norm of a head is a wave reduction with no LDS and no barrier, and
-// four contiguous bf16 per lane is one 8-byte access on both sides. Channel groups are counted in
-// heads rather than in channels so that a group never straddles the q/k/v boundaries (they fall on
-// head multiples at every tensor-parallel size).
+// Layout: a workgroup is HPB waves, one wave per 128-dim head, four dims per lane, so a head's
+// norm is a barrier-free wave reduction and each lane does one 8-byte access. Channel groups are
+// counted in heads so a group never straddles the q/k/v boundaries (head multiples at every TP).
 //
-// Tokens are blocked by the chunk, 64, because the cumsum is per chunk: the whole scan is then a
-// wave-level prefix over 32 lanes holding two tokens each, and no workgroup needs another's
-// partial sums. The conv reads three tokens of halo per block, 4.7% of the traffic, which is
-// cheaper than the barrier a shared staging buffer would need.
+// Tokens are blocked by the 64-token chunk because the cumsum is per chunk: it becomes a wave
+// prefix over 32 lanes of two tokens each. Each block reads three tokens of halo (4.7% of the
+// traffic), cheaper than a barrier around a shared staging buffer.
 //
-// The conv output is rounded to bf16 BEFORE the norm and the store, which is what the two kernels
-// it replaces do (the conv writes a bf16 tensor and the prep reads it back). Keeping the fp32
-// accumulator through the norm would be slightly finer and slightly different; matching is worth
-// more than the last half ULP here, because it makes this kernel a bit-for-bit drop-in for the
-// pair it replaces.
+// The conv output is rounded to bf16 before the norm and the store, as in the unfused pair, so
+// this kernel is a bit-exact drop-in for it.
 #include <hip/hip_runtime.h>
 #include "r4d.h"
 #include "r4d_gdn_args.h"
@@ -44,66 +36,37 @@
 #define CP_BT     64            // token block = the scan's chunk, so the cumsum stays wave-local
 #define CP_W       R4D_GDN_CONV_W   // conv width
 #define CP_ST   (CP_W - 1)      // conv state depth
-// CU_MAXT: tokens the DECODE update pre-loads into registers. 16 is about 13% slower than 8: the
-// sixteen ushort4 cost more in register pressure and predicated-load exec-mask work than the round
-// trips they hide, and the compiler already batches the loop's loads.
-// 1 disables it (slen is num_spec+1 > 1 on every speculative step).
-// CU_STATIC=1: index the xb[] preload with a COMPILE-TIME t.  The preload exists so a token tap is
-// not an HBM round trip, but a register array under a RUNTIME index is not a register read: the
-// compiler builds a select tree for it.  With both readers -- the token loop and the cache rewrite
-// -- indexing at runtime, the HPB=1 ISA census is 2033 instructions for 41 loads and 29 stores,
-// 193 s_cselect_b32 + 138 s_cmp_eq_u32 + 132 v_cndmask_b16 of it: about a third of the kernel
-// choosing which register to read.  That is also why a larger CU_MAXT loses -- twice the array is
-// twice the tree, not twice the reuse.  Unrolling both readers over CU_MAXT with a wave-uniform
-// `t < slen` guard turns every access into a static index; `slen` is uniform, so the guard is a
-// scalar branch, not a per-lane select.
-#ifndef CU_STATIC
-#define CU_STATIC 1
-#endif
-// CU_ISSUE=1: put the input preload AHEAD of the history load.  `xrow` depends only on the token
-// range and this lane's channels, while `hp` depends on `slot`, which has to come back from
-// cache_idx first -- and the history block consumes its loads immediately (bf2f), so the compiler
-// waits on them before it issues a single input load and the two HBM round trips run back to back.
-// One wave per SIMD means nothing else hides either of them.
-#ifndef CU_ISSUE
-#define CU_ISSUE 1
-#endif
-#ifndef CU_MAXT
+// Tokens the decode update preloads into registers. 16 is ~13% slower than 8 (register pressure
+// and predicated-load overhead outweigh the hidden round trips).
+//
+// The xb[] preload is indexed with a compile-time t: a register array under a runtime index
+// compiles to a select tree (about a third of the kernel's instructions at HPB=1). Both readers
+// unroll over CU_MAXT with a wave-uniform `t < slen` guard, so every index is static and the guard
+// is a scalar branch. The preload is issued before the history load: the history address depends
+// on `slot` (a cache_idx load) and its values are consumed immediately, so otherwise the two
+// memory round trips serialise, with no other wave on the SIMD to hide them.
 #define CU_MAXT 8
-#endif
-// WVEC: read a channel's CP_W conv weights as one vector load instead of CP_W scalar ones.
-#ifndef WVEC
-#define WVEC 1
-#endif
 #define CP_DPL     4            // dims per lane (CP_HD / 32)
 
-// cp_silu, and the reason it is a reciprocal and not a divide, is r4d_gdn_conv_tap.h: the
-// recurrent update folds the decode convolution in and has to compute the same bits.
+// cp_silu is in r4d_gdn_conv_tap.h, shared with the recurrent update's folded convolution.
 
-// softplus, in the two-sided form FLA uses, with the same large-x cutoff
+// softplus, in FLA's two-sided form with the same large-x cutoff
 __device__ __forceinline__ float cp_softplus(float x, float thr) {
   if (x > thr) return x;
   return (x > 0.0f) ? (x + __logf(1.0f + __expf(-x)))
                     : __logf(1.0f + __expf(x));
 }
 
-// a and b arrive as the layer holds them: a chunk() of the ba projection, so bf16 and strided by
-// 2*H, not the fp32 contiguous pair FLA's own kernels are usually handed. Reading them where they
-// lie is what keeps this a single kernel -- a .float().contiguous() per tensor per layer would put
-// two more launches and 0.6 MB back on the path this exists to shorten.
+// a and b are read where they lie: a chunk() of the ba projection, bf16 with row stride 2*H (or
+// fp32), avoiding a .float().contiguous() copy and two launches per layer.
 template <int ABF16>
 __device__ __forceinline__ float cp_ab(const void* p, size_t i) {
   return ABF16 ? bf2f(((const unsigned short*)p)[i]) : ((const float*)p)[i];
 }
 
-// `has_init` SAYS WHETHER THE SLOT HOLDS A HISTORY, and its width is the caller's -- the flag is
-// the caller's answer, like ab_is_bf16 above. Guessing the width is not safe. The engine hands
-// over RadBatch::ctx_lens, which is int32 like every derived buffer the core computes; reading
-// that as `unsigned char` takes byte n of an int32 array. At n = 0 with a cold sequence that is 0
-// by luck and correct; at the SECOND chunk of a long prompt, ctx_len 512 has a zero low byte, so
-// the conv window would silently start from zeros and the sequence would lose its history. libref
-// reads the operand through its own dtype and is right either way, so a width mismatch shows up
-// only as the two implementations disagreeing, with the fast path wrong.
+// `has_init` says whether the slot holds a history; its element width (int32 or byte) is given by
+// the caller. The engine passes RadBatch::ctx_lens (int32); read as bytes, a ctx_len of 512 would
+// look like 0 and the conv window would silently start from zeros.
 __device__ __forceinline__ bool r4d_has_init(const void* p, int i32, int n) {
   if (!p) return false;
   return i32 ? ((const int*)p)[n] != 0 : ((const unsigned char*)p)[n] != 0;
@@ -128,8 +91,8 @@ void r4d_gdn_conv_prep_kernel(const unsigned short* __restrict__ x, long xpitch,
 {
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
 
-  // flat chunk id -> (sequence, chunk); see r4d_gdn_kkt_solve_k128_c64_bf16.hip for why the grid is an upper
-  // bound rather than the exact count
+  // flat chunk id -> (sequence, chunk); the grid is an upper bound (see
+  // r4d_gdn_kkt_solve_k128_c64_bf16.hip)
   int n = -1, t0 = 0, bos = 0, rows = 0, slen = 0;
   {
     int acc = 0, want = blockIdx.x;
@@ -145,8 +108,7 @@ void r4d_gdn_conv_prep_kernel(const unsigned short* __restrict__ x, long xpitch,
   const bool first = (t0 == 0);
 
   // ---- the gating half, on one workgroup per chunk ----------------------------------------
-  // g and beta come from a and b alone, so this is independent of the convolution; it rides on
-  // the y == 0 workgroup rather than costing a launch of its own.
+  // g and beta depend only on a and b; computed by the y == 0 workgroups instead of a launch.
   if (blockIdx.y == 0) {
     for (int hv = warp; hv < H; hv += HPB) {
       const float alog = __expf(A_log[hv]), dtb = dt_bias[hv];
@@ -192,8 +154,8 @@ void r4d_gdn_conv_prep_kernel(const unsigned short* __restrict__ x, long xpitch,
     bs[c] = bias ? bf2f(bias[d0 + c]) : 0.0f;
   }
 
-  // window[i] holds x[t - (W-1) + i]; seed it from the previous tokens, or from the conv state
-  // cache when this is the first chunk of the sequence
+  // win[i] holds x[t - (W-1) + i]; seeded from the previous tokens, or from the conv state cache
+  // at the sequence's first chunk
   float win[CP_W][CP_DPL];
   {
     const bool init = first && r4d_has_init(has_init, hi_i32, n);
@@ -213,17 +175,15 @@ void r4d_gdn_conv_prep_kernel(const unsigned short* __restrict__ x, long xpitch,
   }
 
   // ---- write the new conv state, from x, at the sequence's first chunk ---------------------
-  // Ordering: the cache line is updated in place, so the read above and this write must be in the
-  // same workgroup for the same channels -- which they are, and this is why the FIRST chunk owns
-  // the write even though the tokens it stores belong to the last one.
+  // The cache is updated in place, so the read above and this write must be in the same workgroup
+  // for the same channels. That is why the first chunk writes the state even though its tokens
+  // come from the last chunk.
   if (first && cache_idx) {
     unsigned short* sp = cstate + (size_t)cache_idx[(size_t)n * ci_stride] * cs_seq
                        + (size_t)d0 * cs_dim;
     const bool init = r4d_has_init(has_init, hi_i32, n);
-    // Channel-major, because the cache is [dim][slot] with the slot contiguous: this lane owns
-    // CP_DPL consecutive channels, so its CP_DPL*CP_ST shorts are one contiguous run and the wave
-    // covers 32 of those back to back. A slot-major order would make every store a strided 2-byte
-    // scalar.
+    // Channel-major: the cache is [dim][slot] with slot contiguous, so a lane's CP_DPL*CP_ST
+    // shorts are one contiguous run. Slot-major order would make every store a strided scalar.
 #pragma unroll
     for (int c = 0; c < CP_DPL; ++c) {
 #pragma unroll
@@ -253,7 +213,7 @@ void r4d_gdn_conv_prep_kernel(const unsigned short* __restrict__ x, long xpitch,
       float acc = bs[c];
 #pragma unroll
       for (int i = 0; i < CP_W; ++i) acc += wt[i][c] * win[i][c];
-      // the pair this replaces rounds here, on the way to HBM; keep that
+      // round as the unfused pair does on the way to HBM
       o[c] = bf2f(f2bf(cp_silu(acc)));
     }
 
@@ -318,15 +278,10 @@ extern "C" int r4d_gdn_conv_prep_w4_h128_bf16(
 }
 
 // ---------------------------------------------------------------------------------------------
-// The decode-time convolution. Same depthwise causal filter, but the tokens of a step are a
-// speculative window rather than a chunk, and the state cache is a rolling buffer of
-// width-1 + num_spec entries rather than width-1: a step reads its window starting at the slot
-// the last ACCEPTED token left behind, and rewrites the buffer shifted by one so the next step
-// can do the same. That offset is the only thing the caller has to get right, and it is why this
-// is a separate entry point rather than a flag on the one above.
-//
-// It writes q, k and v in their own layouts, which also removes the torch.cat the reference layer
-// needs to make the three views contiguous for the recurrent kernel.
+// Decode-time convolution. Same filter, but a step's tokens are a speculative window and the
+// state cache is a rolling buffer of width-1 + num_spec entries: a step reads its window starting
+// at the slot the last accepted token left, and rewrites the buffer shifted by one. Writes q, k
+// and v in their own layouts (no torch.cat for the recurrent kernel).
 // ---------------------------------------------------------------------------------------------
 template <int HPB>
 __global__ __launch_bounds__(HPB * 32)
@@ -346,55 +301,42 @@ void r4d_gdn_conv_update_kernel(const unsigned short* __restrict__ x, long xpitc
   const int bos = cu[n], slen = cu[n + 1] - bos;
   if (slen <= 0) return;
   const int slot = cache_idx[(size_t)n * ci_stride];
-  // A NEGATIVE slot is the pad and ZERO IS A REAL SLOT. `slot <= 0` would be vLLM's NULL_BLOCK_ID
-  // convention, where 0 is reserved; radiance's block manager hands out 0-based state slots, so
-  // that test would skip the FIRST sequence on the card entirely -- no convolution at all, on
-  // every decode step and every linear-attention layer, silently. libref skips only a negative
-  // slot (libref/ref_gdn.cpp) and so does every index in libr4d.
+  // A negative slot is padding; 0 is a real slot. (vLLM reserves 0 as NULL_BLOCK_ID, but this
+  // engine's state slots are 0-based, as in libref/ref_gdn.cpp.)
   if (slot < 0) return;
 
   const int off = naccept ? (naccept[n] - 1) : 0;
-  // the cache depth this step actually uses; FLA shrinks the caller's max_query_len bound by the
-  // tokens this sequence did not bring
+  // cache depth this step uses: as in FLA, the bound shrinks by the tokens this sequence lacks
   const int slen_eff = state_len_max - (maxq - slen);
 
   const int unit = blockIdx.y * HPB + warp;
   const int d0 = unit * CP_HD + lane * CP_DPL;
 
-  // The weight of one channel is CP_W contiguous shorts, so a lane's four channels are four
-  // vector loads, not sixteen scalar ones.
+  // A channel's weights are CP_W contiguous shorts: one vector load per channel.
+  static_assert(CP_W == 4, "the weight load reads a channel's taps as one ushort4");
   float wt[CP_W][CP_DPL], bs[CP_DPL];
 #pragma unroll
   for (int c = 0; c < CP_DPL; ++c) {
-    if (WVEC && CP_W == 4) {
-      const ushort4 w4 = *(const ushort4*)(wgt + (size_t)(d0 + c) * CP_W);
-      const unsigned short* ws = (const unsigned short*)&w4;
+    const ushort4 w4 = *(const ushort4*)(wgt + (size_t)(d0 + c) * CP_W);
+    const unsigned short* ws = (const unsigned short*)&w4;
 #pragma unroll
-      for (int i = 0; i < CP_W; ++i) wt[i][c] = bf2f(ws[i]);
-    } else {
-#pragma unroll
-      for (int i = 0; i < CP_W; ++i) wt[i][c] = bf2f(wgt[(size_t)(d0 + c) * CP_W + i]);
-    }
+    for (int i = 0; i < CP_W; ++i) wt[i][c] = bf2f(ws[i]);
     bs[c] = bias ? bf2f(bias[d0 + c]) : 0.0f;
   }
 
-  // ADDRESS ARITHMETIC IS WHAT THIS KERNEL SPENDS ITS TIME ON.  Indexing with (size_t)i * cs_tok
-  // and (size_t)(bos + ti) * xpitch gives every one of the ~40 cache stores and every input tap a
-  // 64-bit multiply: that form costs 1297 instructions -- 252 of them s_wait_alu and about 330
-  // scalar address ALU -- to move 290 KB.  The strides are small (cs_dim is the per-channel row, a
-  // handful of tokens; xpitch is conv_dim), so every offset below is an int taken from a base
-  // pointer that already carries the 64-bit part, and the loops walk their pointers rather than
-  // re-deriving them.
+  // This kernel's time is address arithmetic. size_t indexing gives each of the ~40 cache stores
+  // and every input tap a 64-bit multiply. The strides are small, so offsets are 32-bit ints off
+  // base pointers that carry the 64-bit part, and loops walk their pointers.
   const int csd = (int)cs_dim, cst = (int)cs_tok, xpi = (int)xpitch;
   unsigned short* const sp = cstate + (size_t)slot * cs_seq + (size_t)d0 * cs_dim;
   const unsigned short* const xrow = x + (size_t)bos * xpitch + d0;
-#if CU_ISSUE
+  // Every input load of the step is issued before any is waited on; the cache rewrite below
+  // reuses the same values.
   ushort4 xb[CU_MAXT];
   const bool xpre = (slen <= CU_MAXT);
 #pragma unroll
   for (int t = 0; t < CU_MAXT; ++t)
     if (xpre && t < slen) xb[t] = *(const ushort4*)(xrow + t * xpi);
-#endif
   float win[CP_W][CP_DPL];
   unsigned short hist[CP_ST][CP_DPL];             // the raw history, for the shifted rewrite
   {
@@ -412,21 +354,7 @@ void r4d_gdn_conv_update_kernel(const unsigned short* __restrict__ x, long xpitc
   const int hq = unit, hk = unit - Hg, hv = unit - 2 * Hg;
   const int region = (unit < Hg) ? 0 : ((unit < 2 * Hg) ? 1 : 2);
 
-  // This step's inputs, all issued before the first is waited on. With the load inside the loop
-  // each of the (num_spec + 1) four-tap taps pays an HBM round trip that nothing hides: a decode
-  // step launches one wave per channel group, so there is no other wave on the SIMD to run
-  // meanwhile. They are also exactly the values the cache rewrite at the bottom re-reads.
-#if !CU_ISSUE
-  ushort4 xb[CU_MAXT];
-  const bool xpre = (slen <= CU_MAXT);
-#pragma unroll
-  for (int t = 0; t < CU_MAXT; ++t)
-    if (xpre && t < slen) xb[t] = *(const ushort4*)(xrow + t * xpi);
-#endif
-
-  // The destination of a token is the previous one plus a fixed stride, so it is walked rather
-  // than rebuilt: recomputing ((bos + t) * H + hv) * CP_HD per token is a 64-bit multiply each
-  // time.
+  // Output pointer walked by a fixed stride per token, avoiding a 64-bit multiply each.
   unsigned short* op = (region == 2)
       ? (v + ((size_t)bos * H + hv) * CP_HD + lane * CP_DPL)
       : ((region ? k : q) + ((size_t)bos * Hg + (region ? hk : hq)) * CP_HD + lane * CP_DPL);
@@ -452,10 +380,9 @@ void r4d_gdn_conv_update_kernel(const unsigned short* __restrict__ x, long xpitc
         _Pragma("unroll")                                                        \
         for (int c = 0; c < CP_DPL; ++c) win[i][c] = win[i + 1][c];              \
     }
-#if CU_STATIC
   if (xpre) {
-    // A GUARD, NOT A BREAK.  `#pragma unroll` needs a constant trip count; a data-dependent exit
-    // leaves the loop rolled and `t` a runtime variable again, which is the whole thing being fixed.
+    // A guard, not a break: a data-dependent exit would leave the loop rolled and t a runtime
+    // index again.
 #pragma unroll
     for (int t = 0; t < CU_MAXT; ++t) {
       if (t < slen) CU_TOKEN_BODY(xb[t])          // static index: a register read, not a tree
@@ -463,66 +390,40 @@ void r4d_gdn_conv_update_kernel(const unsigned short* __restrict__ x, long xpitc
   } else {
     for (int t = 0; t < slen; ++t) CU_TOKEN_BODY(*(const ushort4*)(xrow + t * xpi))
   }
-#else
-  for (int t = 0; t < slen; ++t)
-    CU_TOKEN_BODY(xpre ? xb[t] : *(const ushort4*)(xrow + t * xpi))
-#endif
 
-  // Rewrite the cache shifted by one: the tail of the old history, then this step's tokens. The
-  // first CP_ST-1 entries are exactly the history already in registers, so the rewrite costs no
-  // extra reads -- and reading before writing is what makes the in-place update safe.
-  // Channel-major for the same reason as the prefill path, and it matters more here: this is
-  // width-1 + num_spec slots per channel, so the slot-major order made it 44 strided 2-byte
-  // stores per lane where channel-major is one 88-byte run.
-  // The two halves of this run have different sources -- the tail of the old history, then this
-  // step's tokens -- and testing for it per store put a branch and a select in front of every one
-  // of the ~40.  The split point is a loop bound instead.  `nh` is CP_W-2 by construction
-  // (state_len_max is (CP_W-1)+(maxq-1) and slen_eff takes off the tokens this sequence did not
-  // bring), but it is computed rather than assumed so a caller that shrinks the window differently
-  // still gets the shipped answer.
+  // Rewrite the cache shifted by one: the tail of the old history (already in registers, read
+  // before any write, so the in-place update is safe), then this step's tokens. Channel-major, as
+  // in prefill: one contiguous run per lane instead of strided 2-byte stores.
+  // The split between the two sources is a loop bound, not a per-store test. `nh` is CP_W-2 on the
+  // shipped path but computed, so a caller that shrinks the window differently stays correct.
   const int VAL = CP_W - 2;
   const int nh = slen_eff - slen < 0 ? 0 : (slen_eff - slen);
 #pragma unroll
   for (int c = 0; c < CP_DPL; ++c) {
     unsigned short* dst = sp + c * csd;
-#if CU_STATIC
-    // The history half is bounded by the array it reads: `hist[i + 1]` with i < nh already required
-    // nh <= CP_ST - 1, so unrolling to that bound reads exactly what the runtime loop did.
+    // History half, unrolled to hist's bound (i + 1 < CP_ST).
 #pragma unroll
     for (int i = 0; i + 1 < CP_ST; ++i)
       if (i < nh && i < slen_eff) dst[i * cst] = hist[i + 1][c];
-    // The token half, walked by TOKEN rather than by slot, so the index into xb is the loop counter.
+    // Token half, walked by token so the xb index is the loop counter.
     if (xpre) {
 #pragma unroll
       for (int t = 0; t < CU_MAXT; ++t) {
         const int i = t + VAL;
         if (i >= nh && i < slen_eff && t < slen) {
-          // NOT `((const unsigned short*)&xb[t])[c]`.  Taking the address of an element makes the
-          // whole array address-taken, and an address-taken array does not become registers however
-          // static the index is -- that one `&` costs 80 bytes a thread of SCRATCH under the
-          // preload.  With t and c both compile-time this ternary folds to a register read.
+          // Not `((const unsigned short*)&xb[t])[c]`: taking an element's address forces the
+          // whole array to scratch. With t and c compile-time, this ternary is a register read.
           const ushort4 vv = xb[t];
           dst[i * cst] = (c == 0) ? vv.x : (c == 1) ? vv.y : (c == 2) ? vv.z : vv.w;
         }
       }
     }
-    // Whatever the two loops above did not cover: a slot whose token is outside [0, slen), and the
-    // whole range when the caller brought more tokens than the preload holds.  Both are empty on the
-    // shipped path (slen_eff is slen + CP_ST - 1 and nh is CP_W - 2), so this stores nothing.
+    // Remainder: slots whose token is outside [0, slen), or the whole range when slen exceeds the
+    // preload. Empty on the shipped path.
     for (int i = nh; i < slen_eff; ++i) {
       const int ti = i - VAL;
       if (!xpre || ti < 0 || ti >= slen) dst[i * cst] = xrow[ti * xpi + c];
     }
-#else
-    int i = 0;
-    for (; i < nh && i < slen_eff; ++i) dst[i * cst] = hist[i + 1][c];
-    for (; i < slen_eff; ++i) {
-      const int ti = i - VAL;
-      dst[i * cst] = (xpre && ti >= 0 && ti < slen)
-                         ? ((const unsigned short*)&xb[ti])[c]
-                         : xrow[ti * xpi + c];
-    }
-#endif
   }
 #undef CU_TOKEN_BODY
 }
@@ -537,9 +438,8 @@ extern "C" int r4d_gdn_conv_update_w4_h128_bf16(
   const int units = 2 * Hg + H;
   int hpb = 8;
   while (hpb > 1 && (Hg % hpb || H % hpb)) hpb >>= 1;
-  // A decode step is a handful of sequences, so the channel grouping is what decides whether the
-  // grid covers the device: at 8 sequences and 8 heads per block this launches 40 workgroups for
-  // 64 CUs. Narrow the block until there are enough of them.
+  // A decode step has few sequences, so narrow the channel group until the grid covers the
+  // device (8 sequences at 8 heads per block would be 40 workgroups for 64 CUs).
   while (hpb > 1 && (long)N * (units / hpb) < 256) hpb >>= 1;
   dim3 grid(N, units / hpb), blk(hpb * 32);
 #define CU_LAUNCH(P)                                                                          \
@@ -559,14 +459,9 @@ extern "C" int r4d_gdn_conv_update_w4_h128_bf16(
   return (int)hipGetLastError();
 }
 
-// THE OPERAND ENUMS CARRY AN `OPD_` PREFIX: this kernel's own tile constants are already called
-// CP_W and CP_ST, and an unprefixed operand index named CP_W in the same translation unit is a
-// redefinition -- caught by the compiler, but only because the spellings happen to collide. The
-// prefix says which namespace a name is in.
 // ============================================================== the plugin ABI entry points
-//
-// The shared operand helpers are r4d_gdn_args.h. See libr4d/r4d_args.h for why there is no
-// adapter directory between the core and these launches.
+// Shared operand helpers: r4d_gdn_args.h. Operand enums use an OPD_ prefix because CP_W and CP_ST
+// are already kernel constants in this unit.
 /* ------------------------------------------------------------------ conv prep */
 
 
@@ -596,8 +491,8 @@ extern "C" int r4d_rad_gdn_conv_prep(const RadArgs* a, RadStream s) {
 
     if (!x || !w || !alog || !dtb || !cst || !cu || !q || !k || !v || !g || !beta)
         return R4D_NO(RAD_E_INVAL);
-    /* Optional in the SCHEMA so docs/OPS.md's shorter list stays a positional prefix, required by
-     * the KERNEL: it dereferences all three unconditionally. Named rather than crashed. */
+    /* Optional in the schema (so docs/OPS.md's shorter list stays a positional prefix) but
+     * required here: the kernel dereferences all three. */
     if (!ta || !tb || !cidx) return R4D_NO(RAD_E_INVAL);
 
     if (x->rank < 2 || q->rank != 3 || k->rank != 3 || v->rank != 3) return R4D_NO(RAD_E_SHAPE);
@@ -607,8 +502,8 @@ extern "C" int r4d_rad_gdn_conv_prep(const RadArgs* a, RadStream s) {
     int rc = seqs_of(cu, &N);
     if (rc != RAD_OK) return rc;
 
-    /* x may be a padded VIEW -- the qkvz split the layer hands it -- so its row pitch is an
-     * argument. Its inner axes still have to be tight. */
+    /* x may be a padded view (the layer's qkvz split), so its row pitch is an argument; inner
+     * axes must be dense. */
     const long long xpitch = r4d_row_pitch(x);
     if (xpitch < 0) return R4D_NO(RAD_E_STRIDE);
     const long long ab_stride = r4d_row_pitch(ta);
@@ -633,32 +528,27 @@ extern "C" int r4d_rad_gdn_conv_prep(const RadArgs* a, RadStream s) {
 
     const int width = (int)r4d_geti_or(a, "conv_width", 4);
     const float thr = (float)r4d_getf(a, "softplus_thr", 20.0);
-    /* libr4d's l2 norm is rsqrt(ss + 1e-6f) with the epsilon COMPILED IN, not an argument. A
-     * caller that names a different one is asking for arithmetic this kernel does not do, and
-     * running it anyway would be a silently different normalisation. Refused by name instead. */
+    /* The l2 norm epsilon is compiled in (1e-6f); refuse any other value. */
     if ((float)r4d_getf(a, "l2_eps", 1e-6) != 1e-6f) return R4D_NO(RAD_E_UNSUPPORTED);
-    /* `a` and `b` may be bf16 or f32; libr4d takes a flag rather than two entry points. */
+    /* a and b may be bf16 or f32 (a flag, not two entry points). */
     const int ab_is_bf16 = (ta->dtype == RAD_BF16) ? 1 : 0;
     if (tb->dtype != ta->dtype) return R4D_NO(RAD_E_DTYPE);
     if (!ab_is_bf16 && ta->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
 
-    /* "bf16 x / weights / conv state / q,k,v out, fp32 a,b and gate/beta out". The CONV WEIGHT is
-     * bf16: the kernel takes it as `const unsigned short*` and reads it through bf2f. */
+    /* bf16 x, weights, conv state and q/k/v; fp32 A_log, dt_bias, g and beta. */
     R4D_DT(x, RAD_BF16); R4D_DT(w, RAD_BF16); R4D_DT(cst, RAD_BF16);
     R4D_DT(q, RAD_BF16); R4D_DT(k, RAD_BF16); R4D_DT(v, RAD_BF16);
     R4D_DT(alog, RAD_F32); R4D_DT(dtb, RAD_F32); R4D_DT(g, RAD_F32); R4D_DT(beta, RAD_F32);
 
-    return r4d_gdn_conv_prep_w4_h128_bf16(
+    return R4D_RAW(r4d_gdn_conv_prep_w4_h128_bf16(
         x->data, (long)xpitch, w->data, b ? b->data : nullptr, cst->data,
         (long)cst->stride[0], (long)cst->stride[1], (long)cst->stride[2],
         cidx->data, (long)cidx->stride[0], hin ? hin->data : nullptr,
-        /* The WIDTH of has_init, not a guess: the engine hands over RadBatch::ctx_lens, which is
-         * int32 like every derived buffer. Reading it as bytes is silent for a cold first chunk
-         * and wrong for every one after it. */
+        /* has_init element width (see r4d_has_init) */
         hin && (hin->dtype == RAD_I32 || hin->dtype == RAD_U32),
         ta->data, tb->data, (long)ab_stride, ab_is_bf16,
         alog->data, dtb->data, q->data, k->data, v->data, g->data, beta->data,
-        cu->data, N, (int)T, (int)H, (int)Hg, (int)K, (int)V, width, thr, s);
+        cu->data, N, (int)T, (int)H, (int)Hg, (int)K, (int)V, width, thr, s));
 }
 
 /* ------------------------------------------------------------------ conv update */
@@ -698,35 +588,29 @@ extern "C" int r4d_rad_gdn_conv_update(const RadArgs* a, RadStream s) {
     if (H == 0 || Hg == 0 || H % Hg) return R4D_NO(RAD_E_SHAPE);
     if (v->shape[0] != T || k->shape[0] != T) return R4D_NO(RAD_E_SHAPE);
 
-    /* "bf16 x / weights / conv state / q,k,v out" -- same casts as the prefill conv. */
+    /* bf16 x, weights, conv state and q/k/v, as in the prefill conv. */
     R4D_DT(x, RAD_BF16); R4D_DT(w, RAD_BF16); R4D_DT(cst, RAD_BF16);
     R4D_DT(q, RAD_BF16); R4D_DT(k, RAD_BF16); R4D_DT(v, RAD_BF16);
 
     const int width = (int)r4d_geti_or(a, "conv_width", 4);
-    /* THE TWO WINDOW ARGUMENTS DESCRIBE ONE WINDOW, SO ONLY ONE OF THEM IS FREE. The state cache
-     * is a rolling window read at the slot the last ACCEPTED token left, which is how a
-     * speculative rejection becomes a change of read offset rather than a recompute (spec 10).
-     * The kernel lays it out as `width - 2` history entries followed by the step's tokens, and it
-     * finds the split as `state_len_max - max_query_len` -- so that difference MUST be width - 2,
-     * whatever the two of them are individually. The cache depth fixes one; the other follows.
+    /* state_len_max and max_query_len describe one window, so only one is free. The state cache
+     * is a rolling window read at the slot the last accepted token left, so a speculative
+     * rejection is a change of read offset, not a recompute (spec 10). The kernel splits it into
+     * `width - 2` history entries and the step's tokens at state_len_max - max_query_len, so that
+     * difference must be width - 2; max_query_len follows from the cache depth.
      *
-     * DO NOT DERIVE max_query_len FROM THE STEP. The mean tokens per sequence is wrong twice over:
-     * it is not the max when one request in the step drafts and another does not, and even the max
-     * is not what this kernel wants, because the pool is sized for the deepest draft the
-     * DEPLOYMENT allows. A decode step that drafts nothing would then put the split at
-     * width - 2 + n_spec instead of width - 2. The history half runs past what the kernel has in
-     * registers, this step's tokens land outside the range the next step reads, and the
-     * convolution advances over a window that never changes: the model stops hearing its own last
-     * three tokens and repeats one phrase forever. */
+     * Do not derive max_query_len from the step: the pool is sized for the deployment's deepest
+     * draft, and a non-drafting step would misplace the split, so the convolution would stop
+     * seeing the latest tokens and the model would loop on one phrase. */
     const long long state_len_max = cst->shape[2];
     const long long mql = state_len_max - (width - 2);
     if (width < 2 || mql < 1) return R4D_NO(RAD_E_SHAPE);
 
-    return r4d_gdn_conv_update_w4_h128_bf16(
+    return R4D_RAW(r4d_gdn_conv_update_w4_h128_bf16(
         x->data, (long)xpitch, w->data, b ? b->data : nullptr, cst->data,
         (long)cst->stride[0], (long)cst->stride[1], (long)cst->stride[2],
         (int)state_len_max, sidx->data, (long)sidx->stride[0],
         nacc ? nacc->data : nullptr, q->data, k->data, v->data, cu->data,
-        N, (int)H, (int)Hg, (int)K, (int)V, width, (int)mql, s);
+        N, (int)H, (int)Hg, (int)K, (int)V, width, (int)mql, s));
 }
 

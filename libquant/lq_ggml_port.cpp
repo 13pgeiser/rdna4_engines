@@ -19,10 +19,9 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  *
  * The functions below are ggml/src/ggml-quants.c's at 06938ac12, in that file's order, each under
- * a `ggml-quants.c:A-B` marker naming the lines it came from; the conversions and the init
- * dispatch at the head and the foot are ggml-impl.h's and ggml.c's. The bodies are left as
- * upstream wrote them -- their comments, their spacing, their commented-out lines -- because the
- * point of the port is that it can be read against the original line by line.
+ * a `ggml-quants.c:A-B` marker naming its source lines; the conversions at the head and the init
+ * dispatch at the foot are ggml-impl.h's and ggml.c's. The bodies keep upstream's comments,
+ * spacing and commented-out lines so the port can be diffed against the original line by line.
  */
 #include "lq_ggml_port.h"
 
@@ -42,8 +41,8 @@ namespace lq::ggml {
 
 #define GGML_RESTRICT __restrict__
 
-/* ggml.h's assertion, which aborts the process with a message in every build: a broken invariant
- * in a quantiser is a corrupt container if it is allowed to continue. */
+/* ggml.h's assertion: prints and aborts in every build, since a quantiser that continues past a
+ * broken invariant writes a corrupt container. */
 #define GGML_ABORT(msg)                                                                     \
     do {                                                                                    \
         std::fprintf(stderr, "libquant: ggml port: %s:%d: %s\n", __FILE__, __LINE__, msg);  \
@@ -4245,9 +4244,9 @@ size_t quantize_iq2_s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
 
 /* ================================================================== ggml.c: ggml_quantize_init
  *
- * ggml guards the table build with a global critical section and the build itself with an `if
- * (grid) return`; one std::once_flag a table does both. IQ1_S and IQ1_M share a table (the same
- * lattice and the same neighbour count), and so share a flag. */
+ * ggml guards the table build with a global critical section plus an `if (grid) return`; here one
+ * std::once_flag per table does both. IQ1_S and IQ1_M share a table (same lattice and neighbour
+ * count) and so share a flag. */
 void ggml_quantize_init(enum ggml_type type) {
     static std::once_flag once_iq2[4];
     static std::once_flag once_iq3[2];

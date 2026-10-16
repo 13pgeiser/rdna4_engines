@@ -1,5 +1,5 @@
-/* vram_budget.cpp -- see vram_budget.h for why a derived budget is not the §6 violation it looks
- * like. This file is the arithmetic and the receipt. */
+/* vram_budget.cpp -- the budget arithmetic and its printed report. See vram_budget.h for why a
+ * derived budget does not violate §6. */
 #include "mem/vram_budget.h"
 
 #include <algorithm>
@@ -10,48 +10,38 @@ namespace rad {
 namespace {
 constexpr int64_t kMiB = 1024 * 1024;
 
-/* DOWN, ALWAYS. The pools take MiB and multiply back up, so a budget rounded up is a budget that
- * asks the card for more than the arithmetic said was there -- which fails at the allocation
- * rather than here, with the driver's message instead of ours. */
+/* Rounds down: the pools multiply MiB back up, and rounding up would ask the card for more than
+ * the arithmetic found, failing at allocation with the driver's message instead of ours. */
 int64_t to_mib(int64_t bytes) { return bytes > 0 ? bytes / kMiB : 0; }
 
-/* UP, FOR THE ONE BUDGET THAT IS A FLOOR. The KV budget is a CAPACITY -- truncated, the cache
- * addresses a few fewer tokens and nothing else changes. The weights budget is `statics +
- * experts`, a figure the pool must COVER, and a byte short is a tensor with nowhere to land. An
- * expert share pads the number enough to hide that; a dense model is budgeted its static
- * footprint to the byte, and there the rounding direction decides whether it loads. The MiB this
- * claims comes out of the headroom, which is what the headroom is for. */
+/* Rounds up, for the weights budget only. The KV budget is a capacity and may be truncated; the
+ * weights budget (`statics + experts`) must cover every tensor, and a dense model is budgeted its
+ * static footprint to the byte. The extra MiB comes out of the headroom. */
 int64_t to_mib_up(int64_t bytes) { return bytes > 0 ? (bytes + kMiB - 1) / kMiB : 0; }
 
-/* WHAT THE DRIVER'S OWN HOLDING MOVES BY AFTER IT IS READ. `already_held` is one reading, and on
- * ROCm 7.2 the same server started twice has read 4 MiB less than it later held (and once 30 MiB
- * more): a budget that split the difference away came up a few MiB short of the headroom the
- * first launches of kernels allocate from. Four times the drift seen, and charged before anything
- * is split. */
+/* How much the driver's own holding moves after `already_held` is read. On ROCm 7.2 the reading
+ * has come in 4 MiB below what the driver later held, leaving the first kernel launches short of
+ * headroom. Four times that, charged before anything is split. */
 constexpr int64_t kDriverDrift = 16 * kMiB;
 }  /* namespace */
 
-/* WHAT THE CACHE BACKS, counted on its PAGED part. The ceiling is the recurrent and conv state of
- * max_seqs sequences plus their context, and the state is spent before a single token is cached --
- * on a hybrid model at a few dozen sequences it is gigabytes a card. A ratio over the whole
- * ceiling counts that state as context and reports full-length sessions the cache cannot hold. */
+/* The fraction of the paged (context) part of the ceiling the cache backs. The ceiling also
+ * includes fixed recurrent and conv state (gigabytes per card on a hybrid model), which a ratio
+ * over the whole ceiling would wrongly count as context. */
 static double paged_share(const VramBudget& b) {
     const double ctx = (double)(b.kv_ceiling - b.kv_fixed);
     return ctx > 0 ? std::max(0.0, (double)(b.kv - b.kv_fixed)) / ctx : 0.0;
 }
 
-/* The resolver, with its log lines behind `log`: vram_budget_trial asks the same question
- * of a configuration it may not use, and a refusal printed for a split nobody takes reads as the
- * startup failing. */
+/* The resolver. `log` is false for vram_budget_trial, whose split may never be used, so its
+ * refusals must not print as startup failures. */
 static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudget* out, bool log) {
     VramBudget b;
     if (per_rank.empty()) { if (out) *out = b; return RAD_OK; }
 
-    /* THE SMALLEST CARD AND THE LARGEST PROGRAM, because one split is derived for every rank. Ranks
-     * of one deployment normally hold the same shard shapes and the same program, so these folds
-     * are no-ops -- they exist so that a mixed pair degrades to the card that binds instead of
-     * overcommitting the smaller one on the first allocation. An uneven world's cheaper ranks are
-     * re-split from this answer afterwards (vram_budget_rank_split, called by Engine::plan). */
+    /* The smallest card and the largest program, since one split serves every rank. Normally a
+     * no-op; a mixed pair degrades to the card that binds. An uneven world's cheaper ranks are
+     * re-split afterwards (vram_budget_rank_split, from Engine::plan). */
     b.capacity   = per_rank[0].capacity;
     int64_t freeb = per_rank[0].free;
     int64_t layer_max = 0, kv_one = 0;
@@ -71,7 +61,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         b.statics    = std::max(b.statics, f.statics);
         b.expert_ceiling = std::max(b.expert_ceiling, f.experts);
         layer_max        = std::max(layer_max, f.expert_layer_max);
-        /* THE RANK THAT NEEDS MOST ON THE CARD SETS THE FLOOR. */
+        /* The rank that needs most on the card sets the floor. */
         b.expert_floor = std::max(b.expert_floor, f.expert_floor);
         kv_one = std::max(kv_one, f.kv_one);
     }
@@ -83,11 +73,10 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
     const bool shared = host_reserve > b.headroom;
     if (shared) b.headroom = host_reserve;
 
-    /* A DEVICE THAT REPORTS NO CAPACITY HAS NOTHING TO SPLIT, and inventing a capacity would be
-     * exactly the inference §6 forbids. What each pool needs is still known: the weights pool
-     * holds what the planner would copy out of the container -- the statics and experts
-     * weight_footprint counts -- and the cache is its ceiling, every sequence at the full context.
-     * (The host backend reports half the machine's memory and is split like a card.) */
+    /* A device that reports no capacity has nothing to split, and inventing one is the inference
+     * §6 forbids. Each pool gets what it needs: weights what the planner copies out of the
+     * container (weight_footprint), the cache its ceiling. (The host backend reports half the
+     * machine's memory and is split like a card.) */
     if (b.capacity <= 0) {
         b.weights = std::max<int64_t>(b.statics + b.expert_ceiling, kMiB);
         b.kv      = std::max<int64_t>(b.kv_ceiling, kMiB);
@@ -102,14 +91,12 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         return RAD_OK;
     }
 
-    /* MEASURED, NOT ASSUMED, AND IT IS THE ONLY TERM THAT IS. Everything the driver and the loaded
-     * code objects already hold shows up here, including a desktop compositor on the same card --
-     * which is a real configuration on a workstation and the reason this is a line in the report
-     * rather than a constant folded into the headroom. Read after declare(), so every kernel
-     * plugin's init has run and its code object is resident. */
+    /* The only measured term: the driver, loaded code objects and anything else on the card (e.g.
+     * a desktop compositor), so it is reported on its own line rather than folded into the
+     * headroom. Read after declare(), once every kernel plugin's code object is resident. */
     b.already_held = std::max<int64_t>(b.capacity - freeb, 0);
 
-    /* What is left after the terms nobody gets to spend. */
+    /* What is left after the fixed terms. */
     b.drift = kDriverDrift;
     b.claimable = b.capacity - (b.already_held + b.drift + b.headroom + b.arena + b.staging +
                                 b.queues + b.prefetch);
@@ -126,7 +113,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             "  hardware queues    %10s   (%d at %s each, measured)\n"
             "  expert prefetch    %10s   (its ring of expert units and buffers)\n"
             "  ------------------------------\n"
-            "  SHORT BY           %10s\n"
+            "  short by           %10s\n"
             "Lower --gpu-headroom-mib, lower --max-num-batched-tokens (the arena scales with it), "
             "or free the card.\n",
             humanb(b.capacity).c_str(), humanb(b.already_held).c_str(), humanb(b.drift).c_str(),
@@ -138,41 +125,37 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         return RAD_E_NOMEM;
     }
 
-    /* ---- the static weights come off the top ------------------------------------------------
-     *
-     * They are a floor and not a share. */
+    /* ---- the static weights come off the top, as a floor ------------------------------------ */
     b.statics = std::min(b.statics, b.claimable);
     if (b.statics >= b.claimable && b.claimable > 0) {
-        /* Not fatal: the planner will demote what does not fit and the model still serves,
-         * badly. Name it, because "why is this model 8x slower than it should be" has no other
-         * answer at startup. */
-        if (log) RAD_WARN("the static (non-expert) weights alone want %s of the %s this card has to "
-                 "give. Every expert will stream from host memory and the KV cache has "
-                 "nothing left -- this model wants more VRAM, fewer ranks of it, or a smaller "
-                 "--max-num-batched-tokens.",
-                 humanb(b.statics).c_str(), humanb(b.claimable).c_str());
+        /* Not fatal: the planner demotes what does not fit and the model serves slowly. Warn so
+         * the slowdown is explained at startup. */
+        if (log) RAD_WARN("the static (non-expert) weights alone want %s of the %s this card can "
+                          "give, so every expert streams from host memory and the KV cache gets "
+                          "nothing; use more cards or a smaller --max-num-batched-tokens",
+                          humanb(b.statics).c_str(), humanb(b.claimable).c_str());
     }
     b.elastic = b.claimable - b.statics;
     if (b.elastic < 0) b.elastic = 0;
 
-    /* ---- and only what is left is divided --------------------------------------------------- */
+    /* ---- the rest is divided ---------------------------------------------------------------- */
     {
-        /* An unset cache ceiling (plan_groups failed) bounds nothing; zero experts is a ceiling of
-         * zero, which weight_footprint always measures. */
+        /* An unset cache ceiling (plan_groups failed) bounds nothing. An expert ceiling of zero is
+         * real: weight_footprint always measures it. */
         const int64_t kv_cap = b.kv_ceiling > 0 ? b.kv_ceiling : b.elastic;
         int64_t kv = 0, exp = 0;
         if (kv_cap + b.expert_ceiling <= b.elastic) {
-            /* BOTH FIT: nothing trades. */
+            /* Both fit: nothing trades. */
             kv  = kv_cap;
             exp = b.expert_ceiling;
         } else if (b.lends) {
-            /* THE CACHE LENDS, so it is sized for what live requests could need and gives back
-             * whatever they do not. The experts keep what the host pool cannot hold. */
+            /* The cache lends: size it for what live requests could need; it gives back what
+             * they do not. The experts keep what the host pool cannot hold. */
             exp = std::min(b.expert_floor, b.elastic);
             kv  = std::min(kv_cap, std::max(b.elastic - exp, kv_one));
             exp = std::min(std::max(b.expert_ceiling, b.expert_floor), b.elastic - kv);
-            /* THE ONE SEQUENCE WINS, and the experts it pushes off the card have no tier: the
-             * planner refuses them by name. Said here too, with what moves it. */
+            /* One full-length sequence wins; experts it pushes off the card have no tier and the
+             * planner refuses them. Warn here too, with the flags that fix it. */
             if (log && b.expert_floor > 0 && exp < b.expert_floor)
                 RAD_WARN("one --max-model-len sequence's cache (%s) leaves the experts %s, short of "
                          "the %s the pinned host pool cannot hold: raise --host-pool-mib or lower "
@@ -180,8 +163,8 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
                          humanb(kv_one).c_str(), humanb(exp).c_str(),
                          humanb(b.expert_floor).c_str());
         } else {
-            /* NO LENDER: a block the cache does not use would sit empty, so the experts come
-             * first and the cache keeps one --max-model-len sequence. */
+            /* No lender: an unused block would sit empty, so experts come first and the cache
+             * keeps one --max-model-len sequence. */
             kv  = std::min(kv_cap, std::max(b.elastic - b.expert_ceiling, kv_one));
             exp = std::min(b.expert_ceiling, b.elastic - kv);
         }
@@ -192,35 +175,29 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         b.weights  = b.statics + exp;
         b.unusable = std::max<int64_t>(b.elastic - kv - exp, 0);
     }
-    /* A POOL NOTHING IS PLACED IN STILL HAS TO EXIST. Where every weight is read where the
-     * container's mapping has it -- every op on the host, on the host backend -- the statics and
-     * experts are zero, and the pools refuse a zero budget as a resolver that never ran. A MiB,
-     * out of the headroom as the rounding's is. */
+    /* The weights pool must exist even when empty (every weight read from the container's
+     * mapping on the host backend), since the pools treat a zero budget as an unresolved one. One
+     * MiB, out of the headroom. */
     b.weights = std::max<int64_t>(b.weights, kMiB);
 
-    /* ---- THE PREFILL STAGING REGION, out of the expert share ---------------------------------
+    /* ---- the prefill staging region ----------------------------------------------------------
      *
-     * A prefill chunk routes to nearly every expert of every layer, so the part of each layer the
-     * budget leaves off the card is read across the link by the layer's GEMM -- on the critical
-     * path, at the link's rate, while the rest of the layer's work leaves the link idle. Two
-     * buffers of one layer's share of that let the next layer's copy run behind the current one
-     * (core/place/stager.h). They come out of the expert share because they exist only for the
-     * experts that do not fit, and they sit at the top of the activation arena, which every step
-     * smaller than the full plan lends back to the expert slab: a decode step keeps the residency
-     * they cost.
+     * Two layers' share of the experts left off the card, for the prefill stager's ring
+     * (core/place/stager.h). It exists only for experts that do not fit, so it comes out of the
+     * expert share (or, when the cache lends, the cache's). It sits at the top of the activation
+     * arena, which steps smaller than the full plan lend back to the expert slab, so decode keeps
+     * the residency.
      *
-     * The share is the budget's -- what the slab alone leaves off -- which is the most a step can
-     * see: the loans the KV cache and the smaller arena levels make only ever add residency. A
-     * layer whose pooled part is larger than a buffer stages what fits and streams the rest. */
+     * The share is what the slab alone leaves off, the most a step can see: KV and arena loans only
+     * add residency. A layer larger than its share stages what fits and streams the rest. */
     if (layer_max > 0 && b.expert_ceiling > b.experts && cfg.placement != "all_vram" &&
         cfg.placement != "layer_offload") {
         const double f = (double)(b.expert_ceiling - b.experts) / (double)b.expert_ceiling;
         const int64_t one = ((int64_t)std::ceil(f * (double)layer_max) + RAD_ALIGN_UNIT - 1) /
                             RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
         if (b.lends) {
-            /* A LENDING CACHE PAYS FOR IT: the experts are at their floor and a byte less would
-             * leave one with no tier, while the region is lent to the slab whenever the steps are
-             * small -- the same memory the cache would have lent. */
+            /* With a lending cache the cache pays: experts are at their floor, and the region is
+             * lent to the slab in small steps, as the cache would have lent it. */
             if (b.kv - 2 * one >= kv_one) {
                 b.stage = 2 * one;
                 b.kv   -= b.stage;
@@ -232,45 +209,31 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         }
     }
 
-    /* HOW MUCH OF THE ADVERTISED CONTEXT THE POOL BACKS, AND IT IS A PROVISIONING CHOICE RATHER
-     * THAN A SHORTFALL.
-     *
-     * A KV share under max_seqs x max_ctx is not a warning. The argument that it would be -- that
-     * the server accepts at the door what it cannot serve -- is wrong for a PAGED cache, and the
-     * difference is the whole of vLLM's block manager: a sequence holds only the blocks its tokens
-     * actually occupy (KVManager::ensure grows it by ceil_div(n_tokens, block_size) as it runs,
-     * drops them at completion, and returns RAD_E_FULL for the scheduler to preempt rather than
-     * failing the request). Every sequence reaching max_ctx at the same moment is the worst case,
-     * not the workload -- real loads run well under half backing -- and sizing for the worst case
-     * spends VRAM that a model whose experts do not fit would rather have for them.
-     *
-     * So it is reported and not warned about. What IS still checked, and belongs in the KV manager
-     * because it is a real limit rather than a ratio, is that ONE max-length sequence fits: a
-     * context no single request can complete is a configuration error however much slack the pool
-     * has (core/engine_bringup.cpp, configure_kv). */
+    /* How much of max_seqs x max_ctx the pool backs: a provisioning choice, reported, not warned
+     * about. A paged cache holds only the blocks a sequence occupies (KVManager::ensure grows it,
+     * and RAD_E_FULL makes the scheduler preempt), so all sequences at max_ctx at once is the
+     * worst case, not the workload, and sizing for it takes VRAM from experts that do not fit.
+     * The real limit, that one max-length sequence fits, is checked in configure_kv
+     * (core/engine_bringup.cpp). */
     if (log && b.kv_ceiling > 0 && cfg.max_ctx > 0)
         RAD_INFO("kv: the pool backs %.0f%% of the worst case (%lld sequences all at %lld tokens), "
-                 "%.1f full-length sessions. That is concurrency at length before the scheduler "
-                 "preempts, not a bound on any one request. WITH PREFIX CACHING a finished "
-                 "sequence's blocks stay held so the next turn can reuse them, so the demand is "
-                 "live SESSIONS and not running requests -- when they do not all fit, the cache "
-                 "evicts prefixes the next turn wanted and that turn re-prefills its whole "
-                 "context. --host-pool-mib moves it: the experts the host pool cannot hold are the "
-                 "part of the card the cache cannot have.",
+                 "%.1f full-length sessions; a larger --host-pool-mib gives the cache more",
                  100.0 * paged_share(b),
                  (long long)cfg.max_seqs, (long long)cfg.max_ctx,
                  (double)cfg.max_seqs * paged_share(b));
-    /* Rounding the floor up claims up to a MiB the split did not hand out. Take it back from the
-     * cache -- a paged pool a MiB smaller addresses a handful fewer tokens and nothing else -- so
-     * the headroom stays whole. */
+    /* Rounding the weights up claims up to a MiB the split did not hand out; take it back from
+     * the cache so the headroom stays whole. */
     cfg.vram_weights_mib = to_mib_up(b.weights);
     const int64_t w_over = cfg.vram_weights_mib * kMiB - b.weights;
     cfg.vram_kv_mib      = to_mib(std::max<int64_t>(b.kv - w_over, 0));
+    /* A cache given its whole ceiling is rounded up to cover it, out of the headroom as the
+     * weights' MiB is: truncated, a ceiling under a MiB would be an empty pool and one just over a
+     * whole MiB a pool short of its own context. */
+    if (b.kv_ceiling > 0 && b.kv >= b.kv_ceiling && cfg.vram_kv_mib * kMiB < b.kv_ceiling)
+        cfg.vram_kv_mib = to_mib_up(b.kv_ceiling);
 
-    /* THE RECEIPT. Every term, in the order it was spent, so that a split anybody disagrees with
-     * can be argued about against numbers instead of re-derived from sysfs by hand. The unclaimed
-     * line is not padding: to_mib truncates, and what it drops is real VRAM that ends up beside
-     * the headroom. */
+    /* The report: every term in the order spent. `unclaimed` includes what to_mib truncated,
+     * which stays beside the headroom. */
     const int64_t granted   = cfg.vram_weights_mib * kMiB + cfg.vram_kv_mib * kMiB;
     const int64_t unclaimed = b.capacity - b.already_held - b.drift - b.arena - b.staging - b.queues -
                               b.prefetch - b.stage - granted;
@@ -326,22 +289,16 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
                   "                                  more would be unusable",
                   (long long)cfg.max_seqs, (long long)cfg.max_ctx).c_str()
             : (b.kv_ceiling > 0
-                   /* SAID AS A SESSION COUNT, because that is the number to compare against
-                    * --max-num-seqs, and "28%" makes the reader do the arithmetic.
-                    *
-                    * AND IT NAMES SESSIONS, NOT RUNNING REQUESTS. "Paged blocks are held only
-                    * while a sequence occupies them" stops being true once prefix caching takes a
-                    * KV reference on every block it indexes: a finished sequence's blocks stay
-                    * held so the next turn can reuse them. So the demand of a multi-turn workload
-                    * is the number of LIVE SESSIONS, and counting running requests instead
-                    * under-counts by exactly the thing that makes agent turns cheap. When the pool
-                    * cannot hold them all, the cache evicts prefixes the next turn wants and that
-                    * turn re-prefills its whole context (radiance:prefix_cache_evictions_total). */
+                   /* Given as a session count, comparable with --max-num-seqs. Sessions, not
+                    * running requests: prefix caching holds a finished sequence's blocks for the
+                    * next turn, so multi-turn demand is live sessions. When they do not fit, the
+                    * cache evicts prefixes and the next turn re-prefills its whole context
+                    * (radiance:prefix_cache_evictions_total). */
                    ? fmt(" -- %.0f%% backing of the %lld x %lld worst case: %.1f full-length\n"
                          "                                  sessions. With prefix caching a "
                          "finished sequence's blocks stay held\n"
-                         "                                  for reuse, so the demand is LIVE "
-                         "SESSIONS and not running requests",
+                         "                                  for reuse, so the demand is live "
+                         "sessions, not running requests",
                          100.0 * paged_share(b),
                          (long long)cfg.max_seqs, (long long)cfg.max_ctx,
                          (double)cfg.max_seqs * paged_share(b)).c_str()
@@ -381,9 +338,8 @@ RankSplit vram_budget_rank_split(int64_t common_weights_mib, int64_t common_kv_m
     s.kv_mib      = common_kv_mib;
     if (need_kv_mib < 0 || need_kv_mib >= common_kv_mib) return s;
     const int64_t saved = common_kv_mib - need_kv_mib;
-    /* NEVER LESS THAN THE COMMON WEIGHTS POOL, and never more than every weight resident: a weights
-     * pool is one whole allocation, so MiB past what this rank could ever place are left unclaimed
-     * rather than allocated empty. */
+    /* At least the common weights pool and at most every weight resident: the weights pool is one
+     * allocation, so MiB this rank could never place stay unclaimed rather than allocated empty. */
     const int64_t cap   = std::max(common_weights_mib, to_mib_up(weights_cap_bytes));
     const int64_t grown = std::min(common_weights_mib + saved, cap);
     s.kv_mib       = need_kv_mib;

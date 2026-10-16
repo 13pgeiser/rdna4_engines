@@ -1,26 +1,27 @@
-/* tokenizer_perf_test.cpp -- the tokeniser's speed, held to budgets.
+/* tokenizer_perf_test.cpp -- the tokeniser's cost, held to budgets.
  *
- * Tokenisation runs on the request path: an agent re-sends its whole conversation every turn and
- * every byte of it is encoded before the first token can be generated. So speed is a property
- * with a test:
+ * Tokenisation is on the request path: an agent re-sends its whole conversation every turn, and
+ * every byte is encoded before the first token is generated. Checked here, in work
+ * (tests/work_counter.h) so the bounds hold on a loaded machine:
  *
- *   - throughput on prose-and-code text, against an absolute floor and against the reference
- *     encoder (tools/tokref) on the same text -- the ratio holds on a loaded machine where an
- *     absolute number would not;
- *   - LINEAR SCALING: four times the text takes about four times the time, on ordinary text and
- *     on the inputs a pre-tokeniser is quadratic on when it goes wrong (one enormous word, one
- *     enormous run of whitespace, digits, alternating classes);
- *   - the segment cache: the last turn of a long conversation costs a fraction of encoding it.
+ *   - linear scaling: four times the text is about four times the work, on ordinary text and on
+ *     inputs a broken pre-tokeniser is quadratic on (one huge word, a huge whitespace run,
+ *     digits, alternating classes);
+ *   - the encoder against the reference encoder (tools/tokref) on the same text;
+ *   - the segment cache: the last turn of a long conversation hits for every earlier turn and
+ *     costs a fraction of a full encode.
  *
- * Budgets are set well inside what this build does, so a failure is a regression and not noise.
- * Every time is the best of several runs.
+ * Cases named perf_ hold wall-time budgets (an absolute throughput floor, pattern compile time);
+ * they belong to the serial performance tier.
  */
 #include "rad_test.h"
+#include "work_counter.h"
 #include "tokenizer_fixture.h"
 #include "tokref.h"
 
 #include "rad_internal.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <functional>
@@ -77,70 +78,13 @@ std::shared_ptr<const Vocab> vocab() {
     return v;
 }
 
-double encode_seconds(const Tokenizer& t, const std::string& text, int runs = 5) {
-    std::vector<int32_t> ids;
-    return best_of(runs, [&] { ids.clear(); t.encode(text, ids, false, true); });
-}
+struct Pathological {
+    const char* name;
+    std::function<std::string(size_t)> make;
+};
 
-/* TWO TEXTS TIMED IN TURNS, best of five each, so a burst of load from whatever else the machine
- * runs lands on both: timed one after the other, a parallel ctest beside a server read a linear
- * input as x3.6 for twice the text, past the bound a quadratic one is held to. */
-void encode_both(const Tokenizer& t, const std::string& small, const std::string& big,
-                 double* ts, double* tb) {
-    *ts = *tb = 1e30;
-    for (int i = 0; i < 5; ++i) {
-        *ts = std::min(*ts, encode_seconds(t, small, 1));
-        *tb = std::min(*tb, encode_seconds(t, big, 1));
-    }
-}
-
-}  /* namespace */
-
-TEST(throughput_has_a_floor_and_beats_the_reference) {
-    auto v = vocab();
-    REQUIRE(v != nullptr);
-    Tokenizer t;
-    t.init(v);
-    t.set_segment_cache(false);
-    const std::string text = document(2, 2 << 20);
-    const double s = encode_seconds(t, text);
-    const double mbs = text.size() / s / 1e6;
-    std::vector<int32_t> ids;
-    const double r = best_of(2, [&] { ids.clear(); tokref::encode(*v, text, ids, false, true); });
-    std::fprintf(stderr, "    %.1f MB/s (reference %.1f MB/s, %.1fx)\n", mbs, text.size() / r / 1e6, r / s);
-    CHECK(mbs > 25.0);
-    CHECK(r / s > 4.0);
-}
-
-/* FOUR TIMES THE TEXT, ABOUT FOUR TIMES THE TIME. The texts differ, so a cache that remembered one
- * would not help the other; the ratio is allowed well past 4 because the larger one also walks
- * more of memory. A quarter and a whole megabyte: the cost of a byte steps up by about half
- * between one and two megabytes on the machine these were measured on, where the working set
- * leaves the core's cache, and a step across that reads as growth the encoder does not have. */
-TEST(encoding_time_is_linear_in_the_text) {
-    auto v = vocab();
-    REQUIRE(v != nullptr);
-    Tokenizer t;
-    t.init(v);
-    t.set_segment_cache(false);
-    const std::string one = document(3, 256 << 10), four = document(4, 1 << 20);
-    double a, b;
-    encode_both(t, one, four, &a, &b);
-    std::fprintf(stderr, "    256 KB %.2f ms, 1 MB %.2f ms, ratio %.2f\n", a * 1e3, b * 1e3, b / a);
-    CHECK(b / a > 2.6);
-    CHECK(b / a < 6.0);
-}
-
-/* THE INPUTS A SPLITTER GOES QUADRATIC ON. A backtracking `\s+(?!\S)` rescans a whitespace run
- * from every position in it, and a merge that is quadratic in the word shows on one enormous
- * word; both must stay linear. */
-TEST(pathological_inputs_stay_linear) {
-    auto v = vocab();
-    REQUIRE(v != nullptr);
-    Tokenizer t;
-    t.init(v);
-    t.set_segment_cache(false);
-    const struct { const char* name; std::function<std::string(size_t)> make; } inputs[] = {
+const std::vector<Pathological>& pathological_inputs() {
+    static const std::vector<Pathological> v = {
         { "one word", [](size_t n) { return std::string(n, 'a'); } },
         { "whitespace", [](size_t n) { return std::string(n, ' ') + "x"; } },
         { "mixed whitespace", [](size_t n) { std::string s; while (s.size() < n) s += " \t \n"; return s + "x"; } },
@@ -148,20 +92,88 @@ TEST(pathological_inputs_stay_linear) {
         { "alternating", [](size_t n) { std::string s; while (s.size() < n) s += "a1!"; return s; } },
         { "apostrophes", [](size_t n) { std::string s; while (s.size() < n) s += "''s"; return s; } },
     };
-    /* 125 and 500 KB: linear is 4, quadratic 16, and the bound of 8 sits a factor of two from
-     * each. Both stay below the size where a byte's cost steps up (see above); a run of whitespace
-     * costs a little more a byte as it grows, about x4.8 here, and that is not what this holds. */
-    for (const auto& in : inputs) {
+    return v;
+}
+
+double encode_seconds(const Tokenizer& t, const std::string& text, int runs = 5) {
+    std::vector<int32_t> ids;
+    return best_of(runs, [&] { ids.clear(); t.encode(text, ids, false, true); });
+}
+
+/* The work of one encode, in radtest::Work's unit. Without an instruction counter the unit is CPU
+ * time, which a busy machine inflates run to run, so the least of three runs is taken. */
+uint64_t encode_work(const Tokenizer& t, const std::string& text) {
+    std::vector<int32_t> ids;
+    const int runs = radtest::work().exact() ? 1 : 3;
+    uint64_t best = UINT64_MAX;
+    for (int r = 0; r < runs; ++r) {
+        ids.clear();
+        best = std::min(best, radtest::work().of([&] { t.encode(text, ids, false, true); }));
+    }
+    return best;
+}
+
+}  /* namespace */
+
+/* Four times the text is about four times the work. The texts differ, so a cache of one cannot
+ * help the other; the encoder's per-call word cache makes the larger one slightly cheaper per byte
+ * (about x3.3). Counted in work, so the ratio does not depend on the machine's load or on where the
+ * working set leaves the core's cache. */
+TEST(encoding_work_is_linear_in_the_text) {
+    auto v = vocab();
+    REQUIRE(v != nullptr);
+    Tokenizer t;
+    t.init(v);
+    t.set_segment_cache(false);
+    const std::string one = document(3, 256 << 10), four = document(4, 1 << 20);
+    const uint64_t a = encode_work(t, one), b = encode_work(t, four);
+    std::fprintf(stderr, "    256 KB %llu, 1 MB %llu %s, ratio %.2f\n", (unsigned long long)a,
+                 (unsigned long long)b, radtest::work().unit(), (double)b / (double)a);
+    CHECK((double)b / (double)a > 2.6);
+    CHECK((double)b / (double)a < 4.6);
+}
+
+/* Inputs a splitter goes quadratic on. A backtracking `\s+(?!\S)` rescans a whitespace run from
+ * every position in it, and a merge quadratic in word length shows on one huge word; both must
+ * stay linear. 125 and 500 KB: linear is 4 (a whitespace run is x4.3), quadratic 16. Counted in CPU
+ * time the larger text also pays for leaving the core's cache (x7.4 on a whitespace run with every
+ * core busy), so that bound is wider; both stay far below quadratic. */
+TEST(pathological_inputs_stay_linear) {
+    auto v = vocab();
+    REQUIRE(v != nullptr);
+    Tokenizer t;
+    t.init(v);
+    t.set_segment_cache(false);
+    for (const auto& in : pathological_inputs()) {
         const std::string one = in.make(125000), four = in.make(500000);
-        double a, b;
-        encode_both(t, one, four, &a, &b);
-        std::fprintf(stderr, "    %-17s 125 KB %7.2f ms, 500 KB %7.2f ms, ratio %.2f\n", in.name,
-                     a * 1e3, b * 1e3, b / a);
-        CHECK(b / a < 8.0);
+        const uint64_t a = encode_work(t, one), b = encode_work(t, four);
+        std::fprintf(stderr, "    %-17s 125 KB %llu, 500 KB %llu, ratio %.2f\n", in.name,
+                     (unsigned long long)a, (unsigned long long)b, (double)b / (double)a);
+        CHECK((double)b / (double)a < (radtest::work().exact() ? 6.0 : 9.0));
     }
 }
 
-/* THE LAST TURN OF A LONG CONVERSATION costs what is new in it. */
+/* The encoder does a fraction of the reference encoder's work (tools/tokref, the plain
+ * formulation it is checked against) on the same text. */
+TEST(the_encoder_does_a_fraction_of_the_reference_s_work) {
+    auto v = vocab();
+    REQUIRE(v != nullptr);
+    Tokenizer t;
+    t.init(v);
+    t.set_segment_cache(false);
+    const std::string text = document(2, 512 << 10);
+    const uint64_t e = encode_work(t, text);
+    std::vector<int32_t> ids;
+    const uint64_t r = radtest::work().of([&] { tokref::encode(*v, text, ids, false, true); });
+    std::fprintf(stderr, "    512 KB: encoder %llu, reference %llu %s (%.1fx)\n",
+                 (unsigned long long)e, (unsigned long long)r, radtest::work().unit(),
+                 (double)r / (double)e);
+    CHECK((double)r / (double)e > 4.0);
+}
+
+/* The last turn of a long conversation costs only what is new in it: every earlier turn is a
+ * segment the cache holds, so encoding the last prompt hits once per earlier turn and misses once,
+ * for the new one, and does a fraction of an uncached encode's work. */
 TEST(a_resent_conversation_costs_its_new_turn) {
     auto v = vocab();
     REQUIRE(v != nullptr);
@@ -180,15 +192,40 @@ TEST(a_resent_conversation_costs_its_new_turn) {
     std::vector<int32_t> ids;
     for (size_t k = 0; k + 1 < prompts.size(); ++k) { ids.clear(); cached.encode(prompts[k], ids, false, true); }
     const std::string& last = prompts.back();
-    const double warm = best_of(1, [&] { ids.clear(); cached.encode(last, ids, false, true); });
-    const double cold = encode_seconds(plain, last, 3);
-    std::fprintf(stderr, "    %zu bytes: uncached %.2f ms, cached %.2f ms (%.0fx)\n", last.size(),
-                 cold * 1e3, warm * 1e3, cold / warm);
+    const Tokenizer::CacheStats before = cached.cache_stats();
+    std::vector<int32_t> warm_ids, cold_ids;
+    const uint64_t warm = radtest::work().of([&] { cached.encode(last, warm_ids, false, true); });
+    const Tokenizer::CacheStats after = cached.cache_stats();
+    const uint64_t cold = radtest::work().of([&] { plain.encode(last, cold_ids, false, true); });
+    std::fprintf(stderr, "    %zu bytes: uncached %llu, cached %llu %s (%.0fx)\n", last.size(),
+                 (unsigned long long)cold, (unsigned long long)warm, radtest::work().unit(),
+                 (double)cold / (double)warm);
+    CHECK(warm_ids == cold_ids);
+    CHECK_EQ(after.hits - before.hits, (uint64_t)39);
+    CHECK_EQ(after.misses - before.misses, (uint64_t)1);
     CHECK(warm * 5 < cold);
 }
 
+/* Wall-time budgets, for the serial performance tier: an absolute throughput floor on prose and
+ * code, and the encoder ahead of the reference in time as well as in work. */
+TEST(perf_throughput_has_a_floor_and_beats_the_reference) {
+    auto v = vocab();
+    REQUIRE(v != nullptr);
+    Tokenizer t;
+    t.init(v);
+    t.set_segment_cache(false);
+    const std::string text = document(2, 2 << 20);
+    const double s = encode_seconds(t, text);
+    const double mbs = text.size() / s / 1e6;
+    std::vector<int32_t> ids;
+    const double r = best_of(2, [&] { ids.clear(); tokref::encode(*v, text, ids, false, true); });
+    std::fprintf(stderr, "    %.1f MB/s (reference %.1f MB/s, %.1fx)\n", mbs, text.size() / r / 1e6, r / s);
+    CHECK(mbs > 25.0);
+    CHECK(r / s > 4.0);
+}
+
 /* Compiling a shipped pattern is a load-time cost, paid once; it stays small. */
-TEST(compiling_a_shipped_pattern_is_cheap) {
+TEST(perf_compiling_a_shipped_pattern_is_cheap) {
     for (const char* p : { k_qwen35, k_minicpm, k_llama3, k_gpt2 }) {
         std::unique_ptr<TokRegex> re;
         std::string why;

@@ -1,4 +1,4 @@
-/* heat.cpp -- the heat engine's mechanics. See heat.h for why any of it is shaped this way. */
+/* heat.cpp -- the heat engine's mechanics. See heat.h for the policy and data layout. */
 #include "heat.h"
 
 #include <algorithm>
@@ -26,7 +26,7 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     bytes_.assign(n, 0);
     ever_.assign(n, 0u);
 
-    /* The movable units' slab classes, as dense indices -- see heat.h's `cls_`. */
+    /* The movable units' slab classes as dense indices (heat.h: `cls_`). */
     cls_.assign(n, -1);
     {
         std::vector<int32_t> dense;
@@ -46,13 +46,12 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
 
     n_layer_ = 0;
     for (const MoveUnit& mu : plan.units) n_layer_ = std::max(n_layer_, mu.layer + 1);
-    if (n_layer_ < 0) n_layer_ = 0;
     res_count_.assign((size_t)n_layer_, 0);
 
-    /* Each layer's units by expert id, and each slot's other movable units in plan order: a
-     * layer's, then (slot n_layer_) those with no layer. Two units naming one (layer, expert)
-     * leave the later one indexed by the expert -- the one a histogram credits -- and the
-     * earlier, if it can move, among the layer's others. */
+    /* Each layer's units by expert id, and each slot's other movable units in plan order (slot
+     * n_layer_ holds those with no layer). If two units name one (layer, expert), the later one
+     * is indexed by the expert (and credited by histograms); the earlier, if movable, goes among
+     * the layer's others. */
     std::vector<std::vector<int32_t>> by_expert((size_t)n_layer_);
     std::vector<std::vector<int32_t>> other((size_t)n_layer_ + 1);
     int64_t movable = 0;
@@ -124,13 +123,12 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     end_n_cold_.assign((size_t)n_layer_ + 1, 0);
     end_ok_.assign((size_t)n_layer_ + 1, 0);
 
-    /* Two ways to be off, and they are different facts worth different lines. A static plan is a
-     * mode the operator asked for; a plan with nothing movable is a model that does not need this
-     * engine -- the all-in-VRAM degenerate case, where the mover never runs either. */
+    /* Two distinct ways to be off: a static plan (an operator choice), or nothing movable (every
+     * weight fits in VRAM; the mover never runs either). */
     if (!plan.dynamic) {
         enabled_ = false;
-        RAD_INFO("placement is static (--deterministic): the heat engine will not run, so "
-                 "residency -- and therefore the summation order -- is fixed for the run");
+        RAD_INFO("placement is static (--deterministic): residency and summation order are "
+                 "fixed for the run");
         return RAD_OK;
     }
     if (movable == 0) {
@@ -152,7 +150,7 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
 void HeatEngine::observe_ids(int32_t layer, const int32_t* experts, const int32_t* counts,
                              int32_t n) {
     if (!enabled_ || layer < 0 || layer >= n_layer_) return;
-    /* The histogram these name, dense, so both entry points are the one pass. */
+    /* Densify so both entry points share observe(). */
     const int32_t n_ex = n_ex_[(size_t)layer];
     std::vector<int32_t> dense((size_t)n_ex, 0);
     for (int32_t i = 0; i < n; ++i) {
@@ -162,53 +160,43 @@ void HeatEngine::observe_ids(int32_t layer, const int32_t* experts, const int32_
     observe(layer, dense.data(), n_ex, 1.0f);
 }
 
-/* DECAY EVERY POSITION, THEN CREDIT THE ROUTED ONES. Decay first, then credit: the other order
- * gives THIS dispatch's experts a decayed count, which makes min_gain = 1.0 mean 1/decay
- * activations rather than one -- the kind of off-by-a-constant that only ever shows up as a
- * threshold that does not do what it says.
+/* Decay every position, then credit the routed ones. Decay comes first so this dispatch's
+ * credit is not decayed; otherwise min_gain = 1.0 would mean 1/decay activations.
  *
- * THE DECAY IS THE ONLY WORK EVERY POSITION NEEDS, so it is the only dense pass: one multiply a
- * float, vector code at any instruction set. A dispatch routes to a few dozen of a layer's
- * hundreds of experts, and everything else -- the credit, the pricing, the layer's ends -- is a
- * property of those, so it is done for those alone. `h * d` and then `+ c * w` round exactly as
- * the one expression `h * d + c * w` does, so the heats are the same bits either way.
+ * The decay is the only dense pass (one vector multiply per float). A dispatch routes to a few
+ * dozen of a layer's hundreds of experts, so crediting, pricing and the layer's ends touch only
+ * those. `h * d` then `+ c * w` rounds exactly as `h * d + c * w`, so heats are bit-identical.
  *
- * A ROUTED EXPERT IS PRICED HERE TOO. A unit not in VRAM is not a stall -- the GEMM reads it
- * where it lies -- but for every tier above VRAM that read crosses the link, and those are the
- * bytes the mover exists to stop paying. Pricing them on the pass that credits the heat puts the
- * hit rate and the streamed bytes beside the policy's decisions.
+ * Routed experts are priced here too: a unit off the device is read in place across the link,
+ * and those are the bytes the mover exists to save. Pricing on the crediting pass puts hit rate
+ * and streamed bytes beside the policy's decisions.
  *
- * THE LAYER'S ENDS FOLLOW FROM THE CREDITED EXPERTS WHEN THEY WERE VALID. A positive scale keeps
- * every order, and rounding is monotone, so the hottest unit off the device decays to exactly
- * `hot * d` and nothing uncredited passes it: the new hot end is that or a credited unit, whichever
- * is larger. The coldest units on the device decay to exactly `cold * d` likewise, and a credit
- * only raises a unit, so the cold end stands while any unit is left at it. The ends count the
- * units AT the cold value -- equal heats decay to equal heats -- because the common cold end is
- * a crowd: every resident unit no token has routed to yet sits at exactly zero. Only when the
- * last of them is credited is the next coldest unknown here, and the layer is rebuilt from its
- * positions. A tie decay creates is not counted, which can only rebuild a layer that did not need
- * it. */
+ * The layer's ends are updated from the credited experts when they were valid. Decay by a positive
+ * scale with monotone rounding keeps every order, so the hot end becomes `hot * d` or a credited
+ * unit, whichever is larger; the cold end becomes `cold * d` and stands while any unit remains at
+ * it, since credit only raises. The cold end counts units at exactly that value, because it is
+ * usually a crowd (every resident unit not routed to lately sits at zero). When the last is
+ * credited the layer is rebuilt from its positions. Ties created by decay are not counted, which
+ * can only cause an unneeded rebuild. */
 void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert, float weight) {
     if (!enabled_ || layer < 0 || layer >= n_layer_ || !counts) return;
     if (!(weight > 0.0f)) weight = 1.0f;
-    /* Passes this histogram stands for -- see observe()'s contract. At least one, so a caller
-     * that does not set it still prices its reads. */
+    /* Routing passes this histogram stands for (see heat.h: observe); at least one. */
     const uint64_t passes = weight >= 1.0f ? (uint64_t)(weight + 0.5f) : 1u;
 
     const size_t l = (size_t)layer;
     const int32_t lo = slot_lo_[l], len = slot_lo_[l + 1] - lo;
-    /* Past the histogram's last expert, and past the layer's, a position is credited nothing. */
+    /* Positions past the histogram's or the layer's last expert get no credit. */
     const int32_t n = std::max(0, std::min(n_expert, n_ex_[l]));
     const float d = params_.decay;
 
-    /* THE HISTOGRAM ARRIVES BY DMA, so none of it is in the cache: every line is a miss, and a
-     * scan that meets them one at a time pays one latency a line. Asked for all at once they
-     * overlap each other and the decay below -- and a caller sweeping layers asks earlier still
-     * (prefetch()), which makes this a no-op. */
+    /* The histogram arrives by DMA and is not in cache. Prefetching every line at once overlaps
+     * the misses with each other and with the decay; a caller sweeping layers may prefetch
+     * earlier still. */
     prefetch(counts, n);
 
-    /* The credit cap (HeatParams::credit_cap) scales the whole histogram, so its experts keep
-     * their order. The pricing below counts every pass whatever the credit is. */
+    /* The credit cap (HeatParams::credit_cap) scales the whole histogram, preserving order.
+     * Pricing ignores the cap. */
     int64_t total = 0;
     for (int32_t j = 0; j < n; ++j) total += counts[j] > 0 ? counts[j] : 0;
     const float cap = params_.credit_cap;
@@ -235,9 +223,8 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
         if (rank_as_[q] == 1) hot = std::max(hot, x);
         else if (rank_as_[q] == 2 && was <= cold && --n_cold <= 0) ends = false;
     };
-    /* A dispatch routes to a few dozen of the layer's experts, so the credited ones are found a
-     * block at a time -- a mask of the positive counts is vector code -- and only its set bits are
-     * visited, in increasing order as a scan would meet them. */
+    /* Find credited experts a block at a time via a vectorisable mask of positive counts, then
+     * visit only the set bits, in increasing order. */
     int32_t j0 = 0;
     for (; j0 + kLanes <= n; j0 += kLanes) {
         uint32_t m = 0;
@@ -325,15 +312,13 @@ void HeatEngine::abandon(const Swap& s) {
     set_busy(s.demote, false);
 }
 
-/* THE ONE-PAIR PICK, kept as the definition of the ranking: the hottest movable unit off the device
- * against the coldest one on it, ties broken toward the layer that most needs the slot, and the
- * first unit in index order on a full tie. step() proposes exactly the pairs repeated calls to
- * this would, from one pass. */
+/* The one-pair pick, kept as the reference definition of the ranking: the hottest movable unit
+ * off the device against the coldest on it, ties broken toward the layer that most needs the
+ * slot, then by lowest index. step() proposes exactly the pairs repeated calls to this would. */
 bool HeatEngine::pick(Swap* out) const {
     if (!enabled_ || !warm() || !out) return false;
 
-    /* Each class's hottest unit off the device and coldest one on it: a swap stays in its class
-     * (heat.h's `cls_`). */
+    /* Per class, since a swap stays in its class (heat.h: `cls_`). */
     std::vector<int32_t> hot((size_t)n_cls_, -1), cold((size_t)n_cls_, -1);
     std::vector<float>   hot_h((size_t)n_cls_, 0.0f), cold_h((size_t)n_cls_, 0.0f);
     std::vector<int32_t> hot_res((size_t)n_cls_, 0), cold_res((size_t)n_cls_, 0);
@@ -345,32 +330,27 @@ bool HeatEngine::pick(Swap* out) const {
         const int32_t rc = l >= 0 ? res_count_[(size_t)l] : 0;
         const float h = heat_[(size_t)pos_[i]];
         if (tier_[i] == Tier::VRAM) {
-            /* Colder wins; on an exact tie take from the layer holding the MOST resident units,
-             * which is the layer that can spare it. */
+            /* Colder wins; on a tie, take from the layer holding the most resident units. */
             if (cold[c] < 0 || h < cold_h[c] || (h == cold_h[c] && rc > cold_res[c])) {
                 cold[c] = (int32_t)i; cold_h[c] = h; cold_res[c] = rc;
             }
         } else {
-            /* Hotter wins; on an exact tie the layer with the FEWEST resident units wins, because
-             * that is the layer whose tokens are missing most often. Both halves of this are the
-             * same statement about where capacity should sit.
+            /* Hotter wins; on a tie, the layer with the fewest resident units, whose tokens miss
+             * most often.
              *
-             * Tier::SSD is a candidate here and Tier::HostPinned is too, deliberately: this
-             * engine promotes UP from wherever the unit is, and the mover knows which source that
-             * means. What it never does is push a unit DOWN to the file tier -- banishing
-             * something to disk is a bet that it will not be needed, paid at a full read every
-             * time the bet is wrong, and a frequency counter has no forward-looking confidence to
-             * justify one. Demotion targets the host pool, and only the planner assigns SSD. */
+             * Both Tier::SSD and Tier::HostPinned units are candidates: promotion is from wherever
+             * the unit is, and the mover knows the source. Demotion never targets the file tier,
+             * since a frequency counter cannot justify a bet that a unit will not be needed; it
+             * targets the host pool, and only the planner assigns SSD. */
             if (hot[c] < 0 || h > hot_h[c] || (h == hot_h[c] && rc < hot_res[c])) {
                 hot[c] = (int32_t)i; hot_h[c] = h; hot_res[c] = rc;
             }
         }
     }
 
-    /* BOTH guards, and they answer different failures. The ratio stops a swap that trades one
-     * warm unit for another; the additive floor stops the degenerate case where the victim's heat
-     * is zero, which every ratio passes trivially and which describes most of the resident set
-     * right after warmup. Of the classes whose pair passes, the one with the hotter candidate. */
+    /* Both guards: the ratio stops trading one warm unit for another, and the additive floor
+     * stops swaps against a zero-heat victim, which any ratio passes. Of the classes whose pair
+     * passes, take the one with the hotter candidate. */
     int32_t best = -1;
     for (int32_t c = 0; c < n_cls_; ++c) {
         if (hot[(size_t)c] < 0 || cold[(size_t)c] < 0) continue;
@@ -388,12 +368,10 @@ bool HeatEngine::pick(Swap* out) const {
     return true;
 }
 
-/* THE WHOLE STEP'S PROPOSALS FROM ONE PASS. Marking a pair busy changes neither a unit's heat nor
- * any layer's resident count, so the m-th pair repeated pick() calls would return is simply the
- * m-th entry at each end of the same ranking. One pass keeps the `moves_per_step` best of each
- * end; the proposals, and the counters that say why the list stopped, are the ones the repeated
- * picks produce. This runs once a step on the thread that issues the next one, and the budget is
- * dozens of swaps, so a scan per proposed move would be most of its cost. */
+/* A whole step's proposals from one pass. Marking a pair busy changes no heat or resident
+ * count, so the m-th pair repeated pick() calls would return is the m-th entry at each end of the
+ * same ranking. One pass keeps the `moves_per_step` best of each end and yields the same
+ * proposals and stop counters as repeated picks, without a scan per move on the issuing thread. */
 namespace {
 using Ranked = HeatRanked;
 /* Hotter first, then the layer with fewer residents, then the lower index. */
@@ -425,10 +403,9 @@ int HeatEngine::step(std::vector<Swap>* out) {
     const int k = params_.moves_per_step;
     if (k <= 0) return RAD_OK;
 
-    /* THE BEST PAIR FROM THE LAYERS' ENDS FIRST. If it fails the guard every pair does -- the
-     * ranking only gets colder at one end and warmer at the other -- and the dispatch proposes
-     * nothing, which is the verdict the full ranking below reaches, from one entry a layer. The
-     * ends also count the candidates at each end, which is all the stop reasons below need. */
+    /* Test the best pair from the layers' ends first. If it fails the guard, every pair does,
+     * and the dispatch proposes nothing after one entry per layer. The ends' counts also give the
+     * stop reasons. */
     int64_t n_off = 0, n_on = 0;
     float bar = 0.0f;
     {
@@ -448,31 +425,21 @@ int HeatEngine::step(std::vector<Swap>* out) {
         bar = cold_h * params_.hysteresis + params_.min_gain;
     }
 
-    /* THE RANKING, over every movable position. A unit can only enter a full list by reaching
-     * its last entry's heat, so each block of positions is first screened against the two lists'
-     * last heats -- one compare a position, over contiguous floats -- and only what passes the
-     * screen meets the exact comparison, ties and all. The screen passes a tie, so it never drops
-     * a unit the comparison would keep; and the lists are a strict order's best k, so meeting the
-     * units in position order rather than unit order ends in the same lists.
+    /* The ranking over every movable position. Each kLanes block is screened against the two
+     * lists' last heats (one vector compare per position); only what passes meets the exact
+     * comparison. The screen passes ties, so it never drops a unit the comparison would keep, and
+     * since the lists hold a strict order's best k, visiting in position order gives the same
+     * lists. The hot end is also screened against the guard bar: a unit below it cannot be
+     * proposed against any victim.
      *
-     * The hot end is screened against the guard as well. A unit colder than the coldest resident
-     * unit's bar fails the guard against every victim the cold list can hold, so it cannot be
-     * proposed, and the list it is kept out of only ever ends at the pair that fails. A layer's
-     * run is a whole number of kLanes blocks, so every block has the same trip count and the
-     * screen is vector code.
+     * Each layer is first screened by its ends. Most resident units sit exactly at the cold end
+     * (zero), which the position screen passes, so without this nearly every resident unit would
+     * reach the exact comparison. A layer whose hot end is below the hot bar and whose cold end
+     * cannot beat the cold list's last entry is skipped; on a heat tie the comparison falls to the
+     * layer's shared resident count, then to the unit index, bounded by the layer's lowest.
      *
-     * A WHOLE LAYER IS SCREENED FIRST, BY ITS ENDS. Most resident units sit at exactly the cold
-     * end's heat -- zero, for every one no token has routed to lately -- and the position screen
-     * passes a tie, so it would send nearly every resident unit to the exact comparison only for
-     * the tie break to refuse it. The ends are that layer's hottest candidate off the device and
-     * coldest on it, so a layer whose hot end is below the hot list's bar and whose cold end
-     * cannot beat the cold list's last entry holds no unit either list would keep. On a tie the
-     * comparison falls to the layer's resident count, which every unit of the layer shares, and
-     * then to the unit index, which the layer's lowest bounds. */
-    /* ONE PAIR OF LISTS A CLASS, because a swap stays inside its class (heat.h's `cls_`). The
-     * screens below take the loosest of the classes' thresholds, so a unit any class's list would
-     * keep still reaches the exact comparison; with one class they are that class's thresholds
-     * and the screen is exact. */
+     * One pair of lists per class (heat.h: `cls_`). The screens use the loosest threshold across
+     * classes, so they stay conservative; with one class they are exact. */
     const int nc = n_cls_;
     rank_hot_.resize((size_t)(k * nc));
     rank_cold_.resize((size_t)(k * nc));
@@ -484,8 +451,8 @@ int HeatEngine::step(std::vector<Swap>* out) {
     const int64_t n_pool = n_off, n_vram = n_on;
     const float*   hp = heat_.data();
     const uint8_t* ra = rank_as_.data();
-    /* A hot unit reaches a list at the lowest last entry of a full list, and none below the guard;
-     * a cold one at the highest last entry, and any heat while some list is not full. */
+    /* Hot threshold: the lowest last entry of any full list, never below the guard. Cold
+     * threshold: the highest last entry, or any heat while some list is not full. */
     auto hot_bar = [&]() {
         float t = INFINITY;
         for (int c = 0; c < nc; ++c) t = std::min(t, n_hot[c] == k ? hot[c * k + k - 1].h : -INFINITY);
@@ -537,10 +504,9 @@ int HeatEngine::step(std::vector<Swap>* out) {
         }
     }
 
-    /* The proposals: each class's m-th hottest against its m-th coldest, for as long as that
-     * passes the guard -- the ranking only gets colder at one end and warmer at the other, so the
-     * first pair that fails ends the class -- and at most `k` of them a class, taken across the
-     * classes hottest first, which is the order repeated pick() calls would return them in. */
+    /* Each class's m-th hottest against its m-th coldest while that passes the guard (the first
+     * failure ends the class), at most `k` per class, taken across classes hottest first: the
+     * order repeated pick() calls would return. */
     int32_t* m_of = m_of_.data();
     for (int c = 0; c < nc; ++c) m_of[c] = 0;
     int made = 0;
@@ -563,7 +529,7 @@ int HeatEngine::step(std::vector<Swap>* out) {
         s.promote = hot[best * k + m_of[best]].unit;
         s.demote = cold[best * k + m_of[best]].unit;
         ++m_of[best];
-        /* Marked busy on the way out: the caller owns the pair until it publishes or abandons. */
+        /* The caller owns the pair until it publishes or abandons it. */
         set_busy(s.promote, true);
         set_busy(s.demote, true);
         out->push_back(s);
@@ -571,11 +537,8 @@ int HeatEngine::step(std::vector<Swap>* out) {
         ++made;
     }
     if (short_of_budget) {
-        /* Two ways to propose nothing more and they are different diagnoses. `refused` is the
-         * guard declining -- the healthy steady state. `no_candidate` is one end of the ranking
-         * being empty, which means either everything movable is resident or nothing is, and is a
-         * budget question rather than a policy one. The pairs already proposed are busy by now,
-         * so they are not counted at either end. */
+        /* See HeatStats for `refused` vs `no_candidate`. Pairs already proposed are busy and not
+         * counted at either end. */
         if (n_pool - made > 0 && n_vram - made > 0) ++stats_.refused; else ++stats_.no_candidate;
     }
     return RAD_OK;
@@ -595,20 +558,15 @@ std::string HeatEngine::report() const {
                         (unsigned long long)stats_.demotions);
     s += fmt("  %llu dispatches declined on hysteresis, %llu found no candidate at one end\n",
              (unsigned long long)stats_.refused, (unsigned long long)stats_.no_candidate);
-    /* The one line that says whether the traffic above was worth paying. A readmit is a unit this
-     * engine demoted and then fetched back: both directions of the link spent to return to where
-     * it started, on the link the zero-copy tier needs. High here means the guards are too
-     * loose -- and note that TIGHTENING min_gain to fix it costs more bytes, not fewer. */
+    /* A readmit is a unit demoted and then fetched back: link traffic both ways for nothing. A high
+     * rate means the guards are too loose, though raising min_gain costs more bytes (heat.h). */
     s += fmt("  %llu distinct units promoted, %llu readmits (%.0f%% of promotions were of "
              "something already demoted)\n",
              (unsigned long long)stats_.distinct_promoted, (unsigned long long)stats_.readmits,
              stats_.promotions ? 100.0 * (double)stats_.readmits / (double)stats_.promotions : 0.0);
 
-    /* The histogram this engine exists for. A global profile ranking leaves the per-layer
-     * resident count wherever it happens to fall; a layer starved of slots misses on nearly every
-     * token however good the ranking inside it is, which is how a hit rate lands below what
-     * choosing at random would give. Whether the engine repaired that is a question about this
-     * DISTRIBUTION, not about the mean. */
+    /* The per-layer resident distribution: a layer starved of slots misses on nearly every token
+     * however good its internal ranking, so the spread matters more than the mean. */
     if (!res_count_.empty()) {
         int32_t lo = res_count_[0], hi = res_count_[0];
         double sum = 0;
@@ -618,10 +576,7 @@ std::string HeatEngine::report() const {
         for (int32_t v : res_count_) var += (v - mean) * (v - mean);
         s += fmt("  resident units a layer: min %d max %d mean %.1f sd %.1f\n", (int)lo, (int)hi,
                  mean, std::sqrt(var / (double)res_count_.size()));
-        /* AND WHICH LAYERS, because min/max/sd cannot be joined to anything. A kernel trace can
-         * say which layers run longer than their neighbours; only this line can say whether those
-         * are the starved ones, and without it the two measurements sit in different files saying
-         * nothing to each other. One line, one number a layer, printed once at exit. */
+        /* Per-layer counts, so slow layers in a kernel trace can be matched to starved ones. */
         s += "  per layer:";
         for (size_t i = 0; i < res_count_.size(); ++i) {
             if (i % 12 == 0) s += fmt("\n   L%-3zu ", i);

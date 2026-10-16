@@ -1,19 +1,13 @@
-/* planner.cpp -- the placement planner. See planner.h for the design; this file is the mechanics.
+/* planner.cpp -- the placement planner's mechanics; planner.h has the design.
  *
- * The planner runs once, between declare and load, and it is pure: it reads the Program, the
- * Config and the container's profile, and it writes a Plan. It queries no device, reads no clock
- * and looks at no environment. That is not tidiness -- it is what makes Config::deterministic
- * implementable (spec §17) and what makes the resident set identical on every tensor-parallel
- * rank (planner.h, MoveUnit).
+ * The planner is pure: it reads the Program, the Config and the container's profile and writes a
+ * Plan. It queries no device, clock or environment, which is what makes Config::deterministic
+ * possible (spec §17) and keeps the resident set identical on every TP rank (planner.h, MoveUnit).
  *
- * DO NOT ADD A DEVICE QUERY HERE, and the reason is concrete rather than principled. Every pool is
- * budgeted explicitly from Config (spec §6) -- no profiling pass, no utilisation fraction. A
- * planner that instead derived a budget from RadDeviceProps would have to cope with rad_dev_count()
- * reporting devices that are not the target: an integrated GPU enumerates alongside the discrete
- * ones and reports tens of GiB of "VRAM" that is really system RAM, so summing capacity across
- * devices overstates the budget by that much and produces a plan that cannot load. Any future code
- * that does look at props must be per-device and must filter on RadDeviceProps::arch, never on
- * index and never on capacity.
+ * Do not add a device query. Budgets come from Config (spec §6). rad_dev_count() also enumerates
+ * integrated GPUs, which report tens of GiB of "VRAM" that is system RAM, so summing capacity
+ * overstates the budget. Any code that does read RadDeviceProps must be per device and filter on
+ * RadDeviceProps::arch, never on index or capacity.
  */
 #include "planner.h"
 
@@ -25,8 +19,9 @@
 namespace rad {
 
 /* ------------------------------------------------------------------ names */
-/* These live here because placement is the component that owns what a tier and a site MEAN.
- * rad_core.h declares them; if a second definition appears, one of us is wrong about ownership. */
+constexpr int kSiteCount = (int)Site::Host + 1;
+
+/* Declared in rad_core.h, defined here because placement owns what a tier and a site mean. */
 const char* tier_name(Tier t) {
     switch (t) {
         case Tier::VRAM:         return "vram";
@@ -87,10 +82,8 @@ Budgets Budgets::from(const Config& c) {
 
 /* ------------------------------------------------------------------ sizes and keys */
 int64_t weight_bytes(const WeightInfo& w) {
-    /* The layout pass's answer when it has run: the stored layout is what actually occupies a
-     * tier, and for a kernel that re-layouts its weights it is not the logical size. Before the
-     * layout pass -- which is the state a planner unit test builds -- fall back to the declared
-     * dtype and shape, which is what logical_bytes is. */
+    /* The stored size occupies the tier and differs from the logical size for a relayout. Before
+     * the layout pass (as in planner unit tests), fall back to the declared dtype and shape. */
     if (w.stored_bytes > 0) return w.stored_bytes;
     if (w.logical_bytes > 0) return w.logical_bytes;
     int64_t n = w.decl.rank ? 1 : 0;
@@ -99,9 +92,6 @@ int64_t weight_bytes(const WeightInfo& w) {
 }
 
 
-/* See planner.h. Planner::resolve_sites, Planner::build_units and Planner::pin_mapped, run over
- * the same program without allocating a Plan -- the budget resolver calls this before a Planner
- * exists. Kept adjacent to the three so a change to any of them has this in the same diff. */
 int64_t file_stage_reserve(int64_t widest, bool routed) {
     return (int64_t)RAD_PLACE_FILE_STAGE_SLOTS * widest +
            (routed ? (int64_t)RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES : 0);
@@ -122,29 +112,49 @@ int plan_check_weights_pool(const Plan& p, int64_t pool_bytes) {
     return RAD_E_STATE;
 }
 
+/* ------------------------------------------------------------------ site availability */
+/* A site is available for an op only if every band resolved a kernel in its domain (spec §5.1),
+ * read from Band::dom rather than a flag. Every band, not just the one that runs: the same op
+ * serves M=1 at decode and M=4096 at prefill (spec §2.2), and placement is decided once for all
+ * steps.
+ *
+ * Host availability is an option the budgets may take. Device availability decides whether the
+ * weight may be on a card at all; without it pin_mapped keeps it in the container's mapping.
+ * Declare rejects only ops with no kernel in either domain, so a host-only op (e.g.
+ * `embed_lookup_q` with no device kernel loaded) does reach the planner. */
+static void resolve_sites(const Program& prog, std::vector<uint8_t>* host_ok,
+                          std::vector<uint8_t>* device_ok) {
+    host_ok->assign(prog.weights.size(), 1u);
+    device_ok->assign(prog.weights.size(), 1u);
+    for (const OpInfo& o : prog.ops) {
+        bool host = !o.bands.empty();
+        bool dev  = !o.bands.empty();
+        for (const Band& b : o.bands) {
+            if (!b.dom[RAD_DOMAIN_HOST]) host = false;
+            if (!b.dom[RAD_DOMAIN_DEVICE]) dev = false;
+        }
+        for (rad_weight w : o.weights) {
+            if (w == RAD_NULL_HANDLE || w >= host_ok->size()) continue;
+            if (!host) (*host_ok)[w] = 0u;
+            /* No device kernel leaves host as the only option. Declare rejects a band with neither
+             * kernel, so `!dev` here implies `host`. */
+            if (!dev) (*device_ok)[w] = 0u;
+        }
+    }
+}
+
+/* Planner::build_units and pin_mapped replayed without a Plan, for the budget resolver that runs
+ * before a Planner exists. Keep in step with those two; resolve_sites is shared. */
 void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement embedding,
                       TablePlacement ngram, bool host_backend, bool container) {
     if (!out) return;
     *out = WeightFootprint{};
 
-    /* resolve_sites: a weight every one of whose ops lacks a device band cannot be read on the
-     * card, so it is never copied there whatever the budgets say. */
-    std::vector<uint8_t> device_ok(prog.weights.size(), 1u), host_ok(prog.weights.size(), 1u);
-    for (const OpInfo& o : prog.ops) {
-        bool dev = !o.bands.empty(), host = !o.bands.empty();
-        for (const Band& b : o.bands) {
-            if (!b.dom[RAD_DOMAIN_DEVICE]) dev = false;
-            if (!b.dom[RAD_DOMAIN_HOST]) host = false;
-        }
-        for (rad_weight w : o.weights) {
-            if (w == RAD_NULL_HANDLE || w >= device_ok.size()) continue;
-            if (!dev) device_ok[w] = 0u;
-            if (!host) host_ok[w] = 0u;
-        }
-    }
+    std::vector<uint8_t> host_ok, device_ok;
+    resolve_sites(prog, &host_ok, &device_ok);
 
     /* build_units: a model-level weight is its own unit, everything else groups by the declared
-     * (layer, expert). Ordered, for the same reason build_units is. */
+     * (layer, expert). */
     struct U { int32_t layer = -1, expert = -1; int64_t bytes = 0; bool mapped = false;
                bool emb = false, ngram = false, host = true, direct = true;
                int access = -1; };
@@ -174,7 +184,7 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
         U& mu = units[u];
         const int64_t a = wi.align > 0 ? wi.align : RAD_ALIGN_UNIT;
         mu.bytes = align_up(mu.bytes, a) + weight_bytes(wi);
-        /* pin_mapped: THE WHOLE UNIT GOES, not the one weight. */
+        /* pin_mapped: the whole unit is mapped, not the one weight. */
         if (w < device_ok.size() && !device_ok[w]) mu.mapped = true;
         if (!weight_file_direct(wi, prog.ctx.world_size)) mu.direct = false;
         if (w < host_ok.size() && !host_ok[w]) mu.host = false;
@@ -188,22 +198,25 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
         }
     }
 
-    /* And one align_up a unit, because that is how Mover::init spends the slab: `us.static_off =
-     * align_up(static_need, RAD_ALIGN_UNIT)` before every unit it places. A budget that summed raw
-     * bytes would be short by one alignment per unit, which on a 512-expert MoE is real. */
     for (U& mu : units) mu.mapped = mapped_unit(mu.mapped, container && mu.direct, host_backend);
     std::map<int32_t, int64_t> layer_experts;
     std::set<int64_t> expert_strides;
     bool ngram_host = true;
     for (const U& mu : units) if (mu.ngram && !mu.host) ngram_host = false;
     for (const U& mu : units) {
+        /* Each unit is rounded up to RAD_ALIGN_UNIT, as Mover::init aligns before every unit it
+         * places; summing raw bytes would come up short by one alignment per unit. */
         const int64_t b = align_up(mu.bytes, RAD_ALIGN_UNIT);
         /* pin_embedding moves a table out of the statics only where nothing has mapped it. */
         if (mu.emb && !mu.mapped) out->embedding += b;
         if (mu.ngram) out->ngram += b;
         if (mu.ngram && !mu.mapped) out->ngram_device = true;
-        /* pin_towers moves an encoder tower's unit out of the statics on the same test. */
-        if (mu.access == RAD_ACCESS_PER_REQUEST && !mu.mapped && mu.expert < 0) out->tower += b;
+        /* pin_towers moves an encoder tower's unit out of the statics on the same test, except a
+         * lookup table pin_embedding has already pinned (tower_pin_bytes). */
+        if (mu.access == RAD_ACCESS_PER_REQUEST && !mu.mapped && mu.expert < 0) {
+            out->tower += b;
+            if (mu.emb) out->tower_lookup += b;
+        }
         /* pin_mapped: an n-gram table a device kernel reads stays off the card unless it was
          * placed in VRAM. */
         if (mu.mapped || (mu.ngram && ngram != TablePlacement::Vram)) out->mapped += b;
@@ -241,80 +254,30 @@ std::string weight_class_key(const std::string& name) {
     return out;
 }
 
-/* ------------------------------------------------------------------ site availability */
-/* Host-site execution needs a RAD_DOMAIN_HOST kernel from a kernel plugin, and where none
- * resolved that site is UNAVAILABLE for that op (spec §5.1). The planner does not take that as a
- * flag from somewhere; it reads the Band's per-domain resolution, because the resolution IS the
- * fact and anything else can drift from it.
- *
- * EVERY band, not the band that happens to run. A bucket table exists because the same op serves
- * M=1 at decode and M=4096 at prefill (spec §2.2), and a site that is available for one and not
- * the other is a site that changes under load. Placement is decided once; it has to hold for
- * every step the plan is legal for.
- *
- * BOTH DOMAINS ARE TRACKED, and they answer different questions. Host says whether the host SITE
- * is available -- an option the budgets may or may not take. Device says whether the weight may be
- * placed on a card AT ALL, and a weight whose op has no device kernel anywhere may not: it is
- * pinned to the container's mapping by pin_mapped below, before any budget is consulted.
- *
- * Tracking host alone would rest on the argument that a missing device kernel is fatal at declare
- * and never reaches the planner. That is true only of an op with NO kernel in either domain: an op
- * such as `embed_lookup_q` resolves on the host and nowhere else when no device kernel for it is
- * loaded, and declare reports that device band as unserved without refusing the model. */
-void Planner::resolve_sites(const Program& prog) {
-    host_ok_.assign(prog.weights.size(), 1u);
-    device_ok_.assign(prog.weights.size(), 1u);
-
-    for (const OpInfo& o : prog.ops) {
-        bool host = !o.bands.empty();
-        bool dev  = !o.bands.empty();
-        for (const Band& b : o.bands) {
-            if (!b.dom[RAD_DOMAIN_HOST]) host = false;
-            if (!b.dom[RAD_DOMAIN_DEVICE]) dev = false;
-        }
-        for (rad_weight w : o.weights) {
-            if (w == RAD_NULL_HANDLE || w >= host_ok_.size()) continue;
-            if (!host) host_ok_[w] = 0u;
-            /* AND THE OTHER DIRECTION, which is not the same statement. The absence of a host
-             * kernel removes a placement OPTION; the absence of a DEVICE one removes every option
-             * but host, and that is a decision rather than a preference: bytes an op can only be
-             * computed over on the CPU must not be copied to a card that cannot read them.
-             *
-             * Declare's asymmetry still holds -- a band with neither kernel is fatal before the
-             * planner runs -- so reaching here with `!dev` means `host` is true. */
-            if (!dev) device_ok_[w] = 0u;
-        }
-    }
-}
-
 /* ------------------------------------------------------------------ the mapped tier */
-/* A weight no device kernel can read is pinned to the container's mapping BEFORE any budget is
- * consulted, because it is not a budget question -- and so is an n-gram table --ngram-placement put
- * in RAM or on disk, whatever kernels could read it on a card. The other three off-device tiers are
- * what the planner falls back to when VRAM runs out; this one is where the weight has to be
- * whatever the budgets say, and charging a pool for bytes that are never copied would size that
- * pool against a number that does not exist.
+/* A weight no device kernel can read is pinned to the container's mapping before any budget is
+ * consulted, and so is an n-gram table --ngram-placement put in RAM or on disk. This is not a
+ * fallback tier: these bytes are never copied into a pool, so no pool is charged for them.
  *
- * THE WHOLE UNIT GOES, not the one weight. A unit is the movement granularity and a half-mapped one
- * has no meaning -- and it costs nothing here, because `device_ok_` is cleared for EVERY weight
- * operand of a host-only op, so the unit's other members are the same op's scale and constants.
- * What this does exclude is a plugin that groups a host-only weight with a device one: that
- * collapses the whole group onto the host, so the report names it. */
+ * The whole unit is mapped, not the one weight. `device_ok_` is cleared for every operand of a
+ * host-only op, so the unit's other members are normally that op's scales and constants. A plugin
+ * that groups a host-only weight with a device one collapses the group onto the host, and gets a
+ * warning. */
 void Planner::pin_mapped(const Program& prog, Plan* p) {
     const TablePlacement ng = in_.config->ngram_resolved;
     for (MoveUnit& mu : p->units) {
-        bool host_only = false, direct = in_.container;
+        /* `stored`: every weight is in the container exactly as its kernel reads it. */
+        bool host_only = false, stored = true;
         for (rad_weight w : mu.weights) {
             if (w < device_ok_.size() && !device_ok_[w]) host_only = true;
             if (w < prog.weights.size() &&
-                !weight_file_direct(prog.weights[w], prog.ctx.world_size)) direct = false;
+                !weight_file_direct(prog.weights[w], prog.ctx.world_size)) stored = false;
         }
-        /* On the host backend a unit stored in another form than its host kernel reads is placed
-         * like any other weight, in the pool its kernel can read too (mapped_unit). */
-        host_only = mapped_unit(host_only, direct, in_.host_backend);
-        /* --ngram-placement keeps an n-gram table OFF THE CARD unless it says vram, whether or not
-         * a device kernel could read it there: ram and disk are where the operator put it, and the
-         * strategies below would otherwise spend the card on 48 GB of rows read sixteen a token. */
+        /* See mapped_unit: on the host backend a non-direct unit goes to the weights pool. */
+        host_only = mapped_unit(host_only, in_.container && stored, in_.host_backend);
+        /* --ngram-placement keeps an n-gram table off the card unless it says vram, even when a
+         * device kernel could read it; otherwise the strategies would spend VRAM on a huge table
+         * read a few rows a token. */
         const bool ngram = mu.layer < 0 && !mu.weights.empty() &&
                            is_ngram_table(prog, mu.weights.front());
         if (!host_only && !(ngram && ng != TablePlacement::Vram)) continue;
@@ -331,33 +294,26 @@ void Planner::pin_mapped(const Program& prog, Plan* p) {
         } else {
             mu.site = Site::Host;
             mu.reason = "--ngram-placement disk: the host gather reads it from the container";
-            for (rad_weight w : mu.weights)
-                if (w < host_ok_.size() && !host_ok_[w])
-                    note_unfit(p, mu, "--ngram-placement disk needs a host kernel for its gather, "
-                                      "and none was loaded");
+            if (!host_kernel(mu))
+                note_unfit(p, mu, "--ngram-placement disk needs a host kernel for its gather, "
+                                  "and none was loaded");
         }
-        /* --ngram-placement ram: the load phase copies an n-gram table out of the mapping and
-         * publishes the copy -- locked memory the host kernel reads, or pinned memory the card
-         * reads where a device kernel gathers. Every pool still sees the mapped tier; the report
-         * shows what the copy costs. */
+        /* --ngram-placement ram: the load phase copies the table out of the mapping into locked
+         * memory (host gather) or pinned memory (device gather). Pools still see the mapped tier;
+         * the report shows the copy's cost. */
         if (ngram && ng == TablePlacement::Ram) {
             if (host_only) mu.reason = "--ngram-placement ram: a locked copy in RAM, made at load";
             else           p->ngram_copy_card = true;
             p->ngram_copy_bytes += mu.bytes;
         }
-        /* AND ONLY WHAT LIES IN THE CONTAINER AS THE KERNEL READS IT can be read from the mapping,
-         * or copied out of it: a weight its kernel rearranges at load, or a shard of one, has no
-         * place in the file that already looks the way the kernel reads it (spec §5.1). */
+        /* Only a weight stored in the container exactly as its kernel reads it can be read from,
+         * or copied out of, the mapping; a load-time relayout or a shard cannot (spec §5.1). */
         if (!in_.container)
-            note_unfit(p, mu, "it is read from a container's mapping or copied out of one -- and "
-                              "a checkpoint served directly has none; convert it to a container");
-        else
-            for (rad_weight w : mu.weights)
-                if (w < prog.weights.size() &&
-                    !weight_file_direct(prog.weights[w], prog.ctx.world_size))
-                    note_unfit(p, mu, "it is read from the container's mapping or copied out of "
-                                      "it -- and its stored form is not the container's (a "
-                                      "relayout, a widening or a shard)");
+            note_unfit(p, mu, "it must be read from a container's mapping, and a checkpoint served "
+                              "directly has none; convert it to a container");
+        else if (!stored)
+            note_unfit(p, mu, "it must be read from the container's mapping, and its stored form "
+                              "is not the container's (a relayout, a widening or a shard)");
         if (host_only)
             for (rad_weight w : mu.weights)
                 if (w < device_ok_.size() && device_ok_[w])
@@ -375,8 +331,7 @@ int access_strength(int access) {
         case RAD_ACCESS_PER_REQUEST: return 2;
         case RAD_ACCESS_CONDITIONAL: return 1;
         case RAD_ACCESS_RARE:        return 0;
-        default:                     return 4;   /* an access class we do not know is not one to
-                                                  * gamble a demotion on */
+        default:                     return 4;   /* unknown: never risk a demotion */
     }
 }
 
@@ -384,10 +339,8 @@ void Planner::build_units(const Program& prog, Plan* p) {
     p->unit_of_weight.assign(prog.weights.size(), -1);
     p->units.clear();
 
-    /* Keyed on the declared RadWeightGroup, which is the plugin's statement about what moves
-     * together. Ordered, not hashed: the unit order has to be a function of the model and not of
-     * a hash seed, or two ranks can rank the same profile differently and disagree about which
-     * experts are resident. */
+    /* Keyed on the declared RadWeightGroup. Ordered, not hashed: the unit order must depend only
+     * on the model, or TP ranks could disagree about which experts are resident. */
     std::map<std::pair<int32_t, int32_t>, int32_t> by_group;
 
     for (rad_weight w = 1; (size_t)w < prog.weights.size(); ++w) {
@@ -395,15 +348,12 @@ void Planner::build_units(const Program& prog, Plan* p) {
         const int32_t layer = wi.decl.group.layer;
         const int32_t expert = wi.decl.group.expert;
 
-        /* A model-level weight is its own unit. Grouping every model-level weight together would
-         * make the embedding table and the output norm one movement unit of wildly different
-         * access classes, and the mover would have to carry the larger of them for the smaller. */
+        /* A model-level weight is its own unit; grouping them would tie, e.g., the embedding table
+         * and the output norm together despite very different sizes and access classes. */
         int32_t u;
         if (layer < 0) {
             u = (int32_t)p->units.size();
             p->units.push_back(MoveUnit{});
-            p->units.back().layer = -1;
-            p->units.back().expert = -1;
         } else {
             auto key = std::make_pair(layer, expert);
             auto it = by_group.find(key);
@@ -434,10 +384,9 @@ void Planner::build_units(const Program& prog, Plan* p) {
         p->unit_of_weight[w] = u;
     }
 
-    /* Warm start from the profile. It ranks which experts BEGIN resident and nothing else: it is
-     * worth about a point of hit rate against an arbitrary order and honestly not more, because
-     * imatrix popularity is not decode popularity and the heat engine re-ranks from real routing
-     * within a few dispatches regardless. A warm start, not a policy (spec §5.3). */
+    /* Warm start from the profile: it only decides which experts begin resident (spec §5.3). It is
+     * worth about a point of hit rate, since imatrix popularity is not decode popularity and heat
+     * re-ranks from real routing within a few dispatches. */
     if (in_.profile && in_.n_profile > 0) {
         std::map<std::pair<int32_t, int32_t>, float> share;
         for (int64_t i = 0; i < in_.n_profile; ++i)
@@ -451,21 +400,16 @@ void Planner::build_units(const Program& prog, Plan* p) {
 }
 
 /* ------------------------------------------------------------------ slab classes */
-/* One class per (unit kind, byte size). A slab slot is interchangeable within its class and
- * nowhere else, which is what lets a promotion be an integer swap instead of an allocation, and
- * what lets a slot be LAYER-AGNOSTIC: heat promotes the hottest pooled expert against the coldest
- * resident one wherever they sit, so capacity moves to the layers that need it. A per-layer
- * ranking cannot repair the residency skew a global profile leaves behind, and the slab being
- * layer-agnostic is the whole reason a global ranking is legal.
+/* One class per (unit kind, byte size). Slots are interchangeable within a class, so a promotion
+ * is an integer swap, and they are layer-agnostic: heat swaps the hottest pooled expert for the
+ * coldest resident one wherever they sit, which is what makes a global ranking legal.
  */
 void Planner::build_classes(Plan* p) {
     std::map<std::pair<int, int64_t>, int32_t> seen;
 
     for (MoveUnit& mu : p->units) {
-        /* A MAPPED UNIT HAS NO CLASS AND NO SLOT. Classes exist so a slab slot is interchangeable
-         * within one; a unit that is never copied anywhere has nothing to be interchangeable with,
-         * and giving it a stride would charge its whole size to a pool it does not occupy. Its
-         * slot_bytes stays 0, which is what every budget below spends against. */
+        /* A mapped unit has no class and no slot: it occupies no pool, so its slot_bytes stays 0
+         * and no budget is charged for it. */
         if (mu.tier == Tier::Mapped) continue;
         const int kind = mu.expert >= 0 ? 2 : (mu.layer >= 0 ? 1 : 0);
         const int64_t stride = align_up(mu.bytes, RAD_ALIGN_UNIT);
@@ -489,10 +433,8 @@ void Planner::build_classes(Plan* p) {
 }
 
 /* ------------------------------------------------------------------ the ranking */
-/* Rank-invariant by construction. The key is (profile share desc, layer, expert, unit index) and
- * every component of it is a property of the model or of the container -- nothing rank-local,
- * nothing timed, nothing from the device. Under tensor parallel every rank runs this and gets the
- * same order, which is what makes a slab slot mean the same thing on every card. */
+/* Rank-invariant: every sort key comes from the model or the container, never from the rank,
+ * a clock or the device, so all TP ranks get the same order (planner.h, MoveUnit). */
 void Planner::rank_units(Plan* p, std::vector<int32_t>* order) const {
     order->clear();
     order->reserve(p->units.size());
@@ -501,38 +443,13 @@ void Planner::rank_units(Plan* p, std::vector<int32_t>* order) const {
         const MoveUnit& ua = p->units[(size_t)a];
         const MoveUnit& ub = p->units[(size_t)b];
         if (ua.profile_share != ub.profile_share) return ua.profile_share > ub.profile_share;
-        /* EXPERT-MAJOR, NOT LAYER-MAJOR, AND THE TIE-BREAK IS THE WHOLE POLICY WHEN THERE IS NO
-         * PROFILE -- which is the common case, because a container without one gives every unit
-         * share 0.0 and every comparison above falls through to here.
-         *
-         * Layer-major fills every expert of layer 0, then layer 1, and stops wherever the budget
-         * runs out, so the layers past the cut begin the run with NOTHING resident. The heat
-         * engine cannot repair that quickly: a promotion needs the candidate to beat the victim by
-         * `hysteresis * cold + min_gain`, and an expert in a starved layer is routed to rarely
-         * enough that the skew is worked off a few hundred units at a time, paying both link
-         * directions for every one.
-         *
-         * WHAT THE SKEW COSTS IS ON-DEMAND STREAMING, not mover churn. A starved layer misses on
-         * most of what it routes to and streams those shards over the link inside the GEMM, so its
-         * expert projections run several times longer than a well-stocked layer's, every step.
-         *
-         * Expert-major puts expert 0 of every layer before expert 1 of any, so the budget cut
-         * lands at the same expert index in every layer and residency starts balanced. That is
-         * not a better RANKING -- with no profile there is no information to rank on -- it is the
-         * absence of an arbitrary one, and it leaves the heat engine's moves to do the job it
-         * exists for instead of repairing the fill. heat.h makes the same argument about its own
-         * tie-break: ties go to the layer that can most afford it, never to the low index.
-         *
-         * NO CAPACITY IS ADDED BY THIS, and the per-layer residency histogram in HeatEngine::report
-         * is where that shows: the mean resident count a layer is unchanged and only its spread
-         * collapses. Well-stocked layers give up some slots and get slightly slower; starved ones
-         * gain more than that back. The largest single beneficiary is whichever layer runs more
-         * than once a step -- a draft head runs once per draft round -- because every slot there is
-         * spent several times a step.
-         *
-         * Uniform is still the right fill when there is no profile to rank on, and the heat engine
-         * already sees the extra activations of a multiply-run layer in its own counter, so the
-         * planner does not weight for it. */
+        /* Expert-major tie-break, which is the whole policy without a profile (every share is
+         * 0.0). Layer-major would fill layer 0, then layer 1, and leave the layers past the
+         * budget cut with nothing resident; those layers then stream most of their experts over
+         * the link inside the GEMM every step, and heat's hysteresis repairs the skew only slowly.
+         * Expert-major puts expert 0 of every layer before expert 1 of any, so the cut lands at
+         * the same expert index everywhere and residency starts balanced. Layers that run more
+         * than once a step (a draft head) are not weighted here; heat's counters see them. */
         if (ua.expert != ub.expert) return ua.expert < ub.expert;
         return ua.layer < ub.layer;
     });
@@ -541,9 +458,8 @@ void Planner::rank_units(Plan* p, std::vector<int32_t>* order) const {
 /* ------------------------------------------------------------------ assignment */
 namespace {
 
-/* The three ways a unit can live off the device, in the order the planner tries them. Split out
- * so the expert path and the layer path cannot drift: they are the same mechanism at two
- * granularities and they have to spell the fallback the same way. */
+/* The off-device fallback, in the order the planner tries it, shared by the layer and expert
+ * paths so they cannot drift. */
 struct HostFall {
     int64_t host_used = 0;
     int64_t host_budget = 0;
@@ -551,60 +467,45 @@ struct HostFall {
 
     /* Returns true and sets tier/site, or false when nothing below VRAM will take it.
      *
-     * THE SITE DECIDES THE TIER, which is the independent-axes claim made concrete. Only a unit
-     * the DEVICE has to read needs pinned memory; a host-site unit is read by a host kernel and
-     * pinning it buys nothing. That matters because pinned memory is genuinely scarce -- past a
-     * driver-dependent total the registration call starts returning success and leaving the
-     * process broken -- so pinning tens of gigabytes of weights only the CPU touches is not a
-     * waste, it is a failure mode. Both kinds are charged against the same --host-pool-mib,
-     * because an unbudgeted tier is how a process gets OOM-killed. */
+     * The site decides the tier: only a unit the device reads needs pinned memory. Pinned memory
+     * is scarce -- past a driver-dependent total, registration returns success and leaves the
+     * process broken -- so host-site weights stay pageable. Both kinds are charged to
+     * --host-pool-mib so no tier is unbudgeted. */
     bool place(MoveUnit& mu, bool host_kernel, const char** reason) {
         if (host_used + mu.slot_bytes <= host_budget) {
             host_used += mu.slot_bytes;
             if (host_kernel && mu.access == RAD_ACCESS_PER_TOKEN) {
-                /* llama.cpp -ngl: the bytes stay in host memory and the arithmetic happens there
-                 * too, so a weight read every token is never moved at all. It costs the
-                 * activation crossing at the run boundary, which is why runs are the objective. */
+                /* llama.cpp -ngl: bytes and arithmetic both on the host, so the weight never moves;
+                 * the cost is the activation crossing at each run boundary. */
                 mu.tier = Tier::HostPageable;
                 mu.site = Site::Host;
                 *reason = "host kernel resolved; host run";
                 return true;
             }
-            /* Everything below is read by the DEVICE out of host memory, so it must be pinned. */
+            /* The device reads everything below out of host memory, so it must be pinned. */
             mu.tier = Tier::HostPinned;
             if (mu.access == RAD_ACCESS_CONDITIONAL) {
-                /* THE HYBRID TIER. A routed expert that is not resident is NOT copied into
-                 * VRAM and then multiplied: the GEMM's tile names the pinned pool and streams the
-                 * shard over the link as it computes, so the transfer is inside the kernel rather
-                 * than in front of it, and a miss costs one shard rather than a shard plus a
-                 * slab slot plus an eviction. No slot, so it costs no residency either. */
+                /* A non-resident routed expert is not copied to VRAM first: the GEMM streams the
+                 * shard from the pinned pool as it computes, so a miss costs one shard and no
+                 * slab slot or eviction. */
                 mu.site = Site::DeviceZeroCopy;
                 *reason = "pooled expert; streamed over the link";
             } else {
-                /* Read every token with no host kernel: staging into a slab slot is right,
-                 * because zero-copy would re-stream the same bytes every single step while a
-                 * staged copy pays once and the prefetch schedule hides it. */
+                /* Staged rather than zero-copy: zero-copy would re-stream the same bytes every
+                 * step, while the exact prefetch schedule hides a staged copy. */
                 mu.site = Site::DeviceStaged;
                 *reason = "no host kernel; staged into a slab slot";
             }
             return true;
         }
-        /* THE FILE TIER, for a unit that lies in the container as its kernel reads it.
-         *
-         * A Tier::SSD unit has NO ADDRESS until something stages it, and the two kinds of unit
-         * are staged two ways. A SCHEDULED one is `Plan::prefetch` -- an exact schedule built from
-         * first_use_op, because declare enumerated the whole access sequence. A ROUTED one cannot
-         * be scheduled: the router picks it on the card, and a grouped MoE GEMM is handed every
-         * expert's pointer at issue. So the file stager reads ALL of a routed layer's file-tier
-         * experts into a VRAM buffer before the layer's first expert op, on every pass, routed to
-         * or not (place/stager.h). Every pointer then exists at issue; what it costs is the whole
-         * layer's file-tier bytes a pass, which a prefill chunk -- routing to nearly every expert
-         * of a layer -- reads anyway, and which makes a decode step as slow as the drive. That is
-         * the trade --weights-disk-tier asks for by name, and the plan sizes the two buffers it
-         * needs (Plan::file_stage_vram).
-         *
-         * Never MOVABLE: the heat engine promotes out of the pinned pool, and a unit with no pool
-         * slot has nothing to promote from. assign_expert_tiered says so where it sets the bit. */
+        /* The file tier, for a unit stored in the container as its kernel reads it. A Tier::SSD
+         * unit has no address until staged. A scheduled unit is staged by Plan::prefetch. A routed
+         * one cannot be scheduled, since a grouped MoE GEMM needs every expert's pointer at issue,
+         * so the file stager reads all of a routed layer's file-tier experts into a VRAM buffer
+         * before the layer's first expert op, every pass (place/stager.h, Plan::file_stage_vram).
+         * Prefill reads nearly all of them anyway; decode runs at drive speed, which is the trade
+         * --weights-disk-tier asks for. File-tier units are never movable: heat promotes out of
+         * the pinned pool, and they have no pool slot. */
         if (ssd && mu.file_direct) {
             mu.tier = Tier::SSD;
             mu.site = Site::DeviceStaged;
@@ -622,10 +523,7 @@ struct HostFall {
 int Planner::assign_all_vram(Plan* p) {
     int64_t used = 0;
     for (MoveUnit& mu : p->units) {
-        /* A PREPLACED UNIT IS ALREADY PLACED and no strategy may move it: a mapped one has no
-         * device kernel that could read it anywhere else, and a token embedding
-         * --embedding-placement put in the host pool is read there in place. Every assignment pass
-         * below begins with this line. */
+        /* No strategy may move a preplaced unit; every assignment pass starts with this check. */
         if (mu.preplaced()) continue;
         mu.tier = Tier::VRAM;
         mu.site = Site::Device;
@@ -642,17 +540,11 @@ int Planner::assign_all_vram(Plan* p) {
     return RAD_OK;
 }
 
-/* LAYER OFFLOAD IS A SCHEDULING PROBLEM, and this is the whole of the decision half: pick which
- * layers leave VRAM. The prefetch that follows is exact, because declare enumerated every op with
- * its weight operands in order and WeightInfo::first_use_op is that order.
+/* Picks which layers leave VRAM; schedule_prefetch then stages them exactly.
  *
- * CONTIGUOUS HOST RUNS ARE AN EXPLICIT OBJECTIVE (spec §5.3). A host-site op leaves its activation
- * in host memory, so every boundary between a device run and a host run costs a link crossing. A
- * few hundred KB is nothing; alternating per layer is 2L of them. llama.cpp gets this free because
- * -ngl assigns a contiguous suffix; here the suffix is chosen on purpose, and for a second reason
- * as well: the FIRST layers are needed earliest in the step, so a staged prefix has to have landed
- * before the step can start at all, while a staged suffix has the whole step's duration to arrive.
- * Spilling the tail is the only choice that gives the mover any lead at all.
+ * It spills a suffix of the execution order, which is one contiguous host run (spec §5.3; see
+ * Plan::host_runs), and a suffix also gives the mover the longest lead: a staged prefix would have
+ * to land before the step starts, a staged suffix has the whole step to arrive.
  */
 int Planner::assign_layer_offload(Plan* p) {
     for (MoveUnit& mu : p->units) {
@@ -664,47 +556,35 @@ int Planner::assign_layer_offload(Plan* p) {
     for (const MoveUnit& mu : p->units) if (!mu.preplaced()) total += mu.slot_bytes;
     if (p->vram_budget <= 0 || total <= p->vram_budget) return RAD_OK;
 
-    /* Layers in EXECUTION order. The layer index is normally that order already, but the order
-     * declare produced is the authority -- a plugin is free to declare a tower whose layer
-     * numbering is not its issue order, and a run computed against the wrong order is not a run. */
+    /* Layers in execution order (first use), which a plugin's layer numbering need not follow. */
     std::vector<int32_t> layers;
     std::map<int32_t, int64_t> bytes_of;
     std::map<int32_t, int32_t> first_of;
     for (const MoveUnit& mu : p->units) {
         if (mu.layer < 0) continue;
-        if (!bytes_of.count(mu.layer)) { layers.push_back(mu.layer); first_of[mu.layer] = mu.first_use_op; }
+        if (!bytes_of.count(mu.layer)) { layers.push_back(mu.layer); first_of[mu.layer] = -1; }
         bytes_of[mu.layer] += mu.slot_bytes;
-        if (mu.first_use_op >= 0 && (first_of[mu.layer] < 0 || mu.first_use_op < first_of[mu.layer]))
-            first_of[mu.layer] = mu.first_use_op;
+        int32_t& first = first_of[mu.layer];
+        if (mu.first_use_op >= 0 && (first < 0 || mu.first_use_op < first)) first = mu.first_use_op;
     }
     std::stable_sort(layers.begin(), layers.end(), [&](int32_t a, int32_t b) {
         if (first_of[a] != first_of[b]) return first_of[a] < first_of[b];
         return a < b;
     });
 
-    /* RESERVE THE STAGING RING BEFORE CHOOSING THE CUT. A spilled layer with no host kernel is
-     * staged, and a staged unit needs a slab slot to be staged into -- so a plan that spills
-     * exactly to the budget and only then discovers it has nowhere to stage is a plan that does
-     * not load. Deciding this before the cut means asking whether ANY layer lacks a host kernel,
-     * which over-reserves when the spill happens to land only on host-capable ones. That is the
-     * right direction to be wrong in. */
-    /* AND THE RING IS PER CLASS, NOT ONE RING FOR THE WIDEST CLASS.
+    /* Reserve the staging ring before choosing the cut: a spilled layer without a host kernel is
+     * staged and needs ring slots. Whether any layer lacks a host kernel is asked before the cut,
+     * which may over-reserve; over-reserving spills one layer too many, under-reserving gives a
+     * plan that does not load.
      *
-     * The mover allocates a staging ring in EVERY slab class that has one (Mover::init sums
-     * n_slab + shadow + n_stage per class, and finish() charges (n_shadow + n_stage) * stride per
-     * class to slab_overhead). A hybrid model has two layer classes -- attention layers and linear
-     * layers are different strides -- so reserving one ring at the widest stride is short by a
-     * whole ring, and the plan then reports a fit that the mover refuses for want of VRAM. A plan
-     * that does not load is worse than one that spills a layer too many, because the second serves.
-     *
-     * Summed over the classes that actually carry a layer unit, which is the same set the mover
-     * builds a slab for. The tail pad is per class too, for the same reason. */
+     * One ring plus tail pad per layer slab class, matching what Mover::init allocates and
+     * finish() charges. A hybrid model has several layer strides (attention vs linear layers). */
     bool any_stage = ssd_;
     std::map<int32_t, int64_t> stride_of;
     for (const MoveUnit& mu : p->units) {
         if (mu.layer < 0 || mu.slab_class < 0) continue;
         stride_of[mu.slab_class] = p->classes[(size_t)mu.slab_class].stride;
-        for (rad_weight w : mu.weights) if (!host_ok_[w]) { any_stage = true; break; }
+        if (!host_kernel(mu)) any_stage = true;
     }
     int64_t reserve = 0;
     if (any_stage)
@@ -712,8 +592,7 @@ int Planner::assign_layer_offload(Plan* p) {
             reserve += (int64_t)RAD_PLACE_STAGE_RING * kv.second + RAD_ALIGN_UNIT;
 
     int64_t need = total + reserve - p->vram_budget;
-    /* Walk the tail. `cut` is the first layer, in execution order, that leaves VRAM -- so the
-     * spilled set is a suffix of the execution order and therefore ONE run by construction. */
+    /* `cut` is the first layer, in execution order, to leave VRAM; the spilled set is a suffix. */
     size_t cut = layers.size();
     int64_t freed = 0;
     while (cut > 0 && freed < need) { --cut; freed += bytes_of[layers[cut]]; }
@@ -728,9 +607,7 @@ int Planner::assign_layer_offload(Plan* p) {
     for (size_t i = cut; i < layers.size(); ++i) {
         for (MoveUnit& mu : p->units) {
             if (mu.layer != layers[i] || mu.preplaced()) continue;
-            bool host_kernel = true;
-            for (rad_weight w : mu.weights) if (!host_ok_[w]) { host_kernel = false; break; }
-            if (!fall.place(mu, host_kernel, &mu.reason)) {
+            if (!fall.place(mu, host_kernel(mu), &mu.reason)) {
                 mu.reason = "fits in no tier";
                 note_unfit(p, mu, ssd_ ? "neither VRAM nor the host pool has room"
                                        : "the host pool is full and no --weights-disk-tier was given");
@@ -741,11 +618,9 @@ int Planner::assign_layer_offload(Plan* p) {
     return rc;
 }
 
-/* EXPERT OFFLOAD IS A PREDICTION PROBLEM, and this is the initial guess. Everything that is not
- * conditional is pinned to VRAM first: a PER_TOKEN weight is read on every forward pass, so
- * spilling one to buy residency for an expert that MIGHT be routed to is a certain cost against a
- * probabilistic saving. The conditional units then take what is left, ranked by the container's
- * profile, and the heat engine re-ranks from real routing from the first dispatch onward.
+/* The initial expert residency. Non-conditional units go to VRAM first, since they are read
+ * every pass; conditional units take the rest in rank_units order, and heat re-ranks from real
+ * routing from the first dispatch.
  */
 int Planner::assign_expert_tiered(Plan* p) {
     int64_t fixed = 0;
@@ -757,9 +632,8 @@ int Planner::assign_expert_tiered(Plan* p) {
     }
 
     if (p->vram_budget > 0 && fixed > p->vram_budget) {
-        /* The dense part alone does not fit. That is a layer-offload problem wearing an expert
-         * hat, and answering it here with a second copy of the run-picking logic is how two
-         * granularities of one mechanism drift apart. Hand it over. */
+        /* The dense part alone does not fit: delegate to layer offload rather than duplicating
+         * its run-picking logic. */
         RAD_WARN("placement: the non-routed weights alone need %s against a %s weight budget; "
                  "falling through to layer offload for them",
                  humanb(fixed).c_str(), humanb(p->vram_budget).c_str());
@@ -768,10 +642,8 @@ int Planner::assign_expert_tiered(Plan* p) {
         for (const MoveUnit& mu : p->units)
             if (mu.access != RAD_ACCESS_CONDITIONAL && mu.tier == Tier::VRAM) fixed += mu.slot_bytes;
     }
-    /* WHAT LAYER OFFLOAD ALREADY PUT IN THE HOST POOL: the dense units of the layers it spilled.
-     * The routed experts below are placed again whatever it did with them, but the dense units
-     * stay where it put them, so the expert fill spends the pool that is left and not the whole
-     * of --host-pool-mib a second time. */
+    /* Host pool already spent by layer offload on dense units. The expert fill below re-places
+     * the routed experts but keeps the dense units, so it spends only the remainder. */
     int64_t host_spent = 0;
     for (const MoveUnit& mu : p->units)
         if (!mu.preplaced() && mu.access != RAD_ACCESS_CONDITIONAL &&
@@ -781,20 +653,15 @@ int Planner::assign_expert_tiered(Plan* p) {
     std::vector<int32_t> order;
     rank_units(p, &order);
 
-    /* RESERVE THE SPARE SLOTS OUT OF THE BUDGET. The slab has to hold the residents AND the
-     * shadow slots a promotion writes into, and they all come out of the weights pool -- so a
-     * fill that spends the whole budget on residents leaves the mover with nowhere to move into
-     * and, worse, makes the mover's allocation overrun the weights pool.
-     *
-     * Two passes, and the second is enough: the reserve depends only on the first pass's slot
-     * counts, and the first pass over-counts (it had more room), so the reserve it produces is an
-     * upper bound. A third pass can only give slots back, never take more. */
+    /* The spare slots come out of the same weights pool as the residents, or the mover's
+     * allocation would overrun it. Two passes suffice: the first pass had more room, so its
+     * spare count is an upper bound for the second. */
     HostFall fall{host_spent, p->host_budget, ssd_};
     int rc = RAD_OK;
 
-    /* ONE FILL: the conditional units in rank order, at most `cap` of them resident and the rest to
-     * the host pool or the file tier; what it costs the VRAM side comes back -- the residents, the
-     * shadow slots and the staging ring, and the file stager's two buffers. */
+    /* One fill: conditional units in rank order, at most `cap` resident within `room`, the rest
+     * to the host pool or file tier. Returns the VRAM cost: residents, shadow slots and staging
+     * ring, and the file stager's two buffers. */
     struct Cost { int64_t used = 0, spare = 0, file = 0, residents = 0; };
     auto fill = [&](int64_t room, int64_t cap) -> Cost {
         Cost k;
@@ -819,20 +686,16 @@ int Planner::assign_expert_tiered(Plan* p) {
                 mu.tier = Tier::VRAM;
                 mu.site = Site::Device;
                 mu.reason = "resident: ranked by the container's profile";
-                /* Movable is what the heat engine is allowed to touch. Under
-                 * Config::deterministic this is left false everywhere and the resident set is
-                 * exactly what this loop decided, for the whole run. */
+                /* Only movable units are touched by heat; under Config::deterministic none are,
+                 * so this resident set holds for the whole run. */
                 mu.movable = p->dynamic;
                 continue;
             }
-            bool host_kernel = true;
-            for (rad_weight w : mu.weights) if (!host_ok_[w]) { host_kernel = false; break; }
-            if (!fall.place(mu, host_kernel, &mu.reason)) {
+            if (!fall.place(mu, host_kernel(mu), &mu.reason)) {
                 mu.tier = Tier::SSD;
                 mu.site = Site::DeviceStaged;
                 mu.reason = "fits in no tier";
-                /* With the file tier on, only a unit the container does not hold as its kernel
-                 * reads it gets here -- a relayout, a widening or a shard (HostFall::place). */
+                /* With the file tier on, only a non-file-direct unit gets here (HostFall::place). */
                 note_unfit(p, mu, ssd_ ? "neither VRAM nor the host pool has room, and its "
                                          "stored form is not the container's (a relayout, a "
                                          "widening or a shard), so the file tier cannot read it "
@@ -842,29 +705,19 @@ int Planner::assign_expert_tiered(Plan* p) {
                 rc = RAD_E_NOMEM;
                 continue;
             }
-            /* A pooled expert is still MOVABLE: it is exactly what the heat engine promotes.
-             * Movability is about whether placement may change, not about where it is. A
-             * file-tier one is not: the mover promotes out of a pool slot and it has none -- the
-             * file stager reads it a layer at a time instead. */
+            /* A pooled expert is movable, since heat promotes from the pool. A file-tier one has
+             * no pool slot to promote from; the file stager reads it a layer at a time. */
             mu.movable = p->dynamic && mu.tier != Tier::SSD;
         }
 
-        /* How many slots the fill actually used, per class, and therefore how many spares to
-         * keep. A static plan reserves none: nothing moves, so nothing needs somewhere to move
-         * into. */
+        /* Slots used per class, which sizes the spares. A static plan reserves no shadow slots. */
         std::vector<int64_t> resident(p->classes.size(), 0), staged(p->classes.size(), 0);
         for (const MoveUnit& mu : p->units) {
             if (mu.slab_class < 0) continue;
             if (mu.movable && mu.tier == Tier::VRAM) ++resident[(size_t)mu.slab_class];
-            /* THE STAGING RING IS A SLAB ALLOCATION TOO, so this reserve has to charge for it.
-             * finish() sizes it from the units that ended up staged, which is known only after
-             * the fill -- the same chicken-and-egg the shadow slots have, and solved the same way.
-             *
-             * A ring exists only when something falls to the host or file tier, so a model that
-             * fits entirely in VRAM never exercises this. On one that spills, leaving the ring
-             * uncharged overruns the weight budget by a few slots, and the mover then refuses the
-             * statically placed weights on a plan the report called a fit. A ROUTED file-tier
-             * unit is not counted: the file stager reads it into buffers of its own. */
+            /* The staging ring is slab memory too. finish() sizes it from the staged units,
+             * known only after the fill, so it is reserved the same two-pass way as the shadow
+             * slots. Routed file-tier units are excluded; the file stager has its own buffers. */
             if (mu.site == Site::DeviceStaged && mu.access != RAD_ACCESS_CONDITIONAL)
                 ++staged[(size_t)mu.slab_class];
         }
@@ -875,15 +728,13 @@ int Planner::assign_expert_tiered(Plan* p) {
                 : 0;
             p->classes[c].n_shadow = shadow;
             if (shadow + ring <= 0) continue;
-            /* Plus the slab's tail padding, which is a real allocation and therefore a real
-             * charge: a kernel that assembles a packed code window from a wide read legitimately
-             * reads a few bytes past the last slot's data. Inside the slab that lands in a
-             * neighbour; at the end it runs off the allocation and faults the card. */
+            /* Plus the slab's tail pad: a kernel assembling a packed code window from a wide read
+             * reads a few bytes past the last slot, which would fault at the allocation's end. */
             k.spare += (shadow + ring) * p->classes[c].stride + RAD_ALIGN_UNIT;
         }
 
-        /* THE FILE STAGER'S BUFFERS: two, each the largest routed layer's file-tier units at the
-         * stager's packing, and the same tail pad. */
+        /* The file stager's two buffers, each the largest routed layer's file-tier units at the
+         * stager's packing, plus a tail pad. */
         std::map<int32_t, int64_t> layer_bytes;
         for (const MoveUnit& mu : p->units)
             if (mu.tier == Tier::SSD && mu.access == RAD_ACCESS_CONDITIONAL && mu.layer >= 0)
@@ -900,14 +751,10 @@ int Planner::assign_expert_tiered(Plan* p) {
     Cost k = fill(room0, uncapped);
     if (p->vram_budget > 0) k = fill(room0 - k.spare, uncapped);
 
-    /* THE FILE BUFFERS COME OUT OF THE SAME BUDGET, AND THEY PULL THE OTHER WAY. The two-pass fill
-     * above made as many residents as fit beside the shadow slots; a routed layer it then put on
-     * the file tier needs two buffers it never paid for. Each resident given up pays for some of
-     * them -- and may put one more unit into a layer's file-tier share, growing them again -- so
-     * the resident count steps down, in rank order, from what the fill made until the residents,
-     * the shadow slots and the buffers fit together. Rank order spreads residency over the layers
-     * (rank_units), which is what keeps the largest layer's share -- the buffer -- small. A plan
-     * with nothing on the file tier never enters the loop. */
+    /* The file buffers come out of the same budget, which the two-pass fill did not charge. Each
+     * resident given up frees room but may grow a layer's file-tier share and so the buffers, so
+     * the resident cap steps down in rank order until residents, spares and buffers fit together.
+     * Rank order spreads residency over layers (rank_units), keeping the largest share small. */
     if (p->vram_budget > 0 && k.file > 0) {
         int64_t cap = k.residents;
         while (fixed + k.used + k.spare + k.file > p->vram_budget && cap > 0)
@@ -923,6 +770,12 @@ int Planner::assign_expert_tiered(Plan* p) {
     return rc;
 }
 
+bool Planner::host_kernel(const MoveUnit& mu) const {
+    for (rad_weight w : mu.weights)
+        if (w < host_ok_.size() && !host_ok_[w]) return false;
+    return true;
+}
+
 void Planner::note_unfit(Plan* p, const MoveUnit& mu, const char* why) const {
     const std::string what = mu.weights.empty()
         ? std::string("<no weights>")
@@ -933,15 +786,16 @@ void Planner::note_unfit(Plan* p, const MoveUnit& mu, const char* why) const {
 }
 
 /* ------------------------------------------------------------------ op-level agreement */
-/* WeightInfo carries the site, but an OP runs in exactly one domain. Two weight operands of one
- * op that disagree about whether the arithmetic is on the host is not a placement the run phase
- * can execute -- a host kernel cannot read a VRAM pointer and a device kernel cannot read a
- * pageable one. So the planner reconciles, and it reconciles DOWNWARD: any disagreement collapses
- * to the device side, staged, because staging is the site that works from every tier.
- *
- * It is a repair and it is reported. A plan that needs it is usually a plugin that put a
- * per-layer weight in a model-level group, and the note is how that gets noticed. */
+/* An op runs in exactly one domain, so its weight operands must agree on the site: a host kernel
+ * cannot read VRAM and a device kernel cannot read pageable memory. A disagreement collapses to
+ * the device side, staged, since staging works from every tier. The repair is logged; it usually
+ * means a plugin put a per-layer weight in a model-level group. */
 void Planner::enforce_op_site_agreement(const Program& prog, Plan* p) {
+    /* On the host backend the weights pool is host memory and every op runs its host kernel, which
+     * reads the pool and the container's mapping alike: an op reading a mapped weight beside a
+     * converted one in the pool (hc_read's norm gain and its joined E4M3 mixing matrices) has no
+     * disagreement to repair. */
+    if (in_.host_backend) return;
     for (const OpInfo& o : prog.ops) {
         bool any_host = false, any_dev = false;
         for (rad_weight w : o.weights) {
@@ -957,11 +811,9 @@ void Planner::enforce_op_site_agreement(const Program& prog, Plan* p) {
             const int32_t u = p->unit_of_weight[w];
             if (u < 0 || p->units[(size_t)u].site != Site::Host) continue;
             MoveUnit& mu = p->units[(size_t)u];
-            /* EXCEPT A MAPPED ONE, which cannot be demoted: staging works from every tier but
-             * this one, because no device kernel for the op exists to read the staged copy. The
-             * op would be unrunnable either way, so the plan says so instead of quietly producing
-             * a placement that cannot serve. A weight reaches here only if the plugin grouped it
-             * with a host-only weight or an op reads both kinds -- both are plugin bugs. */
+            /* A mapped unit cannot be demoted: no device kernel exists to read a staged copy, so
+             * the op is unrunnable and the plan says so. This needs a plugin bug: a weight grouped
+             * with a host-only one, or an op reading both kinds. */
             if (mu.tier == Tier::Mapped) {
                 p->notes.push_back(fmt("op '%s' reads a weight only a host kernel can read "
                                        "alongside one placed on the device; no site serves both",
@@ -972,10 +824,8 @@ void Planner::enforce_op_site_agreement(const Program& prog, Plan* p) {
             }
             mu.site = Site::DeviceStaged;
             mu.reason = "op mixes host and device operands; demoted to staged";
-            /* A repair, not a misfit, so it does not go in the plan's did-not-fit list -- a plan
-             * that was repaired still fits, and marking it otherwise would make a caller treat a
-             * working plan as a failure. It IS visible: the class table shows a `staged` site
-             * where a `host` one was intended, and this line says which op caused it. */
+            /* A repair, not a misfit: the plan still fits, so it is warned about rather than
+             * listed as unfit. The report shows the `staged` site. */
             RAD_WARN("placement: op '%s' mixes host-site and device-site weight operands; layer "
                      "%d demoted to staged", o.op.c_str(), (int)mu.layer);
         }
@@ -983,13 +833,10 @@ void Planner::enforce_op_site_agreement(const Program& prog, Plan* p) {
 }
 
 /* ------------------------------------------------------------------ prefetch */
-/* The exact prefetch schedule. `at_op` is a DEADLINE, not a launch time: declare enumerated the
- * whole access sequence, so the planner knows precisely when each staged unit's bytes are needed
- * and states that. WHEN to start the transfer is the mover's problem, because it is a question
- * about slot supply -- a slot returns to the free list only when its quarantine event signals --
- * and a lead baked in here would be a constant guessing at a queue depth the planner cannot see.
- *
- * No policy and no predictor: a unit appears here exactly once, at the op that first reads it. */
+/* The exact prefetch schedule: each staged, non-routed unit once, at the op that first reads it.
+ * `at_op` is a deadline, not a launch time. When to start the copy is the mover's decision, since
+ * it depends on slot supply (a slot frees only when its quarantine event signals), which the
+ * planner cannot see. */
 void Planner::schedule_prefetch(Plan* p) {
     p->prefetch.clear();
     for (int32_t i = 0; i < (int32_t)p->units.size(); ++i) {
@@ -1007,9 +854,8 @@ void Planner::schedule_prefetch(Plan* p) {
 
 /* ------------------------------------------------------------------ finish */
 void Planner::finish(const Program& prog, Plan* p) {
-    /* Slab slots. Only a MOVABLE unit needs one: a statically resident weight is allocated once
-     * at a fixed offset and never relocates, so giving it a slot would buy nothing and cost the
-     * mover a slot it could have used. WeightInfo::slab_slot == -1 means exactly this. */
+    /* Only a movable unit gets a slab slot; a static resident lives at a fixed offset
+     * (slab_slot == -1). */
     std::vector<int64_t> next(p->classes.size(), 0);
     std::vector<int64_t> staged(p->classes.size(), 0);
     for (MoveUnit& mu : p->units) {
@@ -1018,8 +864,8 @@ void Planner::finish(const Program& prog, Plan* p) {
         } else {
             mu.slab_slot = -1;
         }
-        /* The ring serves the exact prefetch; a routed file-tier unit is read into the file
-         * stager's own buffers instead (Plan::file_stage_vram). */
+        /* The ring serves the exact prefetch; routed file-tier units use the file stager's
+         * buffers (Plan::file_stage_vram). */
         if (mu.site == Site::DeviceStaged && mu.slab_class >= 0 &&
             mu.access != RAD_ACCESS_CONDITIONAL)
             ++staged[(size_t)mu.slab_class];
@@ -1027,13 +873,10 @@ void Planner::finish(const Program& prog, Plan* p) {
     for (size_t c = 0; c < p->classes.size(); ++c) {
         p->classes[c].n_slots = next[c];
         p->classes[c].movable = next[c] > 0;
-        /* The staging ring, capped at the number of units that could use it: a class with one
-         * staged unit does not need two slots to double-buffer a single copy. */
+        /* The staging ring, capped at the number of staged units in the class. */
         p->classes[c].n_stage = std::min<int64_t>(RAD_PLACE_STAGE_RING, staged[c]);
-        /* n_shadow was set by the assignment pass, which is the only place that can reserve it
-         * out of the budget. Recomputing it here from the resident count would produce a second,
-         * differing number, and the mover would allocate against one while the operator was
-         * charged for the other. */
+        /* n_shadow comes from the assignment pass, which reserved it out of the budget; do not
+         * recompute it here, or the mover and the budget would see different numbers. */
         if (!p->classes[c].movable) p->classes[c].n_shadow = 0;
         const int64_t slots = p->classes[c].n_slots + p->classes[c].n_shadow +
                               p->classes[c].n_stage;
@@ -1041,7 +884,7 @@ void Planner::finish(const Program& prog, Plan* p) {
         if (slots > 0) p->slab_overhead += RAD_ALIGN_UNIT;   /* the slab's tail pad */
     }
 
-    /* Host runs, from the final assignment rather than from the intent. One entry is one run. */
+    /* Host runs, from the final assignment. */
     std::vector<std::pair<int32_t, int64_t>> host_layers;
     for (const MoveUnit& mu : p->units)
         if (mu.site == Site::Host && mu.layer >= 0) host_layers.push_back({mu.layer, mu.bytes});
@@ -1050,7 +893,6 @@ void Planner::finish(const Program& prog, Plan* p) {
         Plan::HostRun r;
         r.first_layer = host_layers[i].first;
         r.last_layer = host_layers[i].first;
-        r.bytes = 0;
         while (i < host_layers.size() &&
                (host_layers[i].first == r.last_layer || host_layers[i].first == r.last_layer + 1)) {
             r.last_layer = host_layers[i].first;
@@ -1059,13 +901,10 @@ void Planner::finish(const Program& prog, Plan* p) {
         }
         p->host_runs.push_back(r);
     }
-    /* Two crossings a run: the activation goes to host at the run's first layer and comes back at
-     * its last. This is the number the contiguity objective exists to hold down, so it is
-     * computed and printed rather than assumed. */
+    /* Two crossings a run: to the host at its first layer, back after its last. */
     p->link_crossings = 2 * (int32_t)p->host_runs.size();
 
-    /* Push the unit's decision down onto every weight, which is what the rest of the engine
-     * reads. WeightInfo is frozen and the planner is the component that fills these three. */
+    /* Copy each unit's decision onto its weights, which is what the rest of the engine reads. */
     p->weight.assign(prog.weights.size(), Placement{});
     p->totals = Plan::Totals{};
     for (int32_t i = 0; i < (int32_t)p->units.size(); ++i) {
@@ -1096,20 +935,17 @@ bool read_only_by(const Program& prog, rad_weight w, const char* op) {
     return read;
 }
 
-/* --embedding-placement ram: THE TOKEN EMBEDDING goes to the pinned host pool before any strategy
- * runs, and stays there. The site is DeviceZeroCopy: the host pool is mapped (Pools::configure),
- * so the lookup kernel is handed the pool's device-side address and reads its M rows of n_embd
- * over the link in place -- a few KiB a decode step -- while the table, the largest model-level
- * weight a dense model has, gives its VRAM to the KV cache. Every strategy and every VRAM total
- * skips the unit through MoveUnit::preplaced(), as they skip the mapped tier, and weight_footprint
- * has already counted it out of the statics with the same test, so the budget the card was split
- * by is the one the planner spends. A layer unit is never one: is_embedding_table asks for a
- * model-level weight, and a layer belongs to the offload strategies. */
+/* --embedding-placement ram: the token embedding goes to the pinned host pool before any strategy
+ * runs. The host pool is mapped (Pools::configure), so at the DeviceZeroCopy site the lookup
+ * kernel reads its M rows over the link in place, a few KiB a decode step, and the table's VRAM
+ * goes to the KV cache. Strategies skip it via MoveUnit::preplaced(), and weight_footprint counts
+ * it out of the statics with the same test, so budget and plan agree. Only model-level weights
+ * qualify (is_embedding_table). */
 int Planner::pin_embedding(const Program& prog, const Config& cfg, Plan* p) const {
     if (cfg.embedding_resolved != TablePlacement::Ram) return RAD_OK;
     int rc = RAD_OK, found = 0;
     for (MoveUnit& mu : p->units) {
-        /* build_units gives a model-level weight a unit of its own: it is the unit's one weight. */
+        /* A model-level unit holds exactly one weight (build_units). */
         if (mu.layer >= 0 || mu.weights.empty() || mu.tier == Tier::Mapped) continue;
         const rad_weight w = mu.weights.front();
         if (!is_embedding_table(prog, w)) continue;
@@ -1136,25 +972,22 @@ int Planner::pin_embedding(const Program& prog, const Config& cfg, Plan* p) cons
                  "(--embedding-placement ram%s)", name.c_str(), humanb(mu.bytes).c_str(),
                  cfg.embedding_placement_given ? "" : ", the default");
     }
-    /* Engine::plan resolves Ram only where weight_footprint found a table with this same test,
-     * so an empty pass is a plan built from a different program than the budget was: a wiring
-     * fault, said by name rather than leaving the table on the card the budget split without it. */
+    /* Engine::plan resolves Ram only where weight_footprint found a table by the same test, so
+     * finding none means the plan and the budget saw different programs. */
     if (!found) {
-        RAD_ERR("placement: --embedding-placement ram, and this rank's program has no model-level "
-                "weight that only embed_lookup reads");
+        RAD_ERR("placement: --embedding-placement ram found no model-level weight that only "
+                "embed_lookup reads");
         p->notes.push_back("--embedding-placement ram: no token embedding table to place");
         rc = RAD_E_STATE;
     }
     return rc;
 }
 
-/* --vision-tower-placement ram: EVERY UNIT OF AN ENCODER TOWER goes to the pinned host pool before
- * any strategy runs, as the embedding does, at the DeviceZeroCopy site: the encoder's kernels read
- * the weights over the link in place, once an image or a clip, and a text-only request never
- * touches them. A tower's unit is one whose every weight the architecture declared read once per
- * request (RAD_ACCESS_PER_REQUEST) -- the test weight_footprint counted out of the statics with,
- * so the budget the card was split by is the one spent here. The test is the access class and not
- * the unit's level: a tower is model-level weights (a stem, a merger) and a layer unit a block. */
+/* --vision-tower-placement ram: every encoder-tower unit goes to the pinned host pool before any
+ * strategy runs, read in place at the DeviceZeroCopy site once per image or clip; text-only
+ * requests never touch it. A tower unit is a non-expert unit with access RAD_ACCESS_PER_REQUEST,
+ * the same test weight_footprint uses. It is tested by access class, not level, because a tower
+ * has both model-level weights (a stem, a merger) and layer units (its blocks). */
 int Planner::pin_towers(const Config& cfg, Plan* p) const {
     if (cfg.tower_resolved != TablePlacement::Ram) return RAD_OK;
     auto tower = [](const MoveUnit& mu) {
@@ -1164,10 +997,9 @@ int Planner::pin_towers(const Config& cfg, Plan* p) const {
     int64_t need = 0, n = 0;
     for (const MoveUnit& mu : p->units)
         if (tower(mu)) { need += mu.slot_bytes; ++n; }
-    /* Engine::plan resolves Ram only where weight_footprint found a tower with this same test. */
+    /* Engine::plan resolves Ram only where weight_footprint found a tower by the same test. */
     if (!n) {
-        RAD_ERR("placement: --vision-tower-placement ram, and this rank's program has no weight it "
-                "reads once per request");
+        RAD_ERR("placement: --vision-tower-placement ram found no weight read once per request");
         p->notes.push_back("--vision-tower-placement ram: no encoder tower to place");
         return RAD_E_STATE;
     }
@@ -1217,30 +1049,17 @@ int Planner::plan(Plan* out) {
         return RAD_E_INVAL;
     }
 
-    resolve_sites(prog);
+    resolve_sites(prog, &host_ok_, &device_ok_);
     build_units(prog, out);
-    /* BEFORE build_classes and before assign: the mapped tier is not a fallback the budgets
-     * choose, it is where a weight no device kernel can read has to be. */
+    /* Before build_classes and assign: mapped units get no class and no budget. */
     pin_mapped(prog, out);
     build_classes(out);
 
-    /* CHARGE THE FILE TIER'S STAGING POOL BEFORE PLACING ANYTHING IN THE HOST POOL.
-     *
-     * A unit read from the container lands in a pinned buffer, and those come out of
-     * --host-pool-mib. Handing HostFall the whole budget lets it fill the pool with pinned units,
-     * and the mover then asks the exhausted pool for its staging slots and refuses a plan the
-     * report has just called a fit. Reserving here is the same rule the VRAM side follows for the
-     * slab ring: the component that budgets an allocation has to budget ALL of it.
-     *
-     * Sized off the widest class that carries a LAYER unit, because that is the only kind either
-     * offload strategy spills -- model-level weights stay put in both. It is an upper bound on
-     * what the mover will compute from the units that actually land on the file tier, and over-
-     * reserving costs one spilled layer where under-reserving costs the whole plan.
-     *
-     * A model with ROUTED units also gets the read windows a routed layer streams through
-     * (RAD_PLACE_FILE_WINDOWS), whether or not this plan ends up putting one there: which units
-     * land on the file tier is decided by the fill below, and that fill spends the host budget
-     * this line leaves it. */
+    /* Charge the file tier's staging pool (RAD_PLACE_FILE_STAGE_SLOTS) before anything is placed
+     * in the host pool, or the fill could exhaust it and the mover refuse the plan. Sized from the
+     * widest class carrying a layer unit, the only kind either offload strategy spills; this
+     * upper-bounds what the mover computes. A model with routed units also reserves the read
+     * windows, since which units reach the file tier is decided only by the fill below. */
     if (ssd_) {
         int64_t widest = 0;
         bool routed = false;
@@ -1268,7 +1087,7 @@ int Planner::plan(Plan* out) {
         }
     }
 
-    /* NOT a RAD_TRY: a refusal still leaves `out` filled in far enough to print. */
+    /* Not RAD_TRY: a refusal still leaves `out` filled in far enough to print. */
     int hrc = pin_embedding(prog, cfg, out);
     const int trc = pin_towers(cfg, out);
     if (hrc >= 0) hrc = trc;
@@ -1290,10 +1109,8 @@ int Planner::assign(Plan* p) {
 
     Strategy s = p->strategy;
     if (s == Strategy::Auto) {
-        /* `auto` is a choice between three named strategies and nothing more -- it never invents a
-         * fourth. It fits if it can, prefers spilling routed experts over dense layers when there
-         * are experts to spill (a conditional weight is read only when selected; a dense one is
-         * read every token), and offloads layers otherwise. */
+        /* `auto` picks one of the three named strategies: all_vram if it fits, else expert
+         * offload when there are routed experts (read only when selected), else layer offload. */
         if (p->vram_budget <= 0 || total <= p->vram_budget) s = Strategy::AllVram;
         else if (has_conditional)                           s = Strategy::ExpertTiered;
         else                                                s = Strategy::LayerOffload;
@@ -1314,9 +1131,8 @@ int Planner::assign(Plan* p) {
     }
 
     if (s != Strategy::AllVram && p->vram_budget <= 0) {
-        /* Every pool is budgeted explicitly (spec §6). An offload strategy with no number to
-         * spill against would have to infer one from free VRAM, and an engine that quietly
-         * re-optimises its own split is an engine whose benchmarks do not reproduce. */
+        /* Offload needs an explicit budget (spec §6); inferring one from free VRAM would make
+         * runs irreproducible. */
         RAD_ERR("placement: %s needs a weights budget and none was resolved; there is nothing to "
                 "spill against",
                 strategy_name(s));
@@ -1333,13 +1149,11 @@ int Planner::assign(Plan* p) {
 
 /* ------------------------------------------------------------------ the report (spec §16) */
 std::string Plan::report(const Program& prog) const {
-    /* One line per weight CLASS. A model with eleven thousand routed experts has eleven thousand
-     * weights and three lines worth reading; printing one line each is how a report becomes
-     * something nobody opens. */
+    /* One line per weight class (weight_class_key), not per weight. */
     struct Row {
         int64_t n = 0, bytes = 0;
         int64_t per_tier[kTierCount] = {0};
-        int64_t per_site[4] = {0, 0, 0, 0};
+        int64_t per_site[kSiteCount] = {0};
     };
     std::map<std::string, Row> rows;
     std::vector<std::string> order;
@@ -1370,7 +1184,7 @@ std::string Plan::report(const Program& prog) const {
             if (r.per_tier[t])
                 tiers += fmt("%s%s %lld", tiers.empty() ? "" : " / ", tier_name((Tier)t),
                              (long long)r.per_tier[t]);
-        for (int t = 0; t < 4; ++t)
+        for (int t = 0; t < kSiteCount; ++t)
             if (r.per_site[t])
                 sites += fmt("%s%s %lld", sites.empty() ? "" : " / ", site_name((Site)t),
                              (long long)r.per_site[t]);
@@ -1390,22 +1204,18 @@ std::string Plan::report(const Program& prog) const {
                  humanb(totals.bytes[(int)Tier::HostPageable]).c_str());
     s += fmt("  ssd tier      %12s  %12s\n", "unbounded",
              humanb(totals.bytes[(int)Tier::SSD]).c_str());
-    /* NO BUDGET COLUMN, and the dash is the statement: a mapped weight occupies the container's
-     * own mapping and no pool at all, so there is nothing for an operator to size. What it does
-     * cost is page cache, which is the OS's to manage. */
+    /* No budget: a mapped weight occupies only page cache, which the OS manages. */
     if (totals.bytes[(int)Tier::Mapped])
         s += fmt("  mapped        %12s  %12s   (the container's mapping; no pool)\n", "-",
                  humanb(totals.bytes[(int)Tier::Mapped]).c_str());
-    /* Taken out of --host-pool-mib before any weight was placed, so the `host pinned` budget above
-     * is smaller than the flag by exactly this. Printed rather than folded in: an operator who
-     * raises --host-pool-mib and sees less of it reach the weights than expected is owed the
-     * reason on the same page. */
+    /* Taken out of --host-pool-mib before placement, so the `host pinned` budget above is smaller
+     * than the flag by this much. */
     if (file_stage_reserve)
         s += fmt("  file staging  %12s  %12s   (%d slots%s, pinned)\n", "-",
                  humanb(file_stage_reserve).c_str(), RAD_PLACE_FILE_STAGE_SLOTS,
                  file_windows ? fmt(" and %d read windows", RAD_PLACE_FILE_WINDOWS).c_str() : "");
-    /* The same, for --embedding-placement ram: out of --host-pool-mib before any strategy, read
-     * in place. And the n-gram copy, which no pool holds: locked RAM the load phase fills. */
+    /* Likewise taken out of --host-pool-mib: the embedding and the encoder towers. The n-gram copy
+     * is in no pool; the load phase fills it. */
     if (embedding_host_bytes)
         s += fmt("  embedding     %12s  %12s   (--embedding-placement ram, pinned, read in place)\n",
                  "-", humanb(embedding_host_bytes).c_str());
@@ -1416,9 +1226,7 @@ std::string Plan::report(const Program& prog) const {
         s += fmt("  n-gram copy   %12s  %12s   (--ngram-placement ram, %s, filled at load)\n",
                  "-", humanb(ngram_copy_bytes).c_str(),
                  ngram_copy_card ? "pinned RAM the card reads" : "locked RAM");
-    /* Out of the VRAM weight budget, beside the residents and not among them: the two buffers a
-     * routed layer's file-tier experts are read into, each sized to the layer that puts the most
-     * there. */
+    /* The file stager's two VRAM buffers, out of the weight budget but not among the residents. */
     if (file_stage_vram)
         s += fmt("  file buffers  %12s  %12s   (two of %s: the most one routed layer reads from "
                  "the container)\n", "-", humanb(file_stage_vram).c_str(),
@@ -1456,9 +1264,7 @@ std::string Plan::report(const Program& prog) const {
     if (!notes.empty() || !unfit.empty()) {
         s += "\n  DID NOT FIT\n";
         for (const std::string& n : notes) s += "    " + n + "\n";
-        /* Aggregated, so nine hundred stranded experts are one line. The count and the bytes are
-         * what an operator needs to size the next run; the identity of expert 107 of layer 47 is
-         * not, and printing it nine hundred times buries the two numbers that are. */
+        /* Aggregated by class and reason: the count and bytes are what sizing the next run needs. */
         for (const Unfit& u : unfit)
             s += fmt("    %lld x %s (%s): %s\n", (long long)u.count, u.what.c_str(),
                      humanb(u.bytes).c_str(), u.why.c_str());

@@ -2,60 +2,31 @@
 // residual add that finishes the layer; and, as `causal_conv1d`, the same convolution with no
 // activation, no residual and no dilation, which is LFM2's short convolution.
 //
-// ============================== WHAT IT COMPUTES ==============================
-//
 //   y[t][c] = resid[t][c] + silu( sum_j w[c][j] * x[t - (width-1-j)*dilation][c] )
 //
-// libref/ref_ple.cpp is the oracle and docs/OPS.md the contract. THE TAPS ARE `dilation` APART, so
-// at this model's width 4 and dilation 3 they sit 9, 6, 3 and 0 timesteps back and the history a
-// sequence carries is (width-1)*dilation = NINE, not three. Every off-by-one in a convolution cache
-// is a model that generates fluently from a slightly wrong context, so the indexing here mirrors
-// ref's line for line: state slot `i` holds the value at relative position `i - hist`, a read at
-// `src < 0` becomes `cs[slot][c][off + src + hist]`, and `has_init` 0 means that window is ZEROS
-// rather than whatever the slot last held.
+// libref/ref_ple.cpp is the oracle and docs/OPS.md the contract. The taps are `dilation` apart, so
+// at width 4 and dilation 3 they sit 9, 6, 3 and 0 timesteps back and a sequence carries a history
+// of (width-1)*dilation = 9, not 3. An off-by-one in a convolution cache yields fluent output from
+// a slightly wrong context, so the indexing mirrors ref's line for line: state slot `i` holds
+// relative position `i - hist`, a read at `src < 0` becomes `cs[slot][c][off + src + hist]`, and
+// `has_init` 0 means that window is zeros, not the slot's stale contents.
 //
-// ============================== ONE THREAD A CHANNEL ==============================
-//
-// A depthwise convolution never mixes channels, so the only axis that has to stay together is time.
-// A thread owns one channel and walks a tile of tokens; consecutive threads own consecutive
-// channels, so a wave's load is one contiguous 512-byte slice of a token row on both sides, and the
-// time axis -- the one with the dependence -- never crosses a thread.
+// One thread per channel: a depthwise convolution never mixes channels, so only time must stay
+// together. A thread walks a tile of tokens; consecutive threads own consecutive channels, so a
+// wave loads one contiguous 512-byte slice of a token row.
 //
 // The grid is (channel blocks, token tiles, sequences). Token tiles are counted from the batch's
-// TOTAL token count, which is an upper bound on any one sequence's: a short sequence in a mixed
-// batch launches a few blocks that find `t0 >= slen` and return, and the waste is bounded by the
-// sequence count. Reading a per-sequence tile count would mean reading `cu` on the host.
+// total token count, an upper bound on any one sequence's; a short sequence's extra blocks find
+// `t0 >= slen` and return. A per-sequence count would mean reading `cu` on the host.
 //
-// ============================== FOUR TAP READS AND NOT A SHIFT REGISTER ==============================
+// The taps are read from memory, not kept in a shift register: the window would need `hist + 1`
+// registers indexed by a runtime value, which compiles to a select tree (see CU_STATIC in
+// r4d_gdn_conv_w4_h128_bf16.hip), and a compile-time window would need a specialisation per
+// (width, dilation). The re-reads hit a tile working set of (BT + hist) * 512 bytes (21 KB at
+// BT 32, L0-resident), and the op is bound by the three arrays it must touch anyway.
 //
-// The taps move by ONE timestep per output while they are spaced `dilation` apart, so a thread that
-// kept its window in registers would need `hist + 1` of them and would index that array by a value
-// the compiler cannot see -- and a register array under a runtime index is not a register read, it
-// is a select tree. The GDN conv update's CU_STATIC note records exactly that
-// (r4d_gdn_conv_w4_h128_bf16.hip: a third of the kernel becomes s_cselect/v_cndmask choosing which
-// register to read). A compile-time window would mean templating on (width, dilation) and a
-// specialisation per model.
-//
-// So the taps are read where they lie. They are re-reads of the same 512-byte slice a handful of
-// iterations apart -- a tile's whole working set is (BT + hist) * 512 bytes, 21 KB at BT 32, which
-// is L0-resident -- and this op is bandwidth-bound on the three arrays it must touch anyway. If a
-// profile ever says otherwise, the templated window is the change to make, not a runtime ring.
-//
-// ============================== THE WINDOW WRITE-BACK IS IN THE SAME LAUNCH ==============================
-//
-// The obvious reading says it cannot be: the write-back overwrites the window other blocks read,
-// and a kernel boundary is the only grid-wide barrier this tree has. What makes it legal here is
-// WHICH BLOCK READS THE STATE. History is reached only where `t - hist + j*dilation < 0`, so only
-// tokens below `hist` -- nine of them -- read it at all, and they are all inside the 32-token TILE
-// ZERO. One block reads state[slot][c], one thread inside it owns the whole channel, and its own
-// reads are ordered before its own writes by program order. No barrier and no second dispatch.
-//
-// That matters because at decode this op is nothing but dispatch: its cost is flat from M=1 to
-// M=8, which is the launches and none of the work. A second dispatch for the write-back would
-// roughly double it.
-//
-// It only holds while `hist < kPcBT`, which the constraint table already guarantees -- the
-// static_assert below is where that dependency is written down.
+// The window write-back is in the same launch; see the note at the end of the kernel. It relies
+// on `hist < kPcBT`, asserted below.
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_common.h"
@@ -71,21 +42,18 @@ enum {
     kPcMaxHist = 16,   /* (width-1)*dilation, the write-back's register window; see cPleConv */
 };
 
-/* THE WINDOW WRITE-BACK LIVES IN TILE ZERO and that is only sound while the deepest tap is inside
- * the first tile. At hist >= BT a second block would read history too, and the fold would overwrite
- * bytes another block is still reading -- a wrong prefix on the first tokens of a sequence, which
- * nothing downstream reports. The constraint table caps width and dilation so that hist <= 16; this
- * is the line that says the tile size is the OTHER half of that bound. */
+/* The write-back lives in tile 0, which is sound only while the deepest tap is inside the first
+ * tile. At hist >= BT a second block would read history and the write-back would overwrite bytes
+ * it is still reading, silently corrupting a sequence's first tokens. The constraint table caps
+ * hist <= 16; the tile size is the other half of that bound. */
 static_assert(kPcMaxHist < kPcBT, "the conv history must fit inside tile 0 for the fused write-back");
 
-/* x * sigmoid(x), and expf rather than __expf. The result is rounded to bf16 two instructions
- * later, so the fast intrinsic's couple of ULP would be invisible in the bytes -- but this op is
- * bound by the three arrays it moves, not by its transcendental, and the oracle it is checked
- * against uses std::exp. The GDN conv, which is instruction-bound, makes the opposite trade. */
+/* expf rather than __expf: the op is bound by memory, not the transcendental, and the oracle uses
+ * std::exp. The instruction-bound GDN conv makes the opposite trade. */
 __device__ __forceinline__ float pc_silu(float z) { return z / (1.0f + expf(-z)); }
 
-/* SILU is ple_conv's activation; causal_conv1d (LFM2's short convolution) is the same window
- * with none, no residual and dilation one. */
+/* SILU is ple_conv's activation; causal_conv1d (LFM2's short convolution) is the same window with
+ * no activation, no residual and dilation one. */
 template <bool SILU>
 __global__ __launch_bounds__(kPcThreads) void ple_conv_kernel(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
@@ -108,9 +76,8 @@ __global__ __launch_bounds__(kPcThreads) void ple_conv_kernel(
 
     const int32_t slot = sidx ? sidx[s] : (int32_t)s;
     if (slot < 0) return;
-    /* A cold slot's window is ZEROS and not what the slot last held: a fresh sequence landing on a
-     * recycled slot would otherwise convolve the previous sequence's tail into its first `hist`
-     * tokens -- fluent output with the wrong prefix. */
+    /* A cold slot's window is zeros: a fresh sequence on a recycled slot would otherwise convolve
+     * the previous sequence's tail into its first `hist` tokens. */
     const bool warm = cs && (!hini || hini[s] != 0);
     const long long off = nacc ? (long long)nacc[s] - 1 : 0;
 
@@ -140,29 +107,22 @@ __global__ __launch_bounds__(kPcThreads) void ple_conv_kernel(
         yc[(size_t)t * yld] = f32_to_bf16(r + (SILU ? pc_silu(acc) : acc));
     }
 
-    /* THE WINDOW THIS STEP LEAVES BEHIND, in the same launch and with no barrier at all.
+    /* The window this step leaves, in the same launch with no barrier. History is read only where
+     * `t - hist + j*dilation < 0`, i.e. by tokens below `hist` (9, against a 32-token tile), so
+     * tile 0 is the only block touching state[slot][c]. One thread owns the whole channel there, so
+     * its reads precede its writes in program order. At decode the op's cost is the dispatch itself
+     * (flat from M=1 to M=8), so a second launch would roughly double it.
      *
-     * WHICH BLOCK READ THE STATE decides that this is legal: history is read only where
-     * `t - hist + j*dilation < 0`, so only tokens below `hist` reach back -- and `hist` is 9
-     * against a 32-token tile, so TILE ZERO is the only block that ever touches state[slot][c].
-     * Within it one thread owns a whole channel, so its own reads are ordered before its own
-     * writes by program order and there is nothing to synchronise.
+     * The layout is libref/ref_ple.cpp's, chosen by `num_accepted`. Present, this is a decode step
+     * whose drafts a verify may reject: the history read shifts down by one and every input of the
+     * step follows it, slot i holding position i + 1 of (window read ++ step), so a next step that
+     * kept k tokens reads at k - 1. Absent, every token commits and the last `hist` inputs land at
+     * offset zero. The two agree at one token. Slots past `state_len` are not written; the manager
+     * sizes the window hist + n_spec, enough for a step of 1 + n_spec tokens.
      *
-     * Folding it in matters because at decode this op is nothing but launches: its cost is flat
-     * from M=1 to M=8, which is the dispatches and none of the work.
-     *
-     * THE LAYOUT IS libref/ref_ple.cpp's, and `num_accepted` picks it. Present, this is a decode
-     * step whose drafts a verify may reject: the history read is shifted down by one and every
-     * input of the step follows it, slot i holding position i + 1 of (window read ++ step), so a
-     * next step that kept k tokens reads at k - 1 and finds the history ending at the k-th.
-     * Absent, every token commits and the last `hist` inputs land at offset zero. The two agree
-     * at one token. Slots past `state_len` are not written; the manager sizes the window
-     * hist + n_spec, which covers a step of 1 + n_spec tokens.
-     *
-     * The values are copied as bf16 BITS -- the same tensor's bytes on both sides, and a round
-     * trip through f32 would be a second definition of the state's precision. The step's rows
-     * come out of `x`, which is read-only here, so reading rows another tile is also reading is
-     * not a hazard. Every history value is loaded before the first store, as in the tail form. */
+     * Values are copied as bf16 bits, the same tensor's bytes on both sides. The step's rows come
+     * from the read-only `x`, so other tiles reading them is no hazard. Every history value is
+     * loaded before the first store. */
     if (!dst || blockIdx.y != 0) return;
     uint16_t keep[kPcMaxHist];
     if (nacc) {
@@ -204,9 +164,9 @@ int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, co
     if (cs && cs->data && cs->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
     if (cu->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
     if (cidx && cidx->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
-    /* `has_init` IS THE CALLER'S WIDTH and reading it as bytes is how the GDN conv lost a long
-     * prompt's history: ctx_len 512 has a zero low byte. The engine hands over RadBatch::ctx_lens,
-     * which is int32 like every derived buffer, so anything else is refused rather than guessed. */
+    /* `has_init` must be int32 (RadBatch::ctx_lens, like every derived buffer): read as bytes, a
+     * ctx_len of 512 has a zero low byte and the history would be dropped. Anything else is
+     * refused. */
     if (hini && hini->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
     if (nacc && nacc->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
 
@@ -224,8 +184,8 @@ int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, co
     const long long rld = resid ? r4d_rows_pitch(resid, n, &tr) : 0;
     const long long wld = r4d_rows_pitch(w, wid, &wrows);
     if (xld < 0 || yld < 0 || wld < 0 || (resid && rld < 0)) return R4D_NO(RAD_E_STRIDE);
-    /* THE ROW COUNT COMES FROM THE OPERANDS AND EVERY ONE HAS TO AGREE. `M` is ranged, so the value
-     * in the args is the band's upper bound and a grid sized by it walks off the arena. */
+    /* The row count comes from the operands, and they must agree: `M` is ranged, so the arg holds
+     * the band's upper bound and a grid sized by it would run off the arena. */
     if (T <= 0 || ty != T || (resid && tr != T)) return R4D_NO(RAD_E_SHAPE);
     if (wrows < n) return R4D_NO(RAD_E_SHAPE);
 
@@ -233,9 +193,9 @@ int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, co
     if (N <= 0) return R4D_NO(RAD_E_SHAPE);
     if (!r4d_contig(cu)) return R4D_NO(RAD_E_STRIDE);
 
-    /* [n_slots, n, state_len]. A state too shallow for the deepest tap is refused here; the OFFSET
-     * a rollback reads at cannot be checked without reading `num_accepted` on the host, and the
-     * manager sizes the window as hist + n_spec for exactly that reason. */
+    /* [n_slots, n, state_len]. A state too shallow for the deepest tap is refused here; the
+     * rollback offset cannot be checked without reading `num_accepted` on the host, which is why
+     * the manager sizes the window hist + n_spec. */
     long long cs_slot = 0, cs_ch = 0, cs_tok = 0, state_len = 0;
     const bool have_cs = cs && cs->data && hist > 0;
     if (have_cs) {

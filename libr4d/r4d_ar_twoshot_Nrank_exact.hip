@@ -6,20 +6,18 @@
 // Shard s = a contiguous run of the message's 16-byte words, owned by rank s. Phase 1: push my
 // contribution to each peer-owned shard into the owner's slot[me] region A, flag 2s-1; reduce my
 // shard fp32 in ascending rank order (own contribution from the input). Phase 2: reduced words go
-// to my out AND every peer's slot[me] region B, flag 2s; assemble out from region B. Region A at
+// to my out and every peer's slot[me] region B, flag 2s; assemble out from region B. Region A at
 // 0, B at sh_max; the slot stride must hold 2*sh_max.
 //
-// UNEVEN SHARDS. A message of n16 words splits into base = n16/ws words a shard, and the first
-// n16 % ws shards take one more: shard s starts at s*base + min(s, rem). At 4 and 8 ranks every
-// residual the engine issues divides evenly and this is the plain 1/ws split. At 3 it almost never
-// does -- a 2048-wide bf16 row is 256 words, and 256 * rows is a multiple of 3 only when rows is --
-// so the split has to tolerate it rather than refuse it. The sum per word is the same fp32 fold in
-// ascending rank order whichever rank owns it, so the bits match the one-shot's.
+// Uneven shards: n16 words split into base = n16/ws words per shard, and the first n16 % ws shards
+// take one more, so shard s starts at s*base + min(s, rem). At 4 and 8 ranks engine residuals
+// divide evenly; at 3 they rarely do (a 2048-wide bf16 row is 256 words). Each word is the same
+// fp32 fold in ascending rank order whoever owns it, so the bits match the one-shot's.
 //
-// SHARES the wide family's flag/seq/scratch set: every wide kernel publishes in the 2*seq flag
-// space (this one adds the 2s-1 half-step) and advances the per-block counter once per AR, so
-// parity and the monotonic spin survive any mixed one-shot/two-shot stream on one buffer set.
-// The slot stride must hold the largest requirement of every family in the mix.
+// Shares the wide family's flag/seq/scratch set (r4d_ar_wide.h): it publishes in the 2*seq flag
+// space plus the 2s-1 half-step and advances the per-block counter once per AR, so one buffer set
+// can carry any mix of one-shot and two-shot launches. The slot stride must hold the largest
+// requirement in the mix.
 #include "r4d.h"
 #include "r4d_ar_wide.h"
 #include <stdexcept>
@@ -30,10 +28,12 @@ __global__ void r4d_ar_twoshot_wide_exact_kernel(
     const int4* __restrict__ in4, R4DArWidePeers<int4, WS - 1> peers,
     const int4* __restrict__ my_base, unsigned int* __restrict__ my_flags,
     int4* __restrict__ out4, unsigned int* __restrict__ seq_ctrs, int n16,
-    int slot_stride16, int rank, int drain, int acq, int pub) {
+    int slot_stride16, int rank, int drain, int acq, int pub,
+    long long* gate, unsigned int* gate_ctr) {
   constexpr int NPEERS = WS - 1;
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
+  const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
   r4d_ar_seq_take(seq_ctrs, R4D_AR_WIDE_MAX_BLOCKS, s_seq, s_slot);  // device-resident, replay-safe
   const unsigned int s = s_seq;
   const int parity = (int)s_slot;
@@ -93,6 +93,12 @@ __global__ void r4d_ar_twoshot_wide_exact_kernel(
     for (int p = 0; p < NPEERS; ++p) pa[p][sh_max + k] = o;  // region B
   }
   r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s, drain, acq, pub);
+  /* The hold ends after the second handshake, not the first: the reduce above is fused with the
+   * phase-2 push (every reduced word goes to each peer's region B), so at the first handshake the
+   * link still carries this launch's phase-2 bytes. Here every phase-1 and phase-2 remote store
+   * has retired behind its flag store and every peer's pushes to this rank have been waited on;
+   * only the local assemble is left (r4d_ar_seq.h). */
+  r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
 
   // ---- assemble: every peer-owned shard from my region B copies
   for (int p = 0; p < NPEERS; ++p) {
@@ -111,7 +117,8 @@ template <int WS>
 static void ar_twoshot_launch(const long* peer_scratch, const long* peer_flags, long my_scratch,
                               long my_flags, long seq_ctrs, long slot_stride16, long inp,
                               long out, long n_elem, long dtype, long rank, long stream_i,
-                              long nblocks, long nthreads, long drain, long acq, long pub) {
+                              long nblocks, long nthreads, long drain, long acq, long pub,
+                              long gate, long gate_ctr) {
   constexpr int NPEERS = WS - 1;
   if (rank < 0 || rank >= WS)
     throw std::runtime_error("all_reduce: rank " + std::to_string(rank) +
@@ -154,9 +161,8 @@ static void ar_twoshot_launch(const long* peer_scratch, const long* peer_flags, 
     peers.rank[i] = (i < (int)rank) ? i : i + 1;
   }
 
-  // scratch must back 2*WS slots of the declared stride, flags one word per (block, source
-  // rank), seq a handshake and a parity word per block of capacity (r4d_ar_seq.h) -- checked
-  // against the allocations, not the arguments.
+  // Checked against the allocations: scratch backs 2*WS slots of the stride, flags one word per
+  // (block, source rank), seq a handshake and a parity word per block of capacity (r4d_ar_seq.h).
   const long slot_bytes = 2L * WS * (long)slot_stride16 * 16;
   const long flag_bytes = (long)nb * WS * (long)sizeof(unsigned int);
   r4d_ar_check_extent(my_scratch, slot_bytes, "all_reduce", "my_scratch");
@@ -173,7 +179,8 @@ static void ar_twoshot_launch(const long* peer_scratch, const long* peer_flags, 
   r4d_ar_twoshot_wide_exact_kernel<T, LN, WS><<<nb, nt, 0, st>>>(                     \
       (const int4*)inp, peers, (const int4*)my_scratch, (unsigned int*)my_flags,      \
       (int4*)out, (unsigned int*)seq_ctrs, (int)n16, (int)slot_stride16,              \
-      (int)rank, (int)drain, (int)acq, (int)pub)
+      (int)rank, (int)drain, (int)acq, (int)pub, (long long*)gate,                    \
+      (unsigned int*)gate_ctr)
   if (dtype == 0) R4D_AR_TS_LAUNCH(__hip_bfloat16, 8);
   else if (dtype == 1) R4D_AR_TS_LAUNCH(__half, 8);
   else if (dtype == 2) R4D_AR_TS_LAUNCH(float, 4);
@@ -188,8 +195,9 @@ void r4d_ar_twoshot_3rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long acq, long pub) {
   const long ps[2] = {peer_scratch0, peer_scratch1};
   const long pf[2] = {peer_flags0, peer_flags1};
+  /* No link gate at three ranks: the row answers 1, the engine releases by barrier. */
   ar_twoshot_launch<3>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
-                       dtype, rank, stream, nblocks, nthreads, drain, acq, pub);
+                       dtype, rank, stream, nblocks, nthreads, drain, acq, pub, 0L, 0L);
 }
 
 void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
@@ -197,11 +205,11 @@ void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long my_scratch, long my_flags, long seq_ctrs,
                                 long slot_stride16, long inp, long out, long n_elem, long dtype,
                                 long rank, long stream, long nblocks, long nthreads, long drain,
-                                long acq, long pub) {
+                                long acq, long pub, long gate, long gate_ctr) {
   const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
   const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
   ar_twoshot_launch<4>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
-                       dtype, rank, stream, nblocks, nthreads, drain, acq, pub);
+                       dtype, rank, stream, nblocks, nthreads, drain, acq, pub, gate, gate_ctr);
 }
 
 void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
@@ -216,6 +224,7 @@ void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long pee
                       peer_scratch4, peer_scratch5, peer_scratch6};
   const long pf[7] = {peer_flags0, peer_flags1, peer_flags2, peer_flags3,
                       peer_flags4, peer_flags5, peer_flags6};
+  /* No link gate at eight ranks: the row answers 1, the engine releases by barrier. */
   ar_twoshot_launch<8>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
-                       dtype, rank, stream, nblocks, nthreads, drain, acq, pub);
+                       dtype, rank, stream, nblocks, nthreads, drain, acq, pub, 0L, 0L);
 }

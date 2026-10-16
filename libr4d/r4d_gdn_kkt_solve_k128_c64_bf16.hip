@@ -2,117 +2,74 @@
 //
 //     A = (I + strict_lower(diag(beta) . K K^T . e^{g_i - g_j}))^{-1}     per chunk of 64
 //
-// It replaces FLA's chunk_scaled_dot_kkt_fwd + solve_tril, whose intermediate is a 64x64 fp32
-// matrix per (chunk, head) written to HBM and read straight back -- 16 KB in and 16 KB out per
-// chunk-head, for a matrix that is dead the moment the inverse is formed. Here the gram never
-// leaves LDS, and only the bf16 inverse is stored.
+// Replaces FLA's chunk_scaled_dot_kkt_fwd + solve_tril, whose 64x64 fp32 intermediate per
+// (chunk, head) round-trips through HBM. Here the gram stays in LDS and only the bf16 inverse is
+// stored. Also:
 //
-// Two structural wins over the pair it replaces, both from doing the whole thing at once:
+//   * The gram is computed once per k head, not per v head: K K^T does not depend on beta or g,
+//     so one workgroup owns a (chunk, k head) and applies each v head's scales to it.
+//   * The gram is computed as its upper-triangle tiles. K K^T is symmetric, and read transposed
+//     into A's strictly lower half each accumulator holds eight consecutive columns of one row:
+//     one 16-byte LDS store instead of eight 2-byte ones.
 //
-//   * THE GRAM IS COMPUTED ONCE PER K HEAD, NOT ONCE PER V HEAD. K K^T does not depend on beta or
-//     g, and this model has three v heads per k head, so FLA computes the same 64x64x128 matmul
-//     three times. One workgroup owns a (chunk, k head) and applies each v head's scales to the
-//     gram it already holds in registers.
-//   * THE GRAM IS COMPUTED IN ITS UPPER TRIANGLE. K K^T is symmetric, so the strictly LOWER half
-//     of A can be read out of the upper tiles -- and that orientation is the one where a WMMA
-//     accumulator's eight elements are eight CONSECUTIVE columns of one row of A, i.e. one
-//     16-byte LDS store instead of eight 2-byte ones.
+// The decay is applied per element as e^{g_i-g_j}, not split about a per-chunk reference c: each
+// half of e^{g_i-c} * e^{c-g_j} can overflow fp32 on its own. Here the exponent is always <= 0
+// (g decreases along the chunk and only i > j is kept), and the eight exps per tile are cheap in
+// a memory-bound kernel.
 //
-// The decay is applied as e^{g_i-g_j} PER ELEMENT, not split across a per-chunk reference. The
-// split form (e^{g_i-c} . e^{c-g_j}) is one exp per token instead of eight per tile, and it is what
-// the chunked scan uses -- but it only holds while the chunk's gate span stays inside fp32's
-// exponent range, and each half can overflow on its own even where the product cannot. Here the
-// difference is always <= 0 (g decreases along the chunk and only i > j is kept), so the direct
-// form cannot overflow at any span, and the exps it costs are eight per tile against a kernel
-// whose cost is memory.
-//
-// The inverse is blocked 16 -> 32 -> 64. The four diagonal blocks are inverted by fp32 forward
-// substitution (one wave each, one lane per column), which is both cheaper than a WMMA Neumann
-// series at this size and exact in fp32 -- FLA does the same thing for the same reason. The two
-// 32-merges and the 64-merge are WMMA, using the identity
+// The inverse is blocked 16 -> 32 -> 64. The four diagonal blocks use fp32 forward substitution
+// (one wave each, one lane per column), cheaper than a WMMA Neumann series at this size and exact
+// in fp32, as in FLA. The 32-merges and the 64-merge are WMMA, using
 //
 //     [[P, 0], [R, Q]]^-1 = [[P^-1, 0], [-Q^-1 R P^-1, Q^-1]]
 //
-// Every buffer is named for the layout it holds because the WMMA contract fixes it:
-// mma(X, Y) computes X . Y^T from two row-major, k-contiguous operands, so a product's left
-// operand must be row-major and its right operand must be stored transposed. An accumulator
-// writes its transpose contiguously and its row-major form scattered, which is why the
-// intermediates below are staged transposed and the final M is assembled row-major (it is stored
-// to HBM by rows).
+// mma(X, Y) computes X . Y^T from two k-contiguous operands, so a left operand is row-major and a
+// right operand is stored transposed. An accumulator writes its transpose contiguously, so the
+// intermediates are staged transposed; the final inverse is assembled row-major for the HBM store.
 #include <hip/hip_runtime.h>
 #include "r4d.h"
+#include "r4d_common.h"   // lds_barrier
 #include "r4d_gdn_args.h"
 #include "r4d_gdn_wmma.h"
 
 #define BT   64                 // chunk
 #define KD  128                 // head_k
 #define NBK   4                 // 16x16 blocks per chunk edge
-#ifndef AP
-#define AP   68                 // row pitch of the [BT][BT] buffers, in shorts. 136 B: 8-byte
-#endif                          // aligned for the paired stores, and 136 mod 128 has gcd 8 with
-                                // 128, so 16 rows still cover every bank
-#ifndef NW
+#define AP   68                 // row pitch of the [BT][BT] buffers, in shorts (136 B): 8-byte
+                                // aligned for the paired stores, and 16 rows still cover every
+                                // bank
 #define NW    4
-#endif
 #define NTHR (NW * 32)
 #define NTILE 10                // upper-triangular tiles of a 4x4 tiling
 #define MAXT  ((NTILE + NW - 1) / NW)
 
-#ifndef LDSBAR
-#define LDSBAR 1
-#endif
-#if LDSBAR
-#define BAR() do {                                                        \
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");       \
-    __builtin_amdgcn_s_barrier();                                         \
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");       \
-  } while (0)
-#else
-#define BAR() __syncthreads()
-#endif
-
-// LDS is what limits how many of these run per CU, and this kernel spends most of its time waiting
-// on memory -- so a buffer is worth keeping only if it buys more than the occupancy it costs. The
-// inverse's transposed form does not: it is needed as the right operand of three fragments per
-// head, and fragT rebuilds those from the row-major copy for eight scalar reads each.
-// ... and by the same argument the inverse does not need a buffer of its own either. Each stage
-// reads the block of A it is about to overwrite BEFORE writing it, and the stages are separated by
-// workgroup barriers, so the inverse can be formed in place:
+// LDS limits occupancy, and this kernel is memory-bound, so buffers are minimised. No transposed
+// inverse is kept (fragT rebuilds the three right operands that need it). The inverse is formed
+// in place in A, since each stage reads the block it overwrites before writing it, with barriers
+// between stages:
 //   diagonal p    reads A[p][p], writes it after the substitution has finished reading
 //   32-merge      reads A10 and the two diagonal inverses, writes A10
-//   64-merge      reads R = A[32:,:32] into registers everywhere, barriers, then writes it
-// That leaves one 64x64 buffer plus a 32x32 scratch: 11 KB, against 31 KB for a form that gives
-// every stage a buffer of its own.
+//   64-merge      reads R = A[32:,:32] into TMP everywhere, barrier, then writes it
+// One 64x64 buffer plus a 32x32 scratch: 11 KB instead of 31 KB.
 struct KkSmem {
   unsigned short A[BT][AP];     // A on the way in, its inverse on the way out
   unsigned short TMP[32][36];   // one 32x32 intermediate, transposed
   float gb[BT], bt[BT];         // the chunk's gate cumsum and beta, per token
 };
 
-// The (mt, nt) of the NTILE upper-triangular tiles, walked out arithmetically rather than read
-// from a __constant__ table: the table form is one byte load per tile from a segment this kernel
-// is otherwise never touching, and it is wave-uniform arithmetic either way.
+// (mt, nt) of upper-triangular tile ti, computed with wave-uniform arithmetic instead of a
+// __constant__ table load.
 __device__ __forceinline__ void kkt_tile(int ti, int* mt, int* nt) {
   int m = 0, n = ti;
   while (n >= NBK - m) { n -= (NBK - m); ++m; }
   *mt = m; *nt = n + m;
 }
 
-// OCC: minimum waves per SIMD to compile for. This kernel is memory wait, not arithmetic
-// (~2000 instructions per wave against its wall clock), so occupancy is its lever -- and at
-// HG_RATIO=3 it lands on 190 VGPRs, which caps it at 8 waves/SIMD where its 11.5 KB of LDS
-// would allow 10. The trade does not pay: OCC=10 reaches 10 waves (144 VGPRs) but spills 148
-// bytes per lane and runs about 57% slower. Left at 0.
-#ifndef OCC
-#define OCC 0
-#endif
+// No occupancy hint: at HG_RATIO=3 the kernel uses 190 VGPRs (8 waves per SIMD; LDS would allow
+// 10), and forcing 10 waves spills 148 bytes per lane and is ~57% slower.
 template <int HG_RATIO>
 __global__
-#if OCC
-__launch_bounds__(NTHR, OCC)
-#else
 __launch_bounds__(NTHR)
-#endif
 void r4d_gdn_kkt_solve_kernel(const unsigned short* __restrict__ k,
                               const float* __restrict__ beta,
                               const float* __restrict__ g,
@@ -125,10 +82,9 @@ void r4d_gdn_kkt_solve_kernel(const unsigned short* __restrict__ k,
   const int lo = lane & 15, hi = lane >> 4;
   const int hg = blockIdx.y;
 
-  // Resolve the flat chunk id to (sequence, chunk). The grid is launched with an upper bound on
-  // the total chunk count, so this also decides which workgroups have nothing to do -- it costs
-  // N+1 scalar loads and saves the host a device-to-host sync it would otherwise need to size the
-  // grid exactly.
+  // Resolve the flat chunk id to (sequence, chunk). The grid is an upper bound on the chunk
+  // count, so surplus workgroups exit here; this saves the host a device-to-host sync to size
+  // the grid exactly.
   int n = -1, t0 = 0, bos = 0, rows = 0;
   {
     int acc = 0, want = blockIdx.x;
@@ -142,11 +98,8 @@ void r4d_gdn_kkt_solve_kernel(const unsigned short* __restrict__ k,
     if (n < 0) return;
   }
 
-  // ---- zero the parts no store ever reaches: the upper tiles of A, and everything in M / MT
-  // outside the blocks the inverse writes. Done once; the write pattern is the same for every
-  // head, so it cannot be dirtied between heads.
-  // 16 bytes per thread per step, not 2: as shorts this is 34 ds_store_b16 per thread for a
-  // buffer that is 8704 bytes and 16-byte aligned.
+  // ---- zero A once: the parts no store reaches (the upper tiles) are the same for every head.
+  // 16-byte stores (the buffer is 8704 bytes, 16-byte aligned).
   for (int i = tid; i < BT * AP / 8; i += NTHR) ((uint4*)&s.A[0][0])[i] = make_uint4(0, 0, 0, 0);
 
   // ---- the gram, once for all HG_RATIO v heads of this k head -----------------------------
@@ -160,10 +113,7 @@ void r4d_gdn_kkt_solve_kernel(const unsigned short* __restrict__ k,
     const int ti = warp + t * NW;
     if (ti < NTILE) {
       int mt, nt; kkt_tile(ti, &mt, &nt);
-      // One 32-bit element offset per operand row, hoisted out of the k loop. The pointer form
-      // (fragG) rebuilds v_mad_co_i64_i32 + v_lshlrev_b64 + a 64-bit add for EVERY one of the
-      // sixteen fragments, because the size_t row stride forces 64-bit arithmetic and LLVM will
-      // not keep the address live across the loop.
+      // One 32-bit offset per operand row, hoisted out of the k loop (see rowGo/fragGo).
       const unsigned om = rowGo(krow, mt * 16, rows - 1, lane);
       const unsigned on = rowGo(krow, nt * 16, rows - 1, lane);
 #pragma unroll
@@ -181,12 +131,12 @@ void r4d_gdn_kkt_solve_kernel(const unsigned short* __restrict__ k,
       s.gb[tid] = g[(size_t)(bos + t0 + t) * H + hv];
       s.bt[tid] = beta[(size_t)(bos + t0 + t) * H + hv];
     }
-    BAR();
+    lds_barrier();
 
     // ---- scale, mask and place the gram as the strictly lower half of A ---------------------
-    // Tile (mt, nt) holds P[m][n]; the element written is A[n][m] = rs[n] gv[m] P[m][n], which is
-    // in the lower triangle exactly when n > m. n is fixed per lane and m runs over the eight
-    // accumulator elements, so this is one row of A and one 16-byte store.
+    // Tile (mt, nt) holds P[m][n]; the element written is A[n][m], in the lower triangle when
+    // n > m. n is fixed per lane and m runs over the eight accumulator elements: one row of A,
+    // one 16-byte store.
 #pragma unroll
     for (int t = 0; t < MAXT; ++t) {
       const int ti = warp + t * NW;
@@ -201,14 +151,10 @@ void r4d_gdn_kkt_solve_kernel(const unsigned short* __restrict__ k,
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
           const int j = j0 + e;
-          // i > j means g_i <= g_j, so this exponent is never positive whatever the span is --
-          // but ONLY for a live row. On a padding row (i >= rows) gi is forced to 0 above while
-          // gb[j] keeps its real, negative cumsum, so gi - gb[j] = -gb[j] is large POSITIVE,
-          // __expf overflows to +INF, and bi * INF = 0 * INF = NaN. Those NaNs sit in padding
-          // rows of the 64x64 tile, and the blocked inverse below merges the whole tile with
-          // WMMA, so they reach live rows and poison the chunk's output for the head. On real
-          // Qwen3.8-27B inputs that is a handful of non-finite values in A, which chunk_scan then
-          // spreads across an entire head_v-wide head of the layer output.
+          // For a live row, i > j gives g_i <= g_j, so the exponent is never positive. Padding
+          // rows and columns must be masked to -inf: with gi = 0 the exponent -gb[j] is large and
+          // positive, 0 * inf = NaN, and the WMMA merges in the blocked inverse would spread it
+          // into live rows.
           const float d = (live && i > j && j < rows) ? (gi - s.gb[j]) : -INFINITY;
           vv[e] = bi * __expf(d) * P[t][e];
         }
@@ -216,11 +162,11 @@ void r4d_gdn_kkt_solve_kernel(const unsigned short* __restrict__ k,
         *(uint2*)(&s.A[i][j0 + 4]) = f2bf4(vv[4], vv[5], vv[6], vv[7]);
       }
     }
-    BAR();
+    lds_barrier();
 
     // ---- 1. the four diagonal blocks, by fp32 forward substitution --------------------------
-    // D = (I + N)^-1 solves D = I - N D one row at a time. Lane l owns column l of D, so the
-    // dot product over j < i is 16 registers deep and N[i][j] is a broadcast LDS read.
+    // D = (I + N)^-1 solves D = I - N D row by row. Lane l owns column l of D, so the dot product
+    // over j < i is in 16 registers and N[i][j] is a broadcast LDS read.
     for (int p = warp; p < NBK; p += NW) {
       const int b0 = p * 16;
       float d[16];
@@ -237,7 +183,7 @@ void r4d_gdn_kkt_solve_kernel(const unsigned short* __restrict__ k,
         for (int i = 0; i < 16; ++i) s.A[b0 + i][b0 + lo] = f2bf(d[i]);
       }
     }
-    BAR();
+    lds_barrier();
 
     // ---- 2. the two 32-merges: M10 = -D1 A10 D0 --------------------------------------------
     for (int blk = warp; blk < 2; blk += NW) {
@@ -246,11 +192,10 @@ void r4d_gdn_kkt_solve_kernel(const unsigned short* __restrict__ k,
       v8f X = (v8f){0, 0, 0, 0, 0, 0, 0, 0};
       X = mma(frag(&s.A[0][0], AP, r0 + 16, r0, lane),
               fragT(&s.A[0][0], AP, r0, r0, lane), X);
-      // stage X transposed for the next product. The two merges run on two waves against the
-      // same scratch, so each owns 16 rows of it.
+      // Stage X transposed for the next product; each of the two merges owns 16 rows of TMP.
       *(uint2*)(&s.TMP[blk * 16 + lo][8 * hi])     = f2bf4(X[0], X[1], X[2], X[3]);
       *(uint2*)(&s.TMP[blk * 16 + lo][8 * hi + 4]) = f2bf4(X[4], X[5], X[6], X[7]);
-      // fragT reads A column-wise below, so the merge result only needs the row-major copy
+      // fragT reads A column-wise below, so the merge result needs only the row-major copy
       __builtin_amdgcn_wave_barrier();
       // M10 = -D1 . X    (left D1 row-major, in place in A; right X transposed, in TMP)
       v8f Y = (v8f){0, 0, 0, 0, 0, 0, 0, 0};
@@ -261,7 +206,7 @@ void r4d_gdn_kkt_solve_kernel(const unsigned short* __restrict__ k,
 #pragma unroll
       for (int e = 0; e < 8; ++e) s.A[i + e][j] = f2bf(-Y[e]);
     }
-    BAR();
+    lds_barrier();
 
     // ---- 3. the 64-merge: M[32:,:32] = -Q^-1 (R P^-1) --------------------------------------
     // Y = R . P^-1, R = A[32:,:32] row-major, P^-1 read transposed out of A[:32,:32] by fragT
@@ -275,7 +220,7 @@ void r4d_gdn_kkt_solve_kernel(const unsigned short* __restrict__ k,
       *(uint2*)(&s.TMP[nt * 16 + lo][mt * 16 + 8 * hi])     = f2bf4(Y[0], Y[1], Y[2], Y[3]);
       *(uint2*)(&s.TMP[nt * 16 + lo][mt * 16 + 8 * hi + 4]) = f2bf4(Y[4], Y[5], Y[6], Y[7]);
     }
-    BAR();                          // every wave has read R into TMP; now it may be overwritten
+    lds_barrier();                  // every wave has read R into TMP; now it may be overwritten
     // Z = -Q^-1 . Y, Q^-1 = A[32:,32:] row-major, Y transposed = TMP
     for (int t = warp; t < 4; t += NW) {
       const int mt = t >> 1, nt = t & 1;
@@ -289,7 +234,7 @@ void r4d_gdn_kkt_solve_kernel(const unsigned short* __restrict__ k,
 #pragma unroll
       for (int e = 0; e < 8; ++e) s.A[i + e][j] = f2bf(-Z[e]);
     }
-    BAR();
+    lds_barrier();
 
     // ---- store: one row of the inverse is 64 bf16, contiguous in HBM -----------------------
     {
@@ -300,7 +245,7 @@ void r4d_gdn_kkt_solve_kernel(const unsigned short* __restrict__ k,
         *(uint4*)(op + (size_t)r * orow + c8) = *(const uint4*)(&s.A[r][c8]);
       }
     }
-    if (hh + 1 < HG_RATIO) BAR();
+    if (hh + 1 < HG_RATIO) lds_barrier();
   }
 }
 
@@ -330,9 +275,7 @@ extern "C" int r4d_gdn_kkt_solve_k128_c64_bf16(const void* k, const void* beta, 
 }
 
 // ============================================================== the plugin ABI entry points
-//
-// The shared operand helpers are r4d_gdn_args.h. See libr4d/r4d_args.h for why there is no
-// adapter directory between the core and these launches.
+// Shared operand helpers: r4d_gdn_args.h.
 /* ------------------------------------------------------------------ kkt solve */
 
 enum { KS_K = 0, KS_BETA, KS_G, KS_CU, KS_A };
@@ -348,8 +291,7 @@ extern "C" int r4d_rad_gdn_kkt_solve(const RadArgs* a, RadStream s) {
     if (k->rank != 3 || bt->rank != 2 || g->rank != 2 || A->rank != 3) return R4D_NO(RAD_E_SHAPE);
     if (!r4d_contig(k) || !r4d_contig(bt) || !r4d_contig(g) || !r4d_contig(A))
         return R4D_NO(RAD_E_STRIDE);
-    /* "bf16 k and A out, fp32 beta / gate / gram / inverse" -- and `A` is the OUT, written as
-     * unsigned short by r4d_gdn_kkt_solve_kernel. */
+    /* bf16 k and A (the output, written as bf16); fp32 beta and gate. */
     R4D_DT(k, RAD_BF16); R4D_DT(A, RAD_BF16); R4D_DT(bt, RAD_F32); R4D_DT(g, RAD_F32);
 
     int N = 0;
@@ -365,7 +307,8 @@ extern "C" int r4d_rad_gdn_kkt_solve(const RadArgs* a, RadStream s) {
     if (A->shape[0] != T || A->shape[1] != H) return R4D_NO(RAD_E_SHAPE);
     if (H == 0 || Hg == 0 || H % Hg) return R4D_NO(RAD_E_SHAPE);
 
-    return r4d_gdn_kkt_solve_k128_c64_bf16(k->data, bt->data, g->data, A->data, cu->data,
-                                           N, (int)T, (int)H, (int)Hg, (int)K, (int)chunk, s);
+    return R4D_RAW(r4d_gdn_kkt_solve_k128_c64_bf16(k->data, bt->data, g->data, A->data,
+                                                   cu->data, N, (int)T, (int)H, (int)Hg, (int)K,
+                                                   (int)chunk, s));
 }
 

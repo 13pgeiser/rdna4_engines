@@ -1,41 +1,31 @@
-// SAMPLING ON THE DEVICE: the whole vLLM chain for one position in one workgroup -- temperature,
-// softmax, top_k, top_p, min_p, renormalise, draw -- plus the second draw and the accept
-// probability a greedy-draft rejection-sampling verify needs.
+// Sampling on the device: the vLLM chain for one position in one workgroup (temperature, softmax,
+// top_k, top_p, min_p, renormalise, draw), plus the second draw and accept probability that a
+// greedy-draft rejection-sampling verify needs.
 //
-// WHY THE LIBRARY NEEDS IT. The head this feeds leaves a [vocab][M] plane in VRAM with the
-// vocabulary ROW-SPLIT across ranks. A host sampler therefore needs every card's band brought back
-// and then a softmax and a nucleus cut over 248K entries per position, on the dispatch thread, in
-// the middle of the decode loop. Sampling where the logits already are costs one gather of the
-// other ranks' bands and nothing else.
+// The head leaves a [vocab][M] plane in VRAM, row-split across ranks. A host sampler would need
+// every band copied back and a softmax and nucleus cut over 248K entries per position on the
+// dispatch thread; on the device it costs one gather of the other ranks' bands.
 //
-// WHY IT RETURNS THREE THINGS. Greedy speculation accepts a drafted token when it equals the
-// target's argmax, and that rule is only correct at temperature 0. With the target sampling, the
-// correct rule is rejection sampling -- and with a GREEDY draft the proposal is a point mass, so it
-// is accepted with probability p(x) under the target's own FILTERED distribution. On rejection the
-// emitted token must come from the residual, which for a point-mass proposal is the same
-// distribution with the proposed token removed and the rest renormalised. One pass produces all
-// three, and the host then walks the positions with its own uniforms without coming back.
+// Three outputs: accepting a draft token when it equals the target's argmax is only correct at
+// temperature 0. With a sampling target the rule is rejection sampling, and a greedy draft is a
+// point mass, so it is accepted with probability p(x) under the target's filtered distribution. On
+// rejection the token comes from the residual, which for a point mass is the same distribution
+// with the proposal removed and renormalised. One pass produces all three; the host then walks the
+// positions with its own uniforms. Acceptance is lower than greedy-against-greedy, which is the
+// cost of emitting the target's true distribution.
 //
-// Stated plainly, because it is a cost and not a bug: acceptance FALLS relative to
-// greedy-against-greedy, because a proposal the target agrees with is still only accepted with
-// probability p(x). That is the price of emitting the target's true distribution.
+// The order is vLLM's; reordering changes which tokens survive. Temperature 0 is a real path, not
+// special-cased by the caller, so it uses the argmax kernel's tie-break (lowest id wins) and a
+// temperature-0 request matches a greedy run.
 //
-// THE ORDER IS vLLM'S and it is not a detail: reordering changes which tokens survive. The
-// temperature-0 path is kept as a real path rather than special-cased by the caller, so a
-// deterministic request gets the SAME tie-break (lowest id wins) an argmax would; the two must
-// agree or a temperature-0 request stops matching a greedy run.
+// One block owns one position and walks the vocabulary several times; after the first pass the
+// plane is L2-resident, which beats staging at this vocabulary size. The top_k and top_p cuts are
+// four radix passes each over 256 buckets of a monotone key, giving the k-th largest probability
+// and the nucleus threshold exactly without sorting.
 //
-// ONE BLOCK OWNS ONE POSITION and walks the vocabulary several times. Every pass reads the same
-// plane, so after the first it is L2-resident; at this vocabulary that beats any staging. The
-// top_k and top_p cuts are four radix passes each over the 256 buckets of a monotone key -- the
-// k-th largest probability and the nucleus threshold EXACTLY, without sorting the vocabulary.
-//
-// NO GEOMETRY OF ITS OWN. The kernel body takes the logits plane through explicit row and column
-// strides, so nothing in it is specific to a model. The entry point takes flat scalar arguments
-// and returns a negative code rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
-//
-// `f32` in the name is the LOGITS dtype, which is what discriminates this entry point: the head
-// writes f32 and a bf16-logits variant would be a different instantiation beside this one.
+// The kernel reads the logits through explicit row and column strides, so nothing is
+// model-specific. The entry point takes flat scalars and returns a negative code instead of
+// throwing, for the reason given in r4d_gemm_fp8a8.hip. `f32` in the name is the logits dtype.
 
 #include "r4d.h"
 #include "r4d_fp8_args.h"
@@ -50,16 +40,14 @@ typedef R4DSpecDraw SpecDraw;
 
 constexpr uint32_t kThr = 256;
 
-// A monotone map from float to uint32, so a radix pass on the bits orders the values. The same trick
-// the indexer's top-k uses; written for the general case even though probabilities are non-negative,
-// so it cannot surprise anyone who reuses it.
+// A monotone map from float to uint32, so a radix pass over the bits orders the values. Written for
+// the general case although probabilities are non-negative.
 __device__ __forceinline__ uint32_t mono(float v) {
   const uint32_t u = __float_as_uint(v);
   return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
-// Everything the block shares, declared once. Shared memory inside a nested scope is a portability
-// question nobody should have to ask while reading a sampler.
+// Everything the block shares, declared once at kernel scope.
 struct Shared {
   float    red[kThr];       // the general-purpose reduction buffer
   uint32_t red_i[kThr];     // ...and the ids that ride along with it
@@ -100,11 +88,7 @@ __device__ __forceinline__ float reduce_sum(Shared& sh, float v) {
 
 // ---- the kernel ---------------------------------------------------------------------------------
 //
-// One block owns one position and walks the vocabulary several times. Every pass reads the same
-// plane, so after the first it is L2-resident; at this vocabulary that beats any staging.
-//
-// The order is vLLM's — temperature, softmax, top_k, top_p, min_p, renormalise, sample — and it is
-// not a detail: reordering changes which tokens survive.
+// See the file header for the chain order and the multi-pass structure.
 __global__ __launch_bounds__(kThr) void sample_kernel(
     const float* __restrict__ logits, uint32_t vocab, uint32_t row_stride, uint32_t col_stride,
     const uint32_t* __restrict__ query, const float* __restrict__ u, float temperature,
@@ -123,11 +107,8 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
     return best;
   }());
 
-  // ---- temperature 0 is greedy, and stays a real path ------------------------------------------
-  //
-  // Kept here rather than special-cased by the caller so that a request asking for determinism gets
-  // it from the same code, with the SAME tie-break the argmax kernel uses (lowest id wins) — the two
-  // must agree or a temperature-0 request stops matching a greedy run.
+  // ---- temperature 0 is greedy, and stays a real path, with the argmax kernel's tie-break
+  //      (lowest id wins) so it matches a greedy run.
   if (!(temperature > 0.0f)) {
     float bv = -INFINITY;
     uint32_t bi = 0xFFFFFFFFu;
@@ -149,8 +130,7 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
       __syncthreads();
     }
     if (tid == 0) {
-      // A row of NaNs beats nothing and leaves the reduction at its seed, which is not a token;
-      // token 0 is then as good an answer as any and is at least one.
+      // An all-NaN row leaves the reduction at its seed, which is not a token; emit token 0.
       const uint32_t g = sh.red_i[0] < vocab ? sh.red_i[0] : 0u;
       out[pos].tok = g;
       out[pos].tok_excl = g;
@@ -168,8 +148,8 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
 
   // ---- top_k, as an exact threshold on the monotone key ----------------------------------------
   //
-  // Four radix passes narrowing one byte at a time, counting tokens. That is the k-th largest
-  // probability exactly, without sorting the vocabulary.
+  // Four radix passes narrowing one byte at a time, counting tokens: the k-th largest probability
+  // exactly, without sorting.
   uint32_t k_key = 0u;
   if (top_k > 0 && top_k < vocab) {
     if (tid == 0) sh.prefix = 0u;
@@ -200,10 +180,10 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
 
   // ---- top_p, the same passes accumulating MASS ------------------------------------------------
   //
-  // Descend the buckets summing probability until the nucleus target is reached; the bucket that
-  // crosses it holds the threshold and the next pass narrows inside it. Ties AT the threshold are
-  // all kept, which can overshoot top_p by the mass of the tie — the alternative is inventing an
-  // order among equal probabilities.
+  // Descend the buckets summing probability until the nucleus target is reached; the crossing
+  // bucket holds the threshold and the next pass narrows inside it. Ties at the threshold are all
+  // kept, which can overshoot top_p by the tie's mass, rather than inventing an order among equal
+  // probabilities.
   uint32_t p_key = 0u;
   if (top_p < 1.0f) {
     if (tid == 0) sh.prefix = 0u;
@@ -265,21 +245,17 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
 
   // ---- inverse CDF, in two stages ---------------------------------------------------------------
   //
-  // CONTIGUOUS slices, not the strided ones every other loop here uses, and that is the whole
-  // correctness argument. An inverse CDF walks the distribution in some order, and any fixed order
-  // samples correctly — but only ASCENDING TOKEN ID makes the answer a property of the uniform
-  // rather than of the block size. Strided slices put token 256 second; a host reference, another
-  // implementation, or this kernel at a different kThr would all disagree about which token a given
-  // draw selects. Contiguous slices make the per-thread prefix the id prefix, so they agree.
+  // Contiguous slices, unlike the strided ones elsewhere here, for correctness: any fixed order
+  // samples correctly, but only ascending token id makes the result a function of the uniform
+  // alone and not of the block size, so a host reference or another kThr picks the same token.
   //
-  // Each thread sums its own range, thread 0 finds which range the draw lands in, that thread
-  // rescans it. Exact, and no sort. Every thread reaches both calls, so the barriers are uniform.
+  // Each thread sums its own range, thread 0 finds the range the draw lands in, and that thread
+  // rescans it. Exact, no sort. Every thread reaches both calls, so the barriers are uniform.
   //
-  // ONLY A RANGE WITH MASS CAN BE CHOSEN, and only a token with mass inside it. A range holding
-  // no kept token satisfies `acc + 0 >= want` whenever the draw is 0 or float drift has left the
-  // walk a hair short, and rescanning it finds nothing, which would emit 0xFFFFFFFF as a token.
-  // So empty ranges are passed over, the fall-through is the last range that has mass, and
-  // inside it the fall-through is the last token that has mass. `total > 0` guarantees one exists.
+  // Only a range with mass, and a token with mass inside it, can be chosen. An empty range
+  // satisfies `acc + 0 >= want` when the draw is 0 or float drift leaves the walk short, and
+  // rescanning it would emit 0xFFFFFFFF. So empty ranges are skipped, the fall-through is the last
+  // range with mass, and within it the last token with mass; `total > 0` guarantees one exists.
   const uint32_t chunk = (vocab + kThr - 1) / kThr;
   const uint32_t lo = tid * chunk;
   const uint32_t hi = lo + chunk < vocab ? lo + chunk : vocab;
@@ -321,8 +297,8 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
         acc += p;
         if (acc >= want) { sh.pick = v; break; }
       }
-      // Float drift can leave the walk a hair short at the very top of the range; the last token
-      // with mass in this range is the right answer there, not token 0.
+      // Float drift can leave the walk just short at the top of the range; the last token with
+      // mass is the answer there.
       if (sh.pick == 0xFFFFFFFFu) sh.pick = last;
     }
     __syncthreads();
@@ -344,18 +320,15 @@ __global__ __launch_bounds__(kThr) void sample_kernel(
 }  // namespace
 
 // `logits` is the head's plane, addressed as `logits[pos*col_stride + v*row_stride]`, so either
-// layout the head produces is read without a transpose.
+// head layout is read without a transpose.
 //
-// `query[i]` is the token the draft proposed for position i, or 0xFFFFFFFF where there is none (the
-// last position of a verify block, which has no proposal to accept); the whole pointer may be 0.
-// `u` holds TWO uniforms a position in [0,1), for `tok` and `tok_excl`; the accept draw stays on the
-// host, which is where the seed lives.
+// `query[i]` is the draft's proposal for position i, or 0xFFFFFFFF where there is none (the last
+// position of a verify block); the pointer may be 0. `u` holds two uniforms per position in [0,1),
+// for `tok` and `tok_excl`; the accept draw stays on the host, which owns the seed.
 //
-// `n_vocab` is the FULL vocabulary. On a vocab-parallel rank the caller gathers the other bands
-// first, because a nucleus over half a distribution is not a nucleus -- and that gather is the
-// caller's, not this kernel's.
+// `n_vocab` is the full vocabulary: a vocab-parallel caller gathers the other bands first.
 //
-// Returns 0, or a negative code.
+// Returns 0, -4 for a failed launch, or another negative code for arguments it refuses.
 extern "C" int r4d_sample_chain_f32(long logits, long query, long u, long out,
                                     int M, int n_vocab, int row_stride, int col_stride,
                                     float temperature, float top_p, int top_k, float min_p,
@@ -374,8 +347,8 @@ extern "C" int r4d_sample_chain_f32(long logits, long query, long u, long out,
 
 // ============================================================== the plugin ABI entry points
 //
-// The shared operand reader is r4d_fp8_args.h. See libr4d/r4d_args.h for why there is no adapter
-// directory between the core and these launches.
+// The shared operand reader is r4d_fp8_args.h. See libr4d/r4d_args.h on why there is no adapter
+// layer.
 /* ================================================================== the device sampler */
 
 extern "C" int r4d_rad_sample_chain(const RadArgs* a, RadStream s) {
@@ -387,14 +360,13 @@ extern "C" int r4d_rad_sample_chain(const RadArgs* a, RadStream s) {
     if (lg->rank != 2) return R4D_NO(RAD_E_SHAPE);
     const long long M = lg->shape[0], V = lg->shape[1];
     if (M < 1 || V < 1) return R4D_NO(RAD_E_SHAPE);
-    /* TWO uniforms a position -- one for the draw and one for the exclusive draw. Checked because a
-     * caller that supplies M of them reads past the end of its own buffer, on a kernel whose whole
-     * purpose is that the host does not have to look at the result. */
+    /* Two uniforms per position, one for each draw; a caller supplying M would read past its own
+     * buffer. */
     if (r4d_numel(u) < 2 * M) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(dr) < M) return R4D_NO(RAD_E_SHAPE);
     if (qy && r4d_numel(qy) < M) return R4D_NO(RAD_E_SHAPE);
-    /* The strides ARE the interface here: the head writes either [M][V] or [V][M] and this kernel
-     * reads both without a transpose. So they are taken from the tensor rather than assumed. */
+    /* The head writes [M][V] or [V][M], and the kernel reads both, so the strides come from the
+     * tensor. */
     const long long rs = lg->stride[1], cs = lg->stride[0];
     if (rs < 1 || cs < 1) return R4D_NO(RAD_E_STRIDE);
 
@@ -408,5 +380,5 @@ extern "C" int r4d_rad_sample_chain(const RadArgs* a, RadStream s) {
                                        (int)M, (int)V, (int)rs, (int)cs,
                                        (float)temp, (float)topp, (int)topk, (float)minp,
                                        (long)(uintptr_t)s);
-    return e == 0 ? RAD_OK : RAD_E_SHAPE;
+    return e == 0 ? RAD_OK : R4D_NO(e == -4 ? RAD_E_DEVICE : RAD_E_SHAPE);
 }

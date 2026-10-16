@@ -1,74 +1,52 @@
-// r4d_gemm_mxfp4a8_tiled.hip - r4d_gemm_mxfp4a8_tiled: the OCP-MXFP4 x fp8 GEMM for PREFILL row
-// counts, gfx1201.  C[M,N] = A[M,K] @ dequant(Wq)[N,K]^T with the same operands, the same weight
-// layout and the same fold as r4d_gemm_mxfp4a8_nt_m64 and r4d_gemm_mxfp4a8_decode -- the band
-// above theirs.
+// r4d_gemm_mxfp4a8_tiled.hip - r4d_gemm_mxfp4a8_tiled: the OCP-MXFP4 x fp8 GEMM for prefill row
+// counts, gfx1201. C[M,N] = A[M,K] @ dequant(Wq)[N,K]^T with the operands, weight layout and fold
+// of r4d_gemm_mxfp4a8_nt_m64 and r4d_gemm_mxfp4a8_decode, for the band above theirs.
 //
-// WHY A SEPARATE KERNEL.  The decode kernels give a block at most 128 rows, so at prefill they
-// would re-read the whole weight ceil(M/128) times.  Here a block is a 256 x (32*TN) tile and each
-// weight byte is unpacked once per K slab into LDS, where all four row-waves of the block read it.
+// The decode kernels cover at most 128 rows per block, so at prefill they would re-read the weight
+// ceil(M/128) times. Here a block is a 256 x (32*TN) tile and each weight byte is unpacked once per
+// K slab into LDS, shared by the block's four row-waves.
 //
-// A COMES STRAIGHT FROM GLOBAL INTO REGISTERS, NOT THROUGH LDS.  Staging A through LDS costs a
-// write, a barrier and a second read of the operand the block uses most, and a WMMA A fragment --
-// lane l holds row l%16, k-bytes 8*(l/16)..+8 of a 16 x 16 tile -- is 16 rows apart in a row-major
-// plane, so it cannot be loaded straight from one either.  So A is re-tiled first, into the op's
-// scratch, in FRAGMENT ORDER:
+// A goes from global straight into registers. A WMMA A fragment (lane l holds row l%16, k-bytes
+// 8*(l/16)..+8) spans 16 rows of a row-major plane, and staging it through LDS would cost a write,
+// a barrier and a second read. So A is first re-tiled into the op's scratch in fragment order:
 //
 //     AT[((m/16) * (K/16) + k/16) * 256 + ((m%16) + 16 * ((k/8)%2)) * 8 + k%8] = A[m][k]
 //
-// One 16 x 16 fragment is 256 contiguous bytes and a lane's eight are one aligned 8-byte load, so
-// every A fragment a wave needs for a slab issues as one clause of global loads off a wave-uniform
-// base (SGPR, the SADDR form) and is consumed at the WMMAs.  The re-tile is one read and one write
-// of A -- tens of microseconds at a 2048-row chunk against the hundreds the A-direct loop saves on
-// every large projection -- and it is the op's own, so no producer has to know about the layout.
-// Rows past M in the last fragment are written as zeros; they only reach accumulators the
-// epilogue drops.
+// A fragment is 256 contiguous bytes and a lane's eight are one aligned 8-byte load, so a slab's A
+// fragments issue as one clause of global loads off a wave-uniform SGPR base (SADDR form). The
+// re-tile costs one read and write of A, far less than it saves on large projections, and is
+// internal to the op. Rows past M in the last fragment are written as zeros.
 //
-// THE WEIGHT AND THE FOLD ARE THE SKINNY KERNEL'S.  It reads the fragment-order weight that
-// r4d_rad_layout_mxfp4 stores and folds each block's exponent into the e4m3 value through the
-// table in r4d_mxfp4.h, so all three MXFP4 kernels produce the same e4m3 byte for every element.
-// The table is copied to LDS once per block: read from global it would be a dependent load issued
-// behind the A fragments, and the in-order load counter would make the fold wait for all of them.
-// 2^(Wref[n]-127) is applied once in the epilogue next to the activation's scale; see
-// r4d_gemm_mxfp4a8_nt_m64.hip for the fold and its error analysis.
+// Weight and fold as in the skinny kernel: the fragment-order weight from r4d_rad_layout_mxfp4,
+// folded through r4d_mxfp4.h's table, so all three MXFP4 kernels produce identical e4m3 bytes. The
+// table is copied to LDS per block; from global it would be a dependent load behind the A
+// fragments, and the in-order load counter would make the fold wait for all of them.
+// 2^(Wref[n]-127) is applied in the epilogue (see r4d_gemm_mxfp4a8_nt_m64.hip).
 //
-// THE TILE.  8 waves as 4 (M) x 2 (N); a wave owns TM=4 x TN accumulator fragments, so the block
-// covers BMF = 4*4*16 = 256 rows and BNF = 2*TN*16 columns.  The tall tile is for reuse: every
-// weight byte staged is multiplied against 256 rows.  TN is the axis that depends on M.  Widening
-// N halves the column-block count while BMF still masks most of a short M, so TN=4 wins only on
-// long prompts; on a 17408x5120 weight the two cross near M=2048.  Hence tn=0, the default, picks
-// TN=4 from M >= 2048 and TN=2 below.  The K slab is 128 at TN=2 and 64 at TN=4 (and 64 at TN=2
-// when K is not a multiple of 128): TN=4 holds twice the accumulators, and a 128 slab's A
-// fragments on top of them would cost occupancy.
+// Tile: 8 waves as 4 (M) x 2 (N), each owning TM=4 x TN fragments, so a block covers BMF = 256
+// rows and BNF = 2*TN*16 columns. TN=4 halves the column-block count and only wins on long prompts
+// (crossover near M=2048 on a 17408x5120 weight), so tn=0 picks TN=4 from M >= 2048. The K slab is
+// 128 at TN=2 (64 if K % 128 != 0) and 64 at TN=4, which holds twice the accumulators.
 //
-// BARRIERS FENCE LDS ONLY.  __syncthreads() is a workgroup acquire/release over every address
-// space, which drains the global load counter at each barrier.  Nothing in global memory is
-// shared between the block's waves, so the barrier is scoped to LDS and the next slab's A loads
-// stay in flight across it.
+// Barriers fence LDS only: __syncthreads() also drains the global load counter, and nothing in
+// global memory is shared between the waves, so the next slab's A loads stay in flight.
 //
-// STAGING IS CLAMPED, NEVER PREDICATED.  A bounds-predicated load lands in its own exec-mask
-// region and the compiler then cannot carry a counted s_wait_loadcnt across the merge.  Clamped
-// (a tile past M reads the last real tile, a weight row past N the last aligned group), a slab's
-// loads issue back to back; the epilogue drops what they computed.
+// Staging is clamped, never predicated: a predicated load gets its own exec-mask region and the
+// compiler cannot carry a counted s_wait_loadcnt across the merge. Clamped loads (tile past M ->
+// last real tile, row past N -> last aligned group) issue back to back; the epilogue drops them.
 //
-// THE ACCUMULATOR IS C TRANSPOSED.  The WMMA takes the weight fragment as its A operand and the
-// activation fragment as its B operand -- the two have the same register layout, so this is only
-// an argument order -- and computes C^T: a lane's accumulator for (M fragment i, N fragment j)
-// holds ONE row and eight consecutive columns.  So a row's activation scale is one value a lane
-// for each of its TM rows, and the epilogue writes each (i, j) as one 16-byte store.
+// The accumulator is C transposed: the WMMA takes the weight fragment as A and the activation as B
+// (same register layout), so a lane's accumulator for (i, j) holds one row and eight consecutive
+// columns. A lane needs one activation scale per row, and each (i, j) is one 16-byte store.
 //
-// TWO ACTIVATION SCALE GRIDS.  `a_scale` is either one f32 per row (ABLK=false) or one per (row,
-// 128 of K) (ABLK=true: the block-scaled fp8 family's grid, which every fused producer in
-// arch/common writes).  Per-block scales vary along K and so cannot wait for the epilogue.  The
-// accumulator is carried IN UNITS OF THE CURRENT BLOCK'S SCALE: at each 128 boundary every row's
-// partial sum is multiplied by s_prev / s_next, and the epilogue applies the last block's scale --
-// one multiply per accumulator element per 128 of K, ~K/128 fp32 ulps of extra rounding.  The
-// ratio is computed once a row: thread t owns row t of the block, loads the next boundary's two
-// scales a boundary early (no slab waits on a scale load) and writes the ratio to LDS, and a lane
-// reads one ratio for each of its TM rows.
+// Two activation scale grids: one f32 per row (ABLK=false) or one per (row, 128 of K) (ABLK=true,
+// as every fused producer in arch/common writes). With ABLK the accumulator is carried in units of
+// the current block's scale: at each 128 boundary every row is multiplied by s_prev / s_next
+// (~K/128 fp32 ulps of extra rounding), and the epilogue applies the last scale. Thread t owns row
+// t of the block, loads the next boundary's two scales a boundary early and writes the ratio to
+// LDS; a lane reads one ratio per row.
 //
-// TRAP FOR ANYONE MEASURING THIS KERNEL: the same as the skinny kernel's.  A weight of tens of
-// megabytes streamed in a loop is Infinity-Cache resident on this part, so a bandwidth figure
-// taken that way reads above the DRAM roofline.
+// Benchmarking note: as for the skinny kernel, a looped weight stays Infinity-Cache resident.
 #include "r4d.h"
 #include "r4d_gemm_args.h"
 #include "r4d_common.h"
@@ -91,14 +69,7 @@ typedef int      mxt_v2i  __attribute__((ext_vector_type(2)));
 typedef unsigned mxt_u2   __attribute__((ext_vector_type(2)));
 typedef unsigned mxt_u4   __attribute__((ext_vector_type(4)));
 
-static __device__ __forceinline__ void mxt_lds_barrier() {
-  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
-  __builtin_amdgcn_s_barrier();
-  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
-}
-
-// The re-tile: one thread per 8-byte slot of the fragment-ordered plane, so the writes are
-// contiguous and each lane reads one 8-byte group of one row.
+// The re-tile: one thread per 8-byte slot of the fragment-ordered plane; writes are contiguous.
 __global__ __launch_bounds__(256) void r4d_mxfp4a8_tile_a_kernel(
     const unsigned char* __restrict__ A, unsigned char* __restrict__ AT, int M, int K,
     long long slots, int lda) {
@@ -139,8 +110,8 @@ __global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
 
   if (tid < 32) sMag[tid] = (&kMxfp4Mag[0][0])[tid];
 
-  // One A base per M fragment: wave-uniform, so readfirstlane keeps it in an SGPR and every load
-  // takes the SADDR form with a 32-bit lane offset.  A tile past M reads the last real one.
+  // One A base per M fragment, wave-uniform: readfirstlane keeps it in an SGPR so loads take the
+  // SADDR form with a 32-bit lane offset. A tile past M reads the last real one.
   const unsigned char* abase[TM];
 #pragma unroll
   for (int i = 0; i < TM; ++i) {
@@ -176,19 +147,18 @@ __global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
 #pragma unroll
     for (int j = 0; j < TN; ++j) acc[i][j] = (v8f)(0.f);
 
-  // ABLK, once a row: thread t owns row m0 + t (BMF == NTHR) and loads the next 128 boundary's two
-  // scales -- the block that starts there and the one before it -- a boundary early.
+  // ABLK: thread t owns row m0 + t (BMF == NTHR) and loads the next 128 boundary's two scales (the
+  // block starting there and the one before it) a boundary early.
   const int trow = m0 + tid < M ? m0 + tid : M - 1;
   const float* __restrict__ asrow = As + (size_t)trow * as_rs;
   float ns = 0.f, np = 0.f;
   const unsigned int* __restrict__ Wp = (const unsigned int*)W;
-  mxt_lds_barrier();   // sMag
+  lds_barrier();   // sMag
 
   for (int k0 = 0; k0 < K; k0 += LBK) {
-    // ABLK: a new 128-wide activation block starts with this slab; each row's ratio goes to LDS,
-    // published by the staging barrier below (sR's previous readers were behind the last slab's
-    // closing barrier).  A zero block keeps the carried scale; a zero block before this one sends
-    // the carried scale back to the grid, which only an all-zero activation block ever does.
+    // ABLK: at a 128 boundary each row's ratio goes to LDS, published by the staging barrier below
+    // (sR's previous readers finished before the last slab's closing barrier). A zero block keeps
+    // the carried scale; after a zero block the carried scale is looked up from the grid.
     const bool bnd = ABLK && k0 && (k0 & 127) == 0;
     if constexpr (ABLK) {
       if (bnd)
@@ -231,7 +201,7 @@ __global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
         *(mxt_u2*)(&sW[(wrow[it] + q) * STR + wkloc[it]]) = mxt_u2{lo, hi};
       }
     }
-    mxt_lds_barrier();
+    lds_barrier();
 
     if constexpr (ABLK) {
       // Re-express each row's partial sum in the new block's scale: one ratio a lane a row.
@@ -261,8 +231,8 @@ __global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
         const unsigned char* p = &sW[(wn * TN * 16 + j * 16 + col) * STR + kk];
         wf[j][0] = *(const int*)p; wf[j][1] = *(const int*)(p + 4);
       }
-      // One step's W fragments live at a time: without the fence the compiler hoists every
-      // step's loads above the first WMMA and holds them all.
+      // Keep one step's W fragments live at a time; otherwise the compiler hoists every step's
+      // loads above the first WMMA.
       __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
       for (int i = 0; i < TM; ++i)
@@ -271,17 +241,17 @@ __global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
           acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(wf[j], af[i][step],
                                                                           acc[i][j]);
     }
-    mxt_lds_barrier();
+    lds_barrier();
   }
 
-  // Epilogue.  A lane holds row m0 + 64*wm + 16i + col of M fragment i and eight consecutive columns of N fragment
-  // j, so each (i, j) is one 16-byte store.  2^(Wref[n]-127) is exactly the float whose exponent
-  // field is Wref[n]; N % 16 == 0 keeps a lane's eight columns all inside N or all outside it.
+  // Epilogue. A lane holds row m0 + 64*wm + 16i + col of M fragment i and eight consecutive columns
+  // of N fragment j, one 16-byte store per (i, j). 2^(Wref[n]-127) is the float whose exponent
+  // field is Wref[n]; N % 16 == 0 keeps a lane's eight columns all inside or all outside N.
   float sc[TM];
   if constexpr (ABLK) {
     // the scale each row ends in, once a row; the K loop's closing barrier retired the ratio reads
     sR[tid] = r4d_mxfp4_carried(asrow, (K - 1) >> 7);
-    mxt_lds_barrier();
+    lds_barrier();
 #pragma unroll
     for (int i = 0; i < TM; ++i) sc[i] = sR[wm * TM * 16 + i * 16 + col];
   } else {
@@ -341,8 +311,8 @@ extern "C" void r4d_gemm_mxfp4a8_tiled(long at, long ascale, long wq, long ws, l
   if (N < 16 || N % 16) throw std::runtime_error("r4d gemm_mxfp4a8_tiled: N must be a multiple of 16");
   if (K < R4D_MXT_KUNIT || K % R4D_MXT_KUNIT)
     throw std::runtime_error("r4d gemm_mxfp4a8_tiled: K must be a multiple of 64");
-  // tn=0: TN=4 from the M crossover on, unless its 128-wide tile leaves the grid short of 128
-  // blocks (a narrow N): there the TN=2 grid's extra blocks win.
+  // tn=0: TN=4 from the M crossover on, unless its 128-wide tile leaves fewer than 128 blocks
+  // (narrow N), where TN=2's extra blocks win.
   if (TN == 0)
     TN = M >= R4D_MXT_TN4_MIN_M && (long)((N + 127) / 128) * ((M + R4D_MXT_BMF - 1) / R4D_MXT_BMF) >= 128
              ? 4 : 2;
@@ -372,17 +342,15 @@ extern "C" void r4d_gemm_mxfp4a8_tiled(long at, long ascale, long wq, long ws, l
 }
 
 // ============================================================== the plugin ABI entry point
-// The row-major activation is re-tiled into the op's scratch, then the GEMM reads it from there.
-// A partitioned weight re-tiles each part's copy of the activation into the scratch in turn and
-// runs the GEMM over that part's rows (mx_parts).
+// The row-major activation is re-tiled into the op's scratch and the GEMM reads it there. For a
+// partitioned weight (mx_parts), each part's activation copy is re-tiled and multiplied in turn.
 extern "C" int r4d_rad_gemm_mxfp4a8_tiled(const RadArgs* a, RadStream s) {
     GemmOps g;
     int rc = gemm_ops(a, &g, 1, /*parts=*/1);
     if (rc != RAD_OK) return rc;
     if (g.N < 16 || g.N % 16) return R4D_NO(RAD_E_SHAPE);
     if (!g.ascale) return R4D_NO(RAD_E_INVAL);
-    /* The per-row reference exponent, as in r4d_rad_gemm_mxfp4a8_m64: without it the fold has no
-     * reference and every element would be scaled against zero. */
+    /* The per-row reference exponent is required, as in r4d_rad_gemm_mxfp4a8_m64. */
     if (!g.bref) return R4D_NO(RAD_E_INVAL);
     MxParts mp;
     rc = mx_parts(a, &g, &mp);
@@ -410,9 +378,9 @@ extern "C" int r4d_rad_gemm_mxfp4a8_tiled(const RadArgs* a, RadStream s) {
     return RAD_OK;
 }
 
-/* The core sizes the op's scratch from this, at the band's widest M: the fragment-tiled copy of
- * the activation, whole 16-row fragments. One copy for every part: the parts run one after another
- * on the op's stream, so a part's re-tile cannot overtake the previous part's GEMM. */
+/* The op's scratch, sized at the band's widest M: the fragment-tiled activation in whole 16-row
+ * fragments. One copy serves every part: parts run in order on the op's stream, so a re-tile
+ * cannot overtake the previous part's GEMM. */
 extern "C" int64_t r4d_rad_gemm_mxfp4a8_tiled_scratch(const RadArgs* a) {
     const long long M = r4d_geti_or(a, "M", 0), K = r4d_geti_or(a, "K", 0);
     return (int64_t)r4d_mxfp4a8_tile_a_bytes((int)M, (int)K);

@@ -1,30 +1,24 @@
 // r4d_dequant_w4_bf16.hip - r4d_dequant_w4_bf16: the packed 4-bit weight back to a plain row-major
 // bf16 [N, K].
 //
-// WHY THIS EXISTS.  W4A8 buys nothing at prefill: the iu8 and fp8 matrix rates are within a couple
-// of percent of each other and the shape is compute-bound.  But once the weights are STORED at 4
-// bits there is no fp8 copy to fall back on, so the requirement at prefill is "do not regress", not
-// "win" -- and the skinny W4A8 GEMM cannot meet even that, because a block owns 64 rows and
-// therefore re-reads the whole weight slice once per 64 output rows.  Its rate is flat in M for
-// that reason; it is structural and no choice of geometry fixes it.  Dequantising one layer into a
-// scratch buffer and handing it to the tuned bf16 GEMM costs one extra write and read of the bf16
-// weight, a few percent of the GEMM it feeds.
+// Used at prefill. W4A8 gains nothing there (iu8 and fp8 matrix rates are within a few percent and
+// the shape is compute-bound), and the skinny W4A8 GEMM re-reads the whole weight slice once per
+// 64 output rows, so its rate is flat in M. Dequantising one layer into scratch and running the
+// tuned bf16 GEMM costs one extra write and read of the bf16 weight, a few percent of the GEMM.
 //
-// TWO ENCODINGS SHARE THESE BYTES AND THEY DIFFER BY BIT 3, so the caller has to say which.  The
-// symmetric grid stores a TWO'S COMPLEMENT code -- that is what lets the int8 GEMM read the
-// high-nibble byte signed and get 16*q directly -- and its value is (n^8)-8, i.e. n=8 means -8.
-// The asymmetric grid stores an UNSIGNED nibble and subtracts a per-group zero, which is what lets
-// the same GEMM read it unsigned and correct with an activation row-sum.  Feeding one to the other
-// is silently wrong rather than obviously wrong: it agrees for n<8 and is off by 16 above.
+// Two encodings share these bytes and differ by bit 3, so the caller must say which. The
+// symmetric grid stores a two's complement code, value (n^8)-8, so the int8 GEMM can read the
+// high-nibble byte signed and get 16*q. The asymmetric grid stores an unsigned nibble minus a
+// per-group zero, corrected in the GEMM by an activation row-sum. Mixing them up agrees for n<8
+// and is off by 16 above.
 //
-// It is very nearly lossless: the stored value is a 4-bit code times an f16 scale, and bf16's
-// 8-bit mantissa holds that to within a ULP.
+// Nearly lossless: a 4-bit code times an f16 scale fits bf16's 8-bit mantissa to within a ULP.
 //
-// UNDOING THE FRAGMENT ORDER.  radiance_w4.pack lays a dword out as [t][kb][lh][r][s] with eight
-// nibbles along i, where t = n/16, r = n%16, kb = k/64, s = (k%64)/16, and the k inside the step is
-// 4*lh + _KOFF[i] with _KOFF = {0,8,1,9,2,10,3,11}.  One thread per dword scatters its eight
-// nibbles; the scale dword lives at [t][g][r] and carries the f16 scale low and -(1024+zero) high,
-// so the same routine serves the symmetric grid (zero == 8) and the asymmetric one.
+// Fragment order: radiance_w4.pack lays a dword out as [t][kb][lh][r][s] with eight nibbles along
+// i, where t = n/16, r = n%16, kb = k/64, s = (k%64)/16, and the k inside the step is
+// 4*lh + _KOFF[i] with _KOFF = {0,8,1,9,2,10,3,11}. One thread per dword scatters its eight
+// nibbles. The scale dword at [t][g][r] holds the f16 scale low and -(1024+zero) high, so one
+// routine serves the symmetric grid (zero == 8) and the asymmetric one.
 #include "r4d.h"
 #include "r4d_gemm_args.h"
 #include <hip/hip_bf16.h>
@@ -63,8 +57,8 @@ __global__ __launch_bounds__(R4D_DQ_THREADS) void r4d_dequant_w4_bf16_kernel(
     for (int i = 0; i < 8; i++) {
       const int n = (int)((w >> (4 * i)) & 0xF);
       const float q = twos ? (float)((n ^ 8) - 8) : (float)n;
-      // 4*lh is part of the k, not just of the scale lookup: position (lh, i) holds
-      // kk = 4*lh + _KOFF[i], so lh=0 covers {0,8,1,9,2,10,3,11} and lh=1 the other eight.
+      // Position (lh, i) holds kk = 4*lh + _KOFF[i]: lh=0 covers {0,8,1,9,2,10,3,11}, lh=1
+      // the other eight.
       const int k = kbase + r4d_dq_koff[i];
       Out[(size_t)row_n * K + k] = __float2bfloat16((q - (twos ? 0.f : zero)) * sc);
     }
@@ -86,8 +80,7 @@ void r4d_dequant_w4_bf16(long wq, long ws, long out, int N, int K, int group, in
 
 // ============================================================== the plugin ABI entry points
 //
-// The operand reader and the split law are in r4d_gemm_args.h. See libr4d/r4d_args.h for why an
-// entry point takes the ABI's own argument list directly rather than going through an adapter.
+// The operand reader and the split law are in r4d_gemm_args.h; see libr4d/r4d_args.h.
 /* ------------------------------------------------------------------ dequant */
 
 enum { D_WQ = 0, D_WS, D_Y };

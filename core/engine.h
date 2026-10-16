@@ -1,23 +1,21 @@
-/* engine.h -- the startup sequence and the step loop. This is the file that says, in order, what
- * happens between a command line and a served token, and it is deliberately the thinnest thing in
- * the project: every step below is one component doing its own job.
+/* engine.h -- the startup sequence and the step loop: what happens, in order, between a command
+ * line and a served token. Kept thin; each step is one component doing its own job.
  *
  * Startup, per spec §1:
  *
  *   1. Load kernel plugins from $RADIANCE_HOME/kernels/, in the configured hierarchy order.
- *   2. Load the model's metadata ONLY -- architecture id, dimensions, quantisation, vocab.
+ *   2. Load the model's metadata only: architecture id, dimensions, quantisation, vocab.
  *   3. Look up the architecture id in $RADIANCE_HOME/architectures/. No match, no model.
- *   4. DECLARE. The architecture plugin enumerates every weight, buffer and op it will ever
- *      issue. The core resolves each op against the kernel hierarchy. This phase ALWAYS
- *      completes; if anything failed to resolve, the full list is reported at the end rather
- *      than the first failure at the top.
- *   5. PLAN. The placement planner assigns every weight a tier and an execution site, against
+ *   4. Declare. The architecture plugin enumerates every weight, buffer and op it will ever
+ *      issue, and the core resolves each op against the kernel hierarchy. This phase always
+ *      completes and reports every resolution failure, not just the first.
+ *   5. Plan. The placement planner assigns every weight a tier and an execution site against
  *      explicit pool budgets.
- *   6. LOAD. Weights are mapped and staged according to the plan.
+ *   6. Load. Weights are mapped and staged according to the plan.
  *   7. Serve.
  *
- * Between 4 and 5 the whole model is known statically: every op, every kernel that will service
- * it, every weight it touches, and the order. That is the property the rest of the engine spends.
+ * After step 4 the whole model is known statically: every op, its kernel, the weights it touches,
+ * and the order. The rest of the engine relies on that.
  */
 #pragma once
 #include "rad_core.h"
@@ -42,86 +40,86 @@
 namespace rad {
 
 class Kld;
+class StallWatch;
 namespace gen { class Driver; }
 struct TierPump;
 struct TierJob;
 struct StepSlot;
 
 struct VramFacts;   /* mem/vram_budget.h */
+struct WeightFootprint;   /* place/planner.h */
 
 class Engine {
 public:
     explicit Engine(Config cfg);
     ~Engine();
 
-    /* Steps 1..6. Returns negative and has already printed WHAT failed and WHY. A missing kernel
-     * is reported as the whole list, not the first one. */
+    /* Steps 1..6. Returns negative after printing what failed and why; missing kernels are
+     * reported as a full list. */
     int start();
 
-    /* Step 7. Blocks. Returns when the server is asked to stop or a device fault ends the
-     * process -- a device fault is not recoverable in-process and we exit non-zero rather than
-     * serving from a wedged queue (spec §17). */
-    int serve();
+    /* Step 7. Blocks until the server is asked to stop. A device fault is not recoverable
+     * in-process, so it exits non-zero rather than serving from a wedged queue (spec §17).
+     * `watch`, when given, is the startup's stall watch (util/stallwatch.h): held until the
+     * server listens, or the KL mode starts scoring, so the stretch from start() to there
+     * reports where it waits like start() itself. */
+    int serve(std::unique_ptr<StallWatch> watch);
 
-    /* --debug-graph and friends: everything declare and plan learned, printed, without serving.
-     * This is the answer to "it is unclear what even runs", so it is a first-class mode and not
-     * a side effect of a verbose flag. */
+    /* --debug-graph and friends: print everything declare and plan learned, without serving. A
+     * first-class mode rather than a verbose-flag side effect, so what runs is always visible. */
     int dump();
 
     const Program& program() const;
     const Config&  config()  const { return cfg_; }
 
-    /* THE STARTUP REPORT (core/diag/diag.h): every option with the value in force and its source,
-     * the machine, and what on it costs speed or correctness. serve() prints it before it starts
-     * listening with `status` RAD_OK; main prints it with the error start() or serve() stopped
-     * with, so a log of a server that never came up still says what it was running on and what
-     * it had decided -- and ends with that error again on an E line, because the report's lines
-     * now follow the one that said it and a reader of the log's tail would see only them. */
+    /* The startup report (core/diag/diag.h): every option with its value and source, the
+     * machine, and what on it costs speed or correctness. serve() prints it with RAD_OK before
+     * listening; main prints it with the error start() or serve() failed with, so a server that
+     * never came up still logs its setup. The report then repeats the error on an E line, so the
+     * log's tail shows it. */
     void print_startup_report(int status);
-    /* The same, as JSON, with the hardware read again -- a card's link and clock are only
-     * meaningful under load, and /diagnostics is how they are read while a request runs. The
-     * reading is reused for a second, and covers the power-management files of the serving
-     * cards only (hardware_facts). */
+    /* The report as JSON, with the hardware re-read, since link and clock state only mean
+     * something under load (/diagnostics). The reading is reused for a second and covers only the
+     * serving cards' power-management files (hardware_facts). */
     std::string diagnostics_json() const;
     bool startup_report_printed() const { return report_printed_; }
 
 private:
-    /* One thread per tensor-parallel rank, each owning one device. No IPC, no shared-memory
-     * handshake, no serialisation between ranks -- which is most of what a Python engine spends
-     * its multiprocessing budget on. Because the ranks share an address space, the step batch is
-     * shared BY POINTER rather than broadcast (spec §1). */
+    /* One thread per tensor-parallel rank, each owning one device. Ranks share the address
+     * space, so there is no IPC or serialisation and the step batch is shared by pointer rather
+     * than broadcast (spec §1). */
     struct Rank;
     std::vector<std::unique_ptr<Rank>> ranks_;
-    /* THE TIERS' WORK IN FLIGHT: the copy to host memory the transfer streams are running. */
+    /* The tiers' work in flight: the host-memory copies the transfer streams are running. */
     std::unique_ptr<TierPump> pump_;
+    /* serve()'s startup stall watch, released when the server listens (run_server) or the KL
+     * mode starts (run_kld). */
+    std::unique_ptr<StallWatch> startup_watch_;
     std::vector<std::thread>           rank_threads_;
 
     Config cfg_;
-    /* THE SPLIT EACH RANK ACTUALLY TAKES. Equal to cfg_ on every rank whose cache costs as much per
-     * token as the dearest rank's -- every rank of a world whose ranks all cost the same; a rank
-     * whose cache costs less (an attention-zero rank) gets a KV pool sized for the common token
-     * count and the difference in its weights pool. Engine::plan fills it, and every reader of the
-     * resolved pool sizes -- Pools::configure and the planner -- takes its rank's entry, never
-     * cfg_: a grown pool the planner never reads is an empty pool, and plan() refuses a rank whose
-     * plan and weights pool disagree. */
+    /* The VRAM split each rank actually takes, filled by Engine::plan. Equal to cfg_ on every
+     * rank whose cache costs as much per token as the dearest rank's. A cheaper rank (an
+     * attention-zero rank) gets a KV pool sized for the common token count and the difference in
+     * its weights pool. Pools::configure and the planner must read the rank's entry, never cfg_;
+     * plan() refuses a rank whose plan and weights pool disagree. */
     std::vector<Config> rank_cfg_;
     int64_t kv_planned_tokens_ = 0;   /* the common token count plan() sized the re-split pools for */
 
-    /* The model's source, one of the two. A container stays mapped for the life of the engine:
-     * the mapped and file tiers read it where it lies (spec §4.2). A checkpoint served directly
-     * stays mapped too, and is read once, at load (spec §4.3). */
+    /* The model's source, one of the two. A container stays mapped for the engine's life because
+     * the mapped and file tiers read it in place (spec §4.3). A checkpoint served directly also
+     * stays mapped and is read once, at load (spec §4.3). */
     std::unique_ptr<RadFile> file_;
     std::unique_ptr<Checkpoint> ckpt_;
     std::unique_ptr<CheckpointSources> ckpt_src_;
-    /* What rad_weight_encoding is answered from: the container's entries or the checkpoint's
-     * tensors. */
+    /* The source rad_weight_encoding answers from: container entries or checkpoint tensors. */
     WeightSourceFn sources() const;
 
     RadModelMeta   meta_{};
     LoadedPlugins  plugins_;
 
-    /* RadModelMeta holds bare char*, so the strings behind its free-form key/value table have to
-     * outlive every declare. */
+    /* RadModelMeta holds bare char*, so the strings behind its key/value table must outlive
+     * every declare. */
     std::vector<std::string> meta_kv_k_, meta_kv_v_;
     std::vector<const char*> meta_kv_kp_, meta_kv_vp_;
 
@@ -135,35 +133,38 @@ private:
     int apply_rope_scaling();
     int declare();
     int plan();
-    /* --embedding-placement, --vision-tower-placement and --ngram-placement, resolved into Config
-     * before the card is split (engine_bringup.cpp says how auto chooses). */
+    /* Resolves --embedding-placement, --vision-tower-placement and --ngram-placement into Config
+     * before the card is split (engine_bringup.cpp describes how auto chooses). `wfs` is every
+     * rank's footprint, read for its towers. `host_late` is the pinned host memory startup
+     * allocates after the tables and outside every pool (the checkpoint store, the host
+     * activation arenas), which a table pinned in host memory must leave room for. */
     int resolve_table_placement(const std::vector<VramFacts>& facts,
                                 const std::vector<int64_t>& emb_bytes,
-                                const std::vector<int64_t>& tower_bytes, int64_t kv_floor,
-                                int64_t ngram_bytes, bool ngram_device, bool ngram_host);
-    /* --ngram-placement ram: the copy of the container's [src, src + n), file offset `foff`, made
-     * once and shared by every rank -- locked for the host gather, or pinned for a device kernel
-     * to read over the link (`card`). */
+                                const std::vector<WeightFootprint>& wfs, int64_t kv_floor,
+                                int64_t ngram_bytes, bool ngram_device, bool ngram_host,
+                                int64_t host_late);
+    /* --ngram-placement ram: one copy of the container's [src, src + n) at file offset `foff`,
+     * shared by every rank. Locked for the host gather, or pinned for a device kernel to read
+     * over the link (`card`). */
     int copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
                    std::string* why);
-    /* An auto-chosen pinned copy that could not be made: every rank's n-gram gather to the host. */
+    /* An auto-chosen pinned copy failed: move every rank's n-gram gather to the host. */
     bool ngram_gather_to_host();
-    /* The copies made: the locked ones, each [base, base + bytes); the pinned ones, rad_dev_alloc
-     * RAD_MEM_HOST_MAPPED ranges; and the container address each one copies. Freed in ~Engine
-     * after the ranks that read them are gone. */
+    /* The table copies: locked ones as [base, base + bytes), pinned ones as rad_dev_alloc
+     * RAD_MEM_HOST_MAPPED ranges, and the container address each copies. Freed in ~Engine after
+     * the ranks that read them are gone. */
     std::vector<TableCopy> table_copies_;
     std::vector<void*> card_copies_;
     std::vector<std::pair<const void*, void*>> table_copy_of_;
     int load_weights();
     int configure_kv();
-    /* One sampled row's worth of bookkeeping, so the step loop can map a logits row back to the
-     * sequence that wanted it. It is NOT the identity: a prefill chunk in the middle of a long
-     * prompt produces no row at all, and a speculative verify produces 1 + n_spec of them. */
+    /* Maps the step's logits rows back to the sequences that wanted them. Not the identity: a
+     * mid-prompt prefill chunk produces no row, and a speculative verify produces 1 + n_spec. */
     struct StepOut {
         std::vector<Request*> reqs;       /* the requests that wanted a row, in row order */
         std::vector<int32_t>  first_row;  /* [n_seq] that entry's first row, or -1 */
-        /* HOW MANY OF THE STEP'S LOGITS ROWS THE SAMPLER READS: the first ones. RadBatch::n_out
-         * counts the KL mode's scored rows after them too (Request::score). */
+        /* Leading logits rows the sampler reads. RadBatch::n_out also counts the KL mode's scored
+         * rows after them (Request::score). */
         int32_t               n_rows = 0;
         std::vector<int32_t>  rows;       /* [n_out] the device's answer, copied back */
         int32_t*              rb = nullptr;   /* the pinned readback collect_issue filled */
@@ -176,15 +177,14 @@ private:
         std::vector<TokenLogprobs> lp;
     };
 
-    /* The text frontend, loaded out of the container. `vocab_view_` is what the sampler's
-     * grammars walk; it holds a reference to `vocab_` and must not outlive it. */
+    /* The text frontend, loaded from the container. The sampler's grammars walk `vocab_view_`,
+     * which references `vocab_` and must not outlive it. */
     std::shared_ptr<const Vocab> vocab_;
     std::unique_ptr<VocabView>   vocab_view_;
 
-    /* The chunk geometry, resolved ONCE here and handed to both consumers. The prefix cache needs
-     * the checkpoint interval at configure time and the scheduler needs the whole geometry at
-     * init; resolving it independently in each is how the cache ends up testing the operator's raw
-     * interval against positions the scheduler chose with the rounded one. */
+    /* The chunk geometry, resolved once and shared: the prefix cache needs the checkpoint interval
+     * at configure time and the scheduler the whole geometry at init. Resolving it separately
+     * would let the cache use the raw interval while the scheduler uses the rounded one. */
     ChunkGeometry                 geo_;
 
     /* One scheduler for every rank: one decision per step, one batch, shared by pointer. */
@@ -192,38 +192,23 @@ private:
     std::unique_ptr<IKVManager>   kv_iface_;
     std::unique_ptr<IPrefixCache> pc_iface_;
 
-    /* The release point. Width is tp + 1 -- the scheduler thread is on both sides of it. */
+    /* The release point. Width is tp + 1: the scheduler thread also takes part. */
     std::unique_ptr<RankBarrier>  barrier_;
     std::atomic<const RadBatch*>  step_batch_{nullptr};
-    /* WHAT A RELEASE ASKS THE RANKS TO ISSUE: the forward pass and its sampler (kIssueAll), the
-     * forward pass alone (kIssueModel) -- the next step's, issued before this one is read back --
-     * or that pass's sampler alone (kIssueSampler), once the host has committed what the sampler
-     * stages from. Every release sets it: one left over from the release before tells a draft
-     * pass to issue nothing but its sampler. */
+    /* What a release asks the ranks to issue: the forward pass and its sampler (kIssueAll), the
+     * forward pass alone (kIssueModel: the next step's, issued before this one is read back), or
+     * that pass's sampler alone (kIssueSampler, once the host has committed its inputs). Every
+     * release must set it; a stale value would make a draft pass issue only its sampler. */
     enum { kIssueAll = 0, kIssueModel = 1, kIssueSampler = 2 };
     std::atomic<int>              issue_what_{kIssueAll};
     std::atomic<int>              step_status_{RAD_OK};
     std::atomic<bool>             stopping_{false};
-    /* WHY THE STEP LOOP ENDED, when it ended on an error; RAD_OK while it runs or after a clean
-     * stop. Written once, by fail_loop(); read by the server watcher to take the HTTP side down
-     * and by serve() to return it. */
+    /* The error the step loop ended on; RAD_OK while running or after a clean stop. Written once
+     * by fail_loop(); read by the server watcher to stop HTTP and by serve() to return it. */
     std::atomic<int>              loop_status_{RAD_OK};
     int  fail_loop(int st);
 
-    /* THE SAMPLER'S HOST WORK RUNS UNDER THE MODEL, NOT IN FRONT OF IT.
-     *
-     * Staging a step's sampler parameters -- and with a grammar, walking a whole-vocabulary mask
-     * for every position in the speculative window -- is pure host work: every upload in the chain
-     * is issued by Sampler::run on the rank thread, so build_step touches no stream and nothing
-     * the ranks read until they are told to sample. Run BEFORE the release it sits in front of a
-     * device with nothing to do, and every microsecond of it is added to the step.
-     *
-     * So the ranks are released to enqueue the model first, and the scheduler stages the sampler
-     * while they do. The ranks then wait here for it before enqueueing the sampler chain -- which
-     * the device cannot reach until the whole forward pass has run, and that pass is the time the
-     * walk hides inside. This is a one-shot gate per step, reset while the ranks are parked at the
-     * release, so there is no window in which a rank can read a stale ready flag. */
-    /* THIS STEP'S SCORED ROWS (Request::token_scores): a logits row and the result it fills.
+    /* This step's scored rows (Request::token_scores): a logits row and the result it fills.
      * Written by the scheduler thread while the ranks are parked, read by them during the step,
      * consumed by collect_step. */
     std::vector<std::pair<int32_t, TokenScores*>> score_rows_;
@@ -231,12 +216,18 @@ private:
     int  issue_scored_rows(Rank& r);
     int  collect_scored_rows();
 
+    /* Gate for the sampler's host work, which runs while the device executes the model.
+     * Staging sampler parameters (and, with a grammar, a whole-vocabulary mask per draft
+     * position) touches no stream: Sampler::run issues every upload on the rank thread. So the
+     * ranks enqueue the model first, the scheduler runs build_step meanwhile, and the ranks wait
+     * here before enqueueing the sampler chain. One-shot per step, reset while the ranks are
+     * parked at the release, so no rank can see a stale ready flag. */
     std::mutex                    build_mu_;
     std::condition_variable       build_cv_;
     bool                          build_ready_  = false;
     int                           build_status_ = RAD_OK;
 
-    /* Scratch for the checkpoint copies: the state slots of one sequence, reused so the step path
+    /* Scratch for the checkpoint copies: one sequence's state slots, reused so the step path
      * does not allocate. See state_slots_of. */
     std::vector<int32_t>          ckpt_slots_;
     std::vector<int32_t>          ckpt_win_;    /* KVManager::window_rows, same reuse */
@@ -244,41 +235,37 @@ private:
 
     int  load_vocab();
     int  declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool sizing = false);
-    /* The build context every declare of rank `rank` gets, at `max_tok` -- the real one and the
-     * activation arena's sizing declares differ in nothing else. */
+    /* The build context for every declare of rank `rank` at `max_tok`; the real declare and the
+     * arena's sizing declares differ only in max_tok. */
     RadBuildCtx build_ctx(int rank, int64_t max_tok) const;
     void probe_arena_levels();
     int  step_loop();
-    /* The step's sampled ids on their way to the host, and then the wait for them and what they
-     * mean. Split so the copy can be issued before draft passes that overwrite the ids and the
-     * wait left until after them. */
-    int  collect_issue(const RadBatch* b, StepOut& so);
+    /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
+     * Split so the copy is issued before draft passes overwrite the ids, and the wait comes after
+     * them. */
+    int  collect_issue(StepOut& so);
     int  collect_step(const RadBatch* b, StepOut& so);
     int  row_logprobs(StepOut& so, int32_t row, int32_t token);
-    /* WHERE THE STEP ENDS ON THE CARD: after its last draft pass and the copies the host reads,
-     * and before the step issued ahead of it. collect_step waits for this and not for the
-     * stream, so the card runs the next step while the host commits this one. */
+    /* The step's end on the card: after its last draft pass and the host readbacks, before the
+     * step issued ahead. collect_step waits on this event, not the stream, so the card runs the
+     * next step while the host commits this one. */
     int  mark_step_end(const RadBatch* b, StepOut& so);
     RadEvent step_end_ = nullptr;
 
-    /* THE DRAFT HEAD, exactly as the plugin declared it (rad_declare_drafter), and zeroed when
-     * the deployment asked for no speculative window. `kind` selects which of the two drivers
-     * below runs; nothing else in the engine knows what model this is.
-     *
-     * `drafter_name_` owns the string, because RadDrafterDecl::name points into the Program. */
+    /* The draft head as declared (rad_declare_drafter), zeroed when no speculative window was
+     * asked for. `kind` selects which of the two drivers below runs. `drafter_name_` owns the
+     * string because RadDrafterDecl::name points into the Program. */
     RadDrafterDecl       drafter_{};
     std::string          drafter_name_;
 
-    /* THE SERIAL DRIVER (spec §10): `depth` dependent passes after the step commits, each
-     * embedding what the last one proposed. MTP, EAGLE and Medusa-serial are all this shape. */
+    /* Serial driver (spec §10): `depth` dependent passes after the step commits, each embedding
+     * the previous proposal. MTP, EAGLE and Medusa-serial have this shape. */
     std::vector<int32_t> draft_out_;   /* [rows][depth], what each pass proposed */
 
-    /* THE HOST SIDE OF EVERY READBACK ON THE STEP PATH: the sampled tokens, and each draft pass's
-     * proposals. Pinned, because a device-to-host copy into pageable memory is a synchronous
-     * bounce through a staging buffer -- the copy itself waits for the whole stream, and the wait
-     * the step then makes finds nothing left to wait for, so it cannot be the wait that sleeps.
-     * Into pinned memory the copy is one more packet on the stream and the step's wait is the
-     * whole of the wait. Grown on first use to the largest readback asked for. */
+    /* Host side of every step-path readback (sampled tokens, draft proposals). Pinned, because a
+     * device-to-host copy into pageable memory bounces synchronously through a staging buffer and
+     * blocks on the whole stream; into pinned memory it is one more stream packet and the step's
+     * own wait is the only wait. Grown on first use to the largest readback requested. */
     struct Readback {
         int32_t* p = nullptr;
         int64_t  n = 0;
@@ -286,33 +273,33 @@ private:
         ~Readback();
     };
     Readback             readback_;
-    /* AN EMBEDDING PROGRAM (rad_declare_pooled): no sampler, and a step's answer is the pooled
-     * buffer's first n_seq rows rather than sampled ids. `pooled_host_` is their pinned landing
-     * place, [max_seqs, pooled_dim_] f32; collect_pooled copies them there behind the step and
-     * hands each row to its request's sink after the step's one wait. */
+    /* Embedding program (rad_declare_pooled): no sampler; a step's answer is the pooled buffer's
+     * first n_seq rows. `pooled_host_` is their pinned landing area, [max_seqs, pooled_dim_] f32;
+     * collect_pooled copies them behind the step and hands each row to its sink after the
+     * step's one wait. */
     bool                 embedding_ = false;
     int64_t              pooled_dim_ = 0;
     float*               pooled_host_ = nullptr;
     int  collect_pooled_issue(const RadBatch* b, StepOut& so);
     int  collect_pooled(const RadBatch* b, StepOut& so);
-    /* AN IMAGE GENERATOR (rad_declare_generator): the driver that turns its requests into passes
-     * and the loop that runs them, in place of the scheduler and the step loop (engine_gen.cpp).
-     * Null for every other program. */
+    /* Image generator (rad_declare_generator): the driver that turns requests into passes and the
+     * loop that runs them, replacing the scheduler and step loop (engine_gen.cpp). Null for every
+     * other program. */
     std::unique_ptr<gen::Driver> gen_;
     int  gen_loop();
     bool serial_drafting() const;
     int  advance_all(int mode, int round, bool from_proposal, int rows = -1);
-    int  issue_serial_drafter(int step, const RadBatch* b, StepOut& so);
+    int  issue_serial_drafter(int step, StepOut& so);
     /* The next step's forward pass, issued before this one is read back; null when the scheduler
      * wants this step committed first. See Scheduler::step_next. */
     int  issue_ahead(const RadBatch** out);
     /* The arena level and the followers' pools, before any release that runs a forward pass. */
     int  prepare_release(const RadBatch* b);
-    /* Whether a step may be issued ahead at all: the drafter, if there is one, runs on the card
-     * (a block drafter and the prompt-lookup drafter both read the committed sequence). */
+    /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (a
+     * block drafter and the prompt-lookup drafter both read the committed sequence). */
     bool pipelining_ = false;
     int  finish_serial_drafter(const StepOut& so);
-    /* What issue_serial_drafter left for finish_serial_drafter: the rows that draft, the rounds
+    /* Handed from issue_serial_drafter to finish_serial_drafter: the drafting rows, the rounds
      * asked for, and the rounds that ran. */
     std::vector<Scheduler::SerialRow> serial_row_;
     int  serial_rounds_ = 0, serial_rows_ = 0, serial_done_ = 0;
@@ -322,11 +309,9 @@ private:
     void step_state_fini();
     StepSlot*            slots_host_ = nullptr;
 
-    /* STEP-TIME ATTRIBUTION, Debug only (see the barrier in step_loop): which of the scheduler's
-     * own jobs the time went to. A two-way host/ranks split says which side of the barrier a step
-     * is slow on and nothing more: it does not separate the plan from the grammar from the staging,
-     * and the whole region after the join -- the readback, the commit, the drafter -- falls in
-     * neither bucket, leaving most of the step unattributed. These nine sum to the step. */
+    /* Step-time attribution, Debug only (see the barrier in step_loop): time per scheduler phase.
+     * The nine phases sum to the whole step, including the readback, commit and drafter after the
+     * join. */
     enum Ph { PH_PLAN, PH_BEGIN, PH_BUILD, PH_PRE, PH_RANKS, PH_SAVE, PH_COLLECT, PH_COMMIT,
               PH_DRAFT, PH_N };
     double phase_us_[PH_N] = {};
@@ -334,62 +319,63 @@ private:
     std::chrono::steady_clock::time_point phase_t_{};
     void   phase_mark(int p);
 
-    /* THE BLOCK DRIVER (spec §10): a context pass that mirrors the step just run, then ONE pass
-     * that fills every drafted position at once. DFlash2 is this shape. */
-    rad_buf              raw_buf_ = 0;  /* RADIANCE_DRAFT_RAW's bisect; see run_block_drafter */
+    /* Block driver (spec §10): a context pass mirroring the step just run, then one pass that
+     * fills every drafted position at once. DFlash2 has this shape. */
     int  run_block_drafter(int step);
-    /* THE ENCODER DRIVER (spec §11): every media item the scheduler is waiting on, encoded in
-     * passes of whole segments and read back into the item, between steps and never inside one.
-     * core/engine_mm.cpp. */
+    /* Encoder driver (spec §11, core/engine_mm.cpp): encodes every media item the scheduler waits
+     * on, in passes of whole segments, and reads it back into the item. Runs between steps, never
+     * inside one. */
     int  run_encodes();
     int32_t enc_step_ = 0;
     void drain_completed();
-    /* The terminal ids drain_completed() took, reused so a steady state allocates nothing. */
+    /* Terminal ids drain_completed() took, reused so steady state allocates nothing. */
     std::vector<uint64_t> done_;
-    /* THE TIERS' SIDE OF THE LOOP, every iteration: collect a copy that has landed, hand the next
-     * one out, and make room in a full arena. Nothing in it waits on the device, and the
-     * scheduler's lock is held only around the bookkeeping. */
+    /* The tiers' per-iteration work: collect a landed copy, start the next, make room in a full
+     * arena. Never waits on the device; the scheduler's lock covers only the bookkeeping. */
     void tier_tick();
     /* --prefix-cache-ttl, once a second, with or without the tiers (PrefixCache::expire). */
     void expire_tick(uint64_t now_ns);
     uint64_t expire_last_ns_ = 0;
-    /* Every host copy that is waiting, issued and landed now. Under the scheduler's lock, from an
+    /* Issue and land every waiting host copy now. Called under the scheduler's lock by an
      * eviction that would otherwise erase what the copies cover. True when any landed. */
     bool flush_copies();
-    /* THE LOAN: what the KV cache is not using, lent to every rank's expert slab at the addresses
-     * the cache already owns (KVManager, the loan block). Here rather than inside the scheduler
-     * because it spans both sides -- rank 0's cache decides how much, and every rank's mover
-     * fills or empties its slots -- and because a mover may only be driven while its rank thread
-     * is parked, which this thread is the one to know. `idle` also runs each mover's own fill,
-     * which a busy engine gets from the step. */
+    /* The KV loan: what the cache is not using, lent to every rank's expert slab at addresses the
+     * cache already owns (KVManager, the loan block). Lives here, not in the scheduler, because
+     * rank 0's cache sets the amount while every rank's mover fills or empties slots, and a mover
+     * may only be driven while its rank thread is parked, which this thread knows. `idle` also
+     * runs each mover's own fill, which a busy engine gets from the step. */
     void loan_tick(bool idle);
     bool     lending_ = false;
     uint64_t loan_last_ns_ = 0;
-    /* THE ACTIVATION ARENA'S LOAN (Engine::arena_step). `arena_rows_[k]` is the largest step Ctx
-     * level k serves -- level 0 is the full plan -- and empty when the arena lends nothing. The
-     * floor is the largest step seen lately: the loan grows past what it allows only once no step
-     * that large has run for a while, so a turn of prefill chunks does not refill and recall the
-     * slab between every chunk. */
+    /* The activation arena's loan (Engine::arena_step). `arena_rows_[k]` is the largest step Ctx
+     * level k serves (level 0 is the full plan); empty when the arena lends nothing. The floor is
+     * the largest recent step: the loan grows past it only after no step that large has run for a
+     * while, so a run of prefill chunks does not refill and recall the slab between chunks. */
     int  arena_step(const RadBatch* b);
     void arena_tick(uint64_t now_ns);
+    int  arena_level(int64_t rows) const;
     std::vector<int64_t> arena_rows_;
+    /* The span's shared level (Engine::probe_arena_levels): the rows of the level a step of one
+     * interval runs at under --prefill-span, where the prefill stager's ring is the level's own
+     * (stager.h); 0 without one. */
+    int64_t  arena_span_rows_ = 0;
     int64_t  arena_floor_ = 0;
     int64_t  arena_last_ = 0;
     uint64_t arena_floor_ns_ = 0;
-    /* WHAT THE VRAM BUDGET KEPT FOR ALLOCATIONS MADE AFTER start(), on top of --gpu-headroom-mib:
-     * the step batch's staging, which serve() allocates, and what is built on first use, if
-     * ever -- the KV tiers' copy staging and the second compute lane's queue. The bringup's
-     * closing reading is checked against both. */
+    /* VRAM the budget reserves for allocations after start(), on top of --gpu-headroom-mib: the
+     * step batch's staging (allocated by serve()) and what is built on first use, if ever (the KV
+     * tiers' copy staging, the second compute lane's queue). Bring-up's final VRAM reading is
+     * checked against both. */
     int64_t  late_step_bytes_ = 0;
     int64_t  late_lazy_bytes_ = 0;
-    /* THE LINEAR-STATE SNAPSHOT STORE: pinned host memory, --checkpoint-slots slots, each holding
-     * every rank's shard of one snapshot (KVManager::set_checkpoint_store). Not on the card: a
-     * snapshot is read by no kernel, only copied back into a sequence's state. */
+    /* Linear-state snapshot store: pinned host memory, --checkpoint-slots slots, each holding every
+     * rank's shard of one snapshot (KVManager::set_checkpoint_store). Off the card because no
+     * kernel reads a snapshot; it is only copied back into a sequence's state. */
     HostArena ck_store_;
     int  run_server();
-    /* THE KL MODE (core/kld.h), in place of run_server: the corpus's documents submitted as
-     * scoring requests, and every step's scored rows copied to the host and handed to `kld_`.
-     * One pinned block a rank, a step's tokens of this rank's logits columns. */
+    /* KL mode (core/kld.h), replacing run_server: submits the corpus documents as scoring
+     * requests and hands every step's scored rows, copied to the host, to `kld_`. One pinned
+     * block per rank, holding a step's tokens of that rank's logits columns. */
     int  run_kld();
     int  score_rows(const RadBatch* b, const StepOut& so);
     std::unique_ptr<Kld> kld_;
@@ -398,9 +384,8 @@ private:
     /* The engine half of /server_info, as a JSON object. See the definition in engine.cpp. */
     std::string engine_info() const;
 
-    /* ---- what the startup report says about the run (engine_diag.cpp). `decisions_` holds each
-     * value startup resolved and why, recorded where it was resolved; the rest are the facts a
-     * check needs that only startup saw. */
+    /* ---- startup report inputs (engine_diag.cpp). `decisions_` holds each value startup resolved
+     * and why, recorded where it was resolved; the rest are facts only startup saw. */
     std::vector<diag::Decision> decisions_;
     void decide(const std::string& key, const std::string& value, const std::string& why) {
         diag::decide(&decisions_, key, value, why);
@@ -412,38 +397,34 @@ private:
     std::string prefix_off_why_;     /* why the engine itself turned prefix caching off, or "" */
     std::vector<std::string> env_set_;   /* the RADIANCE_* names set when the engine was made */
     bool        report_printed_ = false;
-    /* THE RUNTIME'S DEVICES, ASKED ONCE, in start() beside usable_devices, which reads every
-     * device's properties anyway. A report printed after start() failed -- possibly after a device
-     * fault -- then makes no runtime call at all, and /diagnostics, on an HTTP thread, makes none
-     * either: a runtime call there can wait on a lock the launch path holds
-     * (DeviceBackend::vram_used says the same of the dashboard). What only the runtime knows --
-     * each device's PCI address, its name, whether it is integrated, and the runtime's version --
-     * is kept from that one reading. */
+    /* Runtime device identity (PCI address, name, integrated flag, runtime version), read once in
+     * start() beside usable_devices. Later reports make no runtime call: after a failed start
+     * there may have been a device fault, and on an HTTP thread (/diagnostics) a runtime call can
+     * wait on a lock the launch path holds (see DeviceBackend::vram_used). */
     struct DevId { int device = -1; std::string bdf, name; bool integrated = false; };
     std::vector<DevId> dev_ids_;
     std::string        runtime_version_;
     void identify_devices(const std::vector<std::string>& names);
-    /* WHAT ONLY A SYSTEM CALL ANSWERS (diag::probe_process), asked once when the report is first
-     * printed: the memlock limit cannot change under a running process, and the io_uring probe is
-     * a syscall that /diagnostics has no reason to repeat on every request. */
+    /* Syscall-only facts (diag::probe_process), read once at the first report: the memlock limit
+     * cannot change under a running process, and the io_uring probe need not repeat per
+     * /diagnostics request. */
     bool        probed_ = false;
     int64_t     memlock_soft_ = -1;
     std::string io_uring_;
-    /* THE MACHINE AS /diagnostics LAST READ IT, kept for kDiagReuseNs. The card files are answered
-     * by the SMU under the driver's power-management lock, so a client polling the endpoint must
-     * not turn into a stream of SMU requests beside the serving process; a second's staleness is
-     * nothing to a reading of links and clocks. */
+    /* The last /diagnostics hardware reading, reused for kDiagReuseNs. The SMU answers the card
+     * files under the driver's power-management lock, so a polling client must not become a
+     * stream of SMU requests beside the server. */
     mutable std::mutex  diag_mu_;
     mutable diag::Facts diag_facts_;
     mutable uint64_t    diag_read_ns_ = 0;
-    /* `serving`: read the power-management files of the cards the ranks serve on only
-     * (diag::collect's `managed`), which is how a running server reads them. */
+    /* `serving`: read power-management files only for the cards the ranks serve on
+     * (diag::collect's `managed`). */
     diag::Facts    hardware_facts(bool serving) const;
     diag::RunFacts run_facts(bool failed) const;
 
-    /* One dispatch of the tiering seam: retire what landed, credit last step's routing and issue
-     * what the heat engine proposes. A member because Rank is private, and a no-op on a static
-     * plan. See the long note at the definition for why a step is the unit. */
+    /* One dispatch of the tiering seam: retire what landed, credit last step's routing, issue
+     * what the heat engine proposes. A member because Rank is private; a no-op on a static plan.
+     * The definition explains why a step is the unit. */
     void tiering_dispatch(Rank& r, int step);
     void rank_loop(int rank);
 };

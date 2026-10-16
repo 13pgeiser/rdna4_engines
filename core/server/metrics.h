@@ -1,24 +1,20 @@
 /* core/server/metrics.h -- Prometheus /metrics, with vLLM's metric names.
  *
- * The names are not ours to choose. There is a published Grafana dashboard for vLLM and a great
- * deal of alerting built on `vllm:time_to_first_token_seconds_bucket` and friends, and the point
- * of matching them is that swapping vLLM for radiance behind an existing deployment changes
- * nothing on the observability side. So: the vLLM names, the vLLM bucket boundaries, and the
- * vLLM label set (`model_name`, `engine`), copied exactly. Where vLLM renamed something we emit
- * both spellings -- `vllm:gpu_cache_usage_perc` is what every dashboard in the wild queries and
- * `vllm:kv_cache_usage_perc` is what current vLLM emits, and two gauges cost nothing.
+ * Names, bucket boundaries and the label set (`model_name`, `engine`) are copied exactly from vLLM,
+ * so existing vLLM dashboards and alerts work unchanged against radiance. Where vLLM renamed a
+ * metric both spellings are emitted (`vllm:gpu_cache_usage_perc`, which dashboards query, and
+ * `vllm:kv_cache_usage_perc`, which current vLLM emits).
  *
- * Anything vLLM does not have goes under `radiance:`. Inventing a new `vllm:` name would be worse
- * than useless: it would look to a dashboard like a metric it knows and is not.
+ * Anything vLLM lacks goes under `radiance:`; a new `vllm:` name would pass for a metric a
+ * dashboard knows.
  *
- * What is deliberately NOT emitted is as important. `vllm:iteration_tokens_total` and
- * `vllm:request_queue_time_seconds` are properties of the scheduler's step loop, not of the HTTP
- * boundary, and the server cannot observe them. Emitting a plausible-looking approximation of a
- * latency breakdown is how a dashboard ends up lying, so they are absent until the scheduler
- * reports them, and their absence is documented rather than papered over.
+ * Not emitted: `vllm:iteration_tokens_total` and `vllm:request_queue_time_seconds`. They belong to
+ * the scheduler's step loop, which the HTTP boundary cannot observe, and an approximation would
+ * mislead. They stay absent until the scheduler reports them.
  */
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -39,6 +35,8 @@ public:
         double cur = v_.load(std::memory_order_relaxed);
         while (!v_.compare_exchange_weak(cur, cur + v, std::memory_order_relaxed)) {}
     }
+    /* Raises the count to `total`, a cumulative value kept elsewhere; never lowers it. */
+    void advance_to(double total) { inc(std::max(0.0, total - get())); }
     double get() const { return v_.load(std::memory_order_relaxed); }
 private:
     std::atomic<double> v_{0.0};
@@ -52,17 +50,18 @@ private:
     std::atomic<double> v_{0.0};
 };
 
-/* Cumulative buckets, the Prometheus convention: bucket i counts observations <= bounds[i], and
- * the implicit +Inf bucket is `count`. Atomics rather than a lock because /metrics is scraped
- * from one thread while every HTTP thread observes into it. */
+/* Cumulative buckets, the Prometheus convention: bucket i counts observations <= bounds[i] and
+ * the implicit +Inf bucket is `count`. Atomic, since every HTTP thread observes while /metrics
+ * is scraped. */
 class Histogram {
 public:
     explicit Histogram(std::vector<double> bounds);
     void observe(double v);
 
     const std::vector<double>& bounds() const { return bounds_; }
-    uint64_t bucket(size_t i) const { return cnt_[i].load(std::memory_order_relaxed); }
-    uint64_t count() const { return n_.load(std::memory_order_relaxed); }
+    /* Read the buckets in ascending order, then the count, for a consistent picture (observe). */
+    uint64_t bucket(size_t i) const { return cnt_[i].load(std::memory_order_acquire); }
+    uint64_t count() const { return n_.load(std::memory_order_acquire); }
     double   sum() const { return sum_.load(std::memory_order_relaxed); }
 
 private:
@@ -72,8 +71,8 @@ private:
     std::atomic<double>   sum_{0.0};
 };
 
-/* vLLM's bucket layouts, verbatim. Changing one of these silently invalidates every histogram
- * quantile a dashboard computes across a version boundary, so they are constants, not options. */
+/* vLLM's bucket layouts, verbatim. Changing one breaks every histogram quantile a dashboard
+ * computes across versions, so they are constants, not options. */
 std::vector<double> buckets_ttft();          /* vllm:time_to_first_token_seconds */
 std::vector<double> buckets_tpot();          /* vllm:time_per_output_token_seconds */
 std::vector<double> buckets_latency();       /* every vllm:request_*_seconds */
@@ -81,8 +80,8 @@ std::vector<double> buckets_1_2_5(int64_t max_value);   /* token-count histogram
 
 /* ------------------------------------------------------------------ the registry */
 
-/* The finish reasons `vllm:request_success_total` is broken down by. Fixed, because a label whose
- * cardinality depends on user input is a Prometheus outage waiting to happen. */
+/* The finish reasons `vllm:request_success_total` is broken down by. A fixed set, because label
+ * cardinality must never depend on user input. */
 enum class SuccessReason { Stop = 0, Length, ToolCalls, Abort, Error, N_ };
 
 class Metrics {
@@ -115,48 +114,42 @@ private:
     Gauge   g_kv_max_tokens_, g_kv_max_bytes_;
     Gauge   g_prefill_tps_, g_decode_tps_, g_draft_accept_, g_preempted_;
     Gauge   queue_depth_;
-    /* The per-position draft hazard, kept as plain gauges because that is what it is: a
-     * conditional acceptance rate at each draft position, which is the only number that separates
-     * a drafter that decays from one whose later rounds are broken. See core/sched/draft.h. */
+    /* Per-position conditional draft acceptance (see render() and core/sched/draft.h). */
     enum { MAX_DRAFT_POS = 64 };
     Gauge   g_draft_pos_[MAX_DRAFT_POS];
     Gauge   g_draft_pos_reached_[MAX_DRAFT_POS];
     Gauge   g_draft_pos_accepted_[MAX_DRAFT_POS];
     std::atomic<int> draft_pos_seen_{0};
-    /* THE ADAPTIVE DRAFT WINDOW (--draft-window adaptive): the mean window of the running sequences,
-     * and the verifies by the window they carried, index = drafts. Rendered only while the policy
-     * is on, so a deployment without it exposes exactly what it always did. */
+    /* Adaptive draft window (--draft-window adaptive): the running sequences' mean window, and
+     * verifies by the window they carried (index = drafts). Rendered only while the policy is on. */
     Gauge   g_draft_depth_adapt_;
     Gauge   g_draft_vdepth_[MAX_DRAFT_POS + 1];
     std::atomic<bool> draft_adapt_on_{false};
     std::atomic<int>  draft_vdepth_top_{0};   /* the deepest window with a verify counted */
 
-    /* sample() turns the scheduler's cumulative totals into counter increments by reading each
-     * counter and adding the difference. Two scrapes doing that at once both read the old value
-     * and both add the whole difference, so they are serialised. */
+    /* sample() turns the scheduler's cumulative totals into counter increments (read, add the
+     * difference). Concurrent scrapes would both add the same difference, so they are serialised. */
     std::mutex sample_mu_;
 
     Counter c_prompt_tokens_, c_generation_tokens_, c_preemptions_;
-    /* ENGINE STEPS. Tokens a second cannot answer "how long is a step", and with speculation the
-     * two stop being the same question: a step emits 1 + however many drafts survived. Exposed as
-     * a counter so two scrapes and a clock give the step time directly. */
+    /* Engine steps. With speculation a step emits 1 + the accepted drafts, so tokens/s does not
+     * give step time; two scrapes of this counter and a clock do. */
     Counter c_steps_;
-    /* STEPS BY SHAPE, and the decode rows a mixed step cost speculation. Exposed as counters so
-     * two scrapes give the rate over a window rather than a number dominated by startup. */
+    /* Steps by shape, and decode rows that ran unspeculated. Counters, so two scrapes give the
+     * rate over a window rather than an average dominated by startup. */
     Counter c_steps_prefill_, c_steps_mixed_, c_steps_decode_, c_rows_unspec_, c_steps_ahead_;
-    Counter c_prefill_capped_;
-    /* SECONDS SPENT INSIDE A STEP, and the decode half of it. A step time is not wall clock over
-     * a step count -- SchedMetrics::step_ns says why -- and without these every scraper has to
-     * assume a saturated window and no prefill in it. */
+    Counter c_prefill_capped_, c_steps_held_;
+    /* Seconds inside a step, all shapes and decode-only. Wall clock over a step count is not a
+     * step time (see SchedMetrics::step_ns). */
     Counter c_step_secs_, c_step_secs_decode_;
-    /* THE EXACT TOTALS BEHIND THE RATE GAUGES. A gauge answers "how fast right now"; a counter
-     * answers "how much between these two scrapes", and only the second survives a comparison
-     * between two runs that settled into different mixes. */
+    /* Exact totals behind the rate gauges; see render(). */
     Counter c_prefill_tokens_, c_decode_tokens_, c_draft_tokens_, c_draft_accepted_;
     Counter c_draft_refills_, c_draft_refill_tokens_;
     Counter c_attn_cached_, c_linear_cached_, c_checkpoints_;
     Counter c_prefix_evict_, c_prefix_ckpt_evict_;
     Counter c_prefix_expired_, c_prefix_ckpt_expired_;
+    Counter c_ckpt_retired_, c_ckpt_lru_, c_ckpt_refused_;
+    Counter c_cut_no_snapshot_, c_cut_window_, c_cut_adopt_, c_cut_tokens_;
     Gauge   g_linear_hit_;
     Counter c_success_[(size_t)SuccessReason::N_];
     Counter c_rejected_, c_disconnect_, c_overflow_;

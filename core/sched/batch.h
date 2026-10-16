@@ -1,20 +1,11 @@
-/* batch.h -- the step batch, built ONCE PER STEP BY THE CORE and shared by every layer and every
- * KV group (spec §8).
+/* batch.h -- the step batch, built once per step by the core and shared by every layer and every
+ * KV group (spec §8). Unlike vLLM, which rebuilds the metadata per KV-cache group, there is one
+ * build and every consumer reads the same buffers.
  *
- * vLLM builds this per KV-cache group, per layer, in Python, and that shape is what this file
- * exists to avoid: a model whose linear-attention layers fall into several KV-cache groups runs
- * the metadata builder once per group, and every run after the first produces values identical to
- * it -- dozens of tiny dispatches a step for numbers already computed, and host time on the step
- * path is time the GPU spends idle.
- *
- * So: one build, one owner, every consumer reads the same buffers.
- *
- * Everything here comes out of pools sized at max_tok / max_seqs at init. Nothing on this path
- * allocates. Staging is PINNED HOST memory crossing in one async copy a rank, out of a RING so
- * that a build is never written while an earlier build's copy is still reading it -- the cost of
- * getting that wrong is a torn block table, which shows up as a sequence reading another
- * sequence's KV and reads as a model quality problem -- and so that the host can stage several
- * passes ahead of the card without waiting for any of them.
+ * Everything comes from pools sized at max_tok / max_seqs at init; nothing on this path
+ * allocates. Staging is pinned host memory, uploaded in one async copy per rank, carved from a
+ * ring so that a build never overwrites staging an earlier upload is still reading (that would
+ * tear a block table) and the host can stage several passes ahead of the card.
  */
 #pragma once
 #include "advance.h"
@@ -26,63 +17,52 @@
 namespace rad {
 
 /* One sequence's participation in one step. The scheduler fills these; the builder turns them
- * into device arrays and touches nothing else. */
+ * into device arrays. */
 struct StepEntry {
     const Request* req = nullptr;
-    uint64_t seq = 0;             /* the KV manager's key -- the request id */
-    int32_t slot = -1;            /* scheduler slot: where the scheduler keeps the request */
+    uint64_t seq = 0;             /* the KV manager's key (the request id) */
+    int32_t slot = -1;            /* the scheduler's slot for the request */
     int32_t card = -1;            /* the card's StepSlot index, [0, max_seqs): the sequence
                                    * identity in this batch (SchedReq::card) */
     int32_t n_tokens = 0;         /* query length this step */
-    int32_t ctx_len = 0;          /* computed tokens BEFORE this step -- the first token's position */
+    int32_t ctx_len = 0;          /* tokens computed before this step: the first token's position */
     int32_t n_spec = 0;           /* draft tokens included in n_tokens (decode only) */
-    /* HOW MANY TOKENS THE PREVIOUS STEP COMMITTED, and it is ONE-BASED: the token that step was
-     * given plus however many of its drafts survived. Both linear kernels read it that way --
+    /* Tokens the previous step committed, one-based: its input token plus its accepted drafts.
      * gdn_conv_update reads its rolling window at `num_accepted - 1` and gdn_recurrent_update
-     * takes the state the (num_accepted)th token left -- so 1 is the ordinary decode step that
-     * drafted nothing, which is exactly what they assume when the operand is absent. Zero is not
-     * a value either of them can read; the scheduler's own `SchedReq::n_accepted` counts DRAFTS,
-     * which is one less. */
+     * takes the state the (num_accepted)th token left, so 1 is a plain decode step (also their
+     * default when the operand is absent) and 0 is invalid. SchedReq::n_accepted counts drafts
+     * only, one less. */
     int32_t n_accepted = 1;
     int32_t conv_cursor = 0;      /* read offset inside the rolling conv window (§10) */
     int32_t ckpt_tok = -1;        /* token index WITHIN this entry to snapshot at, or -1 */
     int32_t ckpt_slot = -1;
-    /* THE SNAPSHOT THIS ENTRY RESUMES FROM, or -1. Set on the first step after a prefix hit and
-     * never again: the recurrent half of a hit is carried by this and by nothing else, because
-     * the adopted blocks describe the attention layers only. */
+    /* Snapshot this entry resumes from, or -1. Set only on the first step after a prefix hit; the
+     * adopted blocks cover attention only, so this is the sole carrier of the recurrent state. */
     int32_t ckpt_restore = -1;
     const int32_t* draft = nullptr;   /* the drafter's proposal, appended after the committed tail */
     int32_t n_draft = 0;
-    /* WHICH LOGITS ROW OF THE STEP JUST RUN holds the hidden state this entry continues from,
-     * or -1 for the ordinary rule. It exists for the MTP drafter's history pass: the trunk step
-     * produced 1 + n_spec rows for a verifying sequence, and the head gathers the run of them
-     * starting here. Filled into `out_ids`, so the head's gather picks them out of the same
-     * buffer.
-     *
-     * A pass that gathers its OWN output names rows of itself through the same field -- the
-     * DFlash2 query pass does, because the rows it wants logits for are the mask positions of the
-     * block it just ran. Which buffer out_ids indexes is the architecture block's business; this
-     * is only the list. */
+    /* First logits row, written into `out_ids`, that this entry reads, or -1 for the default
+     * rule. The MTP history pass uses it to gather the 1 + n_spec trunk rows of a verifying
+     * sequence; the DFlash2 query pass uses it to name the mask rows of its own block. Which
+     * buffer out_ids indexes is up to the architecture block. */
     int32_t hidden_row = -1;
-    /* HOW MANY ROWS FROM `hidden_row`, or 0 for the rule that predates it: one a token. The MTP
-     * history pass wants exactly its n_tokens and says 0; the DFlash2 query pass runs `block`
-     * tokens and wants the block-1 mask rows, so it says block-1 and starts one row in. */
+    /* Rows from `hidden_row`, or 0 for one per token. The MTP history pass uses 0; the DFlash2
+     * query pass runs `block` tokens and uses block-1, starting one row in. */
     int32_t hidden_n = 0;
-    /* THIS ENTRY'S LAST ROW IS DRAFT ROUND 1 (RadBatch::draft_out_ids): set on a history-pass
-     * entry whose sequence drafts, whose rows end with the position round 1 continues from. */
+    /* This entry's last row is where draft round 1 continues from (RadBatch::draft_out_ids).
+     * Set on a history-pass entry whose sequence drafts. */
     bool    draft_out = false;
     bool    is_prefill = false;
     bool    produces_token = false;   /* this entry's last token is the sequence's last */
-    /* ITS DRAFTS CAME FROM PROMPT LOOKUP, not from the declared drafter. Their outcome is counted
-     * in the reported acceptance like any other, and kept out of the adaptive window's estimate,
-     * which describes the draft head (DraftController, draft.h). */
+    /* The drafts came from prompt lookup, not the declared drafter. They count toward reported
+     * acceptance but not the adaptive window's estimate of the draft head (DraftController,
+     * draft.h). */
     bool    ngram = false;
-    /* A DEVICE ROW: the card fills its tokens, positions, rollback count and slots from the slot's
-     * StepSlot before the pass runs (advance.h), and what the host staged for them is replaced.
-     * `ctx_len` is then an upper bound, which is what the host-side ceilings read. The other three
-     * are advance.h's row descriptor: the verify step's token row of the row's first verified
-     * position, its first sampled row (-1 for none), and the mode's own number. A verify step's
-     * entries always carry them, for its acceptance. */
+    /* Device row: the card overwrites its tokens, positions, rollback count and slots from the
+     * StepSlot before the pass runs (advance.h); `ctx_len` is then only an upper bound for the
+     * host-side ceilings. dev_tok/dev_out/dev_aux are advance.h's row descriptor: the verify
+     * step's token row of the first verified position, the first sampled row (-1 for none), and
+     * the mode's own number. A verify step's entries always carry them. */
     bool    dev = false;
     int32_t dev_tok = 0;
     int32_t dev_out = -1;
@@ -93,20 +73,17 @@ struct StepPlan {
     std::vector<StepEntry> e;
     int64_t n_tok = 0;
     int     phase = RAD_PHASE_DECODE;
-    /* THE DRAFT PASS, straight through to RadBatch::draft_pass. 0 is a trunk step; r > 0 runs
-     * only the draft head, r < 0 is a history pass. */
+    /* Passed to RadBatch::draft_pass. 0 is a trunk step, r > 0 runs only the draft head, r < 0
+     * is a history pass. */
     int     draft_pass = 0;
-    /* HOW FAR AHEAD OF ITS POSITION A ROW READS ITS TOKEN. The MTP head pairs the trunk's hidden
-     * state at index i with the embedding of the token at i + 1 (rad_block_mtp_fp8.h), so its
-     * passes say 1 and the shift is applied once, here, rather than in a kernel. It is NOT a
-     * property of "being a draft pass": DFlash2's query block embeds the token at its own
-     * position -- the anchor at the row that holds it and a mask everywhere after -- and says 0.
-     * Deriving it from `draft_pass` instead feeds such a drafter the token one past its anchor. */
+    /* How far past its position a row reads its token. The MTP head pairs hidden state i with
+     * the token at i + 1 (rad_block_mtp_fp8.h), so its passes use 1. Do not derive this from
+     * `draft_pass`: DFlash2's query block embeds the token at its own position and uses 0. */
     int     tok_shift = 0;
     int     n_spec = 0;               /* the batch-wide speculative window */
     bool    spec_is_tree = false;     /* a tree drafter fills spec_parent; a chain leaves it null */
-    /* THE SPLIT, for a block that issues over each half separately. Sorted above, so the decode
-     * rows are sequences [0, n_seq_decode) and the prefill chunks are the rest. */
+    /* Decode/prefill split, for a block that issues each half separately. Entries are sorted so
+     * decode rows are sequences [0, n_seq_decode) and prefill chunks follow. */
     int64_t n_seq_decode = 0;
     int64_t n_tok_decode = 0;
     int32_t max_q_len = 0;
@@ -122,58 +99,52 @@ struct StepPlan {
 /* ------------------------------------------------------------------ the builder */
 class BatchBuilder {
 public:
-    /* `prog` is non-const because derived buffers are written into the arena, and the arena
-     * pointer lands in BufferInfo::ptr after the buffer plan runs. */
-    /* What the builder needs about one rank: which card its slab lives on, which stream its
-     * upload rides, and which Program holds the arena a derived buffer is copied into. */
+    /* One rank: the card its slab lives on, the stream its upload runs on, and the Program whose
+     * arena derived buffers are copied into. */
     struct RankIO {
         int       device = 0;
         RadStream stream = nullptr;
         Program*  prog   = nullptr;
     };
 
+    /* `prog` is non-const because derived buffers are written into its arena, whose pointer lands
+     * in BufferInfo::ptr after the buffer plan runs. */
     int  init(Program& prog, const Config& cfg, const ChunkGeometry& geo,
               const KVGeom& kvg, const std::vector<RankIO>& ranks);
     void fini();
 
-    /* The bytes init() allocates on each rank's card -- the step slab and, with an encoder, the
-     * media staging -- computed without allocating, for the VRAM budget. -1 when the program is
-     * one init() would refuse. */
+    /* Bytes init() allocates on each rank's card (the step slab and, with an encoder, the media
+     * regions), computed without allocating, for the VRAM budget. -1 if init() would refuse. */
     static int64_t device_bytes(Program& prog, const Config& cfg, const KVGeom& kvg);
 
-    /* Build the batch for this step. The returned pointer is stable until the kOut-th next call
-     * and is the pointer the rank threads share -- because the ranks share an address space, the
-     * batch is shared by pointer rather than broadcast (spec §1). Null on a device failure, which
-     * is fatal for the step. */
+    /* Build the batch for this step. The returned pointer stays valid for the next kOut - 1
+     * calls and is shared by pointer across rank threads (spec §1). Null on a device failure,
+     * which is fatal for the step. */
     const RadBatch* build(const StepPlan& plan, const IKVManager& kv, int step);
 
-    /* The batch the LAST build produced for one rank. Same contents as build()'s return
-     * except for the device pointers, which name that rank's staging slab. */
+    /* The last build's batch for one rank: build()'s result with that rank's slab pointers. */
     const RadBatch* batch_for(int rank) const;
 
-    /* THE ADVANCE'S VIEW OF THE LAST BUILD on one rank: the slab and every offset in it. The mode,
-     * the round, the slot state and the inputs are the caller's (advance.h). */
+    /* The last build's slab and offsets on one rank, for the advance. The caller supplies mode,
+     * round, slot state and inputs (advance.h). */
     AdvanceArgs advance_args(int rank) const;
 
-    /* THE LONGEST SEQUENCE A BATCH CAN DESCRIBE, in tokens: what the block-table rows were sized
-     * for at init. A position at or past it has no column to be addressed through. */
+    /* Longest sequence a batch can describe, in tokens, as sized into the block-table rows at
+     * init. A position at or past it cannot be addressed. */
     int64_t max_ctx() const { return max_ctx_; }
 
-    /* AN ENCODER PASS (RadBatch::enc): the patches of whole segments of one or more media items,
-     * staged into every rank's encoder input -- each rank runs the tower on its own card, so none
-     * waits on another's output. Returns rank 0's batch like build(); batch_for() serves the rest.
-     * The caller synchronises every rank's stream before the next encoder build, which it has to
-     * anyway to read the pass's rows back. */
+    /* An encoder pass (RadBatch::enc): patches of whole segments of one or more media items,
+     * staged into every rank's encoder input, since each rank runs the tower itself. Returns rank
+     * 0's batch like build(); batch_for() serves the rest. The caller must synchronise every
+     * rank's stream before the next encoder build. */
     struct EncoderPart {
         const mm::Item* item = nullptr;
         int32_t         seg0 = 0, n_seg = 0;
     };
-    /* `enc` is the encoder the pass runs: its patch width, pass size and merge bound the parts,
-     * and its modalities are RadBatch::enc. */
+    /* `enc` is the encoder the pass runs: its patch width, pass size and merge bound the parts;
+     * its modalities become RadBatch::enc. */
     const RadBatch* build_encoder(const std::vector<EncoderPart>& parts, int step,
                                   const RadEncoderDecl& enc);
-    bool    has_encoder() const { return mm_on_; }
-
 
 private:
     struct Group {
@@ -181,9 +152,8 @@ private:
         int64_t     block_size = 0;
         int64_t     max_blocks = 0;
         int32_t*    h_slot = nullptr;  int32_t* d_slot = nullptr;
-        /* The group's block tables on the card: a fixed place in the table region, `bt_fix`
-         * int32 past its start, max_seqs rows of this build's pitch. They have no host twin -- a
-         * build stages only what changed. */
+        /* The group's block tables on the card: max_seqs rows of this build's pitch, `bt_fix`
+         * int32 into the table region. No host twin; a build stages only what changed. */
         int64_t     bt_fix = 0;
         int32_t*    d_bt   = nullptr;
         int32_t*    h_used = nullptr;  int32_t* d_used = nullptr;
@@ -191,38 +161,27 @@ private:
         int64_t     sidx_pitch = 1;    /* columns per sequence in h_sidx/d_sidx */
     };
 
-    /* THE LAYOUT OF A BUILD: every array's place on the card and in host staging, at the same
-     * offset in both, so that one copy moves a whole build.
+    /* Layout of a build: every array at the same offset on the card and in host staging, so one
+     * copy moves a whole build.
      *
-     * THE DEVICE SLAB IS ONE PER RANK AND IS NEVER DOUBLE BUFFERED. A build's upload and every
-     * kernel that reads it are on that rank's compute stream, so the next build's upload is
-     * ordered behind the kernels of the last one by the queue itself: nothing on the card can
-     * read a slab another build is writing. What does need more than one copy is the HOST side,
-     * which the upload reads when the stream reaches it and not when it is issued -- and the host
-     * may be several passes ahead of the card. That staging is carved out of a ring (see Ring),
-     * so any number of builds can be in flight and a build only waits when the ring is full.
-     *
-     * `h_*` are re-carved for every build at its place in the ring; `d_*` are rank 0's slab and
-     * never move. */
+     * The device slab is one per rank and never double buffered: uploads and the kernels reading
+     * them share the rank's compute stream, so stream order protects it. The host side is read
+     * when the stream reaches the upload, possibly several passes later, so it comes from a ring
+     * (see Ring). `h_*` are re-carved for every build at its ring position; `d_*` are rank 0's
+     * slab and never move. */
     struct Set {
         int64_t host_bytes = 0, dev_bytes = 0;
-        /* THE BLOCK TABLES ARE NOT PART OF THE FIXED LAYOUT'S COPY. `bt_base` is where they
-         * start, and everything below it crosses whole every build. On the card the region past
-         * it is every group's tables at a fixed place; in the host span it is the build's
-         * PAYLOAD -- the table entries that changed, packed -- followed by the list of ranges
-         * saying where each run of it lands (see BtMirror). `dev_bytes` is the ALLOCATION, which
-         * holds every group's worst table. */
+        /* Everything below `bt_base` is uploaded whole every build. Past it, the card holds every
+         * group's block tables at fixed places, while the host span holds the payload (changed
+         * table entries, packed) followed by the ranges saying where each run lands (see
+         * BtMirror). `dev_bytes` is the allocation, sized for every group's largest table. */
         int32_t* bt_h0 = nullptr;  int32_t* bt_d0 = nullptr;
         int64_t  bt_base = 0;
-        /* ONE DEVICE SLAB PER RANK, and this is not an optimisation.
-         *
-         * The batch is built once and shared BY POINTER (spec §1), which is right for the host
-         * side and wrong for the device side. A single slab on rank 0's card, filled by async
-         * copies on rank 0's stream and read by every rank's kernels off its own stream, has
-         * nothing ordering the other ranks' reads after rank 0's copies. A slab per rank makes
-         * each rank's upload an ordinary same-stream dependency and puts the metadata on the card
-         * that reads it, instead of behind PCIe. The carve is identical on every rank, so d_*
-         * below are rank 0's pointers AND the offset basis for the rest. */
+        /* One device slab per rank, required for correctness: a single slab on rank 0 would leave
+         * other ranks' reads unordered against rank 0's copies. Per rank, each upload is a
+         * same-stream dependency and the metadata sits on the card that reads it. The carve is
+         * identical on every rank, so d_* below are rank 0's pointers and the offset basis for
+         * the rest. */
         std::vector<void*> dev;
 
         int32_t *h_tok = nullptr, *h_pos = nullptr, *h_cu = nullptr, *h_sid = nullptr;
@@ -246,18 +205,16 @@ private:
          * mm_rows): carved only when the program declared an encoder, empty otherwise. */
         int32_t   *h_rope = nullptr, *d_rope = nullptr;
         int32_t   *h_mmrow = nullptr, *d_mmrow = nullptr;
-        /* [n_kv_groups][max_seqs]: EVERY conv group's state slot per sequence, not just one, since
-         * a model may have more than one conv group -- see init(). */
+        /* [n_kv_groups][max_seqs]: every conv group's state slot per sequence (see init()). */
         int32_t*   h_convslot = nullptr;
 
         std::vector<Group>           groups;
     };
 
-    /* THE HOST STAGING RING. A build takes the bytes it will upload -- the fixed prefix and the
-     * block-table rows it fills -- as one contiguous span, fills it, and records an event per rank
-     * behind the upload. A span is reusable once every rank's upload of it has run, which is what
-     * `reserve` waits for when the ring is full; at steady state it never is, because a decode
-     * build's span is a small fraction of the ring. */
+    /* Host staging ring. A build takes one contiguous span for what it uploads (the fixed prefix
+     * and its block-table payload), fills it, and records an event per rank behind the upload. A
+     * span is reusable once every rank's upload has run; `reserve` waits for that only when the
+     * ring is full. */
     struct Flight {
         int64_t begin = 0, end = 0;
         int     ev = -1;               /* row of ev_ holding one event per rank */
@@ -271,9 +228,9 @@ private:
         int     first = 0, live = 0;
     };
 
-    /* What a build hands the ranks: the ABI views and the batch, ONE PER RANK, since they differ
-     * only in the device pointers. kOut of them so a batch stays valid while later ones are
-     * built: a step's own batch is read after its draft passes and the next step's batch are. */
+    /* A build's ABI views and batch, one per rank (they differ only in device pointers). kOut of
+     * them, because a step's batch is still read after its draft passes and the next step have
+     * been built. */
     static constexpr int kOut = RAD_SCHED_MAX_SPEC + 4;
     struct Out {
         std::vector<std::vector<RadKVGroupBatch>> kv;
@@ -282,8 +239,8 @@ private:
 
     struct Derived {
         rad_buf     handle = 0;
-        /* WHICH conv group this derivation is about, or -1 for none. From RadBufDecl::kv, or the
-         * only conv group when the plugin left that 0 and there IS only one. */
+        /* Conv group this derivation is about, or -1. From RadBufDecl::kv, or the only conv
+         * group when the plugin left it 0 and there is exactly one. */
         int32_t     conv_grp = -1;
         const char* name = nullptr;
         int         fn_index = -1;
@@ -300,16 +257,12 @@ private:
     std::vector<RankIO> ranks_;
 
     int64_t max_tok_ = 0, max_seqs_ = 0, max_ctx_ = 0;
-    /* Per KV GROUP, indexed by group, and 0 for a group that is not RAD_KV_CONV.
-     *
-     * THIS AND `h_convslot` FEED `DeriveInput` AND NOTHING ELSE. A conv KERNEL reads its slot from
-     * RadKVGroupBatch::state_index, which is per group. What reads these two is the
-     * `conv_state_index` DERIVATION, which no architecture plugin currently calls --
-     * rad_block_gdn_fp8.h takes `cv->state_index` straight off the group batch. Keeping them per
-     * group is what makes the derivation correct, and usable, for a model with a second conv
-     * group. */
+    /* Per KV group, 0 for a non-conv group. This and `h_convslot` only feed DeriveInput for the
+     * `conv_state_index` derivation, which no plugin calls at present; conv kernels read
+     * RadKVGroupBatch::state_index instead. Kept per group so the derivation is correct with more
+     * than one conv group. */
     std::vector<int32_t> conv_window_;
-    int32_t conv_group_ = -1;    /* the ONLY conv group, when there is exactly one; else -1 */
+    int32_t conv_group_ = -1;    /* the conv group when there is exactly one, else -1 */
     int32_t n_conv_ = 0;
 
     Set  set_;
@@ -323,22 +276,17 @@ private:
     /* Per group, this build's block-table pitch: sized before the span is reserved. */
     std::vector<int64_t> pitch_;
 
-    /* WHAT EVERY RANK'S SLAB HOLDS IN ITS BLOCK-TABLE REGION, so a build stages only what changed.
+    /* What every rank's slab holds in its block-table region, so a build stages only what changed.
+     * At long context a table is thousands of entries per group, too many to restage every build.
+     * The slab outlives the build and uploads land in build order, so it holds the last build's
+     * rows. A row still holding the same sequence at the same pitch is restaged from the first
+     * entry the manager changed (take_table_changes) to the end of what it or the card holds; any
+     * other row is restaged whole.
      *
-     * A sequence's table is its whole context in blocks, thousands of entries a group at long
-     * context, and restaging every row whole every build cost the scheduler time in proportion
-     * to context times sequences times the several builds of a speculative step -- and the card
-     * as much in upload. But the slab is one per rank and outlives the build, the uploads reach it
-     * in the order the builds were made, and a group's tables have a fixed place in it, so it
-     * already holds the last build's rows. A row that still holds the same sequence at the same
-     * pitch is restaged from the lowest entry the manager changed (take_table_changes) to the end
-     * of what it or the card holds; any other row is restaged whole.
-     *
-     * `len[i]` is how many entries of row i are the table of `seq[i]`, and the rest of the row is
-     * -1, which is what a whole restage leaves; -1 in `len` is "unknown". A sequence is current in
-     * at most one row: its change marks are consumed where it is written, so a copy of it left
-     * in another row goes unknown. A layout change -- the group's pitch -- and a build that fails
-     * after taking marks make every row unknown. */
+     * `len[i]` is how many entries of row i are the table of `seq[i]`; the rest of the row is -1.
+     * -1 in `len` means unknown. A sequence is current in at most one row, because its change marks
+     * are consumed where it is written; a copy left in another row becomes unknown. A pitch change,
+     * or a build that fails after taking marks, makes every row unknown. */
     struct BtMirror {
         int64_t pitch = -1;
         std::vector<uint64_t> seq;
@@ -347,54 +295,53 @@ private:
     std::vector<BtMirror> bt_mirror_;
     /* This build's upload ranges, host-side, until build() writes them behind the payload. */
     std::vector<RadCopyRange> ranges_;
-    int64_t pay_words_ = 0;   /* the payload build_groups wrote, in int32 */
+    int64_t pay_words_ = 0;   /* payload build_groups wrote, in int32 words */
     void forget_tables();
     int64_t last_n_seq_ = 0;
 
     int64_t               derived_bytes_ = 0;
     std::vector<Derived>  derived_;
 
-    /* THE MEDIA STAGING, allocated only when the program declared an encoder (mm_on_).
+    /* Media staging, allocated only when the program declares an encoder (mm_on_).
      *
-     * The encoder rows a pass overwrites its embeddings with are NOT in the slab: the slab's
-     * prefix crosses whole on every build, and max_tok rows of an embedding are megabytes a decode
-     * step would copy for nothing. They have a device region of their own on every rank, filled
-     * only by a build that carries them -- rank 0 from pinned staging, every other rank with zeros
-     * (RadBatch::mm_embd says why). The staging is refilled only once the last upload out of it
-     * has run, which `mm_ev_` records. */
+     * Encoder rows are kept out of the slab, whose prefix is uploaded every build; max_tok
+     * embedding rows would be megabytes per decode step. Each rank has its own device region,
+     * filled only by a build that carries rows: rank 0 from pinned staging, the others with zeros
+     * (see RadBatch::mm_embd). The staging is refilled only after its last upload has run
+     * (`mm_ev_`). */
     bool                   mm_on_ = false;
     int64_t                n_embd_ = 0;
     std::vector<void*>     mm_dev_;
     uint16_t*              mm_host_ = nullptr;
     RadEvent               mm_ev_ = nullptr;
     bool                   mm_ev_live_ = false;
-    /* ...and the encoders' inputs: patches, their coordinates and the segment boundaries, sized
-     * for the larger of the passes the plugin declared (a vision tower's and an audio encoder's
-     * run one at a time and share it). One copy a rank, since each runs the tower itself. */
+    /* Encoder inputs: patches, their coordinates and segment boundaries, sized for the largest
+     * declared pass (encoder passes run one at a time and share it). One copy per rank. */
     int64_t                enc_patches_ = 0, enc_pix_elems_ = 0, enc_segs_ = 0;
     std::vector<void*>     enc_pix_dev_, enc_coord_dev_, enc_cu_dev_;
     uint16_t*              enc_pix_host_ = nullptr;
     int32_t*               enc_coord_host_ = nullptr;
     int32_t*               enc_cu_host_ = nullptr;
+    std::vector<int32_t>   enc_coord_tmp_;   /* one item's coordinates; kept for its capacity */
     int64_t                last_n_tok_ = 0;
     struct MediaBytes { int64_t mm = 0, pix = 0, crd = 0, cu = 0; };
-    MediaBytes media_bytes();   /* the four device regions alloc_media reserves, per rank */
+    MediaBytes media_bytes();   /* the four per-rank device regions alloc_media reserves */
     int  alloc_media();
     void free_media();
-    /* The encoder rows of one entry: the media tokens among its positions, their rows copied into
-     * the staging from `n_rows` on. Returns how many it added, or negative. */
+    /* Stage the encoder rows of one entry's media tokens, starting at row `n_rows`. Returns how
+     * many it added, or negative on error. */
     int64_t stage_mm_rows(const StepEntry& e, int64_t k, int64_t shift, int64_t n_rows,
                           int32_t* rows);
 
-    /* The members init() derives from the program and the config, allocating nothing. */
+    /* Derive the members init() needs from the program and config, without allocating. */
     int  layout(Program& prog, const Config& cfg);
-    /* The set's groups and its carve with no base: dev_bytes and host_bytes, nothing reserved. */
+    /* Fill the set's groups and sizes (dev_bytes, host_bytes) without reserving anything. */
     void size_set(Set& s, const std::vector<KVGroupInfo>& groups);
     int  alloc_set(Set& s, const std::vector<KVGroupInfo>& groups);
     void free_set(Set& s);
     /* Point every h_* at host staging based at `base`, and every d_* at rank 0's slab. */
     void carve(Set& s, char* base);
-    /* A span of `need` bytes of the ring, waiting for old uploads when it is full. */
+    /* Reserve `need` bytes of the ring, waiting for old uploads when it is full. */
     int  reserve(int64_t need, int64_t* off);
     int  run_derivations(const StepPlan& plan, Set& s);
     int  build_groups(const StepPlan& plan, const IKVManager& kv, Set& s, Out& o);

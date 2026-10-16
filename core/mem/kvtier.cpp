@@ -35,17 +35,18 @@ int IdleTiers::configure(const Config& c) {
     }
 
     char buf[512];
-    if (!any_on()) {
-        report_ = "kv tiers: off (no --prefix-cache-mib), so a finished conversation's KV stays "
-                  "in VRAM until the cache evicts it under pressure -- it is never copied to host "
-                  "memory, and what the pool is holding is mostly cache rather than live requests";
+    if (!host_on()) {
+        report_ = "kv tiers: off (no --prefix-cache-mib); a finished conversation's KV stays in "
+                  "VRAM until the cache evicts it";
     } else {
         std::snprintf(buf, sizeof buf,
                       "kv tiers: a finished conversation's KV is copied to host memory at once "
-                      "(%s, %lld entries) and its VRAM is given up when the expert loan or a "
-                      "request wants it; a full host tier drops its least recently used entries. "
-                      "One entry is %s",
+                      "(%s, %lld entries, %lld tokens of context) and its VRAM is given up when "
+                      "the expert loan or a request wants it; a full host tier drops its least "
+                      "recently used entries, the end of a conversation before its start. One "
+                      "entry is %s",
                       humanb(arena_.cap_bytes()).c_str(), (long long)arena_.capacity(),
+                      (long long)(arena_.capacity() * cfg_.block_tokens),
                       humanb(cfg_.entry_bytes).c_str());
         report_ = buf;
         if (cfg_.ckpt_bytes > 0) {
@@ -65,7 +66,6 @@ void IdleTiers::close() {
     reset();
 }
 
-/* The body of close(), for the caller that already holds the lock. */
 void IdleTiers::reset() {
     recs_.clear();
     sessions_.clear();
@@ -73,7 +73,7 @@ void IdleTiers::reset() {
     host_lru_.clear();
     wb_q_.clear();
     clean_q_.clear();
-    starved_ = 0;
+    room_.clear();
     wb_stuck_ = false;
     arena_.close();
     cfg_ = Config{};
@@ -88,12 +88,20 @@ void IdleTiers::unlist(Rec& r) {
     r.listed = false;
 }
 
-/* ONLY A RECORD WHOSE BYTES ARE ONLY OFF THE CARD. A device record -- clean or not -- is ordered by
- * the prefix cache's own LRU, and a second ordering of the same entries is the two-owner shape the
- * header's one-record rule exists to rule out. */
+/* Host records only: device records, clean or not, are ordered by the prefix cache's LRU (see the
+ * one-record rule in the header). */
+/* A use: stamps the record and moves a listed (host) one to the back of its list. */
+void IdleTiers::touch(const BlockHash& key, Rec& r, uint64_t now_ns) {
+    r.used_ns = now_ns;
+    if (r.listed) {
+        unlist(r);
+        relist(key, r);
+    }
+}
+
 void IdleTiers::relist(const BlockHash& key, Rec& r) {
     if (r.pending || r.tier == KVTier::Device || r.listed) return;
-    r.it = host_lru_.emplace_hint(host_lru_.end(), r.used_ns, key);
+    r.it = host_lru_.emplace_hint(host_lru_.end(), LruKey{ r.used_ns, r.depth }, key);
     r.listed = true;
 }
 
@@ -127,9 +135,6 @@ void IdleTiers::queue_clean(const BlockHash& key, Rec& r) {
 
 /* ------------------------------------------------------------------ the linear half */
 
-/* RECORDED, NOT MOVED. A snapshot is in host memory from the moment it is saved and stays in its
- * store slot until the cache retires it; the tiers keep its slot and position for the session
- * view. */
 void IdleTiers::note_snapshot(const BlockHash& key, int32_t slot, int64_t pos) {
     if (slot < 0) return;
     std::lock_guard lk(mu_);
@@ -144,49 +149,41 @@ void IdleTiers::release_snapshot(const BlockHash& key) {
     if (it == recs_.end()) return;
     Rec& r = it->second;
     r.ck_slot = -1;
-    /* A RECORD THAT ONLY EVER EXISTED FOR THE SNAPSHOT GOES WITH IT. note_snapshot creates one at
-     * commit time, which is mid-request and long before the chain is published; a request that
-     * never publishes -- a rebased block table, a cancel before the first whole block -- would
-     * otherwise leave a record with no blocks, no storage and no way to be reached again. */
+    /* A record that only existed for the snapshot goes with it. note_snapshot creates one
+     * mid-request; a request that never publishes (a rebased block table, a cancel before the
+     * first whole block) would otherwise leave an unreachable empty record. */
     if (!r.pending && r.tier == KVTier::Device && r.blocks.empty() && r.host_slot < 0)
         recs_.erase(it);
 }
 
 /* ------------------------------------------------------------------ the cache's notices */
 
-void IdleTiers::note_used(const BlockHash& key, const std::vector<int32_t>& blocks, uint64_t now_ns) {
-    if (!any_on()) return;
+void IdleTiers::note_used(const BlockHash& key, const std::vector<int32_t>& blocks, uint64_t now_ns,
+                          int64_t depth) {
+    if (!host_on()) return;
     std::lock_guard lk(mu_);
     Rec& r = recs_[key];
-    r.used_ns = now_ns;
     if (r.tier == KVTier::Device && !r.pending) r.blocks = blocks;
-    /* A record only moves on the host list when it is IN it. A device record is a timestamp and
-     * nothing else, which is what keeps this cheap enough to sit on the publish path -- the hash
-     * insert is the whole cost. */
-    if (r.listed) {
-        unlist(r);
-        relist(key, r);
-    }
+    /* Before touch, which files a host record under it. */
+    r.depth = depth;
+    /* For a device record this is a timestamp and a hash insert, cheap enough for the publish
+     * path. */
+    touch(key, r, now_ns);
     queue_copy(key, r);
 }
 
 void IdleTiers::note_hits(const BlockHash* keys, int64_t n, uint64_t now_ns) {
-    if (!any_on() || !keys || n <= 0) return;
+    if (!host_on() || !keys || n <= 0) return;
     std::lock_guard lk(mu_);
     for (int64_t i = 0; i < n; ++i) {
         auto it = recs_.find(keys[i]);
-        if (it == recs_.end()) continue;
-        Rec& r = it->second;
-        r.used_ns = now_ns;
-        if (r.listed) {
-            unlist(r);
-            relist(keys[i], r);
-        }
+        if (it != recs_.end()) touch(keys[i], it->second, now_ns);
     }
 }
 
-void IdleTiers::rebound(const BlockHash& key, const std::vector<int32_t>& blocks, uint64_t now_ns) {
-    if (!any_on()) return;
+void IdleTiers::rebound(const BlockHash& key, const std::vector<int32_t>& blocks, uint64_t now_ns,
+                        int64_t depth) {
+    if (!host_on()) return;
     std::lock_guard lk(mu_);
     Rec& r = recs_[key];
     if (r.pending) return;
@@ -195,6 +192,7 @@ void IdleTiers::rebound(const BlockHash& key, const std::vector<int32_t>& blocks
     r.tier = KVTier::Device;
     r.blocks = blocks;
     r.used_ns = now_ns;
+    r.depth = depth;
     queue_copy(key, r);
 }
 
@@ -207,18 +205,13 @@ bool IdleTiers::doomed(const BlockHash& key) const {
 IdleTiers::Stats IdleTiers::stats() const {
     std::lock_guard lk(mu_);
     Stats s = stats_;
-    /* What the block arena holds, clean copies included: counted off the arena rather than kept
-     * beside it, because every path that takes or returns a slot would otherwise have to remember
-     * to move a second number. */
+    /* Derived from the arena, clean copies included, so no separate counter can drift. */
     s.host_bytes = arena_.used_slots() * cfg_.entry_bytes;
     return s;
 }
 
-/* AND EVERY CONVERSATION THAT STARTED HERE. A chain whose first block has gone cannot be hit at any
- * length -- a prefix hit starts at position zero. Leaving the row behind would report blocks the
- * pool has already handed to somebody else as this session's, and would hold its whole chain in
- * memory for a conversation that can never come back. Called wherever an entry goes for good: the
- * cache's forget(), and the sites here that drop an off-device entry and tell the cache. */
+/* A chain whose first block has gone can never be hit (see roots_). Called wherever an entry goes
+ * for good: forget(), and the sites here that drop an off-device entry and tell the cache. */
 void IdleTiers::drop_rooted(const BlockHash& key) {
     auto ro = roots_.find(key);
     if (ro == roots_.end()) return;
@@ -233,9 +226,7 @@ void IdleTiers::forget(const BlockHash& key) {
     if (it == recs_.end()) return;
     Rec& r = it->second;
     if (r.pending) {
-        /* The engine is mid-transfer against this record. Erasing it now is exactly the
-         * use-after-free the one-record rule exists to prevent, so mark it and let report()
-         * finish the job and clean up. */
+        /* Mid-transfer: erasing now would be a use-after-free. report() cleans up. */
         r.doomed = true;
         return;
     }
@@ -261,16 +252,15 @@ bool IdleTiers::resident_off_device(const BlockHash& key) const {
 
 bool IdleTiers::writeback_waiting() const {
     std::lock_guard lk(mu_);
-    /* NOT WHILE NOTHING CAN MOVE. An arena full of the copies of entries still in VRAM has nothing
-     * a capacity drop may take, so a plan would pop the queue, find no slot and put it back, every
-     * tick, until a slot is freed or a VRAM copy is given up -- which is what ends the wait. */
+    /* Not while nothing can move: an arena full of copies of entries still in VRAM offers nothing
+     * to drop, so wait until a slot is freed or a VRAM copy is given up. */
     if (wb_stuck_ && arena_.full()) return false;
     return !wb_q_.empty() && host_on();
 }
 
 bool IdleTiers::starved() const {
     std::lock_guard lk(mu_);
-    return starved_ > 0;
+    return !room_.empty();
 }
 
 void IdleTiers::plan_writeback(int64_t max_entries, std::vector<TierJob>* out) {
@@ -293,11 +283,8 @@ void IdleTiers::plan_writeback(int64_t max_entries, std::vector<TierJob>* out) {
         out->push_back(std::move(j));
     }
 
-    /* THE HOST SLOTS, AS RUNS. Taken for the whole batch at once so that entries planned together
-     * sit together in the arena and each run crosses the link as one copy. A batch the arena
-     * cannot hold is cut where the arena ran out: the entries past that point go back to the
-     * front of the queue, and the maintenance plan is told how many copies were refused so it can
-     * make that much room. */
+    /* Allocate host slots for the whole batch as runs, so each run crosses the link as one copy.
+     * Jobs past where the arena ran out are refused; see below. */
     const int64_t want = (int64_t)(out->size() - first);
     std::vector<int32_t> slots;
     slots.reserve((size_t)want);
@@ -316,7 +303,6 @@ void IdleTiers::plan_writeback(int64_t max_entries, std::vector<TierJob>* out) {
             ++i;
             continue;
         }
-        ++starved_;
         refused.push_back(j.key);
         out->erase(out->begin() + (long)i);
     }
@@ -326,13 +312,55 @@ void IdleTiers::plan_writeback(int64_t max_entries, std::vector<TierJob>* out) {
         unlist(r);
         r.pending = true;
     }
-    /* Back where they were, at the front and in order, so the oldest conversation is still the
-     * first copied once there is room. */
+    if (refused.empty()) return;
+
+    /* A refused copy is worth making room for only by dropping a host entry worth less than it.
+     * The most valuable refused copies are matched with the least valuable host entries; one
+     * that finds none leaves the queue, since any room made for it would cost more than it
+     * saves: it would drop a conversation's start to keep its end, or a newer conversation to
+     * keep an older one. Its entry stays in VRAM only and is copied again when a turn uses it. */
+    const LruOrder less;
+    std::vector<std::pair<LruKey, BlockHash>> by_value;
+    by_value.reserve(refused.size());
+    for (const BlockHash& k : refused) {
+        const Rec& r = recs_[k];
+        by_value.push_back({ LruKey{ r.used_ns, r.depth }, k });
+    }
+    std::sort(by_value.begin(), by_value.end(),
+              [&less](const auto& a, const auto& b) { return less(b.first, a.first); });
+    std::unordered_set<BlockHash, BlockHashHash> keep;
+    int64_t held = 0;
+    auto victim = host_lru_.begin();
+    for (const auto& kv : by_value) {
+        if (victim != host_lru_.end() && less(victim->first, kv.first)) {
+            room_.push_back(kv.first);
+            keep.insert(kv.second);
+            ++victim;
+        } else {
+            ++held;
+        }
+    }
+    /* Requeue at the front, in order, so the oldest is still copied first. */
     for (auto it = refused.rbegin(); it != refused.rend(); ++it) {
+        if (!keep.count(*it)) continue;
         auto ri = recs_.find(*it);
         if (ri == recs_.end() || ri->second.queued) continue;
         wb_q_.push_front(*it);
         ri->second.queued = true;
+    }
+    if (held == 0) return;
+    stats_.held_back += held;
+    const uint64_t now = rad_mono_ns();
+    if (held_back_warned_ns_ == 0 || now - held_back_warned_ns_ >= 60ull * 1000000000ull) {
+        held_back_warned_ns_ = now;
+        RAD_WARN("kv tiers: %lld entries (%lld tokens of context) got no host copy: the host "
+                 "tier (--prefix-cache-mib, %s, %lld tokens) is full of context used more "
+                 "recently or nearer the start of its conversation. They stay in VRAM only and "
+                 "are prefilled again once VRAM gives them up; a larger --prefix-cache-mib holds "
+                 "more. Counted in /sessions moved.held_back",
+                 (long long)held, (long long)(held * cfg_.block_tokens),
+                 humanb(arena_.cap_bytes()).c_str(),
+                 (long long)(arena_.capacity() * cfg_.block_tokens));
     }
 }
 
@@ -372,13 +400,14 @@ void IdleTiers::drop_commit(const BlockHash& key) {
 void IdleTiers::plan(int budget, std::vector<TierJob>* out) {
     if (!host_on() || budget <= 0) return;
     std::lock_guard lk(mu_);
-    /* HOW MANY, AND NOT "UNTIL THERE IS ROOM". A queued drop does not free its slot until the
-     * engine reports it, so a loop that tested the arena would queue a drop for every entry on the
-     * list and empty the whole tier to make room for one. The copies refused since the last plan
-     * say how much room was wanted; this frees exactly that much, least recently used first. */
-    const int64_t want = std::min<int64_t>(starved_, budget);
-    starved_ = 0;
+    /* Drop one entry for each copy refused, least valuable first, and only one worth less than
+     * the copy it makes room for (room_ runs most valuable first, the list least valuable first,
+     * so the first pair that fails ends the plan). Looping until the arena has room would empty
+     * the tier, since a queued drop frees its slot only when the engine reports it. */
+    const int64_t want = std::min<int64_t>((int64_t)room_.size(), budget);
+    const LruOrder less;
     for (int64_t k = 0; k < want && !host_lru_.empty();) {
+        if (!less(host_lru_.begin()->first, room_[(size_t)k])) break;
         auto ri = recs_.find(host_lru_.begin()->second);
         if (ri == recs_.end()) { host_lru_.erase(host_lru_.begin()); continue; }
         Rec& r = ri->second;
@@ -392,13 +421,14 @@ void IdleTiers::plan(int budget, std::vector<TierJob>* out) {
         out->push_back(std::move(j));
         ++k;
     }
+    room_.clear();
 }
 
 void IdleTiers::expired(uint64_t cutoff_ns, size_t max, std::vector<BlockHash>* out) const {
     std::lock_guard lk(mu_);
-    /* The list holds no record with a job out (relist), so every key it yields can go now. */
+    /* The list holds no pending record (relist), so every key here can go now. */
     for (auto it = host_lru_.begin();
-         it != host_lru_.end() && it->first < cutoff_ns && out->size() < max; ++it)
+         it != host_lru_.end() && it->first.used_ns < cutoff_ns && out->size() < max; ++it)
         out->push_back(it->second);
 }
 
@@ -424,21 +454,19 @@ void IdleTiers::report(const TierJob& job, bool ok, uint64_t now_ns) {
     std::lock_guard lk(mu_);
     auto it = recs_.find(job.key);
     if (it == recs_.end()) {
-        /* Nothing names the slots a copy was handed but the job itself. */
+        /* Only the job names a write-back's slot. */
         if (job.kind == TierJob::Kind::WriteBack) give_slot(job.host_slot);
         return;
     }
     Rec& r = it->second;
     r.pending = false;
-    /* A promotion the chain was cut before is not a failure: nothing was tried. */
+    /* An unstarted promotion is not a failure: nothing was tried. */
     if (!ok && (job.kind != TierJob::Kind::ToDevice || job.started)) ++stats_.failures;
 
-    /* A record that was forgotten mid-transfer is finished off here and nowhere else. Doing it at
-     * the top, before the per-kind handling, means no branch below has to remember to check. */
+    /* A record forgotten mid-transfer is finished off here, before the per-kind handling. */
     if (r.doomed) {
-        /* THE JOB'S SLOT AND THE RECORD'S ARE NOT THE SAME SLOT on every path. A copy's host slot
-         * is the job's until it reports; freeing only the record's would leak it, and freeing the
-         * job's as well where it IS the record's would return one slot twice. */
+        /* The job's slot may or may not be the record's: a write-back's slot belongs to the job
+         * until it reports. Free each distinct slot once. */
         if (job.host_slot >= 0 && job.host_slot != r.host_slot) give_slot(job.host_slot);
         free_host(r);
         recs_.erase(it);
@@ -467,29 +495,22 @@ void IdleTiers::report(const TierJob& job, bool ok, uint64_t now_ns) {
             if (ok) {
                 r.tier = KVTier::Device;
                 r.blocks = job.blocks;
-                /* THE HOST COPY IS KEPT, which is what makes the entry clean the moment it lands:
-                 * its VRAM copy can go again at no cost, and the next copy this conversation needs
-                 * is only of the tokens its next turn adds. */
+                /* The host copy is kept, so the entry is clean on landing. */
                 r.host_slot = job.host_slot;
-                /* THE CLOCK RESTARTS: the entry came back because a request is about to hit it. */
+                /* A request is about to hit it. */
                 if (now_ns) r.used_ns = now_ns;
                 ++stats_.promoted;
                 queue_clean(job.key, r);
                 return;
             }
             if (!job.started) {
-                /* NEVER STARTED: the reservation ran out before this entry, and nothing about it
-                 * was touched. It stays exactly where it was. */
+                /* Never started: the reservation ran out first. It stays on the host tier. */
                 relist(job.key, r);
                 return;
             }
-            /* A FAILED PROMOTION DROPS THE ENTRY, AND THE CACHE MUST HEAR ABOUT IT. Every other
-             * failure here can leave the record where it was, because nothing was consumed. This
-             * one cannot: the scatter may have written some layers and not others, so the blocks
-             * hold a mixture and the cached tensors are no longer a function of the tokens. A miss
-             * is always safe and this is the only way to guarantee one -- but the prefix cache
-             * still holds an entry naming blocks that are not ours any more, and left alone it
-             * would serve them. */
+            /* A started promotion that failed may have scattered some layers and not others, so
+             * the entry is dropped to force a miss, and the cache is told so it stops naming the
+             * blocks. */
             if (job.host_slot >= 0 && job.host_slot != r.host_slot) give_slot(job.host_slot);
             free_host(r);
             recs_.erase(it);
@@ -510,10 +531,8 @@ void IdleTiers::report(const TierJob& job, bool ok, uint64_t now_ns) {
 
 /* ------------------------------------------------------------------ the session view */
 
-/* A PREFIX RELATION IS WHAT MAKES TWO CHAINS THE SAME CONVERSATION. The blocks are content
- * addressed, so turn N's chain is byte for byte turn N-1's with more on the end; anything that
- * diverges anywhere is a different transcript from that point on, however much of a system prompt
- * it shares. */
+/* Two chains are the same conversation when one is a prefix of the other: blocks are content
+ * addressed, so turn N's chain is turn N-1's plus more. */
 static bool chain_extends(const std::vector<BlockHash>& shorter,
                           const std::vector<BlockHash>& longer) {
     if (shorter.size() > longer.size()) return false;
@@ -526,24 +545,15 @@ void IdleTiers::note_session(uint64_t id, const std::vector<BlockHash>& chain, i
     if (chain.empty()) return;
     std::lock_guard lk(mu_);
 
-    /* A SESSION IS A LEAF OF THE PREFIX TRIE, and that is what decides every case here. The turns
-     * of one conversation arrive under different ids -- the id is the request's, and a
-     * conversation is a new request every turn -- so without this the table grows a row a turn,
-     * each holding its own copy of a chain that is a prefix of the next one's and none of them
-     * ever revisited. Candidates are the sessions sharing this root, which is a handful at most.
+    /* A session is a leaf of the prefix trie. Each turn arrives under a new request id, so the
+     * candidates are the sessions sharing this root (a handful at most):
      *
-     * A CHAIN THIS ONE EXTENDS HAS STOPPED BEING A LEAF, so it is absorbed: its blocks are the
-     * first blocks of this one, byte for byte, because the chain is content addressed.
-     *
-     * A CHAIN THAT EXTENDS THIS ONE MEANS THIS ONE IS NOT A LEAF EITHER. That happens when a
-     * preempted request re-prefills and republishes SHORTER than the conversation it belongs to;
-     * recording it would shrink the row to less than the pool is holding, and there may be
-     * several conversations below it -- two clients past the same system prompt -- with nothing
-     * to say which of them republished. So the most recent of them is touched and no row is
-     * added, which is the one answer that is wrong about nothing. */
+     *   - a chain this one extends is no longer a leaf and is absorbed;
+     *   - a chain that extends this one means this is not a leaf either (a preempted request
+     *     republishing shorter). Several conversations may extend it, so the most recent one is
+     *     touched and no row is added. */
     uint64_t first_seen = 0;
-    /* A conversation's label outlives the turn that sent it: a later turn without one keeps the
-     * name an earlier one gave. */
+    /* A label persists across later turns that send none. */
     std::string kept_label = label;
     bool absorbed = false;
     std::vector<uint64_t>& at_root = roots_[chain[0]];
@@ -596,20 +606,14 @@ void IdleTiers::drop_session(uint64_t id) {
     sessions_.erase(it);
 }
 
-void IdleTiers::forget_session(uint64_t id) {
-    std::lock_guard lk(mu_);
-    drop_session(id);
-}
-
 std::vector<IdleTiers::SessionInfo> IdleTiers::sessions(Occupancy* occ) const {
-    /* The view's hold on the lock, a slice at a time (YieldingMutex). */
+    /* One slice's hold on the lock (YieldingMutex). */
     struct Slice {
         YieldingMutex& m;
         explicit Slice(YieldingMutex& mu) : m(mu) { m.lock_after_others(); }
         ~Slice() { m.unlock(); }
     };
-    /* Records a slice visits: a few microseconds of hash lookups, the most an engine-side taker
-     * arriving mid-slice waits. */
+    /* Records per slice: a few microseconds of hash lookups, the longest an engine thread waits. */
     constexpr size_t kSliceRecords = 64;
 
     std::vector<SessionInfo> out;
@@ -628,19 +632,14 @@ std::vector<IdleTiers::SessionInfo> IdleTiers::sessions(Occupancy* occ) const {
             out.push_back(std::move(si));
         }
     }
-    /* SNAPSHOTS IN THE STORE, each once. The store is the engine's and is not read from this
-     * thread -- but this walk visits every record a stored conversation reaches, so it counts them
-     * here. They are sparse, one per checkpoint interval, so the set stays small beside the walk
-     * that fills it. */
+    /* Distinct snapshots reached by the walk, for Occupancy. The store itself is the engine's and
+     * is not read from this thread. One per checkpoint interval, so the set stays small. */
     std::unordered_set<BlockHash, BlockHashHash> host_snaps;
     size_t kept = 0;
     for (size_t k = 0; k < out.size(); ++k) {
         SessionInfo& si = out[k];
-        /* The histogram is computed here and stored nowhere. A session's blocks move one tier at
-         * a time under a bounded plan, so a second copy of this would be stale between the pass
-         * that moves the first block and the pass that moves the last -- which is exactly the
-         * window an operator is looking at the page during. The session is found again at every
-         * slice: between slices it may have been absorbed into a longer one or dropped, and a
+        /* The histogram is computed, never stored, since blocks move a few at a time. The session
+         * is looked up again each slice: in between it may have been absorbed or dropped, and a
          * row that is gone is left out. */
         bool gone = false;
         for (size_t at = 0;;) {
@@ -659,8 +658,7 @@ std::vector<IdleTiers::SessionInfo> IdleTiers::sessions(Occupancy* occ) const {
                     case KVTier::Device: ++si.on_device; break;
                     case KVTier::Host:   ++si.on_host;   break;
                 }
-                /* THE LINEAR HALF, which is in host memory from the moment it is saved, whatever
-                 * tier its blocks are on. */
+                /* Snapshots are in host memory whatever tier the blocks are on. */
                 if (rr.ck_slot >= 0) {
                     ++si.snapshots;
                     if (occ) host_snaps.insert(h);
@@ -683,8 +681,7 @@ std::vector<IdleTiers::SessionInfo> IdleTiers::sessions(Occupancy* occ) const {
         Slice lk(mu_);
         occ->host_bytes = arena_.used_slots() * cfg_.entry_bytes +
                           (int64_t)host_snaps.size() * cfg_.ckpt_bytes;
-        /* What the operator gave the block arena and the snapshot store -- the same scope as
-         * `host_bytes` above, which counts both. */
+        /* Block arena plus snapshot store, the same scope as `host_bytes`. */
         occ->host_cap_bytes = (host_on() ? cfg_.host_cap_bytes : 0) +
                               cfg_.ckpt_slots * cfg_.ckpt_bytes;
     }

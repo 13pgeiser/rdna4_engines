@@ -1,27 +1,23 @@
 /* engine_mm.cpp -- the encoder driver (spec §11).
  *
  * The scheduler holds back a request whose media is not encoded (Scheduler::media_ready) and hands
- * its items here. They are encoded BETWEEN steps, never inside one: a pass is issued with no step
- * in flight, read back, and the item marked done, so the next step's admission finds its rows in
- * host memory and the batch builder copies them in with the chunk that reaches them. Nothing on the
- * step path ever waits on the tower.
+ * its items here. They are encoded between steps, never inside one: a pass runs with no step in
+ * flight, is read back, and the item is marked done, so admission finds its rows in host memory and
+ * the batch builder copies them in with the chunk that reaches them. The step path never waits on
+ * the tower.
  *
- * A PASS IS WHOLE SEGMENTS. An image is one segment and a video one per temporal group, and the
- * encoder attends within a segment, so a pass may end between two segments of a video and never
- * inside one; the processor has already kept every segment within a pass. Several items share a
- * pass when they fit, which is what a request with a handful of small pictures wants.
+ * A pass holds whole segments: an image is one segment, a video one per temporal group, and the
+ * encoder attends within a segment (the processor keeps each within a pass). Several items share a
+ * pass when they fit. An audio clip is one segment of the audio encoder, whose passes are separate.
  *
- * AN AUDIO CLIP IS ONE SEGMENT OF THE AUDIO ENCODER, whose passes are separate from the vision
- * tower's: a program declares one of each at most, and an item goes to the one its kind names.
- *
- * EVERY RANK RUNS THE WHOLE TOWER on its own card from its own copy of the patches. The rows are
- * needed on every rank anyway -- each rank embeds every token -- and running it everywhere costs the
- * encoder's compute once per card instead of a transfer of its output between them.
+ * Every rank runs the whole tower from its own copy of the patches: every rank embeds every token,
+ * so this costs compute per card instead of a transfer between them.
  */
 #include "engine_priv.h"
 
 #include "mm/processor.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 
@@ -31,11 +27,11 @@ int Engine::run_encodes() {
     std::vector<std::shared_ptr<mm::Item>> items;
     sched_.take_encodes(&items);
     if (items.empty()) return RAD_OK;
+    const auto t0 = std::chrono::steady_clock::now();
 
-    /* A DIAGNOSTIC: RADIANCE_DEBUG_MM_DUMP=<dir> writes each item's patches (`.pix.bf16`, the
-     * processor's output in merge-block order) and its rows (`.bf16`) there as raw bf16, named by
-     * its content key -- the tower's input and output, for comparison against a reference encoder
-     * fed the same input. */
+    /* Diagnostic: RADIANCE_DEBUG_MM_DUMP=<dir> writes each item's patches (`.pix.bf16`, processor
+     * output in merge-block order) and rows (`.bf16`) as raw bf16, named by content key, for
+     * comparison against a reference encoder. */
     static const char* const dump_dir = std::getenv("RADIANCE_DEBUG_MM_DUMP");
     auto dump = [&](const mm::Item& it, const char* ext, const uint16_t* p, size_t n) {
         char path[512];
@@ -58,8 +54,8 @@ int Engine::run_encodes() {
         if (dump_dir && *dump_dir) dump(*ip, ".pix.bf16", ip->pixels.data(), ip->pixels.size());
     }
 
-    /* THE PASSES, ENCODER BY ENCODER: an audio clip goes through the audio encoder and a picture
-     * or a video through the other, each with its own pass size and output buffer. */
+    /* Passes per encoder: audio through the audio encoder, pictures and video through the vision
+     * encoder, each with its own pass size and output buffer. */
     for (int which = 0; which < 2; ++which) {
         const bool audio = which == 1;
         const RadEncoderDecl& enc = audio ? prog.audio_encoder : prog.encoder;
@@ -103,18 +99,15 @@ int Engine::run_encodes() {
             const RadBatch* b = sched_.build_encoder(parts, enc_step_++, enc);
             if (!b) return RAD_E_STATE;
             RAD_TRY(prepare_release(b));
-            /* THE OUTPUT'S ADDRESS IS THE PASS'S LEVEL'S, read after prepare_release: a pass runs
-             * at the arena's full plan (Engine::arena_step), and a buffer sits at another offset
-             * in every level. An address taken at the level the last step left would read some
-             * other buffer, or memory lent to the expert slab, in place of the rows. */
+            /* Read the output address after prepare_release: a pass runs at the arena's full plan
+             * (Engine::arena_step), and a buffer's offset differs per level. */
             void* out = r0.ctx.buf_ptr(enc.out);
             if (!out) {
                 RAD_ERR("encoder '%s': its output buffer was declared but never planned",
                         enc_name.c_str());
                 return RAD_E_STATE;
             }
-            /* kIssueModel: the pass and nothing behind it -- no sampler, and no tiering tick,
-             * which belongs to steps. */
+            /* kIssueModel: the pass only, with no sampler and no tiering tick. */
             issue_what_.store(kIssueModel, std::memory_order_release);
             step_batch_.store(b, std::memory_order_release);
             barrier_->arrive_and_wait();
@@ -137,8 +130,7 @@ int Engine::run_encodes() {
                                          bytes, r0.ctx.stream()));
                 row += rows;
             }
-            /* Every rank's stream, not only rank 0's: the next pass rewrites the staging every
-             * rank's copy reads, and the arena every rank's tower wrote. */
+            /* Sync every rank's stream: the next pass rewrites every rank's staging and arena. */
             for (auto& rk : ranks_) RAD_TRY(rad_stream_sync(rk->ctx.stream()));
         }
     }
@@ -151,7 +143,9 @@ int Engine::run_encodes() {
         it.pixels.shrink_to_fit();
         if (dump_dir && *dump_dir) dump(it, ".bf16", it.embd.data(), it.embd.size());
     }
-    RAD_DEBUG("encoder: %zu item(s) encoded", items.size());
+    RAD_DEBUG("encoder: %zu item(s) encoded in %.1f ms", items.size(),
+              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                  .count());
     return RAD_OK;
 }
 

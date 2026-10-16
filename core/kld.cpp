@@ -231,8 +231,8 @@ int Kld::load_corpus(const Config& cfg, const std::shared_ptr<const Vocab>& voca
             RAD_ERR("kld: %s line %lld has no \"prompt\" string", corpus_.c_str(), (long long)lineno);
             return RAD_E_FORMAT;
         }
-        /* THE TEXT AS THE SERVER WOULD SEE A RENDERED TEMPLATE: control tokens in it are
-         * themselves, and nothing is added in front. */
+        /* Tokenised as the server tokenises a rendered template: control tokens parsed, nothing
+         * prepended. */
         std::vector<int32_t> ids;
         RAD_TRY(tok.encode(j["prompt"].get<std::string>(), ids, false, true));
         const int64_t from = j.value("score_from", (int64_t)0);
@@ -253,8 +253,8 @@ int Kld::record_into(const std::string& dir, int64_t n_vocab, const std::string&
     n_vocab_ = n_vocab;
     if (docs_.empty()) return RAD_E_INVAL;
     size_rows();
-    /* A REFERENCE IS NEVER OVERWRITTEN. Everything measured against it would silently change
-     * meaning; a directory with no manifest is a run that died, and is written over. */
+    /* Never overwrite a reference; a directory without a manifest is an interrupted run and is
+     * reused. */
     ::mkdir(dir_.c_str(), 0755);
     struct stat st{};
     if (::stat((dir_ + "/kld.json").c_str(), &st) == 0) {
@@ -380,7 +380,7 @@ int Kld::score(const std::vector<KldSpan>& spans, const std::vector<KldShard>& s
     return RAD_OK;
 }
 
-/* THE REFERENCE ROW: log-softmax over the whole vocabulary, in double where it sums. */
+/* The reference row: log-softmax over the whole vocabulary, summed in double. */
 void Kld::record_row(const Job& j, const std::vector<KldShard>& sh, std::vector<uint16_t>& f16) {
     float m = -std::numeric_limits<float>::infinity();
     for (const KldShard& s : sh) {
@@ -429,14 +429,14 @@ void Kld::record_row(const Job& j, const std::vector<KldShard>& sh, std::vector<
         io_err_.store(1);
 }
 
-/* THE CANDIDATE ROW against the reference's:
+/* The candidate row against the reference's:
  *
  *   KL(P || Q) = sum_i p_i (log p_i - log q_i)
  *
- * with log q from this model's logits at full f32 precision and log p from the reference: f16
- * for the whole row, then the kKldTop most likely tokens replaced by their exact values. p is
- * renormalised over the row as stored -- the f16 rounding leaves sum p a few 1e-5 off one -- so
- * with S = sum e^{lp} and A = sum e^{lp} (lp - lq), KL = A / S - log S. */
+ * with log q from this model's f32 logits and log p from the reference (f16 for the row, exact for
+ * the kKldTop most likely tokens). p is renormalised over the stored row (f16 rounding leaves
+ * sum p a few 1e-5 off one): with S = sum e^{lp} and A = sum e^{lp} (lp - lq), KL = A / S -
+ * log S. */
 void Kld::score_row(const Job& j, const std::vector<KldShard>& sh, std::vector<uint16_t>& f16) {
     float m = -std::numeric_limits<float>::infinity();
     int64_t arg = 0;

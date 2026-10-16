@@ -63,7 +63,7 @@ vendor/llama/common/jinja/                   <- llama.cpp common/jinja/
     on nlohmann/json and common/unicode.h and on nothing else in llama.cpp -- no ggml, no
     llama.h, no common.h -- which is why it lifts cleanly and chat.cpp did not.
 
-    LOCAL CHANGES: none.
+    LOCAL CHANGES: patches/0015-jinja-print-a-list-or-a-dict-as-its-repr.patch
 
 vendor/llama/common/chat.{h,cpp}
 vendor/llama/common/chat-auto-parser.h
@@ -100,6 +100,7 @@ vendor/llama/common/regex-partial.{h,cpp}    <- llama.cpp common/*
                    patches/0012-json-schema-a-schema-no-value-satisfies.patch
                    patches/0013-json-schema-a-count-past-int-is-no-bound.patch
                    patches/0014-json-schema-a-not-of-every-type-is-never.patch
+                   patches/0016-chat-analyse-a-template-once.patch
 
     On 0003: a `pattern` in a `response_format` reaches _visit_pattern() as client data, and three
     of its paths do not survive that. `front()`/`back()` run on an empty string; `seq.back()` runs
@@ -156,9 +157,8 @@ vendor/cpp-httplib/LICENSE                   <- llama.cpp vendor/cpp-httplib/cpp
 REWRITTEN INTO core/ INSTEAD
 ----------------------------
 
-spec §12 lists these as lifts. Each one turned out to be a file we would have had to modify
-heavily, and a file you modify heavily is a file that belongs in core/ under our own name -- so
-it is there, with a comment at the top naming what it was read from.
+spec §12 marks these as rewritten. Each one would have needed heavy modification, so it lives in
+core/ under our own name, with a comment at the top naming what it was read from.
 
   src/llama-grammar.{h,cpp} -> core/sample/gbnf.{h,cpp}
       MIT, same upstream commit. The GBNF parser and the stack machine, element for element; it
@@ -460,3 +460,30 @@ PATCH SERIES
       not stand for `number`, so a `not` is only read as `never` when it is. Every other `not` is
       refused as 0004 refuses it. The comment of 0012 above is_unsatisfiable, which 0013 had left
       above _schema_count, is back beside the function it describes.
+
+  patches/0015-jinja-print-a-list-or-a-dict-as-its-repr.patch
+
+      `{{ value }}` with a list or a dict printed the list's strings run together and nothing at
+      all for a dict: statement results are gathered as an array and flattened, and an
+      expression's own list was flattened with them. jinja2 prints the repr. MiniCPM5's template
+      prints a tool call's arguments with a bare `{{ param_value }}`, so every list or object
+      argument in a replayed call reached the model as `<param name="edits"></param>`. Every block
+      statement returns a string, so a list or a dict among a block's results is now printed as
+      its repr. The repr of a string inside one is Python's: single quotes unless the text holds
+      one and no double quote, and backslash escapes for the backslash, the quote and the ASCII
+      controls; it was the bare text in single quotes, or JSON when it held a quote. Python also
+      escapes non-printable non-ASCII code points, which pass through. tests/chat_test.cpp
+      (every_shipped_template_renders_as_reference_jinja_does) compares every shipped template's
+      render with Python jinja2's.
+
+  patches/0016-chat-analyse-a-template-once.patch
+
+      common_chat_templates_apply ran autoparser::analyze_template on every request: many
+      renders of the template to find its reply delimiters, most of what a Qwen 3.x or MiniCPM5
+      render cost. The analysis reads nothing but the template, so it is now made on
+      first use and kept beside the template (one for template_default, one for
+      template_tool_use), under a mutex because requests render from several threads. An analysis
+      that throws is not kept, so the next request throws the same refusal. The parser generated
+      from it per request is unchanged: the prompt, grammar, triggers, preserved tokens, stops and
+      PEG parser of 32 requests through each shipped template hash the same with and without the
+      cache, and a render took 1.4-1.6 ms with it against 10-13 ms without (one loaded machine).

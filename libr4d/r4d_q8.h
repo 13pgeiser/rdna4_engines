@@ -1,15 +1,13 @@
 // r4d_q8.h -- the 8-bit activation codes the trunk GEMMs read, written by every quantising producer:
 // E4M3 for the fp8a8 GEMMs, int8 for their int8 twins (gemm_i8a8_*). One scale per (row, 128
-// columns) either way; only the largest code and the conversion differ.
+// columns); only the largest code and the conversion differ.
 //
-// THE E4M3 FORM IS EXACTLY WHAT EACH PRODUCER WROTE INLINE BEFORE: the scale `amax * (1 / 448)`,
-// the clamp to +-448 (v_cvt_pk_fp8_f32 answers an out-of-range input with NaN rather than
-// saturating, and `amax * (1 / scale)` can land an ulp above 448), and two packed conversions. So a
-// producer switched to this header writes the same bytes it did.
+// E4M3: scale `amax * (1 / 448)`, clamp to +-448, two packed conversions. The clamp is required:
+// v_cvt_pk_fp8_f32 returns NaN for out-of-range input instead of saturating, and
+// `amax * (1 / scale)` can land an ulp above 448.
 //
-// THE INT8 FORM IS quant_act_i8g's (r4d_quant_act_fp8.hip): the scale `amax * (1 / 127)` and the
-// value over it rounded to nearest-even, -127..127 -- so a producer that writes int8 itself writes
-// exactly what the standalone quantiser would have written from the bf16 plane.
+// Int8: as quant_act_i8g (r4d_quant_act_fp8.hip), scale `amax * (1 / 127)` and round-to-nearest-
+// even into -127..127, so a fused producer writes the same codes as the standalone quantiser.
 #pragma once
 #include <hip/hip_runtime.h>
 #include <cstdint>

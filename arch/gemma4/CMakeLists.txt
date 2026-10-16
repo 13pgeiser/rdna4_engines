@@ -1,8 +1,8 @@
-# gemma4 -- the architecture plugin for Gemma 4's text model (Gemma4ForConditionalGeneration /
-# Gemma4ForCausalLM; the 26B-A4B MoE and the dense sizes without per-layer embeddings), with a
+# gemma4 -- architecture plugin for Gemma 4's text model (Gemma4ForConditionalGeneration /
+# Gemma4ForCausalLM: the 26B-A4B MoE and the dense sizes without per-layer embeddings), with a
 # z-lab DFlash drafter merged at convert time.
 #
-# Built inside radiance's tree (arch/ discovers it) or on its own against an installed radiance:
+# Built in radiance's tree (arch/ discovers it) or standalone against an installed radiance:
 #   cmake -S arch/gemma4 -B build-gemma4 -DCMAKE_PREFIX_PATH=/opt/radiance && cmake --build build-gemma4
 if(NOT COMMAND rad_add_plugin)
   cmake_minimum_required(VERSION 3.21)

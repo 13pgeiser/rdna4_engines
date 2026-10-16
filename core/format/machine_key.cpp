@@ -1,10 +1,6 @@
-/* machine_key.cpp -- the machine half of the tuning cache key.
- *
- * Separate from tunecache.cpp on purpose: the cache is pure file I/O and must stay linkable and
- * testable without a device layer, while this needs one. It is also the only part of the key that
- * can be wrong in a way that is invisible -- a cache measured on another card is not a slower
- * answer, it is a wrong one -- so it names everything that changes the answer and nothing that
- * does not.
+/* machine_key.cpp -- the machine half of the tuning cache key. Separate from tunecache.cpp, which
+ * is pure file I/O and must link without a device layer. A cache from another machine gives wrong
+ * answers, so the key names everything that changes the answer and nothing else.
  */
 #include "tunecache.h"
 
@@ -15,10 +11,12 @@ namespace rad {
 std::string rad_machine_key() {
     RadDeviceProps p{};
     const int n = rad_dev_count();
+    return rad_machine_key_of(n, n > 0 && rad_dev_props(0, &p) >= 0 ? &p : nullptr);
+}
 
-    /* The host backend is a supported configuration and not a degraded one, so it gets a real key
-     * rather than a placeholder: host kernels tune too, and their answer depends on the CPU. */
-    if (n <= 0 || rad_dev_props(0, &p) < 0) {
+std::string rad_machine_key_of(int n, const RadDeviceProps* dev) {
+    /* No device to name at all. */
+    if (n <= 0 || !dev) {
 #if defined(__x86_64__)
         return "host-x86_64";
 #elif defined(__aarch64__)
@@ -28,10 +26,12 @@ std::string rad_machine_key() {
 #endif
     }
 
-    /* Device count matters because a collective's variant depends on how many peers there are,
-     * and those rows share this file. Card name is included, arch is not enough: two boards of the
-     * same architecture can differ in clocks and memory width. */
-    std::string name = p.is_host_backend ? "host" : p.name;
+    /* Device count, because a collective's variant depends on the peer count; card name, because
+     * boards of one arch differ in clocks and memory width. The host backend's device name is the
+     * CPU model, which host kernels' tuning depends on (an AVX2 part's answer is not an AVX-512
+     * part's), so its key is `host-x<N>-<cpu model>`. */
+    const RadDeviceProps& p = *dev;
+    std::string name = p.name;
     for (char& c : name)
         if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')))
             c = '_';

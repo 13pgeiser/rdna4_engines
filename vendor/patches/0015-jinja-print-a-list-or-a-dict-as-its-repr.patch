@@ -1,0 +1,67 @@
+diff --git a/common/jinja/runtime.h b/common/jinja/runtime.h
+index b6f4a6ab..af84c910 100644
+--- a/common/jinja/runtime.h
++++ b/common/jinja/runtime.h
+@@ -606,7 +606,15 @@ static void gather_string_parts_recursive(const value & val, value_string & part
+     } else if (is_val<value_array>(val)) {
+         auto items = cast_val<value_array>(val)->as_array();
+         for (const auto & item : items) {
+-            gather_string_parts_recursive(item, parts);
++            /* RADIANCE: `val` is a block's statement results, and every block statement returns
++             * a string, so a list or a dict among them is the value of an expression the template
++             * prints. jinja2 prints its repr; flattening it ran its strings together and printed
++             * nothing for a dict. */
++            if (is_val<value_array>(item) || is_val<value_object>(item)) {
++                parts->val_str.append(item->as_string().str());
++            } else {
++                gather_string_parts_recursive(item, parts);
++            }
+         }
+     }
+ }
+diff --git a/common/jinja/value.cpp b/common/jinja/value.cpp
+index 16b8bbf1..b7af1ae1 100644
+--- a/common/jinja/value.cpp
++++ b/common/jinja/value.cpp
+@@ -1496,13 +1496,35 @@ std::string value_to_json(const value & val, int indent, const std::string_view
+ // TODO: avoid circular references
+ std::string value_to_string_repr(const value & val) {
+     if (is_val<value_string>(val)) {
+-        const std::string val_str = val->as_string().str();
+-
+-        if (val_str.find('\'') != std::string::npos) {
+-            return value_to_json(val);
+-        } else {
+-            return "'" + val_str + "'";
++        /* RADIANCE: Python's str repr, which jinja2 prints for a string inside a list or a dict:
++         * single quotes unless the text holds one and no double quote, and backslash escapes for
++         * the backslash, the quote, \t \n \r and the other ASCII controls. Python also escapes
++         * non-printable non-ASCII code points; those pass through here. */
++        const std::string s = val->as_string().str();
++        const char q = s.find('\'') != std::string::npos && s.find('"') == std::string::npos ? '"' : '\'';
++        std::string out(1, q);
++        for (const char ch : s) {
++            const unsigned char c = (unsigned char) ch;
++            if (ch == q || ch == '\\') {
++                out += '\\';
++                out += ch;
++            } else if (ch == '\t') {
++                out += "\\t";
++            } else if (ch == '\n') {
++                out += "\\n";
++            } else if (ch == '\r') {
++                out += "\\r";
++            } else if (c < 0x20 || c == 0x7f) {
++                static const char hex[] = "0123456789abcdef";
++                out += "\\x";
++                out += hex[c >> 4];
++                out += hex[c & 15];
++            } else {
++                out += ch;
++            }
+         }
++        out += q;
++        return out;
+     } else {
+         return val->as_repr();
+     }

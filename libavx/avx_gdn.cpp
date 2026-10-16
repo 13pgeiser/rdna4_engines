@@ -1,80 +1,57 @@
 /* avx_gdn.cpp -- the gated delta net: the two convolution forms, the triangular solve, the chunked
  * scan, the decode recurrence, and the gated norm.
  *
- * ============================== WHAT IS ACTUALLY SLOW HERE ==============================
+ * These ops contract heads (128 elements of k against 128 of q, or a [128, 128] state against a
+ * key), and libref reads every operand of every product through `ldt`, a dtype switch per element.
+ * In the quadratic ops that is the whole cost (gdn_kkt_solve at chunk 64, head_k 128: 1 M switched
+ * loads over 8 K distinct elements). Here each chunk's q, k and v rows are widened once into f32
+ * panels and every dot is a vector reduction. The algorithms are libref's, step for step:
  *
- * These are not elementwise ops and the win is not the vector width. Every one of them contracts a
- * HEAD -- 128 elements of k against 128 of q, or a [128, 128] recurrent state against a key -- and
- * libref reads both sides of every one of those products through `ldt`, which is a dtype switch per
- * element. In the quadratic ops that is the whole cost:
+ *   The decay is applied per element as e^{g_i - g_j}, not split around a per-chunk reference.
+ *   Only i > j is used and g decreases along the chunk, so the exponent is <= 0 and cannot
+ *   overflow; the split form can, at spans this model reaches.
  *
- *   gdn_kkt_solve  reads k[ti] and k[tj] for every (i, j) pair of a chunk. At chunk 64 and
- *                  head_k 128 that is 64*64*2*128 = 1.0 M switched loads to compute 64*64 dots
- *                  over data that is 64*128 = 8 K elements. THE K ROWS OF A CHUNK ARE READ ONCE
- *                  HERE, into an f32 panel, and every dot is then a vector reduction over it.
+ *   The triangular inverse is a forward substitution. I + M is unit lower triangular, so the
+ *   inverse is unique and libr4d's blocked WMMA merge agrees with it.
  *
- *   gdn_chunk_scan does the same for q, k and v, and additionally re-reads `g` inside three
- *                  separate double loops. Same treatment: one panel per chunk.
+ *   The conv output is rounded before the L2 norm, as the unfused pair does (the conv writes a
+ *   tensor that the prep reads back): it is written to q/k/v and re-read for the norm.
  *
- * That is a change of constant, not of asymptotics -- the algorithms below ARE libref's, step for
- * step, because every one of them is a definition rather than a choice:
+ *   The L2 norm does not divide by the head width: rsqrt(sum(x^2) + l2_eps), l2_eps 1e-6 (FLA's
+ *   and libr4d's L2NORM_EPS).
  *
- *   THE DECAY IS APPLIED PER ELEMENT as e^{g_i - g_j}, not split about a per-chunk reference. Only
- *   i > j is kept and g decreases along the chunk, so the difference is always <= 0 and the direct
- *   form cannot overflow at any span -- which the split form can, at spans this model reaches.
+ * Rollback contract (spec §10): speculative rejection without recompute. The recurrent state and
+ * conv window have already absorbed the rejected tokens, so `num_accepted` is required and a
+ * rejection is a change of read offset:
  *
- *   THE TRIANGULAR INVERSE IS A FORWARD SUBSTITUTION. I + M is unit lower triangular, so its
- *   inverse is unique and the substitution computes it exactly; libr4d's blocked WMMA merge agrees
- *   with it because there is only one answer to agree with.
- *
- *   THE CONV OUTPUT IS ROUNDED BEFORE THE L2 NORM. A fused kernel rounds to bf16 there because the
- *   pair of kernels it replaces does -- the conv writes a tensor and the prep reads it back -- and
- *   matching that is what lets the fused form stand in for the unfused pair on real weights. So the
- *   conv result is WRITTEN to q/k/v and READ BACK for the norm, rather than carried in registers.
- *
- *   THE L2 NORM HAS NO DIVISION BY THE HEAD WIDTH. It is a norm, not an RMS:
- *   rsqrt(sum(x^2) + l2_eps), with l2_eps 1e-6, which is FLA's and libr4d's L2NORM_EPS.
- *
- * ============================== THE ROLLBACK CONTRACT ==============================
- *
- * A linear-attention kernel pair must support speculative rejection WITHOUT RECOMPUTE (spec §10).
- * The recurrent state and the conv window have already absorbed the rejected tokens, so
- * `num_accepted` is a required operand and a rejection is a CHANGE OF READ OFFSET:
- *
- *   conv state   read at `num_accepted - 1`, rewritten shifted DOWN BY ONE so slots
+ *   conv state   read at `num_accepted - 1`, rewritten shifted down by one, so slots
  *                0..conv_width-3 take the tail of the old history and this step's token t lands at
  *                slot t + conv_width - 2.
- *   linear state read from state_idx[s, num_accepted - 1]; EVERY candidate token writes its own
- *                state to state_idx[s, t], because which of them survives verification is not
- *                known until after this layer has run.
+ *   linear state read from state_idx[s, num_accepted - 1]; every candidate token writes its own
+ *                state to state_idx[s, t], since which survives is known only after this layer.
  *
- * `num_accepted` IS ONE-BASED: it counts the tokens the previous step committed, so 1 is an
- * ordinary decode that drafted nothing and 0 is not a value either op can read.
+ * `num_accepted` is one-based: the number of tokens the previous step committed, so 1 is a plain
+ * decode with no drafts and 0 is invalid.
  *
- * THE OP DECLARES WHICH STATE CONTRACT IT RUNS UNDER, in its `state_form` parameter. libref and
- * this plugin implement "per_candidate", the reading above; libr4d also serves "anchor" -- one
- * committed state plus a small replay block, two slots a sequence instead of 1 + n_spec. The two
- * produce the same `o` from different states, so both host plugins decline "anchor" by name
- * rather than run the per-candidate reading over a cache laid out the other way. libref is the
- * oracle for this plugin under per_candidate, and that is what rad-avx-check exercises.
+ * `state_form` names the state contract: "per_candidate" (above), or "anchor", one committed state
+ * a sequence plus each token's replay factors beside it, in libr4d's cache layout (AnchorLayout,
+ * at gdn_recurrent_update). Both forms give the same `o`; an implementation handed the other form
+ * would continue from the wrong state, so the form is a parameter, never inferred.
  */
 #include "avx_vec.h"
 #include "avx_common.h"
 
+#include <algorithm>
 #include <vector>
 
 using namespace avx;
 
-/* THE VIEW HELPERS ARE `view2` / `view3` / `view4` AND NOT `v2` / `v3` / `v4`, which is what
- * libref calls them. The per-level inline namespace in avx_vec.h is named `sc` / `v1` / `v2` / `v3`
- * (AVX_SUFFIX), so a file-scope function called `v3` is ambiguous with the namespace at AVX-512 and
- * with a different one at each other level -- three of the four levels would fail to compile and
- * the fourth would build cleanly, so a build of that one level alone would not show it.
+/* The view helpers are `view2` / `view3` / `view4`, not libref's `v2` / `v3` / `v4`: those names
+ * collide with the per-level inline namespaces (AVX_SUFFIX: sc / v1 / v2 / v3) at three of the four
+ * levels.
  *
- * The deepest convolution history held in a stack frame. libr4d's width is 4 and no linear-
- * attention model in circulation exceeds it by much; a wider request returns RAD_E_UNSUPPORTED by
- * name rather than convolving a truncated window, which would be numerically plausible and
- * completely wrong. Same number as libref's, so the two refuse the same calls. */
+ * Deepest convolution history held on the stack. libr4d's width is 4; a wider request returns
+ * RAD_E_UNSUPPORTED rather than convolving a truncated window. Same bound as libref. */
 enum { AVX_CONV_HIST_MAX = 16 };
 
 struct V3 { const RadTensor* t; int64_t s0, s1, s2; };
@@ -90,10 +67,9 @@ static inline V3 view3(const RadTensor* t, int64_t d1, int64_t d2) {
     }
     return v;
 }
-/* The same [tokens, d1, d2] reading for an operand that may be a COLUMN VIEW of a wider row: the
- * fp8 delta net's output gate is the tail of a fused [q|k|v|z] projection, so its token stride is
- * its own rather than d1*d2. A rank-3 spelling carries all three strides; a rank-2 one carries the
- * token stride in stride[0] and view3() would have guessed d1*d2 for it. */
+/* view3 for an operand that may be a column view of a wider row (the fp8 delta net's output gate is
+ * the tail of a fused [q|k|v|z] projection). At rank 2 the token stride is stride[0], where view3
+ * would assume d1*d2. */
 static inline V3 view3_rows(const RadTensor* t, int64_t d1, int64_t d2) {
     if (t->rank != 2) return view3(t, d1, d2);
     return V3{ t, t->stride[0], d2 * t->stride[1], t->stride[1] };
@@ -108,11 +84,9 @@ static inline int64_t at3(const V3& v, int64_t i, int64_t j, int64_t k) {
 }
 static inline int64_t at2(const V2& v, int64_t i, int64_t j) { return i * v.s0 + j * v.s1; }
 
-/* [N, heads, head_v, head_k] -- the shape both the chunked scan's h0/ht and the paged recurrent
- * state have. THE SLOT AND HEAD STRIDES ARE READ OFF THE TENSOR and not derived from the shape: a
- * paged state cache is padded so its page matches the attention page, and a kernel that derived
- * the stride would read every slot but the first at the wrong offset -- which looks exactly like a
- * correct kernel producing noise. */
+/* [N, heads, head_v, head_k], the shape of the chunked scan's h0/ht and of the paged recurrent
+ * state. Slot and head strides come from the tensor, not the shape: a paged state cache is padded
+ * so its page matches the attention page. */
 static inline V4 view4(const RadTensor* t, int64_t d1, int64_t d2, int64_t d3) {
     V4 v{ t, d1 * d2 * d3, d2 * d3, d3, 1 };
     if (t->rank >= 4) {
@@ -129,22 +103,24 @@ static inline int64_t at4(const V4& v, int64_t i, int64_t j, int64_t k, int64_t 
 
 static inline int64_t cu_at(const RadTensor* cu, int64_t i) { return ldi(cu, offlin(cu, i)); }
 
-/* The conv state is [n_slots, conv_dim, state_len]; a rank the caller flattened is read as the
- * tight layout that shape implies. */
+/* The conv state is [n_slots, conv_dim, state_len]; a flattened tensor is read as the dense layout
+ * that shape implies. */
 static inline V3 conv_state_view(const RadTensor* cs, int64_t conv_dim, int64_t width,
                                  int64_t* state_len) {
     *state_len = cs->rank >= 3 ? cs->shape[cs->rank - 1] : (width > 1 ? width - 1 : 1);
     return view3(cs, conv_dim, *state_len);
 }
 
-/* softplus in the two-sided form, with the large-x cutoff FLA and libr4d both use: above the
- * threshold log1p(e^x) IS x to every bit f32 holds, and evaluating it costs an overflow. */
+/* Two-sided softplus with FLA's and libr4d's large-x cutoff: above the threshold log1p(e^x) equals
+ * x in f32, and evaluating it would overflow. */
 static inline float softplus(float x, float thr) {
     if (x > thr) return x;
-    return x > 0.0f ? x + std::log1p(std::exp(-x)) : std::log1p(std::exp(x));
+    return x > 0.0f ? x + sc_log1p(sc_exp(-x)) : sc_log1p(sc_exp(x));
 }
 
-static inline float dotf(const float* a, const float* b, int64_t n) {
+/* A dot product with two accumulators: the delta net's summation order, which differs from
+ * avx_vec.h's four-accumulator dotf. */
+static inline float dot2(const float* a, const float* b, int64_t n) {
     vf a0 = vf_zero(), a1 = vf_zero();
     int64_t i = 0;
     for (; i + 2 * VF_N <= n; i += 2 * VF_N) {
@@ -157,13 +133,10 @@ static inline float dotf(const float* a, const float* b, int64_t n) {
     return s;
 }
 
-/* dst += c * src */
-/* Widen-transpose a [cbw, width] tap block starting at channel c0 into tapT[j*cbw + c]:
- * the token loops read tap COLUMNS, and this makes them contiguous. 8 rows at a time:
- * vector-widen into a 32-float staging block, then scatter the 32 values into the four
- * columns (~15ns a block, L1-hot). Loads/stores only, so bit-exact; anything the vector
- * form cannot spell -- another width, unpacked rows, an exotic dtype, levels 0/1 -- and
- * the ragged tail take the scalar form below it. */
+/* Widen and transpose a [cbw, width] tap block starting at channel c0 into tapT[j*cbw + c], so the
+ * token loops read tap columns contiguously. The vector form (width 4, dense f32 or bf16 rows,
+ * AVX2+) widens 8 rows into a 32-float staging block and scatters them into the four columns;
+ * loads and stores only, so bit-exact. Everything else, and the ragged tail, is scalar. */
 static inline void fill_tapT(const RadTensor* w, V2 wv, int64_t c0, int64_t cbw, int64_t width,
                              float* tapT) {
 #if AVX_LEVEL >= 2
@@ -180,8 +153,8 @@ static inline void fill_tapT(const RadTensor* w, V2 wv, int64_t c0, int64_t cbw,
                 _mm256_store_ps(stg + 16, _mm256_loadu_ps(base + 16));
                 _mm256_store_ps(stg + 24, _mm256_loadu_ps(base + 24));
             } else {
-                /* bf16 -> f32 is a zero-extend and a shift, NOT cvtph (which reads FP16).
-                 * Same values as cvt_bf16_to_f32, same order. */
+                /* bf16 -> f32 is a zero-extend and shift (not cvtph, which reads f16), as in
+                 * cvt_bf16_to_f32. */
                 const uint16_t* base = (const uint16_t*)w->data + (c0 + c) * 4;
                 for (int k = 0; k < 4; ++k) {
                     __m128i h = _mm_loadu_si128((const __m128i*)(base + k * 8));
@@ -211,8 +184,8 @@ static inline void axpy(float* dst, const float* src, float c, int64_t n) {
     for (; i < n; ++i) dst[i] += c * src[i];
 }
 
-/* A [rows, width] panel of an operand read as [token, head, d], widened into f32 once. This is the
- * whole optimisation in the quadratic ops -- see the file header. */
+/* A [rows, width] panel of an operand read as [token, head, d], widened to f32 once (see the file
+ * header). */
 static void panel3(const RadTensor* t, const V3& v, int64_t t0, int64_t rows, int64_t h,
                    int64_t width, float* dst) {
     for (int64_t r = 0; r < rows; ++r) {
@@ -222,12 +195,10 @@ static void panel3(const RadTensor* t, const V3& v, int64_t t0, int64_t rows, in
     }
 }
 
-/* One token's convolution output over a channel panel [c0, c0 + cbw), split into q, k and v by
- * region and written to each at its head AND ITS OFFSET WITHIN THE HEAD. A panel is 1024 channels
- * and a head is K or V of them, so a panel edge falls mid-head whenever the head width does not
- * divide 1024 -- 96 or 192, say -- and the piece that starts there begins part way into a head
- * and may end part way into another. Each run below is cut at the next head boundary, so it is
- * always contiguous within one head's row. */
+/* Writes one token's convolution output over channel panel [c0, c0 + cbw) into q, k and v, each
+ * piece at its head and its offset within the head. Panels are 1024 channels, so an edge falls
+ * mid-head when the head width does not divide 1024 (e.g. 96 or 192); runs are cut at head
+ * boundaries so each is contiguous within one head's row. */
 static inline void store_pieces(const float* acc, int64_t cbw, int64_t c0, int64_t bos, int64_t t,
                                 const RadTensor* q, const RadTensor* k, const RadTensor* v,
                                 V3 qv, V3 kv, V3 vv, int64_t Hg, int64_t K, int64_t V,
@@ -257,7 +228,7 @@ static inline void store_pieces(const float* acc, int64_t cbw, int64_t c0, int64
 
 /* ------------------------------------------------------------------ gdn_conv_prep */
 /* Everything between the qkv projection and the chunked scan: the width-`conv_width` depthwise
- * causal convolution with silu and its state cache, the q/k/v split, the l2 norm over each q and k
+ * causal convolution with silu and its state cache, the q/k/v split, the L2 norm over each q and k
  * head, the gate with its per-chunk cumsum, and beta. */
 AVX_KERNEL(gdn_conv_prep) {
     if (a->n_t < 16) return RAD_E_INVAL;
@@ -273,15 +244,13 @@ AVX_KERNEL(gdn_conv_prep) {
     const RadTensor* hini = rad_arg_in(a, 10);
     if (!x->data || !w->data || !cu->data || !q->data || !k->data || !v->data ||
         !g->data || !beta->data) return RAD_E_INVAL;
-    /* One of the two, not one of each: a caller that names the gate has to name beta as well, or
-     * the second read silently falls back into a fused row that may not be there. */
+    /* Both or neither: with only one, the other would be read from a fused row that may not
+     * exist. */
     if ((ta != nullptr) != (tb != nullptr)) return RAD_E_INVAL;
 
     const int64_t K = p_int(a, "head_k", 0), V = p_int(a, "head_v", 0);
-    /* `chunk` is RAD_DERIVED and NOTHING HERE CARRIES IT: the gate cumsum is cut at the chunk
-     * boundary and no operand's shape records where that is. A caller who omitted it gets
-     * RAD_E_SHAPE by name; the alternative -- treating the sequence as one chunk -- is a decay
-     * summed over the wrong span, numerically plausible and completely wrong. */
+    /* `chunk` is RAD_DERIVED but no operand's shape records it, and the gate cumsum restarts at
+     * each chunk boundary, so a missing value is refused rather than defaulted. */
     const int64_t chunk = p_int(a, "chunk", 0), width = p_int(a, "conv_width", 0);
     const float l2eps = p_f32(a, "l2_eps", 1e-6f);
     const float spthr = p_f32(a, "softplus_thr", 20.0f);
@@ -291,7 +260,7 @@ AVX_KERNEL(gdn_conv_prep) {
     const int64_t N = numel(cu) - 1;
     if (N <= 0) return RAD_E_SHAPE;
     const int64_t T = cu_at(cu, N);
-    if (T <= 0) return RAD_OK;                       /* an empty step is not an error */
+    if (T <= 0) return RAD_E_SHAPE;                  /* zero rows is not a call (docs/OPS.md) */
     const int64_t Hg = numel(q) / (T * K);
     const int64_t H = numel(v) / (T * V);
     if (Hg <= 0 || H <= 0 || H % Hg != 0) return RAD_E_SHAPE;
@@ -301,9 +270,8 @@ AVX_KERNEL(gdn_conv_prep) {
 
     const int64_t xrow = x->rank >= 2 ? x->stride[x->rank - 2] : (conv_dim + (ta ? 0 : 2 * H));
     const int64_t xcol = laststride(x);
-    /* THE BOUND IS THE VIEW'S AND NOT THE BUFFER'S. `x` may be a column slice of a wider row, and
-     * a slice's numel counts only the elements it names -- so the flat product would refuse a call
-     * that is perfectly in range. Rank 2 or more spells the extent in the shape. */
+    /* Bound by the view, not numel: `x` may be a column slice of a wider row, whose numel counts
+     * only the named elements. At rank >= 2 the shape gives the extent. */
     const int64_t xneed = conv_dim + (ta ? 0 : 2 * H);
     if (x->rank >= 2) {
         if (x->shape[x->rank - 1] < xneed || x->shape[x->rank - 2] < T) return RAD_E_SHAPE;
@@ -323,14 +291,11 @@ AVX_KERNEL(gdn_conv_prep) {
     const V2 bgv = tb ? view2(tb, H) : V2{ nullptr, 0, 0 };
 
     /* ---- phase 1: the convolution, straight into q / k / v ---------------------------------- */
-    /* TOKENS OUTER, CHANNELS VECTOR. The other nest -- each channel walked down the tokens --
-     * reads x strided (a cache line per bf16) and issues a dtype switch plus a scalar exp per
-     * element. Walking tokens outer over channel panels turns the tap loop into vector FMA
-     * over contiguous rows. Per element the order is unchanged -- bias, taps ascending, silu
-     * last -- and the multiply and add stay SEPARATE ops: an FMA would fuse one rounding the
-     * reference keeps. The silu goes through vf_silu (the exact minimax, ~1 ulp from libm),
-     * which the bf16 store that follows cannot carry. Panels are 1024 channels, and a panel
-     * edge may fall inside a head; store_pieces places each piece at its offset in the head. */
+    /* Tokens outer, channels vectorised over contiguous rows (channel-outer would read x
+     * strided, one cache line per element, with a dtype switch and scalar exp each). Per element
+     * the order is bias, taps ascending, silu last, with separate mul and add rather than FMA, to
+     * keep the reference's roundings. vf_silu is ~1 ulp from libm, below what the bf16 store
+     * keeps. Panels are 1024 channels; store_pieces handles edges inside a head. */
     const int64_t CB = 1024;
     const int64_t npan = (conv_dim + CB - 1) / CB;
     AVX_PARALLEL_FOR_IF(N * npan >= 4)
@@ -340,20 +305,17 @@ AVX_KERNEL(gdn_conv_prep) {
         const int64_t bos = cu_at(cu, n), slen = cu_at(cu, n + 1) - bos;
         if (slen <= 0) continue;
         const int64_t slot = sidx ? ldi(sidx, offlin(sidx, n)) : n;
-        /* A zero `has_init` means the slot holds no history: the window in front of the
-         * sequence's first token is ZEROS, not whatever the slot last held. Without it a
-         * fresh sequence landing on a recycled slot convolves the previous sequence's tail
-         * into its first conv_width-1 tokens, which is fluent output with the wrong prefix. */
+        /* `has_init` zero: the slot holds no history and the window before the first token is
+         * zeros, so a new sequence on a recycled slot does not read the previous one's tail. */
         const bool warm = !hini || ldi(hini, offlin(hini, n)) != 0;
 
         float* acc = scratch_f32((size_t)cbw);
         float* xr = scratch_f32_b((size_t)cbw);
-        /* Taps transposed to [width][cbw], widened once per panel: the token loop reads tap
-         * columns, which are contiguous in this layout. Launch-constant, thread-local. */
+        /* Taps transposed to [width][cbw], widened once per panel. */
         float* tapT = scratch_f32_c((size_t)width * (size_t)cbw);
         fill_tapT(w, wv, c0, cbw, width, tapT);
-        /* Bias, widened once per panel into the raw slot (the three f32 slots are taken);
-         * each token starts its accumulator as a copy of this. */
+        /* Bias, widened once per panel into the raw scratch slot (the three f32 slots are in
+         * use); each token's accumulator starts as a copy. */
         float* bs = (float*)scratch_raw((size_t)cbw * sizeof(float) + 64);
         if (bias) {
             if (laststride(bias) == 1)
@@ -365,7 +327,7 @@ AVX_KERNEL(gdn_conv_prep) {
         }
 
         for (int64_t t = 0; t < slen; ++t) {
-            /* Fresh accumulator per token: bias copy, then taps ascending. */
+            /* Per token: bias, then taps ascending. */
             int64_t c = 0;
             for (; c + VF_N <= cbw; c += VF_N) vf_storeu(acc + c, vf_loadu(bs + c));
             for (; c < cbw; ++c) acc[c] = bs[c];
@@ -388,11 +350,9 @@ AVX_KERNEL(gdn_conv_prep) {
                         for (int64_t c = 0; c < cbw; ++c)
                             xr[c] = ldt(cs, at3(cvs, slot, c0 + c, src + width - 1));
                 } else {
-                    for (int64_t c = 0; c < cbw; c += VF_N) vf_storeu(xr + c, vf_zero());
-                    for (int64_t c = (cbw / VF_N) * VF_N; c < cbw; ++c) xr[c] = 0.0f;
+                    std::memset(xr, 0, (size_t)cbw * sizeof(float));
                 }
-                /* Separate mul and add -- NOT an FMA -- so the rounding matches the reference's
-                 * scalar loop bit for bit. */
+                /* Separate mul and add, not FMA, to match the reference bit for bit. */
                 const float* tc = tapT + j * cbw;
                 c = 0;
                 for (; c + VF_N <= cbw; c += VF_N)
@@ -400,17 +360,16 @@ AVX_KERNEL(gdn_conv_prep) {
                                               vf_loadu(acc + c)));
                 for (; c < cbw; ++c) acc[c] += xr[c] * tc[c];
             }
-            /* Silu in place, then split into q/k/v, through the same helper the decode entry
-             * uses (below), which places a piece at its head AND its offset within the head. */
+            /* Silu in place, then split into q/k/v. */
             c = 0;
             for (; c + VF_N <= cbw; c += VF_N)
                 vf_storeu(acc + c, vf_silu(vf_loadu(acc + c)));
-            for (; c < cbw; ++c) acc[c] /= (1.0f + std::exp(-acc[c]));
+            for (; c < cbw; ++c) acc[c] /= (1.0f + sc_exp(-acc[c]));
             store_pieces(acc, cbw, c0, bos, t, q, k, v, qv, kv, vv, Hg, K, V, conv_dim);
         }
     }
 
-    /* ---- phase 2: the l2 norm over each q and k head, reading the ROUNDED conv output -------- */
+    /* ---- phase 2: the L2 norm over each q and k head, reading the rounded conv output -------- */
     AVX_PARALLEL_FOR_IF(T * Hg * 2 >= 32)
     for (int64_t th = 0; th < T * Hg * 2; ++th) {
         const int64_t which = th / (T * Hg);
@@ -423,7 +382,7 @@ AVX_KERNEL(gdn_conv_prep) {
         const float* u = (zv.s2 == 1) ? row_f32_in(z->dtype, byte_at(z->data, z->dtype, b), buf, K)
                                       : buf;
         if (zv.s2 != 1) for (int64_t d = 0; d < K; ++d) buf[d] = ldt(z, b + d * zv.s2);
-        /* No division by K: this is an L2 norm, not an RMS. */
+        /* L2 norm, not RMS: no division by K. */
         const float inv = 1.0f / std::sqrt(row_sumsq(u, K) + l2eps);
         if (zv.s2 == 1) {
             float* o2 = scratch_f32_b((size_t)K);
@@ -438,17 +397,15 @@ AVX_KERNEL(gdn_conv_prep) {
     }
 
     /* ---- phase 3: the gate, its per-chunk cumsum, and beta ----------------------------------- */
-    /* The cumsum is per CHUNK and per sequence, because that is what the scan consumes: g[j] is the
-     * decay from the start of j's chunk up to and including j. Sequential in t by construction --
-     * a running sum is the one shape no vectorisation reaches, and the exp/softplus per token is
-     * what it costs. */
+    /* The cumsum restarts per chunk and per sequence, as the scan consumes it: g[j] is the decay
+     * from the start of j's chunk through j. A running sum, so sequential in t. */
     AVX_PARALLEL_FOR_IF(N * H >= 4)
     for (int64_t nh = 0; nh < N * H; ++nh) {
         const int64_t n = nh / H, h = nh % H;
         const int64_t bos = cu_at(cu, n), slen = cu_at(cu, n + 1) - bos;
         const float alog = A_log ? ldt(A_log, h * laststride(A_log)) : 0.0f;
         const float dtb = dt_bias ? ldt(dt_bias, h * laststride(dt_bias)) : 0.0f;
-        const float negexp = -std::exp(alog);
+        const float negexp = -sc_exp(alog);
         float run = 0.0f;
         for (int64_t t = 0; t < slen; ++t) {
             if (t % chunk == 0) run = 0.0f;
@@ -458,14 +415,13 @@ AVX_KERNEL(gdn_conv_prep) {
                                  : ldt(x, (bos + t) * xrow + (conv_dim + H + h) * xcol);
             run += negexp * softplus(av_ + dtb, spthr);
             stt(g, at2(gv, bos + t, h), run);
-            stt(beta, at2(bv, bos + t, h), 1.0f / (1.0f + std::exp(-bvl)));
+            stt(beta, at2(bv, bos + t, h), 1.0f / (1.0f + sc_exp(-bvl)));
         }
     }
 
     /* ---- phase 4: rewrite the conv state from the sequence's last width-1 tokens -------------- */
-    /* After phase 1, so the history it overwrites has already been read. A sequence shorter than
-     * width-1 keeps what the old state held in front of its tokens, which is what makes chunked
-     * prefill work: the second chunk of a sequence continues from the first. */
+    /* After phase 1, which has read the old history. A sequence shorter than width-1 keeps the
+     * old state ahead of its tokens, so a sequence's next prefill chunk continues from this one. */
     if (cs->data && width > 1) {
         AVX_PARALLEL_FOR_IF(N * conv_dim >= 32)
         for (int64_t nc = 0; nc < N * conv_dim; ++nc) {
@@ -487,28 +443,25 @@ AVX_KERNEL(gdn_conv_prep) {
     return RAD_OK;
 }
 
-/* Silu in place over a channel panel, then split into q/k/v by region. Shared by the two
- * convolution entry points; the split itself is store_pieces, above both. */
+/* Silu in place over a channel panel, then store_pieces. */
 static inline void silu_store_pieces(float* acc, int64_t cbw, int64_t c0, int64_t bos, int64_t t,
                                      const RadTensor* q, const RadTensor* k, const RadTensor* v,
                                      V3 qv, V3 kv, V3 vv, int64_t Hg, int64_t K, int64_t V,
                                      int64_t conv_dim) {
-    /* Exact silu only: the cheap form (vf_silu_fast, as silu_mul uses), keyed on all-bf16
-     * outputs, measures unmeasurably different here -- the token loop is frontend-bound and the
-     * extra branch buys nothing. Do not switch to it without measuring. */
+    /* Exact silu only: vf_silu_fast (as silu_mul uses for bf16 outputs) made no measurable
+     * difference here, since the token loop is frontend-bound. */
     int64_t c = 0;
     for (; c + VF_N <= cbw; c += VF_N) vf_storeu(acc + c, vf_silu(vf_loadu(acc + c)));
-    for (; c < cbw; ++c) acc[c] /= (1.0f + std::exp(-acc[c]));
+    for (; c < cbw; ++c) acc[c] /= (1.0f + sc_exp(-acc[c]));
     store_pieces(acc, cbw, c0, bos, t, q, k, v, qv, kv, vv, Hg, K, V, conv_dim);
 }
 
 /* ------------------------------------------------------------------ gdn_conv_update */
-/* The same convolution for a decode step, against the rolling window. The two things that matter
- * are that the READ starts at num_accepted-1 and that the rewrite shifts the buffer DOWN BY ONE so
- * the next step can do the same -- a rejection is a change of read offset and not a recompute,
- * which is the whole reason this is a separate entry point rather than a flag on the prefill one.
+/* The convolution for a decode step against the rolling window: the read starts at
+ * num_accepted - 1 and the rewrite shifts the window down by one (the rollback contract in the
+ * file header).
  *
- * No l2 norm here: on the decode path the recurrent update does it, which is where libr4d puts it. */
+ * No L2 norm here; on the decode path the recurrent update applies it, as in libr4d. */
 AVX_KERNEL(gdn_conv_update) {
     if (a->n_t < 10) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *w = &a->t[1], *cs = &a->t[3], *cu = &a->t[6];
@@ -527,7 +480,7 @@ AVX_KERNEL(gdn_conv_update) {
     const int64_t N = numel(cu) - 1;
     if (N <= 0) return RAD_E_SHAPE;
     const int64_t T = cu_at(cu, N);
-    if (T <= 0) return RAD_OK;
+    if (T <= 0) return RAD_E_SHAPE;
     const int64_t Hg = numel(q) / (T * K);
     const int64_t H = numel(v) / (T * V);
     if (Hg <= 0 || H <= 0 || H % Hg != 0) return RAD_E_SHAPE;
@@ -539,9 +492,8 @@ AVX_KERNEL(gdn_conv_update) {
     int64_t state_len = 0;
     const V3 cvs = conv_state_view(cs, conv_dim, width, &state_len);
 
-    /* Checked rather than clamped: a cache too shallow for this step's offset is a caller bug
-     * whose symptom would otherwise be a silently truncated history. Before the loop, because an
-     * OpenMP body cannot return. */
+    /* A state too shallow for this step's offset is refused, not clamped (that would silently
+     * truncate history). Checked before the loop; an OpenMP body cannot return. */
     for (int64_t n = 0; n < N; ++n) {
         const int64_t slen = cu_at(cu, n + 1) - cu_at(cu, n);
         const int64_t off = nacc ? ldi(nacc, offlin(nacc, n)) - 1 : 0;
@@ -553,9 +505,8 @@ AVX_KERNEL(gdn_conv_update) {
     const V3 qv = view3(q, Hg, K), kv = view3(k, Hg, K), vv = view3(v, H, V);
     const V2 wv = view2(w, width);
 
-    /* Tokens outer, channels vector -- the prefill entry's form. The channel-outer nest reads a
-     * cache line per bf16 and pays a switch and a scalar exp per element; at decode slen is 1 but
-     * conv_dim is 10240, so the problem is the same one. */
+    /* Tokens outer, channels vectorised, as in gdn_conv_prep (at decode slen is 1 but conv_dim
+     * is 10240). */
     const int64_t CB = 1024;
     const int64_t npan = (conv_dim + CB - 1) / CB;
     AVX_PARALLEL_FOR_IF(N * npan >= 4)
@@ -572,9 +523,8 @@ AVX_KERNEL(gdn_conv_update) {
         float* xr = scratch_f32_b((size_t)cbw);
         float* tapT = scratch_f32_c((size_t)width * (size_t)cbw);
         fill_tapT(w, wv, c0, cbw, width, tapT);
-        /* ONE raw block, partitioned by hand (single arena slot): bias panel, then the
-         * (width-1) history rows over this panel, widened once -- only the first width-1
-         * tokens read history. */
+        /* One raw block (single scratch slot): the bias panel, then the width-1 history rows of
+         * this panel, widened once. Only the first width-1 tokens read history. */
         float* raw = (float*)scratch_raw(((size_t)cbw + (size_t)(width - 1) * (size_t)cbw) *
                                          sizeof(float) + 64);
         float* bs = raw;
@@ -610,12 +560,11 @@ AVX_KERNEL(gdn_conv_update) {
                         for (int64_t c = 0; c < cbw; ++c)
                             xr[c] = ldt(x, (bos + src) * xrow + (c0 + c) * xcol);
                 } else {
-                    /* src + width - 1 lies in [0, width - 2]: the history segment above. */
+                    /* src + width - 1 is in [0, width - 2]: the history segment. */
                     const float* hs = hseg + (src + width - 1) * cbw;
                     for (int64_t c = 0; c < cbw; ++c) xr[c] = hs[c];
                 }
-                /* Separate mul and add -- NOT an FMA -- matching the scalar reference's two
-                 * roundings. */
+                /* Separate mul and add, not FMA, to match the reference's two roundings. */
                 const float* tc = tapT + j * cbw;
                 c = 0;
                 for (; c + VF_N <= cbw; c += VF_N)
@@ -625,17 +574,15 @@ AVX_KERNEL(gdn_conv_update) {
             }
             silu_store_pieces(acc, cbw, c0, bos, t, q, k, v, qv, kv, vv, Hg, K, V, conv_dim);
         }
-        /* Shift down by one: the tail of the history this step READ -- the window at
-         * `off`, not the one at zero -- then this step's tokens. Row memcpys where both
-         * sides are channel-contiguous and the dtypes match (a move, not a conversion);
-         * the scalar form otherwise. Slot i takes slot off + i + 1, which no earlier
-         * iteration has written, so the ascending walk is safe in place. */
+        /* Shift down by one: the tail of the window this step read (at `off`, not zero), then
+         * this step's tokens. Slot i takes slot off + i + 1, which no earlier iteration has
+         * written, so the ascending walk is safe in place. Byte moves when both sides are
+         * channel-contiguous with the same dtype; scalar otherwise. */
         if (width > 1) {
             const uint32_t csbits = rad_dtype_bits(cs->dtype);
             const size_t elbytes = (size_t)csbits / 8;
-            /* memmove, not memcpy: the shift reads row off+i+1 after row i was written, so the
-             * ranges can overlap when the history stride is short. Byte dtypes only -- a
-             * sub-byte element has no whole-byte row to move. */
+            /* memmove: the ranges can overlap when the history stride is short. Whole-byte
+             * dtypes only. */
             if (cvs.s1 == 1 && xcol == 1 && x->dtype == cs->dtype && csbits % 8 == 0 &&
                 elbytes > 0) {
                 for (int64_t i = 0; i + 1 < width - 1; ++i)
@@ -665,26 +612,21 @@ AVX_KERNEL(gdn_conv_update) {
 }
 
 /* ------------------------------------------------------------------ gdn_kkt_solve */
-/* A = (I + strict_lower(diag(beta) . K K^T . e^{g_i - g_j}))^{-1}, per chunk, per v head.
- *
- * THE K ROWS OF A CHUNK ARE WIDENED ONCE. libref reads k[ti] and k[tj] through `ldt` for every
- * (i, j) pair, which at chunk 64 and head_k 128 is a million switched loads over eight thousand
- * distinct elements. One panel per chunk makes every dot a vector reduction, and `g` and `beta`
- * are pulled into the same frame for the same reason. */
+/* A = (I + strict_lower(diag(beta) . K K^T . e^{g_i - g_j}))^{-1}, per chunk, per v head. The
+ * chunk's k rows, `g` and `beta` are widened once (see the file header). */
 AVX_KERNEL(gdn_kkt_solve) {
     if (!rad_args_have(a, 5)) return RAD_E_INVAL;
     const RadTensor *k = &a->t[0], *beta = &a->t[1], *g = &a->t[2], *cu = &a->t[3], *A = &a->t[4];
 
     const int64_t K = p_int(a, "head_k", 0);
-    /* RAD_DERIVED: A is [T, heads, chunk] and the caller sized it, which is this plugin's rule for
-     * every other extent too. */
+    /* RAD_DERIVED: taken from A's shape [T, heads, chunk] when absent. */
     const int64_t chunk = p_int(a, "chunk", A->rank >= 3 ? A->shape[A->rank - 1] : 0);
     if (K <= 0 || chunk <= 0) return RAD_E_SHAPE;
 
     const int64_t N = numel(cu) - 1;
     if (N <= 0) return RAD_E_SHAPE;
     const int64_t T = cu_at(cu, N);
-    if (T <= 0) return RAD_OK;
+    if (T <= 0) return RAD_E_SHAPE;
     const int64_t H = numel(beta) / T;
     const int64_t Hg = numel(k) / (T * K);
     if (H <= 0 || Hg <= 0 || H % Hg != 0) return RAD_E_SHAPE;
@@ -698,7 +640,7 @@ AVX_KERNEL(gdn_kkt_solve) {
     for (int64_t nh = 0; nh < N * H; ++nh) {
         const int64_t n = nh / H, h = nh % H, hk = h / grp;
         const int64_t bos = cu_at(cu, n), slen = cu_at(cu, n + 1) - bos;
-        /* ONE scratch call, carved by hand: a second may reallocate and invalidate the first. */
+        /* One scratch call, carved by hand; a second could reallocate the first. */
         const size_t need = (size_t)(chunk * chunk + chunk + chunk * K + 2 * chunk + chunk) + 16;
         float* wsp = scratch_f32(need);
         float* Am = wsp;                          /* [chunk, chunk] the inverse, in f32 */
@@ -717,23 +659,21 @@ AVX_KERNEL(gdn_kkt_solve) {
             }
             for (int64_t i = 0; i < L; ++i) {
                 const int64_t ti = bos + c0 + i;
-                /* e^{g_i - g_j} over the row, vectorised (vf_exp ~1 ulp from libm -- the
-                 * gate's question): one L1 pass instead of i scalar exps. */
+                /* e^{g_i - g_j} over the row with vf_exp (~1 ulp from libm, within tolerance). */
                 {
                     const vf vg = vf_set1(gp[i]);
                     int64_t j = 0;
                     for (; j + VF_N <= i; j += VF_N)
                         vf_storeu(ev + j, vf_exp(vf_sub(vg, vf_loadu(gp + j))));
-                    for (; j < i; ++j) ev[j] = std::exp(gp[i] - gp[j]);
+                    for (; j < i; ++j) ev[j] = sc_exp(gp[i] - gp[j]);
                 }
                 for (int64_t j = 0; j < i; ++j)
-                    row[j] = bp[i] * dotf(kp + i * K, kp + j * K, K) * ev[j];
+                    row[j] = bp[i] * dot2(kp + i * K, kp + j * K, K) * ev[j];
                 /* (I + M) A = I, row by row: A[i][j] = delta - sum_{j<=l<i} M[i][l] A[l][j].
-                 * l-outer so the inner run over j is contiguous vector work (Am rows are).
-                 * Each (i, j) lane still subtracts l ascending, and mul+sub rather than FMA
-                 * keeps the rounding identical to the scalar loop -- bit-identical, only
-                 * wider. Terms with l < j read Am[l][j] = 0, so extending the sum down to 0
-                 * changes nothing. */
+                 * l outer so the run over j is contiguous vector work. Each (i, j) lane still
+                 * subtracts in ascending l with mul+sub (not FMA), so the result is bit-identical
+                 * to the scalar loop. Terms with l < j read Am[l][j] = 0, so starting the sum at
+                 * l = 0 changes nothing. */
                 for (int64_t j = 0; j <= i; ++j) Am[i * chunk + j] = (i == j) ? 1.0f : 0.0f;
                 for (int64_t l = 0; l < i; ++l) {
                     const vf rl = vf_set1(row[l]);
@@ -765,8 +705,8 @@ AVX_KERNEL(gdn_chunk_scan) {
     const RadTensor *g = &a->t[4], *beta = &a->t[5], *cu = &a->t[7];
     const RadTensor *o = &a->t[8], *ht = &a->t[9];
     const RadTensor* h0 = rad_arg_in(a, 6);
-    /* THE STATE SLOT, when the caller keeps its recurrent states in a pool the batch does not
-     * index positionally. Absent, a row owns slot n. */
+    /* Optional state slot per sequence, for a state pool not indexed by batch position; absent,
+     * sequence n owns slot n. */
     const RadTensor* sidx = rad_arg_in(a, 10);
     if (!q->data || !k->data || !v->data || !A->data || !g->data || !beta->data ||
         !cu->data || !o->data) return RAD_E_INVAL;
@@ -779,7 +719,7 @@ AVX_KERNEL(gdn_chunk_scan) {
     const int64_t N = numel(cu) - 1;
     if (N <= 0) return RAD_E_SHAPE;
     const int64_t T = cu_at(cu, N);
-    if (T <= 0) return RAD_OK;
+    if (T <= 0) return RAD_E_SHAPE;
     const int64_t H = numel(beta) / T;
     const int64_t Hg = numel(q) / (T * K);
     if (H <= 0 || Hg <= 0 || H % Hg != 0) return RAD_E_SHAPE;
@@ -802,16 +742,15 @@ AVX_KERNEL(gdn_chunk_scan) {
     for (int64_t nh = 0; nh < N * H; ++nh) {
         const int64_t n = nh / H, h = nh % H, hk = h / grp;
         const int64_t bos = cu_at(cu, n), slen = cu_at(cu, n + 1) - bos;
-        /* COLUMN 0 IS THE STATE. A row may be wider -- a decode kernel serving speculation asks
-         * for scratch beside it -- and the scan writes the state and nothing else. */
+        /* Column 0 of state_idx is the slot. A row may be wider (a speculative decode kernel
+         * keeps more slots beside it); the scan writes only this one. */
         const int64_t sw = sidx && sidx->rank >= 1 ? sidx->stride[0] : 1;
         const int64_t sn = sidx ? ldi(sidx, n * sw) : n;
-        if (sn < 0) continue;                  /* a padded row owns no state */
+        if (sn < 0) continue;                  /* padded row: no state */
 
-        /* One scratch request, carved by hand. The three panels (q, k, v) are what makes the
-         * quadratic loops below vector work instead of a dtype switch per element. Ap/expv do
-         * the same for the A weights and the gate exponentials: at chunk 64 the O-loop issues
-         * L*L/2 scalar exps a chunk, which is most of the wall time at model shape. */
+        /* One scratch request, carved by hand: the q/k/v panels, plus Ap/expv holding the A
+         * weights and gate exponentials once per chunk (scalar exps in the O loop were most of the
+         * time at model shape). */
         const size_t need = (size_t)(V * K + 3 * chunk * V + 2 * chunk * K + 3 * chunk +
                                      V + K + chunk * chunk + chunk + K * V) + 32;
         float* wsp = scratch_f32(need);
@@ -824,18 +763,14 @@ AVX_KERNEL(gdn_chunk_scan) {
         float* vp = kp + chunk * K;                /* [chunk, V] */
         float* gp = vp + chunk * V;                /* [chunk] */
         float* bp = gp + chunk;                    /* [chunk] */
-        /* Two more, and they get their own names rather than reusing a dead buffer: the output row
-         * and the decayed key. Carving them out of `Wm`'s tail and out of `row` would be correct
-         * only while chunk*V >= V and K <= chunk -- two conditions that hold at every shape this is
-         * checked at and neither of which the op promises. A buffer aliased under a size
-         * assumption fails first on a geometry nobody checked. */
+        /* Own buffers for the output row and the decayed key, not aliases of `Wm` or `row`,
+         * which would only fit while K <= chunk, a condition the op does not promise. */
         float* acc = bp + chunk;                   /* [V] the output row being formed */
         float* gk = acc + V;                       /* [K] e^{g_last - g_j} . k[j] */
         float* Ap = gk + K;                        /* [chunk, chunk] A weights, one row per i */
         float* expv = Ap + chunk * chunk;          /* [chunk] e^{g_j} */
 
-        /* The initial state, widened a row at a time rather than switched per element -- the
-         * recurrent update's form, same values. */
+        /* Initial state, widened a row at a time. */
         if (h0 && h0v.s3 == 1) {
             for (int64_t e = 0; e < V; ++e)
                 row_to_f32(h0->dtype,
@@ -856,17 +791,14 @@ AVX_KERNEL(gdn_chunk_scan) {
                 bp[j] = ldt(beta, at2(bv, bos + c0 + j, h));
             }
             const float glast = gp[L - 1];
-            /* e^{g_j} once per j, vectorised: the W-loop and the decay below each spent a
-             * scalar exp per (j) and per (i, j). vf_exp's minimax is ~1 ulp from libm --
-             * a tolerance question the gate answers, not a second definition. */
+            /* e^{g_j} once per j, vectorised (vf_exp is ~1 ulp from libm, within tolerance). */
             {
                 int64_t j = 0;
                 for (; j + VF_N <= L; j += VF_N)
                     vf_storeu(expv + j, vf_exp(vf_loadu(gp + j)));
-                for (; j < L; ++j) expv[j] = std::exp(gp[j]);
+                for (; j < L; ++j) expv[j] = sc_exp(gp[j]);
             }
-            /* The A rows for this chunk's tokens, widened once: the triangle below reads
-             * A[ti, h, 0..i] 2k times a chunk through a dtype switch. */
+            /* The chunk's A rows, widened once for the triangle below. */
             if (Av.s2 == 1) {
                 for (int64_t i = 0; i < L; ++i)
                     row_to_f32(A->dtype,
@@ -874,16 +806,16 @@ AVX_KERNEL(gdn_chunk_scan) {
                                Ap + i * chunk, chunk);
             }
 
-            /* W = beta . (V - e^g . (K S)). Two transposed-S k-outer forms -- Wm-streaming and
-             * register-blocked over a 4-chain -- both measure slower than this dot loop. */
+            /* W = beta . (V - e^g . (K S)). Transposed-S k-outer forms (streaming Wm, or
+             * register-blocked) measured slower than this dot loop. */
             for (int64_t j = 0; j < L; ++j) {
                 const float ge = expv[j];
                 for (int64_t e = 0; e < V; ++e)
                     Wm[j * V + e] =
-                        bp[j] * (vp[j * V + e] - ge * dotf(kp + j * K, S + e * K, K));
+                        bp[j] * (vp[j * V + e] - ge * dot2(kp + j * K, S + e * K, K));
             }
-            /* V' = A W, with A unit lower triangular so only j <= i contributes. Accumulated over
-             * e as a vector, which is the same j order libref sums in. */
+            /* V' = A W; A is unit lower triangular, so only j <= i contributes. Vectorised over e,
+             * summing in libref's j order. */
             for (int64_t i = 0; i < L; ++i) {
                 const int64_t ti = bos + c0 + i;
                 for (int64_t e = 0; e < V; ++e) Vp[i * V + e] = 0.0f;
@@ -899,29 +831,27 @@ AVX_KERNEL(gdn_chunk_scan) {
             for (int64_t i = 0; i < L; ++i) {
                 const int64_t ti = bos + c0 + i;
                 const float gi = gp[i];
-                const float ge = std::exp(gi);
-                /* e^{gi - g_j} over the row, vectorised, then the dots: splitting the exp
-                 * out of the dot loop costs one L1 pass over 64 floats and removes L
-                 * scalar exps per i. */
+                const float ge = sc_exp(gi);
+                /* e^{gi - g_j} over the row, vectorised, before the dots. */
                 {
                     const vf vg = vf_set1(gi), vs = vf_set1(scale);
                     int64_t j = 0;
                     for (; j + VF_N <= i + 1; j += VF_N)
                         vf_storeu(row + j,
                                   vf_mul(vs, vf_exp(vf_sub(vg, vf_loadu(gp + j)))));
-                    for (; j <= i; ++j) row[j] = scale * std::exp(gi - gp[j]);
+                    for (; j <= i; ++j) row[j] = scale * sc_exp(gi - gp[j]);
                 }
                 for (int64_t j = 0; j <= i; ++j)
-                    row[j] *= dotf(qp + i * K, kp + j * K, K);
+                    row[j] *= dot2(qp + i * K, kp + j * K, K);
                 for (int64_t e = 0; e < V; ++e)
-                    acc[e] = scale * ge * dotf(qp + i * K, S + e * K, K);
+                    acc[e] = scale * ge * dot2(qp + i * K, S + e * K, K);
                 for (int64_t j = 0; j <= i; ++j) axpy(acc, Vp + j * V, row[j], V);
                 if (ov.s2 == 1) out_row(o, at3(ov, ti, h, 0), V, acc);
                 else for (int64_t e = 0; e < V; ++e) stt(o, at3(ov, ti, h, e), acc[e]);
             }
             /* S = e^{g_last} S + V'^T (e^{g_last - g_j} . K) */
             {
-                const float el = std::exp(glast);
+                const float el = sc_exp(glast);
                 for (int64_t e = 0; e < V; ++e) {
                     const vf ve = vf_set1(el);
                     int64_t d = 0;
@@ -929,21 +859,18 @@ AVX_KERNEL(gdn_chunk_scan) {
                         vf_storeu(S + e * K + d, vf_mul(vf_loadu(S + e * K + d), ve));
                     for (; d < K; ++d) S[e * K + d] *= el;
                 }
-                /* e^{g_last - g_j} over the chunk, vectorised into `row` (dead here): one
-                 * pass instead of L scalar exps. */
+                /* e^{g_last - g_j} over the chunk, vectorised into `row` (free here). */
                 {
                     const vf vg = vf_set1(glast);
                     int64_t j = 0;
                     for (; j + VF_N <= L; j += VF_N)
                         vf_storeu(row + j, vf_exp(vf_sub(vg, vf_loadu(gp + j))));
-                    for (; j < L; ++j) row[j] = std::exp(glast - gp[j]);
+                    for (; j < L; ++j) row[j] = sc_exp(glast - gp[j]);
                 }
                 for (int64_t j = 0; j < L; ++j) {
                     const float gs = row[j];
-                    /* gs . k[j] formed ONCE per j rather than per (e, d), and in THAT ASSOCIATION:
-                     * libref writes `Vp * (gs * k)`, and f32 multiplication is not associative, so
-                     * forming (Vp * gs) * k instead would move the answer in the last bits on
-                     * every element of the state. */
+                    /* gs * k[j] formed once per j, in libref's association `Vp * (gs * k)`;
+                     * (Vp * gs) * k would differ in the last bits. */
                     const vf vg = vf_set1(gs);
                     int64_t d = 0;
                     for (; d + VF_N <= K; d += VF_N)
@@ -970,11 +897,48 @@ AVX_KERNEL(gdn_chunk_scan) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ the anchor state form
+ *
+ * docs/OPS.md `state_form`, libref's reading (ref_gdn.cpp) of libr4d's layout: under `anchor` a
+ * sequence keeps one committed state, and each step records its tokens' rank-1 update factors
+ * beside it; the next step replays the first `num_accepted` of them onto the state before running
+ * its own tokens.
+ *
+ *   state_idx  six columns: 0..2 the anchor, 3..5 the factor block. A paged caller's window can
+ *              shift by -1, 0 or +1 pages a step; the anchor is published at column 2 and each
+ *              factor copy is stamped with its column (1, 2, 3), so the next step reads the stamp
+ *              at column 4 and the anchor at the column it implies. A zeroed block reads as no
+ *              shift.
+ *   factors    per token, inside the head's [V, K] block of the factor slot: the normalised k once
+ *              per 32-row group of V, then v, then (g, beta) once per group, each group's rows
+ *              replaying from their own copy; room for `tmax` tokens, the stamp just past them.
+ *
+ * libr4d's kernel is K = V = 128, where the block holds kTmax = 16 tokens and the stamp sits at
+ * 16 * fstr; square heads from 64 up hold 16 too, so there the layout is libr4d's byte for byte.
+ * A smaller head's block holds fewer tokens' factors (a 16 x 16 head: 7), so `tmax` is as many as
+ * fit before the stamp, and a step or an accepted prefix longer than that is refused (libref's
+ * rule, docs/OPS.md). */
+namespace {
+struct AnchorLayout {
+    static constexpr int64_t kTmax = 16;
+    int64_t groups, fstr, vb, gb, tmax, mark;
+    AnchorLayout(int64_t K, int64_t V)
+        : groups((V + 31) / 32), fstr(groups * K + V + 2 * groups), vb(groups * K),
+          gb(groups * K + V), tmax(std::min<int64_t>(kTmax, (V * K - 1) / fstr)),
+          mark(tmax * fstr) {}
+    /* The anchor's column, from the stamp at the factor block `fb`'s `mark`. */
+    int anchor_col(const RadTensor* st, int64_t fb) const {
+        const int m = (int)(ldt(st, fb + mark) + 0.5f) - 1;
+        return 3 - ((m >= 0 && m <= 2) ? m : 1);
+    }
+};
+}  // namespace
+
 /* ------------------------------------------------------------------ gdn_recurrent_update */
-/* What decode runs where prefill runs the chunked scan, against the PAGED state cache: the initial
- * state comes from the slot the last accepted token wrote and EVERY candidate token writes its own
- * slot, because which of them survives verification is not known until after this layer has run.
- * The gated RMS norm is folded into the epilogue, which is where libr4d puts it too. */
+/* Decode's counterpart of the chunked scan, against the paged state cache: the initial state is
+ * read from the slot the last accepted token wrote, and every candidate token writes its own slot
+ * (see the rollback contract), or under `anchor` the replayed state is published and each token's
+ * factors are written instead. The gated RMS norm is folded into the epilogue, as in libr4d. */
 AVX_KERNEL(gdn_recurrent_update) {
     if (a->n_t < 14) return RAD_E_INVAL;
     const RadTensor *q = &a->t[0], *k = &a->t[1], *v = &a->t[2], *av = &a->t[3], *bvt = &a->t[4];
@@ -986,19 +950,15 @@ AVX_KERNEL(gdn_recurrent_update) {
     const RadTensor* cu = rad_arg_in(a, 10);
     const RadTensor* z = rad_arg_in(a, 11);
     const RadTensor* nw = rad_arg_in(a, 12);
-    /* The out projection's quantiser, folded in. Optional and all-or-nothing. */
+    /* Optional fused quantiser for the out projection (o_q and o_scale). */
     const RadTensor* oq = (a->n_t > 14 && a->t[14].data) ? &a->t[14] : nullptr;
     const RadTensor* osc = (a->n_t > 15 && a->t[15].data) ? &a->t[15] : nullptr;
     if (!q->data || !k->data || !v->data || !av->data || !bvt->data || !state->data || !o->data ||
         !cu) return RAD_E_INVAL;
 
-    /* ONLY THE PER-CANDIDATE STATE CONTRACT, AND ANY OTHER IS DECLINED BY NAME, as libref declines
-     * it. Under "anchor" the cache holds one committed state a sequence plus a block of replay
-     * factors and the accepted prefix is replayed onto it next step; the `o` that contract
-     * produces is the same, the state is not, so running this reading over an anchor cache would
-     * compute the right output once and resume every later step from the wrong state. */
     const char* sf = p_str(a, "state_form", "per_candidate");
-    if (sf && std::strcmp(sf, "per_candidate") != 0) return RAD_E_UNSUPPORTED;
+    const bool anchor = sf && std::strcmp(sf, "anchor") == 0;
+    if (!anchor && sf && std::strcmp(sf, "per_candidate") != 0) return RAD_E_UNSUPPORTED;
 
     const int64_t K = p_int(a, "head_k", 0), V = p_int(a, "head_v", 0);
     const float scale = p_f32(a, "scale", 1.0f);
@@ -1007,10 +967,11 @@ AVX_KERNEL(gdn_recurrent_update) {
     const float spthr = p_f32(a, "softplus_thr", 20.0f);
     static const char* kActs[] = { "silu", "sigmoid" };
     const int nact = p_enum(a, "act", kActs, 2, 0);
+    if (nact != 0 && nact != 1) return RAD_E_INVAL;
     if (K <= 0 || V <= 0) return RAD_E_SHAPE;
 
-    /* The head count and the token count come off the operands: v is [T, head_v_count, head_v], so
-     * a rank-3 value tensor names both. `n_head_v` overrides it for a flattened view. */
+    /* Head and token counts come from v ([T, n_head_v, head_v]); `n_head_v` overrides for a
+     * flattened view. */
     int64_t Hv = p_int(a, "n_head_v", 0);
     if (Hv <= 0) Hv = v->rank >= 3 ? v->shape[v->rank - 2] : 0;
     if (Hv <= 0) return RAD_E_SHAPE;
@@ -1020,9 +981,7 @@ AVX_KERNEL(gdn_recurrent_update) {
     if (Hg <= 0 || Hv % Hg != 0) return RAD_E_SHAPE;
     const int64_t grp = Hv / Hg;
 
-    /* N COMES FROM cu AND NOTHING ELSE: cu is [N+1] and its length minus one IS the sequence
-     * count. Deriving it from state_idx and trusting cu to be at least as long is an off-by-one
-     * waiting to happen. */
+    /* The sequence count comes from cu ([N+1]) only. */
     const int64_t n_seq = numel(cu) - 1;
     if (n_seq <= 0) return RAD_E_SHAPE;
     if (cu_at(cu, n_seq) != Tk) return RAD_E_SHAPE;
@@ -1035,19 +994,54 @@ AVX_KERNEL(gdn_recurrent_update) {
     const V3 zv = z ? view3_rows(z, Hv, V) : vv;
     const V2 a2 = view2(av, Hv), b2 = view2(bvt, Hv);
     const V2 si = sidx ? view2(sidx, sw) : V2{ nullptr, 0, 0 };
+    /* The anchor form keeps its factors inside a head's [V, K] block of a state slot, at libr4d's
+     * offsets, so the block must be dense and large enough. Checked before any write. */
+    const AnchorLayout al(K, V);
+    if (anchor) {
+        if (!sidx || sw < 6) return RAD_E_SHAPE;
+        if (state->rank >= 4 && (state->stride[3] != 1 || state->stride[2] != K))
+            return RAD_E_STRIDE;
+        if (al.tmax < 1) return RAD_E_SHAPE;
+        for (int64_t n = 0; n < n_seq; ++n) {
+            const int64_t na = nacc ? ldi(nacc, offlin(nacc, n)) : 1;
+            if (cu_at(cu, n + 1) - cu_at(cu, n) > al.tmax || na > al.tmax) return RAD_E_SHAPE;
+        }
+    }
 
     AVX_PARALLEL_FOR_IF(n_seq * Hv >= 4)
     for (int64_t nh = 0; nh < n_seq * Hv; ++nh) {
         const int64_t n = nh / Hv, h = nh % Hv, hk = h / grp;
         const int64_t bos = cu_at(cu, n), q_len = cu_at(cu, n + 1) - bos;
-        if (q_len <= 0) continue;
+        const int64_t sstride = state->rank >= 4 ? state->stride[0] : (int64_t)Hv * V * K;
+        const int64_t hstride = state->rank >= 4 ? state->stride[1] : (int64_t)V * K;
+        const int64_t vstride = state->rank >= 4 ? state->stride[2] : K;
+        const int64_t dstride = state->rank >= 4 ? state->stride[3] : 1;
+        /* Under `anchor` a sequence with no rows this step still folds its accepted prefix in. */
+        if (q_len <= 0 && !anchor) continue;
         const int64_t na = nacc ? ldi(nacc, offlin(nacc, n)) : 1;
         const int64_t rd = na > 0 ? na - 1 : 0;
-        const int64_t slot_in = sidx ? ldi(sidx, at2(si, n, rd < sw ? rd : sw - 1)) : n;
-        if (slot_in < 0) continue;
+        int64_t col[6] = { 0, 0, 0, 0, 0, 0 };
+        int64_t slot_in = 0;
+        if (anchor) {
+            bool pad = false;
+            for (int c = 0; c < 6; ++c) {
+                col[c] = ldi(sidx, at2(si, n, c));
+                pad = pad || col[c] < 0;
+            }
+            if (pad) continue;
+            slot_in = col[al.anchor_col(state, col[4] * sstride + h * hstride)];
+        } else {
+            slot_in = sidx ? ldi(sidx, at2(si, n, rd < sw ? rd : sw - 1)) : n;
+            if (slot_in < 0) continue;
+        }
+        /* The factor blocks: column 4's is read, and 3, 4 and 5 are written (each a page the
+         * window can shift onto). */
+        const int64_t fb = anchor ? col[4] * sstride + h * hstride : 0;
+        const int64_t fbs[3] = { anchor ? col[3] * sstride + h * hstride : 0, fb,
+                                 anchor ? col[5] * sstride + h * hstride : 0 };
+        const bool dup_f = anchor && (col[3] != col[4] || col[5] != col[4]);
 
-        /* vrow/zrow widen the per-token value and gate rows once: the loops below read them
-         * V times each, and per-element ldt there is a dtype switch per element. */
+        /* vrow/zrow hold the per-token value and gate rows, widened once. */
         const size_t need = (size_t)(V * K + 2 * K + 5 * V) + 16;
         float* wsp = scratch_f32(need);
         float* S = wsp;
@@ -1059,15 +1053,7 @@ AVX_KERNEL(gdn_recurrent_update) {
         float* vrow = gainv + V;
         float* zrow = vrow + V;
 
-        const int64_t sstride = state->rank >= 4 ? state->stride[0] : (int64_t)Hv * V * K;
-        const int64_t hstride = state->rank >= 4 ? state->stride[1] : (int64_t)V * K;
-        const int64_t vstride = state->rank >= 4 ? state->stride[2] : K;
-        const int64_t dstride = state->rank >= 4 ? state->stride[3] : 1;
-
-        /* ONE SWITCH PER ROW, NOT PER ELEMENT (avx_vec.h): the state tile is V*K scalar
-         * dtype-switched loads below, and the widened row loop is what the hardware
-         * prefetcher can see through. Same f32 values either way, so the arithmetic is
-         * untouched. */
+        /* Widen the state a row at a time (one dtype switch per row, avx_vec.h). */
         if (dstride == 1) {
             for (int64_t e = 0; e < V; ++e)
                 row_to_f32(state->dtype,
@@ -1083,17 +1069,52 @@ AVX_KERNEL(gdn_recurrent_update) {
 
         const float alog = A_log ? ldt(A_log, h * laststride(A_log)) : 0.0f;
         const float dtb = dt_bias ? ldt(dt_bias, h * laststride(dt_bias)) : 0.0f;
-        const float negexp = -std::exp(alog);
-        /* The norm gain, read once per head rather than once per (token, channel). */
+        const float negexp = -sc_exp(alog);
+        /* Norm gain, read once per head. */
         if (nw) {
             if (laststride(nw) == 1) row_to_f32(nw->dtype, nw->data, gainv, V);
             else for (int64_t e = 0; e < V; ++e) gainv[e] = ldt(nw, e * laststride(nw));
         }
 
+        if (anchor) {
+            /* Replay the previous step's accepted tokens from their factors, with the token
+             * loop's own arithmetic, so the replayed state is the one per_candidate would hold.
+             * Then publish it at column 2 and stamp each factor copy with its column. */
+            for (int64_t t = 0; t < na; ++t) {
+                const int64_t f = fb + t * al.fstr;
+                for (int64_t e = 0; e < V; ++e) vrow[e] = ldt(state, f + al.vb + e);
+                /* Each 32-row group of V replays from its own copy of k and its own (g, beta), as
+                 * libr4d's kernel and libref read them; writers store equal copies. */
+                for (int64_t gi = 0; gi < al.groups; ++gi) {
+                    const int64_t e0 = 32 * gi, e1 = std::min<int64_t>(V, e0 + 32);
+                    for (int64_t d = 0; d < K; ++d) kn[d] = ldt(state, f + gi * K + d);
+                    const float gval = ldt(state, f + al.gb + 2 * gi);
+                    const float bt = ldt(state, f + al.gb + 2 * gi + 1);
+                    const float dec = sc_exp(gval);
+                    const vf vdec = vf_set1(dec);
+                    for (int64_t e = e0; e < e1; ++e) {
+                        float* Se = S + e * K;
+                        int64_t d = 0;
+                        for (; d + VF_N <= K; d += VF_N)
+                            vf_storeu(Se + d, vf_mul(vf_loadu(Se + d), vdec));
+                        for (; d < K; ++d) Se[d] *= dec;
+                        uu[e] = bt * (vrow[e] - dot2(Se, kn, K));
+                    }
+                    for (int64_t e = e0; e < e1; ++e) axpy(S + e * K, kn, uu[e], K);
+                }
+            }
+            for (int64_t e = 0; e < V; ++e)        /* the anchor block is dense (checked) */
+                row_from_f32(state->dtype, S + e * K,
+                             (void*)byte_at(state->data, state->dtype,
+                                            col[2] * sstride + h * hstride + e * K),
+                             K);
+            for (int c = 0; c < 3; ++c) stt(state, fbs[c] + al.mark, (float)(c + 1));
+        }
+
         for (int64_t t = 0; t < q_len; ++t) {
             const int64_t tok = bos + t;
             const float gval = negexp * softplus(ldt(av, at2(a2, tok, h)) + dtb, spthr);
-            const float bt = 1.0f / (1.0f + std::exp(-ldt(bvt, at2(b2, tok, h))));
+            const float bt = 1.0f / (1.0f + sc_exp(-ldt(bvt, at2(b2, tok, h))));
 
             if (qv.s2 == 1 && kv.s2 == 1) {
                 row_to_f32(q->dtype, byte_at(q->data, q->dtype, at3(qv, tok, hk, 0)), qn, K);
@@ -1104,13 +1125,12 @@ AVX_KERNEL(gdn_recurrent_update) {
                     kn[d] = ldt(k, at3(kv, tok, hk, d));
                 }
             }
-            /* The value row, widened once per token: the decay loop below reads it V times. */
+            /* Value row, widened once per token. */
             if (vv.s2 == 1)
                 row_to_f32(v->dtype, byte_at(v->data, v->dtype, at3(vv, tok, h, 0)), vrow, V);
             else
                 for (int64_t e = 0; e < V; ++e) vrow[e] = ldt(v, at3(vv, tok, h, e));
-            /* The l2 norms: no division by K, and `scale` folded into q's -- libref multiplies
-             * them in that order and the product is not associative in f32. */
+            /* L2 norms (no division by K), with `scale` folded into q's in libref's order. */
             const float qs = 1.0f / std::sqrt(row_sumsq(qn, K) + l2eps) * scale;
             const float ks = 1.0f / std::sqrt(row_sumsq(kn, K) + l2eps);
             {
@@ -1123,7 +1143,7 @@ AVX_KERNEL(gdn_recurrent_update) {
                 for (; d < K; ++d) { qn[d] *= qs; kn[d] *= ks; }
             }
 
-            const float dec = std::exp(gval);
+            const float dec = sc_exp(gval);
             const vf vdec = vf_set1(dec);
             for (int64_t e = 0; e < V; ++e) {
                 float* Se = S + e * K;
@@ -1131,15 +1151,29 @@ AVX_KERNEL(gdn_recurrent_update) {
                 for (; d + VF_N <= K; d += VF_N)
                     vf_storeu(Se + d, vf_mul(vf_loadu(Se + d), vdec));
                 for (; d < K; ++d) Se[d] *= dec;
-                uu[e] = bt * (vrow[e] - dotf(Se, kn, K));
+                uu[e] = bt * (vrow[e] - dot2(Se, kn, K));
             }
             for (int64_t e = 0; e < V; ++e) {
                 float* Se = S + e * K;
                 axpy(Se, kn, uu[e], K);
-                orow[e] = dotf(Se, qn, K);
+                orow[e] = dot2(Se, qn, K);
             }
 
-            /* The gate row, widened once per token like the value row above. */
+            /* This token's factors, for the next step to replay: the normalised k once per
+             * 32-row group, v, then the decay exponent and beta once per group. */
+            if (anchor)
+                for (int c = 0; c < 3; ++c) {
+                    if (c != 1 && !dup_f) continue;
+                    const int64_t f = fbs[c] + t * al.fstr;
+                    for (int64_t gi = 0; gi < al.groups; ++gi) {
+                        for (int64_t d = 0; d < K; ++d) stt(state, f + gi * K + d, kn[d]);
+                        stt(state, f + al.gb + 2 * gi, gval);
+                        stt(state, f + al.gb + 2 * gi + 1, bt);
+                    }
+                    for (int64_t e = 0; e < V; ++e) stt(state, f + al.vb + e, vrow[e]);
+                }
+
+            /* Gate row, widened once per token. */
             if (z) {
                 if (zv.s2 == 1)
                     row_to_f32(z->dtype, byte_at(z->data, z->dtype, at3(zv, tok, h, 0)), zrow,
@@ -1147,14 +1181,14 @@ AVX_KERNEL(gdn_recurrent_update) {
                 else
                     for (int64_t e = 0; e < V; ++e) zrow[e] = ldt(z, at3(zv, tok, h, e));
             }
-            /* The gated RMS norm, over the head's V channels. */
+            /* Gated RMS norm over the head's V channels. */
             const float sc = 1.0f / std::sqrt(row_sumsq(orow, V) / (float)V + neps);
             for (int64_t e = 0; e < V; ++e) {
                 float r = orow[e] * sc;
                 if (nw) r *= gainv[e];
                 if (z) {
                     const float zz = zrow[e];
-                    const float sg = 1.0f / (1.0f + std::exp(-zz));
+                    const float sg = 1.0f / (1.0f + sc_exp(-zz));
                     r *= (nact == 1 ? sg : zz * sg);
                 }
                 orow[e] = r;
@@ -1162,9 +1196,8 @@ AVX_KERNEL(gdn_recurrent_update) {
             if (ov.s2 == 1) out_row(o, at3(ov, tok, h, 0), V, orow);
             else for (int64_t e = 0; e < V; ++e) stt(o, at3(ov, tok, h, e), orow[e]);
 
-            /* QUANTISE WHAT WAS WRITTEN, not what produced it: the standalone quant_act_fp8 this
-             * replaces read `o` back out of memory, so it saw the rounded store and not the f32.
-             * One group per (token, head), because head_v is the fp8 block width. */
+            /* Quantise `o` as stored (read back), as the standalone quant_act_fp8 would see it.
+             * One group per (token, head): head_v is the fp8 block width. */
             if (oq && osc) {
                 if (ov.s2 == 1)
                     row_to_f32(o->dtype, byte_at(o->data, o->dtype, at3(ov, tok, h, 0)), uu, V);
@@ -1197,6 +1230,7 @@ AVX_KERNEL(gdn_recurrent_update) {
                 stt(osc, rowoff(osc, tok, Hv) + h * laststride(osc), qsc);
             }
 
+            if (anchor) continue;
             const int64_t so = sidx ? ldi(sidx, at2(si, n, t < sw ? t : sw - 1)) : n;
             if (so >= 0) {
                 if (dstride == 1) {
@@ -1218,14 +1252,12 @@ AVX_KERNEL(gdn_recurrent_update) {
 }
 
 /* ------------------------------------------------------------------ gdn_conv_recurrent_update */
-/* gdn_conv_update into a staging q, k and v, then gdn_recurrent_update over them. The fused op is
- * DEFINED as that pair, so this is the pair -- this level's own two kernels, called with the
- * operands and parameters each one takes -- and nothing is restated. The head geometry the staging
- * needs comes off `o` ([T, Hv, head_v]) and `x` (2 Hg head_k + Hv head_v columns).
+/* Defined as gdn_conv_update into a staging q, k and v, then gdn_recurrent_update over them, and
+ * implemented as exactly that pair of this level's kernels. The staging geometry comes from `o`
+ * ([T, Hv, head_v]) and `x` (2 Hg head_k + Hv head_v columns).
  *
- * The staging is sized from x's dtype, a whole element each; a sub-byte activation is refused
- * rather than given a buffer the convolution would write past. It lives in a buffer the calling
- * thread keeps, so a call allocates nothing once the thread has seen its widest. */
+ * The staging uses x's dtype; sub-byte dtypes are refused. It is a per-thread buffer that only
+ * grows. */
 AVX_KERNEL(gdn_conv_recurrent_update) {
     if (a->n_t < 16) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *o = &a->t[15];
@@ -1268,28 +1300,23 @@ AVX_KERNEL(gdn_conv_recurrent_update) {
     const int rc = AVX_FN(avx_gdn_conv_update)(&ca, stream);
     if (rc != RAD_OK) return rc;
 
-    std::vector<RadParam> rp;
-    for (int i = 0; i < a->n_p; ++i)
-        if (std::strcmp(a->p[i].key, "conv_width")) rp.push_back(a->p[i]);
     /* q, k, v, a, b, A_log, dt_bias, state, state_idx, num_accepted, cu, z, norm_w, o, o_q,
-     * o_scale */
+     * o_scale. The parameters pass as they are: the recurrence reads its own by name. */
     RadTensor rt[16] = { tq, tk, tv, a->t[5], a->t[6], a->t[7], a->t[8], a->t[9], a->t[10],
                          a->t[11], a->t[12], a->t[13], a->t[14], a->t[15],
                          a->n_t > 16 ? a->t[16] : RadTensor{}, a->n_t > 17 ? a->t[17] : RadTensor{} };
     RadArgs ra = *a;
-    ra.t = rt; ra.n_t = 16; ra.p = rp.data(); ra.n_p = (int)rp.size();
+    ra.t = rt; ra.n_t = 16;
     return AVX_FN(avx_gdn_recurrent_update)(&ra, stream);
 }
 
 /* ------------------------------------------------------------------ gdn_gated_rmsnorm */
-/* out = x * rsqrt(mean_channels(x^2) + eps) * w * act(z), one row per (token, head). The prefill
- * path's form of the epilogue the recurrent update folds in.
+/* out = x * rsqrt(mean_channels(x^2) + eps) * w * act(z), one row per (token, head): the prefill
+ * form of the epilogue the recurrent update folds in.
  *
- * THE GATE HAS A THIRD SPELLING the shared rowoff() cannot see. It walks [tokens, heads, ch], and a
- * flat [rows, ch] projection is its product; but a COLUMN SLICE of a wider projection row -- the
- * fp8 delta net fuses [q|k|v|z] into one GEMM -- has heads*ch as its last axis, so rowoff reads it
- * as a dense row and lands in the next token. Spelled out here rather than generalised into
- * avx_common.h, because it is a property of THIS operand and not of every one. */
+ * The gate may be a rank-2 column slice of a wider projection row (the fp8 delta net fuses
+ * [q|k|v|z] into one GEMM) with heads*ch as its last axis, which rowoff() would read as a dense row.
+ * Handled here since it is specific to this operand. */
 static inline int64_t gate_rowoff(const RadTensor* t, int64_t r, int64_t ch) {
     if (t->rank == 2 && ch > 0 && t->shape[1] != ch && t->shape[1] % ch == 0) {
         const int64_t heads = t->shape[1] / ch;
@@ -1305,6 +1332,7 @@ AVX_KERNEL(gdn_gated_rmsnorm) {
     const float eps = p_f32(a, "eps", 1e-6f);
     static const char* kActs[] = { "silu", "sigmoid" };
     const int act = p_enum(a, "act", kActs, 2, 0);
+    if (act != 0 && act != 1) return RAD_E_INVAL;
     if (ch <= 0) return RAD_E_SHAPE;
     const int64_t rows = numel(x) / ch;
     if (rows <= 0 || numel(o) < rows * ch || numel(z) < rows * ch || numel(w) < ch)
@@ -1339,7 +1367,7 @@ AVX_KERNEL(gdn_gated_rmsnorm) {
         }
         for (; i < ch; ++i) {
             const float zz = zv2[i];
-            const float sg = 1.0f / (1.0f + std::exp(-zz));
+            const float sg = 1.0f / (1.0f + sc_exp(-zz));
             obuf[i] = xv[i] * sc * gain[i] * (act == 1 ? sg : zz * sg);
         }
         if (os == 1) out_row(o, ob, ch, obuf);

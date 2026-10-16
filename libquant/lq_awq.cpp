@@ -1,30 +1,27 @@
 /* lq_awq.cpp -- AWQ: activation-aware weight quantisation (Lin et al., 2023), on any grid.
  *
- * WHAT IT DOES. A few input channels carry most of a layer's activation energy, and the error a
- * weight column contributes to the output scales with its channel's activation. AWQ scales each
- * column UP by s_j before quantising -- so the channels that matter use more of the grid -- and the
- * reader multiplies the column back down. The scales are s_j = a_j^alpha over the channels'
- * activation magnitudes a_j, normalised so their geometric middle is one, and alpha is chosen from
- * a grid of `alpha_steps` values in [0, 1) by the output error it gives; alpha = 0 is plain
- * rounding, so the search can only improve on it. A per-block clip search follows: each scale
- * block's range is pulled in by up to half, in twentieths, and the fraction of least output error
- * kept -- which is AWQ's auto_clip, the clamped weight quantised as it stands.
+ * A few input channels carry most of a layer's activation energy, and a weight column's output
+ * error scales with its channel's activation. AWQ scales each column up by s_j before quantising,
+ * so important channels use more of the grid, and the reader scales it back down. s_j = a_j^alpha
+ * over the channel activation magnitudes a_j, normalised so their geometric middle is one; alpha
+ * is picked from `alpha_steps` values in [0, 1) by output error. alpha = 0 is plain rounding, so
+ * the search never does worse. A per-block clip search follows (AWQ's auto_clip): each scale
+ * block's range is shrunk in steps of 0.05 and the factor with least output error is kept.
  *
- * THE OUTPUT ERROR IS THE HESSIAN'S QUADRATIC FORM (lq_hess.h), over a sample of `sample_rows` rows
- * for the alpha search and over each block's own columns -- H restricted to them -- for the clip,
- * which is the error AWQ measures on its calibration activations, without needing them. a_j is
- * sqrt(H_jj), the channel's root mean square. With no Hessian for a weight but an imatrix, the
- * imatrix is the diagonal: a_j is sqrt of its importance and the error is diagonal-weighted; with
- * neither, alpha is 0 and only the plain grid remains -- each said on stderr.
+ * Output error: the Hessian's quadratic form (lq_hess.h), over `sample_rows` rows for the alpha
+ * search and over each block's own columns (H restricted to them) for the clip. This is the error
+ * AWQ measures on calibration activations, without needing them. a_j = sqrt(H_jj), the channel's
+ * RMS. With no Hessian but an imatrix, the imatrix is the diagonal (a_j = sqrt(importance), error
+ * diagonal-weighted); with neither, alpha is 0 and only the plain grid remains. Each fallback is
+ * reported on stderr.
  *
- * THE SCALES ARE STORED, NOT FOLDED. AWQ's reference implementation folds 1/s into the layer
- * before (a norm or the previous projection), which needs the model's graph; here they are the
- * encoding's last scale level, a [* x 1] plane of one value a column, `colscale` wide, and the
- * stored value is the multiplier itself, c_j = 1/s_j rounded to that dtype. The weight is divided
- * by the ROUNDED c_j before it is quantised, so what a reader multiplies back is what was divided.
+ * The scales are stored, not folded. The reference implementation folds 1/s into the preceding
+ * norm or projection, which needs the model graph. Here they are the encoding's last scale level,
+ * a [* x 1] plane with one `colscale`-typed value per column holding the multiplier c_j = 1/s_j.
+ * The weight is divided by the rounded c_j, so the reader multiplies back exactly what was divided.
  *
- * NO TRANSFORM: the statistics are of the input's own channels, and a rotated weight's columns are
- * not those channels.
+ * No transform: the statistics describe the input's own channels, which a rotated weight's columns
+ * are not.
  */
 #include "lq_hess.h"
 #include "lq_quant.h"
@@ -59,8 +56,8 @@ int awq_grid(const RadParam* o, int n_o, const RadQuantWeight* w, Grid* g, uint3
     const char* c = rad_param_gets(o, n_o, "colscale", "f16");
     *cdt = rad_dtype_parse(c);
     if (*cdt != RAD_F32 && *cdt != RAD_BF16 && *cdt != RAD_F16)
-        return refuse(w, "colscale= is f32, bf16 or f16");
-    if (rad_param_geti(o, n_o, "alpha_steps", 20) < 1) return refuse(w, "alpha_steps= is >= 1");
+        return refuse(w, "colscale= must be f32, bf16 or f16");
+    if (rad_param_geti(o, n_o, "alpha_steps", 20) < 1) return refuse(w, "alpha_steps= must be >= 1");
     return RAD_OK;
 }
 
@@ -80,14 +77,6 @@ int awq_encoding(const RadParam* o, int n_o, const RadQuantWeight* w, RadEncodin
 }
 
 int64_t awq_row_block(const RadParam*, int, const RadQuantWeight*) { return 0; }
-
-float to_dt(uint32_t dt, float v) {
-    switch (dt) {
-        case RAD_BF16: return bf16_to_f32(f32_to_bf16(v));
-        case RAD_F16:  return f16_to_f32(f32_to_f16(v));
-        default:       return v;
-    }
-}
 
 /* The output error of a candidate, D = w_hat - w over `rows` rows: the Hessian's form, or the
  * diagonal's. */
@@ -139,7 +128,7 @@ int awq_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* src
     }
     const bool have = err.H || err.diag;
 
-    /* the channels' activation magnitudes, floored as AWQ floors them */
+    /* Channel activation magnitudes, floored as AWQ floors them. */
     std::vector<double> a((size_t)K, 1.0);
     if (have)
         for (int64_t j = 0; j < K; ++j) {
@@ -147,26 +136,17 @@ int awq_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* src
             a[(size_t)j] = std::max(std::sqrt(std::max(e, 0.0)), 1e-4);
         }
 
-    /* THE SAMPLE: whole scale blocks of rows, evenly spread, so a candidate is quantised exactly
-     * as the full weight will be. */
+    /* The sample: whole row blocks of the scale grid, evenly spread, so a candidate is quantised
+     * exactly as the full weight will be. */
     const int64_t unit = g.br > 0 ? g.br : N;
     const int64_t nunits = (N + unit - 1) / unit;
     const int64_t take = std::min<int64_t>(nunits, std::max<int64_t>(1, want / unit));
     std::vector<int64_t> pick;
     for (int64_t i = 0; i < take; ++i) pick.push_back(i * nunits / take);
-    int64_t srows = 0;
-    for (int64_t u : pick) srows += std::min(unit, N - u * unit);
-    std::vector<float> ws((size_t)(srows * K));
-    {
-        int64_t at = 0;
-        for (int64_t u : pick) {
-            const int64_t n = std::min(unit, N - u * unit);
-            std::memcpy(ws.data() + at * K, src + u * unit * K, (size_t)(n * K) * sizeof(float));
-            at += n;
-        }
-    }
+    std::vector<float> ws;
+    const int64_t srows = gather_units(src, N, K, unit, pick, &ws);
 
-    /* c_j for an exponent: the stored column multiplier, 1 / s_j rounded */
+    /* c_j for an exponent: the stored column multiplier 1 / s_j, rounded to its dtype. */
     auto colscales = [&](double alpha, std::vector<float>* c) {
         std::vector<double> s((size_t)K);
         double mx = 0.0, mn = 1e300;
@@ -177,10 +157,11 @@ int awq_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* src
         }
         const double norm = std::sqrt(mx * mn);
         c->resize((size_t)K);
-        for (int64_t j = 0; j < K; ++j) (*c)[(size_t)j] = to_dt(cdt, (float)(norm / s[(size_t)j]));
+        for (int64_t j = 0; j < K; ++j)
+            (*c)[(size_t)j] = round_to(cdt, (float)(norm / s[(size_t)j]));
     };
 
-    /* ---- the exponent */
+    /* Search the exponent. */
     std::vector<float> c, best_c, scaled((size_t)(srows * K)), fake((size_t)(srows * K));
     colscales(0.0, &best_c);
     if (have) {
@@ -203,12 +184,12 @@ int awq_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* src
         std::fprintf(stderr, "libquant: awq: '%s' alpha %.3f\n", w->name, (double)best_k / steps);
     }
 
-    /* ---- the weight in its scaled form, every row */
+    /* Scale the whole weight. */
     for (int64_t r = 0; r < N; ++r)
         for (int64_t j = 0; j < K; ++j) src[r * K + j] /= best_c[(size_t)j];
 
-    /* ---- the clip, block by block: the clamped block's own quantisation, measured in the
-     * original units against H over the block's columns */
+    /* Clip search per block: quantise the clamped block and measure the error in original units
+     * against H over the block's columns. */
     if (clip && have) {
         const int64_t br = g.br > 0 ? g.br : N, bc = g.bc > 0 ? g.bc : K;
         const int64_t nr = (N + br - 1) / br, nc = (K + bc - 1) / bc;
@@ -267,9 +248,9 @@ int awq_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* src
         }
     }
 
-    /* ---- the grid over the scaled, clipped weight, and the column scales after it. A column's
-     * importance in the scaled weight is its own times c_j squared: the error there is c_j times
-     * larger once the reader multiplies the column back. */
+    /* Quantise the scaled, clipped weight, then store the column scales. A column's importance in
+     * the scaled weight is its own times c_j^2, since its error grows by c_j when the reader
+     * multiplies the column back. */
     std::vector<float> imp;
     if (w->importance) {
         imp.resize((size_t)K);

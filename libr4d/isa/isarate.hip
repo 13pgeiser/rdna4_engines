@@ -1,14 +1,11 @@
-// What one instruction slot is worth on gfx1201, so that an instruction COUNT taken out of a
-// disassembly can be turned into a time.
+// Issue cost of one instruction slot on gfx1201, to turn an instruction count from a disassembly
+// into a time. A staged GEMM K tile is a few dozen v_wmma among several hundred other
+// instructions, so the wmma-to-VALU cost ratio decides whether trimming the rest pays; no public
+// table gives it for this part. Each instruction runs in independent back-to-back chains (issue
+// bound) and the rate is reported. The ratio is clock-independent, so no clock is read.
 //
-// A GEMM's staged K tile is a few dozen v_wmma inside several hundred other instructions, so
-// whether trimming the shell is worth anything depends entirely on what a wmma costs relative to a
-// plain VALU op -- and that ratio is not in any public table for this part. So measure it: run each
-// instruction back to back in independent chains (nothing to stall on but issue) and report the
-// rate. The RATIO is what matters and it is clock-independent, which is why no clock is read here.
-//
-// Occupancy is a parameter because a real tile kernel runs at 2 waves a SIMD (36864 B of LDS) and a
-// microbenchmark at 8 would answer a different question.
+// LDS is a parameter because occupancy matters: a tile kernel runs at 2 waves a SIMD (36864 B of
+// LDS), and 8 waves would answer a different question.
 #include <hip/hip_runtime.h>
 #include <cstdio>
 #include <cstdlib>
@@ -46,8 +43,7 @@ __global__ __launch_bounds__(256) void valu_rate(float* out, int iters) {
     float x0 = threadIdx.x, x1 = x0 + 1, x2 = x0 + 2, x3 = x0 + 3;
     float x4 = x0 + 4, x5 = x0 + 5, x6 = x0 + 6, x7 = x0 + 7;
     const float k = 1.0000001f;
-    // Eight independent chains, eight ops an iteration -- the same shape as the wmma loop so the
-    // two numbers differ only in the instruction being issued.
+    // Same shape as the wmma loop (eight independent chains) so only the instruction differs.
     for (int i = 0; i < iters; ++i) {
         x0 *= k; x1 *= k; x2 *= k; x3 *= k; x4 *= k; x5 *= k; x6 *= k; x7 *= k;
     }

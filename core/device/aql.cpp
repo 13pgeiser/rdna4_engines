@@ -1,33 +1,30 @@
 /* aql.cpp -- the AQL device backend: every stream is an HSA queue the engine owns, and every
- * kernel, copy, fill and fence on it is an AQL packet this file writes.
+ * kernel, copy, fill and fence on it is an AQL packet written here.
  *
- * WHY THE ENGINE WRITES ITS OWN PACKETS. hipLaunchKernel costs 0.5-1.3 us of host time a
- * dispatch, where writing the packet is 6 ns; and HIP fences every kernel at SYSTEM scope, which
- * costs the device about half a microsecond between two dependent kernels that an AGENT-scope
- * fence does not. A decode step is ~1600 dispatches a rank, so both are milliseconds a step. HIP
- * also retires a Command object per launch on a thread of its own, which is most of a core under
- * load. None of that is needed to put a kernel on a queue.
+ * Why own packets: hipLaunchKernel costs 0.5-1.3 us of host time per dispatch versus 6 ns to
+ * write the packet, and HIP fences every kernel at system scope, which costs ~0.5 us of device
+ * time between dependent kernels that an agent-scope fence does not. At ~1600 dispatches per rank
+ * per decode step both add up to milliseconds. HIP also retires a Command object per launch on its
+ * own thread, most of a core under load.
  *
- * WHAT STAYS WITH HIP. Allocation, device properties, peer access, IPC and elastic memory are
- * HIP's, through the HIP backend's own entry points. So is compiling and REGISTERING kernels: a
- * kernel library is built by hipcc and calls hipLaunchKernel exactly as it would under HIP. This
- * file defines hipLaunchKernel in the executable, which the dynamic linker binds every plugin's
- * reference to ahead of the HIP runtime's, and it records what __hipRegisterFatBinary and
- * __hipRegisterFunction are told so a host stub maps to its own code object. A launch onto a
- * stream this backend did not create is forwarded to HIP unchanged.
+ * What stays with HIP: allocation, device properties, peer access, IPC, elastic memory, and
+ * compiling and registering kernels. A kernel library is built by hipcc and calls hipLaunchKernel
+ * as usual; this file defines hipLaunchKernel in the executable, so the dynamic linker binds every
+ * plugin's reference here ahead of the HIP runtime, and it records __hipRegisterFatBinary and
+ * __hipRegisterFunction so a host stub maps to its code object. A launch onto a stream this
+ * backend did not create is forwarded to HIP unchanged.
  *
- * THE FENCES. Two kernels on one queue see each other's writes through the L2 with an agent-scope
- * fence; the system scope is only needed where memory the L2 does not see is involved:
- *
- *   - the kernel argument ring lives in VRAM and the host writes it through the BAR, which the L2
- *     does not snoop. A slot is rewritten one ring lap after it was last read, so a system-scope
- *     acquire is placed at least once per half lap: at agent scope alone, every kernel after the
- *     first lap reads its predecessor's arguments. Slots are 1 KiB so that no
- *     kernel's argument fetch shares a cache line with the next slot;
- *   - memory the host wrote. The first dispatch after the host has waited on any queue takes a
- *     system-scope acquire, since that wait is what host writes for the next step follow;
- *   - copies that read or write host or peer memory carry the scope themselves, and so do the
- *     barrier packets that implement events and synchronisation.
+ * Fences: kernels on one queue see each other's writes through the L2 with an agent-scope fence.
+ * System scope is needed only for memory the L2 does not see:
+ *   - the kernel argument ring is in VRAM and written by the host through the BAR, which the L2
+ *     does not snoop. A slot is rewritten one lap after it was last read, so a system-scope
+ *     acquire is placed at least once per half lap; without it every kernel after the first lap
+ *     reads its predecessor's arguments. Slots are 1 KiB so no argument fetch shares a cache line
+ *     with the next slot;
+ *   - host-written memory: the first dispatch after the host waits on any queue takes a
+ *     system-scope acquire, since host writes for the next step follow such a wait;
+ *   - copies touching host or peer memory carry the scope themselves, as do the barrier packets
+ *     that implement events and synchronisation.
  */
 #include "device.h"
 
@@ -136,21 +133,19 @@ Real& real() {
     return *r;
 }
 
-/* THE LAST-ERROR SLOT, AS HIP KEEPS IT. Every HIP call overwrites the thread's last error with
- * its own result, success included, and a plugin's `launch; if (hipGetLastError())` depends on
- * exactly that: an error left by some earlier call must not be reported against the launch. An
- * entry point handled here records its result and marks itself as the thread's latest call, and
- * hipGetLastError answers from it while the mark stands. */
+/* HIP's per-thread last-error slot. Every HIP call overwrites it, success included, and a
+ * plugin's `launch; if (hipGetLastError())` relies on that: an earlier call's error must not be
+ * reported against the launch. An entry point handled here records its result and marks itself
+ * as the thread's latest call; hipGetLastError answers from it while the mark stands. */
 thread_local hipError_t t_err = hipSuccess;
 thread_local bool       t_ours = false;
 
 inline hipError_t ret(hipError_t e) { t_err = e; t_ours = true; return e; }
 thread_local uint8_t    t_next_fence = 0;
 
-/* WHETHER ANYTHING WAS EVER HANDED TO HIP'S OWN STREAMS. Every submission this process makes goes
- * to the backend's queues; a HIP stream gets work only when a caller passes one the backend does
- * not own, and that is forwarded. Until then HIP's default stream is empty, so synchronising it is
- * a no-op answered here -- asking HIP would make it build the stream's queue first. */
+/* Whether any work was forwarded to a HIP stream (a stream this backend does not own). Until
+ * then HIP's default stream is empty and synchronising it is answered here; asking HIP would
+ * make it create the stream's queue first. */
 std::atomic<bool> g_hip_streams_used{false};
 
 /* ------------------------------------------------------------------ kernels */
@@ -196,8 +191,8 @@ struct Registry {
     std::mutex mu;
     std::unordered_map<void**, Module*> by_handle;
     std::unordered_map<const void*, Func*> by_stub;
-    /* Every registration in the order it happened, so the fat binaries one dlopen brought in are a
-     * contiguous run the plugin loader can check against the card (a_code_runs). */
+    /* Registrations in order, so one dlopen's fat binaries form a contiguous run the plugin
+     * loader can check against the card (a_code_runs). */
     std::vector<Module*> order;
 };
 
@@ -258,11 +253,10 @@ hsa_status_t collect_isa(hsa_isa_t isa, void* data) {
     return HSA_STATUS_SUCCESS;
 }
 
-/* The code-object targets an agent runs, in the runtime's order of preference: its own processor
- * first, then the generic target of its family, each with the modes the agent is in -- for one of
- * these R9700s "gfx1201" then "gfx12-generic". A kernel library built for either loads; asking the
- * runtime rather than keeping a family table here is what keeps a card released after this file
- * from needing an edit to it. */
+/* The code-object targets an agent runs, in the runtime's order of preference: its own processor,
+ * then its family's generic target, each with the agent's modes (an R9700: "gfx1201", then
+ * "gfx12-generic"). Asking the runtime instead of keeping a family table means newer cards need
+ * no edit here. */
 std::vector<std::string> agent_isas(hsa_agent_t a) {
     std::vector<std::string> v;
     hsa_agent_iterate_isas(a, collect_isa, &v);
@@ -285,11 +279,11 @@ int topo_node(uint32_t gpu_id) {
     return -1;
 }
 
-/* WHETHER THE CPU CAN WRITE THE CARD'S VRAM: 1 yes, 0 no, -1 the topology does not say. The driver
- * maps VRAM for the CPU only where the PCI BAR spans all of it. With a smaller BAR -- Resizable BAR
- * off in the firmware, or a board without it -- the topology calls the card's memory a private
- * frame buffer and the runtime maps every VRAM allocation PROT_NONE, which the kernel argument
- * rings are; the heap type is what the runtime itself decides from. */
+/* Whether the CPU can write the card's VRAM: 1 yes, 0 no, -1 unknown. The driver maps VRAM for
+ * the CPU only when the PCI BAR spans all of it. With a smaller BAR (Resizable BAR off or
+ * unsupported) the topology reports a private frame buffer heap and the runtime maps every VRAM
+ * allocation PROT_NONE, including the kernel argument rings. The heap type is what the runtime
+ * itself decides from. */
 int vram_host_writable(uint32_t gpu_id) {
     constexpr unsigned long long kHeapFbPrivate = 2;    /* HSA_HEAPTYPE_FRAME_BUFFER_PRIVATE */
     const int n = gpu_id ? topo_node(gpu_id) : -1;
@@ -411,8 +405,8 @@ bool init_devices() {
             g.why = fmt("HIP device %d (%s) has no matching HSA agent with a VRAM pool", i, bus);
             return false;
         }
-        /* Every dispatch's arguments are written by the host into VRAM (a_stream_create), so a
-         * card the CPU cannot write is refused here rather than at the first launch's SIGSEGV. */
+        /* The host writes every dispatch's arguments into VRAM (a_stream_create), so a card the
+         * CPU cannot write is refused here instead of at the first launch's SIGSEGV. */
         if (vram_host_writable(g.dev[(size_t)i].kfd_id) == 0) {
             g.why = fmt("card %d (%s) does not let the CPU write its VRAM: its PCI BAR is smaller "
                         "than its memory. The AQL backend needs Resizable BAR -- turn on Above 4G "
@@ -421,8 +415,8 @@ bool init_devices() {
             return false;
         }
     }
-    /* Refused, a fault is left to the runtime's own handling, which is what the memory-fault
-     * report below exists to replace: so the start says it. */
+    /* Without the handler a fault falls back to the runtime's own handling, which the
+     * memory-fault report below replaces; warn at startup. */
     if (hsa_amd_register_system_event_handler(on_system_event, nullptr) != HSA_STATUS_SUCCESS)
         RAD_WARN("device: the runtime refused the memory-fault report's handler; a GPU memory "
                  "fault will not be reported, and may hang the server instead of ending it");
@@ -508,16 +502,15 @@ KernelRec* resolve(Func* fn, int ord) {
                                    &k->group_size);
     hsa_executable_symbol_get_info(s, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_PRIVATE_SEGMENT_SIZE,
                                    &k->private_size);
-    /* THE ARGUMENT SLOT IS FIXED AT 1 KiB, and a kernel whose segment does not fit leaves less
-     * than the guard the fence scheme needs between one slot and the next. Refused by name: no
-     * kernel in this tree comes near it. */
+    /* The argument slot is fixed at 1 KiB; a larger segment would eat into the guard the fence
+     * scheme needs between slots. No kernel in this tree comes near it. */
     if (k->kernarg_size > kKargMax) {
         fn->err[ord] = fmt("its kernel argument segment is %u bytes and the backend's slot holds %u",
                            k->kernarg_size, kKargMax);
         return nullptr;
     }
-    /* A dynamic stack needs a scratch size the kernel cannot state; HIP guesses one. This backend
-     * does not guess, and no kernel in this tree has one. */
+    /* A dynamic stack needs a scratch size the kernel cannot state; HIP guesses one, this backend
+     * refuses. No kernel in this tree has one. */
     if (meta->dynamic_stack) {
         fn->err[ord] = "it uses a dynamic stack, which the AQL backend does not size";
         return nullptr;
@@ -546,7 +539,7 @@ KernelRec* resolve(Func* fn, int ord) {
     return out;
 }
 
-/* One lookup a launch, so a thread-local direct-mapped cache sits in front of the registry. */
+/* One lookup per launch: a thread-local direct-mapped cache in front of the registry. */
 struct CacheEnt { const void* stub; int ord; KernelRec* k; };
 thread_local CacheEnt t_cache[512];
 
@@ -585,6 +578,7 @@ struct Stream {
     uint64_t        epoch = 0;                /* host epoch at the last system acquire */
     hsa_signal_t    ride{};                   /* rad_ride: the next dispatch's completion signal */
     bool            agent_only = false;       /* rad_xp_stream_create: never a system-scope acquire */
+    std::atomic<int> gates{0};                /* closed gates (rad_stream_gate) on this queue */
     std::atomic<int> fault{0};
     char*           bounce = nullptr;         /* pinned, for pageable copies */
     std::mutex      bounce_mu;
@@ -596,9 +590,9 @@ struct Stream {
     void unlock() { busy.store(false, std::memory_order_release); }
 };
 
-/* EVERY QUEUE THIS PROCESS HAS MADE, by a number that is never reused, so a record of "the wait
- * packet at index i of queue n" stays meaningful after the queue is destroyed: a destroyed queue's
- * entry is null, and everything it held has been consumed. */
+/* Every queue this process has made, by an id that is never reused, so "packet i of queue n"
+ * stays meaningful after the queue is destroyed. A destroyed queue's entry is null; everything
+ * it held has been consumed. */
 constexpr uint32_t kMaxQueues = 1024;
 std::atomic<hsa_queue_t*> g_queue_by_id[kMaxQueues];
 std::atomic<uint32_t>     g_next_queue_id{0};
@@ -619,11 +613,11 @@ void on_queue_error(hsa_status_t st, hsa_queue_t*, void* data) {
     RAD_ERR("device %d: the AQL queue faulted: %s", s->ord, m ? m : "?");
 }
 
-/* WHAT EVERY QUEUE IS DOING, printed once when a host wait has not come back for five seconds.
- * Nothing on the step path takes that long, so a wait that does is a queue stuck on a packet --
- * a barrier on a signal nothing will decrement, or a kernel that faulted without a report -- and
- * the packet at the read index is the answer. */
-/* Every queue's read index, summed: it only grows, so an unchanged sum is "no queue moved". */
+/* Queue dump, printed once when a host wait has not returned for 5 s. Nothing on the step path
+ * takes that long, so such a wait means a queue is stuck on a packet (a barrier on a signal
+ * nothing will decrement, or a kernel that faulted silently); the packet at the read index says
+ * which. */
+/* Sum of every queue's read index. It only grows, so an unchanged sum means no queue moved. */
 uint64_t read_progress() {
     std::lock_guard<std::mutex> lk(G().streams_mu);
     uint64_t n = 0;
@@ -631,7 +625,7 @@ uint64_t read_progress() {
     return n;
 }
 
-/* The DMA lanes' part of the dump, set once a lane opens (the lanes are kept further down). */
+/* The DMA lanes' part of the dump, set once a lane opens. */
 void (*g_dump_lanes)() = nullptr;
 
 void dump_queues(const char* where) {
@@ -669,23 +663,19 @@ void dump_queues(const char* where) {
 
 /* ------------------------------------------------------------------ the memory-fault report
  *
- * WHAT A GPU MEMORY FAULT READ, in this process's terms. The runtime's own line gives the card and
- * the address and nothing else, and an address alone cannot say whether a kernel was handed a
- * buffer that was freed under it, read past the end of a live one, or followed a pointer that was
- * never one. So every range this backend hands out is kept with its kind, size and order, and the
- * latest frees with it, and on a fault the address and the running kernel's pointer arguments are
- * each placed against both.
+ * Explains a GPU memory fault in this process's terms. The runtime reports only the card and the
+ * address, which cannot distinguish a use-after-free, an overrun of a live buffer, or a bogus
+ * pointer. So every range this backend hands out is kept with its kind, size and order, along
+ * with the latest frees, and on a fault the address and the running kernel's pointer arguments
+ * are each located against both.
  *
- * AND THEN THE PROCESS ENDS, at once and without a core. A fault stops the queue it happened on for
- * good, and what the runtime does next turns on the core-size limit, neither way usefully. With no
- * core file to write, the HIP runtime's own handler claims the event (HIP_SKIP_ABORT_ON_GPU_ERROR
- * defaults on) and keeps the error for a HIP call this backend never makes: nothing prints, nothing
- * aborts, and every wait spins on the stopped queue -- a server that hangs with only the stall
- * report to say so. With a limit set, the runtime prints its line and writes a GPU core of every
- * device mapping before it aborts, tens of gigabytes for a served model: minutes of a server that
- * neither answers nor exits. So the report is followed by fatal() -- exit status 70, no destructors
- * (they would wait on that queue), no core -- and a supervisor's restart is what brings the server
- * back. */
+ * The process then ends at once, without a core. A fault stops its queue for good, and the
+ * runtime's next step depends on the core-size limit, uselessly either way. With no core limit,
+ * HIP's handler claims the event (HIP_SKIP_ABORT_ON_GPU_ERROR defaults on) and holds the error
+ * for a HIP call this backend never makes, so every wait spins on the stopped queue and the
+ * server hangs. With a limit, the runtime writes a GPU core of every device mapping before
+ * aborting, tens of GB for a served model. So the report is followed by fatal(): exit status 70,
+ * no destructors (they would wait on that queue), no core; a supervisor restarts the server. */
 struct AllocRec {
     uintptr_t base = 0;
     int64_t   bytes = 0;
@@ -738,9 +728,9 @@ std::string rec_str(const AllocRec& r, uintptr_t a) {
                humanb(r.bytes).c_str(), r.base, humanb((int64_t)(a - r.base)).c_str());
 }
 
-/* Where address `a` lies among this process's ranges: inside a live one, inside one freed since
- * (the newest such first -- a range handed out again holds the address live as well), or in
- * neither, with the live ranges either side of it. Called with g_alloc_mu held. */
+/* Where address `a` lies: inside a live range, inside a freed one (newest first; a reallocated
+ * range also holds it live), or in neither, with the live ranges on either side. Called with
+ * g_alloc_mu held. */
 std::string where_is(uintptr_t a) {
     auto it = g_live.upper_bound(a);
     if (it != g_live.begin()) {
@@ -766,8 +756,8 @@ std::string where_is(uintptr_t a) {
     return s;
 }
 
-/* The runtime's view of the address, which covers what this backend did not allocate itself (a
- * kernel library's own hipMalloc, the runtime's internals): the allocation it falls in, if any. */
+/* The runtime allocation containing the address, if any. Covers what this backend did not
+ * allocate (a kernel library's own hipMalloc, runtime internals). */
 std::string runtime_view(uintptr_t a) {
     hsa_amd_pointer_info_t info{};
     info.size = sizeof info;
@@ -805,11 +795,10 @@ hsa_status_t on_system_event(const hsa_amd_event_t* e, void*) {
         RAD_ERR("device %d: GPU memory fault at %#" PRIxPTR " (%s ): %s; %s", card, va,
                 why.empty() ? " ?" : why.c_str(), where_is(va).c_str(), runtime_view(va).c_str());
     }
-    /* THE KERNEL THAT RAN, AND WHAT IT WAS GIVEN. A queue's read index stays on a packet until it
-     * completes, so the packet there is the one in flight; every pointer-shaped word of its
-     * arguments is placed like the address, which names the operand a stale or short buffer was
-     * passed as. Card `card`'s queues only, and the arguments read through the BAR as they were
-     * written. */
+    /* The running kernel and its arguments. A queue's read index stays on a packet until it
+     * completes, so the packet there is in flight. Every pointer-shaped argument word is located
+     * like the address, which names the operand that got a stale or short buffer. Only card
+     * `card`'s queues; arguments are read back through the BAR. */
     std::lock_guard<std::mutex> sl(G().streams_mu);
     for (Stream* s : G().streams) {
         if (s->ord != card) continue;
@@ -843,13 +832,13 @@ hsa_status_t on_system_event(const hsa_amd_event_t* e, void*) {
 /* How long a host wait goes before it reports the queues; see dump_queues. */
 constexpr uint32_t kStallMs = 5000;
 
-/* A spin that notices when it has gone on too long. Checked every 64k iterations, so the clock
- * is read a few thousand times a second at most.
+/* Stall detector for a spin loop. tick() reads the clock every 64k iterations, a few thousand
+ * times a second at most.
  *
- * SLOW OR STUCK: the dump alone cannot say. A long prefill at a deep context can hold one wait past
- * five seconds while the queue drains packet after packet, and a hung kernel holds it with the
- * read index frozen. So the read indices are noted with the dump and looked at once more a stall
- * period later: advanced is a long wait, unchanged is a queue the GPU is not running. */
+ * The dump alone cannot tell slow from stuck: a long prefill at deep context can hold one wait
+ * past 5 s while the queue drains, and a hung kernel holds it with the read index frozen. So the
+ * read indices are sampled with the dump and again one stall period later: advanced means a long
+ * wait, unchanged means the GPU is not running the queue. */
 struct Stall {
     const char* where;
     uint32_t n = 0;
@@ -861,7 +850,7 @@ struct Stall {
         if (told == 2 || (++n & 0xffff)) return;
         check();
     }
-    /* Every call, for a loop that sleeps between calls and so makes few of them. */
+    /* Checks on every call, for a loop that sleeps between calls. */
     void check() {
         if (told == 2) return;
         const auto waited = std::chrono::steady_clock::now() - t0;
@@ -882,11 +871,10 @@ struct Stall {
     }
 };
 
-/* The slot for packet `idx`, once the packet processor has consumed far enough that it is free.
- * A packet with the barrier bit having been LAUNCHED means every packet before it has COMPLETED --
- * which is what a kernel argument slot, read by the whole of its kernel, needs. A played tape
- * leaves the bit off on at most kTapeOverlapRun packets in a row (see TapeRec::overlap), so of any
- * kTapeOverlapRun + 1 consecutive packets one carries it; the margin is that run and one more. */
+/* Reserves packet `idx` once the packet processor has consumed far enough that its slot is free.
+ * A launched barrier-bit packet means every packet before it has completed, which a kernel
+ * argument slot (read for the kernel's whole run) needs. A played tape clears the bit on at most
+ * kTapeOverlapRun consecutive packets (TapeRec::overlap), so the margin is that run plus one. */
 constexpr uint64_t kReserveMargin = (uint64_t)kTapeOverlapRun + 2;
 
 inline int reserve(Stream* s, uint64_t* out) {
@@ -898,6 +886,13 @@ inline int reserve(Stream* s, uint64_t* out) {
             s->rd = hsa_queue_load_read_index_scacquire(s->q);
             if (idx + kReserveMargin - s->rd <= size) break;
             if (s->fault.load(std::memory_order_relaxed)) return RAD_E_DEVICE;
+            /* Behind a closed gate the queue drains only once the host opens it, and the host is
+             * the one waiting here. */
+            if (s->gates.load(std::memory_order_relaxed) > 0) {
+                device_set_error("a submission onto a full queue behind a closed gate: open the "
+                                 "gate (rad_gate_open) first");
+                return RAD_E_STATE;
+            }
             st.tick();
             _mm_pause();
         }
@@ -919,19 +914,17 @@ inline void publish(Stream* s, uint64_t idx, uint16_t header, uint16_t setup) {
 
 /* ------------------------------------------------------------------ recorded passes
  *
- * A PASS RECORDED ONCE IS WRITTEN STRAIGHT INTO THE QUEUES AFTERWARDS. The engine issues the same
- * pass -- the same kernels with the same arguments -- step after step, and nearly all of a
- * dispatch's host cost is producing it: the architecture's block code, the runtime's operand
- * resolution, the kernel library's argument packing. A recorded dispatch is the finished packet and
- * its finished argument block, which lives in VRAM for as long as the tape does, so playing it back
- * is a 60-byte copy into the queue and a header store.
+ * A pass is recorded once and then written straight into the queues. The engine issues the same
+ * kernels with the same arguments step after step, and nearly all of a dispatch's host cost is
+ * producing it (block code, operand resolution, argument packing). A recorded dispatch is the
+ * finished packet plus its argument block, kept in VRAM for the tape's lifetime, so playback is a
+ * 60-byte copy into the queue and a header store.
  *
- * WHAT IS RECORDED is what THIS THREAD submits while a capture is open: dispatches -- kernels, and
- * the backend's own copies and fills -- and event records and waits. Those are kept by EVENT and
- * replayed through the ordinary calls, because a record takes a fresh signal every time (see
- * "events"). A pageable copy stages through the host and waits, which a tape cannot reproduce, and
- * it makes the tape unusable. Other threads' submissions to the same queues are theirs and are not
- * recorded. */
+ * Recorded: what this thread submits while a capture is open -- dispatches (kernels and the
+ * backend's own copies and fills) and event records and waits. Events are kept by event and
+ * replayed through the ordinary calls, because each record takes a fresh signal (see "events").
+ * A pageable copy stages through the host and waits, which a tape cannot reproduce, so it makes
+ * the tape unusable. Other threads' submissions are not recorded. */
 enum : uint8_t { kTapeDispatch = 0, kTapeRecord = 1, kTapeWait = 2 };
 
 struct TapeRec {
@@ -942,9 +935,9 @@ struct TapeRec {
     Stream*  s = nullptr;
     void*    ev = nullptr;              /* a record's or a wait's event */
     hsa_kernel_dispatch_packet_t pkt{}; /* a dispatch's packet, all but the header word */
-    /* A dispatch played WITHOUT the barrier bit, which lets the packet processor launch it while
-     * the packets before it on its queue are still running. Set by the recorder only where it has
-     * shown the dispatch reads and writes nothing those packets write (tape_set_overlap). */
+    /* Play without the barrier bit, so the packet processor may launch it while earlier packets
+     * on the queue still run. Set only where the dispatch touches nothing those packets write
+     * (tape_set_overlap). */
     uint8_t  overlap = 0;
 };
 
@@ -954,8 +947,8 @@ struct Tape {
     std::vector<unsigned char> karg_host;   /* the argument blocks, kept to compare tapes by */
     char*                karg = nullptr;    /* VRAM, CPU-mapped, from the end of the capture on */
     std::string          bad;               /* why this tape cannot be played, if it cannot */
-    /* The last packet the latest play wrote on each queue. The argument block is freed only once
-     * each of them has been consumed. */
+    /* Last packet the latest play wrote on each queue; the argument block is freed only after
+     * all of them are consumed. */
     std::vector<std::pair<uint32_t, uint64_t>> last;
 };
 
@@ -997,8 +990,8 @@ inline int acquire_scope(Stream* s, uint64_t idx, bool forced) {
     if (forced || lap || s->epoch != ep) {
         s->last_sys_acq = (int64_t)idx;
         s->epoch = ep;
-        /* The prefetch's stream reads nothing the host writes: a system acquire there would only
-         * invalidate the L2 under the compute stream's feet. */
+        /* The prefetch stream reads nothing the host writes; a system acquire there would only
+         * invalidate the L2 under the compute stream. */
         if (s->agent_only && !forced) return HSA_FENCE_SCOPE_AGENT;
         return HSA_FENCE_SCOPE_SYSTEM;
     }
@@ -1071,8 +1064,8 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     p->completion_signal.handle = 0;
     constexpr uint16_t setup = 3u << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS;
     if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence);
-    /* A ride goes on after the tape has its copy: a recorded packet carries no signal of this
-     * issue's, and a play puts on whichever ride is waiting then (PlayRun::put). */
+    /* Attach the ride after the tape copied the packet: a recorded packet carries no signal, and
+     * a play attaches whichever ride is pending then (PlayRun::put). */
     if (s->ride.handle) {
         p->completion_signal = s->ride;
         s->ride.handle = 0;
@@ -1084,21 +1077,18 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     return RAD_OK;
 }
 
-/* A RUN OF RECORDED DISPATCHES ONTO ONE QUEUE, under one hold of the queue's lock and with the
- * doorbell rung once for every kPlayRing packets rather than once a packet: the doorbell is an
- * uncached write across the link, and a pass is over a thousand dispatches. Each packet's body is
- * copied as recorded and its header -- whose acquire scope depends on what the host wrote since --
- * decided now, as dispatch() decides it. The argument blocks were written to VRAM when the tape
- * was made, so there is nothing to fence before the header. A reserve that would wait for room
- * rings first: the packet processor only takes packets the doorbell has announced. */
+/* A run of recorded dispatches onto one queue, under one hold of the queue lock, ringing the
+ * doorbell once per kPlayRing packets: the doorbell is an uncached write across the link and a
+ * pass is over a thousand dispatches. Each body is copied as recorded; the header is decided now
+ * as in dispatch(), since its acquire scope depends on host writes since recording. Argument
+ * blocks were written to VRAM when the tape was made, so no fence precedes the header. Ring
+ * before a reserve that would wait: the packet processor only takes announced packets. */
 constexpr int kPlayRing = 64;
 
-/* WHERE THIS THREAD'S PLAYS LAST LEFT EACH QUEUE. A queue found further on has had packets put on
- * it that no recording saw -- a weight-table patch or a mover wait between two played stretches,
- * another thread's copy -- and the next played packet on it keeps its barrier bit whatever the
- * recording's analysis said: the analysis proved it independent of the packets recorded before
- * it, and those are no longer the ones in front of it. A queue not in the list is treated the
- * same way. */
+/* Where this thread's plays last left each queue. If a queue has moved since, it holds packets
+ * no recording saw (a weight-table patch or mover wait between played stretches, another thread's
+ * copy), so the next played packet keeps its barrier bit: the overlap analysis only proved it
+ * independent of the recorded packets before it. A queue not in the list is treated the same. */
 struct PlayLeft { uint32_t q = UINT32_MAX; uint64_t wr = 0; };
 constexpr int kPlayLeft = 8;
 thread_local PlayLeft t_left[kPlayLeft];
@@ -1133,8 +1123,8 @@ struct PlayRun {
             if (t_left[i].q == q->id) return t_left[i].wr != q->wr;
         return true;
     }
-    /* `done`, when set, is the packet's completion signal and `rel_min` the least release scope
-     * it must carry -- a record riding on this dispatch; see a_tape_play. */
+    /* `done`, when set, is the packet's completion signal and `rel_min` its minimum release
+     * scope, for a record riding on this dispatch (see a_tape_play). */
     int put(const TapeRec& r, uint64_t* out_idx, hsa_signal_t done = hsa_signal_t{0},
             int rel_min = HSA_FENCE_SCOPE_NONE) {
         if (s != r.s) {
@@ -1153,9 +1143,9 @@ struct PlayRun {
         auto* p = static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) + (idx & s->mask);
         std::memcpy(reinterpret_cast<char*>(p) + 4, reinterpret_cast<const char*>(&r.pkt) + 4,
                     sizeof(hsa_kernel_dispatch_packet_t) - 4);
-        /* A ride left waiting by host work between two played stretches (rad_ride) is the first
-         * played dispatch's to complete, as an issued one's would be. A record riding on this
-         * dispatch already has the signal; the ride then waits for the next one. */
+        /* A ride left pending by host work between played stretches (rad_ride) is completed by
+         * the first played dispatch, as with an issued one. If a record already rides on this
+         * dispatch, the ride waits for the next. */
         if (!done.handle && s->ride.handle) {
             done = s->ride;
             s->ride.handle = 0;
@@ -1164,8 +1154,8 @@ struct PlayRun {
         const int acq = acquire_scope(s, idx, (r.fence & kFenceAcquireSystem) != 0);
         int rel = (r.fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
         if (rel < rel_min) rel = rel_min;
-        /* A record riding on the dispatch keeps the bit: its completion signal stands for
-         * everything before it on the queue, which an unordered dispatch's completion does not. */
+        /* A dispatch carrying a record keeps the bit: its completion must cover everything before
+         * it on the queue, which an unordered dispatch's does not. */
         const bool ordered = foreign || !r.overlap || done.handle;
         const uint16_t h = header(HSA_PACKET_TYPE_KERNEL_DISPATCH, acq, rel, ordered);
         __atomic_store_n(reinterpret_cast<uint32_t*>(p), (uint32_t)h | ((uint32_t)r.pkt.setup << 16),
@@ -1179,9 +1169,8 @@ struct PlayRun {
     }
 };
 
-/* One completion signal a thread for synchronous waits, an interrupt signal (see "host waits"):
- * two threads waiting on the same queue each get their own, and a signal is only ever waited on by
- * the thread that armed it. */
+/* One interrupt signal per thread for synchronous waits (see "host waits"). A signal is only
+ * waited on by the thread that armed it, so two threads waiting on one queue do not share. */
 hsa_signal_t thread_signal() {
     thread_local hsa_signal_t s{0};
     if (!s.handle && hsa_signal_create(0, 0, nullptr, &s) != HSA_STATUS_SUCCESS) s.handle = 0;
@@ -1190,28 +1179,25 @@ hsa_signal_t thread_signal() {
 
 /* ------------------------------------------------------------------ host waits
  *
- * A HOST WAIT BLOCKS IN THE DRIVER UNTIL THE DEVICE SAYS IT IS DONE. Every signal the host waits
- * on is an interrupt signal: when the packet that carries it completes, the packet processor posts
- * the signal's event and raises an interrupt, and the driver wakes the threads blocked on that
- * event. A wait costs the host one system call and one wake-up whatever its length, and it makes
- * no guess at how long the device will take, so it can neither sleep past a device that finished
- * early nor spin through one that runs late. What it does cost is the interrupt's delivery: some
- * tens of microseconds between the packet completing and the thread running. That is hidden
- * rather than shortened. The engine keeps work queued behind every point it waits for -- the next
- * step behind a step's end, the layers that do not read a host op's output behind that op's join
- * -- so the device is still running when the host wakes.
+ * A host wait blocks in the driver until the device completes. Every signal the host waits on is
+ * an interrupt signal: when its packet completes, the packet processor posts the signal's event
+ * and raises an interrupt, and the driver wakes the threads blocked on it. A wait costs one
+ * syscall and one wake-up regardless of length, and never guesses the device's duration. The
+ * cost is interrupt delivery, some tens of us; the engine hides it by keeping work queued behind
+ * every point it waits on (the next step behind a step's end, independent layers behind a host
+ * op's join), so the device is still busy when the host wakes.
  *
- * THE WAIT GOES TO THE DRIVER DIRECTLY. The runtime's own blocking wait polls the signal for a
- * stretch before it blocks, which spends a short wait's whole length on a core; the driver's wait
- * on the signal's event spends nothing until the interrupt arrives.
+ * The wait goes to the driver directly. The runtime's blocking wait polls before it blocks,
+ * burning a core for a short wait's whole length; the driver's event wait costs nothing until
+ * the interrupt.
  *
- * NO WAKE-UP IS LOST. The driver counts each event's firings (its age), and a wait that names an
- * age returns at once if the event has fired since. A thread keeps the age each event last woke it
- * at, so an interrupt that lands between reading the signal and entering the driver ends the wait
- * instead of being missed; an age gone stale costs one early return and a second look.
+ * No wake-up is lost. The driver counts each event's firings (its age), and a wait naming an age
+ * returns at once if the event has fired since. Each thread keeps the age each event last woke it
+ * at, so an interrupt between reading the signal and entering the driver ends the wait; a stale
+ * age costs one early return.
  *
- * A FAULT ENDS EVERY WAIT. A faulted queue never completes the signal a wait is on, so every wait
- * also names the fault signal's event, which the queue-error callback fires. */
+ * A fault ends every wait. A faulted queue never completes its signals, so every wait also names
+ * the fault signal's event, which the queue-error callback fires. */
 
 /* The age an event last woke this thread at; 1 is the driver's "never fired". */
 uint64_t& seen_age(uint32_t ev) {
@@ -1251,9 +1237,16 @@ int host_wait(hsa_signal_t sig) {
     return RAD_OK;
 }
 
-/* The store that arms a signal is silent: an interrupt signal's ordinary store also fires its
- * event, which would wake nobody and cost a system call. */
+/* The arming store is silent: an ordinary store to an interrupt signal also fires its event,
+ * which wakes nobody and costs a syscall. */
 int stream_drain(Stream* s) {
+    /* A pageable copy or a destroy behind a closed gate would wait for a barrier the host has not
+     * released yet. */
+    if (s->gates.load(std::memory_order_acquire) > 0) {
+        device_set_error("a host wait on a queue at a closed gate: open the gate "
+                         "(rad_gate_open) first");
+        return RAD_E_STATE;
+    }
     hsa_signal_t sig = thread_signal();
     if (!sig.handle) return RAD_E_DEVICE;
     hsa_signal_silent_store_relaxed(sig, 1);
@@ -1266,18 +1259,16 @@ int stream_drain(Stream* s) {
 
 enum Loc : uint8_t { kDevLocal, kDevPeer, kHost, kPageable };
 
-/* THE ALLOCATIONS A THREAD COPIES BETWEEN, REMEMBERED. hsa_amd_pointer_info takes the runtime's
- * global lock and walks its allocation map, and every copy asks it about both ends -- a few hundred
- * questions a step about the same dozen allocations, about 17 us of each rank thread's step. A hit
- * here answers from the allocation's own range.
+/* Per-thread cache of pointer locations. hsa_amd_pointer_info takes the runtime's global lock and
+ * walks its allocation map; every copy asks about both ends, a few hundred queries per step on
+ * the same dozen allocations, ~17 us of each rank thread's step.
  *
- * Only an answer about a live allocation is kept, never "pageable": memory the runtime does not
- * know may be registered later, and an allocation's kind cannot change while it lives. What can
- * change is WHICH allocation an address belongs to, and only by a free or an unmap -- every one of
- * those in this backend moves `g_loc_gen` first, and an entry of an older generation is ignored.
- * The ranges come back from the runtime itself (sizeInBytes), so a hit is exactly the answer the
- * call would give. A reserved-but-unbacked address is not kept: its card is the reservation's and
- * is looked up per page. */
+ * Only live allocations are cached, never "pageable": unknown memory may be registered later,
+ * while a live allocation's kind cannot change. Which allocation an address belongs to changes
+ * only by a free or unmap, and each of those in this backend bumps `g_loc_gen` first; entries of
+ * an older generation are ignored. Ranges come from the runtime (sizeInBytes), so a hit equals the
+ * call's answer. Reserved-but-unbacked addresses are not cached; their card is looked up per
+ * page. */
 struct LocHit {
     uintptr_t lo = 0, hi = 0;   /* the allocation's range, as the host addresses it */
     intptr_t  shift = 0;        /* agent address minus host address (pinned host memory) */
@@ -1289,7 +1280,7 @@ thread_local LocHit t_loc[kLocWays];
 thread_local unsigned t_loc_next = 0;
 std::atomic<uint64_t> g_loc_gen{1};
 
-/* Every entry in every thread's cache stops answering. */
+/* Invalidates every thread's cache. */
 void loc_forget() { g_loc_gen.fetch_add(1, std::memory_order_acq_rel); }
 
 void loc_keep(const void* host_base, size_t bytes, intptr_t shift, uint64_t owner, uint64_t gen) {
@@ -1302,9 +1293,9 @@ void loc_keep(const void* host_base, size_t bytes, intptr_t shift, uint64_t owne
     h.gen = gen;
 }
 
-/* The host ranges this backend pinned itself (see "pinned host memory, in pieces"), by base,
- * ordered so an inner address finds its range. `pool` is the host-pool allocation the range sits
- * in when it was not locked in pieces, and null when it was. */
+/* Host ranges this backend pinned itself (see "pinned host memory, in pieces"), ordered by base
+ * so an interior address finds its range. `pool` is the host-pool allocation holding the range,
+ * or null if it was locked in pieces. */
 struct Pinned {
     int64_t len = 0;
     void* pool = nullptr;
@@ -1334,9 +1325,9 @@ Loc locate(const void* p, const Stream* s, const void** gpu) {
         if (!h.owner) return kHost;
         return h.owner == s->agent.handle ? kDevLocal : kDevPeer;
     }
-    /* PINNED HERE, ANSWERED HERE. hsa_amd_pointer_info reports memory locked with
-     * hsa_amd_memory_lock_to_pool as UNKNOWN on this runtime -- indistinguishable from pageable --
-     * although the lock mapped it on every card at its own address. */
+    /* Ranges pinned here are answered here: hsa_amd_pointer_info reports memory locked with
+     * hsa_amd_memory_lock_to_pool as UNKNOWN (like pageable), although the lock mapped it on
+     * every card at its own address. */
     uintptr_t plo = 0;
     int64_t plen = 0;
     if (pinned_range(p, &plo, &plen)) {
@@ -1475,6 +1466,11 @@ void a_stream_destroy(RadStream rs) {
 int a_stream_sync(RadStream rs) {
     Stream* s = ours(rs);
     if (!s) { device_set_error("rad_stream_sync: not a stream of this backend"); return RAD_E_INVAL; }
+    if (s->gates.load(std::memory_order_acquire) > 0) {
+        device_set_error("rad_stream_sync: the queue waits at a closed gate, which only "
+                         "rad_gate_open releases");
+        return RAD_E_STATE;
+    }
     const int rc = stream_drain(s);
     if (rc < 0) device_set_error("rad_stream_sync: the queue on device %d faulted", s->ord);
     return rc;
@@ -1482,16 +1478,14 @@ int a_stream_sync(RadStream rs) {
 
 /* ---- events.
  *
- * A RECORD TAKES A FRESH SIGNAL, and a signal is only reused once nothing can still name it. That
- * means two things: its own record has completed, AND every wait packet that was enqueued against
- * it has been consumed. Reusing a signal whose record has completed but whose waiters have not yet
- * been reached re-arms it under them: a lagging queue's wait for record r then waits for whatever
- * record reused the signal, which can sit behind a wait on that same lagging queue. Two lanes that
- * join each other every layer produce exactly that cycle within a step.
+ * Each record takes a fresh signal. A signal is reused only when its record has completed and
+ * every wait packet enqueued against it has been consumed. Reusing it earlier re-arms it under a
+ * lagging waiter, which then waits on the newer record; that record can sit behind a wait on the
+ * same lagging queue, a deadlock that two lanes joining each other every layer hit within a step.
  *
- * So each signal carries the (queue, packet index) of every wait that names it, and returns to the
- * free list when both conditions hold. Nothing here ever blocks the host: a signal that cannot be
- * reused yet is simply not reused, and the pool grows to the number of records in flight. */
+ * So each signal carries the (queue, packet index) of every wait naming it and returns to the
+ * free list when both conditions hold. The host never blocks on this; the pool grows to the
+ * number of records in flight. */
 struct Sig {
     hsa_signal_t h{};
     bool         irq = false;                              /* an interrupt signal */
@@ -1519,20 +1513,17 @@ bool reusable(const Sig* g) {
     return true;
 }
 
-/* A signal for one record: an interrupt signal for an event the host waits on, and a GPU_ONLY one
- * otherwise. Only the first kind can end a host wait (see "host waits"), and it costs what the
- * second does not: a driver event, of which a process has a few thousand, and an interrupt at every
- * completion, which an event recorded dozens of times a step and only ever waited on by other
- * queues has no use for. */
+/* A signal for one record: an interrupt signal if the host waits on the event, else GPU_ONLY.
+ * Only interrupt signals can end a host wait (see "host waits"), but each costs a driver event (a
+ * process has a few thousand) and an interrupt per completion, wasted on events recorded dozens
+ * of times a step and waited on only by queues. */
 Sig* sig_get(bool irq) {
     SigPool& p = pool();
     std::lock_guard<std::mutex> lk(p.mu);
-    /* THE OLDEST FIRST. A signal retires when its event is recorded again, so the retiring list is
-     * in record order and its front is the signal most likely to be done: taking from the front
-     * until one of the kind asked for is free costs a look or two, where a walk of the whole list
-     * reads every signal's value and every waiter's queue out of memory the device writes. The
-     * walk is kept for when the front is not done -- the host plays a step while the card is
-     * still on the one before, and the records that step retired are then still in flight. */
+    /* Oldest first. Signals retire in record order, so the front is most likely done; popping
+     * from the front costs a look or two, where a full walk reads every signal and waiter queue
+     * from device-written memory. The walk is the fallback for when the front is not done (the
+     * host plays a step while the card is still on the previous one). */
     while (p.free[irq].empty() && !p.retiring.empty() && reusable(p.retiring.front())) {
         Sig* g = p.retiring.front();
         p.retiring.pop_front();
@@ -1595,7 +1586,7 @@ int a_event_create(RadEvent* out, unsigned flags) {
     return RAD_OK;
 }
 
-/* The event goes; its signal stays with the pool until the waits that name it are consumed. */
+/* The signal stays in the pool until the waits naming it are consumed. */
 void a_event_destroy(RadEvent re) {
     Event* e = ev_of(re);
     if (!e) return;
@@ -1610,22 +1601,21 @@ void a_event_destroy(RadEvent re) {
     delete e;
 }
 
-/* A fresh signal armed for one record of `e` on `s`, and the release scope that record needs. The
- * caller puts it on a packet and then hands it to record_adopt. */
+/* A fresh signal armed for one record of `e` on `s`, plus the release scope the record needs. The
+ * caller puts it on a packet, then passes it to record_adopt. */
 Sig* record_arm(Event* e, Stream* s, int* rel) {
     Sig* g = sig_get(e->host);
     if (!g) return nullptr;
     hsa_signal_silent_store_relaxed(g->h, 1);
     g->agent = s->agent;
-    /* A LOCAL EVENT RELEASES TO THE CARD, which its own L2 already is. The system scope has to
-     * wait out every write still on its way to host memory, and while the link is carrying
-     * weights that is a stall of up to tens of microseconds in the recording stream. */
+    /* A local event releases at agent scope, which its L2 already satisfies. System scope waits
+     * for every in-flight write to host memory: up to tens of us while the link streams weights. */
     *rel = e->local ? HSA_FENCE_SCOPE_AGENT : HSA_FENCE_SCOPE_SYSTEM;
     return g;
 }
 
-/* The record carrying `g` is on its queue: it becomes the event's latest, and the one before goes
- * back to the pool once the waits that name it are consumed. */
+/* The record carrying `g` is enqueued: it becomes the event's latest, and the previous signal
+ * retires to the pool. */
 void record_adopt(Event* e, Sig* g) {
     Sig* old = nullptr;
     {
@@ -1657,8 +1647,8 @@ int a_event_record(RadEvent re, RadStream rs) {
     return RAD_OK;
 }
 
-/* The event's lock is held across the enqueue so the signal cannot be retired between being read
- * and having this wait noted against it. */
+/* The event lock is held across the enqueue so the signal cannot retire before this wait is
+ * noted against it. */
 int a_event_wait(RadStream rs, RadEvent re) {
     Event* e = ev_of(re);
     Stream* s = ours(rs);
@@ -1673,8 +1663,8 @@ int a_event_wait(RadStream rs, RadEvent re) {
     std::lock_guard<std::mutex> lk(e->mu);
     if (!e->cur) return RAD_OK;               /* never recorded: nothing to wait for */
     uint64_t idx = 0;
-    /* A producer on this stream's own card wrote through the L2 this stream reads, so the acquire
-     * need only reach the card; one on another card, or the host, needs the system's. */
+    /* A producer on this card wrote through the shared L2, so agent scope suffices; another card
+     * or the host needs system scope. */
     const int acq = e->cur->agent.handle == s->agent.handle ? HSA_FENCE_SCOPE_AGENT
                                                             : HSA_FENCE_SCOPE_SYSTEM;
     RAD_TRY(barrier(s, e->cur->h, hsa_signal_t{0}, acq, HSA_FENCE_SCOPE_NONE, &idx));
@@ -1708,8 +1698,7 @@ int a_event_sync(RadEvent re) {
     return host_wait(sig);
 }
 
-/* The host wrote memory the device is about to read: the next dispatch on every queue acquires at
- * system scope, exactly as after a host wait. */
+/* The next dispatch on every queue acquires at system scope, as after a host wait. */
 void a_host_wrote(void) { G().host_epoch.fetch_add(1, std::memory_order_acq_rel); }
 
 /* ---- recorded passes: the calls. See "recorded passes" above. */
@@ -1719,12 +1708,12 @@ inline Tape* tape_of(RadTape t) {
     return (p && p->magic == kTapeMagic) ? p : nullptr;
 }
 
-/* Tapes destroyed while a play of theirs may still be in a queue. */
+/* Destroyed tapes whose plays may still be queued. */
 std::mutex         g_tape_mu;
 std::vector<Tape*> g_tape_retired;
 
-/* Whether every packet the tape's latest play wrote has completed, or its queue is gone: a packet
- * kReserveMargin past it has been launched, which proves it for the reason reserve() gives. */
+/* Whether every packet of the tape's latest play has completed (or its queue is gone): a packet
+ * kReserveMargin past it has launched, which proves it as in reserve(). */
 bool tape_idle(const Tape* t) {
     for (const auto& l : t->last) {
         hsa_queue_t* q = g_queue_by_id[l.first].load(std::memory_order_acquire);
@@ -1767,8 +1756,8 @@ void a_tape_pause(int on) {
     else if (t_tape_pause > 0) --t_tape_pause;
 }
 
-/* The argument blocks go to VRAM on the card the tape's queues belong to, where the packet
- * processor reads them as it reads the ring's; the packets are then final but for their header. */
+/* Moves the argument blocks to VRAM on the tape's card, where the packet processor reads them as
+ * it reads the ring; the packets are then final except for the header. */
 RadTape a_tape_end(int keep) {
     Tape* t = t_tape;
     t_tape = nullptr;
@@ -1846,13 +1835,11 @@ int a_tape_play(RadTape rt, int from, int to) {
     for (int i = from; i < to && rc >= 0; ++i) {
         const TapeRec& r = t->rec[(size_t)i];
         if (r.kind == kTapeDispatch) {
-            /* A RECORD DIRECTLY BEHIND A DISPATCH ON THE SAME QUEUE RIDES ON THE DISPATCH. The
-             * kernel packet carries the barrier bit, so its completion already means everything
-             * before it on the queue is done -- which is all the record's own barrier packet says
-             * -- and the packet processor decrements its completion signal after its release
-             * fence, raised here to the scope the record needs. The separate packet costs the
-             * recording queue a packet of its own between two kernels, and a queue waiting on the
-             * record sees the signal that much later. */
+            /* A record directly after a dispatch on the same queue rides on the dispatch. The
+             * kernel packet has the barrier bit, so its completion already means everything before
+             * it is done, which is all the record's barrier packet would say; the completion signal
+             * is decremented after the release fence, raised here to the record's scope. This
+             * saves a packet between two kernels and signals waiters sooner. */
             const TapeRec* nx = i + 1 < to ? &t->rec[(size_t)i + 1] : nullptr;
             Event* ne = (nx && nx->kind == kTapeRecord && nx->s == r.s) ? ev_of(nx->ev) : nullptr;
             Sig* g = nullptr;
@@ -1870,16 +1857,16 @@ int a_tape_play(RadTape rt, int from, int to) {
                 if (l.first == r.s->id) { l.second = idx; found = true; break; }
             if (!found) t->last.emplace_back(r.s->id, idx);
             if (g) {
-                /* Announced before the event names it, as the record's own path does: another
-                 * queue is about to wait on it. The event's lock is taken with no queue held. */
+                /* Ring before the event names the signal, as a_event_record does, since another
+                 * queue may wait on it next. The event lock is taken with no queue held. */
                 run.end();
                 record_adopt(ne, g);
                 ++i;
             }
             continue;
         }
-        /* An event takes its queue's lock itself, and a wait on another queue must not sit behind
-         * packets this run has written and not yet announced. */
+        /* Event calls take the queue lock themselves, and a wait on another queue must not sit
+         * behind packets this run has written but not announced. */
         run.end();
         rc = r.kind == kTapeRecord ? a_event_record(r.ev, (RadStream)r.s)
                                    : a_event_wait((RadStream)r.s, r.ev);
@@ -1972,9 +1959,9 @@ int blit_copy(Stream* s, void* dst, const void* src, int64_t bytes, uint8_t fenc
     return rc < 0 ? RAD_E_DEVICE : RAD_OK;
 }
 
-/* PAGEABLE MEMORY IS BOUNCED THROUGH PINNED MEMORY AND WAITED FOR, one bounce buffer at a time,
- * which is what HIP does with it too. It is counted: a pageable copy on the step path is a host
- * wait in the middle of a step, and the counter is how such a caller is found. */
+/* Pageable memory is bounced through pinned memory and waited for, one bounce buffer at a time,
+ * as HIP does. The bytes are counted (aql_pageable_bytes) because a pageable copy on the step
+ * path is a host wait mid-step. */
 int pageable_copy(Stream* s, void* dst, Loc ld, const void* src, Loc ls, int64_t bytes) {
     g_pageable_bytes.fetch_add(bytes, std::memory_order_relaxed);
     if (capturing() && t_tape->bad.empty())
@@ -1986,8 +1973,8 @@ int pageable_copy(Stream* s, void* dst, Loc ld, const void* src, Loc ls, int64_t
         if (ls == kPageable && ld == kPageable) {
             std::memcpy((char*)dst + off, (const char*)src + off, (size_t)n);
         } else if (ls == kPageable) {
-            /* The bounce buffer is reused by the next chunk, so the copy out of it has to have run
-             * before the host overwrites it. */
+            /* The previous chunk's copy out of the bounce buffer must finish before the host
+             * overwrites it. */
             RAD_TRY(stream_drain(s));
             std::memcpy(s->bounce, (const char*)src + off, (size_t)n);
             RAD_TRY(blit_copy(s, (char*)dst + off, s->bounce, n,
@@ -2031,8 +2018,7 @@ int a_memcpy_2d_async(void* dst, int64_t dpitch, const void* src, int64_t spitch
     const Loc ld = locate(dst, s, &gd);
     const Loc ls = locate(src, s, &gs);
     if (ld == kPageable || ls == kPageable) {
-        /* Row by row through the 1-D path: a pitched copy of pageable memory has no fast form and
-         * no caller on the step path. */
+        /* Row by row through the 1-D path; no step-path caller copies pitched pageable memory. */
         for (int64_t r = 0; r < height; ++r)
             RAD_TRY(a_memcpy_async((char*)dst + r * dpitch, (const char*)src + r * spitch, width, rs));
         return RAD_OK;
@@ -2046,8 +2032,8 @@ int a_memcpy_2d_async(void* dst, int64_t dpitch, const void* src, int64_t spitch
     return rc < 0 ? RAD_E_DEVICE : RAD_OK;
 }
 
-/* NO PAGEABLE FORM: the kernel reads the range list and the source where they are, so both have
- * to be memory the card reaches, and bouncing them would be a host wait inside the copy. */
+/* No pageable form: the kernel reads the range list and the source in place, so both must be
+ * card-reachable; bouncing them would put a host wait inside the copy. */
 int a_memcpy_ranges_async(void* dst, const void* src, int64_t prefix, const RadCopyRange* ranges,
                           int n, RadStream rs) {
     Stream* s = ours(rs);
@@ -2084,46 +2070,44 @@ int a_memcpy_ranges_async(void* dst, const void* src, int64_t prefix, const RadC
 
 /* ---- the DMA lane: a card's own SDMA queue ------------------------------------------------------
  *
- * A LIST OF COPIES GOES TO THE CARD'S DMA ENGINE THROUGH A QUEUE OF THIS BACKEND'S OWN, not through
- * the runtime's copy call. Measured on gfx1201 with 1.3 MB host->card copies beside a kernel stream
- * that saturates VRAM: this queue moves 28.7 GB/s -- the link -- and costs the kernels nothing; the
- * runtime's copy call moves 22.0 GB/s and costs them 8%; copy kernels get 2.3 GB/s. The runtime's
- * difference is in its packets: from gfx10 on it brackets every copy with a write-back and an
- * invalidation of the WHOLE L2, so a prefill layer's ninety copies were 180 cache flushes under the
- * running GEMMs, and the engine sat out each flush. Here a list is one wait, its copies and one
- * write, and the caches are kept by the two barriers that order the list on its AQL stream.
+ * Copy lists go to the card's DMA engine through this backend's own queue, not the runtime's copy
+ * call. On gfx1201, 1.3 MB host->card copies beside a VRAM-saturating kernel stream: this queue
+ * moves 28.7 GB/s (the link) at no cost to the kernels; the runtime's copy moves 22.0 GB/s and
+ * slows them 8%; copy kernels get 2.3 GB/s. From gfx10 on the runtime brackets every copy with a
+ * write-back and invalidation of the whole L2, two flushes per copy under the running GEMMs. Here
+ * a list is one wait, its copies and one write; the two barriers ordering the list on its AQL
+ * stream handle the caches.
  *
- * The queue is the driver's user-mode SDMA queue (AMDKFD_IOC_CREATE_QUEUE), and the driver holds its
- * buffers to rules the runtime's allocations do not meet: the write pointer must open a one-page GTT
- * buffer of THIS card, which the scheduler firmware pins into the GART, and the ring must be a buffer
- * of exactly its own size. So both are allocated here with the driver calls the runtime's thunk makes
- * for its queues, at an address reserved in this process so the CPU and the card share it, and
- * CPU-mapped through the render node the thunk bound to the process's GPU address space -- the one
- * file the driver lets map a buffer of that space.
+ * The queue is the driver's user-mode SDMA queue (AMDKFD_IOC_CREATE_QUEUE), whose buffers must
+ * meet rules the runtime's allocations do not: the write pointer must start a one-page GTT buffer
+ * of this card (the scheduler firmware pins it into the GART), and the ring must be a buffer of
+ * exactly its own size. Both are allocated here with the thunk's driver calls, at an address
+ * reserved in this process so CPU and card share it, and CPU-mapped through the render node the
+ * thunk bound to the process's GPU address space (the only file the driver lets map such a
+ * buffer).
  *
- * Engine 0 only. A second engine on the same direction moved nothing more (the link is the bound)
- * and cost a VRAM-bound kernel stream 40%. */
+ * Engine 0 only: a second engine in the same direction adds nothing (the link is the bound) and
+ * slowed a VRAM-bound kernel stream 40%. */
 constexpr uint32_t kSdmaCopy     = 1;            /* COPY, sub-op LINEAR */
 constexpr uint32_t kSdmaFence    = 5;
 constexpr uint32_t kSdmaPoll     = 8;            /* POLL_REGMEM */
 constexpr uint64_t kSdmaMaxCopy  = 0x3fffe0;     /* the largest count a linear copy carries */
 constexpr uint64_t kDmaRingBytes = (uint64_t)1 << 20;
 constexpr size_t   kDoorbellPage = 8192;         /* 1024 64-bit doorbells a process */
-/* THE LINK GATE is a signal that only ever counts down: each hold and each release is a barrier
- * packet on the holding stream whose completion takes one off, so the value is odd exactly while a
- * hold is in force, and the engine waits on its low bit. Even to start, and far from zero. */
+/* The link gate is a signal that only counts down: each hold and each release is a barrier packet
+ * on the holding stream whose completion decrements it, so the value is odd exactly while held,
+ * and the engine polls its low bit. Starts even and far from zero. */
 constexpr int64_t  kGateStart    = (int64_t)1 << 62;
-/* A YIELDING LIST CHECKS THE GATE EVERY MEGABYTE. A check costs the engine ~2 us whatever the word's
- * place, so this is 5% of its rate, and a hold that starts mid-list shares the link for 36 us at
- * most; at 2 MB the prefill was slower, at 256 KB the checks cost 17%. */
+/* A yielding list checks the gate every 1 MiB. A check costs the engine ~2 us wherever the word
+ * lives, 5% of its rate, and a hold starting mid-list shares the link for 36 us at most. 2 MiB
+ * made prefill slower; 256 KiB made the checks cost 17%. */
 constexpr uint64_t kYieldBytes   = (uint64_t)1 << 20;
 
-/* THE QUEUE REQUEST AT THE DRIVER'S CURRENT LAYOUT, NOT THE BUILD MACHINE'S. Naming the SDMA engine
- * -- queue type 4 and the sdma_engine_id field -- is KFD ioctl 1.17, and the kernel headers a build
- * sees can be older than the driver the engine runs on: Ubuntu 24.04's <linux/kfd_ioctl.h> is 1.14,
- * whose struct ends before both fields. The driver copies as many bytes as the ioctl number says and
- * zero-fills or drops the rest, so this longer form is what every driver is sent; one older than
- * 1.17 refuses the queue type, and the lane reports that as its reason. */
+/* The create-queue request in the current driver layout, not the build headers'. Selecting the
+ * SDMA engine (queue type 4, sdma_engine_id) needs KFD ioctl 1.17, but build headers can be older
+ * (Ubuntu 24.04's <linux/kfd_ioctl.h> is 1.14, which lacks both fields). The driver copies as many
+ * bytes as the ioctl number encodes and zero-fills or drops the rest, so every driver gets this
+ * form; one older than 1.17 refuses the queue type and the lane reports that. */
 struct KfdCreateQueue {
     uint64_t ring_base_address, write_pointer_address, read_pointer_address, doorbell_offset;
     uint32_t ring_size, gpu_id, queue_type, queue_percentage, queue_priority, queue_id;
@@ -2159,10 +2143,10 @@ struct DmaQueue {
     bool                ever_held = false;       /* a stream has held this card's link at least once */
     std::atomic<bool>   tried{false};            /* dma_open has run, for the startup report */
     std::string         why;                     /* why it failed */
-    /* A QUEUE WHOSE EVERY LIST ENDS BY WRITING ITS NUMBER to `fin` (the expert prefetch's): the room
-     * check takes the end of the last list finished as the least the engine has read. The read
-     * pointer the engine writes back has been seen to stop moving on such a queue while the engine
-     * ran on, and a ring the host thinks full would wait for ever. */
+    /* For a queue whose lists each end by writing their number to `fin` (the expert prefetch's),
+     * the room check uses the end of the last finished list as a lower bound on what the engine
+     * has read. The engine's written-back read pointer can stop moving on such a queue while the
+     * engine runs on, and a ring the host thinks full would wait forever. */
     volatile uint32_t*  fin = nullptr;
     uint32_t            lists = 0;               /* lists handed over; list k ends at ends[k % kDmaEnds] */
     std::unique_ptr<uint64_t[]> ends;
@@ -2171,7 +2155,7 @@ constexpr uint32_t kDmaEnds = 4096;
 DmaQueue g_dma[kMaxDevices];
 DmaQueue g_dma_xp[kMaxDevices];   /* the expert prefetch's, on the card's second engine */
 
-/* The render node a card's buffers are CPU-mapped through: /dev/dri/renderD<minor>, the minor from
+/* Minor of the render node (/dev/dri/renderD<minor>) a card's buffers are CPU-mapped through, from
  * the driver's topology entry for its gpu_id. */
 int render_minor(uint32_t gpu_id) {
     const int n = topo_node(gpu_id);
@@ -2266,8 +2250,8 @@ bool dma_bo(uint32_t gpu_id, int minor, size_t size, DmaBo* b, std::string* why)
     return false;
 }
 
-/* THE GATE IS MADE APART FROM THE QUEUE, on first use by either: a launch is handed its address when
- * its op is bound, and that must not open a DMA queue on a card nothing streams weights onto. */
+/* The gate is created separately from the queue, on first use by either: a launch receives its
+ * address when its op is bound, which must not open a DMA queue on a card nothing streams to. */
 hsa_signal_t* gate_signal(int ord) {
     if (ord < 0 || ord >= kMaxDevices) return nullptr;
     DmaQueue& q = g_dma[ord];
@@ -2342,9 +2326,9 @@ bool dma_open(int ord, DmaQueue* q, std::string* why, uint32_t engine = 0, bool 
 
 inline uint64_t dma_read(const DmaQueue* q);
 
-/* The DMA lanes beside dump_queues' AQL queues: a list stops at the gate while a hold is in force,
- * so a gate left odd shows as a lane whose ring is written past what it has read. Read without the
- * lane's lock, which a stuck writer may hold. */
+/* The DMA lanes' part of dump_queues. A list stops at the gate while held, so a gate left odd
+ * shows as a ring written past what was read. Read without the lane lock, which a stuck writer
+ * may hold. */
 void dump_dma_lanes() {
     for (int c = 0; c < kMaxDevices; ++c) {
         DmaQueue& q = g_dma[c];
@@ -2362,7 +2346,7 @@ void dump_dma_lanes() {
     }
 }
 
-/* The card's queue, made on first use; null, after one warning, where the driver will not give one. */
+/* The card's queue, opened on first use; null (after one warning) if the driver refuses. */
 DmaQueue* dma_queue(int ord) {
     if (ord < 0 || ord >= kMaxDevices || ord >= (int)G().dev.size()) return nullptr;
     DmaQueue& q = g_dma[ord];
@@ -2385,8 +2369,8 @@ DmaQueue* dma_queue(int ord) {
     return q.ok ? &q : nullptr;
 }
 
-/* What the engine has read: the read pointer it writes back, or past it the end of the last list a
- * numbered queue has finished (DmaQueue::fin). */
+/* Bytes the engine has read: its written-back read pointer, or the end of the last finished list
+ * on a numbered queue if that is further (DmaQueue::fin). */
 inline uint64_t dma_read(const DmaQueue* q) {
     uint64_t r = *q->rptr;
     if (q->fin) {
@@ -2396,9 +2380,9 @@ inline uint64_t dma_read(const DmaQueue* q) {
     return r;
 }
 
-/* `n` dwords onto the ring, the queue's lock held. A packet never straddles the ring's end: the
- * tail is padded with single-dword NOPs. The room is what the engine has read: the ring holds a few
- * hundred layers' lists, so a wait here is the host that far ahead of a stalled engine. */
+/* Writes `n` dwords to the ring; queue lock held. A packet never straddles the ring end: the tail
+ * is padded with single-dword NOPs. The ring holds a few hundred layers' lists, so waiting for
+ * room means the host is that far ahead of a stalled engine. */
 int dma_put(DmaQueue* q, const uint32_t* dw, uint64_t n) {
     const uint64_t cap = kDmaRingBytes / 4;
     uint64_t at = (q->w / 4) & (cap - 1);
@@ -2437,8 +2421,8 @@ inline uint64_t sig_value_addr(const Sig* g) {
 
 /* ------------------------------------------------- the expert prefetch's device half (rad_xp_*) */
 
-/* The card's prefetch queue, on its second DMA engine (the first is the lane's): made on first use;
- * null where the driver gives none. Its lists end with a write of their number to a signal's value,
+/* The card's prefetch queue on its second DMA engine (the lane has the first), opened on first
+ * use; null if the driver refuses. Each list ends by writing its number to a signal's value,
  * which the room check and rad_xp_behind read. */
 DmaQueue* xp_queue(int ord) {
     if (ord < 0 || ord >= kMaxDevices || ord >= (int)G().dev.size()) return nullptr;
@@ -2456,8 +2440,9 @@ DmaQueue* xp_queue(int ord) {
         }
         q.why = why;
         q.tried.store(true, std::memory_order_release);
-        if (!q.ok) RAD_INFO("card %d: no DMA queue on the second engine for the expert prefetch (%s)", ord,
-                            why.c_str());
+        if (!q.ok)
+            RAD_INFO("device: card %d has no DMA queue on the second engine for the expert "
+                     "prefetch (%s)", ord, why.c_str());
     });
     return q.ok ? &q : nullptr;
 }
@@ -2471,7 +2456,7 @@ int a_xp_stream_create(RadStream* out) {
     return RAD_OK;
 }
 
-/* Refused while another ride is waiting for its dispatch on the stream. */
+/* Refused while another ride on the stream is still waiting for its dispatch. */
 int a_ride(RadStream rs, void** token) {
     Stream* s = ours(rs);
     if (!s || !token) return RAD_E_INVAL;
@@ -2514,8 +2499,75 @@ void a_ride_release(void* token, RadStream after, int64_t packets) {
     sig_retire(g);
 }
 
-/* Wait for the mark, wait for the card's link gate if a collective has ever held it (TP: the
- * all-reduce crosses the same link, and the step waits on it, not on these copies), copy, write
+/* ---- gates (rad_stream_gate): a barrier on a signal only the host releases.
+ *
+ * The barrier acquires at system scope, which also takes the acquire the first dispatch after a
+ * host wait would otherwise take (acquire_scope), so the packets behind it run at agent scope. The
+ * signal is an interrupt signal from the event pool, the kind host-wait events record: created by
+ * hsa_signal_create in host memory, where the host's store reaches the packet processor's poll as
+ * any host write to fine-grained memory does. It returns to the pool once the barrier is
+ * consumed. */
+constexpr uint64_t kGateMagic = 0x5241442d41514c47ull;   /* "RAD-AQLG" */
+
+struct Gate {
+    uint64_t magic = kGateMagic;
+    Stream*  s = nullptr;
+    Sig*     g = nullptr;
+};
+
+int a_stream_gate(RadStream rs, void** out) {
+    Stream* s = ours(rs);
+    if (!s || !out) { device_set_error("rad_stream_gate: null or foreign argument"); return RAD_E_INVAL; }
+    if (capturing()) {
+        device_set_error("rad_stream_gate: a tape cannot record a gate");
+        return RAD_E_STATE;
+    }
+    Sig* g = sig_get(true);
+    if (!g) { device_set_error("rad_stream_gate: no signal could be made"); return RAD_E_DEVICE; }
+    hsa_signal_silent_store_relaxed(g->h, 1);
+    uint64_t idx = 0;
+    const int rc = barrier(s, g->h, hsa_signal_t{0}, HSA_FENCE_SCOPE_SYSTEM, HSA_FENCE_SCOPE_NONE,
+                           &idx);
+    if (rc < 0) {
+        hsa_signal_silent_store_relaxed(g->h, 0);
+        sig_retire(g);
+        return rc;
+    }
+    g->waiters.emplace_back(s->id, idx);
+    s->gates.fetch_add(1, std::memory_order_acq_rel);
+    Gate* gt = new Gate();
+    gt->s = s;
+    gt->g = g;
+    *out = gt;
+    return RAD_OK;
+}
+
+int a_gate_open(void* p) {
+    Gate* gt = static_cast<Gate*>(p);
+    if (!gt || gt->magic != kGateMagic) return RAD_E_INVAL;
+    hsa_signal_store_screlease(gt->g->h, 0);
+    gt->s->gates.fetch_sub(1, std::memory_order_acq_rel);
+    sig_retire(gt->g);
+    gt->magic = 0;
+    delete gt;
+    return RAD_OK;
+}
+
+/* The packets that fit before reserve() would wait for the read index, and before a dispatch would
+ * take the half-lap system-scope acquire (acquire_scope). Barriers count against both. */
+int64_t a_gate_room(RadStream rs) {
+    Stream* s = ours(rs);
+    if (!s) return 0;
+    s->lock();
+    const uint64_t rd = hsa_queue_load_read_index_scacquire(s->q);
+    const int64_t cap = (int64_t)(rd + s->mask + 1) - (int64_t)kReserveMargin - (int64_t)s->wr;
+    const int64_t lap = s->last_sys_acq + (int64_t)(kQueuePackets / 2) - (int64_t)s->wr;
+    s->unlock();
+    return std::max<int64_t>(0, std::min(cap, lap));
+}
+
+/* Waits for the mark, then for the card's link gate if a collective has ever held it (under TP
+ * the all-reduce shares the link and the step waits on it, not on these copies), copies, writes
  * `done`, then the list's number. */
 int a_xp_list(int ord, void* mark, int n, const uint64_t* src, const uint64_t* dst, const uint64_t* bytes,
               uint32_t* done, uint32_t done_val) {
@@ -2588,12 +2640,11 @@ void a_free_uncached(void* p) {
     if (p) (void)hipFree(p);
 }
 
-/* A LIST: the engine waits for the stream, copies, and the stream waits for the engine (the two
- * barriers in `flush`). A copy the engine cannot take goes the kernel way, in its place in the
- * list: pageable memory (staged through a bounce buffer), a peer card's memory, and any copy while a
- * pass is being recorded -- a tape replays queue packets, and a DMA submission is not one. The two
- * signals go back to the pool behind the second barrier: by then the engine has written `out`, so
- * it has stopped reading `in` as well. */
+/* The engine waits for the stream, copies, and the stream waits for the engine (the two barriers
+ * in `flush`). Copies the engine cannot take go as kernels, in list order: pageable memory
+ * (bounced), a peer card's memory, and any copy while recording (a tape replays queue packets, and
+ * a DMA submission is not one). Both signals retire behind the second barrier: once the engine
+ * has written `out` it has stopped reading `in`. */
 int a_memcpy_list_async(const RadCopySeg* segs, int n, unsigned flags, RadStream rs) {
     Stream* s = ours(rs);
     if (!s) { device_set_error("rad_memcpy_list_async: not a stream of this backend"); return RAD_E_INVAL; }
@@ -2609,13 +2660,12 @@ int a_memcpy_list_async(const RadCopySeg* segs, int n, unsigned flags, RadStream
     std::vector<Dma> dma;
     dma.reserve((size_t)n);
     bool card = false;                       /* a copy reads or writes this card's memory */
-    /* THE ORDER ON THE STREAM IS KEPT BY TWO BARRIERS AND A SIGNAL EACH WAY. The first completes `in`
-     * once everything before the list has; the engine polls `in` before the copies and writes `out`
-     * after them, and the second barrier holds the stream on `out`. The release before is the
-     * system's when a copy touches this card's memory, so the engine reads what kernels wrote and no
-     * dirty L2 line of a destination is written back over its copy later; the acquire after is the
-     * system's always, because the engine writes memory past the L2 and the L2 may still hold the
-     * destination's old bytes. */
+    /* Stream order is kept by two barriers and a signal each way. The first barrier completes
+     * `in` once everything before the list is done; the engine polls `in`, copies, and writes
+     * `out`; the second barrier holds the stream on `out`. The first releases at system scope
+     * when a copy touches this card's memory, so the engine sees kernel writes and no dirty L2
+     * line is later written back over a copied destination. The second always acquires at system
+     * scope: the engine writes past the L2, which may still hold the destination's old bytes. */
     auto flush = [&]() -> int {
         if (dma.empty()) return RAD_OK;
         DmaQueue* dq = dma_queue(s->ord);
@@ -2651,11 +2701,10 @@ int a_memcpy_list_async(const RadCopySeg* segs, int n, unsigned flags, RadStream
                                        (uint32_t)ia, (uint32_t)(ia >> 32), 0u, 0xffffffffu,
                                        10u /* interval */ | (0xfffu << 16) /* retry forever */ };
             rc = dma_put(dq, poll, 6);
-            /* A yielding list checks the gate before its first copy and again once a piece's worth
-             * has gone since the last check, its copies cut to that size, so a hold that starts
-             * mid-list shares the link for one piece at most. Not on a card whose link nothing has
-             * held: no collective crosses it (one card serving alone), and the checks would cost
-             * the engine 5% of a link-bound prefill for nothing. */
+            /* A yielding list checks the gate before its first copy and after every piece (copies
+             * are cut to piece size), so a hold starting mid-list shares the link for one piece at
+             * most. Skipped on a card whose link was never held (no collective, e.g. one card
+             * alone), where the checks would cost 5% of a link-bound prefill. */
             const bool yield = (flags & RAD_COPY_YIELD) != 0 && dq->ever_held;
             const uint64_t piece = yield ? std::min(kYieldBytes, kSdmaMaxCopy) : kSdmaMaxCopy;
             const uint64_t ga = (uint64_t)dq->gate.handle + offsetof(amd_signal_t, value);
@@ -2688,7 +2737,7 @@ int a_memcpy_list_async(const RadCopySeg* segs, int n, unsigned flags, RadStream
             }
             dma_kick(dq);
         }
-        /* A list the ring could not take is not waited for: the stream would stop on `out` for good. */
+        /* If the ring refused the list, release `out` so the stream does not wait on it forever. */
         if (rc != RAD_OK) hsa_signal_store_screlease(out->h, 0);
         uint64_t idx = 0;
         const int br = barrier(s, out->h, hsa_signal_t{0}, HSA_FENCE_SCOPE_SYSTEM,
@@ -2717,7 +2766,7 @@ int a_memcpy_list_async(const RadCopySeg* segs, int n, unsigned flags, RadStream
         const void* gs = nullptr;
         const Loc ld = locate(g.dst, s, &gd);
         const Loc ls = locate(g.src, s, &gs);
-        /* A peer card's memory is the peer's engine's to copy, and the list keeps to this card. */
+        /* The list stays on this card; a peer's memory is copied by kernel. */
         if (capturing() || ld == kPageable || ls == kPageable || ld == kDevPeer || ls == kDevPeer) {
             RAD_TRY(flush());
             RAD_TRY(a_memcpy_async(g.dst, g.src, g.bytes, rs));
@@ -2729,15 +2778,15 @@ int a_memcpy_list_async(const RadCopySeg* segs, int n, unsigned flags, RadStream
     return flush();
 }
 
-/* A hold or a release is one barrier on the holding stream, completing the gate: it takes effect
- * once everything before it on the stream is done, which is when the collective issued after it
- * starts, or when the one before it has finished. A recorded pass holds nothing -- a hold only paces
- * the lists, and a play issues none. */
+/* A hold or release is one barrier on the holding stream that decrements the gate. It takes
+ * effect once everything before it on the stream is done: as the following collective starts, or
+ * after the preceding one finishes. A recorded pass holds nothing; holds only pace lists, and a
+ * play issues none. */
 int a_link_hold(RadStream rs, int on) {
     Stream* s = ours(rs);
     if (!s) { device_set_error("rad_link_hold: not a stream of this backend"); return RAD_E_INVAL; }
     if (capturing()) return RAD_OK;
-    /* Only where lists go to the engine: nothing else polls the gate. */
+    /* Only the DMA engine polls the gate. */
     DmaQueue* dq = dma_queue_open(s->ord);
     if (!dq) return RAD_OK;
     std::lock_guard<std::mutex> lk(dq->mu);
@@ -2746,7 +2795,7 @@ int a_link_hold(RadStream rs, int on) {
                          on == 1 ? "already" : "not");
         return RAD_E_STATE;
     }
-    /* The book follows the queue: a barrier the queue refused changed nothing. */
+    /* Update the state only after the barrier is accepted. */
     if (on != 2)
         RAD_TRY(barrier(s, hsa_signal_t{0}, dq->gate, HSA_FENCE_SCOPE_NONE, HSA_FENCE_SCOPE_NONE));
     dq->held = on == 1;
@@ -2795,23 +2844,19 @@ int a_memset_async(void* dst, int value, int64_t bytes, RadStream rs) {
 
 /* ---- VRAM: the room check.
  *
- * A VRAM ALLOCATION THE DRIVER REFUSES KILLS THE PROCESS IN THIS RUNTIME once a queue has been
- * destroyed. On a refusal ROCr releases its caches and asks again (GpuAgent::Trim), and the release
- * walks every queue the process created on the card. ROCm 7.2's runtime adds a queue to that list
- * (GpuAgent::aql_queues_, amd_gpu_agent.cpp) and never takes a destroyed one off it, so the walk
- * calls into freed memory and the process dies of SIGSEGV inside libhsa-runtime64.so instead of
- * being told no. Startup destroys queues before it allocates anything large -- the two it makes to
- * measure what a queue costs, and the loader's when a load ends -- so every refused device
- * allocation took that path: a card another process had taken memory from crashed startup in
- * hipMalloc rather than refusing its arena. ROCr's develop branch takes the queue off the list on
- * destroy; until a release carries that, every device allocation here is held to what the driver
- * will still give on the card and refused by this layer, naming what the card has and which
- * processes hold it, before the runtime is asked.
+ * In ROCm 7.2 a VRAM allocation the driver refuses kills the process once any queue has been
+ * destroyed. On a refusal ROCr frees its caches and retries (GpuAgent::Trim), walking every queue
+ * created on the card, but it never removes destroyed queues from that list
+ * (GpuAgent::aql_queues_, amd_gpu_agent.cpp), so the walk touches freed memory and SIGSEGVs in
+ * libhsa-runtime64.so. Startup destroys queues before its large allocations (the two that measure
+ * a queue's cost, and the loader's), so a card short on memory would crash in hipMalloc instead of
+ * refusing the arena. Until a ROCr release removes the queue on destroy (develop does), every
+ * device allocation is checked here first against what the driver will still give, and refused
+ * with what the card has and which processes hold it.
  *
- * The figure is the driver's own (AMDKFD_IOC_AVAILABLE_MEMORY), the one its allocation check
- * compares against, and the request is rounded up to 2 MiB so one the driver rounds up is not
- * passed by a hair. It is a check, not a reservation: memory another process takes between it and
- * the allocation still reaches the runtime. */
+ * The figure is the driver's own (AMDKFD_IOC_AVAILABLE_MEMORY), which its allocation check uses;
+ * requests are rounded up to 2 MiB so one the driver rounds up does not slip past. It is a check,
+ * not a reservation: memory another process takes in between still reaches the runtime. */
 
 /* What the driver will still allocate on card `ord`, -1 when it will not say. */
 int64_t card_available(int ord) {
@@ -2822,9 +2867,9 @@ int64_t card_available(int ord) {
     return (int64_t)a.available;
 }
 
-/* The processes holding VRAM on card `ord`, largest first, as the driver lists them: host process
- * ids, which inside a container are not this process's own numbering, so this process is named
- * only where the ids agree. */
+/* Processes holding VRAM on card `ord`, largest first. The driver lists host pids, which differ
+ * from this process's numbering inside a container, so this process is named only when they
+ * agree. */
 std::string card_holders(int ord) {
     const uint32_t id = G().dev[(size_t)ord].kfd_id;
     std::vector<std::pair<int64_t, long>> held;
@@ -2859,7 +2904,7 @@ std::string card_holders(int ord) {
 }
 
 /* True when card `ord` can take `bytes` more; otherwise false with the refusal set, `what` naming
- * the call. A card whose figure the driver will not give is let through, as before this check. */
+ * the call. If the driver gives no figure the allocation is allowed. */
 bool card_has_room(int ord, int64_t bytes, const char* what) {
     const int64_t avail = card_available(ord);
     if (avail < 0) return true;
@@ -2876,23 +2921,21 @@ bool card_has_room(int ord, int64_t bytes, const char* what) {
 
 /* ---- elastic memory, through HSA.
  *
- * HIP's virtual-memory calls build HIP's own default-stream queue on the card the first time a
- * range is backed -- hipMemCreate hands the new pages to HIP's command machinery -- and that queue
- * is a hardware queue this process never submits to. A card runs only so many queues at once; past
- * that it time-slices them, every kernel on the busy ones pays for the switch, and the two lanes of
- * a rank stop overlapping. The same reservations, backings and unmappings through HSA touch no
- * queue at all.
+ * HIP's virtual-memory calls create HIP's default-stream queue on the card the first time a range
+ * is backed (hipMemCreate hands the pages to HIP's command machinery), a hardware queue this
+ * process never submits to. Past a card's concurrent-queue limit it time-slices queues, every
+ * kernel pays for the switch, and a rank's two lanes stop overlapping. The same operations through
+ * HSA create no queue.
  *
- * A CARD WHOSE POOL REPORTS NO ALLOCATION GRANULE REPORTS A GRANULARITY OF ZERO, and every pool is
- * then sized once and allocated whole (VMem::supported()). A backed range is readable and writable
- * by its reservation's card only: every elastic pool belongs to one rank, and tensor parallel shares
- * through the all-reduce buffers, not these.
+ * A card whose pool reports no allocation granule reports granularity 0, and pools are then sized
+ * once and allocated whole (VMem::supported()). A backed range is accessible only to its
+ * reservation's card: each elastic pool belongs to one rank, and tensor parallel shares through
+ * the all-reduce buffers, not these.
  *
- * WHICH CARD A RESERVATION BELONGS TO is recorded when it is made, because the pages a commit maps
- * go on a device and the vtable names none: the device current at RESERVE time is the rank's --
- * every rank reserves its pools with its own card selected -- while the thread that later grows a
- * pool may have visited another card since. A mapping's handle is kept until the unmap, which is
- * what releases it. */
+ * The owning card is recorded at reserve time, because a commit must map pages on a device and
+ * the vtable names none. Each rank reserves with its own card current, while the thread that later
+ * grows a pool may have switched cards since. A mapping's handle is kept until the unmap releases
+ * it. */
 struct VRes { uintptr_t base; uintptr_t end; int ord; };
 std::mutex                                                   g_vres_mu;
 std::vector<VRes>                                            g_vres;
@@ -2914,17 +2957,20 @@ int64_t a_vmem_granularity(void) {
                                      HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_REC_GRANULE, &gran) !=
             HSA_STATUS_SUCCESS || gran == 0)
         return 0;
-    /* The pool's own answer is a floor and not the quantum to use: a map is tens of microseconds
-     * whatever it covers. RAD_ALIGN_POOL is what every pool is aligned to already, and taking it
-     * makes this backend's granule the host backend's. */
+    /* The pool's granule is only a floor: a map costs tens of us whatever its size. Every pool is
+     * already aligned to RAD_ALIGN_POOL, and using it matches the host backend's granule. */
     const int64_t g = (int64_t)gran < (int64_t)RAD_ALIGN_POOL ? (int64_t)RAD_ALIGN_POOL : (int64_t)gran;
     return align_up(g, (int64_t)RAD_ALIGN_POOL);
 }
 
 void* a_vmem_reserve(int64_t bytes, int64_t align) {
     if (bytes <= 0) return nullptr;
+    /* The reservation's card decides where a_vmem_commit maps its pages. */
     int dev = 0;
-    if (hipGetDevice(&dev) != hipSuccess) dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) {
+        device_set_error("vmem: no current device to reserve %lld bytes for", (long long)bytes);
+        return nullptr;
+    }
     void* p = nullptr;
     if (hsa_amd_vmem_address_reserve_align(&p, (size_t)bytes, 0,
                                            (uint64_t)(align > 0 ? align : 0), 0) !=
@@ -2949,8 +2995,8 @@ void a_vmem_release(void* base, int64_t bytes) {
     (void)hsa_amd_vmem_address_free(base, (size_t)bytes);
 }
 
-/* Backed, and readable and writable by the reservation's card at once: HSA grants access per
- * mapping, so there is nothing for a later protect over a longer run to add. */
+/* Backs the range and grants the reservation's card read/write access at once. HSA grants access
+ * per mapping, so vmem_protect has nothing to add. */
 int a_vmem_commit(void* addr, int64_t bytes) {
     if (!addr || bytes <= 0) return RAD_E_INVAL;
     int dev = vres_ord(addr);
@@ -2978,7 +3024,7 @@ int a_vmem_commit(void* addr, int64_t bytes) {
     }
     std::lock_guard<std::mutex> lk(g_vres_mu);
     g_vmaps[(uintptr_t)addr] = h;
-    loc_forget();   /* the range is backed now, and no longer only reserved */
+    loc_forget();   /* the range is backed, no longer only reserved */
     return RAD_OK;
 }
 
@@ -3006,52 +3052,43 @@ int a_vmem_decommit(void* addr, int64_t bytes) {
 
 /* ------------------------------------------------------------------ pinned host memory, in pieces
  *
- * EVERY PINNED OR MAPPED HOST ALLOCATION IS ONE ADDRESS RANGE LOCKED AS PIECES OF AT MOST
- * kPinPiece, BECAUSE OF THE IOMMU. Host memory a card reaches is a userptr buffer object, which the
- * kernel DMA-maps for each card as one scatterlist. On an Intel VT-d host in scalable mode (Linux
- * 7.0, two R9700) that mapping fails for any single buffer larger than about 2.5 GiB while smaller
- * ones succeed every time, so a 12 GiB host pool allocated whole was refused at startup far below
- * the driver's pinned-memory cap. Passthrough (iommu=pt) lets the large pin through but takes peer
- * access away, which every multi-rank kernel requires, so the configuration has to work with
- * translation on. A range locked in pieces never asks the IOMMU for more than one piece at a time.
+ * Every pinned or mapped host allocation is one address range locked in pieces of at most
+ * kPinPiece, because of the IOMMU. Card-reachable host memory is a userptr buffer object that the
+ * kernel DMA-maps per card as one scatterlist. On Intel VT-d in scalable mode that mapping fails
+ * for any single buffer over ~2.5 GiB, so a large host pool allocated whole is refused far below
+ * the driver's pinned-memory cap. iommu=pt allows the large pin but removes peer access, which
+ * every multi-rank kernel needs, so translation must stay on.
  *
- * The lock is ROCr's, hsa_amd_memory_lock_to_pool: the same userptr pin hipHostMalloc makes, one
- * buffer object per call. hsa_amd_pointer_info does not report what it locked, so locate() answers
- * from this backend's own record of the ranges (g_pinned) and HIP is never asked about them.
- * hipHostRegister would be HIP's record instead, and HIP's record is not what the copies read.
+ * The lock is ROCr's hsa_amd_memory_lock_to_pool, the same userptr pin hipHostMalloc makes, one
+ * buffer object per call. hsa_amd_pointer_info does not report locked ranges, so locate() answers
+ * from g_pinned and HIP is never asked. (hipHostRegister would record them in HIP, which the
+ * copies do not read.)
  *
- * The cards still see one range: a locked piece is mapped at its own host address, so the pieces
- * of one reservation are consecutive on the card too. Each piece is checked rather than assumed,
- * because the pools, the mover and the activation arena all hand a kernel base + offset.
+ * The cards still see one range: each piece is mapped at its host address, so the pieces are
+ * contiguous on the card too. This is checked per piece, because the pools, the mover and the
+ * activation arena all hand kernels base + offset.
  *
- * THAT TAKES THE KERNEL DRIVER'S SVM API, AND WITHOUT IT THE RANGE IS ONE ALLOCATION OF THE HOST
- * POOL. A lock lands at its host address because ROCr's thunk registers the range through the
- * KFD's SVM API, which maps a range where it is. A driver that does not offer it -- amdgpu could
- * not register the card's memory with HMM, seen in a KVM guest with both cards passed through --
- * gets a userptr buffer object instead, at an address the thunk's own aperture hands out: below
- * the host address, and each piece a guard page away from the one before, so the pieces are
- * neither where the host has them nor next to each other on the card. hsa_amd_vmem cannot join
- * them (ROCm 7.2 refuses a vmem handle on the host pool). The host pool's own allocation can: the
- * thunk maps it for the CPU at the address the aperture gave the cards. It is one buffer object,
- * as hipHostMalloc made before the pieces, so a host whose IOMMU refuses a large pin AND whose
- * driver has no SVM API has no large pinned range at all; the refusal names both. Which path a
- * process takes is the runtime's HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED, the same capability the thunk
- * decides by, and the log says it once.
+ * In-place mapping needs the KFD's SVM API, through which ROCr's thunk registers the range.
+ * Without it (e.g. amdgpu could not register card memory with HMM, seen in a KVM guest with
+ * passed-through cards) each lock becomes a userptr buffer object at an address from the thunk's
+ * aperture: below the host address, with a guard page between pieces, so pieces are neither in
+ * place nor contiguous. hsa_amd_vmem cannot join them (ROCm 7.2 refuses a vmem handle on the host
+ * pool), but a host-pool allocation can: the thunk maps it for the CPU at the cards' address. It
+ * is one buffer object, so a host whose IOMMU refuses large pins and whose driver lacks SVM has no
+ * large pinned range at all; the refusal names both. The path is chosen by
+ * HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED, the capability the thunk uses, and logged once.
  *
- * What hipHostMalloc does besides the pin is kept: huge pages advised from 2 MiB up, a preferred
- * NUMA node that is the one nearest the current card (ROCr allocates from that node's pool),
- * fine-grained coherence (the pool locked to), and access from every card. The memory is PRIVATE
- * anonymous memory and not hipHostMalloc's shared kind, because the advice is only as good as the
- * policy behind it: shared anonymous memory is shmem, whose huge pages follow
- * transparent_hugepage/shmem_enabled, `never` on stock Ubuntu, so the pool got 4 KiB pages there
- * whatever it advised. Private memory follows transparent_hugepage/enabled, `madvise` on the same
- * hosts. Where an IOMMU translates the cards' reads (Intel VT-d, which these pieces exist for) each
- * page is a translation of its own, and a pool streamed from at 4 KiB measured 10-21% slower
- * prefill on such a host. MADV_DONTFORK keeps the range out of any child: a private range
- * a card has pinned is copied whole into a forked child, where it is of no use.
+ * Kept from hipHostMalloc: huge pages advised from 2 MiB up, preferred NUMA node nearest the
+ * current card (ROCr allocates from that node's pool), fine-grained coherence (the pool locked
+ * to), and access from every card. The memory is private anonymous, not hipHostMalloc's shared
+ * kind: shared anonymous memory is shmem, whose huge pages follow
+ * transparent_hugepage/shmem_enabled (`never` on stock Ubuntu), while private memory follows
+ * transparent_hugepage/enabled (`madvise` there). Under IOMMU translation each page is its own
+ * translation, and streaming from a 4 KiB-page pool made prefill 10-21% slower. MADV_DONTFORK
+ * keeps a forked child from copying the pinned range whole.
  *
- * kPinPiece is a power of two well under the failing size. The cost is one buffer object per piece
- * per card: a few dozen for the largest pools. */
+ * kPinPiece is a power of two well under the failing size; the cost is one buffer object per
+ * piece per card, a few dozen for the largest pools. */
 constexpr int64_t kPinPiece = (int64_t)1 << 30;
 
 /* The NUMA node sysfs reports for the current card, -1 when it reports none. */
@@ -3072,10 +3109,9 @@ int current_card_numa_node() {
     return node;
 }
 
-/* MPOL_PREFERRED | MPOL_F_STATIC_NODES, the policy ROCr's own host allocations take. A refusal (a
- * seccomp profile that blocks mbind, a node with no memory) leaves the pages on whichever node
- * first touches them, which is a placement cost and not a correctness one: said once, then the
- * lock goes ahead. */
+/* MPOL_PREFERRED | MPOL_F_STATIC_NODES, the policy ROCr's host allocations use. On refusal (seccomp
+ * blocking mbind, a node without memory) pages land on the first-touching node, a placement cost
+ * only: warn once and continue. */
 void prefer_numa_node(void* p, int64_t len, int node) {
     constexpr int kMaxNodes = 1024;
     constexpr int kBits = 8 * (int)sizeof(unsigned long);
@@ -3093,9 +3129,9 @@ void prefer_numa_node(void* p, int64_t len, int node) {
                  std::strerror(errno));
 }
 
-/* TRANSPARENT HUGE PAGES TURNED OFF leave every pinned range at 4 KiB pages whatever it advises:
- * said once, because on a host whose IOMMU translates the cards' reads that is a slower stream
- * from the host pool and nothing else on the log points at it. */
+/* With transparent huge pages off, pinned ranges get 4 KiB pages whatever they advise. Warned
+ * once, because under IOMMU translation that slows streaming from the host pool and nothing else
+ * in the log would explain it. */
 void warn_if_no_huge_pages() {
     static std::atomic<bool> said{false};
     if (said.exchange(true)) return;
@@ -3113,7 +3149,7 @@ const char* hsa_why(hsa_status_t st) {
     return hsa_status_string(st, &m) == HSA_STATUS_SUCCESS && m ? m : "unknown HSA status";
 }
 
-/* Whether every card's driver offers the SVM API, so that a locked piece is mapped in place. */
+/* Whether the driver offers the SVM API, so a locked piece is mapped in place. */
 bool svm_in_place() {
     static const bool on = [] {
         bool svm = false;
@@ -3129,9 +3165,8 @@ bool svm_in_place() {
     return on;
 }
 
-/* The range as one allocation of the host pool, for a driver without the SVM API. The pool
- * aligns only a buffer's end to 2 MiB, so one alignment more is asked for and the base rounded
- * up inside it. */
+/* The range as one host-pool allocation, for a driver without the SVM API. The pool aligns only
+ * a buffer's end to 2 MiB, so one extra alignment is requested and the base rounded up within it. */
 void* pin_whole(int64_t bytes, const std::vector<hsa_agent_t>& cards) {
     const int64_t align = RAD_ALIGN_POOL;
     const int64_t len = align_up(bytes, 4096);
@@ -3165,8 +3200,8 @@ void* pin_pieces(int64_t bytes) {
 
     const int64_t align = RAD_ALIGN_POOL;
     const int64_t len = align_up(bytes, 4096);
-    /* One alignment over, trimmed at both ends, so the range starts on a 2 MiB boundary: a pool's
-     * fixed-stride slots inherit its base alignment, and a huge page needs it. */
+    /* Map one alignment extra and trim both ends so the range starts on a 2 MiB boundary: a
+     * pool's fixed-stride slots inherit its base alignment, and huge pages need it. */
     void* m = ::mmap(nullptr, (size_t)(len + align), PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (m == MAP_FAILED) {
@@ -3251,10 +3286,10 @@ void unpin_pieces(void* p) {
 
 bool pinned_kind(int kind) { return kind == RAD_MEM_HOST_PINNED || kind == RAD_MEM_HOST_MAPPED; }
 
-/* HIP's own allocation calls for device and pageable memory; the pinned kinds are the pieces. The
- * two pinned kinds are one thing here: RAD_MEM_HOST_PINNED (the mover's staging and the O_DIRECT
- * landing zone, spec §5.4) and RAD_MEM_HOST_MAPPED (the zero-copy execution site, row three of
- * spec §5.1's table) are both a locked range every card addresses at its host address. */
+/* Device and pageable memory come from HIP's allocation calls; the pinned kinds are locked in
+ * pieces. RAD_MEM_HOST_PINNED (mover staging and the O_DIRECT landing zone, spec §5.4) and
+ * RAD_MEM_HOST_MAPPED (the zero-copy execution site, spec §5.1) are the same thing here: a locked
+ * range every card addresses at its host address. */
 void* (*g_hip_alloc)(int64_t, int) = nullptr;
 void* a_alloc(int64_t bytes, int kind) {
     if (kind == RAD_MEM_DEVICE && bytes > 0) {
@@ -3276,7 +3311,7 @@ void* a_alloc(int64_t bytes, int kind) {
     return p;
 }
 
-/* Behind the forgetting every free needs (locate's cache). */
+/* Every free invalidates locate()'s cache first. */
 void (*g_hip_free)(void*, int) = nullptr;
 void a_free(void* p, int kind) {
     loc_forget();
@@ -3286,7 +3321,7 @@ void a_free(void* p, int kind) {
     else if (g_hip_free) g_hip_free(p, kind);
 }
 
-/* A pinned range is the same address on both sides, inner addresses included. */
+/* A pinned range has the same address on host and device, interior addresses included. */
 void* (*g_hip_host_ptr)(void*) = nullptr;
 void* (*g_hip_device_ptr)(void*) = nullptr;
 void* a_host_ptr(void* p) { return pinned_range(p, nullptr, nullptr) ? p : g_hip_host_ptr(p); }
@@ -3300,10 +3335,9 @@ size_t a_code_mark(void) {
     return r.order.size();
 }
 
-/* Whether every fat binary registered in [from, to) holds a code object `device` runs -- the
- * same choice the first launch out of each will make (module_meta), made now, while a library
- * that carries nothing for this card can still be left out of selection rather than chosen and
- * failed at its first launch. */
+/* Whether every fat binary registered in [from, to) has a code object `device` runs. Makes the
+ * same choice as the first launch (module_meta), early enough that a library with nothing for
+ * this card is left out of selection instead of failing at its first launch. */
 int a_code_runs(size_t from, size_t to, int device, char* why, int cap) {
     if (device < 0 || (size_t)device >= G().dev.size()) return RAD_E_INVAL;
     const std::vector<std::string>& isas = G().dev[(size_t)device].isas;
@@ -3335,10 +3369,9 @@ const DeviceBackend* aql_backend_if_present(void) {
     static const DeviceBackend* b = []() -> const DeviceBackend* {
         const DeviceBackend* hip = hip_backend_if_present();
         if (!hip) return nullptr;
-        /* THE INTERPOSITION HAS TO BE LIVE, or every plugin launch would hand HIP a queue it has
-         * never heard of. It is live when this executable exports hipLaunchKernel, which every
-         * target linking the core does (core/CMakeLists.txt); a binary that does not is a build
-         * error, reported as one rather than run on the other backend. */
+        /* The interposition must be live, or plugin launches would hand HIP queues it does not
+         * know. It is live when this executable exports hipLaunchKernel, as every target linking
+         * the core does (core/CMakeLists.txt); otherwise it is a build error, reported as such. */
         void* bound = dlsym(RTLD_DEFAULT, "hipLaunchKernel");
         if (bound != reinterpret_cast<void*>(&::hipLaunchKernel)) {
             RAD_ERR("device: this executable does not export hipLaunchKernel, so kernel plugins "
@@ -3407,6 +3440,9 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_aql.code_runs = a_code_runs;
         g_aql.tape_set_overlap = a_tape_set_overlap;
         g_aql.tape_destroy = a_tape_destroy;
+        g_aql.stream_gate = a_stream_gate;
+        g_aql.gate_open = a_gate_open;
+        g_aql.gate_room = a_gate_room;
         return &g_aql;
     }();
     return b;
@@ -3425,8 +3461,8 @@ int aql_vmem_device_of(const void* addr, int* dev) {
 
 /* ================================================================== the HIP entry points
  *
- * Defined in the executable, so the dynamic linker binds a plugin's references here ahead of the
- * HIP runtime's. Each forwards anything that is not this backend's to HIP. */
+ * Defined in the executable, so the dynamic linker binds plugin references here ahead of the HIP
+ * runtime. Each forwards anything not on this backend's streams to HIP. */
 
 using namespace rad::aql;
 
@@ -3440,9 +3476,8 @@ void** __hipRegisterFatBinary(const void* data) {
     if (w && w->binary) {
         Registry& r = reg();
         std::lock_guard<std::mutex> lk(r.mu);
-        /* HIP hands back no handle for a fat binary with nothing for any visible device. It is
-         * still counted, under a record nothing can launch from, because that is exactly the
-         * plugin the loader's check exists to catch. */
+        /* HIP returns no handle for a fat binary with nothing for any visible device. It is still
+         * recorded (unlaunchable) so the plugin loader's check (a_code_runs) can catch it. */
         if (!h) {
             Module* m = new Module();
             m->bundle = w->binary;
@@ -3450,10 +3485,10 @@ void** __hipRegisterFatBinary(const void* data) {
             return h;
         }
         Module*& m = r.by_handle[h];
-        /* A handle HIP hands out again after a plugin was unloaded -- the loader closes one it
-         * refuses -- names a new fat binary, and the old record's parsed code object points into a
-         * mapping that is gone. Records are never freed (see __hipUnregisterFatBinary), so the old
-         * one is simply left behind. */
+        /* HIP may reuse a handle after a plugin is unloaded (the loader closes refused ones); it
+         * then names a new fat binary, and the old record's code object points into an unmapped
+         * image. Records are never freed (see __hipUnregisterFatBinary), so the old one is
+         * abandoned. */
         if (!m || m->bundle != w->binary) m = new Module();
         m->bundle = w->binary;
         r.order.push_back(m);
@@ -3478,8 +3513,8 @@ void __hipRegisterFunction(void** modules, const void* host_fn, char* device_fn,
 }
 
 void __hipUnregisterFatBinary(void** modules) {
-    /* The module's executables stay loaded: a process that unloads a kernel plugin is exiting,
-     * and the records above are what a late launch would otherwise dereference. */
+    /* The module's executables and records stay: a process unloading a kernel plugin is exiting,
+     * and a late launch would dereference them. */
     if (real().unreg_fat) real().unreg_fat(modules);
 }
 
@@ -3531,18 +3566,15 @@ hipError_t hipMemsetAsync(void* dst, int value, size_t bytes, hipStream_t st) {
                                                                               : hipSuccess);
 }
 
-/* A SYNCHRONOUS FILL, ON ONE OF THE BACKEND'S OWN QUEUES FOR THE CURRENT DEVICE. Kernel libraries
- * zero their small private blocks this way -- an all-reduce's flags at init, a split-K GEMM's
- * arrival counters on first use -- and HIP would serve each by building its default stream's
- * queues on that card. Those are hardware queues this process never otherwise uses, and a card
- * whose compute work is spread over more queues than it runs at once time-slices them: every
- * kernel on the busy ones then pays a switch, and the two lanes of a rank stop overlapping.
+/* A synchronous fill on one of the backend's own queues for the current device. Kernel libraries
+ * zero small private blocks this way (an all-reduce's flags at init, a split-K GEMM's arrival
+ * counters on first use), and HIP would create its default-stream queues on the card to serve
+ * them: extra hardware queues that make the card time-slice, so every kernel pays a switch and a
+ * rank's two lanes stop overlapping.
  *
- * The fill goes on the first queue this process made on the device, which is the compute stream of
- * the rank that owns it, and is waited for there. A device with no queue yet -- a peer's buffers
- * set up before its rank has started -- gets one for the fill and loses it again, so no queue
- * outlives the call. It is never part of a recorded pass: it runs once for a block that is then
- * kept. */
+ * The fill runs on the first queue this process made on the device (the owning rank's compute
+ * stream) and is waited for. A device with no queue yet (a peer's buffers set up before its rank
+ * starts) gets a temporary one for the call. Never recorded into a tape: it runs once. */
 hipError_t hipMemset(void* dst, int value, size_t bytes) {
     if (!G().ok) return real().memset_sync ? real().memset_sync(dst, value, bytes) : hipErrorNotSupported;
     int dev = -1;
@@ -3572,9 +3604,8 @@ hipError_t hipStreamSynchronize(hipStream_t st) {
     return ret(rad_stream_sync((RadStream)st) < 0 ? hipErrorLaunchFailure : hipSuccess);
 }
 
-/* The two stream APIs a plugin could plausibly reach for that have no meaning on a queue of this
- * backend: events are the engine's, through rad_event_*. Refused by name rather than handed to
- * HIP, which would dereference the queue as one of its own streams. */
+/* HIP events have no meaning on this backend's queues (events go through rad_event_*). Refused
+ * instead of forwarded, since HIP would dereference the queue as one of its own streams. */
 hipError_t hipEventRecord(hipEvent_t e, hipStream_t st) {
     if (!ours(st)) return real().ev_record ? real().ev_record(e, st) : hipErrorNotSupported;
     RAD_ERR("hipEventRecord on an engine stream: use rad_event_record");
@@ -3592,8 +3623,8 @@ hipError_t hipGetLastError(void) {
         const hipError_t e = t_err;
         t_ours = false;
         t_err = hipSuccess;
-        /* HIP's own slot holds whatever came before this backend's call, which that call
-         * overwrote. */
+        /* Clear HIP's own slot: it holds an error from before this backend's call, which that
+         * call superseded. */
         if (real().last) (void)real().last();
         return e;
     }

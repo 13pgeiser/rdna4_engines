@@ -1,24 +1,20 @@
-// R4D attention dispatch. One translation unit so the KV-dtype variants share the device code:
-// each is a template instantiation, not a copy. The entry points are named for the geometry they
-// are compiled for (head_dim 256, 6 queries per KV head, paged block 16) because that geometry is
-// a hard gate -- everything else is rejected below rather than run.
+// R4D paged attention dispatch for head_dim 256, 6 queries per KV head, paged block 16. The
+// KV-dtype variants are template instantiations of one device code. The geometry is a hard gate:
+// anything else is rejected.
 //
-// The query is bf16 in every variant. A single-term 8-bit query is an order of magnitude worse
-// against an fp32 reference (2.58e-02 relative against ~2.3e-03), and the two-term e4m3 form that
-// DOES reach f16 accuracy is 4-10% slower end to end, so no 8-bit query variant is compiled. Two
-// families ship, differing only in KV cache dtype: bf16 KV (all 16-bit) and fp8 KV (16/8 mixed,
-// the production configuration).
+// The query is bf16 in every variant. A single-term 8-bit query is ~10x less accurate against an
+// fp32 reference (2.58e-02 vs ~2.3e-03 relative), and the two-term e4m3 form that reaches f16
+// accuracy is 4-10% slower end to end. Two families ship, differing in KV dtype: bf16 and fp8
+// (the production configuration).
 //
-// `opt` is a bitmask of the optimisation steps, all of them on:
+// `opt` is a bitmask of optimisation steps:
 //     prefill 3954187 = f16 operands | mask skip | folded query scale | contiguous-k fragments
 //                     | prefetch 2 + scheduling barrier | dot2 row sum | block table in SGPRs
 //                     | wide K fetch | V prefetch across the m-tile loop | LDS-scoped barrier
-//     decode  3429947 = the same, minus the wide K fetch (its K never reaches LDS), with the K
-//                       prefetch at 2 rather than 4, plus reading K straight from the paged cache
-//                       (bit 16) and f16 split-KV partials (32).
-// Each bit is defined and justified where it is used, in r4d_attn_prefill_h256_gqa6.hip and
-// r4d_attn_decode_h256_gqa6.hip.
-// They are kept separable so any one of them can be turned off on its own after a geometry change.
+//     decode  3429947 = the same minus the wide K fetch (its K never reaches LDS), plus K read
+//                       straight from the paged cache (bit 16) and f16 split-KV partials (32).
+// Each bit is defined where it is used (r4d_attn_prefill_h256_gqa6.hip,
+// r4d_attn_decode_h256_gqa6.hip) and can be turned off on its own after a geometry change.
 #include "r4d.h"
 #include "r4d_attn_args.h"
 #include "r4d_common.h"
@@ -30,9 +26,8 @@ using std::max;
 
 #define CHK() do { hipError_t e_ = hipGetLastError(); if (e_ != hipSuccess) return -100 - (int)e_; } while (0)
 
-// The geometry every kernel in this translation unit is compiled for. HEAD_DIM and GQA appear in
-// the entry-point names; BLOCK_SIZE does not, because it is 16 for the whole library and so
-// discriminates nothing between them.
+// The geometry of every kernel in this unit. BLOCK_SIZE is not in the entry-point names because
+// it is 16 for all of them.
 #define A_HEAD_DIM   256
 #define A_GQA          6
 #define A_BLOCK_SIZE  16
@@ -46,13 +41,12 @@ extern "C" void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max
 }
 
 // ---- prefill ---------------------------------------------------------------------------------
-// LDS, head_dim 256, 16-bit K and V: sK = TILE*264*2, sV = 256*(TILE+8)*2. bf16 KV at TILE 64
-// would need 68096 B > 65536, so the geometry stops at 48.
+// LDS at head_dim 256, 16-bit K and V: sK = TILE*264*2, sV = 256*(TILE+8)*2. TILE 64 would need
+// 68096 B > 65536, so TILE is 48.
 #define P_NWARPS 24
 #define P_TILE   48
-// K PREFETCH 2, NOT 4. Four fragments in flight hold more than the m-tile loop has to give at six
-// waves a SIMD, and the loop then spills: LLVM 22 to 36 bytes a lane and LLVM 24 to 48, which cost
-// LLVM 24 4% of the prefill. At 2 both compilers spill the same 20 bytes, outside the WMMA groups.
+// K prefetch 2, not 4: four fragments in flight make the m-tile loop spill at six waves per SIMD
+// (36-48 bytes per lane, ~4% of the prefill). At 2 the spill is 20 bytes, outside the WMMA groups.
 #define P_OPT    3954187
 
 // KVP: 0 = fp8 e4m3 cache, 1 = bf16 cache. Reached only through the two named wrappers below.
@@ -77,72 +71,23 @@ extern "C" int r4d_attn_prefill_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t s
 }
 
 // ---- decode ----------------------------------------------------------------------------------
-#ifndef D_TILE
 #define D_TILE 16
-#endif
-// The decode leg prefetches TWO K fragments per WMMA group, not four.  Four costs 8 more VGPRs at
-// the peak of the QK loop and that is exactly the amount this kernel is over: it allocates 256
-// VGPRs, spills 18 of them, and reloads three 16-byte groups of the query FROM SCRATCH ON EVERY
-// TILE.  Two fits in 255 with no spill and is 1.7-7.5% faster across concurrency and depth, for
-// bit-identical output.
-#ifndef D_OPT
+// Decode prefetches two K fragments per WMMA group, not four. Four costs 8 more VGPRs at the peak
+// of the QK loop and spills 18, reloading part of the query from scratch on every tile. Two fits in
+// 255 VGPRs and is 1.7-7.5% faster, with identical output.
 #define D_OPT  3429947
-#endif
-// Output rows per block in the vectorised merge: 32 threads own a row, so this is the block width
-// in waves.  1, 2 and 4 are within 1% of each other everywhere the vectorised form is taken; 2 is
-// the best of them on average across concurrency and depth.
-#ifndef D_JPB
+// Output rows (waves) per block in the vectorised merge. 1, 2 and 4 are within 1%; 2 is best on
+// average.
 #define D_JPB 2
-#endif
-// Output rows below which the vectorised merge is NOT taken.  It gives a row 32 lanes where the
-// general form gives it 256, so it trades parallelism for eight-times-fewer load instructions --
-// and that trade is only good while there are enough rows to fill the part.  At one request there
-// are 96 rows and the segment count is at its largest (the split law scales splits with 1/num_seqs),
-// so each of 96 waves walks 64 segments on an idle machine and the vectorised form LOSES up to
-// 23%.  The crossover is around 192 rows, and above 288 the vectorised form wins by 1.2-20%; the
-// cut is set at four rows per CU.
-#ifndef D_VECMIN
+// Minimum output rows for the vectorised merge. It gives a row 32 lanes instead of 256, trading
+// parallelism for 8x fewer loads, which pays only when there are enough rows to fill the GPU. At
+// one request (96 rows, most segments) it loses up to 23%; the crossover is ~192 rows and above
+// 288 it wins by 1.2-20%. The cut is four rows per CU.
 #define D_VECMIN 256
-#endif
 
-// Split law: AS MANY WORKGROUPS AS FIT UNDER 128.  `splits * kv_heads * num_seqs` is the whole
-// grid, and 128 of them is the argmin at every concurrency this serve reaches on this geometry.
-//
-// THE COUNT IS `128 / units`, NOT THE LARGEST POWER OF TWO UNDER IT.  A power of two lands exactly
-// on 128 only when units is one too -- one, two, four and eight requests -- and at three, five,
-// six and seven it lands on 96, 80, 96 and 112 workgroups instead, which is a third of the part
-// idle in the last round.  `floor(128 / units)` is the argmin at all eight, worth 2-20% over a
-// power-of-two law at the four counts where they differ.
-//
-// Nearby counts are not interchangeable: at five requests 13 splits is 130 workgroups, three
-// rounds of 64 for two rounds of work, and is slower than 12.  UNDER a multiple of 64 is what
-// matters, not near it.
-//
-// What the count buys is partial-buffer traffic, not parallelism.  The split-KV scratch is
-// `seqs x q_len x q_heads x splits` rows of head_dim f16, written once by the decode kernel and
-// read back once by the combine: at eight requests that is 12.8 MB at splits 32 against 3.2 at 8,
-// which is 19% of a 16K step's KV and 1.2% of a 128K one.  So the win shrinks with depth -- a few
-// percent up to 16K, under 2% at 64K and a wash at 128K -- and never reverses enough to be worth a
-// context term.
-static int decode_splits(const R4DArgs* a) {
-    if (a->splits > 0) return a->splits;
-    const int tiles = (a->max_ctx + D_TILE - 1) / D_TILE;
-    const int units = max(1, a->kv_heads * a->num_seqs);
-    int s = 128 / units;                     // as many workgroups as fit under 128
-    const int cap = tiles / 2;               // >= 2 tiles per segment
-    if (s > cap) s = cap;
-    if (s > tiles) s = tiles;
-    if (s < 1) s = 1;
-    return s;
-}
-
-// Same for both cache dtypes: the split law does not read the dtype, and the partials are f16
-// either way (opt bit 32).
+// Split law: r4d_decode_splits (r4d_attn_decode_h256_gqa6.hip).
 extern "C" long r4d_attn_decode_h256_gqa6_scratch_bytes(const R4DArgs* a) {
-    const int  splits = decode_splits(a);
-    const long rows   = (long)r4d_q_total(*a) * a->q_heads;
-    return (D_OPT & 32) ? rows * splits * (long)(a->head_dim * 2 + 8)       // f16 O/l + m + l
-                        : rows * splits * (long)(a->head_dim + 2) * 4L;     // f32 O partials + m + l
+    return r4d_decode_scratch(a, r4d_decode_splits(a, D_TILE), D_OPT);
 }
 
 template <int KVP>
@@ -152,7 +97,7 @@ static int decode_launch(const R4DArgs* a, hipStream_t s) {
     const int rows = a->q_len * A_GQA;
     if (rows > A_MAX_DECODE_ROWS) return -4;    // verify width <= 10 at gqa 6
     const int nw = (rows + 15) / 16;            // gqa-aligned height; no dead m-tiles issued
-    const int splits = decode_splits(a);
+    const int splits = r4d_decode_splits(a, D_TILE);
 
 #define D_LAUNCH(NW)                                                                          \
     hipLaunchKernelGGL((r4d_attn_decode_kernel<NW, D_TILE, A_HEAD_DIM, A_GQA, A_BLOCK_SIZE,    \
@@ -165,11 +110,9 @@ static int decode_launch(const R4DArgs* a, hipStream_t s) {
 #undef D_LAUNCH
     CHK();
 
-    // The vectorised merge owns a row per WAVE, so its wave-wide sum only reproduces the general
-    // path's LDS tree while the segment count fits 64 lanes-worth. Past that -- reachable only
-    // when kv_heads * num_seqs is 1, where the law asks for 128 splits -- fall back rather than
-    // change the merge order. Both forms produce the same bytes; which one runs is a speed choice
-    // only.
+    // The vectorised merge's wave sum reproduces the general LDS tree only while splits <= 64.
+    // Above that (only when kv_heads * num_seqs is 1, giving 128 splits) use the general form.
+    // Both produce identical bytes; the choice is speed only.
     const int jobs3 = r4d_q_total(*a) * a->q_heads;
     if (splits <= 64 && jobs3 >= D_VECMIN) {
         const int blocks = (jobs3 + D_JPB - 1) / D_JPB;
@@ -198,14 +141,11 @@ extern "C" int r4d_attn_decode_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t s)
 
 // ============================================================== the plugin ABI entry points
 //
-// The operand reader is r4d_attn_args.h, a header this kernel family shares because the paged
-// geometries implement one op and take one operand list. See libr4d/r4d_args.h for why there is no
-// adapter directory between the core and these launches.
+// The operand reader is r4d_attn_args.h, shared by every paged geometry.
 //
-// THEY GO IN THE TRANSLATION UNIT AND NOT IN THE FILES IT #includes. r4d_attn_prefill_*.hip and
-// r4d_attn_decode_*.hip are textual inclusions of this one -- appending an entry point to either
-// compiles it into nothing, and the .so then carries an UNDEFINED symbol that no build step
-// reports. The plugin still links; only r4d_selftest catches the missing symbol.
+// Note: entry points belong in this translation unit, not in the r4d_attn_prefill_*.hip or
+// r4d_attn_decode_*.hip files it includes. An entry point added there does not get compiled, and
+// the .so carries an undefined symbol that only r4d_selftest catches.
 /* ------------------------------------------------------------------ paged prefill */
 
 extern "C" int r4d_rad_attn_prefill_h256_fp8(const RadArgs* a, RadStream s) {
@@ -213,13 +153,10 @@ extern "C" int r4d_rad_attn_prefill_h256_fp8(const RadArgs* a, RadStream s) {
     R4DArgs r;
     int rc = fill_paged(a, &r, 256);
     if (rc != RAD_OK) return rc;
-    /* ABSENT DESCALES MEAN 1.0, they are not an error. The kernels already spell it that way --
-     * `a.k_descale ? a.k_descale[seq * kv_heads + kvh] : 1.0f` -- and 1.0 is what vLLM defaults
-     * both scales to, so a cache written by kv_store_fp8 at its default scale is read back by
-     * exactly this path with no descale plane to allocate, fill or keep in step. Refusing here
-     * would make the operands mandatory in the shim while they stay optional in the schema and
-     * optional in the kernel, which is three answers to one question. A CALIBRATED pair still
-     * works: pass the operands and they are used. */
+    /* Absent descales mean 1.0, not an error: the kernels read them that way, vLLM defaults both
+     * scales to 1.0, and kv_store_fp8 at its default scale needs no descale plane. The operands
+     * are optional in the schema and the kernel, so they are optional here too. A calibrated pair
+     * is used when passed. */
     return r4d_attn_prefill_h256_gqa6_fp8kv(&r, (hipStream_t)s);
 }
 
@@ -233,30 +170,19 @@ extern "C" int r4d_rad_attn_prefill_h256_bf16(const RadArgs* a, RadStream s) {
 
 /* ------------------------------------------------------------------ paged decode */
 
-/* The split-KV partial buffer. The decode kernel writes it and the combine reads it back, and
- * nothing else touches it -- so it is arena scratch, sized at declare from the band's upper bound
- * exactly as RadScratchFn intends.
+/* Split-KV partial buffer: written by the decode kernel, read by the combine, nothing else. Arena
+ * scratch sized at declare from the band's upper bound (RadScratchFn).
  *
- * IT IS CALLED WITH PARAMETERS AND NO TENSORS. That is what declare is: the op is known, the batch
- * is not, and there is nothing to point at yet. So the parameters are the primary source here and
- * the tensors are the fallback, not the other way round -- reading tensors first makes this hook
- * refuse every attn_paged row in the model with "invalid argument", which presents as a pile of
- * missing kernels rather than as one hook asking the wrong question.
+ * Declare passes parameters and no tensors (the batch is not known yet), so parameters are the
+ * primary source and tensors the fallback. Reading tensors first would refuse every attn_paged
+ * row with "invalid argument". q_len is the band's upper bound, since the region is sized once
+ * for the worst step.
  *
- * q_len is the band's upper bound, deliberately: this region is sized once for the worst step the
- * arena will ever hold, so the bound is the right number and a per-step count would be the wrong
- * one.
- *
- * THE SEQUENCE COUNT IS EVERY COUNT UP TO max_seqs, NOT max_seqs ALONE. Both split laws hand a
- * step of S sequences a split count that falls as S grows -- about 128 / (kv_heads * S) -- so the
- * partials are S * splits(S) rows a (query position, head), and that product is not monotone in
- * S: at kv_heads 2 the h256 law gives 60 at twelve sequences and 63 at nine, and the h128 law's
- * step off its pothole doubles the splits at one count and not at the next. A step may carry any
- * count up to the bound, so the region is the largest over all of them. The laws are closed forms
- * and this runs at declare, so the sweep costs nothing a step. */
-// One hook per geometry but one shared (seqs x heads x rows) partial layout, so the worst-over-
-// the-batch sweep below asks each geometry its own bytes in one place instead of triplicating the
-// sweep. which: 0 = h256/gqa6, 1 = h128/gqa4, 2 = h256/gqa2 (the Gemma 4 windowed leg).
+ * The size is the maximum over every sequence count up to max_seqs: S * splits(S) is not monotone
+ * in S (at kv_heads 2 the h256 law gives 60 at twelve sequences and 63 at nine, and the h128 law's
+ * step-up doubles splits at one count only). The laws are closed forms, so the sweep is cheap. */
+// Per-geometry byte counts over the shared partial layout, so one sweep serves all.
+// which: 0 = h256/gqa6, 1 = h128/gqa4, 2 = h256/gqa2 (Gemma 4 windowed).
 static int64_t decode_scratch_bytes_of(const R4DArgs* r, int which) {
     if (which == 1) return (int64_t)r4d_attn_decode_h128_gqa4_scratch_bytes(r);
     if (which == 2) return (int64_t)r4d_attn_decode_h256_gqa2_scratch_bytes(r);
@@ -281,8 +207,8 @@ static int64_t decode_scratch(const RadArgs* a, int head_dim, int which) {
         r.max_ctx   = (int)r4d_geti_or(a, "max_ctx", 0);
         r.block_size = (int)r4d_geti_or(a, "block_size", 16);
         r.splits    = sp;
-        /* max_ctx feeds the split law only. Zero would make it choose one split, which UNDERSIZES
-         * the buffer for the launch that later picks more, so refuse rather than guess low. */
+        /* max_ctx feeds only the split law. Zero would pick one split and undersize the buffer
+         * for a launch that later picks more, so refuse. */
         if (r.max_ctx <= 0) return R4D_NO(RAD_E_INVAL);
         int64_t worst = 0;
         for (long long n = 1; n <= max_seqs; ++n) {
@@ -350,10 +276,9 @@ extern "C" int r4d_rad_attn_decode_h128_bf16(const RadArgs* a, RadStream s) {
     return r4d_attn_decode_h128_gqa4_bf16kv(&r, (hipStream_t)s);
 }
 
-/* Gemma 4 dense sliding window -- head_dim 256, 2 queries per KV head, window 1024. Decode only;
- * a prefill step does not match the row's q_len band and takes the caller's (windowed) fallback.
- * Same shape as the drafter leg above (h128): one `which` routing to the gqa2 scratch law and the
- * gqa2 decode launch, no check_dims_once because this is not the geometry that reports dims. */
+/* Gemma 4 dense sliding window (head_dim 256, gqa 2, window 1024) decode; its prefill entry points
+ * are in r4d_attn_paged_h256_gqa2.hip. No check_dims_once: this is not the geometry that reports
+ * dims. */
 extern "C" int64_t r4d_rad_attn_decode_h256_gqa2_scratch(const RadArgs* a) {
     return decode_scratch(a, 256, 2);
 }

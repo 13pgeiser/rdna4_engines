@@ -1,16 +1,14 @@
 /* tokref.cpp -- a reference encoder: llama.cpp's splitters, std::regex and a string-keyed merge.
  *
- * A REFERENCE, not a fallback: core/ does not link it. It runs a `Split` through
- * llama.cpp's unicode_regex_split -- a hand-written splitter for the patterns llama.cpp knows, and
- * std::regex over a category-collapsed copy of the text for every other one -- and it merges with
- * a string-keyed bigram queue. That is an implementation independent of everything in
- * core/text/tokenizer_regex.cpp and tokenizer_bpe.cpp, which is what makes it worth comparing
- * against: tokenizer_test holds core/text's encoder to it id for id, and rad-tokcheck does the
- * same over large corpora. Where the two disagree because this one is wrong -- see tokref.h -- the
- * test says so case by case rather than excluding the input.
+ * A reference, not a fallback; core/ does not link it. A `Split` goes through llama.cpp's
+ * unicode_regex_split (hand-written splitters for known patterns, std::regex over a
+ * category-collapsed copy of the text otherwise), and merging uses a string-keyed bigram queue.
+ * It is independent of core/text/tokenizer_regex.cpp and tokenizer_bpe.cpp. Known divergences are
+ * listed in tokref.h.
  */
 #include "tokref.h"
 
+#include "text/tokenizer_ucd.h"
 #include "text/unicode_norm.h"
 #include "llama/src/unicode.h"
 
@@ -78,32 +76,21 @@ void replace_all(std::string& s, std::string_view from, std::string_view to) {
 
 /* ================================================================== the pre-tokeniser regex
  *
- * WHICH PATTERNS ARE HANDLED STRUCTURALLY AND WHICH FALL THROUGH -- read this before changing
- * anything below it.
+ * Structural patterns: vendor/llama/src/unicode.cpp has hand-written splitters for the patterns
+ * that ship on models (GPT-2, Llama-3, Qwen2, Qwen3.5, Kimi-K2, the AFMoE digit rule and
+ * "[^\n]+|[\n]+"). They are codepoint-class state machines without backtracking, correct on
+ * lookaheads such as `\s+(?!\S)`. `unicode_regex_split` picks one by exact pattern string.
  *
- * llama.cpp carries hand-written splitters for the patterns that actually ship on models, in
- * vendor/llama/src/unicode.cpp: the GPT-2 pattern, the Llama-3 pattern, the Qwen2 pattern, the
- * Qwen3.5 pattern, Kimi-K2, the AFMoE digit rule, and "[^\n]+|[\n]+". Those are STRUCTURAL: a
- * codepoint-class state machine, no backtracking, and correct on the lookahead constructs
- * (`\s+(?!\S)`) that a general engine gets wrong or slow. `unicode_regex_split` dispatches on the
- * pattern string and picks one of them when it matches.
- *
- * Everything else FALLS THROUGH to std::regex over a collapsed representation of the text, where
- * each non-ASCII codepoint is replaced by one byte standing for its unicode category. That is
- * llama.cpp's trick and it is what makes `\p{L}` work under a std::regex that has no idea what
- * `\p{L}` is. Its limits, stated plainly, because they are real:
+ * Everything else falls through to std::regex over a copy of the text where each non-ASCII
+ * codepoint is replaced by one byte for its Unicode category, which makes `\p{L}` work. Limits:
  *   - a pattern mixing `\p{...}` with a non-ASCII literal is refused, not approximated;
- *   - possessive quantifiers and atomic groups are not ECMAScript and are not supported;
+ *   - possessive quantifiers and atomic groups (not ECMAScript) are unsupported;
  *   - std::regex backtracks, so a pathological pattern is slow rather than wrong.
- * A model whose pre-tokeniser needs more than that gets a hand-written splitter here, next to
- * the others, and the .rad still declares the pattern so the decision stays visible.
+ * A model that needs more gets a hand-written splitter.
  *
- * The one rewrite we do apply before dispatching is the case-insensitive contraction group.
- * tokenizer.json writes `(?i:'s|'t|'re|'ve|'m|'ll|'d)`; ECMAScript has no inline flag group, so
- * llama.cpp expands it to explicit classes and keys its structural splitters off the EXPANDED
- * form. Rewriting here is what lets a pattern read straight out of tokenizer.json reach the
- * structural splitter instead of the fallback -- which for Qwen is the difference between a
- * correct split and a merely plausible one. */
+ * One rewrite is applied before dispatch: tokenizer.json's `(?i:'s|'t|'re|'ve|'m|'ll|'d)` becomes
+ * explicit classes, since ECMAScript has no inline flag group and llama.cpp keys its structural
+ * splitters off the expanded form. Without it Qwen's pattern would miss its structural splitter. */
 const char* k_ci_contractions_in  = "(?i:'s|'t|'re|'ve|'m|'ll|'d)";
 const char* k_ci_contractions_out = "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])";
 
@@ -113,13 +100,9 @@ std::string canonicalise_pattern(const std::string& p) {
     return out;
 }
 
-/* Does `unicode_regex_split` have a structural splitter for this pattern? Used only for the
- * diagnostic line, so a slow model is diagnosable without a profiler.
- *
- * IT MUST CANONICALISE FIRST, for the same reason apply_split does: comparing the raw pattern
- * reports "[std::regex fallback]" for a pattern the split path does in fact handle structurally,
- * and a diagnostic that claims a correctness problem where there is none is worse than no
- * diagnostic at all. */
+/* Whether `unicode_regex_split` has a structural splitter for this pattern (diagnostics only).
+ * Canonicalises first, as apply_split does, or a structurally handled pattern would be reported as
+ * a std::regex fallback. */
 bool pattern_is_structural(const std::string& raw) {
     const std::string p = canonicalise_pattern(raw);
     static const char* k_structural[] = {
@@ -137,17 +120,14 @@ bool pattern_is_structural(const std::string& raw) {
 }
 /* --- normalisers ------------------------------------------------------------------------- */
 
-/* A literal Replace is a plain find-and-replace. A regex Replace goes through std::regex, which
- * is acceptable HERE and not in the pre-tokeniser: normalisers run once over the whole prompt
- * rather than once per candidate split, and the patterns that show up in practice
- * (`\s+` -> ` `, `` -> `_`) are trivial. */
+/* A literal Replace is find-and-replace; a regex Replace uses std::regex, acceptable here because
+ * normalisers run once per prompt and real patterns (`\s+` -> ` `, `` -> `_`) are trivial. */
 void apply_replace(std::string& text, const VocabStep& s) {
     if (s.flags & 1) {
         try {
             text = std::regex_replace(text, std::regex(s.arg0), s.arg1);
         } catch (const std::regex_error& e) {
-            /* Refusing to normalise is worse than a slightly wrong normalisation only if you
-             * think a silent difference is cheap. Say it, once, and leave the text alone. */
+            /* Warn and leave the text unchanged. */
             RAD_WARN("tokenizer: Replace pattern '%s' did not compile (%s); step skipped",
                      s.arg0.c_str(), e.what());
         }
@@ -171,8 +151,7 @@ void apply_norm(std::string& text, const VocabStep& s) {
             break;
         }
         case RAD_NORM_STRIP: {
-            /* Whitespace by the unicode definition, not isspace(): a non-breaking space in a
-             * pasted prompt is whitespace to HuggingFace and would not be to isspace(). */
+            /* Unicode whitespace, not isspace(): HuggingFace strips e.g. a non-breaking space. */
             std::vector<uint32_t> cpts = unicode_cpts_from_utf8(text);
             size_t a = 0, b = cpts.size();
             if (s.flags & 1) while (a < b && unicode_cpt_flags_from_cpt(cpts[a]).is_whitespace) ++a;
@@ -203,8 +182,7 @@ void apply_split(std::vector<std::string>& words, const VocabStep& s) {
     out.reserve(words.size() * 2);
     for (const std::string& w : words) {
         if (w.empty()) continue;
-        /* byte_encode=false: ByteLevel is its own declared step and applying it here as well
-         * would encode twice. */
+        /* byte_encode=false: ByteLevel is its own declared step. */
         std::vector<std::string> parts;
         try {
             parts = unicode_regex_split(w, exprs, /*byte_encode=*/false);
@@ -212,9 +190,8 @@ void apply_split(std::vector<std::string>& words, const VocabStep& s) {
             RAD_ERR("tokenizer: Split('%s') failed: %s", s.arg0.c_str(), e.what());
             parts = { w };
         }
-        /* Behaviour only changes what happens to the DELIMITERS, and the patterns that ship on
-         * real models are "Isolated" with a pattern that matches the pieces themselves, so
-         * every part is kept. Removed drops empty parts only, which is already the case. */
+        /* Every behaviour is treated as Isolated (see tokref.h): behaviour only affects
+         * delimiters, and shipped patterns are Isolated and match the pieces themselves. */
         for (std::string& p : parts) if (!p.empty()) out.push_back(std::move(p));
     }
     words.swap(out);
@@ -228,9 +205,8 @@ void apply_bytelevel(std::vector<std::string>& words, const VocabStep& s) {
         words[0].insert(words[0].begin(), ' ');
     }
     if (use_regex) {
-        /* HuggingFace's ByteLevel carries the GPT-2 pattern inside it. rad-convert normally
-         * splits that out into an explicit Split step so the chain reads as what it does, but a
-         * chain that declares it inline still has to work. */
+        /* HuggingFace's ByteLevel can carry the GPT-2 pattern inline. rad-convert normally emits
+         * it as an explicit Split step, but the inline form must still work. */
         VocabStep split;
         split.kind = RAD_PRE_SPLIT;
         split.arg0 = "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)";
@@ -240,14 +216,14 @@ void apply_bytelevel(std::vector<std::string>& words, const VocabStep& s) {
     for (std::string& w : words) w = byte_encode(w);
 }
 
-void apply_metaspace(std::vector<std::string>& words, const VocabStep& s) {
+void apply_metaspace(std::vector<std::string>& words, const VocabStep& s, bool at_start) {
     const std::string rep = s.arg0.empty() ? std::string(k_metaspace) : s.arg0;
     const int64_t prepend = s.iarg;            /* 0 never, 1 first, 2 always */
     const bool    split   = (s.flags & 1) != 0;
 
     for (size_t i = 0; i < words.size(); ++i) {
         std::string& w = words[i];
-        if (prepend == 2 || (prepend == 1 && i == 0)) {
+        if (prepend == 2 || (prepend == 1 && i == 0 && at_start)) {
             if (w.empty() || w.compare(0, 1, " ") != 0) w.insert(0, " ");
         }
         replace_all(w, " ", rep);
@@ -267,25 +243,118 @@ void apply_metaspace(std::vector<std::string>& words, const VocabStep& s) {
     words.swap(out);
 }
 
-/* Whitespace pre-tokeniser: HuggingFace's is the regex \w+|[^\w\s]+ with Isolated behaviour.
- * Written structurally because \w is locale-dependent in std::regex and is not there. */
-void apply_whitespace(std::vector<std::string>& words) {
+/* Membership in one of tokenizer_ucd.h's sorted range tables. */
+bool in_ranges(const ucd::CpRange* r, size_t n, uint32_t c) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (r[mid].last < c) lo = mid + 1;
+        else if (r[mid].first > c) hi = mid;
+        else return true;
+    }
+    return false;
+}
+
+uint32_t gc_of(uint32_t c) {
+    size_t lo = 0, hi = ucd::k_gc_runs_n;
+    while (hi - lo > 1) {
+        const size_t mid = (lo + hi) / 2;
+        if (ucd::k_gc_runs[mid].first <= c) lo = mid; else hi = mid;
+    }
+    return ucd::k_gc_runs[lo].gc;
+}
+
+bool is_space(uint32_t c) { return in_ranges(ucd::k_white_space, ucd::k_white_space_n, c); }
+
+/* Rust's char::is_ascii_punctuation || char::is_punctuation (a P* category), the test
+ * HuggingFace's Punctuation and BertPreTokenizer split on. */
+bool is_hf_punct(uint32_t c) {
+    if ((c >= 0x21 && c <= 0x2F) || (c >= 0x3A && c <= 0x40) || (c >= 0x5B && c <= 0x60) ||
+        (c >= 0x7B && c <= 0x7E))
+        return true;
+    const uint32_t g = gc_of(c);
+    return g >= ucd::Pc && g <= ucd::Po;
+}
+
+/* Rust's char::is_numeric, the test Digits splits on: Nd, Nl, No. */
+bool is_numeric(uint32_t c) {
+    const uint32_t g = gc_of(c);
+    return g == ucd::Nd || g == ucd::Nl || g == ucd::No;
+}
+
+/* NormalizedString::split with a character predicate: every character it accepts is a delimiter
+ * of its own, the runs between them are the other parts, and `behavior` folds the two. */
+template <class Pred>
+void split_chars(std::vector<std::string>& words, Pred is_delim, int behavior) {
+    std::vector<std::string> out;
+    for (const std::string& w : words) {
+        std::vector<std::pair<std::string, bool>> parts;
+        for (uint32_t c : unicode_cpts_from_utf8(w)) {
+            const bool d = is_delim(c);
+            if (!d && !parts.empty() && !parts.back().second) parts.back().first += unicode_cpt_to_utf8(c);
+            else parts.push_back({ unicode_cpt_to_utf8(c), d });
+        }
+        std::vector<std::string> kept;
+        bool prev = false;
+        switch (behavior) {
+            case SPLIT_REMOVED:
+                for (auto& p : parts) if (!p.second) kept.push_back(p.first);
+                break;
+            case SPLIT_MERGED_PREV:
+                for (auto& p : parts) {
+                    if (p.second && !prev && !kept.empty()) kept.back() += p.first;
+                    else kept.push_back(p.first);
+                    prev = p.second;
+                }
+                break;
+            case SPLIT_MERGED_NEXT:
+                for (size_t k = parts.size(); k-- > 0; ) {
+                    if (parts[k].second && !prev && !kept.empty()) kept.back() = parts[k].first + kept.back();
+                    else kept.push_back(parts[k].first);
+                    prev = parts[k].second;
+                }
+                std::reverse(kept.begin(), kept.end());
+                break;
+            case SPLIT_CONTIGUOUS:
+                for (auto& p : parts) {
+                    if (p.second == prev && !kept.empty()) kept.back() += p.first;
+                    else kept.push_back(p.first);
+                    prev = p.second;
+                }
+                break;
+            default:
+                for (auto& p : parts) kept.push_back(p.first);
+                break;
+        }
+        for (std::string& k : kept) if (!k.empty()) out.push_back(std::move(k));
+    }
+    words.swap(out);
+}
+
+/* Rust's regex \w, which HuggingFace's Whitespace uses: Alphabetic (letters, Nl, and the
+ * circled and squared Latin letters among the symbols), marks, Nd, Pc and the two joiners. */
+bool is_rust_word(uint32_t c) {
+    const uint32_t g = gc_of(c);
+    return g <= ucd::Lo || g == ucd::Nl || (g >= ucd::Mn && g <= ucd::Me) || g == ucd::Nd ||
+           g == ucd::Pc || c == 0x200C || c == 0x200D || (c >= 0x24B6 && c <= 0x24E9) ||
+           (c >= 0x1F130 && c <= 0x1F149) || (c >= 0x1F150 && c <= 0x1F169) ||
+           (c >= 0x1F170 && c <= 0x1F189);
+}
+
+/* HuggingFace's Whitespace: the matches of \w+|[^\w\s]+, everything else removed. Alternation is
+ * leftmost-first, so a run of \w is taken first, then a run of what is neither \w nor \s. */
+void apply_whitespace_words(std::vector<std::string>& words) {
     std::vector<std::string> out;
     for (const std::string& w : words) {
         const std::vector<uint32_t> cpts = unicode_cpts_from_utf8(w);
+        auto word  = [](uint32_t c) { return is_rust_word(c); };
+        auto other = [](uint32_t c) { return !is_rust_word(c) && !is_space(c); };
         size_t i = 0;
         while (i < cpts.size()) {
-            const auto f = unicode_cpt_flags_from_cpt(cpts[i]);
-            if (f.is_whitespace) { ++i; continue; }
-            const bool word = f.is_letter || f.is_number || cpts[i] == '_';
             size_t j = i;
-            while (j < cpts.size()) {
-                const auto g = unicode_cpt_flags_from_cpt(cpts[j]);
-                if (g.is_whitespace) break;
-                const bool wj = g.is_letter || g.is_number || cpts[j] == '_';
-                if (wj != word) break;
-                ++j;
-            }
+            if (word(cpts[i]))       while (j < cpts.size() && word(cpts[j])) ++j;
+            else if (other(cpts[i])) while (j < cpts.size() && other(cpts[j])) ++j;
+            if (j == i) { ++i; continue; }
             std::string piece;
             for (size_t k = i; k < j; ++k) piece += unicode_cpt_to_utf8(cpts[k]);
             out.push_back(std::move(piece));
@@ -295,47 +364,18 @@ void apply_whitespace(std::vector<std::string>& words) {
     words.swap(out);
 }
 
+void apply_whitespace(std::vector<std::string>& words, const VocabStep& s) {
+    if (s.flags == kPreWhitespace) { apply_whitespace_words(words); return; }
+    split_chars(words, is_space, SPLIT_REMOVED);
+    if (s.flags == kPreBert) split_chars(words, is_hf_punct, SPLIT_ISOLATED);
+}
+
 void apply_punctuation(std::vector<std::string>& words, const VocabStep& s) {
-    const int64_t behavior = s.iarg;
-    std::vector<std::string> out;
-    for (const std::string& w : words) {
-        const std::vector<uint32_t> cpts = unicode_cpts_from_utf8(w);
-        std::string acc;
-        for (uint32_t c : cpts) {
-            const auto f = unicode_cpt_flags_from_cpt(c);
-            const bool punct = f.is_punctuation || f.is_symbol;
-            if (punct) {
-                if (!acc.empty()) { out.push_back(acc); acc.clear(); }
-                if (behavior != SPLIT_REMOVED) out.push_back(unicode_cpt_to_utf8(c));
-            } else {
-                acc += unicode_cpt_to_utf8(c);
-            }
-        }
-        if (!acc.empty()) out.push_back(acc);
-    }
-    words.swap(out);
+    split_chars(words, is_hf_punct, (int)s.iarg);
 }
 
 void apply_digits(std::vector<std::string>& words, const VocabStep& s) {
-    const bool individual = (s.flags & 1) != 0;
-    std::vector<std::string> out;
-    for (const std::string& w : words) {
-        const std::vector<uint32_t> cpts = unicode_cpts_from_utf8(w);
-        std::string acc;
-        bool acc_digit = false;
-        for (uint32_t c : cpts) {
-            const bool d = unicode_cpt_flags_from_cpt(c).is_number;
-            if (acc.empty()) { acc_digit = d; acc += unicode_cpt_to_utf8(c); continue; }
-            if (d != acc_digit || (d && individual)) {
-                out.push_back(acc);
-                acc.clear();
-                acc_digit = d;
-            }
-            acc += unicode_cpt_to_utf8(c);
-        }
-        if (!acc.empty()) out.push_back(acc);
-    }
-    words.swap(out);
+    split_chars(words, is_numeric, (s.flags & 1) ? SPLIT_ISOLATED : SPLIT_CONTIGUOUS);
 }
 
 }  /* namespace */
@@ -354,7 +394,9 @@ bool structural(const std::string& pattern) { return pattern_is_structural(patte
 
 namespace {
 
-int run_pre(const Vocab& v, const std::string& text, std::vector<std::string>& words) {
+/* `at_start`: the text is the first fragment, which HuggingFace's Metaspace "first" prepends to. */
+int run_pre(const Vocab& v, const std::string& text, std::vector<std::string>& words,
+            bool at_start) {
     std::string t = text;
     for (const VocabStep& s : v.steps()) if (step_is_norm(s.kind)) apply_norm(t, s);
 
@@ -364,13 +406,12 @@ int run_pre(const Vocab& v, const std::string& text, std::vector<std::string>& w
         switch (s.kind) {
             case RAD_PRE_SPLIT:       apply_split(words, s); break;
             case RAD_PRE_BYTELEVEL:   apply_bytelevel(words, s); break;
-            case RAD_PRE_METASPACE:   apply_metaspace(words, s); break;
-            case RAD_PRE_WHITESPACE:  apply_whitespace(words); break;
+            case RAD_PRE_METASPACE:   apply_metaspace(words, s, at_start); break;
+            case RAD_PRE_WHITESPACE:  apply_whitespace(words, s); break;
             case RAD_PRE_PUNCTUATION: apply_punctuation(words, s); break;
             case RAD_PRE_DIGITS:      apply_digits(words, s); break;
             case RAD_PRE_BYTE_FALLBACK:
-                /* A declaration about what the MODEL does with an unknown piece, not a split.
-                 * The fallback itself lives in bpe() below, where the miss happens. */
+                /* Declares how unknown pieces are handled, not a split; bpe() applies it. */
                 break;
             default:
                 RAD_ERR("tokenizer: pre-tokeniser step %u is not implemented", s.kind);
@@ -380,11 +421,17 @@ int run_pre(const Vocab& v, const std::string& text, std::vector<std::string>& w
     return RAD_OK;
 }
 
-/* The BPE merge loop, in shape from llama.cpp's llm_tokenizer_bpe_session (MIT, 06938ac12).
- * A priority queue of candidate bigrams ordered by merge rank; pop the best, splice the two
- * symbols into one, and offer the two new neighbours. Stale entries are recognised by comparing
- * the recorded text against the symbols' current text rather than by deleting from the queue,
- * because deletion from a heap is the expensive operation and staleness is cheap to detect. */
+/* The byte-fallback token for byte c, spelt "<0xNN>"; -1 when the vocab has none. */
+int32_t byte_token(const Vocab& v, unsigned char c) {
+    static const char* hex = "0123456789ABCDEF";
+    const char buf[7] = { '<', '0', 'x', hex[c >> 4], hex[c & 15], '>', 0 };
+    return v.find(buf);
+}
+
+/* The BPE merge loop, after llama.cpp's llm_tokenizer_bpe_session (MIT, 06938ac12). A priority
+ * queue of candidate bigrams ordered by merge rank: pop the best, splice the two symbols, offer the
+ * new neighbours. Stale entries are detected by comparing recorded text with the symbols' current
+ * text instead of deleting from the heap. */
 void bpe(const Vocab& v, const std::vector<std::string>& words, std::vector<int32_t>& out) {
     struct Symbol { int prev, next; const char* text; size_t n; };
     struct Bigram {
@@ -392,8 +439,8 @@ void bpe(const Vocab& v, const std::vector<std::string>& words, std::vector<int3
         size_t size;
         std::string text;
         bool operator<(const Bigram& o) const {
-            /* Lower rank wins, so the comparator is inverted for a max-heap; ties break on the
-             * LEFTMOST position, which is what makes the result independent of heap order. */
+            /* Lower rank wins (inverted for a max-heap); ties go to the leftmost position, so the
+             * result does not depend on heap order. */
             return rank > o.rank || (rank == o.rank && left > o.left);
         }
     };
@@ -402,9 +449,8 @@ void bpe(const Vocab& v, const std::vector<std::string>& words, std::vector<int3
     std::priority_queue<Bigram> work;
     int final_prev = -1;
 
-    /* Byte fallback is only reachable when the chain declares it; without it an unmatched piece
-     * is dropped, which is llama.cpp's behaviour and is what a vocab with a full byte alphabet
-     * relies on (there, nothing is unmatched). */
+    /* Byte fallback applies only when the chain declares it; otherwise an unmatched piece is
+     * dropped, as in llama.cpp (a vocab with a full byte alphabet never misses). */
     bool have_byte_fallback = false;
     bool have_bytelevel = false;
     for (const VocabStep& s : v.steps()) {
@@ -419,14 +465,10 @@ void bpe(const Vocab& v, const std::vector<std::string>& words, std::vector<int3
 
         size_t offset = 0;
         int index = 0;
-        /* A user-defined token is taken whole rather than re-split. Added tokens are exact
-         * strings the vocabulary promises to round-trip; decomposing one into codepoints and
-         * merging back can land on a different sequence, because the merge table was never
-         * fitted over them.
-         *
-         * ORDINARY VOCABULARY ENTRIES GO THROUGH THE MERGE LOOP unless the vocabulary sets
-         * `ignore_merges`, which takes any non-control entry whole (core/text/tokenizer.cpp,
-         * bpe_word, says why control entries are excluded). */
+        /* A user-defined token is taken whole: added tokens must round-trip, and the merge table
+         * was not fitted over them. Ordinary entries go through the merge loop unless the vocab
+         * sets `ignore_merges`, which takes any non-control entry whole (see bpe_word in
+         * core/text/tokenizer.cpp for why control entries are excluded). */
         const int32_t whole = v.find(word);
         if (whole >= 0 && (v.type(whole) == RAD_TT_USER_DEFINED ||
                            (v.build().ignore_merges && v.type(whole) != RAD_TT_CONTROL))) {
@@ -488,9 +530,8 @@ void bpe(const Vocab& v, const std::vector<std::string>& words, std::vector<int3
         const int32_t id = v.find(str);
         if (id >= 0) { out.push_back(id); continue; }
 
-        /* Miss. Decompose into single-byte tokens; how a byte is SPELT depends on the chain.
-         * Under ByteLevel every byte is already its own mapped codepoint, so the piece splits at
-         * codepoint boundaries; under byte fallback it is "<0xNN>". */
+        /* Miss: decompose into single-byte tokens. Under ByteLevel each byte is already a mapped
+         * codepoint, so split at codepoint boundaries; under byte fallback a byte is "<0xNN>". */
         if (have_bytelevel) {
             for (size_t k = 0; k < str.size(); ) {
                 const size_t n = std::min(unicode_len_utf8(str[k]), str.size() - k);
@@ -501,10 +542,8 @@ void bpe(const Vocab& v, const std::vector<std::string>& words, std::vector<int3
                 k += n;
             }
         } else if (have_byte_fallback) {
-            static const char* hex = "0123456789ABCDEF";
             for (unsigned char c : str) {
-                const char buf[7] = { '<', '0', 'x', hex[c >> 4], hex[c & 15], '>', 0 };
-                const int32_t b = v.find(buf);
+                const int32_t b = byte_token(v, c);
                 if (b >= 0) out.push_back(b);
                 else if (v.unk() >= 0) out.push_back(v.unk());
             }
@@ -517,9 +556,8 @@ void bpe(const Vocab& v, const std::vector<std::string>& words, std::vector<int3
     }
 }
 
-/* Unigram, by Viterbi over a prefix trie -- SentencePiece's algorithm, in shape from
- * llama.cpp's llm_tokenizer_ugm_session. Scores are summed in double precision because the
- * reference implementation does and the argmax genuinely differs in float on long inputs. */
+/* Unigram by Viterbi (SentencePiece's algorithm), after llama.cpp's llm_tokenizer_ugm_session.
+ * Scores are summed in double, as the reference does; in float the argmax differs on long inputs. */
 void unigram(const Vocab& v, const std::string& text, std::vector<int32_t>& out) {
     if (text.empty()) return;
     const size_t n = text.size();
@@ -528,20 +566,21 @@ void unigram(const Vocab& v, const std::string& text, std::vector<int32_t>& out)
     std::vector<Best> best(n + 1, { v.unk(), 0, -DBL_MAX });
     best[0] = { v.unk(), 0, 0.0 };
 
-    /* The unknown-token penalty: SentencePiece uses (min score - 10). Recomputing it here rather
-     * than storing it keeps the .rad from carrying a derived number that could disagree. */
+    /* Unknown-token penalty, as in SentencePiece: min score - 10. Derived here, not stored. */
     double unk_penalty = 0.0;
     if (!v.build().scores.empty()) {
         unk_penalty = *std::min_element(v.build().scores.begin(), v.build().scores.end()) - 10.0;
     }
 
+    /* Prefix scan by substring lookup, bounded by the longest entry so it stays linear in the
+     * text. A trie would be faster on a large vocab. */
+    size_t longest = 0;
+    for (const std::string& t : v.build().tokens) longest = std::max(longest, t.size());
+
     for (size_t i = 0; i < n; ) {
         const size_t cp_len = std::min(unicode_len_utf8(text[i]), n - i);
         bool matched_whole_cp = false;
-        /* Longest-prefix scan. A trie would beat this on a large vocab; the substring lookup is
-         * O(len) with a bounded len because no vocab entry is longer than the longest token, and
-         * that bound is what keeps it linear. */
-        const size_t max_len = std::min(n - i, (size_t)256);
+        const size_t max_len = std::min(n - i, longest);
         for (size_t l = 1; l <= max_len; ++l) {
             const int32_t id = v.find(std::string_view(text.data() + i, l));
             if (id < 0) continue;
@@ -557,11 +596,9 @@ void unigram(const Vocab& v, const std::string& text, std::vector<int32_t>& out)
         i += cp_len;
     }
 
-    /* A VOCABULARY WITH NO UNK TOKEN HAS NO ID FOR TEXT NO PIECE COVERS, and the Viterbi above
-     * still routes such text through the unk transition -- whose id is then -1, which is not a
-     * token and must never reach the output. The span is spelled as byte tokens when the chain
-     * declares byte fallback and dropped otherwise, as bpe() does with a piece it cannot match.
-     * Built back to front like the rest of the backtrack, so the bytes go in reversed. */
+    /* Without an unk token, uncovered text still takes the unk transition with id -1, which must
+     * never reach the output. Such spans become byte tokens under byte fallback and are dropped
+     * otherwise, as in bpe(). The backtrack runs back to front, so bytes are pushed reversed. */
     const int32_t unk = v.unk();
     bool byte_fallback = false;
     if (unk < 0)
@@ -575,11 +612,8 @@ void unigram(const Vocab& v, const std::string& text, std::vector<int32_t>& out)
         const Best& b = best[pos];
         const bool is_unk = (b.id == unk);
         if (is_unk && unk < 0) {
-            static const char* hex = "0123456789ABCDEF";
             for (size_t k = pos; k-- > b.from; ) {
-                const unsigned char c = (unsigned char)text[k];
-                const char buf[7] = { '<', '0', 'x', hex[c >> 4], hex[c & 15], '>', 0 };
-                const int32_t id = byte_fallback ? v.find(buf) : -1;
+                const int32_t id = byte_fallback ? byte_token(v, (unsigned char)text[k]) : -1;
                 if (id >= 0) out.push_back(id);
                 else         ++dropped;
             }
@@ -597,14 +631,15 @@ void unigram(const Vocab& v, const std::string& text, std::vector<int32_t>& out)
                  byte_fallback ? "lacks a byte token for them" : "declares no byte fallback");
 }
 
-/* WordPiece: greedy longest-match-first with a continuation prefix. Kept because BERT-family
- * embedding models are a real deployment and they are all WordPiece; it is 30 lines. */
+/* WordPiece (BERT-family models): greedy longest-match-first with a "##" continuation prefix; a
+ * word of more than 100 characters is one unknown token, as in HuggingFace. */
 void wordpiece(const Vocab& v, const std::vector<std::string>& words, std::vector<int32_t>& out) {
     for (const std::string& w : words) {
         if (w.empty()) continue;
         size_t i = 0;
         std::vector<int32_t> piece;
-        bool ok = true;
+        bool ok = unicode_cpts_from_utf8(w).size() <= 100;
+        if (!ok) i = w.size();
         while (i < w.size()) {
             size_t j = w.size();
             int32_t id = -1;
@@ -631,13 +666,10 @@ int encode(const Vocab& v, std::string_view text, std::vector<int32_t>& out,
 
     if (add_special && v.add_bos() && v.bos() >= 0) out.push_back(v.bos());
 
-    /* Special-token partitioning. The text is cut into (raw, token, raw, token, ...) around any
-     * declared special token that appears literally, before any other step touches it, because a
-     * special token is not something the pre-tokeniser is allowed to split.
-     *
-     * `parse_special == false` means a control token typed by a user is ordinary text. That is
-     * not a nicety: without it, user content containing "<|im_start|>system" reaches the model
-     * as an actual role switch. */
+    /* Cut the text into (raw, token, raw, ...) around literal special tokens before any other
+     * step, so the pre-tokeniser never splits one. With `parse_special == false` a control token
+     * in user text is ordinary text; otherwise "<|im_start|>system" in user content would be a
+     * real role switch. */
     struct Frag { bool is_token; int32_t id; size_t off, len; };
     std::vector<Frag> frags;
     const std::string raw(text);
@@ -673,14 +705,14 @@ int encode(const Vocab& v, std::string_view text, std::vector<int32_t>& out,
         const std::string chunk = raw.substr(f.off, f.len);
 
         std::vector<std::string> words;
-        RAD_TRY(run_pre(v, chunk, words));
+        RAD_TRY(run_pre(v, chunk, words, f.off == 0));
 
         switch (v.kind()) {
             case RAD_TOK_BPE:       bpe(v, words, out); break;
             case RAD_TOK_WORDPIECE: wordpiece(v, words, out); break;
             case RAD_TOK_UNIGRAM: {
-                /* Unigram runs Viterbi over the whole normalised fragment; the pre-tokeniser's
-                 * job there is only to insert the metaspace, so the words are rejoined. */
+                /* Unigram runs over the whole fragment; pre-tokenisation only inserted the
+                 * metaspace, so rejoin the words. */
                 std::string joined;
                 for (const std::string& w : words) joined += w;
                 unigram(v, joined, out);

@@ -1,17 +1,15 @@
 /* build_test.cpp -- the declare phase.
  *
- * Against a REAL Registry loading the real test plugin, because that is the only way this test
- * checks the thing it claims to: a fake selector would be a second implementation of the bucket
- * table, and the two would agree with each other and with nothing else. core/plugin/testplugin/
- * already carries spec §2.2's worked example -- t_gemm with rows at M<=16, M<=64 and unconstrained
- * -- a range with a hole in it, an op with no host kernel, and an init() that refuses.
+ * Runs against a real Registry loading the real test plugin; a fake selector would be a second
+ * implementation of the bucket table. core/plugin/testplugin/ carries spec §2.2's worked example
+ * (t_gemm with rows at M<=16, M<=64 and unconstrained), a range with a hole, an op with no host
+ * kernel, and an init() that refuses.
  *
- * What is under test is the five things declare produces (spec §3.1) and the two properties they
- * rest on: that the phase always completes, and that everything it decides it decides once.
+ * Under test: the five products of declare (spec §3.1), and that the phase always completes and
+ * decides everything once.
  */
 #include "rad_test.h"
-
-#include <cstring>
+#include "rad_planes.h"
 
 #include <nlohmann/json.hpp>
 
@@ -25,6 +23,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <sys/stat.h>
 #include <unistd.h>
 
 using namespace rad;
@@ -32,14 +31,6 @@ using json = nlohmann::ordered_json;
 
 namespace {
 
-/* $RADIANCE_HOME is what ctest sets; RAD_TESTPLUGIN_HOME overrides it for a hand-built run. Same
- * spelling as plugin_test.cpp, deliberately: two tests that locate the plugins differently is one
- * more thing to fix when the layout moves. */
-std::string home() {
-    if (const char* d = std::getenv("RAD_TESTPLUGIN_HOME")) return d;
-    const char* h = std::getenv("RADIANCE_HOME");
-    return h ? h : "radiance_home";
-}
 std::string kernels_dir() { return home() + "/testkernels"; }
 
 int load(Registry& r, std::vector<std::string> hierarchy = { "radtest_over", "radtest_base" }) {
@@ -50,8 +41,23 @@ int load(Registry& r, std::vector<std::string> hierarchy = { "radtest_over", "ra
     return st;
 }
 
-bool has(const std::string& hay, const std::string& needle) {
-    return hay.find(needle) != std::string::npos;
+/* t_attn as a paged-attention caller declares it: q_len 1..16, 8 heads of 128, 16-token blocks. */
+rad_op decl_t_attn(Builder& b) {
+    const RadParam p[] = { RAD_RANGE("q_len", 1, 16), RAD_INT("head_dim", 128),
+                           RAD_INT("window", 0), RAD_INT("block_size", 16),
+                           RAD_INT("causal", 1), RAD_INT("n_head", 8),
+                           RAD_STR("kv_dtype", "bf16") };
+    return b.decl_op("t_attn", p, 7, nullptr, 0);
+}
+
+/* A bf16 full-attention KV group, "kv_full", of 8 heads of 128. */
+rad_kvgroup decl_kv_full(Builder& b) {
+    RadKVGroupDecl kd{};
+    kd.kind = RAD_KV_FULL;
+    kd.dtype = RAD_BF16;
+    kd.n_head_kv = 8;
+    kd.head_dim = 128;
+    return b.decl_kv_group("kv_full", &kd);
 }
 
 RadModelMeta make_meta() {
@@ -111,19 +117,12 @@ BufferInfo make_buf(const char* name, int64_t bytes, int kind, int32_t lo, int32
 
 }  /* namespace */
 
-/* A TEST THAT SEGFAULTED IS NOT A TEST THAT REPORTED. Every case below drives a REAL Registry
- * over the test plugin, and on a tree where the radtest_* targets have not been built there is
- * no op for declare to resolve -- so the assertions that follow walk a handle the builder never
- * issued, and the binary dies without naming the reason. ctest keys "Skipped" off this exact
- * prefix (tests/CMakeLists.txt), which is the treatment chat_test and text_test already give a
- * missing model file, for the same reason. */
+/* Leaves a case when the radtest_* plugins do not load; otherwise the assertions would walk
+ * handles the builder never issued and crash without a reason. This build makes them, so their
+ * absence is a missing in-tree artifact (rad_test.h). */
 #define NEED_PLUGIN(reg)                                                              \
     Registry reg;                                                                     \
-    if (load(reg) < 0) {                                                              \
-        fprintf(stderr, "  SKIP %s: no test plugins in %s\n",                         \
-                ::radtest::current(), kernels_dir().c_str());                         \
-        return;                                                                       \
-    }
+    if (load(reg) < 0) ARTIFACT_MISSING("the test plugins in " + kernels_dir());
 
 /* ================================================================== the bucket table */
 TEST(bucket_table_resolves_per_band) {
@@ -145,19 +144,18 @@ TEST(bucket_table_resolves_per_band) {
     CHECK_EQ(o->bands[1].hi, 64);
     CHECK_EQ(o->bands[2].hi, 8192);
 
-    /* The band picks the kernel, not the range: resolving once at max_tok would have picked the
-     * unconstrained prefill row and then run it at M = 1, which is exactly the loss §2.2 exists
-     * to recover. */
+    /* The band picks the kernel, not the range: resolving once at max_tok would pick the
+     * unconstrained prefill row and run it at M = 1, the loss §2.2 avoids. */
     CHECK_EQ(std::string(o->bands[0].dom[RAD_DOMAIN_DEVICE].row->info->name), "t_gemm_m16");
     CHECK_EQ(std::string(o->bands[1].dom[RAD_DOMAIN_DEVICE].row->info->name), "t_gemm_m64");
     CHECK_EQ(std::string(o->bands[2].dom[RAD_DOMAIN_DEVICE].row->info->name), "t_gemm_any");
 
-    /* Both domains are resolved wherever both exist, so the core can change execution site at
-     * runtime without re-resolving (spec §5.1). */
+    /* Both domains are resolved where both exist, so the execution site can change at runtime
+     * without re-resolving (spec §2.1). */
     for (const Band& band : o->bands)
         CHECK_EQ(std::string(band.dom[RAD_DOMAIN_HOST].row->info->name), "t_gemm_host");
 
-    /* Each band is frozen at its UPPER BOUND, which is the worst case in it. */
+    /* Each band is frozen at its upper bound, its worst case. */
     long long m = 0;
     CHECK(o->bands[1].dom[RAD_DOMAIN_DEVICE].geom.get_i("M", &m));
     CHECK_EQ(m, 64);
@@ -165,7 +163,7 @@ TEST(bucket_table_resolves_per_band) {
     CHECK_EQ((int)b.program().misses.size(), 0);
     CHECK_OK(b.finish());
 
-    /* Weight use is what makes layer offload exact prefetch rather than a prediction. */
+    /* Recorded weight use makes layer-offload prefetch exact rather than predicted. */
     CHECK_EQ(b.program().weight(w)->first_use_op, 1);
     CHECK_EQ(b.program().weight(w)->last_use_op, 1);
 }
@@ -179,13 +177,13 @@ TEST(an_op_with_no_ranged_parameter_is_one_band) {
     rad_op h = b.decl_op("t_tie", p, 2, &w, 1);
     CHECK(h == 1);
 
-    /* build_bands returns exactly one band whose hi is INT64_MAX, so the issue path's band scan
-     * always finds it and the no-range case needs no separate path anywhere. */
+    /* build_bands returns one band with hi = INT64_MAX, so the issue path's band scan needs no
+     * special case. */
     const OpInfo* o = b.program().op(h);
     CHECK_EQ((int)o->bands.size(), 1);
     CHECK_EQ(o->bands[0].hi, INT64_MAX);
     CHECK(o->ranged_key.empty());
-    /* Ties break on declaration order, and this is the record of it. */
+    /* Ties break on declaration order. */
     CHECK_EQ(std::string(o->bands[0].dom[RAD_DOMAIN_DEVICE].row->info->name), "t_tie_first");
 }
 
@@ -200,13 +198,11 @@ TEST(graph_dump_matches_the_spec) {
 
     const std::string s = dump_graph_str(b.program(), &b.errors());
 
-    /* The bucket-table block, byte for byte the format in spec §2.2 -- the op, its fixed
-     * parameters, then one line per band naming the kernel, the plugin and the priority. If this
-     * fails because the format drifted, the spec is the thing that is right.
+    /* The bucket-table block, byte for byte spec §2.2's format: the op, its fixed parameters,
+     * then one line per band naming kernel, plugin and priority. If the format drifts, the spec
+     * is right.
      *
-     * t_gemm_m64 declares a `bn` axis, so §15's clause appears on that line and only that line:
-     * a kernel with no declared axis has nothing to say about tuning, and printing a
-     * placeholder for it would bury the rows that do. */
+     * Only t_gemm_m64 declares a `bn` axis, so only its line carries §15's tuning clause. */
     const char* expect =
         "t_gemm  N=4096 K=4096 dtype=bf16\n"
         "    M <=   16  ->  t_gemm_m16              (radtest_base, prio 30)\n"
@@ -217,13 +213,13 @@ TEST(graph_dump_matches_the_spec) {
         CHECK(has(s, expect));
     }
 
-    /* A host kernel exists for this op, so its table is printed too and labelled -- the device
-     * one is unlabelled, which is what makes the block above §2.2's exactly. */
+    /* The op has a host kernel, so a labelled host table follows; the device table is unlabelled,
+     * matching §2.2. */
     CHECK(has(s, "    host domain:\n"));
     CHECK(has(s, "    M <= 8192  ->  t_gemm_host             (radtest_base, prio 10)\n"));
 
-    /* The constraints that matched, the weights it touches, and the manifest with tier and site
-     * left for the planner to fill. */
+    /* Matched constraints, touched weights, and the manifest with tier and site left for the
+     * planner. */
     CHECK(has(s, "      matched  t_gemm_m16: M <= 16, K % 256 == 0, dtype in {bf16 w4a8}\n"));
     CHECK(has(s, "      matched  t_gemm_any: (unconstrained"));
     CHECK(has(s, "      weights  blk.12.ffn_gate.weight\n"));
@@ -238,8 +234,8 @@ TEST(liveness_packing) {
     p.buffers.emplace_back();        /* the sentinel */
     p.ops.resize(6);                 /* five ops plus the sentinel */
 
-    /* a and b cannot be alive at the same time, so they must share bytes.
-     * c and d overlap at op 2 and 3, so they must not. */
+    /* a and b are never live together, so they share bytes; c and d overlap at ops 2 and 3, so
+     * they do not. */
     p.buffers.push_back(make_buf("a", 1024, RAD_BUF_TRANSIENT, 1, 2));
     p.buffers.push_back(make_buf("b", 1024, RAD_BUF_TRANSIENT, 3, 4));
     p.buffers.push_back(make_buf("c", 2048, RAD_BUF_TRANSIENT, 1, 4));
@@ -259,14 +255,14 @@ TEST(liveness_packing) {
     CHECK(c.arena_offset != d.arena_offset);
     CHECK(c.arena_offset + c.bytes <= d.arena_offset || d.arena_offset + d.bytes <= c.arena_offset);
 
-    /* The sum is what no sharing at all would have cost, the peak is what a perfect packer would
-     * reach, and the arena has to sit between them. */
+    /* The sum is the cost without sharing and the peak a perfect packer's; the arena lies
+     * between. */
     CHECK_EQ(rep.sum_bytes, 6144);
     CHECK_EQ(rep.peak_live, 5120);
     CHECK_EQ(rep.transient_bytes, 5120);
 
-    /* A PERSIST buffer survives across steps, so it gets its own region -- at the BOTTOM, where
-     * no smaller step's plan moves it, with the transients above. */
+    /* A persist buffer survives across steps, so it gets its own region at the bottom, where no
+     * smaller step's plan moves it; transients go above. */
     CHECK_EQ(k.arena_offset, 0);
     CHECK_EQ(p.arena_fixed_bytes, 512);
     for (const BufferInfo* t : { &a, &bb, &c, &d }) CHECK(t->arena_offset >= p.arena_fixed_bytes);
@@ -275,8 +271,8 @@ TEST(liveness_packing) {
     CHECK_EQ(rep.n_unknown_live, 0);
 }
 
-/* A SMALLER STEP'S PLAN: the same buffers, rows scaled, the fixed region untouched, and the
- * transients packed lower -- so the arena past `end` is what a step that small never reaches. */
+/* A smaller step's plan: the same buffers with rows scaled, the fixed region untouched and the
+ * transients packed lower, so a step that small never touches the arena past `end`. */
 TEST(a_smaller_step_packs_its_transients_lower_and_keeps_the_fixed_region) {
     auto mk = [](int64_t rows) {
         Program p;
@@ -310,11 +306,11 @@ TEST(a_smaller_step_packs_its_transients_lower_and_keeps_the_fixed_region) {
     }
     CHECK(lv.end < full.arena_bytes);
     CHECK(lv.end - full.arena_fixed_bytes <= (full.arena_bytes - full.arena_fixed_bytes) / 4);
-    /* Two transients alive at once never share bytes at the smaller size either. */
+    /* Simultaneously live transients never share bytes at the smaller size either. */
     CHECK(lv.offset[2] + buffer_bytes(lv.decl[2]) <= lv.offset[3] ||
           lv.offset[3] + buffer_bytes(lv.decl[3]) <= lv.offset[2]);
 
-    /* ONLY THE ROWS MAY SHRINK: a narrower second extent is a different stride. */
+    /* Only the rows may shrink; a narrower second extent changes the stride. */
     Program wide = mk(256);
     wide.buffers[1].decl.shape[1] = 128;
     CHECK_EQ(plan_level(full, wide, 256, &lv, &why), RAD_E_STATE);
@@ -323,13 +319,13 @@ TEST(a_smaller_step_packs_its_transients_lower_and_keeps_the_fixed_region) {
     Program other = mk(256);
     other.buffers.pop_back();
     CHECK_EQ(plan_level(full, other, 256, &lv, &why), RAD_E_STATE);
-    /* Persistent state sized by the step keeps its full size and its place at a smaller one... */
+    /* Persistent state sized by the step keeps its full size and place at a smaller step... */
     Program shrank = mk(256);
     shrank.buffers[4].decl.shape[0] = 1024;
     CHECK_OK(plan_level(full, shrank, 256, &lv, &why));
     CHECK_EQ(lv.decl[4].shape[0], full.buffers[4].decl.shape[0]);
     CHECK_EQ(lv.offset[4], full.buffers[4].arena_offset);
-    /* ...and one LARGER at a smaller step was never sized by the step at all. */
+    /* ...but one larger at a smaller step was not sized by the step, and is refused. */
     Program grew = mk(256);
     grew.buffers[4].decl.shape[0] = 8192;
     CHECK_EQ(plan_level(full, grew, 256, &lv, &why), RAD_E_STATE);
@@ -340,8 +336,8 @@ TEST(unknown_liveness_is_conservative) {
     p.buffers.emplace_back();
     p.ops.resize(4);
 
-    /* Nothing declared a use, so nothing may share: an op may issue any handle obtained during
-     * declare, in any order, and declaration position proves nothing about when it is read. */
+    /* With no declared uses nothing may share: an op may issue any handle from declare, in any
+     * order, so declaration position says nothing about when it is read. */
     p.buffers.push_back(make_buf("x", 1024, RAD_BUF_TRANSIENT, -1, -1));
     p.buffers.push_back(make_buf("y", 1024, RAD_BUF_TRANSIENT, -1, -1));
 
@@ -369,9 +365,9 @@ TEST(host_and_device_buffers_get_separate_offset_spaces) {
     BufPlanReport rep;
     CHECK_OK(plan_buffers(p, &rep));
 
-    /* A host-site activation cannot index device memory, so the domains are coloured separately
-     * and each offset is relative to its own arena. Two live buffers in DIFFERENT domains may sit
-     * at the same offset; two in the same domain may not. */
+    /* A host-site activation cannot index device memory, so each domain is coloured separately
+     * with offsets relative to its own arena. Live buffers in different domains may share an
+     * offset; in the same domain they may not. */
     CHECK_EQ(p.buffers[1].arena_offset, 0);
     CHECK_EQ(p.buffers[2].arena_offset, 0);
     CHECK(p.buffers[3].arena_offset != p.buffers[2].arena_offset);
@@ -414,9 +410,8 @@ TEST(buffer_uses_drive_liveness) {
 }
 
 /* ================================================================== declare errors */
-/* The parameter side of the schema check belongs to Registry::validate, and the sentence it writes
- * is what the report carries. These tests assert that declare refuses, and that the reason reaches
- * the caller intact -- not that this component phrased it. */
+/* The parameter schema check belongs to Registry::validate. These tests assert that declare
+ * refuses and that the registry's reason reaches the caller intact. */
 TEST(two_ranged_parameters_is_an_error) {
     NEED_PLUGIN(reg)
     Builder b(reg, make_meta(), make_ctx());
@@ -429,7 +424,7 @@ TEST(two_ranged_parameters_is_an_error) {
     CHECK_EQ(h, RAD_NULL_HANDLE);
     CHECK_EQ(b.status(), RAD_E_SCHEMA);
     CHECK_EQ((int)b.errors().size(), 1);
-    /* Both are named: "one of them is wrong" is not a diagnostic. */
+    /* Both offending parameters are named. */
     CHECK(has(b.errors()[0], "'M'"));
     CHECK(has(b.errors()[0], "'K'"));
     CHECK(has(b.errors()[0], "at most one ranged parameter"));
@@ -460,9 +455,9 @@ TEST(schema_mismatches_are_named) {
     CHECK_EQ(b.decl_op("t_gemm", wrong, 4, &w, 1), RAD_NULL_HANDLE);
     CHECK(has(b.errors().back(), "the schema says it is a string"));
 
-    /* The wrong number of weight operands. Arguments are positional, so this is not a diagnosable
-     * failure at issue -- it is silent numerical garbage, and it is caught here or not at all.
-     * Registry::validate is handed the parameters and not the operands, so this half stays here. */
+    /* The wrong number of weight operands. Arguments are positional, so at issue this would be
+     * silent garbage; it must be caught here. Registry::validate sees only parameters, so this
+     * check stays in declare. */
     const RadParam ok[] = { RAD_RANGE("M", 1, 8192), RAD_INT("N", 4096), RAD_INT("K", 4096),
                             RAD_STR("dtype", "bf16") };
     const rad_weight two[] = { w, w };
@@ -479,20 +474,19 @@ TEST(no_schema_names_the_near_miss) {
     const RadParam p[] = { RAD_INT("M", 8), RAD_INT("n", 4096) };
     CHECK_EQ(b.decl_op("t_tei", p, 2, nullptr, 0), RAD_NULL_HANDLE);
     CHECK_EQ(b.status(), RAD_E_NOSCHEMA);
-    /* Without a near miss, a typo and an unimplemented op are the same diagnostic (spec §2.3).
-     * WHICH name it suggests is the registry's edit-distance policy and not this component's;
-     * what is asserted here is that the sentence reaches the caller intact. */
+    /* Without a near miss, a typo reads like an unimplemented op (spec §2.3). The suggestion is
+     * the registry's edit-distance policy; this only checks it reaches the caller. */
     CHECK(has(b.errors().back(), "no loaded kernel plugin declares op 't_tei'"));
     CHECK(has(b.errors().back(), "did you mean"));
 }
 
 /* ================================================================== a weight list over its tables
- * A table operand consumes a RUN of the declared weights, and the declaration decides which run:
- * the fixed weight positions take one each, and the rest is divided over the table positions in
- * declaration order, the first positions taking one more where it does not divide. That map
- * (OpInfo::weight_opd) is what the layout pass, the converter and the issue path all read, so it
- * is asserted whole. t_moe is one fixed weight (operand 1) and eight tables -- class pairs at
- * operands 2/3, 5/6, 7/8 and 9/10 -- the way a four-class grouped GEMM lays its classes out. */
+ * A table operand consumes a run of the declared weights: fixed weight positions take one each,
+ * and the rest is divided over the table positions in declaration order, the first positions
+ * taking one extra when it does not divide. The layout pass, converter and issue path all read
+ * this map (OpInfo::weight_opd), so it is asserted whole. t_moe has one fixed weight (operand 1)
+ * and eight tables, class pairs at operands 2/3, 5/6, 7/8 and 9/10, as a four-class grouped GEMM
+ * lays out its classes. */
 namespace {
 
 /* `n` weights declared in a row under `tag`, and t_moe over them. */
@@ -525,24 +519,23 @@ TEST(a_weight_list_divides_over_its_tables_the_first_taking_the_remainder) {
     Builder b(reg, make_meta(), make_ctx());
     std::vector<rad_weight> w;
 
-    /* Ten experts' codes and scales behind the fixed weight: twenty entries over eight tables is
-     * two each and four left, so the first four positions -- classes 0 and 1, codes and scales --
-     * hold three and the last four two. A four-class grouped GEMM over ten experts, whose first
-     * two classes are one expert longer. */
+    /* Ten experts' codes and scales after the fixed weight: twenty entries over eight tables is
+     * two each with four left, so the first four positions (classes 0 and 1, codes and scales)
+     * hold three and the rest two, as a four-class grouped GEMM over ten experts. */
     rad_op h = decl_moe(b, "ten", 21, &w);
     REQUIRE(h != RAD_NULL_HANDLE);
     const OpInfo* o = b.program().op(h);
     REQUIRE(o != nullptr);
     CHECK_EQ(runs(o), std::string("1x1 2x3 3x3 5x3 6x3 7x2 8x2 9x2 10x2"));
-    /* The list is cut into runs in the order it was declared, not dealt out. */
+    /* The list is cut into runs in declaration order, not dealt round-robin. */
     CHECK(o->weights == w);
 
-    /* A list that divides is the plain equal division: sixteen entries, two a table. */
+    /* An evenly dividing list: sixteen entries, two per table. */
     h = decl_moe(b, "eight", 17, &w);
     REQUIRE(h != RAD_NULL_HANDLE);
     CHECK_EQ(runs(b.program().op(h)), std::string("1x1 2x2 3x2 5x2 6x2 7x2 8x2 9x2 10x2"));
 
-    /* One entry a table is the least a declaration can give. */
+    /* One entry per table is the minimum. */
     h = decl_moe(b, "four", 9, &w);
     REQUIRE(h != RAD_NULL_HANDLE);
     CHECK_EQ(runs(b.program().op(h)), std::string("1x1 2x1 3x1 5x1 6x1 7x1 8x1 9x1 10x1"));
@@ -555,15 +548,14 @@ TEST(a_weight_list_shorter_than_its_tables_is_refused_by_name) {
     std::vector<rad_weight> w;
     const size_t ops = b.program().ops.size();
 
-    /* Seven entries for eight tables leaves one empty, which no division can fill: refused at
-     * declare, with the counts that say so. */
+    /* Seven entries for eight tables leaves one empty: refused at declare, with the counts. */
     CHECK_EQ(decl_moe(b, "short", 8, &w), RAD_NULL_HANDLE);
     CHECK_EQ(b.status(), RAD_E_SCHEMA);
     REQUIRE(!b.errors().empty());
     CHECK(has(b.errors().back(), "op 't_moe': 8 weight operands declared"));
     CHECK(has(b.errors().back(), "1 fixed weight operands and 8 weight TABLE operands"));
     CHECK(has(b.errors().back(), "so 7 leaves a table empty"));
-    /* Nothing is recorded for the run phase to reach. */
+    /* Nothing is recorded for the run phase. */
     CHECK_EQ(b.program().ops.size(), ops);
 }
 
@@ -578,8 +570,8 @@ TEST(a_hole_in_the_range_is_reported_as_that_band) {
                            RAD_STR("dtype", "bf16") };
     rad_op h = b.decl_op("t_skinny", p, 4, &w, 1);
 
-    /* The op is not handed back, so the plugin can offer the unfused sequence instead -- and it is
-     * still recorded, so the graph dump shows the hole. Declare always completes. */
+    /* No handle is returned, so the plugin can fall back to the unfused sequence; the op is still
+     * recorded so the graph dump shows the hole. Declare always completes. */
     CHECK_EQ(h, RAD_NULL_HANDLE);
     CHECK_EQ((int)b.program().ops.size(), 2);
     CHECK_EQ(b.status(), RAD_OK);
@@ -591,7 +583,7 @@ TEST(a_hole_in_the_range_is_reported_as_that_band) {
     CHECK(!o.bands[1].dom[RAD_DOMAIN_DEVICE]);         /* the hole */
     CHECK(o.bands[2].dom[RAD_DOMAIN_DEVICE]);          /* M >= 4096 */
 
-    /* The missing-kernel report is per band: the hole is named, not the whole op. */
+    /* The missing-kernel report is per band: it names the hole, not the whole op. */
     bool named = false;
     for (const auto& m : b.program().misses)
         if (m.op == "t_skinny" && has(m.geom, "M=4095")) named = true;
@@ -606,13 +598,9 @@ TEST(an_op_with_no_host_kernel_is_a_miss_per_band_not_a_failure) {
     NEED_PLUGIN(reg)
     Builder b(reg, make_meta(), make_ctx());
 
-    /* t_attn is device-only: the asymmetric-absence case. No host kernel removes host-site
-     * placement for this op and nothing else, so declare succeeds and the report says so. */
-    const RadParam p[] = { RAD_RANGE("q_len", 1, 16), RAD_INT("head_dim", 128),
-                           RAD_INT("window", 0), RAD_INT("block_size", 16),
-                           RAD_INT("causal", 1), RAD_INT("n_head", 8),
-                           RAD_STR("kv_dtype", "bf16") };
-    rad_op h = b.decl_op("t_attn", p, 7, nullptr, 0);
+    /* t_attn is device-only. A missing host kernel only rules out host-site placement for this
+     * op, so declare succeeds and the report records the host miss. */
+    rad_op h = decl_t_attn(b);
     CHECK(h == 1);
     CHECK_EQ(b.op_resolved(h), 1);
     CHECK_EQ(b.status(), RAD_OK);
@@ -622,10 +610,9 @@ TEST(an_op_with_no_host_kernel_is_a_miss_per_band_not_a_failure) {
     CHECK(host_miss);
 }
 
-/* A DEVICE HOLE IS DECIDED PER INSTANCE. Two declarations of one op, one with a weight and one
- * without, are two instances with bands of their own: the weighted one's device miss is covered
- * by its host kernel, because the planner moves it to the host by placing its weight there, and
- * on a card only the weightless instance's miss is a hole. */
+/* A device hole is decided per instance. Of two declarations of one op, the weighted one's device
+ * miss is covered by its host kernel (the planner moves it to the host by placing its weight
+ * there), so on a card only the weightless instance's miss is a hole. */
 TEST(a_device_hole_is_decided_per_instance) {
     Program p;
     p.ops.resize(3);
@@ -661,9 +648,8 @@ TEST(a_refusing_init_becomes_a_miss_and_not_an_abort) {
     NEED_PLUGIN(reg)
     Builder b(reg, make_meta(), make_ctx());
 
-    /* t_eq_m32's init always fails. Declaring it must still complete, and the op after it must
-     * still resolve -- if init ran during resolution, this second op would never be reached and
-     * the miss report would be assembled from half a graph. */
+    /* t_eq_m32's init always fails. Declare must still complete and the following op still
+     * resolve; init runs after the whole graph, so the miss report covers all of it. */
     rad_weight w = decl_w(b, "w");
     const RadParam eq[] = { RAD_INT("M", 32), RAD_INT("n", 4096) };
     rad_op h_eq = b.decl_op("t_eq", eq, 2, &w, 1);
@@ -678,8 +664,8 @@ TEST(a_refusing_init_becomes_a_miss_and_not_an_abort) {
     CHECK(st < 0);
     CHECK(has(b.errors().back(), "init() refused the instance"));
 
-    /* The band is now a miss, so nothing downstream can launch a kernel whose one-time setup
-     * failed -- and the rest of the graph is intact and reported. */
+    /* The band becomes a miss, so no kernel whose setup failed can launch; the rest of the graph
+     * is intact. */
     CHECK(!b.program().op(h_eq)->bands[0].dom[RAD_DOMAIN_DEVICE]);
     CHECK(b.program().op(h_gemm)->bands[0].dom[RAD_DOMAIN_DEVICE]);
     CHECK_EQ(b.op_resolved(h_eq), 0);
@@ -692,7 +678,7 @@ TEST(tune_requests_are_one_per_kernel_and_shape) {
     Builder b(reg, make_meta(), make_ctx());
 
     rad_weight w = decl_w(b, "w");
-    /* Sixty-four layers ask the same question sixty-four times; rad-tune benchmarks it once. */
+    /* Repeated identical ops yield one tuning request. */
     decl_gemm(b, w);
     decl_gemm(b, w);
     CHECK_OK(b.finish());
@@ -706,24 +692,18 @@ TEST(tune_requests_are_one_per_kernel_and_shape) {
 }
 
 /* ================================================================== KV groups */
-/* A HEAD THAT KEEPS NO CACHE OF ITS OWN BINDS NONE: it is given no history pass, so a group bound at
- * one of its layers (meta.n_layers and above) would be read and never written. The same head
- * borrowing only the trunk's layers finishes. */
+/* A head without its own cache must bind none: it gets no history pass, so a group bound at one
+ * of its layers (meta.n_layers and above) would be read but never written. The same head borrowing
+ * only trunk layers finishes. */
 TEST(a_head_with_no_cache_of_its_own_binds_no_group_of_its_own) {
     NEED_PLUGIN(reg)
     for (bool own : { false, true }) {
         Builder b(reg, make_meta(), make_ctx());
-        RadKVGroupDecl kd{};
-        kd.kind = RAD_KV_FULL; kd.dtype = RAD_BF16; kd.n_head_kv = 8; kd.head_dim = 128;
-        const rad_kvgroup g = b.decl_kv_group("kv_full", &kd);
-        const RadParam p[] = { RAD_RANGE("q_len", 1, 16), RAD_INT("head_dim", 128),
-                               RAD_INT("window", 0), RAD_INT("block_size", 16),
-                               RAD_INT("causal", 1), RAD_INT("n_head", 8),
-                               RAD_STR("kv_dtype", "bf16") };
-        b.decl_op("t_attn", p, 7, nullptr, 0);
+        const rad_kvgroup g = decl_kv_full(b);
+        decl_t_attn(b);
         CHECK_OK(b.bind_layer_kv(0, g));
         CHECK_OK(b.bind_layer_kv(1, g));
-        if (own) CHECK_OK(b.bind_layer_kv(2, g));   /* make_meta: two trunk layers, so 2 is the head's */
+        if (own) CHECK_OK(b.bind_layer_kv(2, g));   /* make_meta has two trunk layers; 2 is the head's */
         RadDrafterDecl d{};
         d.kind = RAD_DRAFT_SERIAL; d.name = "mtp"; d.depth = 3;
         CHECK_OK(rad_declare_drafter(&b, &d));
@@ -742,29 +722,19 @@ TEST(kv_block_size_comes_off_the_kernel) {
     NEED_PLUGIN(reg)
     Builder b(reg, make_meta(), make_ctx());
 
-    RadKVGroupDecl kd{};
-    kd.kind = RAD_KV_FULL;
-    kd.dtype = RAD_BF16;
-    kd.n_head_kv = 8;
-    kd.head_dim = 128;
-    rad_kvgroup g = b.decl_kv_group("kv_full", &kd);
+    rad_kvgroup g = decl_kv_full(b);
     CHECK(g == 1);
 
-    /* Before the consuming op exists there is no answer, and a silent zero here becomes a division
-     * by zero in the block manager three components later. */
+    /* With no consuming op there is no answer; this is an error because a silent zero would
+     * become a division by zero in the block manager. */
     CHECK_EQ(b.kv_block_size(g), 0);
     CHECK_EQ(b.status(), RAD_E_STATE);
     CHECK(has(b.errors().back(), "no op that reads this group"));
 
-    const RadParam p[] = { RAD_RANGE("q_len", 1, 16), RAD_INT("head_dim", 128),
-                           RAD_INT("window", 0), RAD_INT("block_size", 16),
-                           RAD_INT("causal", 1), RAD_INT("n_head", 8),
-                           RAD_STR("kv_dtype", "bf16") };
-    rad_op h = b.decl_op("t_attn", p, 7, nullptr, 0);
+    rad_op h = decl_t_attn(b);
     CHECK(h == 1);
 
-    /* 16 because the resolved kernel is compiled for 16 and says so in its constraints, not
-     * because the core picked a number (spec §7.2). */
+    /* 16 because the resolved kernel's constraints say so, not a core choice (spec §7.2). */
     CHECK_EQ(b.kv_block_size(g), 16);
 
     CHECK_OK(b.bind_layer_kv(0, g));
@@ -773,13 +743,10 @@ TEST(kv_block_size_comes_off_the_kernel) {
 
     const KVGroupInfo& gi = b.program().kv_groups[g];
     CHECK_EQ(gi.block_size, 16);
-    /* PINS: ONE PAGE COVERS EVERY LAYER BOUND TO THE GROUP, which is what KVManager documents a
-     * page to be and what its own fallback formula computes. The manager divides the builder's
-     * figure by the layer count, so a builder that sized a page for ONE layer gives a KV pool
-     * n_layers too small and a layer base pointer at a fractional stride -- which surfaces as an
-     * alignment refusal from the attention kernel at the second attention layer of the first real
-     * step. Hence the `* 2`: two layers are bound above, and the factor is the point of the
-     * check. */
+    /* Invariant: one page covers every layer bound to the group, as KVManager defines a page. The
+     * manager divides this figure by the layer count, so a per-layer size would make the pool
+     * n_layers too small with a fractional layer stride. Hence the `* 2` for the two bound
+     * layers. */
     CHECK_EQ(gi.bytes_per_block, 2 * 16 * 8 * 128 * 2 * 2);
     CHECK_EQ((int)gi.layers.size(), 2);
 }
@@ -788,21 +755,11 @@ TEST(a_kv_group_with_no_layers_is_an_error) {
     NEED_PLUGIN(reg)
     Builder b(reg, make_meta(), make_ctx());
 
-    RadKVGroupDecl kd{};
-    kd.kind = RAD_KV_FULL;
-    kd.dtype = RAD_BF16;
-    kd.n_head_kv = 8;
-    kd.head_dim = 128;
-    b.decl_kv_group("kv_full", &kd);
-    const RadParam p[] = { RAD_RANGE("q_len", 1, 16), RAD_INT("head_dim", 128),
-                           RAD_INT("window", 0), RAD_INT("block_size", 16),
-                           RAD_INT("causal", 1), RAD_INT("n_head", 8),
-                           RAD_STR("kv_dtype", "bf16") };
-    b.decl_op("t_attn", p, 7, nullptr, 0);
+    decl_kv_full(b);
+    decl_t_attn(b);
 
-    /* How many state instances a sequence owns is the layer count, so a group nothing is bound to
-     * makes the page size a guess. Declare refuses it where the name of the missing call is still
-     * obvious. */
+    /* A sequence owns one state instance per bound layer, so a group with no layers has no page
+     * size; declare refuses it. */
     CHECK(b.finish() < 0);
     CHECK(has(b.errors().back(), "kv group 'kv_full' has no layers bound"));
 }
@@ -833,19 +790,17 @@ TEST(linear_state_is_sized_per_sequence) {
     CHECK_OK(b.bind_layer_kv(0, gc));
     b.finish();
 
-    /* 32 heads of 128x128 fp32 is 2 MiB a layer, which is why it cannot be snapshotted per block
-     * (spec §7.3). Asking a per-sequence group for a block size is a category error, not a
-     * failure: it warns and returns 0, because what the caller wants is bytes_per_state. */
+    /* 32 heads of 128x128 fp32 is 2 MiB per layer, too large to snapshot per block (spec §7.3).
+     * A per-sequence group has no block size: it warns and returns 0; use bytes_per_state. */
     CHECK_EQ(b.program().kv_groups[gl].bytes_per_state, 32LL * 128 * 128 * 4);
     CHECK_EQ(b.program().kv_groups[gl].bytes_per_block, 0);
 
-    /* A rolling window of conv_width-1 + n_spec entries, so a speculative rejection is a change of
-     * read offset rather than a recompute (spec §10).
+    /* A rolling window of conv_width-1 + n_spec entries, so a speculative rejection changes the
+     * read offset instead of recomputing (spec §10).
      *
-     * EXACTLY THE STATE TENSOR'S EXTENT. The kernels lay a slot out from the tensor's last extent,
-     * conv_width-1 + n_spec, and the KV manager clears, checkpoints and restores the slot this
-     * figure describes; one entry more here put each of those over the start of the next
-     * sequence's window. rad_builder.cpp's note on `entries` is the argument. */
+     * This must equal the state tensor's extent: kernels lay out a slot from it, and the KV
+     * manager clears, checkpoints and restores the slot this figure describes. One extra entry
+     * would spill into the next sequence's window. See rad_builder.cpp's note on `entries`. */
     CHECK_EQ(b.program().kv_groups[gc].bytes_per_state, 32LL * 128 * (4 - 1 + 4) * 4);
     CHECK_EQ(b.program().kv_groups[gc].bytes_per_state,
              32LL * 128 * conv_window_entries(cd, 4) * 4);
@@ -853,16 +808,15 @@ TEST(linear_state_is_sized_per_sequence) {
 
 /* ================================================================== names, notes, the C surface */
 
-/* PINS `src_index` through decl_name_map, both halves: the index a plugin sets survives, and an
- * unset one arrives as -1 rather than as slice zero. Dropping it is an invisible failure, because
- * the field value-initialises to 0 while its documented default is -1 -- so every map in every
- * model would silently ask for sub-tensor 0 of its source. */
+/* decl_name_map keeps `src_index`: a set index survives and an unset one is -1, not slice 0. The
+ * field value-initialises to 0 while its documented default is -1, so losing it would silently
+ * make every map read sub-tensor 0. */
 TEST(a_name_map_carries_its_sub_tensor_index) {
     NEED_PLUGIN(reg)
     RadBuildCtx ctx = make_ctx();
     Builder b(reg, make_meta(), ctx);
 
-    {   /* One expert's slice of two stacked tensors, concatenated -- map_slice_concat's shape. */
+    {   /* One expert's slice of two stacked tensors, concatenated (map_slice_concat's shape). */
         std::string declared = "blk.0.ffn_gate_up.3.weight";
         std::string s0 = "blk.0.ffn_gate_exps.weight";
         std::string s1 = "blk.0.ffn_up_exps.weight";
@@ -875,7 +829,7 @@ TEST(a_name_map_carries_its_sub_tensor_index) {
         m.concat_dim = 0;
         CHECK_OK(b.decl_name_map(&m));
     }
-    {   /* And an ordinary whole-tensor map, which must NOT come back as slice 0. */
+    {   /* An ordinary whole-tensor map, which must not come back as slice 0. */
         std::string declared = "token_embd.weight";
         std::string s0 = "model.embed_tokens.weight";
         RadNameMap m{};
@@ -896,13 +850,10 @@ TEST(a_name_map_carries_its_sub_tensor_index) {
     CHECK_EQ(b.program().name_map[1].src_index[7], -1);
 }
 
-/* A CONCAT MAP DECLARED IN PIECES, which is how a 128-shard tensor gets past `src[8]`, and the
- * two repeats that remain errors.
- *
- * The silent half is the one worth the test. A converter lookup built with `std::map::emplace`
- * KEEPS THE FIRST, so a weight declared twice converts from whichever spelling came first and says
- * nothing. Because CONCAT pieces are joined rather than dropped, the repeats that must NOT be
- * joined have to be refused here, at declare, rather than left to a reader of the conversion. */
+/* A concat map may be declared in pieces (how a 128-shard tensor exceeds `src[8]`), but two other
+ * repeats are errors. A converter lookup built with `std::map::emplace` keeps the first entry, so
+ * a weight declared twice would silently convert from the first spelling; since concat pieces are
+ * joined, repeats that must not be joined are refused at declare. */
 TEST(a_concat_name_map_may_be_declared_in_pieces) {
     RadBuildCtx ctx = make_ctx();
 
@@ -929,12 +880,12 @@ TEST(a_concat_name_map_may_be_declared_in_pieces) {
         CHECK_EQ((int)b.program().name_map.size(), 2);
         CHECK_EQ(b.program().name_map[0].n_src, 8);
         CHECK_EQ(b.program().name_map[1].n_src, 4);
-        /* ORDER IS THE CONCATENATION: shard 0 first, or the table is permuted and every hashed
-         * row id addresses the wrong embedding. */
+        /* Call order is concatenation order: shard 0 first, or the table is permuted and every
+         * hashed row id addresses the wrong embedding. */
         CHECK(std::string(b.program().name_map[0].src[0]) == "s0");
         CHECK(std::string(b.program().name_map[1].src[0]) == "s8");
     }
-    {   /* A repeated COPY map is the accident the merge rule has to keep refusing. */
+    {   /* A repeated copy map is refused. */
         NEED_PLUGIN(reg)
         Builder b(reg, make_meta(), ctx);
         RadNameMap a = piece("w", { "x" }, RAD_MAP_COPY, 0);
@@ -942,7 +893,7 @@ TEST(a_concat_name_map_may_be_declared_in_pieces) {
         CHECK_OK(b.decl_name_map(&a));
         CHECK(b.decl_name_map(&c) != RAD_OK);
     }
-    {   /* ...and so is a piece that joins along a different axis. */
+    {   /* So is a piece joining along a different axis. */
         NEED_PLUGIN(reg)
         Builder b(reg, make_meta(), ctx);
         RadNameMap a = piece("w", { "x" }, RAD_MAP_CONCAT, 0);
@@ -959,8 +910,8 @@ TEST(name_map_and_notes_survive_the_plugin) {
     Builder b(reg, make_meta(), ctx);
 
     {
-        /* The strings the plugin passes are its own; the Program outlives the call, so they are
-         * interned rather than borrowed. */
+        /* The plugin owns these strings and the Program outlives the call, so they are interned,
+         * not borrowed. */
         std::string declared = "attn_qkv.weight";
         std::string s0 = "model.layers.0.q_proj.weight";
         std::string s1 = "model.layers.0.k_proj.weight";
@@ -991,7 +942,7 @@ TEST(the_c_surface_drives_the_builder) {
     NEED_PLUGIN(reg)
     RadModelMeta meta = make_meta();
     Builder b(reg, meta, make_ctx());
-    RadBuilder* h = &b;              /* the handle IS the builder */
+    RadBuilder* h = &b;              /* the handle is the builder */
 
     RadWeightDecl wd{};
     wd.dtype = RAD_BF16; wd.rank = 2; wd.shape[0] = 4096; wd.shape[1] = 4096;
@@ -1006,22 +957,22 @@ TEST(the_c_surface_drives_the_builder) {
     CHECK(op != RAD_NULL_HANDLE);
     CHECK_EQ(rad_op_resolved(h, op), 1);
     CHECK_EQ(rad_op_resolved(h, 99), 0);
-    /* Whether an op is in the vocabulary at all, asked without declaring it: no error either way. */
+    /* Whether an op is in the vocabulary, asked without declaring it; never an error. */
     CHECK_EQ(rad_op_declared(h, "t_gemm"), 1);
     CHECK_EQ(rad_op_declared(h, "t_no_such_op"), 0);
     CHECK_EQ(rad_op_declared(h, nullptr), 0);
     CHECK_EQ(b.status(), RAD_OK);
 
-    /* A weight declared twice cannot be diagnosed later: the container has one entry for it. */
+    /* A weight declared twice is refused now; the container has one entry for it. */
     CHECK_EQ(rad_decl_weight(h, "blk.0.ffn_gate.weight", &wd), RAD_NULL_HANDLE);
     CHECK_EQ(b.status(), RAD_E_DUPLICATE);
 
     CHECK_EQ(rad_meta_geti(&meta, "nothing", 7), 7);
 }
 
-/* The program is moved out of the builder, and a short name lives inside the std::string object
- * itself -- so the decl's own pointer cannot name the program's copy of the string without
- * naming the builder's after the move. The name is drafter_name; the decl carries none. */
+/* The program is moved out of the builder, and a short std::string keeps its characters inline
+ * (SSO), so a pointer into it would dangle after the move. The name lives in drafter_name; the decl
+ * carries none. */
 TEST(the_drafter_name_survives_the_program_leaving_the_builder) {
     Registry reg;
     std::unique_ptr<Builder> b(new Builder(reg, make_meta(), make_ctx()));
@@ -1042,9 +993,9 @@ TEST(the_drafter_name_survives_the_program_leaving_the_builder) {
     CHECK_EQ(p.drafter.depth, 3);
 }
 
-/* A HEAD THAT KEEPS NO CACHE OF ITS OWN (rad_drafter_shared_kv) is a property of a declared SERIAL
- * drafter. With none declared, with a block drafter, or at a position no head sits at, the call is
- * refused at declare -- a head staged the wrong way round costs acceptance and says nothing. */
+/* rad_drafter_shared_kv applies only to a declared serial drafter. With none declared, a block
+ * drafter, or a position no head occupies, it is refused at declare; a head staged the wrong way
+ * silently costs acceptance. */
 TEST(a_head_that_keeps_no_cache_of_its_own_is_a_serial_one) {
     Registry reg;
     {
@@ -1075,7 +1026,7 @@ TEST(a_head_that_keeps_no_cache_of_its_own_is_a_serial_one) {
         CHECK_EQ(b.program().drafter_pos_offset, 1);
     }
     {
-        /* Every drafter that does not ask keeps the old shape. */
+        /* A drafter that does not ask keeps its own cache. */
         Builder b(reg, make_meta(), make_ctx());
         RadDrafterDecl d{};
         d.kind = RAD_DRAFT_SERIAL; d.name = "mtp"; d.depth = 4;
@@ -1085,13 +1036,10 @@ TEST(a_head_that_keeps_no_cache_of_its_own_is_a_serial_one) {
     }
 }
 
-
 /* ================================================================== the enum name tables
  *
- * These are printed into --debug-graph and into the Model view, which is where an operator reads
- * what a plugin declared. An "?" where a class name belongs is not a cosmetic fault: it is the
- * reader being told nothing about the axis they are looking at, and the case that produces it is
- * a value this core does not know -- which is exactly the case worth being able to see.
+ * These names appear in --debug-graph and the Model view, where an operator reads what a plugin
+ * declared. Every known value has a name; "?" marks a value this core does not know.
  */
 TEST(the_declared_enums_all_have_names_and_an_unknown_value_says_so) {
     CHECK_EQ(std::string(bld_domain_name(RAD_DOMAIN_DEVICE)), std::string("device"));
@@ -1107,8 +1055,7 @@ TEST(the_declared_enums_all_have_names_and_an_unknown_value_says_so) {
     CHECK_EQ(std::string(bld_buf_kind_name(RAD_BUF_PERSIST)), std::string("persist"));
     CHECK_EQ(std::string(bld_buf_kind_name(RAD_BUF_DERIVED)), std::string("derived"));
 
-    /* EVERY NAME IS DISTINCT, or the dump is ambiguous in a way a reader cannot detect: two
-       classes printing the same word reads as one class. */
+    /* Every name is distinct, or two classes would read as one in the dump. */
     const char* access[] = { bld_access_name(RAD_ACCESS_PER_TOKEN),
                              bld_access_name(RAD_ACCESS_PER_REQUEST),
                              bld_access_name(RAD_ACCESS_CONDITIONAL),
@@ -1130,9 +1077,8 @@ TEST(the_declared_enums_all_have_names_and_an_unknown_value_says_so) {
 
 /* ================================================================== sizing a declared buffer
  *
- * ZERO MEANS "THE CORE CANNOT SIZE IT", which is legal for a weight -- a kernel's layout hook
- * sizes those -- and is a declare-time failure for an activation. So zero has to be reachable
- * only for the reason it means, and it must not be what an ordinary buffer gets.
+ * Zero means "the core cannot size it": legal for a weight (a kernel's layout hook sizes it), a
+ * declare-time failure for an activation. An ordinary buffer must never get zero.
  */
 TEST(buffer_bytes_sizes_a_declaration_or_says_it_cannot) {
     RadBufDecl d{};
@@ -1147,14 +1093,14 @@ TEST(buffer_bytes_sizes_a_declaration_or_says_it_cannot) {
     d.dtype = RAD_I8;
     CHECK_EQ(buffer_bytes(d), (int64_t)(16 * 32));
 
-    /* A rank-0 declaration has no elements: a scalar buffer is not a buffer of one. */
+    /* A rank-0 declaration has no elements; it is not a buffer of one. */
     RadBufDecl z{};
     z.dtype = RAD_BF16;
     z.rank  = 0;
     CHECK_EQ(buffer_bytes(z), 0ll);
 
-    /* A ZERO EXTENT IN ANY DIMENSION IS ZERO BYTES rather than the product of the others, which
-       is what keeps an unused optional plane from reserving the arena its shape implies. */
+    /* A zero extent in any dimension is zero bytes, so an unused optional plane reserves no
+       arena. */
     RadBufDecl e{};
     e.dtype = RAD_BF16;
     e.rank  = 2;
@@ -1162,15 +1108,14 @@ TEST(buffer_bytes_sizes_a_declaration_or_says_it_cannot) {
     e.shape[1] = 4096;
     CHECK_EQ(buffer_bytes(e), 0ll);
 
-    /* A dtype the core cannot measure is 0 -- the signal plan_buffers turns into a named
-       refusal for an activation. */
+    /* An unknown dtype is 0, which plan_buffers turns into a named refusal for an activation. */
     RadBufDecl p{};
     p.dtype = 0xFFFF;
     p.rank  = 1;
     p.shape[0] = 1024;
     CHECK_EQ(buffer_bytes(p), 0ll);
 
-    /* The sizes here are the ones the arena is carved from, so the big shapes matter too. */
+    /* Large shapes must not overflow. */
     RadBufDecl big{};
     big.dtype = RAD_BF16;
     big.rank  = 2;
@@ -1181,11 +1126,9 @@ TEST(buffer_bytes_sizes_a_declaration_or_says_it_cannot) {
 
 /* ================================================================== the Model view's data
  *
- * dump_graph_json is what the dashboard's Model view parses, and its whole reason for existing is
- * the grouping: a 64-layer model declares one op sixty-four times with one bucket table, and
- * sixty-four identical rows are not more information than one row saying x64. The declared ORDER
- * is kept beside it as indices, because the grouping is exactly what throws the sequence away and
- * a diagram needs it back.
+ * dump_graph_json feeds the dashboard's Model view. It groups identical declarations (a 64-layer
+ * model declares one op 64 times with one bucket table) into one row with a count, and keeps the
+ * declared order beside it as indices, since grouping loses the sequence a diagram needs.
  */
 TEST(the_graph_json_groups_identical_declarations_and_keeps_the_order) {
     Program p;
@@ -1196,7 +1139,7 @@ TEST(the_graph_json_groups_identical_declarations_and_keeps_the_order) {
     p.buffers.emplace_back();
     p.ops.emplace_back();                 /* the sentinel */
 
-    /* Two ops alternating, sixteen layers deep: two groups of sixteen, thirty-two in order. */
+    /* Two ops alternating over sixteen layers: two groups of sixteen, thirty-two in order. */
     for (int l = 0; l < 16; ++l) {
         for (const char* name : { "attn", "ffn" }) {
             OpInfo o;
@@ -1218,28 +1161,26 @@ TEST(the_graph_json_groups_identical_declarations_and_keeps_the_order) {
     CHECK_EQ(j["ops"][0].value("op", std::string()), std::string("attn"));
     CHECK_EQ(j["ops"][1].value("op", std::string()), std::string("ffn"));
 
-    /* THE ORDER IS THE SEQUENCE THE GROUPING THREW AWAY, one index per declared op. */
+    /* The order: one group index per declared op. */
     CHECK_EQ(j["order"].size(), 32u);
     CHECK_EQ(j["order"][0].get<int>(), 0);
     CHECK_EQ(j["order"][1].get<int>(), 1);
     CHECK_EQ(j["order"][2].get<int>(), 0);
 
-    /* And where each group's declarations actually sit, because one op index would tell the
-       reader about the first copy only. */
+    /* Where each group's declarations sit, first and last. */
     CHECK_EQ(j["ops"][0].value("first_at", -1), 0);
     CHECK_EQ(j["ops"][0].value("last_at", -1), 30);
     CHECK_EQ(j["ops"][1].value("first_at", -1), 1);
     CHECK_EQ(j["ops"][1].value("last_at", -1), 31);
 
-    /* The model block is what the view's header reads, and it comes from the container rather
-       than from anything this walk computes. */
+    /* The model block feeds the view's header and comes from the container metadata. */
     CHECK_EQ(j["model"].value("arch", std::string()), std::string("test_arch"));
     CHECK_EQ(j["model"].value("n_layers", (int64_t)0), (int64_t)2);
     CHECK_EQ(j["model"].value("world", (int64_t)0), (int64_t)1);
 }
 
-/* TWO DECLARATIONS OF ONE OP THAT RESOLVED DIFFERENTLY ARE TWO GROUPS, because the band table is
- * part of the key -- collapsing them would hide the one thing a reader opened the view to see. */
+/* Two declarations of one op that resolved differently are two groups: the band table is part of
+ * the grouping key. */
 TEST(the_graph_json_splits_a_group_whose_band_table_differs) {
     Program p;
     p.meta = make_meta();
@@ -1264,8 +1205,8 @@ TEST(the_graph_json_splits_a_group_whose_band_table_differs) {
     CHECK_EQ(j["ops"].size(), 2u);
     CHECK_EQ(j["ops"][0].value("count", (int64_t)0), (int64_t)1);
     CHECK_EQ(j["ops"][1].value("count", (int64_t)0), (int64_t)1);
-    /* A band with no kernel on either domain reports the reason rather than being absent, which
-       is the difference between "not resolved" and "not declared". */
+    /* A band with no kernel on either domain reports the reason, distinguishing "not resolved"
+       from "not declared". */
     CHECK(j["ops"][0]["bands"][0].contains("device_miss"));
     CHECK(j["ops"][0]["bands"][0].contains("host_miss"));
 }
@@ -1286,52 +1227,20 @@ TEST(the_graph_json_of_an_empty_program_is_still_valid_json) {
 
 /* ================================================================== the reference-kernel gate
  *
- * libref is BOTH the fallback that makes an unsupported model run and the oracle every
- * correctness number is measured against. The first is a hazard in production and the second is
- * not, so which one is happening has to be a decision rather than a discovery -- a model that
- * silently fell back to the reference for its GEMMs runs orders of magnitude below the machine
- * with nothing in the output to say so.
- *
- * ONE FUNCTION STANDS BETWEEN THAT AND SERVING. It is called from the engine's bringup and from
- * rad-convert, and a change that made it count zero ops would fail nothing else: every model
- * would start, and the only symptom would be the speed.
+ * libref is both the fallback that lets an unsupported model run and the correctness oracle. In
+ * production the fallback is a hazard: a model silently on reference GEMMs runs orders of
+ * magnitude slower. rad_gate_reference_kernels (called from engine bringup and rad-convert) makes
+ * it an explicit decision; if it counted zero ops, nothing else would fail. Its message (naming
+ * ops and caller) is part of its contract, so the tests read it back from stderr.
  */
 namespace {
 
-/* What the gate SAID, not only what it returned. The message is half the point of the function:
- * it names the ops and the caller so the operator reads what the consequence is rather than that
- * something generic went wrong. Captured rather than silenced -- there is no log level below
- * Error, and a refusal that prints its refusal in a passing test is only noise. */
-std::string say(const std::function<void()>& fn) {
-    std::fflush(stderr);
-    const int saved = dup(2);
-    std::string path = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
-                       "/radiance_build_test_stderr_XXXXXX";
-    std::vector<char> tmpl(path.begin(), path.end());
-    tmpl.push_back('\0');
-    const int fd = mkstemp(tmpl.data());
-    if (fd < 0 || saved < 0) { fn(); return {}; }
-    dup2(fd, 2);
-    fn();
-    std::fflush(stderr);
-    dup2(saved, 2);
-    close(saved);
-    lseek(fd, 0, SEEK_SET);
-    std::string out;
-    char buf[4096];
-    ssize_t n;
-    while ((n = read(fd, buf, sizeof buf)) > 0) out.append(buf, (size_t)n);
-    close(fd);
-    unlink(tmpl.data());
-    return out;
-}
-
-/* Rows live in the test rather than in a Program because a Resolved points at one -- the plugin
- * tables they normally point into are static for the process. */
-/* A library standing in for one that declared itself a reference implementation. Which library is
- * one is the declaration on its rows (KernelRow::reference), never its name. */
+/* A library standing in for one that declared itself a reference implementation. That is decided
+ * by its rows' declaration (KernelRow::reference), never its name. */
 const char* const kRef = "aref";
 
+/* Rows live in static storage because a Resolved points at one, as plugin tables are static for
+ * the process. */
 KernelRow& row_from(const char* plugin) {
     static std::vector<std::unique_ptr<KernelRow>> rows;
     rows.push_back(std::make_unique<KernelRow>());
@@ -1366,8 +1275,8 @@ TEST(an_op_a_real_library_serves_is_not_a_reference_fallback) {
     CHECK_OK(rad_gate_reference_kernels(p, false, "serve"));
 }
 
-/* The sentinel at index 0 carries no bands and is not an op. Counted, it would make every
- * program in the tree look like a fallback and the gate would refuse everything. */
+/* The sentinel at index 0 has no bands and is not an op; counting it would make the gate refuse
+ * every program. */
 TEST(the_op_sentinel_is_not_counted_as_a_reference_fallback) {
     Program p;
     p.ops.emplace_back();
@@ -1386,23 +1295,22 @@ TEST(an_op_only_the_reference_serves_refuses_the_serve) {
     if (!ops.empty()) CHECK_EQ(ops[0], std::string("gemm"));
 
     int st = RAD_OK;
-    std::string msg = say([&] { st = rad_gate_reference_kernels(p, false, "serve"); });
+    std::string msg = stderr_of([&] { st = rad_gate_reference_kernels(p, false, "serve"); });
     CHECK_EQ(st, RAD_E_NOKERNEL);
     CHECK(has(msg, "gemm"));
     CHECK(has(msg, "serve"));
     CHECK(has(msg, "--debug-accept-reference-kernels"));
 
-    /* The flag is spelled with `debug` in it because this is what it is for: the cost is accepted
-     * deliberately, the run continues, and it still says so. */
-    msg = say([&] { st = rad_gate_reference_kernels(p, true, "serve"); });
+    /* With the debug flag the cost is accepted deliberately; the run continues and still
+     * warns. */
+    msg = stderr_of([&] { st = rad_gate_reference_kernels(p, true, "serve"); });
     CHECK_OK(st);
     CHECK(has(msg, "gemm"));
     CHECK(has(msg, "not a production configuration"));
 }
 
-/* A LAYER MODEL DECLARES THE SAME OP SIXTY-FOUR TIMES. The count is every declaration, because
- * that is how much of the program is on the slow path; the names are deduplicated, because
- * "rmsnorm has no kernel" is the useful sentence and sixty-four copies of it is not. */
+/* The count is per declaration (how much of the program is on the slow path); the names are
+ * deduplicated, since a layered model declares the same op many times. */
 TEST(the_reference_count_is_per_declaration_and_the_names_are_not) {
     std::vector<OpInfo> ops;
     for (int i = 0; i < 8; ++i) {
@@ -1413,16 +1321,15 @@ TEST(the_reference_count_is_per_declaration_and_the_names_are_not) {
     std::vector<std::string> names;
     CHECK_EQ(rad_reference_ops(p, &names), 16);
     CHECK_EQ(names.size(), (size_t)2);
-    /* Reported in declaration order, so the message reads like the program. */
+    /* Names are in declaration order. */
     if (names.size() == 2) {
         CHECK_EQ(names[0], std::string("rmsnorm"));
         CHECK_EQ(names[1], std::string("gemm"));
     }
 }
 
-/* AN OP IS ON THE REFERENCE ONLY IF NOTHING ELSE SERVES IT ANYWHERE. A band the reference covers
- * beside one a real library covers is a model whose long shapes are fast, and the gate must not
- * refuse it -- selection already prefers the real row wherever both apply. */
+/* An op counts as on the reference only if no real library serves it in any band or domain.
+ * Selection already prefers the real row wherever both apply. */
 TEST(a_real_kernel_in_any_band_or_domain_clears_the_op) {
     OpInfo oi = op_on("gemm", kRef);
     oi.bands.emplace_back();
@@ -1431,8 +1338,7 @@ TEST(a_real_kernel_in_any_band_or_domain_clears_the_op) {
     std::vector<std::string> names;
     CHECK_EQ(rad_reference_ops(p, &names), 0);
 
-    /* And the same across domains rather than bands: a host row from a real library is still not
-     * the oracle. */
+    /* Likewise across domains: a host row from a real library clears the op. */
     OpInfo oj = op_on("gemm", kRef);
     oj.bands[0].dom[RAD_DOMAIN_HOST].row = &row_from("libr4d");
     Program q = with_ops({ oj });
@@ -1440,38 +1346,35 @@ TEST(a_real_kernel_in_any_band_or_domain_clears_the_op) {
     CHECK_EQ(rad_reference_ops(q, &names), 0);
 }
 
-/* An op nothing resolved at all is not serving on the reference, but it is not servable either.
- * It is counted here rather than passed over, because the alternative is a program that clears
- * this gate and fails at the first step that issues the op. */
+/* An op with nothing resolved is counted too; otherwise the program would clear this gate and
+ * fail at the first step that issues the op. */
 TEST(an_op_nothing_resolved_is_counted_rather_than_waved_through) {
     Program p = with_ops({ op_on("gemm", nullptr) });
     std::vector<std::string> names;
     CHECK_EQ(rad_reference_ops(p, &names), 1);
     int st = RAD_OK;
-    (void)say([&] { st = rad_gate_reference_kernels(p, false, "serve"); });
+    (void)stderr_of([&] { st = rad_gate_reference_kernels(p, false, "serve"); });
     CHECK_EQ(st, RAD_E_NOKERNEL);
 }
 
-/* The caller's own name goes into the message, so it says what the consequence is rather than
- * that something generic went wrong. */
+/* The message names the caller, so it states the consequence. */
 TEST(the_gate_names_its_caller) {
     Program p = with_ops({ op_on("gemm", kRef) });
     int st = RAD_OK;
     const std::string msg =
-        say([&] { st = rad_gate_reference_kernels(p, false, "the container's layout"); });
+        stderr_of([&] { st = rad_gate_reference_kernels(p, false, "the container's layout"); });
     CHECK_EQ(st, RAD_E_NOKERNEL);
     CHECK(has(msg, "the container's layout"));
 }
 
-/* A span and per-part spans have to SURVIVE THE WEIGHT LIST GROWING: WeightInfo's copy is
- * hand-written (the atomic), so a field the copy leaves out is reset on every weight declared
- * before the vector's last reallocation, and the loader then sees an uneven share as an even one
- * and refuses it. */
+/* Shard spans and per-part spans survive the weight list reallocating. WeightInfo's copy is
+ * hand-written (it holds an atomic), so a field the copy omits would be reset on reallocation and
+ * the loader would misread an uneven share. */
 TEST(shard_spans_survive_the_weight_list_reallocating) {
     NEED_PLUGIN(reg)
     Builder b(reg, make_meta(), make_ctx());
-    /* Two weights declared first and marked, then enough declared after them to grow the
-     * list several times over. */
+    /* Two weights declared and marked first, then enough more to reallocate the list several
+     * times. */
     RadWeightDecl d{};
     d.dtype = RAD_BF16; d.rank = 2; d.shape[0] = 36; d.shape[1] = 64;
     d.access = RAD_ACCESS_PER_TOKEN; d.shard = RAD_SHARD_ROW; d.group = rad_group_layer(0);
@@ -1483,7 +1386,6 @@ TEST(shard_spans_survive_the_weight_list_reallocating) {
 
     const rad_weight sp = decl_w(b, "span", 18, 64);
     CHECK_EQ(b.weight_shard_span(sp, 6, 24), RAD_OK);
-
 
     for (int i = 0; i < 300; ++i) {
         char n[32]; snprintf(n, sizeof n, "w%d", i);
@@ -1500,6 +1402,605 @@ TEST(shard_spans_survive_the_weight_list_reallocating) {
     CHECK_EQ((long long)w->shard_lo, 6LL);
     CHECK_EQ((long long)w->shard_hi, 24LL);
     CHECK_EQ((int)b.errors().size(), 0);
+}
+
+/* ================================================================== stored forms and encodings */
+namespace {
+
+std::string extra_dir() { return home() + "/testkernels/extra"; }
+
+/* The base and override plugins with radtest_extra behind them. */
+int load_extra(Registry& r) {
+    return r.load_dirs({ kernels_dir(), extra_dir() },
+                       { "radtest_over", "radtest_base", "radtest_extra" });
+}
+
+#define NEED_EXTRA(reg)                                                               \
+    Registry reg;                                                                     \
+    if (load_extra(reg) < 0) ARTIFACT_MISSING("the test plugins in " + extra_dir());
+
+/* A [256, 256] weight of `dtype` read by t_lay over M in [lo, hi]. */
+rad_op decl_lay(Builder& b, const char* name, uint32_t dtype, int64_t lo, int64_t hi,
+                rad_weight* out = nullptr) {
+    RadWeightDecl d{};
+    d.dtype = dtype;
+    d.rank = 2;
+    d.shape[0] = 256;
+    d.shape[1] = 256;
+    d.access = RAD_ACCESS_PER_TOKEN;
+    d.group = rad_group_layer(0);
+    const rad_weight w = b.decl_weight(name, &d);
+    if (out) *out = w;
+    const RadParam p[] = { RAD_RANGE("M", lo, hi), RAD_INT("N", 256), RAD_INT("K", 256),
+                           RAD_STR("dtype", "bf16") };
+    return b.decl_op("t_lay", p, 4, &w, 1);
+}
+
+bool any_error(const Builder& b, const char* needle) {
+    for (const std::string& e : b.errors()) if (has(e, needle)) return true;
+    return false;
+}
+
+/* Each band as "hi:row ", with its device row. */
+std::string band_names_of(const OpInfo& o) {
+    std::string s;
+    for (const Band& b : o.bands)
+        s += fmt("%lld:%s ", (long long)b.hi,
+                 b.dom[RAD_DOMAIN_DEVICE].row ? b.dom[RAD_DOMAIN_DEVICE].row->info->name : "-");
+    return s;
+}
+
+const char* device_row(const OpInfo* o, size_t band) {
+    const Resolved& r = o->bands[band].dom[RAD_DOMAIN_DEVICE];
+    return r.row ? r.row->info->name : "<none>";
+}
+
+}  /* namespace */
+
+/* Every band of an op reads the same stored bytes. A kernel that relayouts its weight in one band
+ * beside a kernel that reads it as stored in another would misread it with a matching byte count
+ * (an fp8 head read as bf16 gives empty completions once batches grow), so declare refuses the
+ * pair and names both kernels. */
+TEST(a_weight_wanted_in_two_stored_forms_is_refused_naming_both_kernels) {
+    NEED_EXTRA(reg)
+    Builder b(reg, make_meta(), make_ctx());
+    const rad_op h = decl_lay(b, "w.bf16", RAD_BF16, 1, 4096);
+    REQUIRE(h != 0);
+    REQUIRE_EQ(b.program().op(h)->bands.size(), 2u);
+    CHECK_EQ(std::string(device_row(b.program().op(h), 0)), "t_lay_tiled");
+    CHECK_EQ(std::string(device_row(b.program().op(h), 1)), "t_lay_plain");
+    int rc = 0;
+    (void)stderr_of([&] { rc = b.finish(); });
+    CHECK_EQ(rc, RAD_E_SHAPE);
+    CHECK(any_error(b, "two stored forms"));
+    CHECK(any_error(b, "t_lay_tiled") && any_error(b, "t_lay_plain"));
+}
+
+/* A kernel whose layout hook does not read the weight's encoding is not a candidate: the band
+ * falls to the next kernel, so one declaration serves a bf16 checkpoint and its fp8 container. */
+TEST(a_kernel_that_does_not_read_the_encoding_gives_its_band_to_the_next) {
+    NEED_EXTRA(reg)
+    Builder b(reg, make_meta(), make_ctx());
+    const rad_op h = decl_lay(b, "w.fp8", RAD_F8E4M3, 1, 4096);
+    REQUIRE(h != 0);
+    const OpInfo* o = b.program().op(h);
+    REQUIRE_EQ(o->bands.size(), 2u);
+    CHECK_EQ(std::string(device_row(o, 0)), "t_lay_plain");
+    CHECK_EQ(std::string(device_row(o, 1)), "t_lay_plain");
+    CHECK_OK(b.finish());
+    CHECK(b.errors().empty());
+}
+
+/* A hookless device kernel reads one plane as stored, so a weight of codes and scales is not its
+ * to read: the band misses with the reason, while a kernel whose layout joins the planes serves
+ * the band it covers. A host kernel without a hook reads canonically and never conflicts with the
+ * device's stored form. */
+TEST(a_two_plane_weight_needs_a_kernel_that_joins_its_planes) {
+    NEED_EXTRA(reg)
+    auto sources = [](const std::string& name, const Program&, WeightSource* out) -> int {
+        if (name != "w.q") return RAD_E_NOTFOUND;
+        out->enc = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
+        out->rank = 2;
+        out->shape[0] = 256;
+        out->shape[1] = 256;
+        return RAD_OK;
+    };
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        b.set_sources(sources);
+        const rad_op h = decl_lay(b, "w.q", RAD_F8E4M3, 17, 64);
+        REQUIRE(h != 0);                              /* the host kernel serves it */
+        CHECK(!b.program().op(h)->bands[0].dom[RAD_DOMAIN_DEVICE]);
+        bool named = false;
+        for (const Program::Miss& m : b.program().misses)
+            if (m.domain == RAD_DOMAIN_DEVICE && m.op == "t_lay" && has(m.why, "2 planes")) named = true;
+        CHECK(named);
+    }
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        b.set_sources(sources);
+        rad_weight w = 0;
+        const rad_op h = decl_lay(b, "w.q", RAD_F8E4M3, 1, 16, &w);
+        REQUIRE(h != 0);
+        CHECK_EQ(std::string(device_row(b.program().op(h), 0)), "t_lay_tiled");
+        CHECK_OK(b.finish());
+        CHECK_EQ(b.program().weight(w)->layout_tag, std::string("tiled-fp8"));
+    }
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        rad_weight w = 0;
+        const rad_op h = decl_lay(b, "w.bf16", RAD_BF16, 1, 16, &w);
+        REQUIRE(h != 0);
+        CHECK_EQ(std::string(b.program().op(h)->bands[0].dom[RAD_DOMAIN_HOST].row->info->name),
+                 "t_lay_host");
+        CHECK_OK(b.finish());
+        CHECK_EQ(b.program().weight(w)->layout_tag, std::string("tiled"));
+    }
+}
+
+namespace {
+
+/* A [256, 256] E4M3 weight with one f32 scale per 128x128 tile, declared over both planes. */
+int fp8_tiles(const std::string& name, const Program&, WeightSource* out) {
+    if (name != "w.q") return RAD_E_NOTFOUND;
+    out->enc = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
+    out->rank = 2;
+    out->shape[0] = 256;
+    out->shape[1] = 256;
+    return RAD_OK;
+}
+
+/* `op` over that weight for M in [lo, hi]. */
+rad_op decl_two_plane(Builder& b, const char* op, int64_t lo, int64_t hi, rad_weight* out) {
+    RadWeightDecl d{};
+    d.dtype = RAD_F8E4M3;
+    d.rank = 2;
+    d.shape[0] = 256;
+    d.shape[1] = 256;
+    d.access = RAD_ACCESS_PER_TOKEN;
+    d.group = rad_group_layer(0);
+    const rad_weight w = b.decl_weight("w.q", &d);
+    *out = w;
+    const RadParam p[] = { RAD_RANGE("M", lo, hi), RAD_INT("N", 256), RAD_INT("K", 256),
+                           RAD_STR("dtype", "fp8") };
+    return b.decl_op(op, p, 4, &w, 1);
+}
+
+}  /* namespace */
+
+/* Where no device kernel reads a weight of several planes (the host backend, or a band only the
+ * host serves), the host kernel's hook decides how it is stored: the joined form of
+ * abi/rad_planes.h, a header and both planes, sized here from the plane extents. */
+TEST(a_host_kernel_joins_the_planes_no_device_kernel_reads) {
+    NEED_EXTRA(reg)
+    Builder b(reg, make_meta(), make_ctx());
+    b.set_sources(fp8_tiles);
+    rad_weight w = 0;
+    const rad_op h = decl_two_plane(b, "t_join", 17, 64, &w);
+    REQUIRE(h != 0);
+    CHECK(!b.program().op(h)->bands[0].dom[RAD_DOMAIN_DEVICE]);
+    CHECK_OK(b.finish());
+    CHECK(b.errors().empty());
+    const WeightInfo* wi = b.program().weight(w);
+    CHECK_EQ(wi->layout_tag, std::string(RAD_PLANES_TAG));
+    CHECK_EQ(wi->lay_dom, (int)RAD_DOMAIN_HOST);
+    /* 40 + 2 * 80 header bytes to 256, the 65536 codes, the four f32 scales, each padded to 64. */
+    CHECK_EQ((long long)wi->stored_bytes, 256LL + 65536 + 64);
+    CHECK(!wi->identity);
+}
+
+/* On a card the device kernel's stored form stands, and a host kernel that would join the same
+ * planes is no conflict: it cannot take the op, which the runtime decides when an op is placed on
+ * the host (Ctx::check_domain_layout). Refusing here would stop every model whose host fallback
+ * reads a weight differently from its device kernel. */
+TEST(a_device_kernels_stored_form_stands_beside_a_joining_host_kernel) {
+    NEED_EXTRA(reg)
+    Builder b(reg, make_meta(), make_ctx());
+    b.set_sources(fp8_tiles);
+    rad_weight w = 0;
+    const rad_op h = decl_two_plane(b, "t_join", 1, 16, &w);
+    REQUIRE(h != 0);
+    CHECK_EQ(std::string(device_row(b.program().op(h), 0)), "t_join_tiled");
+    CHECK_OK(b.finish());
+    CHECK(b.errors().empty());
+    CHECK_EQ(b.program().weight(w)->layout_tag, std::string("tiled-fp8"));
+    CHECK_EQ(b.program().weight(w)->lay_dom, (int)RAD_DOMAIN_DEVICE);
+}
+
+/* A host kernel without a hook reads one plane as stored. Read by nothing else, a weight of two
+ * planes has nobody to say where the second lies, and the refusal names the host kernel. */
+TEST(a_two_plane_weight_read_only_by_a_hookless_host_kernel_is_refused_by_name) {
+    NEED_EXTRA(reg)
+    Builder b(reg, make_meta(), make_ctx());
+    b.set_sources(fp8_tiles);
+    rad_weight w = 0;
+    const rad_op h = decl_two_plane(b, "t_lay", 17, 64, &w);
+    REQUIRE(h != 0);
+    int rc = 0;
+    (void)stderr_of([&] { rc = b.finish(); });
+    CHECK_EQ(rc, RAD_E_SHAPE);
+    CHECK(any_error(b, "t_lay_host"));
+    CHECK(any_error(b, "rad_planes.h"));
+}
+
+/* The loader widens a bf16 plane to a declared f32 or relayouts it for a kernel, not both: a
+ * widened weight read by a relayouting kernel is refused at declare. */
+TEST(a_widened_weight_cannot_also_be_relayouted) {
+    NEED_EXTRA(reg)
+    Builder b(reg, make_meta(), make_ctx());
+    b.set_sources([](const std::string& name, const Program&, WeightSource* out) -> int {
+        if (name != "w.wide") return RAD_E_NOTFOUND;
+        out->enc = rad_enc_plain(RAD_BF16);
+        out->rank = 2;
+        out->shape[0] = 256;
+        out->shape[1] = 256;
+        return RAD_OK;
+    });
+    const rad_op h = decl_lay(b, "w.wide", RAD_F32, 1, 16);
+    REQUIRE(h != 0);
+    int rc = 0;
+    (void)stderr_of([&] { rc = b.finish(); });
+    CHECK_EQ(rc, RAD_E_DTYPE);
+    CHECK(any_error(b, "a widening and a relayout"));
+}
+
+/* ================================================================== the sizing declare */
+
+/* A smaller arena level is declared again at a smaller max_tok and takes the real declare's bands,
+ * since its kernels are the ones that run. The plugin must declare the same graph: the same op at
+ * every position, and every fixed parameter unchanged, because a fixed row count that followed
+ * max_tok would be launched at the real size over the smaller level's buffers. A capacity the
+ * kernel only bounds its writes by may shrink, never grow. */
+TEST(a_sizing_declare_must_declare_the_real_graph_with_its_fixed_parameters) {
+    NEED_EXTRA(reg)
+    auto cap_op = [](Builder& b, int64_t cap, int64_t max_m) {
+        const RadParam p[] = { RAD_RANGE("M", 1, max_m), RAD_INT("cap", cap), RAD_INT("n", 64) };
+        return b.decl_op("t_cap", p, 3, nullptr, 0);
+    };
+    Builder real(reg, make_meta(), make_ctx());
+    const rad_weight w = decl_w(real, "w0");
+    REQUIRE(decl_gemm(real, w) != 0);
+    REQUIRE(decl_gemm(real, w) != 0);
+    REQUIRE(cap_op(real, 1024, 8192) != 0);
+    REQUIRE_EQ(real.finish(), RAD_OK);
+    const Program& ref = real.program();
+
+    RadBuildCtx small = make_ctx();
+    small.max_tok = 512;
+    auto probe = [&](const std::function<void(Builder&, rad_weight)>& body, std::string* errs) {
+        Builder b(reg, make_meta(), small);
+        b.set_reference(&ref);
+        const rad_weight wp = decl_w(b, "w0");
+        int rc = 0;
+        *errs = stderr_of([&] { body(b, wp); rc = b.finish(); });
+        return rc;
+    };
+    std::string e;
+    const size_t asked = reg.n_selections();
+    CHECK_OK(probe([&](Builder& b, rad_weight wp) {
+        decl_gemm(b, wp, 512);
+        decl_gemm(b, wp, 512);
+        cap_op(b, 1024, 512);
+        for (size_t i = 1; i < b.program().ops.size(); ++i)
+            CHECK_EQ(band_names_of(b.program().ops[i]), band_names_of(ref.ops[i]));
+    }, &e));
+    CHECK_EQ(reg.n_selections(), asked);                       /* nothing resolved again */
+
+    CHECK_EQ(probe([&](Builder& b, rad_weight wp) {
+        decl_gemm(b, wp, 512);
+        const RadParam p[] = { RAD_RANGE("M", 1, 512), RAD_INT("n", 4096), RAD_STR("dtype", "bf16") };
+        b.decl_op("t_norm", p, 3, &wp, 1);
+    }, &e), RAD_E_STATE);
+    CHECK(has(e, "op 2 is 't_norm', and the real declare had 't_gemm'"));
+
+    CHECK_EQ(probe([&](Builder& b, rad_weight wp) {
+        const RadParam p[] = { RAD_RANGE("M", 1, 512), RAD_INT("N", 2048), RAD_INT("K", 4096),
+                               RAD_STR("dtype", "bf16") };
+        b.decl_op("t_gemm", p, 4, &wp, 1);
+    }, &e), RAD_E_STATE);
+    CHECK(has(e, "changes 'N'"));
+
+    CHECK_OK(probe([&](Builder& b, rad_weight wp) {
+        decl_gemm(b, wp, 512);
+        decl_gemm(b, wp, 512);
+        cap_op(b, 256, 512);
+    }, &e));
+    CHECK_EQ(probe([&](Builder& b, rad_weight wp) {
+        decl_gemm(b, wp, 512);
+        decl_gemm(b, wp, 512);
+        cap_op(b, 2048, 512);
+    }, &e), RAD_E_STATE);
+    CHECK(has(e, "changes 'cap'"));
+
+    CHECK_EQ(probe([&](Builder& b, rad_weight wp) {
+        decl_gemm(b, wp, 512);
+        decl_gemm(b, wp, 512);
+        cap_op(b, 1024, 512);
+        decl_gemm(b, wp, 512);
+    }, &e), RAD_E_STATE);
+    CHECK(has(e, "had 'nothing' there"));
+}
+
+/* ================================================================== liveness the plan cannot see */
+
+/* Some buffers are read after the declared op list or beside it. The logits and the pooled output
+ * are read by the sampler and the engine after the last op, so they live to the end. A buffer the
+ * second lane uses lives for the whole program, since its declared range does not bound when the
+ * lane runs, and the second lane gets a scratch region of its own. */
+TEST(the_logits_pooled_and_concurrent_buffers_live_past_their_declared_uses) {
+    NEED_PLUGIN(reg)
+    for (int mode = 0; mode < 3; ++mode) {
+        Builder b(reg, make_meta(), make_ctx());
+        RadBufDecl bd{};
+        bd.dtype = RAD_I8;
+        bd.rank = 1;
+        bd.shape[0] = 4096;
+        bd.kind = RAD_BUF_TRANSIENT;
+        bd.domain = RAD_DOMAIN_DEVICE;
+        /* The pooled output is one f32 row a sequence. */
+        RadBufDecl od = bd;
+        if (mode == 1) {
+            od.dtype = RAD_F32;
+            od.rank = 2;
+            od.shape[0] = make_ctx().max_seqs;
+            od.shape[1] = 4;
+        }
+        const rad_buf out = b.decl_buffer("out", &od);
+        const rad_buf x = b.decl_buffer("x", &bd);
+        const rad_buf y = b.decl_buffer("y", &bd);
+        const rad_weight w = decl_w(b, "w0");
+        rad_op o[4];
+        for (rad_op& h : o) h = decl_gemm(b, w);
+        CHECK_OK(b.op_writes(o[0], &out, 1));
+        CHECK_OK(b.op_writes(o[1], &x, 1));
+        CHECK_OK(b.op_reads(o[2], &x, 1));
+        CHECK_OK(b.op_writes(o[3], &y, 1));
+        if (mode == 0) CHECK_OK(b.declare_logits(out));
+        if (mode == 1) CHECK_OK(b.declare_pooled(out));
+        if (mode == 2) CHECK_OK(b.buf_concurrent(y));
+        CHECK_OK(b.finish());
+        Program& p = b.program();
+        const BufferInfo* bo = p.buffer(out);
+        const BufferInfo* bx = p.buffer(x);
+        const BufferInfo* by = p.buffer(y);
+        if (mode < 2) {
+            CHECK_EQ(bo->first_def, 1);
+            CHECK_EQ(bo->last_use, 4);
+            /* Live together, so x and y cannot reuse the output's bytes. */
+            for (const BufferInfo* t : { bx, by })
+                CHECK(t->arena_offset >= bo->arena_offset + bo->bytes ||
+                      bo->arena_offset >= t->arena_offset + t->bytes);
+            CHECK_EQ(p.scratch_regions, 1);
+        } else {
+            CHECK_EQ(bo->last_use, 1);
+            CHECK_EQ(by->first_def, 0);
+            CHECK_EQ(by->last_use, 4);
+            CHECK_EQ(p.scratch_regions, 2);
+            /* Without the extension y (op 4) would take the bytes the output (op 1) left. */
+            CHECK(by->arena_offset >= bo->arena_offset + bo->bytes ||
+                  bo->arena_offset >= by->arena_offset + by->bytes);
+        }
+    }
+}
+
+/* ================================================================== the buffer plan, at random */
+
+/* The packer is greedy, so its output depends on sizes, and a liveness or offset mistake aliases
+ * two live activations with no crash. Over random programs: same-domain buffers live at once never
+ * share bytes, the fixed region holds every persistent buffer below every transient, offsets keep
+ * the sub-block alignment, the arena covers the live peak, and planning is deterministic. A
+ * smaller step's level keeps the same guarantees inside the full arena. */
+TEST(the_buffer_plan_never_aliases_two_live_buffers) {
+    const uint64_t seed = 0x243f6a8885a308d3ull;
+    uint64_t x = seed;
+    auto rnd = [&x](uint64_t n) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return n ? x % n : 0; };
+    std::string failures;
+    auto bad = [&](int prog, const std::string& what) {
+        if (failures.size() < 2000) failures += fmt("    seed %#llx program %d: %s\n",
+                                                    (unsigned long long)seed, prog, what.c_str());
+    };
+    for (int it = 0; it < 300; ++it) {
+        Program p;
+        p.buffers.emplace_back();
+        const int32_t n_ops = 20 + (int32_t)rnd(380);
+        p.ops.resize((size_t)n_ops + 1);
+        const int n = 30 + (int)rnd(170);
+        for (int i = 0; i < n; ++i) {
+            const uint64_t kind = rnd(10);
+            BufferInfo b;
+            b.name = fmt("b%d", i);
+            b.decl.dtype = RAD_I8;
+            b.decl.rank = 2;
+            b.decl.shape[0] = 1 + (int64_t)rnd(rnd(8) == 0 ? 4096 : 64);
+            b.decl.shape[1] = 1 + (int64_t)rnd(rnd(4) == 0 ? 1024 : 16);
+            b.decl.domain = rnd(5) == 0 ? RAD_DOMAIN_HOST : RAD_DOMAIN_DEVICE;
+            b.decl.kind = kind < 7 ? RAD_BUF_TRANSIENT : RAD_BUF_PERSIST;
+            if (b.decl.kind == RAD_BUF_TRANSIENT && rnd(10) != 0) {
+                b.first_def = 1 + (int32_t)rnd((uint64_t)n_ops);
+                b.last_use = b.first_def + (int32_t)rnd((uint64_t)(n_ops - b.first_def + 1));
+            } else if (b.decl.kind == RAD_BUF_PERSIST) {
+                b.first_def = 0;                    /* as the builder sets every persistent buffer */
+                b.last_use = n_ops;
+            }
+            p.buffers.push_back(b);
+        }
+        BufPlanReport rep;
+        if (plan_buffers(p, &rep) != RAD_OK) { bad(it, "plan_buffers refused"); continue; }
+
+        struct Span { int32_t lo, hi; int64_t off, end; int dom; bool persist; };
+        auto spans = [&](const Program& q, const std::vector<int64_t>* offs,
+                         const std::vector<RadBufDecl>* decl) {
+            std::vector<Span> v;
+            for (size_t i = 1; i < q.buffers.size(); ++i) {
+                const BufferInfo& b = q.buffers[i];
+                const RadBufDecl& d = decl ? (*decl)[i] : b.decl;
+                Span s;
+                s.lo = b.first_def < 0 ? 0 : b.first_def;
+                s.hi = b.first_def < 0 ? n_ops : b.last_use;
+                s.off = offs ? (*offs)[i] : b.arena_offset;
+                s.end = s.off + align_up(buffer_bytes(d), (int64_t)RAD_ALIGN_SUB);
+                s.dom = d.domain;
+                s.persist = d.kind != RAD_BUF_TRANSIENT;
+                v.push_back(s);
+            }
+            return v;
+        };
+        auto aliased = [](const std::vector<Span>& v) {
+            for (size_t i = 0; i < v.size(); ++i)
+                for (size_t j = i + 1; j < v.size(); ++j) {
+                    const Span& a = v[i];
+                    const Span& b = v[j];
+                    if (a.dom != b.dom) continue;
+                    const bool live = a.persist || b.persist || (a.lo <= b.hi && b.lo <= a.hi);
+                    if (live && a.off < b.end && b.off < a.end) return true;
+                }
+            return false;
+        };
+        const std::vector<Span> s = spans(p, nullptr, nullptr);
+        if (aliased(s)) bad(it, "two live buffers share bytes");
+        int64_t peak = 0;
+        for (const Span& a : s) {
+            if (a.off % (int64_t)RAD_ALIGN_SUB != 0) bad(it, "an offset off the sub-block");
+            if (a.dom == RAD_DOMAIN_HOST) {
+                if (a.end > p.host_arena_bytes) bad(it, "a host buffer past the host arena");
+                continue;
+            }
+            if (a.persist && a.end > p.arena_fixed_bytes) bad(it, "a persistent buffer above the fixed region");
+            if (!a.persist && a.off < p.arena_fixed_bytes) bad(it, "a transient in the fixed region");
+            if (a.end > p.arena_bytes) bad(it, "a buffer past the arena");
+        }
+        for (int32_t t = 0; t <= n_ops; ++t) {
+            int64_t live = 0;
+            for (const Span& a : s)
+                if (a.dom == RAD_DOMAIN_DEVICE && !a.persist && a.lo <= t && t <= a.hi) live += a.end - a.off;
+            peak = std::max(peak, live);
+        }
+        if (p.arena_bytes < p.arena_fixed_bytes + peak) bad(it, "the arena is below the live peak");
+        if (rep.peak_live != peak) bad(it, "the report's peak disagrees with a recount");
+
+        Program again = p;
+        for (size_t i = 1; i < again.buffers.size(); ++i) again.buffers[i].arena_offset = -7;
+        plan_buffers(again);
+        for (size_t i = 1; i < p.buffers.size(); ++i)
+            if (again.buffers[i].arena_offset != p.buffers[i].arena_offset) {
+                bad(it, "a second plan moved a buffer");
+                break;
+            }
+
+        for (int64_t div : { 2, 8 }) {
+            Program probe = p;
+            for (size_t i = 1; i < probe.buffers.size(); ++i)
+                if (probe.buffers[i].decl.kind == RAD_BUF_TRANSIENT)
+                    probe.buffers[i].decl.shape[0] = std::max<int64_t>(1, p.buffers[i].decl.shape[0] / div);
+            ArenaLevel lv;
+            std::string why;
+            if (plan_level(p, probe, 1, &lv, &why) != RAD_OK) { bad(it, "plan_level: " + why); continue; }
+            const std::vector<Span> ls = spans(p, &lv.offset, &lv.decl);
+            if (aliased(ls)) bad(it, fmt("two live buffers share bytes at 1/%lld", (long long)div));
+            if (lv.end > p.arena_bytes) bad(it, "a level past the full arena");
+            for (size_t i = 1; i < p.buffers.size(); ++i) {
+                const BufferInfo& b = p.buffers[i];
+                if (b.decl.kind != RAD_BUF_TRANSIENT || b.decl.domain == RAD_DOMAIN_HOST) {
+                    if (lv.offset[i] != b.arena_offset) bad(it, "a level moved a fixed or host buffer");
+                } else if (ls[i - 1].end > lv.end) {
+                    bad(it, "a level's transient past its end");
+                }
+            }
+        }
+    }
+    if (!failures.empty()) fprintf(stderr, "%s", failures.c_str());
+    CHECK(failures.empty());
+}
+
+/* ================================================================== $RADIANCE_HOME */
+
+/* $RADIANCE_HOME is a ':'-separated search path, first home first; empty entries are skipped and
+ * an empty path is the working directory. A file is read from the first home that has it, and
+ * written to the first home when none does. */
+TEST(the_home_search_path_splits_on_colons_and_the_first_home_with_a_file_wins) {
+    CHECK(rad_home_dirs("a::b:") == (std::vector<std::string>{ "a", "b" }));
+    CHECK(rad_home_dirs("") == (std::vector<std::string>{ "." }));
+    CHECK(rad_home_dirs(":") == (std::vector<std::string>{ "." }));
+    CHECK(rad_home_dirs("/x") == (std::vector<std::string>{ "/x" }));
+
+    const std::string root = radtest::tmp_path("home_search");
+    REQUIRE(mkdir(root.c_str(), 0755) == 0);
+    const std::string a = root + "/a", b = root + "/b";
+    REQUIRE(mkdir(a.c_str(), 0755) == 0);
+    REQUIRE(mkdir(b.c_str(), 0755) == 0);
+    REQUIRE(mkdir((b + "/tune").c_str(), 0755) == 0);
+    FILE* f = std::fopen((b + "/tune/m.tune").c_str(), "w");
+    REQUIRE(f != nullptr);
+    std::fclose(f);
+    const std::string path = a + ":" + b;
+    CHECK_EQ(rad_home_file(path, "tune/m.tune"), b + "/tune/m.tune");
+    CHECK_EQ(rad_home_file(path, "tune/none.tune"), a + "/tune/none.tune");
+    CHECK_EQ(rad_home_file(b + ":" + a, "tune/m.tune"), b + "/tune/m.tune");
+}
+
+/* ================================================================== picking the architecture plugin */
+
+/* A family has one plugin per weight format, all answering one architecture id, so the plugin is
+ * selected by the (id, quantisation) pair, exactly. A checkpoint whose quantisation was imported
+ * weight by weight names its producing tool, which no plugin claims: the family's one quantised
+ * plugin serves it (or its only plugin), and two quantised plugins are refused by name rather than
+ * chosen between. */
+TEST(the_architecture_plugin_is_picked_by_id_and_quantisation) {
+    const std::string archq = home() + "/testarchq";
+    NEED_ARTIFACT(archq + "/radtest_archq_fp8.so");
+    const std::string root = radtest::tmp_path("arch_pick");
+    REQUIRE(mkdir(root.c_str(), 0755) == 0);
+
+    /* A home with the test kernels and the named family members. */
+    int n_home = 0;
+    auto make_home = [&](std::initializer_list<const char*> members) {
+        const std::string h = root + fmt("/h%d", n_home++);
+        mkdir(h.c_str(), 0755);
+        if (symlink(kernels_dir().c_str(), (h + "/kernels").c_str()) != 0) return std::string();
+        mkdir((h + "/architectures").c_str(), 0755);
+        for (const char* m : members) {
+            const std::string so = std::string("radtest_archq_") + m + ".so";
+            if (symlink((archq + "/" + so).c_str(), (h + "/architectures/" + so).c_str()) != 0)
+                return std::string();
+        }
+        return h;
+    };
+    auto pick = [&](const std::string& h, const char* quant, bool imported, LoadedPlugins* lp,
+                    std::string* log) {
+        rad_tools_registry().close();
+        int rc = 0;
+        *log = stderr_of([&] {
+            rc = rad_tools_load_plugins(h, { "radtest_over", "radtest_base" }, "radtest.q", quant,
+                                        lp, imported);
+        });
+        return rc;
+    };
+    const std::string all = make_home({ "plain", "fp8", "w4" });
+    const std::string one = make_home({ "plain", "fp8" });
+    const std::string bare = make_home({ "plain" });
+    REQUIRE(!all.empty() && !one.empty() && !bare.empty());
+
+    LoadedPlugins lp;
+    std::string log;
+    for (const char* q : { "", "fp8", "w4" }) {
+        CHECK_OK(pick(all, q, false, &lp, &log));
+        CHECK_EQ(lp.arch_plugin, std::string("radtest_archq_") + (*q ? q : "plain"));
+        CHECK_EQ(lp.arch_quant, std::string(q));
+        CHECK_EQ(lp.kernels.size(), 2u);
+    }
+    CHECK_EQ(pick(all, "int3", false, &lp, &log), RAD_E_NOTFOUND);
+    CHECK(has(log, "is served at"));
+    CHECK(has(log, "fp8") && has(log, "w4"));
+    CHECK_OK(pick(one, "quark-mxfp4", true, &lp, &log));
+    CHECK_EQ(lp.arch_plugin, std::string("radtest_archq_fp8"));
+    CHECK_EQ(lp.arch_quant, std::string("fp8"));
+    CHECK_EQ(pick(all, "quark-mxfp4", true, &lp, &log), RAD_E_NOTFOUND);
+    CHECK(has(log, "more than one quantised plugin (fp8, w4)") ||
+          has(log, "more than one quantised plugin (w4, fp8)"));
+    CHECK_OK(pick(bare, "quark-mxfp4", true, &lp, &log));
+    CHECK_EQ(lp.arch_plugin, std::string("radtest_archq_plain"));
+    CHECK_EQ(pick(all, "fp8", false, &lp, &log), RAD_OK);
+    rad_tools_registry().close();
 }
 
 RAD_TEST_MAIN()

@@ -13,19 +13,22 @@
 
 namespace rad {
 
-/* Wall-clock microseconds on a monotonic base. Used only by the live request table -- the step
- * path measures with its own steady_clock points and never calls this. */
+/* Microseconds on the monotonic clock, for the live request table only; the step path keeps its
+ * own steady_clock points. */
 static int64_t mono_us() {
     return (int64_t)std::chrono::duration_cast<std::chrono::microseconds>(
                std::chrono::steady_clock::now().time_since_epoch()).count();
-
 }
+
+/* Reclaiming KV from the prefix cache for a request: at most kEvictRounds rounds of
+ * kEvictBlocks blocks each. Bounded, because an unbounded loop on the scheduler thread stalls the
+ * server silently; batched, so a large shortfall does not walk the LRU list block by block. */
+static constexpr int kEvictRounds = 256;
+static constexpr int kEvictBlocks = 256;
+
 /* ------------------------------------------------------------------ ordering */
-/* Priority first, arrival second, and arrival is what makes preemption fair without a special
- * case: a preempted request re-enters the queue carrying its ORIGINAL arrival number, which is
- * smaller than every request admitted after it, so it lands at the front of its priority class
- * rather than at the back of the queue. It has already been served once and its blocks were taken
- * from it; sending it to the back would be charging it twice. */
+/* Priority first, then arrival. A preempted request keeps its original arrival number, so it
+ * re-enters at the front of its priority class instead of the back. */
 bool Scheduler::ahead_of(int32_t a, int32_t b) const {
     const SchedReq& x = *reqs_[(size_t)a];
     const SchedReq& y = *reqs_[(size_t)b];
@@ -53,11 +56,9 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     kv_ = kv;
     pc_ = pc;
 
-    /* The engine resolves this once and hands it over, because the prefix cache needs the
-     * checkpoint interval out of it before this runs. A caller that passes nothing (the tests)
-     * resolves its own -- harmless, it is a pure function of prog and cfg. What must not happen is
-     * two independent reads of the operator's RAW interval: the cache is given the resolved
-     * number, so there is one answer to "where does a chunk split". */
+    /* The engine resolves the geometry once, because the prefix cache needs its checkpoint
+     * interval first; a caller without one (tests) resolves its own from prog and cfg. Both
+     * must use the resolved interval, never the raw flag, so chunks split in one place. */
     if (geo) geo_ = *geo;
     else RAD_TRY(chunk_geometry_resolve(prog, cfg, &geo_));
 
@@ -69,27 +70,24 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     has_linear_state_ = false;
     for (const auto& g : kvgeom_.g) if (!g.paged) has_linear_state_ = true;
 
-    /* A hit can only leave a drafter's own cache short where a PAGED group is not prefix-cached;
-     * see scheduler.h at hit_holes_draft_. With the cache off, cached_groups() is empty and this
-     * is true -- which costs nothing, because a run with no cache takes no hits and every
-     * sequence's first block pass sits at ctx_len 0 anyway. */
+    /* A hit can leave a drafter's own cache short only where a paged group is not prefix-cached
+     * (scheduler.h, hit_holes_draft_). With the cache off cached_groups() is empty and this is
+     * true, which costs nothing: no hits are taken, and every first block pass is at ctx_len 0. */
     {
-        /* PAGED AS THE CACHE COUNTS IT, which is KVGroupPlan::paged() and reaches here through
-         * block_tokens(). NOT kvgeom_'s `paged` flag: that one is also true for an empty
-         * placeholder group (0 layers, no plan), which a model is free to declare, so counting it
-         * overstates the paged groups and pins this predicate true. That is exactly the drift the
-         * comment in scheduler.h warns about. */
+        /* Paged as the cache counts it (KVGroupPlan::paged(), via block_tokens()), not kvgeom_'s
+         * `paged` flag, which is also true for an empty placeholder group and would pin this
+         * predicate true. */
         size_t n_paged = 0;
         for (size_t i = 0; i < kvgeom_.g.size(); ++i)
             if (kv->block_tokens((int32_t)i) > 0) ++n_paged;
         hit_holes_draft_ = pc->cached_groups().size() < n_paged;
         RAD_INFO("draft floor: %zu paged group(s), %zu prefix-cached -> a hit %s",
                  n_paged, pc->cached_groups().size(),
-                 hit_holes_draft_ ? "LEAVES a hole in a drafter's own KV" : "leaves no hole");
+                 hit_holes_draft_ ? "leaves a hole in a drafter's own KV" : "leaves no hole");
     }
-    /* THE TRUNK'S SHARE of that question: a paged group a TRUNK layer reads (a bound layer below
-     * the trunk's layer count — a drafter borrows from base_layer and above) that the cache does
-     * not index. Its hole is not repairable by recomputing the tail; see scheduler.h. */
+    /* The trunk's share: a paged group a trunk layer reads (a bound layer below the trunk's layer
+     * count; a drafter borrows from base_layer up) that the cache does not index. Recomputing the
+     * tail cannot repair that hole; see scheduler.h. */
     hit_holes_trunk_ = false;
     for (size_t i = 0; i < prog.kv_groups.size(); ++i) {
         if (kv->block_tokens((int32_t)i) <= 0) continue;
@@ -102,6 +100,13 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     if (hit_holes_trunk_ && cfg.prefix_cache)
         RAD_INFO("prefix cache: a trunk layer's windowed group is not prefix-cached -- a hit "
                  "resumes from a window snapshot (a checkpoint slot) or re-prefills");
+    if (cfg.prefill_interleave > 0)
+        RAD_INFO("scheduler: --prefill-interleave %lld: after a prefill chunk that leaves its "
+                 "prompt unfinished while other sequences decode, the next %lld steps carry "
+                 "decode rows only and admit nothing", (long long)cfg.prefill_interleave,
+                 (long long)cfg.prefill_interleave);
+    interleave_left_ = 0;
+    held_prefill_ = 0;
     draft_refill_ = 0;
     if (cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter.window > 0 &&
         hit_holes_draft_) {
@@ -120,18 +125,11 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
 
     DraftController::Params dp;
     dp.max_depth = cfg.n_spec;
-    /* THE ADAPTIVE WINDOW (draft.h) prices a draft by what the step it adds to costs, measured.
-     * For a serial head that is a round of the head and a verify row. For a BLOCK drafter the
-     * block is proposed in one pass whatever is verified, but each verified draft is still a
-     * verify row -- and on a model whose verify streams weights per row, a MoE that reads the
-     * experts every row routes to, a row is not free: sixteen rows read ten times the experts one
-     * does. So a block drafter takes the same policy with its rounds fixed: each sequence verifies
-     * the first min(D, its stop) of the block, its stop from its own measured acceptance, and D
-     * from the measured step times. Deep where the text is predictable (code, JSON, greedy), a few
-     * drafts where it is not (prose at temperature 1, where a point-mass draft survives a position
-     * with probability p(x) and a fifteen-token chain dies after one or two). Prompt lookup runs
-     * no pass and keeps the fixed window, decided here, once, and said, because a flag that
-     * changes nothing reads exactly like a flag that made no difference. */
+    /* The adaptive window (draft.h) prices a draft by the measured cost of the step it adds to.
+     * A block drafter proposes its block in one pass, but each verified draft is still a verify
+     * row, which is not free on a MoE that reads each row's routed experts. So it takes the same
+     * policy with fixed rounds: each sequence verifies the first min(D, its stop) of the block.
+     * Prompt lookup runs no pass and keeps the fixed window; the outcome is logged either way. */
     if (cfg.draft_window == DraftWindow::Adaptive) {
         const RadDrafterDecl& dd = prog.drafter;
         if (cfg.n_spec <= 0)
@@ -154,16 +152,34 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     draft_est_.reserve((size_t)cfg.max_seqs);
 
     RAD_TRY(builder_.init(prog, cfg, geo_, kvgeom_, ranks));
-    /* The builder's bound and not a second derivation of it: it is what the block tables were
-     * sized for, so it is the one number that says which positions exist. */
+    /* The builder's bound, not a second derivation: the block tables were sized for it. */
     ctx_limit_ = builder_.max_ctx();
+    /* The pool's own bound on one sequence, searched once (can_ever_fit is monotonic in the
+     * length): add_locked refuses a prompt past it. */
+    pool_tokens_ = -1;
+    pool_refusal_.clear();
+    if (const int64_t top = ctx_limit_ > 0 ? ctx_limit_ : ((int64_t)1 << 40);
+        !kv->can_ever_fit(top)) {
+        int64_t lo = 0, hi = top;
+        if (!kv->can_ever_fit(0)) hi = 0;
+        while (hi - lo > 1) {
+            const int64_t mid = lo + (hi - lo) / 2;
+            if (kv->can_ever_fit(mid)) lo = mid; else hi = mid;
+        }
+        pool_tokens_ = hi == 0 ? 0 : lo;
+        /* Worded for clients that compact a conversation on a context overflow by its message. */
+        pool_refusal_ = fmt("This model's maximum context length is %lld tokens, all the KV cache "
+                            "holds for one sequence: the prompt exceeds the available context "
+                            "size; shorten it or give the cache more room",
+                            (long long)pool_tokens_);
+    }
     n_deferred_ = 0;
     closed_ = false;
     closed_status_ = RAD_E_STATE;
 
-    /* Everything the step path touches is reserved here. A vector that grows during a step is an
-     * allocator call on the path this whole component exists to keep clear. */
+    /* Everything the step path touches is reserved here, so a step never calls the allocator. */
     plan_.e.reserve((size_t)cfg.max_seqs);
+    part_.reserve((size_t)cfg.max_seqs);
     running_.reserve((size_t)cfg.max_seqs);
     waiting_.reserve((size_t)cfg.max_seqs * 4 + 64);
     free_slots_.reserve((size_t)cfg.max_seqs);
@@ -196,10 +212,9 @@ int Scheduler::add(std::unique_ptr<Request> r) {
     return add_locked(std::move(r));
 }
 
-/* ONE LOCK FOR ALL OF THEM, so the step that admits the first finds every one waiting. Taken one
- * at a time, a step can begin between two of them and admit a prefix of the set, and which prefix
- * depends on thread timing -- so the batch a request's sequences decode in, and with it their
- * tie-level rounding, would vary between identical runs. */
+/* One lock for all of them, so the step that admits the first finds them all waiting. Otherwise a
+ * step could start between two adds and admit a timing-dependent subset, and the batch (and its
+ * tie-level rounding) would vary between identical runs. */
 void Scheduler::add_all(std::unique_ptr<Request>* rs, size_t n, int* rc) {
     std::lock_guard<std::mutex> lk(mu_);
     for (size_t i = 0; i < n; ++i) rc[i] = add_locked(std::move(rs[i]));
@@ -209,20 +224,33 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     if (!r) return RAD_E_INVAL;
     if (r->prompt.empty()) return RAD_E_INVAL;
     if (by_id_.count(r->id)) return RAD_E_DUPLICATE;
-    /* AN EMBEDDING INPUT RUNS IN ONE STEP OR NOT AT ALL (Request::embed), so one longer than a
-     * step could never be admitted and would wait for good. */
+    /* An embedding input runs in one step or not at all (Request::embed); one longer than a step
+     * could never be admitted. */
     if (r->embed && (int64_t)r->prompt.size() > cfg_.max_tok) return RAD_E_INVAL;
-    /* A SCORED PROMPT names real vocabulary rows, and one step's decision is all it needs:
-     * drafts would be proposed for a continuation nobody reads. */
+    /* Nor could a prompt the KV pool cannot hold even alone: admission takes only what the pool
+     * holds, so it would wait at the head of the queue, and everything behind it, forever. The
+     * prompt is the least a request needs: its first token comes from the prefill's last row.
+     * RAD_E_FULL with the sink failed here, so the caller answers it as a context overflow. */
+    if (!kv_->can_ever_fit((int64_t)r->prompt.size())) {
+        RAD_WARN("request %llu refused: its %zu-token prompt is longer than the KV cache can hold "
+                 "for one sequence (%lld tokens)", (unsigned long long)r->id, r->prompt.size(),
+                 (long long)pool_tokens_);
+        server::sink_fail(r->sink, RAD_E_FULL,
+                          pool_refusal_.empty() ? "the prompt is longer than the KV cache can "
+                                                  "hold for one sequence"
+                                                : pool_refusal_.c_str());
+        return RAD_E_FULL;
+    }
+    /* A scored prompt names real vocabulary rows and needs one step's decision; drafts would be
+     * proposed for a continuation nobody reads. */
     if (r->token_scores) {
         if (r->embed || r->token_scores->tokens.empty()) return RAD_E_INVAL;
         for (int32_t t : r->token_scores->tokens)
             if (t < 0 || t >= prog_->meta.n_vocab) return RAD_E_INVAL;
         r->may_speculate = false;
     }
-    /* NO ENGINE BEHIND THE QUEUE ANY MORE. Accepting would leave the caller waiting on a step
-     * that is never coming, so the sink is failed here -- it is the one thing the caller is
-     * listening to -- and the refusal says why. */
+    /* The engine has stopped. Fail the sink, which is what the caller listens to, so it is not
+     * left waiting on a step that never comes. */
     if (closed_) {
         RAD_WARN("request %llu refused: %s", (unsigned long long)r->id, closed_reason_);
         server::sink_fail(r->sink, closed_status_, closed_reason_);
@@ -243,7 +271,7 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.card = -1;
     s.running = false;
     s.drafter_reset();
-    /* A NEW REQUEST'S TEXT, so a new estimate: the slot's last tenant was writing something else. */
+    /* A new request's text, so a new estimate. */
     s.adapt.depth = 0;
     s.adapt.held  = 0;
     s.sched_tokens = 0;
@@ -256,18 +284,17 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.hit_owed = false;
     s.req->state = ReqState::Waiting;
 
-    /* The output vector is the one thing the step path appends to, so its capacity is settled
-     * here, on the arrival thread, and never again. Bounded by what the context can still hold:
-     * max_tokens is the caller's number, and reserving it as given lets one request ask this
-     * thread for gigabytes it could never fill. */
+    /* The step path appends to `output`, so its capacity is settled here, on the arrival thread.
+     * Bounded by the context's remaining room: reserving a caller's max_tokens as given could ask
+     * for gigabytes. */
     int64_t out_cap = s.req->max_tokens > 0 ? (int64_t)s.req->max_tokens : 1;
     const int64_t ctx_room = ctx_limit_ - (int64_t)s.req->prompt.size();
     if (ctx_limit_ > 0 && out_cap > ctx_room) out_cap = ctx_room > 1 ? ctx_room : 1;
     s.req->output.reserve((size_t)out_cap + (size_t)RAD_SCHED_MAX_SPEC);
 
     by_id_[s.req->id] = slot;
-    /* Keep enough headroom that a step which preempts every running request cannot grow the
-     * queue's storage while it holds the lock. */
+    /* Enough headroom that a step preempting every running request does not grow the queue under
+     * the lock. */
     if (waiting_.capacity() < waiting_.size() + (size_t)cfg_.max_seqs + 1)
         waiting_.reserve(waiting_.size() + (size_t)cfg_.max_seqs + 1);
     queue_insert(waiting_, slot);
@@ -287,15 +314,11 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
     SchedReq& s = *reqs_[(size_t)it->second];
     if (n < 0) return RAD_E_INVAL;
 
-    /* THE NEXT STEP ALREADY VERIFIES THESE. It was planned with the count the drafter issued, and
-     * the card already put the tokens in its batch; the host copy is what that step's commit
-     * emits the accepted ones from, so it takes exactly those, unclamped.
-     *
-     * UNDER THE ADAPTIVE WINDOW THE DRAFTER RAN AS MANY ROUNDS AS THE DEEPEST SEQUENCE WANTED,
-     * and expect_draft() already cut this one's count to its own window -- the card verifies the
-     * FIRST draft_next of the proposals, which are these. So a longer proposal is cut to that
-     * count here, against the number the step was planned with: the window itself may have moved
-     * at the commit in between, and the planned step is what these tokens are for. */
+    /* The step issued ahead already verifies these: it was planned with the drafter's count and
+     * the card has the tokens. The host copy is what its commit emits accepted tokens from, so it
+     * must match that count, unclamped. Under the adaptive window the rounds ran for the deepest
+     * sequence and expect_draft() cut this one's count to its window, so a longer proposal is cut
+     * to the planned count (the window may have moved at the commit since). */
     if (next_open_ && s.entry_next >= 0) {
         if (draft_.adaptive() && n > s.draft_next) n = s.draft_next;
         if (n != s.draft_next) {
@@ -310,10 +333,9 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
         return RAD_OK;
     }
 
-    /* An ineligible request is given no proposal at all rather than a refusal: it decodes one
-     * token a step, exactly as it would on a server started without a drafter. See
-     * Request::may_speculate for the two reasons, and step() for the gate that catches the n-gram
-     * fallback as well. */
+    /* An ineligible request gets no proposal rather than a refusal, so it decodes one token a step
+     * as without a drafter. See Request::may_speculate, and step() for the gate that also catches
+     * the n-gram fallback. */
     if (!s.req->may_speculate) {
         s.n_draft = 0; s.req->n_draft = 0; s.req->draft = nullptr;
         return RAD_OK;
@@ -332,19 +354,10 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
 /* ------------------------------------------------------------------ cancellation */
 /* ------------------------------------------------------------------ the sink
  *
- * THE TOKENS HAVE TO REACH THE CONNECTION, and this is where they leave the engine. `Request::sink`
- * is the server's per-request channel (core/server/sink.h) and it is a `void*` on Request precisely
- * so that core/sched does not depend on the server's types; the inline helpers there are the call
- * sites. A null sink is legal and means nobody is listening -- an offline or benchmark request.
- *
- * Appending to `Request::output` is not enough on its own: without a push the engine generates
- * correctly, step after step, while the HTTP thread waits in `Sink::wait()` until the client times
- * out. Every sink_* call -- push, finish, prompt stats, admission and drafts -- is made from this
- * file and nowhere else.
- *
- * A push returns false ONLY on overflow, and an overflowing sink has already failed the request --
- * a stream missing tokens in the middle is worse than one that stops and says so -- so the return
- * is what tells the scheduler to stop generating for it. */
+ * `Request::sink` is the server's per-request channel (core/server/sink.h), a `void*` so core/sched
+ * does not depend on server types; null means nobody is listening. Tokens reach the client only
+ * through a push, and every sink_* call is made from this file. A push returns false only on
+ * overflow, after the sink has already failed the request, so false means stop generating. */
 static server::Finish finish_of(ReqState st, const std::string& reason) {
     if (st == ReqState::Cancelled) return server::Finish::Cancelled;
     if (st == ReqState::Failed)    return server::Finish::Error;
@@ -352,29 +365,18 @@ static server::Finish finish_of(ReqState st, const std::string& reason) {
     return server::Finish::Stop;
 }
 
-/* THE CACHE IS NOT ALLOWED TO OWN THE WHOLE POOL, and that is a policy decision rather than an
- * optimisation. Every block the cache indexes is a block it holds a reference on, so a cache free
- * to grow without limit drives the pool to full occupancy and keeps it there: admission then pays
- * eviction on every chunk of every prefill, `kv_cache_usage_perc` pins at 1.0, the scheduler
- * spends its time reclaiming rather than running, and a long enough run of distinct large prompts
- * wedges.
+/* The cache may not own the whole pool: it holds a reference on every block it indexes, and an
+ * unbounded cache keeps the pool full, so admission pays eviction on every chunk and a run of
+ * distinct large prompts wedges. A fraction of the pool is kept free (what it protects is the
+ * ability to admit any sequence), trimmed after a publish rather than during admission.
  *
- * So a reserve is kept free. It is a fraction of the pool rather than a token count because the
- * thing being protected is the ability to admit ANY sequence, and how big that is depends on the
- * deployment. Trimming happens after a publish, off the step path, where the blocks were just
- * added -- not during admission, where the cost lands on a request that did nothing wrong.
- *
- * THE RESERVE IS NOT ALWAYS THE CACHE'S TO MEET. Live sequences count against it too, and once they
- * hold more than three quarters of the pool -- five or six agent sessions at 70K tokens each -- no
- * amount of trimming reaches it. Evicting in LRU order until it did would take everything on the
- * list: the entries running sequences share, which frees no block, and the conversation the
- * request being closed has just published, before its host copy can land -- so every agent's next
- * turn would re-prefill its whole context. The trim therefore asks the cache for the blocks it is
- * short and nothing more, and the cache gives only what frees a block without losing a
- * conversation (PrefixCache::trim). */
+ * Live sequences count against the reserve too and can put it out of reach; evicting in LRU
+ * order until it is met would drop shared entries (freeing nothing) and the conversation just
+ * published. So the trim asks only for the blocks it is short, and the cache gives only what
+ * frees a block without losing a conversation (PrefixCache::trim). */
 
-/* Drop every entry, in VRAM or off it -- IPrefixCache::reset, because an eviction does not
- * mean "forgotten" for an entry the idle tiers hold a copy of. */
+/* Drop every entry, in VRAM or not (IPrefixCache::reset): an eviction does not forget an entry
+ * the idle tiers hold a copy of. */
 int64_t Scheduler::reset_prefix_cache() {
     std::lock_guard<std::mutex> lk(mu_);
     if (!pc_ || !cfg_.prefix_cache) return RAD_E_UNSUPPORTED;
@@ -391,30 +393,27 @@ void Scheduler::trim_prefix_cache() {
     const int64_t total = kv_->total_blocks(g);
     if (total <= 0) return;
     const int64_t reserve = total / 4;              /* a quarter of the pool stays free */
-    /* FREE AGAINST THE CARVE, not free_blocks(). On an elastic pool free_blocks() is bounded by
-     * the live mark, so a pool that has handed its unused top back reads as nearly full however
-     * little anything holds -- and the trim would then drain the whole cache to make room the pool
-     * can grow back into on demand. */
+    /* Free against the carve, not free_blocks(): on an elastic pool free_blocks() is bounded by
+     * the live mark, so a pool that returned its unused top would read as nearly full and the
+     * trim would drain the cache for room the pool can grow back into. */
     const int64_t short_by = reserve - (total - kv_->held_blocks(g));
     if (short_by > 0) (void)pc_->trim(short_by);
 }
 
 void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool defer_free,
                               bool publish, int status, const char* why) {
-    /* PUBLISH BEFORE FREEING. This is the only moment the sequence's whole prefix is both
-     * computed and still owned, and it is what makes the cache a cache rather than a permanently
-     * empty lookup: insert() takes its own KV references, so the blocks survive the free below.
-     * A cancelled or failed request is published too -- its prompt was computed either way, and
-     * an agent client that hangs up mid-answer is exactly who asks for that prefix again. */
+    /* Publish before freeing: this is the only moment the whole prefix is both computed and still
+     * owned. insert() takes its own KV references, so the blocks survive the free below. Cancelled
+     * and failed requests are published too; their prompts were computed, and a client that hangs
+     * up mid-answer is likely to ask for that prefix again. */
     if (publish && cfg_.prefix_cache && pc_ && kv_->has_sequence(s.req->id) &&
         s.req->n_computed > 0) {
         const std::vector<int32_t>& cg = pc_->cached_groups();
         pub_blocks_.assign(cg.size(), {});
         bool ok = !cg.empty();
         for (size_t i = 0; i < cg.size(); ++i) {
-            /* A rebased table does not describe the prefix from position zero, so it cannot be
-             * published. cached_groups() already excludes windowed groups, which is where a
-             * moving floor comes from; this is the belt to that. */
+            /* A rebased table does not describe the prefix from position 0, so it cannot be
+             * published. cached_groups() already excludes windowed groups; this is a backstop. */
             if (kv_->first_block_pos(s.req->id, cg[i]) != 0) { ok = false; break; }
             pub_blocks_[i] = kv_->block_table(s.req->id, cg[i]);
         }
@@ -428,8 +427,8 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
     }
 
     if (cfg_.prefix_cache && pc_) pc_->release(*s.req);
-    /* What the draft head did on this text is now part of what the next text starts from --
-     * once: the estimate is marked unstarted, so a second close of the same request adds nothing. */
+    /* Fold what the draft head did on this text into the next text's starting estimate, once:
+     * marking it unstarted makes a second close add nothing. */
     if (draft_.adaptive()) {
         draft_.adapt_retire(s.adapt);
         s.adapt.depth = 0;
@@ -439,9 +438,9 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
         if (!s.pending_free) ++n_deferred_;
         s.pending_free = true;
     } else if (kv_->has_sequence(s.req->id)) {
-        /* A preempted request has already had its blocks taken but the manager still knows the
-         * sequence, and it may still own a state slot. Asking first is what keeps this from
-         * depending on free_sequence() being idempotent. */
+        /* A preempted request has had its blocks taken, but the manager may still know the
+         * sequence and a state slot; asking first avoids relying on free_sequence() being
+         * idempotent. */
         kv_->free_sequence(s.req->id);
     }
     if (!defer_free) drop_card(s);
@@ -452,11 +451,25 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
     queue_erase(waiting_, s.slot);
     s.n_draft = 0;
 
-    /* Terminal, and idempotent on the sink's side: the first call wins, so a cancel racing a
-     * natural stop does not produce two finish reasons. This is the last thing the producer does
-     * to the sink, and the HTTP thread is waiting on exactly it. */
+    /* Terminal. The sink keeps the first finish, so a cancel racing a natural stop yields one
+     * reason. This is the producer's last touch of the sink, which the HTTP thread waits on. */
     if (st == ReqState::Failed && status < 0) server::sink_fail(s.req->sink, status, why);
     else server::sink_finish(s.req->sink, finish_of(st, s.req->finish_reason));
+
+    if (st == ReqState::Failed)         ++m_.failed;
+    else if (st == ReqState::Cancelled) ++m_.cancelled;
+    else                                ++m_.finished;
+    completed_.push_back(s.req->id);
+}
+
+/* Reserve a checkpoint slot for the state at `pos`, written after the entry's row `tok`. A
+ * refusal leaves the entry without one. */
+void Scheduler::reserve_ckpt(StepEntry& e, const Request& r, int64_t pos, int32_t tok) {
+    int32_t cs = -1;
+    if (pc_->reserve_checkpoint(r, pos, &cs) < 0 || cs < 0) return;
+    e.ckpt_tok = tok;
+    e.ckpt_slot = cs;
+    ++m_.checkpoints_written;
 }
 
 int Scheduler::cancel(uint64_t id) {
@@ -467,24 +480,10 @@ int Scheduler::cancel(uint64_t id) {
     if (s.req->state == ReqState::Finished || s.req->state == ReqState::Cancelled)
         return RAD_OK;
 
-    /* Blocks go back NOW, not when the step that would have finished this request runs. A
-     * cancelled request that keeps its pool share until completion is a pool that shrinks under
-     * exactly the load that generates cancellations (spec §14).
-     *
-     * The one exception is a request whose tokens are in the step the device is still executing.
-     * Its blocks are released at commit instead -- one step later, not one request later. Handing
-     * a live block to a new sequence mid-step is a race, and it is the kind that presents as a
-     * model quality problem rather than as a crash.
-     *
-     * AND A DRAFTER'S SNAPSHOT IS THE OTHER. The drafter builds its passes one at a time after
-     * commit, releasing this lock between them, so a cancel can land after one pass was built
-     * and before the next. Freeing then leaves the next pass naming a sequence with no blocks:
-     * its block-table row is all -1 while its length is not, and attention reads block -1. The
-     * blocks are released once the drafter is done with the sequence (sweep_deferred). */
+    /* Blocks go back now (spec §14), unless a step in flight or a drafter snapshot still names
+     * the request; then commit or sweep_deferred releases them (SchedReq::pending_free). */
     const bool in_flight = in_step(s) || block_holds(id);
     close_request(s, ReqState::Cancelled, "cancelled", in_flight);
-    ++m_.cancelled;
-    completed_.push_back(id);
     return RAD_OK;
 }
 
@@ -493,9 +492,8 @@ void Scheduler::take_completed(std::vector<uint64_t>* out) {
     out->clear();
     std::lock_guard<std::mutex> lk(mu_);
     if (!next_open_) { out->swap(completed_); return; }
-    /* A REQUEST THE NEXT STEP STILL CARRIES IS HELD BACK. That step's sampler is staged for it
-     * after this one commits, so its sampler state has to outlive the finish by one step; it is
-     * handed out once the step that carries it has committed. */
+    /* A request the next step still carries is held back: that step's sampler is staged for it
+     * after this one commits, so its sampler state must outlive the finish by one step. */
     size_t keep = 0;
     for (uint64_t id : completed_) {
         auto it = by_id_.find(id);
@@ -546,8 +544,8 @@ void Scheduler::sweep_deferred() {
         if (in_step(s)) continue;
         if (block_holds(s.req->id)) continue;
         if (s.reap_pending) { release_locked(s); continue; }
-        /* A free deferred on a drafter snapshot, for a request nobody has reaped yet. The Request
-         * stays until the reap; only the blocks go back. */
+        /* A free deferred on a drafter snapshot, for a request not yet reaped: only the blocks
+         * go back. */
         free_kv(s);
         s.pending_free = false;
         --n_deferred_;
@@ -577,8 +575,6 @@ void Scheduler::shutdown(const char* reason, int status) {
         if (!s.req) continue;
         close_request(s, ReqState::Failed, closed_reason_, /*defer_free=*/false,
                       /*publish=*/false, closed_status_, closed_reason_);
-        ++m_.failed;
-        completed_.push_back(s.req->id);
     }
     /* Nothing will commit again, so no entry of the last step still owns its slot. */
     step_open_ = false;
@@ -598,23 +594,9 @@ int Scheduler::reap(uint64_t id) {
     if (s.req->state == ReqState::Running || s.req->state == ReqState::Waiting ||
         s.req->state == ReqState::Preempted)
         return RAD_E_STATE;
-    /* NOT WHILE ANYTHING STILL POINTS AT THE SLOT, and two things can. The server reaps as soon as
-     * the sink is finished, and cancel() finishes the sink at once, so a client that hangs up
-     * mid-generation gets here at an arbitrary point in the step loop.
-     *
-     *   - a StepEntry, if the device is still running the step this request is in. Destroying the
-     *     Request there segfaults commit() on `r.state`; returning the slot there is worse,
-     *     because a request admitted before the commit lands would be handed the entry and the
-     *     tokens.
-     *   - the DRAFTER'S SNAPSHOT. block_begin takes it under the lock and block_context,
-     *     block_query and block_end read it again after releasing and retaking the lock; a
-     *     Request freed in that window leaves BatchBuilder::build reading tokens off freed
-     *     memory. Keeping it alive rather than dropping the row is what
-     *     preserves the drafter's row mapping -- the engine already sized its readback from
-     *     block_begin's answer, so a query pass with one fewer row would attribute one
-     *     sequence's drafts to another.
-     *
-     * Both are the same one-step window `pending_free` covers, and both close the same way. */
+    /* Not while a step in flight or a drafter snapshot still points at the slot
+     * (SchedReq::reap_pending). For a drafter snapshot, keeping the Request alive rather than
+     * dropping the row also preserves the row mapping the engine sized its readback from. */
     if (in_step(s) || block_holds(id)) {
         if (!s.reap_pending) ++n_deferred_;
         s.reap_pending = true;
@@ -634,12 +616,7 @@ int Scheduler::queue_snapshot(uint64_t* out, int max) const {
     return n;
 }
 
-
-/* WHAT EVERY REQUEST IS DOING RIGHT NOW. Copied out under the step lock rather than handed out as
- * pointers: a caller holding a SchedReq* across a step is holding one that commit() may reap.
- *
- * Oldest first. A dashboard's reader is looking for the one that is stuck, and the one that is
- * stuck is the one that has been here longest. */
+/* Copied out under the step lock rather than handed out as pointers; see ReqStat. */
 int Scheduler::requests(ReqStat* out, int max) const {
     std::lock_guard<std::mutex> lk(mu_);
     return requests_locked(out, max);
@@ -665,13 +642,10 @@ int Scheduler::requests_locked(ReqStat* out, int max) const {
         o.output_tokens   = (int64_t)r.output.size();
         o.max_tokens      = r.max_tokens;
         o.ctx_tokens      = s.seq_len();
-        /* BLOCKS ADD UP AND TOKENS DO NOT. Each paged group was carved its own blocks, so a count
-         * of them is a sum; but the paged groups SHARE ONE TOKEN AXIS -- one token of context
-         * takes a slot in every one of them -- so summing their tokens reports a request holding
-         * as many times its own context as there are paged groups. Against a pool capacity that
-         * is correctly one group's, two 100K requests then read as 95% of a pool that is 72%
-         * full. The token figure is the largest group's, which is the context the request is
-         * holding, and it is comparable with SchedMetrics::kv_tokens_used by construction. */
+        /* Blocks add up across paged groups, tokens do not: the groups share one token axis, so
+         * summing tokens would count the context once per group against a pool capacity that is
+         * one group's. The token figure is the largest group's, comparable with
+         * SchedMetrics::kv_tokens_used. */
         o.kv_blocks = o.kv_tokens = 0;
         for (int32_t g = 0; g < n_groups; ++g) {
             const int64_t bt = kv_->block_tokens(g);
@@ -684,8 +658,8 @@ int Scheduler::requests_locked(ReqStat* out, int max) const {
         o.slot            = s.slot;
         o.age_s           = (double)(now - s.arrived_us) / 1e6;
         o.ttft_s          = s.first_tok_us ? (double)(s.first_tok_us - s.arrived_us) / 1e6 : -1.0;
-        /* Since its FIRST token, not since admission: a request that waited thirty seconds in the
-         * queue did not decode slowly, and dividing by the wait would say it did. */
+        /* Since the first token, not admission, so time spent queued does not read as slow
+         * decode. */
         const double dec = s.first_tok_us ? (double)(now - s.first_tok_us) / 1e6 : 0.0;
         o.decode_tps      = dec > 1e-3 ? (double)r.output.size() / dec : 0.0;
     }
@@ -694,28 +668,15 @@ int Scheduler::requests_locked(ReqStat* out, int max) const {
 }
 
 /* ------------------------------------------------------------------ drafting */
-/* PROMPT-LOOKUP DRAFTING, and it needs no second model. Take the last few committed tokens of a
- * sequence, find where that pattern last occurred in the SAME sequence, and propose whatever
- * followed it. On the workloads this engine is for -- a coder model quoting the file it was given,
- * a model rewriting a diff, JSON with repeated keys -- that guess is right often enough to pay,
- * and when it is wrong the verify step still emits the target's own token, so it can only cost
- * bandwidth. It is here rather than behind the drafter plugin interface because it is not a model:
- * there is nothing to load, nothing to place, and no second forward pass.
+/* Prompt-lookup drafting: find where the last few committed tokens last occurred in the same
+ * sequence and propose what followed. On code, diffs and JSON it is right often enough to pay,
+ * and a wrong guess costs only bandwidth, since the verify still emits the target's token. Built
+ * in rather than a plugin because there is no model to load and no extra forward pass.
  *
- * Longest pattern first: a longer match is a stronger prediction, and dropping to a shorter one
- * only when the longer finds nothing is what keeps the acceptance rate from collapsing on common
- * bigrams. Most recent occurrence first, for the same reason.
- *
- * A draft head, when one is declared, replaces this by calling set_draft() before step() -- which
- * is why this only fills a proposal that is still empty. */
+ * Longest pattern and most recent occurrence first: a longer match predicts better, and falling
+ * back to shorter ones only on a miss keeps common bigrams from dragging acceptance down. A
+ * declared draft head calls set_draft() before step(), so this only fills an empty proposal. */
 int Scheduler::draft_ngram(SchedReq& s, int depth) const {
-    /* RADIANCE_NO_DRAFT separates the two halves of speculation. With it set the deployment is
-     * still speculative -- the state pool is laid out for it and the linear kernels take the
-     * path that defers the state -- but no step ever carries a draft, so every step is an
-     * ordinary one-token decode and the output must match a non-speculative run exactly. It
-     * answers 'is the deferred state right' without 'is the rollback right' on top of it. */
-    static const bool none = [] { const char* e = getenv("RADIANCE_NO_DRAFT"); return e && *e == '1'; }();
-    if (none) return 0;
     if (depth <= 0 || !s.req) return 0;
     const Request& r = *s.req;
     const int64_t np = (int64_t)r.prompt.size(), no = (int64_t)r.output.size();
@@ -739,14 +700,12 @@ int Scheduler::draft_ngram(SchedReq& s, int depth) const {
 }
 
 /* ------------------------------------------------------------------ chunking */
-/* A prefill chunk splits at the linear-state checkpoint interval so that a checkpoint is always
- * WRITTEN. vLLM writes one only when a scheduler step happens to end on a boundary, which is why
- * a checkpoint landing in request-unique tokens silently drops caching to zero (spec §7.3).
+/* A prefill chunk splits at the linear-state checkpoint interval so a checkpoint is always
+ * written (spec §7.3; see scheduler.h).
  *
- * The order of the two clamps matters. The checkpoint clamp comes first because the interval is a
- * multiple of the quantum, so a chunk clamped to an interval is already quantum-aligned and the
- * second clamp is a no-op on it. Reversing them would round a chunk PAST the checkpoint down and
- * then miss the boundary, which is the exact failure this is written to avoid. */
+ * The checkpoint clamp comes before the quantum clamp. The interval is a multiple of the quantum,
+ * so a chunk clamped to it is already aligned; in the other order a chunk past the checkpoint
+ * would be rounded down and miss the boundary. */
 int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budget,
                               int64_t* checkpoint_pos, int64_t keep_at) const {
     if (checkpoint_pos) *checkpoint_pos = -1;
@@ -759,25 +718,42 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
         const int64_t I = geo_.checkpoint_interval;
         int64_t next = ((n_computed / I) + 1) * I;      /* strictly after n_computed */
         if (geo_.window_ckpt) next = INT64_MAX;          /* a window snapshot: the tail only */
-        if (n_computed + want > next) want = next - n_computed;
-        if (n_computed + want == next) {
-            if (checkpoint_pos) *checkpoint_pos = next;
+        /* A span (ChunkGeometry::span) starts only on an interval boundary past the first
+         * interval, and its chunk is the span's intervals in a row, each the piece a span of 1
+         * makes a chunk of its own. Not from a prompt's start: the first interval may be served on
+         * another path (QSA's dense attention below its exactness bound). Not from a tail
+         * checkpoint: the pieces after it would no longer start on the interval. A chunk the
+         * budget cuts short of the span's end steps back to the last boundary it crosses. */
+        int64_t far = next;
+        if (geo_.span > 1 && span_now_ && n_computed >= I && n_computed % I == 0)
+            far = n_computed + geo_.span * I;
+        if (n_computed + want > far)
+            want = far - n_computed;
+        else if (n_computed + want > next && n_computed + want < n_target)
+            want = (n_computed + want) / I * I - n_computed;
+        if (!geo_.window_ckpt && (n_computed + want) % I == 0) {
+            if (checkpoint_pos) *checkpoint_pos = n_computed + want;
         } else if (n_computed + want == n_target) {
-            /* AND ONE AT THE TAIL OF THE PROMPT. The next turn of a conversation is this prompt
-             * with more on the end, and it resumes from the deepest snapshot under its hit -- on
-             * the interval alone that is up to an interval short of where this prompt ended, and
-             * every one of those tokens is prefilled again on every turn. The last quantum
-             * boundary is as far as a chunk may end short of the target, so the final chunk is
-             * split there and the remainder, under a quantum, runs as the next step's chunk
-             * (tail_checkpoint says where it is worth that step). */
+            /* Also one at the prompt's tail. The next turn resumes from the deepest snapshot
+             * under its hit, which on the interval alone can be nearly an interval short of this
+             * prompt's end, re-prefilled every turn. The final chunk splits at the last quantum
+             * boundary, and the remainder (under a quantum) runs as the next step's chunk
+             * (tail_checkpoint decides when that is worth it). */
             const int64_t tail = tail_checkpoint(n_target);
             if (tail > n_computed) {
                 want = tail - n_computed;
                 if (checkpoint_pos) *checkpoint_pos = tail;
+            } else if (n_computed + want > next) {
+                /* A spanned last chunk with no tail checkpoint still ends on the last boundary it
+                 * crosses, where a span of 1 writes the prompt's deepest checkpoint, and the rest
+                 * (under a quarter interval) is the next chunk; otherwise the next turn would
+                 * resume up to an interval earlier. */
+                want = (n_computed + want) / I * I - n_computed;
+                if (checkpoint_pos) *checkpoint_pos = n_computed + want;
             }
         }
-        /* AND ONE WHERE THE REQUEST ASKED (Request::checkpoint_at), on its quantum: the end of a
-         * prefix other requests are about to start from. Same split as the interval's. */
+        /* And one where the request asked (Request::checkpoint_at), on its quantum: the end of a
+         * prefix other requests are about to start from. */
         const int64_t keep = keep_at / geo_.quantum * geo_.quantum;
         if (keep > n_computed && keep <= n_computed + want && keep <= n_target) {
             want = keep - n_computed;
@@ -786,10 +762,9 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
     }
 
     if (want < remaining) {
-        /* A non-final chunk has to end on a quantum boundary measured from the SEQUENCE origin,
-         * not from the start of the step, or the next chunk hands the linear kernel a partial
-         * tile and the attention kernel a partial block. The final chunk of a request is allowed
-         * to be short: that is the accepted cost of owning the boundaries. */
+        /* A non-final chunk must end on a quantum boundary measured from the sequence origin,
+         * or the next chunk hands the linear kernel a partial tile and attention a partial
+         * block. The final chunk may be short. */
         const int64_t Q = geo_.quantum;
         int64_t end = n_computed + want;
         int64_t aligned = end / Q * Q;
@@ -805,18 +780,17 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
     return want;
 }
 
-/* THE TAIL CHECKPOINT OF A PROMPT OF `target` TOKENS, or -1: its last quantum boundary, past the
- * first interval -- a shorter prompt is cheap to prefill again -- and only where it buys a quarter
- * of an interval or more over the interval checkpoint below it, which is worth the extra step. */
+/* The tail checkpoint of a `target`-token prompt, or -1: its last quantum boundary, only past the
+ * first interval (a shorter prompt is cheap to redo) and only where it gains at least a quarter
+ * interval over the interval checkpoint below it, which pays for the extra step. */
 int64_t Scheduler::tail_checkpoint(int64_t target) const {
     const int64_t I = geo_.checkpoint_interval, Q = geo_.quantum;
     if (I <= 0 || Q <= 0) return -1;
     const int64_t tail = target / Q * Q;
-    /* A WINDOW SNAPSHOT is taken at the tail of any prompt of an interval or more. */
-    /* A block short of the end: the next turn re-renders the last few tokens (a generation
-     * prompt it replaces with the reply), and a snapshot past where the two renderings part is
-     * one no hit can reach -- measured: every prompt whose length left fewer than ~8 tokens in
-     * its last block missed. */
+    /* A window snapshot is taken at the tail of any prompt of an interval or more, a block short
+     * of the end: the next turn re-renders the last few tokens (the generation prompt is replaced
+     * by the reply), and a snapshot past where the two renderings diverge is unreachable. Prompts
+     * that left fewer than ~8 tokens in their last block always missed. */
     if (geo_.window_ckpt) {
         const int64_t t = (target - std::max<int64_t>(Q, 16)) / Q * Q;
         return t >= I ? t : -1;
@@ -825,6 +799,14 @@ int64_t Scheduler::tail_checkpoint(int64_t target) const {
 }
 
 /* ------------------------------------------------------------------ a prefill sharing a step */
+void Scheduler::set_span_min(int64_t tokens) {
+    span_min_ = tokens > 0 ? tokens : 0;
+    if (span_min_ > 0 && geo_.span > 1)
+        RAD_INFO("scheduler: --prefill-span: a prefill spans when it is %lld tokens or longer -- "
+                 "routed experts are read from host memory, and the arena a spanned step takes is "
+                 "room they lose for it", (long long)span_min_);
+}
+
 void Scheduler::set_stage_rows(int64_t rows) {
     stage_rows_ = rows > 0 ? rows : 0;
     const int64_t n = cfg_.busy_prefill_chunk;
@@ -851,45 +833,34 @@ void Scheduler::set_stage_rows(int64_t rows) {
              stage_rows_ > 0 ? " (the prefill stager's smallest pass)" : "");
 }
 
-/* HOW MUCH OF THE STEP A PREFILL CHUNK MAY TAKE WHEN OTHER WORK WANTS IN.
+/* How much of the step a prefill chunk may take when other work wants in.
  *
- * Without a cap the running loop hands a prefill row every token the step has left
- * (plan_chunk(..., budget)). On a step budget of a few thousand tokens and a prompt of a few
- * hundred thousand, that is every step for a minute or more, and in that time a decode row behind
- * the prefill in running_ gets nothing (`want > budget` -> break) and admission never runs
- * (`budget > 0`): a mostly-cached turn that needs a few hundred tokens waits for the whole of
- * somebody else's prefill. The cap leaves `reserve` -- the rows behind it and a share for
- * admission, worked out by step() -- and never goes under the floor.
+ * Uncapped, a prefill row takes every token the step has left, and on a prompt of a few hundred
+ * thousand tokens that lasts a minute or more, during which decode rows behind it get nothing and
+ * admission never runs. The cap leaves `reserve` (computed by step()) and never goes under the
+ * floor: the smallest step the prefill stager overlaps, rounded down to the quantum, or one
+ * quantum with no stager. A smaller step reads every routed layer's pooled experts
+ * synchronously, which costs a long prefill far more than sharing saves.
  *
- * THE FLOOR is the smallest step the prefill stager overlaps (rounded down to the quantum: the
- * rows the chunk shares the step with make up the difference). A step under it reads every
- * routed layer's pooled experts synchronously, and on an expert-tiered placement that costs a
- * long prefill far more than the shared step saves -- a budget set one token under the threshold
- * measured -65 % prefill (#61). With no stager the floor is one quantum.
- *
- * AND THE REST OF THE INTERVAL STAYS ABOVE IT. A chunk ends on the checkpoint interval
- * (plan_chunk), so a chunk held short of the boundary leaves a remainder that is the next step's
- * whole chunk. Held to `budget - reserve`, that remainder is the size of the reserve -- a few
- * hundred tokens, under the floor, and the slowest step of all. When the cap would leave such a
- * remainder the interval is split into two chunks each at or above the floor instead: two staged
- * steps, each with room for the rest of the step's work. */
+ * Chunks end on the checkpoint interval (plan_chunk), so a chunk held short leaves a remainder,
+ * about the size of the reserve, as the next step's whole chunk. When that would be under the
+ * floor, the interval is split into two chunks at or above the floor instead. */
 int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget,
                             int64_t reserve, bool shared, bool rows_only) const {
     const int64_t mode = cfg_.busy_prefill_chunk;
     if (mode == 0 || budget <= 0) return budget;
-    /* auto holds a chunk back only for work that would otherwise get NOTHING this step -- rows
-     * behind it, a request waiting to start. Rows already planned ahead of it are in the step
-     * whatever the chunk takes, so auto leaves the chunk alone for them (it was never what
-     * starved them). An explicit N is the operator trading prefill speed for the latency of every
-     * other row, so it applies whenever the chunk shares the step at all. */
+    /* Auto holds a chunk back only for work that would otherwise get nothing this step: rows
+     * behind it, or a request waiting to start. Rows planned ahead of it are in the step anyway.
+     * An explicit N trades prefill speed for every other row's latency, so it applies whenever
+     * the chunk shares the step. */
     if (reserve <= 0 && !(mode > 0 && shared)) return budget;
     reserve = std::max<int64_t>(reserve, 0);
     const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
 
     int64_t cap = budget - reserve;
     if (mode > 0) {
-        /* The operator's number. No floor: --busy-prefill-chunk N under the stager's step is a
-         * choice set_stage_rows warns about, not one this overrides. */
+        /* The operator's number, with no floor; set_stage_rows warns when it is under the
+         * stager's step. */
         cap = std::min(cap, mode);
     } else {
         const int64_t floor = std::max(Q, stage_rows_ / Q * Q);
@@ -900,19 +871,15 @@ int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget
             const int64_t I = geo_.checkpoint_interval;
             span = std::min(span, ((n_computed / I) + 1) * I - n_computed);
         }
-        /* ...but not for decode rows alone. Their reserve is a few tokens, the chunk ends a
-         * quantum short of the boundary and the next step finishes the interval: the same pair of
-         * steps a prefill already runs whenever decode rows are planned AHEAD of it, so it adds
-         * no step shape the engine does not already pay for. Halving instead would hold a long
-         * prompt to half-interval chunks for as long as any request decodes behind it -- measured
-         * as the larger cost (NOTES: prefill-share run 2). The split is for a share (a request
-         * waiting to start, another prefill), which lasts a step or two. */
+        /* ...but not for decode rows alone: their reserve is a few tokens, so the chunk ends a
+         * quantum short and the next step finishes the interval, a step pair a prefill already
+         * runs when decode rows are ahead of it. Halving would hold a long prompt to
+         * half-interval chunks while anything decodes behind it, which costs more. The split is
+         * for a share (a waiting request, another prefill), which lasts a step or two. */
         if (!rows_only && cap < span && span - cap < floor && span - floor >= floor)
             cap = span - floor;
     }
-    cap = std::min(cap, budget);
-    cap = std::max(cap, Q);
-    return std::min(cap, budget);
+    return std::min(std::max(cap, Q), budget);
 }
 
 /* ------------------------------------------------------------------ preemption */
@@ -921,9 +888,8 @@ void Scheduler::preempt_back() {
     SchedReq& s = *reqs_[(size_t)slot];
     Request& r = *s.req;
 
-    /* Preemption by RECOMPUTE: the blocks go back to the pool and the request restarts from zero.
-     * Its generated output is simply the tail of its token sequence, so recompute needs no special
-     * path -- it re-prefills prompt ++ output through the same chunker. */
+    /* Preemption by recompute: the blocks go back and the request restarts from zero. Its output
+     * is the tail of its token sequence, so it simply re-prefills prompt ++ output. */
     kv_->preempt(r.id);
     drop_card(s);
     r.n_computed = 0;
@@ -931,10 +897,10 @@ void Scheduler::preempt_back() {
     r.n_accepted = 0;
     r.state = ReqState::Preempted;
     s.drafter_reset();
-    /* AND THE REQUEST'S OWN COPY OF THE WINDOW. The sampler stages 1 + Request::n_draft rows for
-     * a request (Sampler::build_step), and a drafter may have set it for the step this preemption
-     * just took away. Left standing, the recompute's first sampled step stages rows its batch does
-     * not have, and every request after it in the step samples another's logits row. */
+    /* Also clear the request's own window. The sampler stages 1 + Request::n_draft rows
+     * (Sampler::build_step), and a drafter may have set it for the step this preemption removed;
+     * left standing, the recompute's first sampled step stages rows its batch lacks and every
+     * later request in the step samples another's logits row. */
     r.n_draft = 0;
     r.draft = nullptr;
     s.running = false;
@@ -945,34 +911,33 @@ void Scheduler::preempt_back() {
 }
 
 /* ------------------------------------------------------------------ admission */
-/* Admission checks the KV budget BEFORE a request enters running. A request admitted without the
- * blocks to run it is a request that will be preempted on its first step, which costs a full
- * recompute for nothing. */
+/* Admission checks the KV budget before a request enters running; a request admitted without the
+ * blocks to run would be preempted on its first step, a full recompute for nothing. */
 int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
     Request& r = *s.req;
 
     if (!kv_->has_sequence(r.id)) RAD_TRY(kv_->add_sequence(r.id));
 
-    /* A FRESH ATTEMPT: nothing looked up yet, nothing counted yet. A request that kept an
-     * earlier attempt's hit (n_computed > 0) keeps what that attempt found as well. */
+    /* A fresh attempt: nothing looked up or counted yet. A request that kept an earlier
+     * attempt's hit (n_computed > 0) keeps what it found. */
     if (r.n_computed == 0) {
         s.ckpt_src = -1;
         s.hit_attn = 0;
         s.hit_owed = true;
+        s.hit_cut = SchedReq::HitCut::None;
     }
 
-    /* WHAT NO HIT CAN CHANGE IS ASKED FIRST: a free sequence and a budget that can take a chunk.
-     * A restore copies the whole context back, and an admission refused after it would give that
-     * hit back and copy it again on the next attempt. */
+    /* Check what no hit can change first (a free card index, a budget that fits a chunk): a
+     * restore copies the whole context back, and an admission refused after it would repeat the
+     * copy on the next attempt. */
     if (s.card < 0 && free_cards_.empty()) return RAD_E_FULL;
     if (budget < std::max<int64_t>(geo_.quantum, 1) && budget < s.seq_len() - r.n_computed)
         return RAD_E_FULL;
 
     if (r.n_computed == 0 && cfg_.prefix_cache) {
-        /* BEFORE the lookup, because the lookup stops at the first block the tiers hold -- an
-         * honest shorter hit, but a shorter one. This is where a cold session gets its
-         * context back instead of re-prefilling it: it costs a copy, and the alternative
-         * costs a prefill. */
+        /* Restore before the lookup, which stops at the first block the tiers hold. This is
+         * where a cold session gets its context back for the cost of a copy instead of a
+         * prefill. */
         pc_->restore(r);
         HitCap cap;
         if (draft_refill_ > 0) {
@@ -986,77 +951,71 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
         }
         int32_t reuse = h.n_attn_tokens;
         if (geo_.checkpoints() && h.n_linear_tokens < reuse) {
-            /* A hit landing between checkpoints reuses the attention blocks and must replay the
-             * linear layers forward from the last checkpoint (§7.3). RadBatch carries ONE query
-             * length for every group, so this build cannot run the linear layers over a longer
-             * range than the attention layers: that would need per-group q_lens on
-             * RadKVGroupBatch. Without them, the conservative and correct answer is to recompute
-             * from the checkpoint. */
+            /* A hit between checkpoints reuses the attention blocks but must replay the linear
+             * layers from the last checkpoint (§7.3). RadBatch carries one query length for all
+             * groups (per-group q_lens on RadKVGroupBatch would be needed), so recompute from
+             * the checkpoint instead. */
             reuse = h.n_linear_tokens;
         }
         int32_t last = (int32_t)r.prompt.size() - 1;   /* one token must remain to produce logits */
         if (reuse > last) reuse = last;
         if (reuse < 0) reuse = 0;
 
-        /* A HIT ON A HYBRID MODEL IS ONLY LEGAL BECAUSE OF THE CHECKPOINT. Reuse skips recomputing
-         * the prefix, which the adopted blocks cover for the paged attention groups and NOTHING
-         * covers for a recurrent group -- its state lives in a per-sequence slot. So a hit that
-         * skips tokens must also restore that state, which is what `ckpt_src` carries into the
-         * entry below and what KVManager::checkpoint_restore performs.
-         *
-         * Refusing to reuse without one is therefore not conservatism, it is the only correct
-         * answer: `reuse` is already clamped to `h.n_linear_tokens` above, so a hit that found no
-         * valid checkpoint clamps to zero on its own. What must never happen is reuse > 0 with no
-         * snapshot to resume from -- that is every recurrent layer continuing from whatever the
-         * slot last held, and it reads as fluent text rather than as a failure. */
+        /* A hit on a hybrid model needs a checkpoint. The adopted blocks cover the paged
+         * attention groups, but nothing covers a recurrent group, whose state lives in a
+         * per-sequence slot; skipping tokens also requires restoring that state (`ckpt_src`,
+         * then KVManager::checkpoint_restore). `reuse` is already clamped to h.n_linear_tokens;
+         * this guarantees reuse > 0 never happens without a snapshot, which would continue every
+         * recurrent layer from stale state and produce fluent but wrong text. */
         if (reuse > 0 && has_linear_state_ && h.checkpoint_slot < 0) reuse = 0;
-        /* A WINDOW SNAPSHOT COVERS THE TRUNK'S WINDOWED GROUPS -- at the checkpoint and nowhere
-         * else. The lookup clamped the hit to it (PrefixCache: a window counts as state there),
-         * so a hit with a slot is exactly at a snapshot; one without is no hit. */
+        if (h.n_attn_tokens > 0 && reuse == 0 && geo_.checkpoints()) {
+            s.hit_cut = SchedReq::HitCut::NoSnapshot;
+            RAD_DEBUG("admit %llu: prefix hit of %lld tokens reuses nothing -- no snapshot at or "
+                      "below it", (unsigned long long)r.id, (long long)h.n_attn_tokens);
+        } else if (reuse < h.n_attn_tokens) {
+            RAD_DEBUG("admit %llu: prefix hit of %lld tokens resumes at the snapshot at %lld",
+                      (unsigned long long)r.id, (long long)h.n_attn_tokens, (long long)reuse);
+        }
+        /* A window snapshot covers the trunk's windowed groups at the checkpoint only. The lookup
+         * clamped the hit to it (a window counts as state there), so a hit with a slot is exactly
+         * at a snapshot; one without is no hit. */
         const bool win_hit = geo_.window_ckpt && kv_->has_window_snapshot() && reuse > 0 &&
                              h.checkpoint_slot >= 0 && reuse == h.n_linear_tokens;
 
-        /* THE WINDOWED-GROUP CLAMP — a prefix hit on a model whose OWN (trunk) KV includes a
-         * paged group the cache does not index. prefix.cpp skips RAD_KV_WINDOW groups — their
-         * blocks below the window are recycled, so no block list describes them; the comment
-         * there says a hit "costs the sequences ... a windowed layer whose cache starts where
-         * the hit ended" — this is that cost in KV corruption. The adopted blocks cover the
-         * cached groups ONLY, while `used = ctx_len + n_tokens` (batch.cpp) makes every
-         * windowed trunk layer read the positions below ctx_len that this sequence NEVER WROTE
-         * — and grab_block's min-heap (kv.cpp) hands this sequence the very blocks the most
-         * recent tenant wrote. The model then attends to the PREVIOUS REQUEST'S KV as its own
-         * prefix: fluent text carrying the last request's CONTENT. Zero the reuse; the whole
-         * prompt re-prefills, which is what a window snapshot (below) exists to avoid -- seconds
-         * to minutes of first-token time on a long agent turn.
+        /* Windowed-group clamp: the trunk's own KV includes a paged group the cache does not
+         * index. prefix.cpp skips RAD_KV_WINDOW groups (their blocks below the window are
+         * recycled), so the adopted blocks cover the cached groups only, while `used = ctx_len +
+         * n_tokens` (batch.cpp) makes each windowed trunk layer read positions below ctx_len this
+         * sequence never wrote. grab_block's min-heap (kv.cpp) hands out the blocks the latest
+         * tenant wrote, so the model would attend to the previous request's KV. Zero the reuse
+         * and re-prefill unless a window snapshot covers it.
          *
-         * NOT the drafter's hole. A drafter's own group (bound at base_layer and above — see
-         * scheduler.h) is repaired by draft refill, which CAPS the hit so the recompute covers
-         * the drafter's window while the trunk reuses the rest; zeroing here would delete that
-         * design. The trunk's hole, which no tail-recompute can fix, is this clamp's own. */
+         * A drafter's own group (bound at base_layer and above) is not this clamp's business:
+         * draft refill caps the hit so the recompute covers the drafter's window. */
         if (reuse > 0 && hit_holes_trunk_ && !win_hit) {
             reuse = 0;
+            s.hit_cut = SchedReq::HitCut::Window;
             RAD_DEBUG("admit %llu: prefix hit %lld zeroed -- a trunk paged group is not "
                       "prefix-cached (windowed) and no window snapshot covers it; re-prefilling",
                       (unsigned long long)r.id,
                       (long long)h.n_attn_tokens);
         }
 
-        /* Claim the cached blocks. Without this the hit is only an accounting entry: the sequence
-         * would skip computing those tokens and then attend to blocks it does not own. adopt()
-         * takes a whole block multiple, which `reuse` is -- a whole number of blocks, or a
-         * checkpoint position, which is on the interval or on a quantum boundary at a prompt's tail
-         * (plan_chunk), and geometry.h made both multiples of the block size. */
+        /* Claim the cached blocks; otherwise the sequence would skip those tokens and attend to
+         * blocks it does not own. adopt() takes a whole block multiple, which `reuse` is: a whole
+         * number of blocks, or a checkpoint position (on the interval, or on a quantum boundary at
+         * a prompt's tail per plan_chunk), both block multiples by geometry.h. */
         if (reuse > 0) {
             const std::vector<int32_t>& cg = pc_->cached_groups();
             for (size_t i = 0; i < cg.size() && i < hit_blocks_.size(); ++i) {
                 int64_t nb = reuse / kvgeom_.g[(size_t)cg[i]].block_size;
                 if ((int64_t)hit_blocks_[i].size() > nb) hit_blocks_[i].resize((size_t)nb);
                 if (kv_->adopt(r.id, cg[i], hit_blocks_[i], reuse) < 0) {
-                    /* AND WHAT THE EARLIER GROUPS ADOPTED GOES BACK. Left in the table, those
-                     * blocks would be the first blocks of a sequence that now starts from zero,
-                     * and the recompute would write its KV into the cache's own blocks. */
+                    /* Return what earlier groups adopted, or the recompute would write its KV
+                     * into the cache's own blocks. */
                     kv_->preempt(r.id);
                     reuse = 0;
+                    s.hit_cut = SchedReq::HitCut::Adopt;
                     break;
                 }
             }
@@ -1065,6 +1024,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
             if (reuse > 0 && win_hit && kv_->seed_window(r.id, reuse) < 0) {
                 kv_->preempt(r.id);
                 reuse = 0;
+                s.hit_cut = SchedReq::HitCut::Adopt;
             }
         }
 
@@ -1077,41 +1037,46 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
 
     int64_t target = s.seq_len();
     int64_t ckpt = -1;
-    /* AN ADMISSION SHARES THE STEP THE SAME WAY. A cold prompt admitted with requests queued
-     * behind it would otherwise take every token left, and the queue behind it would wait a step
-     * for nothing; the hit above is known by now, so the cap is on what really has to run. */
-    const int64_t cap = r.embed ? budget   /* whole input or nothing: never held back (below) */
-                                : busy_cap(r.n_computed, target, budget, reserve, !plan_.e.empty());
-    int64_t want = plan_chunk(r.n_computed, target, cap, &ckpt, r.checkpoint_at);
-    if (cap < budget && want > 0)
-        admit_full_ = plan_chunk(r.n_computed, target, budget, nullptr, r.checkpoint_at);
-    /* The whole input or nothing this step (Request::embed): the next step starts with a whole
-     * budget, and add_locked refused an input no budget holds. */
-    if (r.embed && want < target - (int64_t)r.n_computed) want = 0;
+    int64_t want;
+    if (r.embed) {
+        /* The whole input or nothing this step (Request::embed): the next step starts with a
+         * whole budget, and add_locked refused an input no budget holds. Not through plan_chunk,
+         * whose checkpoint splits would cut every input longer than the interval short, and an
+         * input that can only run whole would then never be admitted, nor anything queued behind
+         * it. An embedding input is never resumed, so it takes no checkpoint. */
+        const int64_t rest = target - (int64_t)r.n_computed;
+        want = rest <= budget ? rest : 0;
+    } else {
+        /* An admission shares the step the same way: otherwise a cold prompt with requests
+         * queued behind it takes every token left. The hit is known by now, so the cap applies
+         * to what really has to run. */
+        const int64_t cap = busy_cap(r.n_computed, target, budget, reserve, !plan_.e.empty());
+        want = plan_chunk(r.n_computed, target, cap, &ckpt, r.checkpoint_at);
+        if (cap < budget && want > 0)
+            admit_full_ = plan_chunk(r.n_computed, target, budget, nullptr, r.checkpoint_at);
+    }
     int rc = RAD_OK;
     if (want <= 0)                                          rc = RAD_E_FULL;
     else if (s.card < 0 && free_cards_.empty())             rc = RAD_E_FULL;
     else {
-        /* THE CACHE GIVES WAY TO A NEW REQUEST as it does to a running one: with nothing running,
-         * no other path would ever take blocks back from it, and the request would wait for good. */
+        /* The cache gives way to a new request as it does to a running one; with nothing
+         * running, no other path would reclaim from it and the request would wait forever. */
         int rounds = 0;
         while (kv_->ensure_from(r.id, r.n_computed + want, r.n_computed) < 0) {
-            if (++rounds > 256 || !cfg_.prefix_cache || pc_->evict(256) <= 0) {
+            if (++rounds > kEvictRounds || !cfg_.prefix_cache || pc_->evict(kEvictBlocks) <= 0) {
                 rc = RAD_E_NOMEM;
                 break;
             }
         }
     }
     if (rc < 0) {
-        /* A HIT THAT RESUMES FROM A SNAPSHOT IS NOT KEPT ACROSS A FAILED ATTEMPT. The slot is
-         * named by id only, and until this request's first step restores from it nothing stops
-         * the cache retiring it and handing it to another sequence's checkpoint -- so a later
-         * attempt that trusted the id would restore somebody else's recurrent state, which reads
-         * as fluent text about the wrong conversation. Giving the hit back costs the next attempt
-         * a lookup; the attention-only hit of a model with no recurrent state holds only
+        /* A hit that resumes from a snapshot is not kept across a failed attempt. The slot is
+         * named by id only, and until the first step restores from it the cache may retire it
+         * and reuse it for another sequence, so a later attempt would restore someone else's
+         * recurrent state. Giving the hit back costs a lookup. An attention-only hit holds only
          * refcounted blocks and is kept. */
         if (s.ckpt_src >= 0) undo_hit(s);
-        /* AND WHAT THE RESTORE BROUGHT BACK STAYS for the next attempt (IPrefixCache::hold). */
+        /* What the restore brought back stays for the next attempt (IPrefixCache::hold). */
         if (cfg_.prefix_cache) pc_->hold(r);
         return rc;
     }
@@ -1122,6 +1087,13 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
         if (cfg_.prefix_cache) {
             m_.attn_cached_tokens += s.hit_attn;
             m_.linear_cached_tokens += r.n_cached;
+            if (s.hit_attn > r.n_cached) m_.hit_cut_tokens += s.hit_attn - r.n_cached;
+            switch (s.hit_cut) {
+                case SchedReq::HitCut::NoSnapshot: ++m_.hit_cut_no_snapshot; break;
+                case SchedReq::HitCut::Window:     ++m_.hit_cut_window;      break;
+                case SchedReq::HitCut::Adopt:      ++m_.hit_cut_adopt;       break;
+                case SchedReq::HitCut::None:       break;
+            }
         }
         s.hit_owed = false;
     }
@@ -1139,8 +1111,8 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
 
 void Scheduler::undo_hit(SchedReq& s) {
     Request& r = *s.req;
-    /* preempt() rather than free_sequence(): the sequence stays known to the manager, at zero
-     * tokens and holding nothing, which is exactly where a fresh attempt starts from. */
+    /* preempt(), not free_sequence(): the sequence stays known to the manager at zero tokens,
+     * where a fresh attempt starts. */
     if (kv_->has_sequence(r.id)) kv_->preempt(r.id);
     r.n_computed = 0;
     r.n_cached = 0;
@@ -1154,13 +1126,12 @@ const RadBatch* Scheduler::step() {
     /* A cycle opens here, so its head depth is chosen here (scheduler.h, draft_cycle). */
     draft_cycle();
 
-    /* The drafter's snapshots describe the step before this one and nothing reads them from here
-     * on. block_end() and serial_end() clear them already; this covers a drafter that stopped
-     * part way through, so a stale snapshot cannot keep deferring a release. */
+    /* The drafter's snapshots describe the previous step and nothing reads them now. block_end()
+     * and serial_end() normally clear them; this covers a drafter that stopped part way, so a
+     * stale snapshot cannot keep deferring a release. */
     block_.clear();
     serial_.clear();
-    /* And the snapshots the last step's admissions were handed have been read by its forward,
-     * which committed before this was called. */
+    /* The last step's admissions have read their snapshots: its forward committed before this. */
     if (pc_) pc_->begin_step();
 
     plan_.reset();
@@ -1169,29 +1140,71 @@ const RadBatch* Scheduler::step() {
 
     int64_t budget = cfg_.max_tok;
     bool preempted_here = false;
+    /* --prefill-interleave: after a step that carried a chunk beside decoding sequences, with the
+     * prompt continuing, the next N steps carry decode rows only and admit nothing. With nothing
+     * decoding there is nothing to give steps to, and the hold is dropped. */
+    bool any_decoding = false;
+    bool hold_prefill = false;
+    held_prefill_ = 0;
+    if (cfg_.prefill_interleave > 0) {
+        for (int32_t slot : running_) {
+            const SchedReq& s = *reqs_[(size_t)slot];
+            if (!s.req || !s.running) continue;
+            const Request& r = *s.req;
+            if (r.n_computed < (int64_t)r.prompt.size() || r.n_computed + 1 < s.seq_len()) continue;
+            any_decoding = true;
+            break;
+        }
+        if (!any_decoding) interleave_left_ = 0;
+        hold_prefill = interleave_left_ > 0;
+    }
 
-    /* A STEP THAT ALSO CARRIES A PREFILL TAKES A DRAFT LIKE ANY OTHER, and that rests on how the
-     * linear blocks issue a mixed step.
-     *
-     * The blocks issue the RECURRENT path over the decode rows of a mixed step and the CHUNKED
-     * path over the prefill ones, so a verifying decode row carries num_accepted and rolls back
-     * exactly as it does in a pure decode step. Were a mixed step prefill-shaped for every
-     * sequence in it, a verifying row would take the chunked path -- which has no num_accepted
-     * operand, because a chunk has nothing to reject -- and its recurrent state and conv window
-     * would advance over all 1 + n_spec tokens with no way back. The rejected tokens stay folded
-     * into the state and the model is then conditioned on text it never emitted: fluent, and
-     * drifting, so it surfaces as concurrent requests disagreeing with the same requests run
-     * alone rather than as anything failing. */
+    /* A span is for a prefill alone in its step (ChunkGeometry::span). A spanned step takes as
+     * long as the intervals it carries, so a decode row riding along would wait that long for its
+     * token. The span is taken only when the step can hold nothing but the one prefill (a single
+     * running request with prompt left and no admission possible, or a single request in an empty
+     * engine); every other step is planned at ChunkGeometry::shared_tok as a deployment without a
+     * span plans it, --busy-prefill-chunk included. Both kinds of chunk end on the same interval
+     * grid, so a prompt may switch between them at any step. */
+    span_now_ = true;
+    struct SpanReset { bool& f; ~SpanReset() { f = true; } } span_reset{span_now_};
+    /* Keyed on the flag, not on whether this model has intervals to span: the engine told the
+     * plugin that a step wider than shared_tok is one sequence (RadBuildCtx::max_mixed_tok),
+     * whatever the geometry turned out to be. */
+    if (cfg_.prefill_span > 1) {
+        bool lone = false;
+        const bool admit_possible = !waiting_.empty() && !free_cards_.empty() &&
+                                    (int64_t)running_.size() < cfg_.max_seqs;
+        if (running_.size() == 1 && !admit_possible) {
+            const SchedReq& s0 = *reqs_[(size_t)running_[0]];
+            lone = s0.req->n_computed < (int64_t)s0.req->prompt.size() ||
+                   s0.req->n_computed + 1 < s0.seq_len();
+            /* By the whole prefill, not what is left of it, so a prompt keeps spanning through
+             * its last intervals (set_span_min). */
+            if (lone && span_min_ > 0)
+                lone = std::max<int64_t>((int64_t)s0.req->prompt.size(), s0.seq_len()) >= span_min_;
+        } else if (running_.empty() && waiting_.size() == 1) {
+            const SchedReq& w = *reqs_[(size_t)waiting_[0]];
+            lone = span_min_ == 0 || (w.req && (int64_t)w.req->prompt.size() >= span_min_);
+        }
+        span_now_ = lone;
+        if (!lone) budget = geo_.shared_tok;
+    }
+
+    /* A mixed step takes drafts like any other: the linear blocks run the recurrent path over its
+     * decode rows and the chunked path over its prefill rows, so a verifying row rolls back as in
+     * a pure decode step. Run through the chunked path (which has no num_accepted operand), its
+     * rejected tokens would stay folded into the recurrent state and conv window. */
     const int depth = draft_.next_depth();
 
-    /* WHAT ELSE WANTS INTO THIS STEP, for --busy-prefill-chunk (busy_cap). The rows still to be
-     * walked -- each decode row's 1 + the deepest window it can take, each prefill row a share --
-     * and one share when a request is waiting and a sequence slot is free for it. Counted down as
-     * the loop walks, so a row's reserve is what is BEHIND it. No allocation: two counters. */
+    /* What else wants into this step, for --busy-prefill-chunk (busy_cap): each decode row still
+     * to be walked needs 1 + the deepest window it can take, each prefill row a share, plus one
+     * share when a request waits and a slot is free. Counted down as the loop walks, so a row's
+     * reserve is what is behind it. */
     const bool share_step = cfg_.busy_prefill_chunk != 0;
-    const int64_t share_tok = std::max<int64_t>(std::max<int64_t>(geo_.quantum, 1),
-                                                cfg_.max_tok / 8 / std::max<int64_t>(geo_.quantum, 1)
-                                                    * std::max<int64_t>(geo_.quantum, 1));
+    const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
+    /* An eighth of this step's budget, which under a span is shared_tok for a shared step. */
+    const int64_t share_tok = std::max<int64_t>(Q, budget / 8 / Q * Q);
     const int64_t dec_row_tok = 1 + std::max<int64_t>(depth, draft_.step_window());
     int64_t behind_dec = 0, behind_pf = 0;
     if (share_step) {
@@ -1210,8 +1223,8 @@ const RadBatch* Scheduler::step() {
     int64_t capped_full = 0;
 
     /* ---------------------------------------------------------- running requests first */
-    /* Continuous batching: a request already holding blocks is served before a new one is let in,
-     * because the alternative is admitting work that then preempts work already half done. */
+    /* Continuous batching: requests already holding blocks are served before new ones are
+     * admitted, so new work never preempts work half done. */
     for (size_t i = 0; i < running_.size(); ) {
         if ((int64_t)plan_.e.size() >= cfg_.max_seqs || budget <= 0) break;
 
@@ -1229,6 +1242,7 @@ const RadBatch* Scheduler::step() {
 
         int64_t ckpt = -1;
         int64_t want;
+        if (prefill && hold_prefill) { ++held_prefill_; ++i; continue; }
         if (prefill) {
             const int64_t shares = share_step ? behind_pf + (admit_waits ? 1 : 0) : 0;
             const int64_t reserve = share_step ? behind_dec + share_tok * shares : 0;
@@ -1240,23 +1254,21 @@ const RadBatch* Scheduler::step() {
                                                 r.checkpoint_at);
                 if (want < full) { capped_at = (int32_t)plan_.e.size(); capped_full = full; }
             }
-            /* A PREFILL WITH NO ROOM LEFT DOES NOT STOP THE WALK. Under a quantum of budget it can
-             * take nothing this step, but a decode row behind it needs only 1 + its window -- so
-             * it is passed over rather than ending the loop (off keeps the old `break`). */
+            /* A prefill with no room left does not end the walk: it takes nothing this step, but
+             * a decode row behind it needs only 1 + its window. With --busy-prefill-chunk off the
+             * walk stops here. */
             if (want <= 0 && share_step) { ++i; continue; }
         } else {
             /* A verify step is 1 + n_draft query rows, which is why attention kernels take a
-             * query length rather than assuming one (spec §10). */
-            /* THE LAST GATE, and it has to be here rather than only at set_draft, because the
-             * n-gram fallback below fills any proposal a drafter left empty -- so refusing a
-             * draft upstream and stopping there hands the request a different draft instead of
-             * none. Request::may_speculate says why a request can be ineligible.
+             * query length (spec §10). */
+            /* The final speculation gate. It must be here, not only in set_draft, because the
+             * n-gram fallback below fills any empty proposal; refusing upstream alone would just
+             * swap in a different draft. See Request::may_speculate.
              *
-             * AND THE CAP IS THE SEQUENCE'S OWN WINDOW, which is `depth` unless the adaptive
-             * policy is on -- then it is what this sequence's acceptance of the HEAD's drafts pays
-             * for. The n-gram fallback is not the head and that estimate says nothing about it, so
-             * it is held to the step's window instead: as deep as the head drafts this step and no
-             * deeper, which adds no pass shape the head's own windows do not. */
+             * The cap is the sequence's own window: `depth`, or under the adaptive policy what
+             * its acceptance of the head's drafts pays for. That estimate says nothing about the
+             * n-gram fallback, so the fallback is held to the step's window, as deep as the head
+             * drafts this step and no deeper. */
             const int cap = draft_.adaptive() ? draft_cap(s) : depth;
             bool ngram = false;
             if (!r.may_speculate) s.n_draft = 0;
@@ -1266,10 +1278,9 @@ const RadBatch* Scheduler::step() {
             }
             if (!ngram && s.n_draft > cap) s.n_draft = cap;
             s.draft_ngram = ngram;
-            /* NO VERIFIED POSITION AT OR PAST THE CONTEXT. The step computes positions n_computed
-             * .. n_computed + n_draft, and nothing past ctx_limit_ - 1 has a rotary row or a
-             * block-table column. commit() finishes a sequence before its length reaches the
-             * limit, so there is always room for the one token itself. */
+            /* No verified position at or past the context end: nothing past ctx_limit_ - 1 has a
+             * rotary row or block-table column. commit() finishes a sequence before it reaches
+             * the limit, so the one token itself always fits. */
             const int64_t spare = ctx_limit_ - 1 - (int64_t)r.n_computed;
             if (ctx_limit_ > 0 && s.n_draft > spare) s.n_draft = spare > 0 ? (int32_t)spare : 0;
             want = 1 + s.n_draft;
@@ -1277,48 +1288,41 @@ const RadBatch* Scheduler::step() {
         }
         if (want <= 0) break;   /* the budget is spent; the rest of running_ waits a step */
 
-        /* KV first, and preempt from the BACK on refusal -- the lowest priority, latest arrival
-         * running request, which is the one that would be re-admitted last anyway. */
-        /* BOUNDED, because this loop is the scheduler thread and an unbounded one is a server that
-         * stops stepping with nothing in the log to say why. Reclaiming from the cache is tried
-         * first (a cached prefix is a saving; a running request is work in flight), but only so
-         * many times -- past that the shortfall is not the cache's to fix and preemption is. */
-        static const int kMaxEvictRounds = 256;
+        /* KV first; on refusal preempt from the back (lowest priority, latest arrival), the one
+         * that would be re-admitted last anyway. Reclaiming from the cache is tried first, but
+         * only kEvictRounds times; past that the shortfall is preemption's to fix. */
         int evict_rounds = 0;
-        bool failed = false;
+        bool failed = false, yielded = false;
         while (kv_->ensure_from(r.id, r.n_computed + want, r.n_computed) < 0) {
-            /* THE CACHE GIVES ITS BLOCKS BACK BEFORE A RUNNING REQUEST DOES. Everything the prefix
-             * cache holds is a saving on work that has already been done once; everything a
-             * running request holds is work in flight. Evicting first is therefore strictly the
-             * cheaper order, and it is also what keeps publishing from turning into a leak -- the
-             * cache retains a reference on every block it indexes and nothing else ever releases
-             * one. Batched rather than one at a time so a large shortfall does not walk the LRU
-             * list a hundred times. */
-            if (++evict_rounds <= kMaxEvictRounds && pc_ && cfg_.prefix_cache &&
-                pc_->evict(256) > 0)
+            /* The cache gives blocks back before a running request does: a cached prefix saves
+             * work done once, a running request is work in flight. Nothing else releases the
+             * cache's references, so this also keeps publishing from leaking. */
+            if (++evict_rounds <= kEvictRounds && pc_ && cfg_.prefix_cache &&
+                pc_->evict(kEvictBlocks) > 0)
                 continue;
-            if (!kv_->can_ever_fit(r.n_computed + want) || running_.size() - 1 <= i) {
-                /* Nothing left to take. §17: if the smallest running request cannot fit, it is
-                 * failed rather than the engine deadlocking on a pool that cannot grow. */
-                /* §17: either an empty pool could not serve this length at all, or there is no
-                 * lower-priority request left to take blocks from. Failing the request beats
-                 * deadlocking on a pool that cannot grow. */
+            const bool last = running_.size() - 1 <= i;
+            if (!kv_->can_ever_fit(r.n_computed + want) || (last && i == 0)) {
+                /* §17: either no pool could serve this length, or the request runs alone and
+                 * still cannot grow. Fail the request rather than deadlock. */
                 RAD_WARN("request %llu failed: the KV pool cannot hold %lld tokens%s",
                          (unsigned long long)r.id, (long long)(r.n_computed + want),
                          kv_->can_ever_fit(r.n_computed + want)
-                             ? " and nothing lower-priority is left to preempt"
+                             ? " and nothing else is left to preempt"
                              : " at any occupancy");
                 close_request(s, ReqState::Failed, "kv_exhausted", false, true, RAD_E_FULL,
                               "the KV pool cannot hold it");
-                ++m_.failed;
-                completed_.push_back(r.id);
                 failed = true;
                 break;
             }
+            /* The back of the running set gives its blocks up. When that is this request, the
+             * requests ahead of it hold the pool: it is preempted by recompute and waits for
+             * them, rather than failed. */
             preempt_back();
             preempted_here = true;
+            if (last) { yielded = true; break; }
         }
-        if (failed) continue;   /* close_request removed it from running_; i now indexes the next */
+        /* close_request or preempt_back removed it from running_; i now indexes the next. */
+        if (failed || yielded) continue;
 
         StepEntry e;
         e.req = &r;
@@ -1328,25 +1332,18 @@ const RadBatch* Scheduler::step() {
         e.n_tokens = (int32_t)want;
         e.ctx_len = (int32_t)r.n_computed;
         e.n_spec = prefill ? 0 : s.n_draft;
-        /* AND THE REQUEST SAYS THE SAME NUMBER. Sampler::build_step sizes its per-row staging from
-         * `Request::n_draft` -- one row per sampled position, so 1 + n_draft of them -- while the
-         * batch sizes its logits rows from `n_spec`. The two are the same window and must be kept
-         * equal by one writer: setting only the scheduler`s copy leaves the sampler staging one
-         * row for a step that produces several, and setting only the request`s leaves it staging
-         * rows for a window a later clamp to the controller`s depth took away. Set here, once,
-         * where the window is decided. */
+        /* Keep the request's window equal to the entry's. Sampler::build_step sizes its staging
+         * from Request::n_draft (1 + n_draft rows) while the batch sizes its logits rows from
+         * `n_spec`; setting only one makes the sampler stage the wrong number of rows. Set here,
+         * once, where the window is decided. */
         r.n_draft = e.n_spec;
         r.draft   = e.n_spec ? s.draft : nullptr;
-        /* ONE-BASED, AND A PREFILL ROW IS 1 AND NOT 0. See StepEntry: the value is "how many
-         * tokens the previous step committed", the rolling windows are read at `n_accepted - 1`,
-         * and zero is not a value any of them can read. A prefill has nothing to roll back, which
-         * is offset zero, which is ONE -- the same thing the kernels assume when the operand is
-         * absent, and what ple_conv's contract states for exactly this case.
-         *
-         * IT IS NOT ONLY THE FIRST CHUNK THAT IS AFFECTED. `has_init` is the context length, so
-         * every chunk after the first of a chunked prefill is WARM, and a warm window read at -1
-         * is one element before the slot: ple_conv takes the previous channel's last sample and
-         * ngram_ids hashes a token the slot never held. A 200K prompt is a hundred chunks. */
+        /* One-based: the number of tokens the previous step committed, with the rolling windows
+         * read at `n_accepted - 1`, so 0 is never valid. A prefill rolls nothing back, which is
+         * 1, as the kernels assume when the operand is absent (ple_conv's contract). Every chunk
+         * after the first is warm (`has_init` is the context length), and a warm read at -1 would
+         * take the slot before: the previous channel's sample in ple_conv, a foreign token in
+         * ngram_ids. */
         e.n_accepted = prefill ? 1 : r.n_accepted + 1;
         e.conv_cursor = s.conv_cursor;
         e.draft = s.draft;
@@ -1358,16 +1355,9 @@ const RadBatch* Scheduler::step() {
          * sequence after this, and restoring it again on a later chunk would rewind it. */
         e.ckpt_restore = s.ckpt_src;
         s.ckpt_src = -1;
-        if (ckpt > 0) {
-            /* The checkpoint is the state AFTER the last token of the chunk, and that token sits
-             * at the interval boundary because the split put it there. */
-            int32_t cs = -1;
-            if (pc_->reserve_checkpoint(r, ckpt, &cs) >= 0 && cs >= 0) {
-                e.ckpt_tok = (int32_t)(want - 1);
-                e.ckpt_slot = cs;
-                ++m_.checkpoints_written;
-            }
-        }
+        /* The checkpoint is the state after the chunk's last token, which the split put at the
+         * interval boundary. */
+        if (ckpt > 0) reserve_ckpt(e, r, ckpt, (int32_t)(want - 1));
         s.entry = (int32_t)plan_.e.size();
         s.sched_tokens = (int32_t)want;
         plan_.e.push_back(e);
@@ -1378,10 +1368,9 @@ const RadBatch* Scheduler::step() {
     }
 
     /* ---------------------------------------------------------- admission */
-    /* Skipped entirely in a step that preempted: the pool just refused a request that already had
-     * blocks, so it will refuse a new one, and the front of the queue is now the request we just
-     * took them from. Probing would cost a lookup per step and admit nothing. */
-    if (!preempted_here) {
+    /* Skipped in a step that preempted: the pool just refused a request that already had blocks,
+     * so it would refuse a new one, and the queue's front is now the preempted request. */
+    if (!preempted_here && !hold_prefill) {
         /* `at` walks the queue and `took_` is what it admitted: a request whose media is not
          * encoded yet stays where it is and the one behind it is asked, so the queue is compacted
          * after the walk rather than cut at its front. */
@@ -1389,31 +1378,28 @@ const RadBatch* Scheduler::step() {
         size_t at = 0;
         while (at < waiting_.size() &&
                (int64_t)plan_.e.size() < cfg_.max_seqs && budget > 0) {
+            /* A step planned for one prefill holds that one (span_now_ above). */
+            if (cfg_.prefill_span > 1 && span_now_ && !plan_.e.empty()) break;
             int32_t slot = waiting_[at];
             SchedReq& s = *reqs_[(size_t)slot];
-            /* A SEQUENCE THE CONTEXT CANNOT HOLD IS NEVER RUN. Its prompt alone reaches the last
-             * position this deployment can address, so there is no room to generate into, and
-             * prefilling it would write positions the block tables and rotary tables do not
-             * have. The server refuses such a prompt at the door; this is the scheduler's own
-             * bound for any caller that did not. close_request takes it out of waiting_, so the
-             * same index now names the next request. */
+            /* A sequence the context cannot hold never runs: its prompt alone reaches the last
+             * addressable position, so prefilling it would write positions the block and rotary
+             * tables lack. The server refuses such prompts; this is the scheduler's own bound.
+             * close_request removes it from waiting_, so `at` now names the next request. */
             if (ctx_limit_ > 0 && s.seq_len() >= ctx_limit_) {
                 RAD_WARN("request %llu failed: %lld tokens leave no room in a %lld-token context",
                          (unsigned long long)s.req->id, (long long)s.seq_len(),
                          (long long)ctx_limit_);
                 close_request(s, ReqState::Failed, "context_length_exceeded", false, true,
                               RAD_E_FULL, "it leaves no room in the context");
-                ++m_.failed;
-                completed_.push_back(s.req->id);
                 continue;
             }
-            /* ITS MEDIA FIRST. A request whose items are not encoded keeps its place and the one
-             * behind it is asked; the engine runs the encoder before the next step
-             * (encodes_pending). */
+            /* Media first: a request whose items are not encoded keeps its place and the next is
+             * asked; the engine encodes before the next step (encodes_pending). */
             if (s.req->media && !media_ready(s)) { ++at; continue; }
-            /* One share left for the next request in the queue, when there is one and a slot
-             * for it (busy_cap). The embed path takes a whole input or nothing, so it is not
-             * held back: a share could only turn its admission into a refusal. */
+            /* Leave one share for the next queued request when there is one and a slot for it
+             * (busy_cap). Embed inputs are whole-or-nothing, so a share could only turn their
+             * admission into a refusal. */
             const int64_t areserve =
                 share_step && !s.req->embed && at + 1 < waiting_.size() &&
                 (int64_t)plan_.e.size() + 1 < cfg_.max_seqs && free_cards_.size() > 1
@@ -1435,9 +1421,8 @@ const RadBatch* Scheduler::step() {
             e.n_tokens = s.sched_tokens;
             e.ctx_len = (int32_t)r.n_computed;
             e.n_spec = 0;
-            /* The sampler sizes its staging off the Request's own window, so it is said here as
-             * well: a request coming back from preemption may still carry a proposal a drafter
-             * set before it was taken off the device. */
+            /* The sampler sizes its staging off the Request's own window, and a request back from
+             * preemption may still carry a drafter's proposal. */
             r.n_draft = 0;
             r.draft = nullptr;
             e.n_accepted = 1;               /* one-based; a prefill rolls nothing back */
@@ -1446,20 +1431,11 @@ const RadBatch* Scheduler::step() {
             e.n_draft = 0;
             e.is_prefill = true;
             e.produces_token = (r.n_computed + s.sched_tokens >= s.seq_len());
-            /* THE ADMISSION PATH IS THE ONE THAT MATTERS for a restore -- admit_one set ckpt_src
-             * moments ago and this is the entry it applies to. Consumed once: the state is in the
-             * slot for the rest of the sequence, and restoring it again on a later chunk would
-             * rewind the recurrence to where the hit started. */
+            /* admit_one just set ckpt_src, and this is the entry it applies to. Consumed once:
+             * restoring again on a later chunk would rewind the recurrence to the hit. */
             e.ckpt_restore = s.ckpt_src;
             s.ckpt_src = -1;
-            if (s.pending_ckpt > 0) {
-                int32_t cs = -1;
-                if (pc_->reserve_checkpoint(r, s.pending_ckpt, &cs) >= 0 && cs >= 0) {
-                    e.ckpt_tok = s.sched_tokens - 1;
-                    e.ckpt_slot = cs;
-                    ++m_.checkpoints_written;
-                }
-            }
+            if (s.pending_ckpt > 0) reserve_ckpt(e, r, s.pending_ckpt, s.sched_tokens - 1);
             s.entry = (int32_t)plan_.e.size();
             plan_.e.push_back(e);
             plan_.n_tok += s.sched_tokens;
@@ -1478,20 +1454,18 @@ const RadBatch* Scheduler::step() {
         }
     }
 
-    /* WHAT THE HELD-BACK CHUNK LEFT FOR OTHERS AND THEY DID NOT TAKE GOES BACK TO IT. The reserve
-     * is a forecast: a decode row drafts less than its window, an admission is refused (the pool
-     * is short, the head of the queue waits on a read), a step preempts and skips admission. A
-     * chunk held to the stager's floor in a step that then carries nothing else is a pass under
-     * the threshold -- exactly the slow step the floor exists to avoid -- so the unused budget is
-     * handed back, as far as the chunk's own geometry allows (plan_chunk) and only if the pool
-     * grants the blocks without a preemption; otherwise the chunk stays as planned. */
+    /* Budget the held-back chunk reserved for others but they did not use goes back to it. The
+     * reserve is a forecast: a decode row drafts less than its window, an admission is refused,
+     * a step preempts and skips admission. A chunk held to the stager's floor in a step with
+     * nothing else is the slow pass the floor exists to avoid, so the unused budget is returned,
+     * as far as plan_chunk allows and only if the pool grants the blocks without preempting. */
     if (capped_at >= 0) {
         StepEntry& e = plan_.e[(size_t)capped_at];
         const Request& r = *e.req;
         SchedReq& s = *reqs_[(size_t)e.slot];
         const int64_t had = e.n_tokens;
-        /* An explicit --busy-prefill-chunk N is a ceiling the operator chose, not a forecast:
-         * the chunk grows back to it at most. */
+        /* An explicit --busy-prefill-chunk N is a ceiling, not a forecast: the chunk grows back
+         * to it at most. */
         int64_t limit = std::min(capped_full, had + budget);
         if (cfg_.busy_prefill_chunk > 0) limit = std::min(limit, std::max(had, cfg_.busy_prefill_chunk));
         int64_t ckpt = -1;
@@ -1500,14 +1474,7 @@ const RadBatch* Scheduler::step() {
         if (grown > had && kv_->ensure_from(r.id, r.n_computed + grown, r.n_computed) >= 0) {
             e.n_tokens = (int32_t)grown;
             e.produces_token = (r.n_computed + grown >= s.seq_len());
-            if (ckpt > 0) {
-                int32_t cs = -1;
-                if (pc_->reserve_checkpoint(r, ckpt, &cs) >= 0 && cs >= 0) {
-                    e.ckpt_tok = (int32_t)(grown - 1);
-                    e.ckpt_slot = cs;
-                    ++m_.checkpoints_written;
-                }
-            }
+            if (ckpt > 0) reserve_ckpt(e, r, ckpt, (int32_t)(grown - 1));
             s.sched_tokens = (int32_t)grown;
             plan_.n_tok += grown - had;
             budget -= grown - had;
@@ -1515,60 +1482,66 @@ const RadBatch* Scheduler::step() {
         if (e.n_tokens < capped_full) ++m_.prefill_chunks_capped;
     }
 
-    if (plan_.e.empty()) return nullptr;
+    if (plan_.e.empty()) { interleave_left_ = 0; held_prefill_ = 0; return nullptr; }
 
-    /* THE DECODE ROWS FIRST, and both halves therefore contiguous.
+    /* Decode rows first, so each half is contiguous. The running loop walks `running_` in
+     * priority order, interleaving the two kinds; sorted, a block can issue the recurrent path
+     * over one run of sequences and the chunked path over the other. cu_seqlens holds absolute
+     * row offsets, so a sub-array needs no rebasing (RadBatch::n_seq_decode).
      *
-     * A mixed step is prefill-shaped for every sequence in it only because the two kinds of row
-     * are interleaved: the running loop walks `running_` in priority order and a request part way
-     * through its prompt sits wherever its priority put it. Sorted, each half is a contiguous run
-     * of sequences, and a block can issue the recurrent path over one and the chunked path over
-     * the other -- cu_seqlens holds absolute row offsets, so a sub-array of it needs no rebasing
-     * and no kernel change (RadBatch::n_seq_decode).
-     *
-     * Stable, so the order within each half is still the order the scheduler chose. `s.entry` is
-     * the index into this vector and every entry's was assigned before the sort, so all of them
-     * are rewritten here -- a stale entry index is a request reading another request's result.
-     *
-     * A pure step sorts to itself and pays one pass over at most max_seqs entries. */
-    std::stable_partition(plan_.e.begin(), plan_.e.end(),
-                          [](const StepEntry& e) { return !e.is_prefill; });
+     * Stable, so each half keeps the scheduler's order. `s.entry` indexes this vector and was
+     * assigned before the sort, so every one is rewritten here; a stale index makes a request
+     * read another's result. */
+    {
+        part_.clear();
+        size_t w = 0;
+        for (size_t i = 0; i < plan_.e.size(); ++i) {
+            if (plan_.e[i].is_prefill) part_.push_back(plan_.e[i]);
+            else plan_.e[w++] = plan_.e[i];
+        }
+        for (const StepEntry& e : part_) plan_.e[w++] = e;
+    }
     for (size_t i = 0; i < plan_.e.size(); ++i) {
         StepEntry& e = plan_.e[i];
         if (e.slot >= 0 && (size_t)e.slot < reqs_.size()) reqs_[(size_t)e.slot]->entry = (int32_t)i;
     }
 
-    /* Phase, from what actually got scheduled. The run phase uses it to index bucket tables, so a
-     * step with one prefill chunk in it is MIXED and not DECODE -- calling it decode would pick
-     * the skinny-GEMM band for a thousand-row GEMM. */
+    /* Phase from what was scheduled; the run phase indexes bucket tables by it. A step with one
+     * prefill chunk is MIXED, not DECODE, or it would pick the skinny-GEMM band for a large
+     * GEMM. */
     bool any_pf = false; int64_t n_dec = 0;
     for (const StepEntry& e : plan_.e) { if (e.is_prefill) any_pf = true; else ++n_dec; }
     plan_.phase = any_pf && n_dec ? RAD_PHASE_MIXED
                 : any_pf         ? RAD_PHASE_PREFILL
                                  : RAD_PHASE_DECODE;
 
-    /* WHAT THE STEP SHAPE COSTS, AND WHAT SPECULATION DID NOT REACH. `steps_mixed` over `steps`
-     * says how often the load produces a step carrying both kinds of row; an agentic load produces
-     * them often enough that it is worth letting such a step draft.
-     *
-     * `decode_rows_unspeculated` is every decode row that took no draft, whatever the reason:
-     * the controller at depth 0, a request that may not speculate, a drafter with nothing to
-     * propose. It counts ROWS rather than any one reason, so it stays the answer to "how much of
-     * my decode is running unspeculated" whatever the current set of reasons is. */
+    /* Step-shape counters. `steps_mixed` / `steps` shows how often a step carries both kinds of
+     * row. `decode_rows_unspeculated` counts every decode row that took no draft, whatever the
+     * reason (depth 0, an ineligible request, nothing to propose). */
     switch (plan_.phase) {
         case RAD_PHASE_PREFILL: ++m_.steps_prefill; break;
         case RAD_PHASE_MIXED:   ++m_.steps_mixed;   break;
         default:                ++m_.steps_decode;  break;
+    }
+    if (cfg_.prefill_interleave > 0) {
+        /* Armed only while a prompt continues past this step: after a last chunk nothing is left
+         * to interleave, and holding would only keep the next request out. */
+        bool continues = false;
+        for (const StepEntry& e : plan_.e)
+            if (e.is_prefill && !e.produces_token) continues = true;
+        if (any_pf) interleave_left_ = any_decoding && continues ? cfg_.prefill_interleave : 0;
+        else if (interleave_left_ > 0) --interleave_left_;
+        if (held_prefill_ > 0) ++m_.steps_held;
     }
     for (const StepEntry& e : plan_.e)
         if (!e.is_prefill && e.n_spec == 0) ++m_.decode_rows_unspeculated;
     plan_.n_seq_decode = n_dec;
     plan_.n_tok_decode = 0;
     for (int64_t i = 0; i < n_dec; ++i) plan_.n_tok_decode += plan_.e[(size_t)i].n_tokens;
-    /* THE ROWS THE CARD'S ACCEPTANCE READS (advance.h), in the final order: each entry's token row
-     * of its first verified position, its first sampled row, and its draft count. Sampled rows
-     * go to the entries that produce a token, 1 + n_spec each, which is the order the builder
-     * writes out_ids in and the engine reads them back in. */
+    /* The rows the card's acceptance reads (advance.h), in final order: each entry's token row of
+     * its first verified position, its first sampled row, and its draft count. Entries that
+     * produce a token get 1 + n_spec sampled rows each, in the order the builder writes out_ids
+     * and the engine reads them back. */
     {
         int64_t k = 0;
         int32_t row = 0;
@@ -1580,27 +1553,11 @@ const RadBatch* Scheduler::step() {
             k += e.n_tokens;
         }
     }
-    /* DIAGNOSTIC, not a policy: RADIANCE_FORCE_MIXED=1 labels a pure-decode step MIXED, which is
-     * the one thing that changes about it -- every sequence still carries one token. It exists to
-     * ask whether the ops an architecture block issues for MIXED are correct at decode lengths,
-     * without needing a concurrent workload to produce a real mixed step. */
-    static const bool force_mixed = [] {
-        const char* v = std::getenv("RADIANCE_FORCE_MIXED");
-        const bool on = v && *v && *v != '0';
-        /* SAID OUT LOUD. A diagnostic whose only evidence is the output it changes cannot be told
-         * apart from one that never took -- and "identical output" is exactly the result this
-         * flag is used to look for, so a silent no-op reads as a pass. */
-        if (on) RAD_WARN("RADIANCE_FORCE_MIXED is set: every pure-decode step is labelled MIXED");
-        return on;
-    }();
-    if (force_mixed && plan_.phase == RAD_PHASE_DECODE) plan_.phase = RAD_PHASE_MIXED;
-
-    /* EVERY SNAPSHOT THIS STEP RESTORES FROM IS STILL IN THE STORE. The prefix cache keeps a
+    /* Every snapshot this step restores from must still be in the store. The prefix cache keeps a
      * handed-out snapshot's slot until the next step begins (PrefixCache::begin_step), so this
-     * holds by construction; it is checked because a restore from a slot the store gave back
-     * reads another session's state or nothing, and the engine can only stop on it. A step that
-     * finds one is abandoned like a failed staging, below: the request gives its hit back and is
-     * prefilled again, and the rest re-schedule unchanged. */
+     * should always hold; it is checked because restoring from a released slot reads another
+     * session's state. A step that fails it is abandoned like a failed staging (below): the
+     * request gives its hit back and is prefilled again. */
     bool lost_restore = false;
     for (const StepEntry& e : plan_.e) {
         if (e.ckpt_restore < 0 || kv_->checkpoint_held(e.ckpt_restore)) continue;
@@ -1614,14 +1571,12 @@ const RadBatch* Scheduler::step() {
     const RadBatch* b = lost_restore ? nullptr : builder_.build(plan_, *kv_, step_);
     if (!b) {
         /* Staging failed. Nothing was computed, so nothing is committed and n_computed did not
-         * advance: the next step re-schedules the same chunks and the KV allocations already made
-         * cover them. Leaving the step OPEN would deadlock the engine on a commit that will never
-         * come, which is worse than losing a step.
+         * advance: the next step re-schedules the same chunks on the KV already allocated. The
+         * step is not left open, or the engine would deadlock waiting for its commit.
          *
-         * THE ONE THING THE RETRY CANNOT RE-SCHEDULE IS A RESTORE. An entry admitted off a
-         * checkpoint carried the slot to resume from, and that was consumed here; the next step
-         * would run the sequence on as if its recurrent state were in place. Such a request goes
-         * back to the queue and gives its hit back, so the next admission looks it up again. */
+         * A restore cannot be re-scheduled: the entry consumed its checkpoint slot, and the next
+         * step would run on as if the recurrent state were in place. Such a request gives its
+         * hit back and returns to the queue for a fresh lookup. */
         for (StepEntry& e : plan_.e) {
             SchedReq& s = *reqs_[(size_t)e.slot];
             s.entry = -1;
@@ -1645,6 +1600,9 @@ const RadBatch* Scheduler::step() {
 bool Scheduler::prefill_continues() const {
     std::lock_guard<std::mutex> lk(mu_);
     if (stage_rows_ <= 0) return false;
+    /* The next step is held to decode rows (--prefill-interleave): experts staged for a chunk now
+     * would be dropped by that step. */
+    if (interleave_left_ > 0) return false;
     for (const StepEntry& e : plan_.e) {
         if (!e.is_prefill || e.slot < 0 || (size_t)e.slot >= reqs_.size() || !reqs_[(size_t)e.slot])
             continue;
@@ -1682,9 +1640,9 @@ void Scheduler::take_encodes(std::vector<std::shared_ptr<mm::Item>>* out) {
 /* ------------------------------------------------------------------ the step's head depth */
 void Scheduler::draft_cycle() {
     if (!draft_.adaptive()) return;
-    /* THE ROWS THE OPENING STEP WILL DECODE: every running sequence past its prompt. Those that
-     * may speculate draft, and their estimates choose D; the rest emit one token each, which is
-     * part of what the step yields and of what it costs. A sequence still prefilling is neither. */
+    /* The rows the opening step will decode: every running sequence past its prompt. Those that
+     * may speculate choose D through their estimates; the rest emit one token each, which still
+     * counts in the step's yield and cost. A sequence still prefilling is neither. */
     draft_est_.clear();
     int n_rows = 0;
     for (int32_t slot : running_) {
@@ -1704,9 +1662,9 @@ void Scheduler::expect_draft(uint64_t id, int n) {
     auto it = by_id_.find(id);
     if (it == by_id_.end()) return;
     SchedReq& s = *reqs_[(size_t)it->second];
-    /* UNDER THE ADAPTIVE WINDOW THE ROUNDS RAN FOR THE DEEPEST SEQUENCE, and this one verifies the
-     * first of them up to its own window -- the cap serial_begin sized the rounds from, unchanged
-     * since: nothing commits between the two, and D is the cycle's (draft_cycle). */
+    /* Under the adaptive window the rounds ran for the deepest sequence; this one verifies the
+     * first of them up to its own window. That is the cap serial_begin used: nothing commits
+     * between the two, and D is the cycle's (draft_cycle). */
     if (draft_.adaptive() && n > 0) {
         const int cap = draft_cap(s);
         if (n > cap) n = cap;
@@ -1728,6 +1686,9 @@ const RadBatch* Scheduler::step_next_locked() {
     if (!step_open_ || next_open_ || plan_.e.empty()) return nullptr;
     /* An admission is a decision about the pool and the queue that the full step makes. */
     if (!waiting_.empty()) return nullptr;
+    /* Once the hold is spent, the held chunk goes into the next full step rather than waiting
+     * behind decode steps issued ahead. */
+    if (held_prefill_ > 0 && interleave_left_ == 0) return nullptr;
 
     plan_next_.reset();
     for (const StepEntry& e : plan_.e) {
@@ -1735,16 +1696,15 @@ const RadBatch* Scheduler::step_next_locked() {
         SchedReq& s = *reqs_[(size_t)e.slot];
         if (!s.req || s.req->state != ReqState::Running || !s.running) return nullptr;
         Request& r = *s.req;
-        /* A chunk in the middle of a prompt continues as a prefill, from where the host knows it
-         * is. And a grammar that cannot rewind decides, when this step commits, whether the next
-         * may speculate; one that can -- and a request with no grammar -- answers as it did. */
+        /* A mid-prompt chunk continues as a prefill from where the host knows it is. A grammar
+         * that cannot rewind decides at commit whether the next step may speculate; one that can,
+         * or no grammar, keeps its answer. */
         if (!e.produces_token || !r.speculation_fixed) return nullptr;
 
-        /* THE FURTHEST CONTEXT THE ROW CAN REACH: every position this step verifies committed,
-         * counted from where the host knows the sequence is -- the last commit -- and not from
-         * this step's own bound, which would add a window of slack every step it is issued
-         * ahead. The card's acceptance says where it really is; this is what the pool, the
-         * block tables and every host-side ceiling are sized for. */
+        /* The furthest context the row can reach: every position this step verifies committed,
+         * counted from the last commit rather than this step's own bound (which would add a
+         * window of slack per step issued ahead). The card knows the real position; this sizes
+         * the pool, the block tables and every host-side ceiling. */
         const int64_t ctx_up = r.n_computed + e.n_tokens;
         const int32_t d      = s.draft_next;
         const int64_t want   = 1 + d;
@@ -1795,9 +1755,8 @@ const RadBatch* Scheduler::step_next_locked() {
 void Scheduler::promote_next() {
     std::lock_guard<std::mutex> lk(mu_);
     if (!next_open_) return;
-    /* The other place a cycle opens: the step issued ahead becomes this one, and step() is not
-     * called. Its proposals were counted under the last cycle's D; the next ones are drafted
-     * under this one. */
+    /* The other place a cycle opens: the step issued ahead becomes current without step(). Its
+     * proposals were counted under the last cycle's D; the next ones are drafted under this one. */
     draft_cycle();
     std::swap(plan_, plan_next_);
     plan_next_.reset();
@@ -1812,6 +1771,11 @@ void Scheduler::promote_next() {
         if (s.req) { s.req->n_draft = plan_.e[i].n_spec; s.req->draft = s.draft; }
     }
     ++m_.steps_decode;
+    /* A step issued ahead during a hold is one of its decode-only steps. */
+    if (interleave_left_ > 0) {
+        --interleave_left_;
+        if (held_prefill_ > 0) ++m_.steps_held;
+    }
     ++m_.steps_ahead;
     for (const StepEntry& e : plan_.e)
         if (e.n_spec == 0) ++m_.decode_rows_unspeculated;
@@ -1833,29 +1797,18 @@ int Scheduler::commit(const StepResult& res) {
 
     const int32_t W = conv_window();
 
-    /* A MIXED STEP DOES NOT RUN THE CHUNKED PATH OVER A SEQUENCE THAT WAS ONLY DECODING, so the
-     * scratch beside its state is not invalidated here.
-     *
-     * The blocks issue the recurrent path over the decode rows of a mixed step and the chunked
-     * path over the prefill ones (RadBatch::n_seq_decode), so those rows leave exactly the replay
-     * factors a decode step leaves, and discarding them would throw away the rollback the next
-     * verify needs. Invalidation would only be correct if a mixed step were prefill-shaped for
-     * everyone in it: the chunked path commits the state directly and leaves no replay factors,
-     * so anything in the scratch would then describe tokens the state already had.
-     *
-     * The one thing that must stay true for that is the ordering: the recurrent path is issued
-     * over sequences [0, n_seq_decode) and nothing else, so a decode row that sorted into the
-     * prefill half would silently take the chunked path and leave stale factors behind it. That
-     * is what the sort in step() and its test are for. */
+    /* A mixed step leaves decode rows the same replay factors as a decode step (recurrent path
+     * over [0, n_seq_decode), chunked over the rest), so their scratch is not invalidated; the
+     * next verify needs it for rollback. This relies on step() sorting decode rows first: one
+     * sorted into the prefill half would take the chunked path and leave stale factors. */
     for (int i = 0; i < res.n_seq; ++i) {
         const StepEntry& e = plan_.e[(size_t)i];
         SchedReq& s = *reqs_[(size_t)e.slot];
         Request& r = *s.req;
         if (r.state != ReqState::Running) {
-            /* Cancelled between step and commit. Its blocks were held until the device finished
-             * with them; that is now. Its SLOT may also be owed back, if the server reaped it in
-             * the same window -- the sweep at the end of this function does that, once every
-             * entry has been retired. */
+            /* Cancelled between step and commit; its blocks were held until the device finished
+             * with them. If the server also reaped it, the sweep at the end of this function
+             * returns the slot once every entry is retired. */
             s.entry = -1;
             /* Unless the drafter's snapshot still names it, or the next step carries it: the
              * sweep below, or that step's commit, releases it once nothing does. */
@@ -1872,31 +1825,27 @@ int Scheduler::commit(const StepResult& res) {
         bool eos = res.eos && res.eos[i] && !r.ignore_eos;
 
         bool overflowed = false;
-        /* A token whose logprobs the engine could not compute (TokenLogprobs::token -1) for a
-         * request that asked for them: the request fails with the reason rather than send that
-         * token without the numbers it was asked for, and nothing after it is sent. */
+        /* A token whose requested logprobs could not be computed (TokenLogprobs::token -1) fails
+         * the request with the reason; that token and everything after it is not sent. */
         bool lp_failed = false;
 
-        /* THE SNAPSHOT THE ENGINE JUST TOOK IS NOW READABLE. Marking it here rather than at
-         * reservation is the difference between a checkpoint and a promise: reserve_checkpoint
-         * runs when the chunk is PLANNED, and a lookup between then and now would adopt a slot
-         * still holding the previous tenant's state. Stream ordering does the rest -- a later
-         * restore is enqueued on the same stream behind this save, so validity does not have to
-         * wait on the copy landing, only on it being issued. */
+        /* The snapshot the engine just took is now readable. Marked here, not at reservation
+         * (which happens at planning), so a lookup in between cannot adopt a slot still holding
+         * the previous tenant's state. A later restore is enqueued on the same stream behind this
+         * save, so issuing the copy is enough. */
         if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && pc_)
             pc_->commit_checkpoint(r, (int64_t)e.ctx_len + e.ckpt_tok + 1);
 
         if (e.is_prefill) {
             r.n_computed += e.n_tokens;
-            /* The chunk is committed: a window group gives its blocks below the window back now,
-             * not at this sequence's next ensure(), which may be steps away while others
-             * prefill. */
+            /* The chunk is committed: a window group returns its blocks below the window now,
+             * not at this sequence's next ensure(), which may be steps away. */
             kv_->trim_window(r.id, r.n_computed);
             step_prefill_tok_ += e.n_tokens;
             server::sink_prompt_progress(r.sink, r.n_computed, (int32_t)r.prompt.size(),
                                          r.n_cached);
-            /* Once, when the prompt is fully placed: the admission accounting the usage block
-             * reports. `n_cached` is what the prefix cache supplied and is not recomputed here. */
+            /* Once, when the prompt is fully placed: the usage block's admission accounting.
+             * `n_cached` is what the prefix cache supplied. */
             if (r.n_computed >= (int64_t)r.prompt.size())
                 server::sink_prompt_stats(r.sink, (int32_t)r.prompt.size(), r.n_cached);
             if (e.produces_token && res.token && r.embed) {
@@ -1911,31 +1860,28 @@ int Scheduler::commit(const StepResult& res) {
                         ? &res.lp[res.first_row[i]] : nullptr;
                 if (lp && lp->token < 0) lp_failed = true;
                 else overflowed = !server::sink_push(r.sink, res.token[i], lp);
-                /* The conv window absorbed this chunk; the cursor advances by one committed
-                 * position, exactly as it does in decode. */
+                /* The conv window absorbed this chunk; the cursor advances one committed
+                 * position, as in decode. */
                 s.conv_cursor = (int32_t)((s.conv_cursor + 1) % (W ? W : 1));
             }
         } else {
             int32_t a = res.n_accepted ? res.n_accepted[i] : 0;
             if (a < 0) a = 0;
             if (a > e.n_spec) a = e.n_spec;
-            /* A ROW ISSUED AHEAD was staged at the furthest context it could reach; it really
-             * continued from the committed end, which is where the host's sequence is. */
+            /* A row issued ahead was staged at the furthest reachable context; it really
+             * continued from the committed end. */
             const int64_t ctx0 = e.dev ? r.n_computed : (int64_t)e.ctx_len;
 
-            /* PAGED KV rolls back: free the blocks past the accepted position, because the KV
-             * written for the rejected tokens is garbage a later step would attend to.
+            /* Paged KV rolls back: blocks past the accepted position are freed, since KV written
+             * for rejected tokens would be attended to later.
              *
-             * LINEAR STATE DOES NOT. The recurrent state and the conv window have already absorbed
-             * the rejected tokens and there is nothing to undo: libr4d's conv update treats the
-             * state cache as a rolling window of width-1 + num_spec entries and reads at the slot
-             * the last accepted token left, so a rejection is a change of READ OFFSET rather than
-             * a recompute (spec §10). The two kinds roll back differently and conflating them is
-             * how you get a model that is subtly wrong only after a rejection. */
+             * Linear state does not. The recurrent state and conv window already absorbed the
+             * rejected tokens; libr4d's conv update treats the state cache as a rolling window of
+             * width-1 + num_spec entries and reads at the slot the last accepted token left, so a
+             * rejection changes the read offset instead of recomputing (spec §10). */
             int64_t valid = ctx0 + 1 + a;
-            /* NOT WHILE THE NEXT STEP IS WRITING PAST IT. A step already issued behind this one
-             * continues the sequence from `valid` and writes its keys and values there and on;
-             * its own commit rolls back to the end it reaches. */
+            /* Not while a step issued ahead writes past `valid`; that step's commit rolls back to
+             * the end it reaches. */
             if (a < e.n_spec && !(next_open_ && s.entry_next >= 0)) {
                 int st = kv_->rollback(r.id, valid);
                 if (st < 0) RAD_WARN("kv rollback for request %llu: %s",
@@ -1944,19 +1890,15 @@ int Scheduler::commit(const StepResult& res) {
             s.conv_cursor = (int32_t)((s.conv_cursor + 1 + a) % (W ? W : 1));
             r.n_accepted = a;
 
-            /* The accepted drafts FIRST and then the verified token, in generation order: the
-             * sink is a stream and a reordering here is a reordering in the client's text.
+            /* Accepted drafts first, then the verified token: the sink is a stream, so order here
+             * is order in the client's text.
              *
-             * AND THE BUDGET IS CHECKED PER TOKEN, because a verify step emits 1 + a of them at
-             * once. Pushing them all and trimming `output` afterwards leaves the SINK holding the
-             * overshoot -- the client has already been streamed tokens it did not ask for, so the
-             * same prompt at the same max_tokens comes back longer with speculation than without.
-             * The same tokens in the same order, just more of them, which is the one way greedy
-             * speculation is allowed to differ and should not. */
+             * The budget is checked per token, because a verify step emits 1 + a at once.
+             * Trimming `output` afterwards would leave the overshoot already streamed, so the
+             * same prompt at the same max_tokens would come back longer with speculation. */
             int64_t room = r.max_tokens > 0
                          ? r.max_tokens - (int64_t)r.output.size() : (int64_t)1 << 62;
-            /* AND THE CONTEXT BOUNDS IT WHATEVER max_tokens SAYS, including "no limit": a
-             * sequence may not grow past the positions this deployment can address. */
+            /* The context bounds it whatever max_tokens says, including no limit. */
             if (ctx_limit_ > 0 && ctx_limit_ - s.seq_len() < room) room = ctx_limit_ - s.seq_len();
             /* `j` is the token's place in the step's emission: its logprobs row is the entry's
              * j-th, when the request asked for them. */
@@ -1978,12 +1920,9 @@ int Scheduler::commit(const StepResult& res) {
 
             if (e.n_spec > 0) {
                 draft_.observe(e.n_spec, a);
-                /* AND THIS SEQUENCE'S OWN ESTIMATE, from the same outcome, under the adaptive
-                 * window -- when the head drafted it. A prompt-lookup proposal is accepted on
-                 * different text by a different rule, and folding it in would price the head's
-                 * next window on what the lookup found. A move takes effect at the next draft:
-                 * this step's drafter has already run, sized from the estimate as it stood before
-                 * this commit. */
+                /* And this sequence's own estimate under the adaptive window, only when the head
+                 * drafted: a prompt-lookup proposal is accepted on different text by a different
+                 * rule. A move takes effect at the next draft; this step's drafter already ran. */
                 if (draft_.adaptive() && !e.ngram) {
                     const int was = s.adapt.depth;
                     const int now = draft_.adapt_observe(s.adapt, e.n_spec, a);
@@ -2009,45 +1948,30 @@ int Scheduler::commit(const StepResult& res) {
         r.n_draft = 0;
         s.entry = -1;
 
-        /* A REQUEST THE NEXT STEP CARRIES FINISHES NOW AND KEEPS ITS BLOCKS: that step is writing
-         * them. Its commit finds the request no longer running and gives them back. */
+        /* A request the next step carries finishes now but keeps its blocks, which that step
+         * writes; its commit finds the request not running and returns them. */
         const bool carried = next_open_ && s.entry_next >= 0;
 
-        /* Finish. The emit above already stops at max_tokens, so `output` cannot run past it --
-         * the resize below is the belt to that braces, kept because a >= test that can only ever
-         * be == is the kind of thing a later change makes wrong quietly. */
+        /* Finish. emit() already stops at max_tokens, so the resize below is a backstop: a >=
+         * test that can only be == is easy to break quietly later. */
         if (overflowed) {
-            /* The sink has already failed the request -- a consumer that far behind is gone --
-             * so all that is left is to stop generating for it and give its blocks back. */
+            /* The sink has already failed the request; stop generating and return its blocks. */
             close_request(s, ReqState::Failed, "sink_overflow", carried);
-            ++m_.failed;
-            completed_.push_back(r.id);
         } else if (lp_failed) {
             close_request(s, ReqState::Failed, "logprobs", carried, true, RAD_E_STATE,
                           "the logprobs of a token it generated could not be computed");
-            ++m_.failed;
-            completed_.push_back(r.id);
         } else if (server::sink_cancelled(r.sink)) {
-            /* The client hung up. Spec §14: the blocks go back now rather than at the end of a
-             * generation nobody will read. */
+            /* The client hung up: the blocks go back now (spec §14). */
             close_request(s, ReqState::Cancelled, "cancelled", carried);
-            ++m_.cancelled;
-            completed_.push_back(r.id);
         } else if (r.max_tokens > 0 && (int64_t)r.output.size() >= r.max_tokens) {
             r.output.resize((size_t)r.max_tokens);
             close_request(s, ReqState::Finished, "length", carried);
-            ++m_.finished;
-            completed_.push_back(r.id);
         } else if (ctx_limit_ > 0 && s.seq_len() >= ctx_limit_) {
-            /* The context is full. The same finish as max_tokens, because to the caller it is
-             * the same thing: the generation ran out of room. */
+            /* The context is full: the same finish as max_tokens, since the generation ran out
+             * of room. */
             close_request(s, ReqState::Finished, "length", carried);
-            ++m_.finished;
-            completed_.push_back(r.id);
         } else if (eos) {
             close_request(s, ReqState::Finished, "stop", carried);
-            ++m_.finished;
-            completed_.push_back(r.id);
         }
     }
 
@@ -2055,47 +1979,27 @@ int Scheduler::commit(const StepResult& res) {
     m_.decode_tokens += step_decode_tok_;
     ++m_.steps;
 
-    /* Every entry is retired now, so anything whose reap or free was deferred on THIS step is
-     * releasable, and so is anything deferred on the last drafter snapshot, which block_end() or
-     * serial_end() has cleared since. Every pass that named them was issued before this step's
-     * readback, which waited for the compute stream. */
+    /* Every entry is retired, so anything deferred on this step, or on a drafter snapshot that
+     * block_end() / serial_end() has since cleared, can be released: every pass naming them was
+     * issued before this step's readback, which waited for the compute stream. */
     sweep_deferred();
     return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ the end of a step */
-/* THE STEP IS NOT OVER AT COMMIT, and timing it there is wrong by the whole draft pass.
+/* Closes the step's timing after the drafter has run. The next step's drafter runs after commit,
+ * the first moment its inputs exist, and its rounds are real forward passes; timed at commit they
+ * would be charged to nothing, so step time would read short and `decode_tps` high. A caller that
+ * drives only commit() (the scheduler tests) gets counters and no timing.
  *
- * The drafter for the NEXT step runs after commit, because that is the first moment both of its
- * inputs exist -- the token the sampler chose, and which drafted position it came from. Its rounds
- * are real forward passes through the draft head. Timed at commit they fall between that commit
- * and the next step(), a gap the engine loop charges to nothing at all: the reported step time
- * comes out short by the draft pass and `decode_tps` -- which divides by the same interval --
- * comes out correspondingly high, which is the direction of error nobody reports.
+ * The rate is tokens over wall time across a decayed window, not an average of step rates: the
+ * host does not wait on the card every step (a prefill chunk that samples nothing commits while
+ * the card still runs it), so per-step rates are skewed by short intervals. Wall time runs from
+ * the last step's end (so a step issued ahead is counted once), or from this step's start after
+ * an idle gap. A step with no tokens of a kind still adds its time, or that rate would freeze.
  *
- * So the engine says when the iteration is genuinely finished and the accounting happens here.
- * Separate from commit() rather than folded into it because they answer different questions:
- * commit() retires a step's tokens, and this closes the engine's loop around it. A caller that
- * only drives commit() -- the scheduler tests -- gets correct counters and no timing, which is
- * the honest answer for a step that never ran on a device.
- *
- * THE RATE IS TOKENS OVER WALL TIME ACROSS A WINDOW, NOT AN AVERAGE OF STEP RATES. A step's
- * interval is host time, and the host does not wait on the card at every step: a prefill chunk
- * that samples nothing is committed while the card is still on it, and a later step's wait pays
- * for it. Averaged as rates, those short intervals dominate -- a 2048-token chunk committed 70 ms
- * after it began reads 30K tok/s -- while the step that absorbed the wait counts once, and the
- * same skew reads decode high. Summed, all of the time is there: each kind's tokens and the wall
- * time since the last step ended -- which also covers a step issued ahead, whose start precedes
- * its predecessor's end, without counting that overlap twice -- or since this step began, when
- * the engine sat idle in between; all three decayed with one time constant.
- *
- * A STEP WITH NO TOKENS OF A KIND STILL ADDS ITS TIME. Skipping it instead would freeze the rate
- * at whatever it last was, so a server that prefilled once long ago would report that prefill
- * throughput for the rest of its life, and a busy engine can read as an idle one.
- *
- * Not a device measurement: enabling per-op timing restores synchronisations that change the
- * mover's slot supply, so a profiled run is not comparable anyway (spec §16). This is the number
- * an operator can always have. */
+ * Host timing, always available. Per-op device timing adds synchronisations that change the
+ * mover's slot supply, so profiled runs are not comparable (spec §16). */
 void Scheduler::step_finished() {
     std::lock_guard<std::mutex> lk(mu_);
     if (step_start_.time_since_epoch().count() == 0) return;   /* no step has run */
@@ -2109,9 +2013,8 @@ void Scheduler::step_finished() {
     const auto   from = step_start_ - last_step_at_ < std::chrono::milliseconds(500)
                             ? last_step_at_ : step_start_;
     const double wall = std::chrono::duration<double>(step_end - from).count();
-    /* The window ages by the time that PASSED, idle included, so a phase that ended -- a prefill
-     * burst before a decode run -- leaves it at the window's own rate; only the busy part is
-     * added as time the tokens took. */
+    /* The window ages by all elapsed time, idle included; only the busy part is added as time the
+     * tokens took. */
     const double aged = std::chrono::duration<double>(step_end - last_step_at_).count();
     if (wall > 0) {
         constexpr double kWindowS = 1.0;
@@ -2119,23 +2022,21 @@ void Scheduler::step_finished() {
         tps_win_prefill_ = tps_win_prefill_ * f + (double)step_prefill_tok_;
         tps_win_decode_  = tps_win_decode_  * f + (double)step_decode_tok_;
         tps_win_time_    = tps_win_time_    * f + wall;
-        /* AT LEAST HALF A SECOND OF TIME UNDER THE RATE. After an idle spell the window starts
-         * over, and a burst's first chunk is committed as soon as it is issued: 2048 tokens over
-         * those few milliseconds is exactly the spike this replaces. Held to half a second the
-         * first reads are low instead, and the steady window (about a second) is not touched. */
+        /* At least half a second of time under the rate. After an idle spell the window starts
+         * over and a burst's first chunk commits as soon as it is issued, which would spike the
+         * rate; with the floor the first reads are low instead, and the steady (~1 s) window is
+         * unaffected. */
         const double t = std::max(tps_win_time_, 0.5);
         m_.prefill_tps = (float)(tps_win_prefill_ / t);
         m_.decode_tps  = (float)(tps_win_decode_  / t);
-        /* An exponential decay approaches zero and never arrives, and 7e-14 tok/s is a number
-         * nobody wants to read. Below a twentieth of a token a second it IS zero. */
+        /* The decay never reaches zero; below 0.05 tok/s it reads as zero. */
         if (m_.prefill_tps < 0.05f) m_.prefill_tps = 0.0f;
         if (m_.decode_tps  < 0.05f) m_.decode_tps  = 0.0f;
     }
-    /* AND WHAT THE STEP COST AT ITS DEPTH, for the adaptive window (draft.h): the same wall time,
-     * which is the step's share of the loop -- the draft rounds that followed it included, and a
-     * step issued ahead counted from the end of the one before rather than twice. A decode step
-     * only: a prefill chunk's time is the chunk's, not the window's. Keyed by the deepest window
-     * the step verified, which is the head depth it ran at whenever D held from the step before. */
+    /* The step's cost at its depth, for the adaptive window (draft.h): the same wall time,
+     * including the draft rounds after it, with a step issued ahead counted once. Decode steps
+     * only. Keyed by the deepest window the step verified, which is the head depth it ran at
+     * whenever D held from the step before. */
     if (draft_.adaptive() && plan_.phase == RAD_PHASE_DECODE && plan_.n_spec > 0 && wall > 0) {
         int rows = 0;
         for (const StepEntry& e : plan_.e) rows += (e.produces_token && !e.is_prefill) ? 1 : 0;
@@ -2147,40 +2048,33 @@ void Scheduler::step_finished() {
 }
 
 /* ------------------------------------------------------------------ the serial drafter */
-/* Which sequences may take a serial draft after the step just committed, and what each of them
- * needs. Called while plan() still describes that step, because everything here is a coordinate
- * INTO it: the head reads the trunk's hidden states out of the buffer the step just filled.
+/* Which sequences may take a serial draft after the step just run, and what each needs. Called
+ * while plan() still describes that step, since everything here indexes into it: the head reads
+ * the trunk's hidden states from the buffer the step filled.
  *
- * THE HEAD'S INDEXING, which StepPlan::tok_shift carries: head index i reads hidden(i) and the
- * token at i + 1, writes its K and V at KV position i, and predicts i + 2. So after a step that
- * committed `n_computed` positions, the newest index the head can serve is n_computed - 1 --
- * its hidden state is the last row the trunk produced and the token one on is the one the
- * sampler just chose. That is draft round 1, and each round after it steps one position further out.
- */
+ * Head indexing (StepPlan::tok_shift): head index i reads hidden(i) and the token at i + 1,
+ * writes K and V at position i, and predicts i + 2. After a step that committed `n_computed`
+ * positions the newest index the head can serve is n_computed - 1; that is draft round 1, and
+ * each later round is one position further. */
 int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
     std::lock_guard<std::mutex> lk(mu_);
     serial_.clear();
     if (!rounds || *rounds <= 0 || !out || max <= 0) return 0;
 
-    /* MAY ANYTHING DRAFT AT ALL? The controller decides depth from measured acceptance, and 0 means
-     * it has turned drafting off. That is the whole test: a step carrying a prefill chunk is not
-     * itself a reason to refuse, because its decode rows still take the recurrent path.
-     *
-     * Neither answer stops the HISTORY pass. The head's own K and V have to be filled whether or
-     * not this particular step drafts -- a sequence three chunks into a long prompt is exactly the
-     * case where nothing can draft yet and the history is exactly what will be needed. */
+    /* May anything draft? The controller sets depth from measured acceptance; 0 means drafting is
+     * off. A step carrying a prefill chunk is no reason to refuse, since its decode rows still
+     * take the recurrent path. Neither answer skips the history pass: the head's K and V must be
+     * filled either way, e.g. for a sequence still in the middle of a long prompt. */
     const int depth = draft_.next_depth();
     bool may_draft = depth > 0;
     if (depth > 0 && *rounds > depth) *rounds = depth;
     if (*rounds > RAD_SCHED_MAX_SPEC) *rounds = RAD_SCHED_MAX_SPEC;
 
-    /* UNDER THE ADAPTIVE WINDOW, NO MORE ROUNDS THAN THE DEEPEST SEQUENCE WANTS. A round is one
-     * pass of the head over every drafting row, so the step runs as many as its deepest window,
-     * and a sequence that wants fewer verifies the first of them (expect_draft, set_draft); a
-     * round past the deepest window is a pass whose proposal nobody verifies. Only a row that will
-     * draft and be given its drafts counts. When no row does, the rounds stay as they are: round 0
-     * is the history pass, and that still has to run. The reservation below is then made for the
-     * rounds that will actually run, which is what it is for. */
+    /* Under the adaptive window, no more rounds than the deepest sequence wants. A round is one
+     * head pass over every drafting row, and a sequence that wants fewer verifies the first of
+     * them (expect_draft, set_draft); a round past the deepest window drafts for nobody. Only a
+     * row that will draft counts. With none, the rounds stay as they are, because round 0 is the
+     * history pass. The lookahead reservation below then matches the rounds that will run. */
     if (may_draft && draft_.adaptive()) {
         int want = 0;
         for (const StepEntry& e : plan_.e) {
@@ -2208,45 +2102,32 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
         if (!s.req || s.req->state != ReqState::Running || !s.running) continue;
         Request& r = *s.req;
 
-        /* THE VERIFIED POSITIONS: the last 1 + n_spec of the entry. Round 1 continues from the
-         * last committed one, which is the first of them plus however many drafts were accepted
-         * -- a number the card has and the host does not yet, so the host bounds it by all of
-         * them. A chunk in the middle of a prompt verified nothing and continues nothing. */
+        /* The verified positions are the entry's last 1 + n_spec. Round 1 continues from the last
+         * committed one, which depends on acceptance the card knows and the host does not yet,
+         * so the host bounds it by all of them. A mid-prompt chunk verified nothing. */
         const int64_t vstart = (int64_t)e.ctx_len + e.n_tokens - 1 - e.n_spec;
         const int64_t head_max = vstart + e.n_spec;
         bool can_draft = may_draft && e.produces_token;
 
-        /* THE LOOKAHEAD KV. Round k writes the head's K and V at position head + k - 1, which runs
-         * past the committed end, so the blocks have to exist before the round does -- for the
-         * furthest head acceptance could leave. They are the same blocks the next verify step
-         * writes the trunk's own K and V into, so this reservation is one the next step would
-         * have made anyway.
-         *
-         * A ROW THAT CANNOT HAVE THEM STILL OWES ITS HISTORY. The history pass writes positions
-         * the sequence already holds blocks for, so a refused lookahead is a reason not to draft
-         * and not a reason to skip the row: skipping it would leave the positions this step added
-         * unwritten in the head's layer for good. The same goes for a row too near the end of the
-         * context for its rounds, whose last positions do not exist. */
+        /* Lookahead KV: round k writes the head's K and V at head + k - 1, past the committed end,
+         * so blocks must exist up to the furthest head acceptance could leave. The next verify
+         * writes the trunk's K and V there, so it would reserve them anyway. A row refused
+         * lookahead (or too near the context end) still owes its history, which writes positions
+         * it already has blocks for; skipping it would leave them unwritten in the head's layer. */
         if (can_draft && ctx_limit_ > 0 && head_max + *rounds > ctx_limit_) can_draft = false;
         if (can_draft && kv_->ensure_from(r.id, head_max + *rounds, r.n_computed) < 0)
             can_draft = false;
 
-        /* THE HISTORY THIS STEP OWES, in two parts. Before the verified positions, the positions
-         * the step computed whose next token the host holds -- a prefill chunk's prompt -- from
-         * the watermark on, clamped to the rows this step produced: a prefix-cache hit adopts
-         * blocks whose head layer somebody else wrote, and there are no hidden states here to
-         * redo those from. Then the verified positions themselves, all 1 + n_spec of them, whose
-         * next tokens are the sampler's picks and exist only on the card.
+        /* The history this step owes: first the positions whose next token the host holds (a
+         * prefill chunk's prompt), from the watermark on, clamped to rows this step produced (a
+         * prefix hit's adopted blocks have no hidden states here to redo them from); then all
+         * 1 + n_spec verified positions, whose next tokens exist only on the card.
          *
-         * ALL OF THEM, AND THE LAST ROW IS DRAFT ROUND 1. The card fills the rows past the last
-         * committed position with that position again (advance.h, ADV_HIST), so the final row of
-         * the run always holds exactly round 1's inputs -- the committed position, the trunk's
-         * hidden state there and the token it chose after it -- and a drafting row takes its
-         * round-1 proposal from it (RadBatch::draft_out_ids) instead of from a pass of its own.
-         *
-         * THE VERIFIED PART HAS A FIXED SHAPE. The repeats write the committed position's key and
-         * value again, identical to the first; nothing past it is written, so no query can reach
-         * a rejected draft's state. */
+         * The last row is draft round 1: the card fills rows past the last committed position
+         * with that position again (advance.h, ADV_HIST), so the final row holds round 1's inputs
+         * and a drafting row takes its proposal from it (RadBatch::draft_out_ids). The repeats
+         * rewrite identical K and V and nothing past it is written, so no query can see a
+         * rejected draft's state. */
         const int64_t owed_end = e.produces_token ? vstart : (int64_t)e.ctx_len + e.n_tokens;
         int64_t hs = s.draft_filled > e.ctx_len ? s.draft_filled : (int64_t)e.ctx_len;
         if (hs > owed_end) hs = owed_end;
@@ -2254,9 +2135,8 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
         const int64_t verified = e.produces_token ? e.n_spec + 1 : 0;
         int64_t hist_n = lead + verified;
 
-        /* A HEAD WITH NO CACHE OF ITS OWN IS OWED NO HISTORY (rad_drafter_shared_kv). Its one row
-         * is round 1's -- the committed position, whichever of the verified ones the card says it
-         * is -- and a sequence that does not draft has nothing to run at all. */
+        /* A head with no cache of its own owes no history (rad_drafter_shared_kv). Its one row is
+         * round 1's at the committed position, and a non-drafting sequence runs nothing. */
         if (serial_shared_) {
             if (!can_draft) continue;
             hs = vstart;
@@ -2272,8 +2152,8 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
         m.card       = e.card;
         m.hist_row   = (int32_t)(base + (hs - e.ctx_len));
         m.hist_n     = (int32_t)hist_n;
-        /* The shared head's one row sits wherever the card's acceptance puts it; the host stages
-         * the furthest that can be, as it does for every round. */
+        /* The shared head's one row sits where the card's acceptance puts it; the host stages
+         * the furthest it can be, as for every round. */
         m.hist_pos   = serial_shared_ ? head_max : hs;
         m.dev        = e.produces_token;
         m.dev_tok    = (int32_t)(base + (vstart - e.ctx_len));
@@ -2311,10 +2191,10 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
     serial_plan_.tok_shift  = 1;           /* the head's own indexing; see StepPlan::tok_shift */
     serial_plan_.e.reserve(serial_.size());
 
-    /* THE DRAFTING SEQUENCES FIRST, in draft order, then the ones that only owe history. Every
-     * round's rows are the drafting sequences in that order, and at depth 1 the history pass is a
-     * group's last pass -- so its first rows are where the advance that takes the last proposal
-     * (ADV_TAKE) reads them, whichever pass that is. */
+    /* Drafting sequences first, in draft order, then history-only ones. Every round's rows are
+     * the drafting sequences in that order, and at depth 1 the history pass is the group's last
+     * pass, so its first rows are where the advance that takes the last proposal (ADV_TAKE)
+     * reads them. */
     for (int part = 0; part < 2; ++part)
     for (size_t i = 0; i < serial_.size(); ++i) {
         const SerialSeq& m = serial_[i];
@@ -2322,8 +2202,8 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
         if (round == 0 && m.hist_n <= 0) continue;      /* nothing owed for this sequence */
         if (round > 0 && m.draft_idx < 0) continue;     /* history only: no token to propose */
         const Request* rq = serial_req(m);
-        /* Cannot happen while reap() defers on block_holds(), and this is what says so: a whole
-         * round skipped is a lost draft, which costs acceptance for one step and nothing else. */
+        /* Unreachable while reap() defers on block_holds(); if it happens the round is skipped,
+         * costing one step's draft. */
         if (!rq) return nullptr;
 
         StepEntry e;
@@ -2332,20 +2212,19 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
         e.slot     = m.slot;
         e.card     = m.card;
         e.n_tokens = round == 0 ? m.hist_n : 1;
-        /* A round's position is the card's; the host stages the furthest it can be, which is what
-         * every host-side ceiling reads. The history's are known here exactly. A head with no
-         * cache of its own does not step forward, so neither does its ceiling. */
+        /* A round's position is the card's; the host stages the furthest it can be, which every
+         * host-side ceiling reads. History positions are exact. A head with no cache of its own
+         * does not step forward, so neither does its ceiling. */
         e.ctx_len  = (int32_t)(round == 0 ? m.hist_pos
                                           : m.base_pos + (serial_shared_ ? 0 : round - 1));
         e.n_spec   = 0;
-        /* One-based and constant: a head pass commits exactly the tokens it was handed. The head
-         * issues no linear-state op, so nothing reads it; it is set rather than left at a value
-         * the kernels cannot take. */
+        /* One-based and constant: a head pass commits exactly the tokens it was given. The head
+         * has no linear-state op to read it; it is set to a value the kernels accept. */
         e.n_accepted  = 1;
         e.conv_cursor = 0;
-        /* NO DRAFT ARRAY. A history row's tokens past its lead, and every round's token, are the
-         * card's (advance.h); token_at() stages a 0 in their place, and the positions before the
-         * lead are the prompt, which it stages exactly. */
+        /* No draft array: a history row's tokens past its lead, and every round's token, come
+         * from the card (advance.h); token_at() stages 0 for them, and the positions before the
+         * lead are the prompt, staged exactly. */
         e.draft   = nullptr;
         e.n_draft = 0;
         e.is_prefill     = false;
@@ -2363,14 +2242,9 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
     }
     if (serial_plan_.e.empty()) return nullptr;
 
-    /* RADIANCE_DEBUG_STAGE: THE BATCH HALF, AND IT IS NOT THE COST. Splits a draft pass into the
-     * plan loop above and `builder_.build`, which stages the block tables and slots, and reports
-     * the average of each. Both are small fractions of what a pass spends ISSUING it
-     * (engine_draft.cpp has the five-way split): staging a draft batch is effectively free, and
-     * the block-table rectangle it copies -- sized for the worst step, not this one -- is not on
-     * any critical path worth shrinking.
-     *
-     * Off by default and it costs two clock reads when it is on, so it can stay. */
+    /* RADIANCE_DEBUG_STAGE: splits a draft pass's host staging into the plan loop above and
+     * `builder_.build`, reporting the average of each. Both are small next to issuing the pass
+     * (engine_draft.cpp has that split). Off by default; two clock reads when on. */
     if (!stg) return builder_.build(serial_plan_, *kv_, step);
 
     static double acc_plan = 0.0, acc_build = 0.0;
@@ -2381,19 +2255,17 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
     acc_plan  += std::chrono::duration<double, std::micro>(t1 - t_stage0).count();
     acc_build += std::chrono::duration<double, std::micro>(t2 - t1).count();
     if (++n_calls % 400 == 0)
-        std::fprintf(stderr, "D stage: %ld draft batches, plan %.1f us, build %.1f us a call\n",
-                     n_calls, acc_plan / (double)n_calls, acc_build / (double)n_calls);
+        RAD_INFO("stage: %ld draft batches; plan %.1f us, build %.1f us a call",
+                 n_calls, acc_plan / (double)n_calls, acc_build / (double)n_calls);
     return b;
 }
 
-/* The watermark moves to what actually ran, and it is read off the COMMITTED sequence: the history
- * pass wrote the head's K and V at the last committed index, n_computed - 1, from the trunk's own
- * hidden state and the committed token, so after it the head's history is exact up to
- * n_computed. The rounds past it write SPECULATIVELY -- correct only for the drafts that turn out
- * to be accepted -- and are deliberately not counted: redoing them next step costs one head pass
- * over a couple of tokens and removes the whole question. A row that only owed history is exact
- * up to where the history reached; that is n_computed too when it covered the verified positions,
- * and its host-known end when it did not. */
+/* The watermark moves to what actually ran, read off the committed sequence: the history pass
+ * wrote the head's K and V at n_computed - 1 from the trunk's hidden state and the committed
+ * token, so the history is exact up to n_computed. Rounds past it write speculatively and are not
+ * counted; redoing them next step costs one head pass over a few tokens. A history-only row is
+ * exact up to where its history reached: n_computed if it covered the verified positions, its
+ * host-known end otherwise. */
 void Scheduler::serial_end(int rounds_done) {
     std::lock_guard<std::mutex> lk(mu_);
     for (const SerialSeq& m : serial_) {
@@ -2405,23 +2277,18 @@ void Scheduler::serial_end(int rounds_done) {
         const bool counts = m.dev ? (rounds_done >= 1 || m.draft_idx < 0) : true;
         if (counts && filled > s.draft_filled) s.draft_filled = filled;
     }
-    /* THE SNAPSHOT ENDS HERE. Every pass that names these rows has been built, so nothing reads
-     * them again, and holding them any longer would keep deferring the release of a request that
-     * was cancelled or reaped while the rounds ran. */
+    /* The snapshot ends here: every pass naming these rows is built, and keeping them would keep
+     * deferring the release of a request cancelled or reaped while the rounds ran. */
     serial_.clear();
 }
 
 /* ------------------------------------------------------------------- the block drafter */
-/* Which sequences the drafter runs over after the step just committed, and which of those may also
- * propose. Called while plan() still describes that step, because the context pass MIRRORS it.
- *
- * The mirror is exact, including a verify step's rejected suffix. That is not sloppiness, it is
- * what keeps the pass free of coordinates: the drafter reads the trunk's tapped hidden states
- * positionally out of a buffer of its own, so batch row i must be buffer row i, and trimming
- * one entry would slide every entry after it. The rejected positions are all inside [n_computed,
- * n_computed + block), which the query pass overwrites before anything reads it -- and the one
- * ensure() below covers them, because n_computed + block is at least the trunk step's own end.
- */
+/* Which sequences the drafter runs over after the step just committed, and which of them may
+ * also propose. Called while plan() still describes that step, because the context pass mirrors
+ * it exactly, rejected suffix included: the drafter reads hidden states positionally from its
+ * own buffer, so batch row i must be buffer row i. The rejected positions lie in [n_computed,
+ * n_computed + block), which the query pass overwrites before anything reads them, and the
+ * ensure() below covers them since n_computed + block reaches the trunk step's own end. */
 int Scheduler::block_begin(int block, int depth, int window, int32_t mask, BlockRow* out, int max) {
     std::lock_guard<std::mutex> lk(mu_);
     block_.clear();
@@ -2432,14 +2299,16 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
     block_depth_ = (int32_t)depth;
     block_mask_.assign((size_t)(block - 1), mask);
 
-    /* NOT the drafter's declared `depth` above -- this is how many tokens the draft POLICY wants
-     * out of this step, which is zero when it has backed off. The two were both called `depth`. */
+    /* Not the drafter's declared `depth`: whether the draft policy wants any tokens this step
+     * (0 when it has backed off). */
     const bool may_draft = draft_.next_depth() > 0;
-    /* THE QUERY PASS IS `block` TOKENS A DRAFTING SEQUENCE, and the builder's staging arrays are
-     * sized at max_tok. A decode step is one token a sequence, so nothing before this could ever
-     * put more rows in a batch than sequences -- this pass can, and eight rows a sequence against
-     * a small token budget is exactly the shape that would run off the end of h_tok. */
-    if ((int64_t)max * block > cfg_.max_tok) max = (int)(cfg_.max_tok / block);
+    /* The query pass is `block` tokens per drafting sequence, and the builder's staging arrays
+     * are sized at max_tok. Unlike a decode step it can put more rows than sequences in a batch,
+     * which on a small token budget would overrun h_tok. Under --prefill-span a step of several
+     * sequences is bounded by the shared budget instead (RadBuildCtx::max_mixed_tok), which is
+     * max_tok without a span. */
+    const int64_t mixed = geo_.shared_tok > 0 ? geo_.shared_tok : cfg_.max_tok;
+    if ((int64_t)max * block > mixed) max = (int)(mixed / block);
     if (max <= 0) return 0;
 
     int n_draft_rows = 0;
@@ -2453,12 +2322,10 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
         d.ctx_len  = e.ctx_len;
         d.n_tokens = e.n_tokens;
 
-        /* EVERY ENTRY OF THE TRUNK STEP GETS A ROW, IN ORDER, whether or not its sequence is
-         * still running. The drafter reads the trunk's hidden states positionally out of a buffer
-         * of its own, so the context pass's row i has to be the trunk's row i; a sequence the
-         * commit just finished that was left out would put every sequence after it onto its
-         * neighbour's hidden states. It stays as a placeholder row that stores nothing -- see
-         * BlockSeq::mirror. */
+        /* Every entry of the trunk step gets a row, in order, running or not: the context pass's
+         * row i must be the trunk's row i, so leaving out a sequence the commit just finished
+         * would shift every later one onto its neighbour's hidden states. It stays as a
+         * placeholder (BlockSeq::mirror). */
         SchedReq* sp = (e.slot >= 0 && (size_t)e.slot < reqs_.size()) ? reqs_[(size_t)e.slot].get()
                                                                         : nullptr;
         if (!sp || !sp->req || sp->req->id != e.seq || sp->req->state != ReqState::Running ||
@@ -2471,25 +2338,22 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
         Request& r = *s.req;
         d.base_pos = r.n_computed;
 
-        /* MAY IT PROPOSE? It needs a token to anchor on -- which is the one the sampler just
-         * chose, so the entry has to have produced one -- and it needs a draft cache that covers
-         * what the block's attention will read. The high end is this step's own context pass,
-         * which has not run yet and is about to cover everything up to the trunk's end. The low
-         * end is draft_lo, which is non-zero only after a prefix-cache hit THAT LEFT A HOLE. */
+        /* May it propose? It needs an anchor token (the one the sampler just chose, so the entry
+         * produced one) and a draft cache covering what the block's attention reads. The high end
+         * is this step's context pass, about to cover everything up to the trunk's end. The low
+         * end is draft_lo, non-zero only after a prefix-cache hit that left a hole. */
         const bool have_tok = e.produces_token && !r.output.empty() && r.n_computed >= 1;
-        /* Where this sequence's draft cache will start once the context pass about to run has
-         * written: its own floor, or -- for a sequence that has never had one -- wherever this
-         * step's first row sits, which is 0 for an ordinary prefill and the hit length for a
-         * prefix-cache hit. The binding query row is the LOWEST one, at n_computed, and it reads
-         * back to n_computed - window + 1. */
+        /* Where this sequence's draft cache starts once the context pass has run: its own floor,
+         * or for a sequence that never had one, this step's first row (0 for an ordinary prefill,
+         * the hit length after a prefix-cache hit). The binding query row is the lowest, at
+         * n_computed, and it reads back to n_computed - window + 1. */
         const int64_t lo = draft_floor(s, (int64_t)e.ctx_len);
         const bool reach = lo <= 0 ? true
                                    : (window > 0 && r.n_computed - window + 1 >= lo);
 
-        /* RADIANCE_DEBUG_DRAFT: WHICH GATE DECLINED. A drafter that quietly stops proposing reads
-         * downstream as "acceptance collapsed" -- the accept% metric is conditional on having
-         * drafted at all, so it stays healthy while tok/step falls to 1. No counter distinguishes
-         * the two, and nothing else tells the five gates below apart. */
+        /* RADIANCE_DEBUG_DRAFT counts which gate declined. A drafter that silently stops
+         * proposing looks like collapsed acceptance downstream (accept% is conditional on
+         * drafting), and no other counter tells the five gates apart. */
         const bool ok_room = n_draft_rows < max;
         /* The query block writes positions n_computed .. n_computed + block - 1, and none of them
          * may be at or past the end of the context. */
@@ -2540,11 +2404,10 @@ const RadBatch* Scheduler::block_context(int step) {
 
     for (const BlockSeq& d : block_) {
         const Request* rq = block_req(d);
-        /* Cannot happen while reap() defers on block_holds(), and this is what says so: a whole
-         * round skipped is a lost draft, which costs acceptance for one step and nothing else.
-         * A placeholder row may have lost its Request before block_begin ran -- the server reaps
-         * a finished request as soon as its sink is done -- and needs none: this pass reads no
-         * token ids, and its KV is gone, so the builder stages it as padding. */
+        /* Unreachable for a live row while reap() defers on block_holds(); if it happens the pass
+         * is skipped, costing one step's draft. A placeholder row may have lost its Request
+         * before block_begin (the server reaps a finished request as soon as its sink is done)
+         * and needs none: this pass reads no token ids and the builder stages it as padding. */
         if (!rq && !d.mirror) return nullptr;
         StepEntry e;
         e.req        = rq;
@@ -2555,8 +2418,8 @@ const RadBatch* Scheduler::block_context(int step) {
         e.ctx_len    = d.ctx_len;
         e.n_spec     = 0;
         e.n_accepted = 1;               /* one-based; nothing in this pass reads it */
-        /* The context pass touches no token ids at all -- it starts from the tapped hidden states
-         * -- so there is nothing to shift and no draft to reach into. */
+        /* The context pass reads tapped hidden states, not token ids: nothing to shift and no
+         * draft. */
         e.produces_token = false;
         block_plan_.e.push_back(e);
         block_plan_.n_tok += e.n_tokens;
@@ -2565,15 +2428,15 @@ const RadBatch* Scheduler::block_context(int step) {
     return builder_.build(block_plan_, *kv_, step);
 }
 
-/* One entry a drafting sequence, `block` tokens: the anchor at the sequence's next position, then
- * `block - 1` masks. `out_ids` names THE LAST `depth` ROWS.
+/* One entry per drafting sequence, `block` tokens: the anchor at the sequence's next position,
+ * then `block - 1` masks. `out_ids` names the last `depth` rows.
  *
- * AT block = depth + 1 that is rows 1..depth, the mask rows: the anchor row predicts nothing and
- * each mask row predicts the token at ITS OWN position (vLLM's _prepare_dflash_inputs_kernel:
- * is_sample = query_off >= 1, sample_pos = query_pos). AT block = depth it is every row, anchor
- * included, and each predicts the token AFTER it -- the ordinary next-token relation, which is
- * what a drafter whose reference reads `hidden[:, -block_size:, :]` was trained in. One rule,
- * both conventions; rad_builder.h argues why the plugin is what states which. */
+ * At block = depth + 1 those are the mask rows: the anchor predicts nothing and each mask row
+ * predicts the token at its own position (vLLM's _prepare_dflash_inputs_kernel: is_sample =
+ * query_off >= 1, sample_pos = query_pos). At block = depth it is every row, anchor included,
+ * each predicting the token after it: the ordinary next-token relation that a drafter whose
+ * reference reads `hidden[:, -block_size:, :]` was trained in. rad_builder.h explains why the
+ * plugin states which. */
 const RadBatch* Scheduler::block_query(int step) {
     std::lock_guard<std::mutex> lk(mu_);
     if (block_.empty() || block_len_ < 2 || block_depth_ <= 0) return nullptr;
@@ -2604,21 +2467,9 @@ const RadBatch* Scheduler::block_query(int step) {
         e.draft      = block_mask_.data();
         e.n_draft    = steps;
         e.produces_token = false;
-        /* THE LAST `depth` ROWS OF THE BLOCK. At block = depth + 1 that skips the anchor; at
-         * block = depth it starts on it, because there the anchor row is a predicting row.
-         *
-         * RADIANCE_DFLASH_ANCHOR=1 slides the head one row EARLIER, onto the anchor, and so does
-         * nothing at block = depth where it already sits there. The anchor is an ordinary row: a
-         * real token, embedded, with the whole context behind it -- so its hidden state predicts
-         * the token at base_pos + 1, which is exactly what draft[0] is verified against. A healthy
-         * backbone therefore accepts at position 0 most of the time, and a broken one does not. It
-         * is the same measurement the hazard counter already makes, pointed at a row whose answer
-         * is known. Debug-only: it drafts `depth` tokens for `depth` positions starting one too
-         * early, so positions 1.. are deliberately misaligned and only position 0 means anything. */
-        static const bool anchor_head = std::getenv("RADIANCE_DFLASH_ANCHOR") != nullptr;
-        int32_t head0 = block - depth;
-        if (anchor_head && head0 > 0) head0 = 0;
-        e.hidden_row = row + head0;
+        /* The last `depth` rows of the block: at block = depth + 1 this skips the anchor; at
+         * block = depth it starts on it. */
+        e.hidden_row = row + block - depth;
         e.hidden_n   = depth;
         block_plan_.e.push_back(e);
         block_plan_.n_tok += block;
@@ -2628,10 +2479,9 @@ const RadBatch* Scheduler::block_query(int step) {
     return builder_.build(block_plan_, *kv_, step);
 }
 
-/* The filled range moves over what the context pass wrote. The query pass's own K and V are
- * SPECULATIVE -- correct only for the positions that turn out to be accepted -- and are
- * deliberately not counted: the next step's context pass rewrites them from the trunk's real
- * hidden states, which is one pass over a handful of rows and removes the whole question. */
+/* The filled range moves over what the context pass wrote. The query pass's K and V are
+ * speculative and not counted; the next step's context pass rewrites them from the trunk's real
+ * hidden states. */
 void Scheduler::block_end() {
     std::lock_guard<std::mutex> lk(mu_);
     for (const BlockSeq& d : block_) {
@@ -2643,9 +2493,8 @@ void Scheduler::block_end() {
         const int64_t hi = (int64_t)d.ctx_len + d.n_tokens;
         if (hi > s.draft_hi) s.draft_hi = hi;
     }
-    /* THE SNAPSHOT ENDS HERE. Both passes are built, so nothing reads these rows again, and
-     * holding them any longer would keep deferring the release of a request that was cancelled
-     * or reaped while the passes ran. */
+    /* The snapshot ends here: both passes are built, and keeping the rows would keep deferring
+     * the release of a request cancelled or reaped while the passes ran. */
     block_.clear();
 }
 
@@ -2700,14 +2549,9 @@ SchedMetrics Scheduler::metrics_locked() const {
     for (int32_t slot : waiting_)
         if (reqs_[(size_t)slot]->req->state == ReqState::Preempted) ++m.preempted_waiting;
 
-    /* AND AN IDLE ENGINE RUNS NO STEPS AT ALL, so the window never moves and the last rate would
-     * stand forever. Decayed on the way out rather than mutated in place: the stored window is a
-     * property of the steps that ran, and this is the honest reading of "tokens a second over the
-     * recent past" when the recent past contains no tokens -- to 37% after half a second of
-     * silence, to nothing after a few.
-     *
-     * NOT WHILE A STEP IS OPEN: a 2048-token prefill chunk runs for a third of a second, and a
-     * read halfway through it is not a read of an idle engine. */
+    /* An idle engine runs no steps, so the window would hold the last rate forever. Decay it on
+     * the way out (to 37% after half a second idle) without touching the stored window. Not while
+     * a step is open: a long prefill chunk is not idleness. */
     const bool   open = step_start_.time_since_epoch().count() != 0;
     const double idle = open ? 0.0
         : std::chrono::duration<double>(std::chrono::steady_clock::now() - last_step_at_).count();
@@ -2719,16 +2563,14 @@ SchedMetrics Scheduler::metrics_locked() const {
         if (m.decode_tps  < 0.05f) m.decode_tps  = 0.0f;
     }
 
-
     const std::vector<KVGroupInfo>& gs = prog_->kv_groups;
     m.n_kv_groups = (int)gs.size();
     if (m.n_kv_groups > RAD_SCHED_MAX_KV_GROUPS) m.n_kv_groups = RAD_SCHED_MAX_KV_GROUPS;
     for (int i = 0; i < m.n_kv_groups; ++i) {
-        /* AGAINST THE CARVE AND WHAT IS HELD OF IT, not against the live mark. An elastic pool
-         * grows back on demand, so a block it has released is not occupied and is not
-         * unavailable; counting it as either makes an idle server read almost full and makes
-         * every decision downstream that watches kv_util read the pool's own arbitration as
-         * pressure from the workload. */
+        /* Against the carve and what is held of it, not the live mark. An elastic pool grows
+         * back on demand, so a released block is neither occupied nor unavailable; counting it
+         * would make an idle server read nearly full and turn the pool's own arbitration into
+         * apparent workload pressure for anything watching kv_util. */
         const int64_t tot = kv_->total_blocks(i);
         const int64_t fr  = tot - kv_->held_blocks(i);
         m.kv[i].name = gs[(size_t)i].name.c_str();
@@ -2744,6 +2586,10 @@ SchedMetrics Scheduler::metrics_locked() const {
 
     if (pc_) { m.prefix_evictions = pc_->evictions();
                m.prefix_ckpt_evictions = pc_->ckpt_evictions();
+               const IPrefixCache::CkptCounts cc = pc_->ckpt_counts();
+               m.prefix_ckpt_retired = cc.retired;
+               m.prefix_ckpt_lru = cc.lru;
+               m.prefix_ckpt_refused = cc.refused;
                m.prefix_expired = pc_->expired();
                m.prefix_ckpt_expired = pc_->ckpt_expired();
                m.prefix_held_tokens = pc_->held_tokens(); }
@@ -2753,12 +2599,9 @@ SchedMetrics Scheduler::metrics_locked() const {
         ? (float)((double)m.linear_cached_tokens / (double)m.prompt_tokens) : 0.0f;
     m.draft_acceptance = draft_.acceptance();
     m.draft_depth = draft_.next_depth();
-    /* THE LOOP BOUND IS THE ARRAY'S OWN EXTENT, not a constant that happens to equal it. Clamping
-     * against RAD_SCHED_MAX_SPEC is correct -- depth_seen() is capped at it and both arrays are
-     * that long -- but the bound and the extent merely being the same number leaves gcc unable to
-     * rule out the boundary index through the inlined accessors, which guard with
-     * `j < RAD_SCHED_MAX_SPEC ? reach_[j] : 0`, and it warns. Writing the cap as the extent makes
-     * the two provably the same rather than coincidentally equal. */
+    /* The loop bound is the array's extent, not RAD_SCHED_MAX_SPEC: the values are equal, but gcc
+     * cannot prove the boundary index safe through the inlined accessors (which guard with
+     * `j < RAD_SCHED_MAX_SPEC ? reach_[j] : 0`) and warns. */
     const int kPos = (int)(sizeof m.draft_pos_reached / sizeof m.draft_pos_reached[0]);
     m.draft_depth_seen = draft_.depth_seen();
     if (m.draft_depth_seen > kPos) m.draft_depth_seen = kPos;

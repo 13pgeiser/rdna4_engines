@@ -1,17 +1,15 @@
-/* gbnf_internal.h -- what the GBNF state machine's three translation units share, and nothing
- * else includes.
+/* gbnf_internal.h -- shared by the GBNF state machine's three translation units only.
  *
  *   gbnf.cpp        the lifted machine: parser, stack machinery, accepting tokens, the compiled
  *                   program and its caches.
  *   gbnf_mask.cpp   the mask engine: the vocabulary index, the stack-set automaton and the
  *                   precomputed mask plan every fill_mask is served from.
  *   tests/gbnf_oracle.cpp
- *                   upstream's candidate walk, kept as the oracle the mask engine is tested
- *                   against and nowhere on a serving path.
+ *                   upstream's candidate walk, the test oracle for the mask engine; never on a
+ *                   serving path.
  *
- * The stack machinery lives here rather than in one of them because all three must run the SAME
- * closure and the same character tests: the oracle is a second implementation of the mask, not of
- * the parse, and a difference between the two has to mean a defect in the mask engine.
+ * The stack machinery is here so all three run the same closure and character tests: the oracle
+ * reimplements the mask, not the parse, so any disagreement is a mask-engine defect.
  */
 #pragma once
 #include "gbnf.h"
@@ -30,80 +28,70 @@ namespace gbnf {
 
 /* ============================================================ what a grammar may cost
 
- * THE GRAMMAR TEXT IS CLIENT DATA, AND IT IS COMPILED AND WALKED ON SHARED THREADS: the HTTP
- * thread that admits the request, and the scheduler thread every other request's tokens come
- * from. So nothing a grammar says may make either one use unbounded memory, time or stack -- a
- * few hundred bytes of text that exhausts the machine is a request that ends every other
- * request with it. Every bound below is one of those, and each is set well above what real
- * grammars reach: a JSON schema of 500 tool calls compiles to about 1.3 MB of text, 22,000 rules
- * and a few megabytes of compiled grammar, nests parentheses two deep, and never holds more than
- * about 1,500 stacks at once; a schema nested 128 objects deep holds stacks about 130 frames
- * tall.
+ * Grammar text is client data, compiled and walked on shared threads: the HTTP thread that
+ * admits the request and the scheduler thread that serves every request. So no grammar may make
+ * either use unbounded memory, time or stack. Each bound below is set well above real grammars:
+ * a JSON schema of 500 tool calls compiles to about 1.3 MB of text, 22,000 rules and a few MB of
+ * compiled grammar, nests parentheses two deep, and holds at most about 1,500 stacks at once; a
+ * schema nested 128 objects deep holds stacks about 130 frames tall.
  *
- * WHAT A GRAMMAR MAY COMPILE TO, BEYOND ITS OWN TEXT. The parse itself is linear in the text
- * except where a construct amplifies it: a repetition copies its operand once per count, and a
- * generated rule's name repeats the name of the rule it came from. Those are charged here, so a
- * 100 KB literal under `{1999}` is refused before it allocates the 1.6 GB it asks for, and what
- * a program in the cache can hold is bounded by its text plus this. */
+ * Bytes a grammar may compile to beyond its own text. The parse is linear in the text except
+ * where a construct amplifies it: a repetition copies its operand once per count, and a
+ * generated rule's name repeats its parent's name. Those are charged here, so a 100 KB literal
+ * under `{1999}` is refused before it allocates 1.6 GB, and a cached program is bounded by its
+ * text plus this. */
 inline constexpr uint64_t kMaxCompileBytes = 32ull << 20;
 
-/* How deeply parentheses may nest. The parser is recursive descent, a pair of frames per level,
- * so an unbounded depth is a stack overflow that 40 KB of '(' reaches. */
+/* Maximum parenthesis nesting. The recursive-descent parser uses two frames per level, so
+ * unbounded depth lets 40 KB of '(' overflow the stack. */
 inline constexpr uint32_t kMaxNesting = 256;
 
-/* One SET OF STACKS, which is the whole state of the pushdown automaton at a position: how many
- * distinct stacks it may hold, and how many elements across all of them. A grammar can make the
- * set grow without end -- ambiguity that forks a stack per token, or a closure whose paths
- * multiply -- and every accept, every mask and every cached state copies it. */
+/* Limits on one stack set (the automaton's whole state at a position): distinct stacks, and
+ * elements across all of them. Ambiguity or multiplying closure paths can grow the set without
+ * end, and every accept, mask and cached state copies it. */
 inline constexpr size_t kMaxStacks   = 1u << 14;
 inline constexpr size_t kMaxSetElems = 1u << 18;
 
-/* Stack elements one epsilon closure may push while exploring, and one set may hold as explored,
- * which bounds the memory a closure holds. A grammar with no left recursion still has closures
- * whose PATHS multiply (each level of `r ::= s "x" | s "y"` doubles them), so the set bound above
- * is reached only after the exploring has been done; this is what stops it. */
+/* Stack elements one epsilon closure may push while exploring, and one set may hold as explored.
+ * Without left recursion, closure paths can still multiply (each level of
+ * `r ::= s "x" | s "y"` doubles them), and the set bound above is only checked after exploring;
+ * this bound stops the exploring itself. */
 inline constexpr size_t kMaxClosureWork = 1u << 20;
 
-/* THE WORK ONE OPERATION MAY DO: one accepted token, one mask. The bounds above cap sizes, and
- * sizes do not cap time: a closure pays for every stack it builds, and a walk pays for every trie
- * node it visits. So the machinery counts what it does against one budget per operation, in units
- * of roughly a nanosecond of the thread it runs on: a stack element copied or a char-range element
- * tested is one; creating a stack -- an allocation and an insertion into the explored set -- costs
- * kStackCost more. A grammar that needs more than this at one position fails the request rather
- * than holding the scheduler thread for more than about half a second. */
+/* Work one operation (one accepted token, one mask) may do. Size bounds do not cap time, so work
+ * is counted per operation in units of roughly a nanosecond: one per stack element copied or
+ * char-range element tested, plus kStackCost per stack created (an allocation and an insertion
+ * into the explored set). Past the limit the request fails rather than hold the scheduler thread
+ * for more than about half a second. */
 inline constexpr uint64_t kStackCost = 64;
 inline constexpr uint64_t kMaxOpWork = 1ull << 29;
 
-/* THE WORK ONE COMPILE MAY DO, in the same units. Compiling precomputes the mask plan (see
- * gbnf_mask.cpp), which walks the vocabulary once for every place in the grammar where a mask can
- * start: on a quarter-million-piece vocabulary a tool-calling grammar needs a few tens of millions
- * of units, 200 tools about two hundred million, and a string bounded past the length of the
- * vocabulary's longest token -- the most a grammar can make the plan walk -- under two billion.
- * It runs on the thread that admits the request, never on the scheduler thread, and a grammar
- * that needs more than this is refused there, in a few seconds at most. */
+/* Work one compile may do, in the same units. The mask plan (gbnf_mask.cpp) walks the vocabulary
+ * once per place a mask can start. On a quarter-million-piece vocabulary a tool-calling grammar
+ * needs tens of millions of units, 200 tools about 200 million, and the worst case (a string
+ * bounded past the longest token's length) under two billion. Compiling runs on the admitting
+ * thread, never the scheduler thread; a grammar past this is refused within a few seconds. */
 inline constexpr uint64_t kMaxCompileWork = 1ull << 31;
 
-/* WHAT ONE COMPILED PLAN MAY HOLD: its precomputed masks and remainder tries. A plan is shared by
- * every request that uses the grammar and is kept for later ones, so this is what one grammar may
- * cost the process while it is cached. A 200-tool grammar holds about 16 MiB on a
- * quarter-million-piece vocabulary, and a string bounded past the longest token about 40. */
+/* Bytes one compiled plan may hold (precomputed masks and remainder tries), i.e. what one cached
+ * grammar may cost the process. On a quarter-million-piece vocabulary a 200-tool grammar holds
+ * about 16 MiB, and a string bounded past the longest token about 40 MiB. */
 inline constexpr size_t kMaxPlanBytes = 64ull << 20;
 
-/* What the programs a vocabulary's cache keeps PINNED may hold together, beside the count it pins.
- * A program some request still holds is kept whatever this says; one that nothing holds is what
- * this bounds. */
+/* Total bytes of the programs a vocabulary's cache pins, alongside its pin count. Bounds only
+ * programs no request holds; a held program is always kept. */
 inline constexpr size_t kMaxPinnedBytes = 256ull << 20;
 
-/* The stack-set automaton is a memo that grows as states are discovered, and a grammar whose
- * stacks deepen with every token discovers new states forever. Past the soft bound it is dropped
- * and rebuilt lazily at the next mask, which costs warm-up and nothing else; the hard bound is
- * what one operation may add before it is refused. */
+/* The stack-set automaton is a memo that grows as states are discovered, without end for a
+ * grammar whose stacks deepen every token. Past the soft bound it is dropped and rebuilt lazily
+ * at the next mask (costing only warm-up); the hard bound is what one operation may add before
+ * it is refused. */
 inline constexpr size_t kMaxDfaElems     = 1u << 22;
 inline constexpr size_t kMaxDfaWalkElems = 1u << 23;
 
-/* A bound above was reached. Thrown from inside the stack machinery, which has no status path
- * (it is lifted code, recursive in places), and caught at every public entry point, where it
- * becomes a status and the request is refused or failed -- never the process. */
+/* A bound above was reached. Thrown from the stack machinery, which is lifted, partly recursive
+ * code with no status path, and caught at every public entry point, where it becomes a status
+ * that refuses or fails the request. */
 struct GbnfLimit : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
@@ -133,16 +121,14 @@ struct StackLess {
     }
 };
 
-/* ONE STACK SET WHILE IT IS BUILT, shared by every call that adds to that set: its running size,
- * which is what makes the set bounds exact rather than per call; the operation it is built for,
- * whose work every addition is charged to; and the stacks already explored for it.
+/* One stack set under construction, shared by every call that adds to it: its running size (so
+ * the set bounds apply to the whole set, not per call), the operation whose work each addition is
+ * charged to, and the stacks already explored.
  *
- * THE EXPLORED STACKS ARE THE SET'S, NOT ONE CLOSURE'S. Every stack a closure pops has had its
- * whole closure added to the set, so a later closure into the same set that reaches it has
- * nothing left to add there. Keeping `seen` per call instead re-derives it every time -- and when
- * many stacks converge on one continuation, as every alternative of a wide rule does once it
- * matches, that is one full re-expansion per stack, quadratic in a width the bounds allow. The
- * set that comes out, and the order it comes out in, are the same either way. */
+ * `seen` belongs to the set, not to one closure: a stack a closure has popped already has its
+ * whole closure in the set, so a later closure reaching it adds nothing. A per-call `seen` would
+ * re-expand a shared continuation once per converging stack (e.g. every alternative of a wide
+ * rule), quadratic in the width. The resulting set and its order are the same either way. */
 struct SetBuild {
     explicit SetBuild(OpWork& w) : work(w) {}
 
@@ -158,13 +144,10 @@ struct SetBuild {
         if (stacks > kMaxStacks || elems > kMaxSetElems) throw_set_limit();
     }
 
-    /* Append `s` to `out` -- the set this belongs to -- unless it is already there.
-     *
-     * A SET OF A FEW STACKS IS SEARCHED, A LARGE ONE IS INDEXED. The search is what the lifted
-     * code does and is the fastest thing at the sizes real states have; but many stacks that
-     * converge on one continuation each re-expand it into the same set, and a linear search per
-     * insertion makes that quadratic in a set size the bounds allow. Past kIndexFrom the set is
-     * indexed by hash, and the order stacks land in `out` is the same either way. */
+    /* Append `s` to `out` (this build's set) unless already present. Small sets use the lifted
+     * linear search, fastest at real state sizes; past kIndexFrom the set is indexed by hash,
+     * since converging stacks would make linear search quadratic. Insertion order is the same
+     * either way. */
     void insert(GbnfStacks& out, GbnfStack s);
 
 private:
@@ -221,8 +204,8 @@ inline std::pair<bool, const GbnfElement*> match_char(const GbnfElement* pos, ui
     return { found == is_positive, pos };
 }
 
-/* True iff SOME completion of a partial UTF-8 sequence could satisfy the range at pos. This is
- * what lets a byte-level BPE token that ends mid-codepoint stay admissible. */
+/* True iff some completion of a partial UTF-8 sequence could satisfy the range at pos, so a
+ * byte-level BPE token ending mid-codepoint stays admissible. */
 inline bool match_partial_char(const GbnfElement* pos, PartialUtf8 partial) {
     const bool is_positive = pos->type == GRE_CHAR || pos->type == GRE_CHAR_ANY;
 
@@ -252,8 +235,8 @@ inline bool match_partial_char(const GbnfElement* pos, PartialUtf8 partial) {
     return !is_positive;
 }
 
-/* How many elements the char range at pos spans, which is what one match_char on it costs: it
- * walks the whole range whatever the code point. */
+/* Elements the char range at pos spans: the cost of one match_char, which walks the whole range
+ * whatever the code point. */
 inline size_t char_range_len(const GbnfElement* pos) {
     return (size_t)(match_char(pos, 0).second - pos);
 }
@@ -266,11 +249,9 @@ inline bool match_token(const GbnfElement* pos, int32_t token) {
 
 /* ============================================================ the compiled rules
 
- * EVERY RULE IN ONE ARENA, so an element's address is also its index. The stacks hold element
- * pointers, and the mask engine needs a fact about every element a stack names -- which class of
- * continuation it is (gbnf_mask.cpp) -- on every mask; with the rules held as separate vectors
- * that is a search per element, with one arena it is a subtraction. The arena is final once the
- * program is published: every stack points into it. */
+ * Every rule in one arena, so an element's address gives its index by subtraction. The mask
+ * engine looks up each stack element's continuation class (gbnf_mask.cpp) on every mask. The
+ * arena is final once the program is published, since every stack points into it. */
 struct GbnfRuleSet {
     std::vector<GbnfElement> elems;
     std::vector<uint32_t>    start;     /* rule id -> index of its first element */
@@ -280,9 +261,9 @@ struct GbnfRuleSet {
     size_t   n_rules() const { return start.size(); }
 };
 
-/* Expand a stack into the N stacks that each end at a terminal. This is the pushdown automaton's
- * epsilon closure and it is where rule references are resolved. `build` is `out` while it is
- * built; see SetBuild. Throws GbnfLimit past the bounds above. */
+/* Expand a stack into the stacks that each end at a terminal: the epsilon closure, where rule
+ * references are resolved. `build` tracks `out` under construction (SetBuild). Throws GbnfLimit
+ * past the bounds above. */
 void advance_stack(const GbnfRuleSet& rules, const GbnfStack& stack, GbnfStacks& out,
                    SetBuild& build);
 
@@ -300,8 +281,7 @@ struct VocabIndex;
 std::shared_ptr<const VocabIndex> vocab_index_build(const VocabView& v);
 size_t vocab_index_bytes(const VocabIndex& x);
 
-/* What compiling a grammar's mask plan cost and holds, for the log line and the acceptance
- * tool. */
+/* What building a mask plan cost and what it holds, for logging and the acceptance tool. */
 struct PlanStats {
     double   ms          = 0.0;   /* wall time of the plan build */
     uint64_t work        = 0;     /* units charged against kMaxCompileWork */
@@ -310,49 +290,46 @@ struct PlanStats {
     size_t   max_depth   = 0;     /* the deepest of them, in stack entries */
     size_t   dense       = 0;     /* of them, held as a full bitmask */
     size_t   rem_nodes   = 0;     /* nodes across every remainder trie */
-    size_t   max_rem     = 0;     /* the largest one remainder trie */
+    size_t   max_rem     = 0;     /* the largest remainder trie */
     size_t   bytes       = 0;     /* what the plan holds */
 };
 
-/* A grammar's compiled mask plan. Its runtime half -- an automaton over stack sets and the scratch
- * a mask needs -- is a memo guarded by the plan's own lock, so a plan is shared by every request
- * and every rank that uses the grammar. */
+/* A grammar's compiled mask plan. Its runtime part (the stack-set automaton and mask scratch) is
+ * a memo under the plan's own lock, so one plan serves every request and rank using the
+ * grammar. */
 struct MaskPlan;
 struct MaskPlanDeleter { void operator()(MaskPlan* p) const; };
 using MaskPlanPtr = std::unique_ptr<MaskPlan, MaskPlanDeleter>;
 
-/* Build the plan for a grammar whose rules are final. Returns RAD_OK or RAD_E_UNSUPPORTED with
- * the reason in *err, naming the rule from `rule_names` (by rule id) where it can: a grammar whose
- * masks cannot be precomputed within the bounds above is refused here rather than served slowly
- * later. Throws GbnfLimit or std::bad_alloc, which the caller turns into a status. */
+/* Build the plan for a grammar whose rules are final. Returns RAD_OK, or RAD_E_UNSUPPORTED with
+ * the reason in *err (naming the rule from `rule_names`, by rule id, where possible) when the
+ * masks cannot be precomputed within the bounds above. Throws GbnfLimit or std::bad_alloc, which
+ * the caller turns into a status. */
 int plan_build(const GbnfRuleSet& rules, uint32_t root, const std::shared_ptr<const VocabIndex>& vx,
                const std::vector<std::string>* rule_names, MaskPlanPtr* out, PlanStats* stats,
                std::string* err);
 
-/* The mask for a stack set: bit set means admissible. `n_words` covers the vocabulary. Returns
- * RAD_OK, or RAD_E_STATE if no token at all is admissible; throws GbnfLimit past the per-operation
- * bounds. Thread-safe: it takes the plan's lock. */
+/* The mask for a stack set, bit set = admissible; `n_words` covers the vocabulary. Returns
+ * RAD_OK, or RAD_E_STATE if no token is admissible; throws GbnfLimit past the per-operation
+ * bounds. Thread-safe (takes the plan's lock). */
 int plan_fill(const MaskPlan& plan, const GbnfStacks& stacks, PartialUtf8 partial, bool allow_eog,
               uint32_t* bitmask, int64_t n_words);
 
-/* STEP A STACK SET OVER CODE POINTS through the plan's automaton: `out` is the set accepting
- * cps[0..n) one at a time leaves -- what accept_chr over every stack, code point by code point,
- * builds -- sorted, without duplicates, written over what `out` held so its capacity is reused.
- * `stacks` need not be sorted and must not point into `out`.
+/* Step a stack set over code points through the plan's automaton. `out` receives the set left by
+ * accepting cps[0..n) one at a time (what accept_chr over every stack builds), sorted and
+ * de-duplicated, overwriting `out` so its capacity is reused. `stacks` need not be sorted and
+ * must not point into `out`.
  *
- * `at` IS THE STATE THE CALLER'S SET IS, when it knows: on entry, a state an earlier step on this
- * plan returned, which spares canonicalising the set, or an id of -1; on return, the state
- * reached, or an id of -1 when that state holds an empty stack or a token terminal on top -- a
- * set the caller does not step whole, so not one it can name next time. Valid only while the
- * automaton that issued it lives; `gen` says which one that was. Returns true when the state
- * reached is the one `at` named on entry: the caller's set already is it, and `out` is left
- * alone. That is the steady state of a free-text value.
+ * `at` is the caller's automaton state, if known. On entry: a state an earlier step on this plan
+ * returned (skips canonicalising the set), or id -1. On return: the state reached, or id -1 when
+ * it holds an empty stack or a token terminal on top (a set the caller does not step whole). Valid
+ * only while the issuing automaton lives; `gen` identifies it. Returns true when the reached
+ * state equals the entry `at`; `out` is then left untouched (the steady state of a free-text
+ * value).
  *
- * The automaton memoises each state's successor per
- * interval of code points, so a state seen before costs a lookup per code point where the stack
- * machinery would rebuild every closure; inside a free-text value the state is the same one
- * token after token. Throws GbnfLimit past the per-operation bounds. Thread-safe: it takes the
- * plan's lock. */
+ * The automaton memoises each state's successor per code-point interval, so a seen state costs a
+ * lookup per code point instead of rebuilding closures. Throws GbnfLimit past the per-operation
+ * bounds. Thread-safe (takes the plan's lock). */
 struct PlanState {
     uint64_t gen = 0;
     int32_t  id  = -1;

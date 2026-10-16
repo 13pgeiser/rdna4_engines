@@ -1,27 +1,17 @@
 /* diag.h -- the startup report: what was configured, what it runs on, and what looks wrong.
  *
- * WHY ONE REPORT AND NOT THE LINES ALREADY IN THE LOG. Every decision startup makes is said
- * somewhere on the way up, in the order it was made, between a hundred other lines. A log a user
- * pastes into an issue is read by someone who has to find the line about the embedding, the one
- * about the VRAM split and the one about the card's link, and cannot find the line that was never
- * printed because the value was a default. The report puts all of it in one block at the end of
- * startup: every option the command line takes with the value in force and where it came from,
- * the machine as the kernel describes it, and a list of the things on it that cost speed or
- * correctness with what to do about each.
+ * One block at the end of startup, instead of decisions scattered through the log (defaults are
+ * never logged at all): every option with its value and source, the machine as the kernel
+ * describes it, and findings that cost speed or correctness, each with a fix.
  *
- * THREE PARTS, each built from data rather than from a list kept beside the code:
+ * Each part is built from data, not a list kept beside the code:
+ *   Configuration  every row of the option table (core/config.cpp); a value startup resolved
+ *                  carries its reason (Decision).
+ *   Hardware       read from /proc and /sys under a root, so tests can supply a tree and a
+ *                  FROM-scratch container (no shell, lspci or rocm-smi) reads the same files.
+ *   Findings       small functions over the two above (checks.cpp), testable without a card.
  *
- *   CONFIGURATION  every row of the option table (core/config.cpp), so an option added there
- *                  appears here without anyone remembering to; a value startup resolved carries
- *                  the reason it was resolved that way (Decision).
- *   HARDWARE       read from /proc and /sys under a ROOT, so a test can hand the collector a
- *                  directory tree of its own and a container built FROM scratch -- no shell, no
- *                  lspci, no rocm-smi -- reads the same files the host does.
- *   FINDINGS       each a small function over the two above (checks.cpp), unit-testable without
- *                  a card.
- *
- * Unknown is a value. A field that could not be read is reported as unknown rather than left out:
- * a report that silently drops a line reads as a machine that does not have the thing.
+ * A field that could not be read is reported as unknown, never omitted.
  */
 #pragma once
 
@@ -34,11 +24,9 @@ struct Config;
 namespace diag {
 
 /* ------------------------------------------------------------------ decisions */
-/* ONE VALUE STARTUP RESOLVED, and why. `key` is the option it resolves (`--placement`) when there
- * is one, so the configuration table can show it on that option's row, or a topic of its own
- * (`vram split`) for what no single option states. Recording the same key again replaces the
- * earlier answer: a later stage that revises a choice (the n-gram copy that could not be made)
- * is the answer in force. */
+/* One value startup resolved, and why. `key` is the option it resolves (`--placement`), shown on
+ * that option's row, or a topic of its own (`vram split`). Recording a key again replaces the
+ * earlier answer, so a later stage can revise a choice. */
 struct Decision {
     std::string key;
     std::string value;
@@ -49,9 +37,8 @@ void decide(std::vector<Decision>* list, const std::string& key, const std::stri
             const std::string& why);
 
 /* ------------------------------------------------------------------ the configuration table */
-/* One option as the report shows it: the value in force, where it came from (`default`, `command
- * line`, an environment variable, or `auto` for a value startup derived), and the reason when
- * startup derived it. */
+/* One option: the value in force, its source (`default`, `command line`, an environment
+ * variable, or `auto` when startup derived it), and the reason when derived. */
 struct ConfigRow {
     std::string flag;
     std::string value;
@@ -59,18 +46,17 @@ struct ConfigRow {
     std::string why;
 };
 
-/* Every option in the command line's table (core/config.cpp), in its order, with the value `c`
- * holds and its source from Config::given. Secrets are not values: --api-key is "set" or "not
- * set". */
+/* Every option in core/config.cpp's table, in order, with the value `c` holds and its source
+ * from Config::given. Secrets are not shown: --api-key is "set" or "not set". */
 std::vector<ConfigRow> config_rows(const Config& c);
 
 /* The options the table holds, for a test that every one reaches the report. */
 std::vector<std::string> config_option_names();
 
 /* ------------------------------------------------------------------ hardware */
-/* One PCIe link on the way from the root port to a card. Speeds are the kernel's strings
- * ("32.0 GT/s PCIe"), widths lanes; -1 / "" where the file is absent, as it is on a bridge
- * internal to a card's own switch on some boards. */
+/* One PCIe link between the root port and a card. Speeds are the kernel's strings
+ * ("32.0 GT/s PCIe"), widths in lanes; -1 / "" where the file is absent (some bridges inside a
+ * card's own switch). */
 struct PciHop {
     std::string bdf;
     std::string cur_speed, max_speed;
@@ -98,7 +84,7 @@ struct CardFacts {
     std::string vddgfx_offset;       /* "-75 mV" from pp_od_clk_voltage, "" when unknown */
     bool        integrated = false;  /* the KFD topology's node has no local memory of its own */
 
-    /* What the engine knows and the kernel does not: filled by the engine for its own cards. */
+    /* Filled by the engine for the cards it uses. */
     std::string name;                /* the runtime's product name */
     int         rank = -1;           /* the tensor-parallel rank it serves, -1 none */
     int         device = -1;         /* the backend's device index, -1 none */
@@ -130,24 +116,22 @@ struct Facts {
     std::vector<CardFacts> cards;    /* every display-class PCI device, in address order */
 };
 
-/* Reads /proc and /sys under `root` ("" is the live system). Never fails: what cannot be read is
+/* Reads /proc and /sys under `root` ("" is the live system). Never fails: unreadable fields are
  * left unknown.
  *
- * `managed`, when given, names the cards (by PCI address) whose power-management files are read
- * -- the DPM tables, the overdrive block, the busy percentage and the hwmon power limits; every
- * other card is described from its PCI and memory files alone. The driver answers those files
- * from the card's SMU under its power-management lock, and wakes a card that was runtime-
- * suspended to do it, so a server reading the machine again while it serves reads them for the
- * cards it serves on and no others. Null reads them for every card. */
+ * `managed`, when given, lists the cards (by PCI address) whose power-management files are read:
+ * DPM tables, overdrive, busy percentage, hwmon power limits. The driver answers those from the
+ * SMU under its power-management lock and wakes a runtime-suspended card to do so, so a serving
+ * process reads them only for its own cards. Null reads them for every card. */
 Facts collect(const std::string& root, const std::vector<std::string>* managed = nullptr);
 
-/* What only a system call answers, filled for the live process: the memlock limit and whether
- * io_uring is allowed here (a container's seccomp profile refuses it). */
+/* Fills what only a system call answers for the live process: the memlock limit and whether
+ * io_uring is allowed (a container's seccomp profile may refuse it). */
 void probe_process(HostFacts* h);
 
-/* The names of the variables in `env` (an environ-shaped, null-terminated array) that start with
- * `prefix`, sorted. Names only: a value can be a path, a host name or a token, and the report is
- * written to be pasted into an issue. */
+/* Sorted names of the variables in `env` (environ-shaped, null-terminated) starting with
+ * `prefix`. Names only: values may be paths, host names or tokens, and the report gets pasted
+ * into issues. */
 std::vector<std::string> env_names(char* const* env, const char* prefix);
 
 /* ------------------------------------------------------------------ what the engine did */
@@ -164,8 +148,8 @@ struct RunFacts {
     bool        tp_wire_lossy = false;
     int64_t     tp_wire_min_kb = 0;
     bool        prefix_cache = true;
-    /* Why the engine turned prefix caching off itself (the KL mode, an embedding model); "" when
-     * it is on or the operator turned it off. */
+    /* Why the engine disabled prefix caching itself (KL mode, an embedding model); "" when it is
+     * on or the operator turned it off. */
     std::string prefix_cache_off_why;
     int64_t     host_pool_mib = 0;       /* a rank, as configured */
     int64_t     pinned_bytes = -1;       /* every pinned host allocation the process made */
@@ -176,9 +160,8 @@ struct RunFacts {
     bool        reference_kernels = false;
     bool        profile_ops = false;
     bool        deterministic = false;
-    /* The RADIANCE_* variables set in the environment, by name (env_names). The option table
-     * covers what the command line takes; these change behaviour beside it -- the log level, a
-     * pinned tuning, an instrument left on -- and a report of every setting in force names them. */
+    /* Names of the RADIANCE_* variables set (env_names): settings outside the option table,
+     * such as the log level, a pinned tuning or an instrument left on. */
     std::vector<std::string> environment;
 };
 
@@ -210,6 +193,15 @@ void merge(std::vector<ConfigRow>* rows, const std::vector<Decision>& decisions,
 
 /* "32.0 GT/s PCIe" -> 32.0; 0 when it does not parse. */
 double link_gts(const std::string& speed);
+
+/* "32.0 GT/s x16" from a sysfs speed and width; "?" for an unknown speed. */
+std::string link_text(const std::string& speed, int width);
+
+/* "300 W" from microwatts; "unknown" when negative. */
+std::string watts_text(int64_t uw);
+
+/* Busy percentage above which a link below its maximum is not idle parking. */
+constexpr int kBusyPercent = 30;
 
 }  /* namespace diag */
 }  /* namespace rad */

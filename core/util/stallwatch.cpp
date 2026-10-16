@@ -3,6 +3,7 @@
 
 #include "rad_internal.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -31,8 +32,8 @@ std::string read_first_line(const std::string& path) {
     return s;
 }
 
-/* The ioctl numbers of the KFD (type 'K'), as <linux/kfd_ioctl.h> assigns them. By number rather
- * than by macro, because the header a build sees can be older than the driver it runs on. */
+/* KFD ioctl numbers (type 'K') from <linux/kfd_ioctl.h>, listed by number because the build's
+ * header can be older than the running driver. */
 const char* kfd_ioctl_name(unsigned nr) {
     static const char* const k[] = {
         nullptr, "GET_VERSION", "CREATE_QUEUE", "DESTROY_QUEUE", "SET_MEMORY_POLICY",
@@ -70,14 +71,7 @@ const char* syscall_name(long nr) {
 #endif
 }
 
-bool is_ioctl(long nr) {
-#if defined(__x86_64__)
-    return nr == 16;
-#else
-    (void)nr;
-    return false;
-#endif
-}
+bool is_ioctl(long nr) { return nr == SYS_ioctl; }
 
 /* ---- the stack of a thread that waits in user space, taken by a signal it handles itself ---- */
 
@@ -133,10 +127,9 @@ std::string stack_of(pid_t tid) {
 }  /* namespace */
 
 std::string stall_module_offset(uintptr_t addr) {
-    /* RELATIVE TO WHERE THE MODULE IS LOADED, which is what addr2line takes for a position-
-     * independent binary or library: the start of its first mapping, less that mapping's file
-     * offset. The offset into the file is not the same number wherever the linker puts a segment
-     * at a different address than its file position, as lld does. */
+    /* Relative to the module's load base (lowest mapping start minus its file offset), which is
+     * what addr2line takes for PIC code. The file offset differs where the linker places a
+     * segment at an address unlike its file position, as lld does. */
     struct Map { unsigned long lo, hi, off; std::string path; };
     std::vector<Map> maps;
     {
@@ -212,8 +205,8 @@ std::string stall_describe_thread(pid_t tid, bool stack) {
     s += ", " + stall_decode_syscall(sc);
     long nr = -1;
     std::sscanf(sc.c_str(), "%ld", &nr);
-    /* A thread in a driver call is not signalled: the call already says where it is, and a wait
-     * the signal interrupts may end the call early instead of restarting it. */
+    /* A thread in a driver call is not signalled: the call already says where it waits, and the
+     * signal could end the wait early instead of restarting it. */
     if (stack && !is_ioctl(nr) && state != 'D') s += "\n    stack: " + stack_of(tid);
     return s;
 }
@@ -221,6 +214,7 @@ std::string stall_describe_thread(pid_t tid, bool stack) {
 struct StallWatch::Impl {
     std::string             phase;
     uint64_t                quiet_ns = 0;
+    uint64_t                poll_ns = 0;
     pid_t                   holder = 0;
     std::mutex              mu;
     std::condition_variable cv;
@@ -256,7 +250,7 @@ struct StallWatch::Impl {
         uint64_t own = 0;                     /* the time of this watch's own last report */
         uint64_t next = quiet_ns;             /* the silence that is reported next */
         std::unique_lock<std::mutex> lk(mu);
-        while (!cv.wait_for(lk, std::chrono::seconds(1), [&] { return stop; })) {
+        while (!cv.wait_for(lk, std::chrono::nanoseconds(poll_ns), [&] { return stop; })) {
             const uint64_t last = log_last_line_ns();
             if (last > since && last != own) { since = last; next = quiet_ns; }
             const uint64_t now = rad_mono_ns();
@@ -273,6 +267,9 @@ struct StallWatch::Impl {
 StallWatch::StallWatch(const char* phase, uint64_t quiet_ms) : p_(std::make_unique<Impl>()) {
     p_->phase = phase ? phase : "phase";
     p_->quiet_ns = quiet_ms * 1000000ull;
+    /* A quarter of the quiet interval, so a report is at most that late, and at most a second. */
+    p_->poll_ns = std::max<uint64_t>(1000000ull, std::min<uint64_t>(1000000000ull,
+                                                                    p_->quiet_ns / 4));
     p_->holder = (pid_t)syscall(SYS_gettid);
     install_stack_handler();
     p_->th = std::thread([this] { p_->run(); });

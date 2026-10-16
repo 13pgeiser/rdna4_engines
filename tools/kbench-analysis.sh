@@ -1,19 +1,13 @@
 #!/bin/sh
-# kbench-analysis.sh -- the half of a kernel library's health that is not a number rad-kbench can
-# measure: what a static analyser says about the source, and what a sanitised build says about the
-# run.
+# kbench-analysis.sh -- what a static analyser says about the kernel sources and a sanitised build
+# says about a replay, as one markdown fragment that rad-kbench splices into its report with
+# --analysis. Separate from rad-kbench because it runs in CI on machines without a GPU, while
+# rad-kbench runs on a card.
 #
-# It writes ONE markdown fragment, which rad-kbench splices into its report with --analysis. That
-# is deliberate rather than having the tool shell out: the tool is what somebody runs on a card,
-# this is what somebody runs in CI on a machine that may have no GPU at all, and a report that
-# needs both present to render is a report that renders nowhere.
+# Usage: [JOBS=N] tools/kbench-analysis.sh <build-dir> <out.md>   (JOBS defaults to every core)
 #
-# Usage: tools/kbench-analysis.sh <build-dir> <out.md>
-#
-# What it does NOT do is fail the build. Every finding here is advisory -- clang-tidy on a HIP
-# translation unit reports things that are true of the language and not of the code, and a
-# sanitised replay is a different binary from the one that ships. The numbers belong in the report
-# so somebody reads them; gating on them would mean somebody turns the gate off.
+# Advisory: it never fails the build. clang-tidy reports language-level noise on this code, and a
+# sanitised replay is a different binary from the one that ships.
 set -eu
 
 BUILD=${1:-build}
@@ -32,10 +26,10 @@ TIDY=$(command -v clang-tidy || echo /opt/rocm/llvm/bin/clang-tidy)
 } > "$OUT"
 
 # ---------------------------------------------------------------- clang-tidy
-# Only the checks that mean something for this code. `bugprone-*` and `clang-analyzer-*` are the
-# ones that find real defects; the readability and naming packs would bury those under thousands
-# of style opinions this tree has already decided against.
-CHECKS='-*,bugprone-*,clang-analyzer-*,performance-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions'
+# The defect-finding packs only; the readability and naming packs would bury them under style
+# findings this tree has decided against. performance-enum-size is excluded too: the ABI's enums
+# are int-sized on purpose.
+CHECKS='-*,bugprone-*,clang-analyzer-*,performance-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions,-performance-enum-size'
 
 if [ ! -f "$CC_JSON" ]; then
   echo "clang-tidy: skipped, no $CC_JSON (configure with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON)" >> "$OUT"
@@ -46,10 +40,16 @@ elif [ ! -x "$TIDY" ] && ! command -v clang-tidy > /dev/null 2>&1; then
 else
   TMP=$(mktemp)
   # Host C++ only. A HIP translation unit needs the offload flags clang-tidy will not replay, and
-  # it reports the __device__ attributes as errors rather than analysing the code.
-  for f in $(find "$ROOT/libref" "$ROOT/core" "$ROOT/tools" -name '*.cpp' | sort); do
-    "$TIDY" -p "$BUILD" --checks="$CHECKS" --quiet "$f" 2>/dev/null || true
-  done > "$TMP"
+  # it reports the __device__ attributes as errors rather than analysing the code. One process per
+  # unit, each into its own file, and a warning in a header counts once however many units
+  # include it.
+  PARTS=$(mktemp -d)
+  find "$ROOT/libref" "$ROOT/core" "$ROOT/tools" -name '*.cpp' | sort |
+    xargs -P "${JOBS:-$(nproc)}" -I{} sh -c \
+      '"$1" -p "$2" --checks="$3" --quiet "$4" > "$5/$(echo "$4" | tr / _).log" 2>/dev/null || true' \
+      sh "$TIDY" "$BUILD" "$CHECKS" {} "$PARTS"
+  cat "$PARTS"/*.log | grep "warning:" | sort -u > "$TMP"
+  rm -rf "$PARTS"
 
   N=$(grep -c "warning:" "$TMP" || true)
   echo "### clang-tidy" >> "$OUT"
@@ -58,7 +58,7 @@ else
   echo "(\`libref/\`, \`core/\`, \`tools/\`). HIP units are excluded: clang-tidy cannot replay the" >> "$OUT"
   echo "offload flags and reports \`__device__\` as an error rather than analysing the body." >> "$OUT"
   echo >> "$OUT"
-  echo "- $N warning(s)" >> "$OUT"
+  echo "- $N distinct warning(s)" >> "$OUT"
   if [ "$N" -gt 0 ]; then
     echo >> "$OUT"
     echo "| check | count |" >> "$OUT"
@@ -71,18 +71,22 @@ else
 fi
 
 # ---------------------------------------------------------------- sanitised replay
-# A second build tree, because -fsanitize changes every object and mixing them is how you get a
-# link that succeeds and a binary that reports nothing.
+# A second build tree: -fsanitize changes every object, and mixing sanitised and plain objects can
+# link into a binary that reports nothing.
 echo "### AddressSanitizer + UndefinedBehaviorSanitizer" >> "$OUT"
 echo >> "$OUT"
 SAN="$BUILD-asan"
 if [ -x "$SAN/bin/rad-kbench" ]; then
   LOG=$(mktemp)
+  # Both fixtures, one run per distinct case, and the reference always run: a cached answer
+  # would leave libref's code unexecuted under the sanitiser.
   ASAN_OPTIONS=detect_leaks=0:abort_on_error=0 \
   UBSAN_OPTIONS=print_stacktrace=1 \
-    "$SAN/bin/rad-kbench" --home "$SAN/radiance_home" > "$LOG" 2>&1 || true
+    "$SAN/bin/rad-kbench" --home "$SAN/radiance_home" --max-cases 1 --no-cache \
+      --fixture "$SAN/radiance_home/kernels.rkb" \
+      --fixture "$SAN/radiance_home/kernels_moe.rkb" > "$LOG" 2>&1 || true
   E=$(grep -c "ERROR: AddressSanitizer\|runtime error:" "$LOG" || true)
-  echo "A sanitised replay of the whole fixture. Host code only -- see the note in the" >> "$OUT"
+  echo "A sanitised replay of both fixtures. Host code only -- see the note in the" >> "$OUT"
   echo "**Memory safety** section for why the device side cannot be sanitised on this card." >> "$OUT"
   echo >> "$OUT"
   echo "- $E report(s)" >> "$OUT"

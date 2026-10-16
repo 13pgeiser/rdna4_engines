@@ -606,7 +606,15 @@ static void gather_string_parts_recursive(const value & val, value_string & part
     } else if (is_val<value_array>(val)) {
         auto items = cast_val<value_array>(val)->as_array();
         for (const auto & item : items) {
-            gather_string_parts_recursive(item, parts);
+            /* RADIANCE: `val` is a block's statement results, and every block statement returns
+             * a string, so a list or a dict among them is the value of an expression the template
+             * prints. jinja2 prints its repr; flattening it ran its strings together and printed
+             * nothing for a dict. */
+            if (is_val<value_array>(item) || is_val<value_object>(item)) {
+                parts->val_str.append(item->as_string().str());
+            } else {
+                gather_string_parts_recursive(item, parts);
+            }
         }
     }
 }

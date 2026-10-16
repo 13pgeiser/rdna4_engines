@@ -1,19 +1,22 @@
-/* item.cpp -- the parts of an Item the step path uses, in a unit of their own. The batch builder
- * links against this and nothing else in core/mm, so a test that fakes the device layer does not
- * pull the processor -- and through its metadata reader, the real device layer -- in with it. */
+/* item.cpp -- the parts of Item the step path uses. The batch builder links only this unit from
+ * core/mm, so a test that fakes the device layer does not pull in the processor and, through its
+ * metadata reader, the real device layer. */
 #include "mm/processor.h"
 
 namespace rad {
 namespace mm {
 
 void Item::coords(int64_t first, int64_t count, int32_t* planes) const {
-    /* AN AUDIO CLIP IS 1-D (RadBatch::enc): the frame's index, whether it is real, the clip's real
-     * frames and its staged ones. */
+    /* An audio clip is 1-D (RadBatch::enc): frame index, whether the frame takes part in the
+     * convolution, the clip's real frame count and its staged frame count. A clip staged in
+     * chunks (AudioFamily::Qwen3ASR) reads each chunk's first `chunk_read` frames; the rest of the
+     * chunk is alignment the encoder reads as zero. */
     if (kind == Kind::Audio) {
         for (int64_t k = 0; k < count; ++k) {
             const int64_t f = first + k;
             planes[k]             = (int32_t)f;
-            planes[count + k]     = f < valid ? 1 : 0;
+            planes[count + k]     = chunk_staged > 0 ? (f % chunk_staged < chunk_read ? 1 : 0)
+                                                     : (f < valid ? 1 : 0);
             planes[2 * count + k] = valid;
             planes[3 * count + k] = grid_h;
         }

@@ -1,17 +1,16 @@
-/* r4d_pair_argmax_f32.hip -- pair_argmax: the global argmax of a row of gathered (id, value) pairs, written as
- * ONE CONTIGUOUS COLUMN of token ids.
+/* r4d_pair_argmax_f32.hip -- pair_argmax: the global argmax of a row of gathered (id, value) pairs,
+ * written as one contiguous column of token ids.
  *
- * WHY THIS OP EXISTS. A vocab-sharded draft head finds each rank's best candidates with `row_topk`
- * and moves them with `all_gather`. The gather moves whole 16-byte words a row, and one (int32 id,
- * f32 value) pair is 8 bytes, so a rank contributes at least R = 2 (rad_block_mtp_hc.h states the
- * same bound). `row_topk_merge` then returns R = 2 columns a row, and a BLOCK drafter's proposal
- * is `steps` contiguous ids a sequence -- column 0 of an [S, 2] plane is not that, and nothing in
- * libr4d copies a strided i32 column. This reduces the gathered row to its top-1 and writes it
+ * A vocab-sharded draft head finds each rank's best candidates with `row_topk` and moves them with
+ * `all_gather`, which moves whole 16-byte words per row; a pair is 8 bytes, so a rank contributes
+ * at least R = 2 (rad_block_mtp_hc.h states the same bound). `row_topk_merge` then returns two
+ * columns per row, but a block drafter's proposal is `steps` contiguous ids per sequence, and
+ * nothing in libr4d copies a strided i32 column. This reduces the row to its top-1 and writes it
  * where the proposal reads it.
  *
- * It is row_topk_merge at R = 1 with a strided output, rule for rule: the largest value wins, a tie
- * goes to the LOWER id, and a pair whose id is negative (a slot a shard could not fill) is skipped.
- * A row with no valid pair writes id -1 and value -inf. One wave a row, eight rows a workgroup.
+ * Same rules as row_topk_merge at R = 1, with a strided output: the largest value wins, a tie goes
+ * to the lower id, and a negative id (a slot a shard could not fill) is skipped. A row with no
+ * valid pair writes id -1 and value -inf. One wave per row, eight rows per workgroup.
  */
 #include <hip/hip_runtime.h>
 
@@ -94,9 +93,10 @@ extern "C" int r4d_rad_pair_argmax_f32(const RadArgs* a, RadStream stream) {
     if (t->rank < 1 || t->shape[0] < rows || (v && (v->rank < 1 || v->shape[0] < rows))) return RAD_E_SHAPE;
     r4d_pick::PickArgs A{};
     A.pairs = (const float*)p->data; A.p_rs = p->stride[0];
-    A.tok = (int*)t->data;           A.t_rs = t->rank >= 2 ? t->stride[0] : 1;
+    /* A row's element is stride[0] apart at any rank: a rank-1 output may be a strided column. */
+    A.tok = (int*)t->data;           A.t_rs = t->stride[0];
     A.val = v ? (float*)v->data : nullptr;
-    A.v_rs = v ? (v->rank >= 2 ? v->stride[0] : 1) : 0;
+    A.v_rs = v ? v->stride[0] : 0;
     A.rows = rows;
     A.n = (int)n;
     R4D_KLAUNCH(R4D_KNAME(r4d_pick::pick_kernel), dim3((unsigned)((rows + 7) / 8)), dim3(256),

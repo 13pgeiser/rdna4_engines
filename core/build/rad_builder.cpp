@@ -1,13 +1,12 @@
 /* rad_builder.cpp -- the Builder, and the C surface of rad_builder.h that drives it.
  *
- * Handles are 1-based indices into the Program's tables, so index 0 is a sentinel and a failed
- * decl_* is falsy. That is not a convention for its own sake: it is what lets an architecture
- * plugin write
+ * Handles are 1-based indices into the Program's tables; index 0 is a sentinel, so a failed
+ * decl_* is falsy and an architecture plugin can write
  *
  *     rad_op h = decl_op(b, "rmsnorm_had_quant_i8", ...);
  *     if (!h) { ... emit the unfused sequence ... }
  *
- * and have fusion be a selection rather than a compiler pass (spec §2.3).
+ * which makes fusion a selection rather than a compiler pass (spec §2.3).
  */
 #include "rad_build.h"
 #include "../device/device.h"
@@ -24,9 +23,8 @@ namespace rad {
 
 /* ================================================================== interning */
 const char* intern(std::string_view s) {
-    /* A node-based set: insertion never moves an existing element, so the pointer we hand out
-     * stays valid for the life of the process. Declare runs once per rank on its own thread
-     * (spec §1), hence the lock -- taken a few thousand times at startup and never again. */
+    /* A node-based set: insertion never moves an element, so returned pointers stay valid. Locked
+     * because each rank declares on its own thread (spec §1). */
     static std::unordered_set<std::string> pool;
     static std::mutex m;
     std::lock_guard<std::mutex> lk(m);
@@ -34,22 +32,17 @@ const char* intern(std::string_view s) {
 }
 
 /* ================================================================== small helpers */
-/* Names for the enums the graph dump prints. `bld_` prefixed because tier_name and site_name in
- * rad_core.h belong to the planner and these are the same kind of thing for a different axis --
- * two components should not race for one symbol. */
 const char* bld_domain_name(int d) { return d == RAD_DOMAIN_HOST ? "host" : "device"; }
 
-/* The full-detail rendering of one miss, used by --debug-graph and by the device-hole report.
- * Defined here rather than in the header so that the domain has exactly one spelling. */
+/* Defined here so the domain is spelled by bld_domain_name. */
 std::string Program::Miss::line() const {
     return fmt("%-22s %s  [%s] -> %s", op.c_str(), geom.c_str(), bld_domain_name(domain),
                why.c_str());
 }
 
 std::vector<const Program::Miss*> Program::device_holes(bool host_backend) const {
-    /* By INSTANCE, because bands are: two declarations of one op can differ in geometry and in
-     * whether they carry a weight, and only the instance that missed decides whether the planner
-     * can move it to the host. */
+    /* Per instance, like bands: two declarations of one op can differ in geometry and in whether
+     * they carry a weight, which decides whether the planner can move the op to the host. */
     std::set<std::pair<int32_t, std::string>> no_host;
     for (const Miss& m : misses)
         if (m.domain == RAD_DOMAIN_HOST) no_host.emplace(m.index, m.span);
@@ -113,7 +106,7 @@ Builder::Builder(Registry& reg, const RadModelMeta& meta, const RadBuildCtx& ctx
     prog_.ctx  = ctx;
     scope_ = ctx.scope ? ctx.scope : "";
 
-    /* Sentinels. Handle 0 is never valid, so a zeroed struct is an unset handle. */
+    /* Sentinels: handle 0 is never valid, so a zeroed struct is an unset handle. */
     prog_.weights.emplace_back();
     prog_.buffers.emplace_back();
     prog_.ops.emplace_back();
@@ -130,16 +123,14 @@ uint32_t Builder::err(int code, const char* f, ...) {
     vsnprintf(msg, sizeof msg, f, ap);
     va_end(ap);
     errors_.emplace_back(msg);
-    /* First class wins: a later error is usually a consequence of the first, and the list carries
-     * all of them anyway. */
+    /* First class wins; later errors are usually consequences, and the list keeps them all. */
     if (status_ == RAD_OK) status_ = code;
     RAD_ERR("declare: %s", msg);
     return RAD_NULL_HANDLE;
 }
 
 /* The scope prefixes declared names so a drafter, a vision tower and the language model can share
- * one builder without colliding (spec §10, §11). Op names are NOT scoped: they are the shared
- * vocabulary the selector matches on. */
+ * one builder (spec §10, §11). Op names are not scoped: the selector matches on them. */
 std::string Builder::scoped(const char* name) const {
     if (scope_.empty()) return name ? name : "";
     return scope_ + "." + (name ? name : "");
@@ -164,18 +155,16 @@ rad_weight Builder::decl_weight(const char* name, const RadWeightDecl* d) {
     WeightInfo w;
     w.name = n;
     w.decl = *d;
-    /* Under tensor parallel the plugin declares dimensions ALREADY DIVIDED (spec §9), so this is
-     * what THIS RANK holds. The core does not reason about sharding propagation and does not
-     * divide anything: a sharding inference pass is a compiler pass, and its failure mode is a
-     * model that produces fluent wrong text on a rank count nobody tested. */
+    /* Under tensor parallelism the plugin declares dimensions already divided (spec §9), so this
+     * is what this rank holds. The core never infers or divides shards. */
     w.logical_bytes = rad_dtype_bytes(d->dtype, numel);
     if (w.logical_bytes == 0 && d->dtype < RAD_DT_PLUGIN_BASE)
         return err(RAD_E_DTYPE, "weight '%s': dtype %u is not one the core can size", n.c_str(),
                    d->dtype);
 
-    /* WHAT IT IS A VIEW OF (spec §4.3): the source's encoding as the model holds it, and the planes
-     * this declaration takes. With nothing behind the builder the weight is its own plain plane
-     * in the declared dtype, which is what a test or a synthetic tool declares against. */
+    /* The view's source (spec §4.3): its encoding as the model holds it, and the planes this
+     * declaration takes. With no source (tests, synthetic tools) the weight is one plain plane in
+     * the declared dtype. */
     w.source = (d->source && *d->source) ? scoped(d->source) : n;
     WeightSource ws;
     w.enc_known = lookup_source(w.source, &ws) == RAD_OK;
@@ -211,10 +200,10 @@ rad_weight Builder::decl_weight(const char* name, const RadWeightDecl* d) {
         }
     }
 
-    /* THE DECLARATION AGAINST THE PLANES. One plane is declared at its own dtype and extents --
-     * this rank's share of them under a shard -- and several at the codes' dtype and the logical
-     * extents. A dtype that is not the plane's is an exact widening the loader performs, or it is
-     * a quantisation, which belongs to rad-convert and is refused here by name. */
+    /* Check the declaration against the planes. One plane is declared at its own dtype and extents
+     * (this rank's share under a shard); several at the codes' dtype and the logical extents. A
+     * different dtype must be an exact widening the loader performs; a quantisation belongs to
+     * rad-convert and is refused. */
     const RadEncPlane& p0 = w.enc.plane[w.sel[0]];
     if (p0.dtype != d->dtype) {
         const bool widen = w.n_sel == 1 && d->dtype == RAD_F32 &&
@@ -242,13 +231,13 @@ rad_weight Builder::decl_weight(const char* name, const RadWeightDecl* d) {
             rad_enc_plane_dims(&pk, vr, vc, &w.sel_rows[k], &w.sel_cols[k]);
             fr = sr; fc = sc;
         }
-        /* Unsharded, the declaration IS the plane (or, for several, the logical weight), and a
-         * mismatch is the plugin and the model disagreeing about a shape -- named now rather than
-         * found at load as a byte count. A shard's share is the loader's to check. */
+        /* Unsharded, the declaration must match the plane (or, for several, the logical weight);
+         * a mismatch is reported now rather than as a byte count at load. The loader checks a
+         * shard's share. */
         const bool whole = d->shard == RAD_SHARD_NONE || prog_.ctx.world_size <= 1;
-        /* A RESHAPE IS NOT A DISAGREEMENT: one whole plane of single elements, a byte or more
-         * each, declared under another shape of the same count -- a conv kernel [O, C, T, H, W]
-         * read as the [O, C*T*H*W] matrix it is. Row-major, its bytes do not move. */
+        /* A reshape is allowed: one whole plane of single elements (a byte or more each) declared
+         * under another shape with the same count, e.g. a conv kernel [O, C, T, H, W] read as
+         * [O, C*T*H*W]. Row-major bytes are unchanged. */
         const bool reshape = w.n_sel == 1 && whole && pk.kind == RAD_PLANE_TILED &&
                              pk.block[0] == 1 && pk.block[1] == 1 &&
                              rad_dtype_bits(pk.dtype) >= 8 && fr * fc == vr * vc;
@@ -260,9 +249,9 @@ rad_weight Builder::decl_weight(const char* name, const RadWeightDecl* d) {
                        (long long)(w.n_sel == 1 ? fr : sr), (long long)(w.n_sel == 1 ? fc : sc));
     }
 
-    /* The stored form defaults to the selected plane as it is. finish_layouts() overwrites it when
-     * the resolved kernel asks for something else through its layout hook (spec §4.3); a kernel
-     * with no hook, or one that answers RAD_E_UNSUPPORTED, takes exactly this. */
+    /* The stored form defaults to the selected plane unchanged. finish_layouts() overwrites it when
+     * the resolved kernel's layout hook asks for another (spec §4.3); no hook, or
+     * RAD_E_UNSUPPORTED, keeps this. */
     w.identity     = true;
     w.stored_dtype = w.widen ? d->dtype : p0.dtype;
     w.stored_bytes = w.widen ? rad_dtype_bytes(d->dtype, vr * vc)
@@ -287,8 +276,8 @@ int Builder::lookup_source(const std::string& name, WeightSource* out) {
     }
     WeightSource ws;
     const int st = sources_(name, prog_, &ws);
-    /* Only an answer is remembered: a weight not found before its name map entry was declared
-     * may be found after it. */
+    /* Cache only successes: a weight not found before its name-map entry is declared may be found
+     * after. */
     if (st == RAD_OK) source_cache_.emplace(name, std::make_pair(st, ws));
     *out = ws;
     return st;
@@ -357,7 +346,7 @@ rad_kvgroup Builder::decl_kv_group(const char* name, const RadKVGroupDecl* d) {
     g.name = n;
     g.decl = *d;
     prog_.kv_groups.push_back(std::move(g));
-    kv_decl_at_.push_back((int32_t)prog_.ops.size());   /* where in the op list we are now */
+    kv_decl_at_.push_back((int32_t)prog_.ops.size());   /* current position in the op list */
     kv_consumer_.push_back(-1);
     return (rad_kvgroup)(prog_.kv_groups.size() - 1);
 }
@@ -374,19 +363,15 @@ int Builder::bind_layer_kv(int layer, rad_kvgroup g) {
     return RAD_OK;
 }
 
-/* Which op reads this group.
+/* Which op reads this group. The ABI does not link an op to a KV group, so declaration order is
+ * the binding, as documented: "declare the group, declare the op, then ask rad_kv_block_size()"
+ * (docs/OPS.md, spec §7.2). The consumer is the first unclaimed op after the group that carries a
+ * block_size; an op serves at most one group, so a hybrid model's full and sliding-window groups
+ * each claim their own attention op.
  *
- * Nothing in the ABI links an op to a KV group: rad_decl_op names parameters and weight operands,
- * and a group is not either of those. Declaration order is therefore the binding, and it is the
- * order the documentation already prescribes -- "declare the group, declare the op, then ask
- * rad_kv_block_size()" (docs/OPS.md, spec §7.2). The consuming op is the first op declared after
- * the group that carries a block_size, and an op serves at most one group, so a hybrid model's
- * full and sliding-window groups each claim their own attention op.
- *
- * "Carries a block_size" means any of three things, and all three are checked because an
- * architecture plugin may legitimately do none of the others: the op DECLARED one, its SCHEMA
- * names one (attn_paged does, so the op is recognisable even when the plugin left the value off
- * precisely because it is about to ask for it), or its resolved kernel CONSTRAINS one. */
+ * An op carries a block_size if it declared one, its schema names one (attn_paged does, so it is
+ * found even when the plugin omits the value it is about to ask for), or its resolved kernel
+ * constrains one. */
 int32_t Builder::find_kv_consumer(rad_kvgroup g) {
     if (kv_consumer_[g] >= 0) return kv_consumer_[g];
 
@@ -420,8 +405,8 @@ int64_t Builder::kv_block_size(rad_kvgroup g) {
     }
     KVGroupInfo& gi = prog_.kv_groups[g];
 
-    /* A per-sequence state has no block size and asking for one is a category error, not a
-     * failure. Say so once and return 0; the caller wants bytes_per_state. */
+    /* Per-sequence state has no block size; warn and return 0 (the caller wants
+     * bytes_per_state). */
     if (gi.decl.kind == RAD_KV_LINEAR || gi.decl.kind == RAD_KV_CONV) {
         RAD_WARN("kv group '%s' is per-sequence state; it has no block size", gi.name.c_str());
         return 0;
@@ -430,8 +415,8 @@ int64_t Builder::kv_block_size(rad_kvgroup g) {
 
     int32_t consumer = find_kv_consumer(g);
     if (consumer < 0) {
-        /* A silent zero here becomes a division by zero in the block manager three components
-         * later, so it is an error with the reason attached. */
+        /* An error, not a silent 0, which would become a division by zero in the block
+         * manager. */
         err(RAD_E_STATE,
             "rad_kv_block_size('%s'): no op that reads this group has been declared yet. The "
             "block size comes off the RESOLVED attention kernel's block_size constraint, so the "
@@ -441,9 +426,8 @@ int64_t Builder::kv_block_size(rad_kvgroup g) {
 
     const OpInfo& o = prog_.ops[consumer];
 
-    /* The kernel's own constraint is the answer, read with core/plugin/'s own accessor: a second
-     * constraint walk here would be a second reading of the same rows. A core that picked its own
-     * block size would be a core that has to be edited when a kernel changes (spec §7.2). */
+    /* The resolved kernel's block_size constraint is the answer, read with core/plugin/'s
+     * accessor; the core never picks a block size (spec §7.2). */
     for (const Band& b : o.bands)
         for (int d = 0; d < RAD_N_DOMAINS; ++d) {
             if (!b.dom[d] || !b.dom[d].row) continue;
@@ -454,22 +438,15 @@ int64_t Builder::kv_block_size(rad_kvgroup g) {
             }
         }
 
-    /* No kernel constrained it: this kernel serves any block size (libref does exactly
-     * that -- correct, slow, no geometry constraints, spec §17). Then the number is the plugin's
-     * declared parameter, which is still not the core choosing one. */
+    /* No kernel constrains it (e.g. libref, which serves any block size, spec §17): use the
+     * plugin's declared parameter. */
     long long v = 0;
     if (o.base.get_i("block_size", &v) && v > 0) { gi.block_size = v; return gi.block_size; }
 
-    /* Nothing to read it off, and the reason is almost always the same one, so it is named here in
-     * full rather than left as "0".
-     *
-     * A constraint whose key the geometry does not carry does NOT hold (rad_util.cpp, and it is
-     * libr4d's rule for good reasons). So a kernel constrained to `block_size == 16` cannot be
-     * selected by a query that omits block_size -- which means an attention op declared WITHOUT a
-     * block_size can never resolve to the kernel whose constraint the answer was supposed to come
-     * from. The plugin has to declare the block size it wants; the resolved kernel's constraint
-     * then either confirms it or refuses it by name, and THAT is what keeps the number the
-     * kernel's rather than the core's (spec §7.2). */
+    /* Nothing to read it from. The usual cause: a constraint on a key the geometry lacks does not
+     * hold, so a kernel constrained to `block_size == 16` is never selected for an op declared
+     * without block_size. The plugin must declare the block size it wants; the resolved kernel's
+     * constraint then confirms or refuses it (spec §7.2). */
     bool resolved_anywhere = false;
     for (const Band& b : o.bands)
         for (int d = 0; d < RAD_N_DOMAINS; ++d) if (b.dom[d]) resolved_anywhere = true;
@@ -489,14 +466,12 @@ int64_t Builder::kv_block_size(rad_kvgroup g) {
 /* ================================================================== ops */
 void Builder::record_tune_request(const Resolved& r) {
     if (!r.row || !r.row->info || r.row->info->n_tunables <= 0) return;
-    /* ONE REQUEST PER KERNEL INSTANTIATION, and the instantiation is (kernel, plugin, the input
-     * params it was resolved at). Every distinct shape a kernel is asked for is a separate
-     * benchmark, and the same shape asked for by sixty-four layers is one (spec §15).
+    /* One request per kernel instantiation: (kernel, plugin, resolved input params). The same
+     * shape requested by many layers is one benchmark (spec §15).
      *
-     * `geom_key` and not geom.str(): the tuner and the selector must key the same way or the cache
-     * never hits, and geom_key is tunecache.h's canonical spelling -- sorted, and taken BEFORE the
-     * tuned axes were folded into the geometry. geom.str() preserves declaration order and now
-     * also carries the axes, so keying on it would make the key depend on its own answer. */
+     * Keyed on geom_key, not geom.str(), so tuner and selector key identically: geom_key is
+     * tunecache.h's canonical sorted spelling without the tuned axes, while geom.str() keeps
+     * declaration order and includes the axes. */
     const std::string key = r.row->info->name + std::string("\x1f") + r.row->plugin +
                             std::string("\x1f") + r.geom_key;
     for (auto& t : prog_.tune_requests)
@@ -512,9 +487,8 @@ void Builder::record_tune_request(const Resolved& r) {
     prog_.tune_requests.push_back(std::move(req));
 }
 
-/* The geometry a band is DISPLAYED as: the fixed parameters plus the ranged one at the band's
- * upper bound. Diagnostics only -- a resolved band already carries the geometry the registry froze
- * it at, and that is the one the kernel is handed. */
+/* The geometry a band is displayed as: the fixed parameters plus the ranged one at the band's upper
+ * bound. Diagnostics only; the kernel receives the geometry the registry froze in Resolved. */
 static Geometry display_geometry(const OpInfo& oi, const Band& b) {
     Geometry g = oi.base;
     if (!oi.ranged_key.empty() && b.hi != INT64_MAX) g.set_i(oi.ranged_key, b.hi);
@@ -522,17 +496,16 @@ static Geometry display_geometry(const OpInfo& oi, const Band& b) {
 }
 
 void Builder::resolve_bands(OpInfo& oi) {
-    /* The bucket table is core/plugin/'s and this component does not second-guess it: the
-     * boundaries are the union of the constraint values candidate kernels place on the ranged
-     * parameter, clamped to the declared range, and both domains are resolved AT EACH BAND'S UPPER
-     * BOUND -- the worst case in the band and therefore the only value safe to select and size on.
-     * An empty ranged_key comes back as exactly one band whose hi is INT64_MAX, so the
-     * no-ranged-parameter case needs no separate path and band_for() always finds it. */
-    /* A KERNEL THAT CANNOT READ A WEIGHT'S ENCODING IS NOT A CANDIDATE FOR THE OP. Its layout
-     * hook says so with RAD_E_DTYPE, and a device row with no hook reads one plane as it is and
-     * nothing else -- so a bf16 head goes to the bf16 GEMM rather than being refused by the fp8
-     * one, and the same declaration serves a checkpoint and its quantised container. The host
-     * domain's hookless rows are libref, which reads canonically and is gated elsewhere. */
+    /* The bucket table comes from core/plugin/: boundaries are the union of candidate kernels'
+     * constraint values on the ranged parameter, clamped to the declared range, and both domains
+     * resolve at each band's upper bound (the worst case, the only safe value to select and size
+     * on). No ranged parameter yields one band with hi INT64_MAX, which band_for() always finds.
+     *
+     * A kernel that cannot read a weight's encoding is not a candidate: its layout hook returns
+     * RAD_E_DTYPE, and a hookless device row reads only a single plane as stored. So a bf16 head
+     * goes to the bf16 GEMM instead of being refused by the fp8 one, and one declaration serves a
+     * checkpoint and its quantised container. Hookless host rows are libref, which reads
+     * canonically and is gated elsewhere. */
     const Registry::RowFilter accept = [&](const KernelRow& r, const Geometry& g) -> std::string {
         const RadKernelInfo* ki = r.info;
         for (size_t wi = 0; wi < oi.weights.size(); ++wi) {
@@ -542,23 +515,10 @@ void Builder::resolve_bands(OpInfo& oi) {
             if (sources_ && !w.enc_known && w.decl.optional) continue;
             const int operand = wi < oi.weight_opd.size() && oi.weight_opd[wi] >= 0
                                     ? (int)oi.weight_opd[wi] : (int)wi;
-            char enc[256];
-            if (!ki->layout) {
-                if (ki->domain == RAD_DOMAIN_DEVICE && w.n_sel > 1) {
-                    rad_enc_format(&w.enc, enc, sizeof enc);
-                    return fmt("reads '%s' as stored, and it is %d planes of %s", w.name.c_str(),
-                               w.n_sel, enc);
-                }
-                continue;
-            }
             RadTensor t[RAD_ENC_MAX_PLANES];
             weight_planes(w, t);
-            RadLayout L{};
-            if (ki->layout(g.params(), g.n_params(), operand, &w.enc, w.sel, t, w.n_sel, &L) ==
-                RAD_E_DTYPE) {
-                rad_enc_format(&w.enc, enc, sizeof enc);
-                return fmt("does not read '%s' encoded %s", w.name.c_str(), enc);
-            }
+            std::string why = weight_refusal(ki, g, operand, w.enc, w.sel, t, w.n_sel, w.name);
+            if (!why.empty()) return why;
         }
         return std::string();
     };
@@ -566,8 +526,7 @@ void Builder::resolve_bands(OpInfo& oi) {
                                 oi.weights.empty() ? nullptr : &accept);
 
     if (oi.bands.empty()) {
-        /* No rows for this op at all. The range still owes an answer, so the miss report names a
-         * band rather than saying nothing about the op. */
+        /* No rows for this op at all; add one band so the miss report names it. */
         oi.bands.emplace_back();
         oi.bands.back().hi = oi.ranged_key.empty() ? INT64_MAX : oi.range_hi;
         for (int d = 0; d < RAD_N_DOMAINS; ++d)
@@ -579,21 +538,17 @@ void Builder::resolve_bands(OpInfo& oi) {
             Resolved& r = b.dom[d];
 
             if (!r) {
-                /* One entry per op per band per domain that resolved to nothing, each carrying the
-                 * constraint that refused it. build_bands records and does not abort -- a device
-                 * miss is fatal for that band and a host miss removes a placement option, and
-                 * which of those matters is not selection's call. Declare always completes and
-                 * reports the list whole (spec §3.1). */
+                /* One miss per op, band and domain, with the refusing constraint. Recorded, not
+                 * fatal: whether a miss matters is decided later (spec §3.1). */
                 prog_.misses.push_back({ oi.op, display_geometry(oi, b).str(), b.span,
                                          b.miss[d].empty() ? "no kernel matched" : b.miss[d],
                                          d, oi.index });
                 continue;
             }
 
-            /* Scratch at the same value the band was selected at. r.geom IS that value, frozen by
-             * the registry, so asking it here cannot drift from what the choice was made against.
-             * RadArgs carries no tensors: a scratch hook is a function of the geometry, which is
-             * the whole reason it can be called at declare at all. */
+            /* Scratch sized at r.geom, the frozen geometry the band was selected at. RadArgs
+             * carries no tensors: a scratch hook depends only on geometry, so it can run at
+             * declare. */
             if (r.row->info && r.row->info->scratch) {
                 RadArgs a{};
                 a.p          = r.geom.params();
@@ -615,13 +570,9 @@ void Builder::resolve_bands(OpInfo& oi) {
     }
 }
 
-/* init() once per resolved instance -- one op, one band, one domain -- run once the WHOLE graph
- * has resolved (spec §2.1). Not during resolution: one kernel's failing init would then abort
- * declare before the miss report was assembled, and the miss report is the point of the phase.
- *
- * A negative init is not a runtime condition. The kernel matched the constraints and then refused
- * the instance, so the band becomes a miss and the report names it here, rather than the failure
- * surfacing at the first launch three frames away. */
+/* init() once per resolved instance (op, band, domain), after the whole graph has resolved
+ * (spec §2.1; see rad_build.h). A negative init means the kernel refused an instance it matched:
+ * the band becomes a miss reported here rather than at the first launch. */
 void Builder::finish_instances() {
     for (size_t i = 1; i < prog_.ops.size(); ++i) {
         OpInfo& oi = prog_.ops[i];
@@ -649,14 +600,10 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
     if (!opname || !*opname) return err(RAD_E_INVAL, "decl_op: null op name");
     if (n_p < 0 || n_w < 0) return err(RAD_E_INVAL, "decl_op('%s'): negative count", opname);
 
-    /* ---- the schema, checked by the component that owns it.
-     *
-     * Registry::validate covers the whole parameter side: no such op (with the near miss named, so
-     * a typo and an unimplemented op are not the same diagnostic), an unknown key, a key given
-     * twice, a type mismatch, an empty range, and the one-ranged-parameter rule. A second copy of
-     * that check here would be a second answer to one question, and the two would drift. The
-     * sentence it fills in is written for an architecture-plugin author, so it goes into the
-     * report unchanged. */
+    /* ---- the schema, checked by its owner. Registry::validate covers the parameter side: unknown
+     * op (naming the near miss), unknown or repeated key, type mismatch, empty range, and the
+     * one-ranged-parameter rule. Its message is written for plugin authors and passed through
+     * unchanged. */
     std::string verr;
     const int v = reg_.validate(opname, p, n_p, &verr);
     if (v < 0) return err(v, "%s", verr.c_str());
@@ -664,8 +611,7 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
     const RadOpSchema* sc = reg_.schema(opname);
     if (!sc) return err(RAD_E_NOSCHEMA, "op '%s' has no declared schema", opname);
 
-    /* ---- parameters. validate() already guaranteed the shape of this list, so this only has to
-     * split the fixed parameters from the single ranged one. */
+    /* ---- parameters, already validated: split the fixed ones from the single ranged one. */
     Geometry base;
     std::string ranged_key;
     int64_t lo = 0, hi = 0;
@@ -675,10 +621,8 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
         switch (q.kind) {
             case RAD_P_INT:   base.set_i(q.key, q.ival); break;
             case RAD_P_STR:   base.set_s(q.key, q.sval); break;
-            /* A float parameter carries a value the kernel reads and NOTHING THE SELECTOR MATCHES
-             * ON: a tolerance is not a predicate, and a kernel that cares about eps to that
-             * precision has a bug (docs/OPS.md). So it goes into the geometry, where the kernel
-             * finds it, and never becomes a band boundary. */
+            /* A float reaches the kernel through the geometry but is never matched on or made a
+             * band boundary (docs/OPS.md; see constraint_holds). */
             case RAD_P_F64:   base.set_f(q.key, q.dval); break;
             case RAD_P_RANGE: ranged_key = q.key; lo = q.ival; hi = q.ihi; break;
             default:
@@ -687,11 +631,9 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
         }
     }
 
-    /* ---- operand count, which validate() does not see: it is handed the parameters and not the
-     * operands. Arguments are positional, so a count that disagrees with the schema means the same
-     * call means different things to different kernels -- not a diagnosable failure at issue, but
-     * silent numerical garbage (spec §2.3). Only the WEIGHT operands are named at declare, so that
-     * is what is counted here; the full count is checked against this same schema at issue. */
+    /* ---- weight operand count, which validate() does not see. Arguments are positional, so a
+     * count that disagrees with the schema produces silent garbage, not an error (spec §2.3). Only
+     * weight operands are named at declare; the full count is checked at issue. */
     size_t before = errors_.size();
     int w_req = 0, w_max = 0, n_tab = 0;
     for (int i = 0; sc->operands && i < sc->n_operands; ++i) {
@@ -700,22 +642,13 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
         ++w_max;
         if (!sc->operands[i].optional) ++w_req;
     }
-    /* ---- and where the operand is a TABLE, the run length.
-     *
-     * A RAD_OPD_WTAB position consumes a RUN of declared weights, so the count alone does not
-     * say how the list divides. The rule is EQUAL DIVISION: whatever is left after the fixed
-     * weight positions have taken one each is split evenly across the table positions, in
-     * declaration order. That is exactly right for the case tables exist for -- a grouped GEMM's
-     * codes and scale planes are one of each per expert, always the same count.
-     *
-     * WHERE IT DOES NOT COME OUT WHOLE, THE FIRST POSITIONS TAKE ONE MORE. A grouped GEMM whose
-     * n experts are C classes by number mod C, declared class by class as a codes table and a
-     * scales table each, gives its first `n % C` classes one expert more than the rest -- exactly
-     * the positions this rule lengthens. A list grouped any other way is refused at issue: the
-     * plugin names each table's run there, and a run other than the one this division bound is
-     * refused. A bound run must also be contiguous, checked when the tables are bound before the
-     * first step, and its entries of one shape, checked at its first issue. A list shorter than
-     * the tables is refused here. */
+    /* ---- table run lengths. A RAD_OPD_WTAB position consumes a run of declared weights. After
+     * each fixed weight position takes one, the rest is divided equally across the table
+     * positions in declaration order (a grouped GEMM has one codes and one scales plane per
+     * expert). If it does not divide, the first positions take one more, which matches n experts
+     * split into C classes by number mod C. Any other grouping is refused at issue, where the
+     * plugin names each run. Runs must also be contiguous (checked when tables are bound) and of
+     * one shape (checked at first issue). Too few weights for the tables is refused here. */
     int per_tab = 0, tab_extra = 0;
     if (n_tab > 0) {
         const int rest = n_w - w_max;
@@ -753,10 +686,8 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
         oi.range_hi   = hi;
     }
     oi.weights.assign(w, w + n_w);
-    /* The many-to-one map from declared weight to schema operand position, built here so the
-     * layout pass, the converter and the issue path all read one answer. A fixed weight position
-     * takes one; a table position takes `per_tab` in a row, and the first `tab_extra` of them one
-     * more. */
+    /* Declared weight -> schema operand position (OpInfo::weight_opd). A fixed position takes one
+     * weight; a table position takes `per_tab`, plus one for the first `tab_extra` tables. */
     oi.weight_opd.assign((size_t)n_w, -1);
     {
         int wi = 0, ti = 0;
@@ -778,10 +709,9 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
                                     "'%s' there -- the plugin declares a different graph at a "
                                     "smaller max_tok", at, opname,
                        at < ref_->ops.size() ? ref_->ops[at].op.c_str() : "nothing");
-        /* AND WITH THE SAME FIXED PARAMETERS. The kernel was chosen for the real declare's, and it
-         * runs with them: an op whose fixed geometry follows max_tok -- a row count declared as a
-         * constant rather than a range -- would be handed the real size while its buffers are the
-         * smaller level's, and write past them into whatever the arena lent out. */
+        /* Fixed parameters must match too: the kernel runs with the real declare's. A fixed row
+         * count that follows max_tok would be launched at the real size over the smaller level's
+         * buffers and write past them into lent arena memory. */
         const Geometry& rb = ref_->ops[at].base;
         auto role_of = [&](const char* key) {
             for (int k = 0; sc->params && k < sc->n_params; ++k)
@@ -801,7 +731,7 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
             bool same = false;
             switch (ra[x].kind) {
                 case RAD_P_INT:
-                    /* A CAPACITY MAY SHRINK: its kernel writes by its operands' extents. */
+                    /* A capacity may shrink: its kernel writes by its operands' extents. */
                     same = y->ival == ra[x].ival ||
                            (role_of(ra[x].key) == RAD_PROLE_CAPACITY && y->ival <= ra[x].ival);
                     break;
@@ -829,9 +759,9 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
     prog_.ops.push_back(std::move(oi));
     op_bufs_.emplace_back();
 
-    /* An op recorded but not handed back: the graph dump still shows it and its holes, and the
-     * plugin gets a falsy handle so it can offer the unfused sequence instead. A miss is not an
-     * error yet -- it becomes one only if the plugin issues it (spec §2.3, §3.2). */
+    /* An unresolved op is recorded (the graph dump shows it) but returns a null handle, so the
+     * plugin can declare the unfused sequence instead. It becomes an error only if issued
+     * (spec §2.3, §3.2). */
     return resolved ? h : RAD_NULL_HANDLE;
 }
 
@@ -866,9 +796,7 @@ int Builder::op_writes(rad_op h, const rad_buf* b, int n) {
     return RAD_OK;
 }
 
-/* SEE rad_buf_concurrent. A buffer a second lane touches is not bounded by the op range its
- * declarations imply, so liveness hands it the whole program. Recorded rather than applied here
- * because liveness runs at finish(), after every declaration is in. */
+/* See rad_buf_concurrent. Recorded here and applied by liveness at finish(). */
 int Builder::buf_concurrent(rad_buf b) {
     if (finished_) { err(RAD_E_STATE, "buf_concurrent after declare finished"); return RAD_E_STATE; }
     if (b == 0 || b >= prog_.buffers.size()) return RAD_E_INVAL;
@@ -876,8 +804,8 @@ int Builder::buf_concurrent(rad_buf b) {
     return RAD_OK;
 }
 
-/* SEE rad_weight_shard_span. Checked against the declaration here, where the plugin that got it
- * wrong can be named; the loader checks it against the container. */
+/* See rad_weight_shard_span. Checked against the declaration here, where the plugin can be named;
+ * the loader checks it against the container. */
 int Builder::weight_shard_span(rad_weight h, int64_t lo, int64_t hi) {
     if (finished_) { err(RAD_E_STATE, "weight_shard_span after declare finished"); return RAD_E_STATE; }
     if (h == 0 || h >= prog_.weights.size()) return RAD_E_INVAL;
@@ -893,8 +821,8 @@ int Builder::weight_shard_span(rad_weight h, int64_t lo, int64_t hi) {
             (long long)lo, (long long)hi);
         return RAD_E_INVAL;
     }
-    /* The declared extent is the rank's own, so it has to be the span's length: each stacked
-     * part's for ROW, the columns for COL. */
+    /* The declared extent is this rank's, so it must equal the span's length: each stacked part's
+     * rows for ROW, the columns for COL. */
     bool ok;
     if (d.shard == RAD_SHARD_ROW) {
         if (d.n_row_parts > 1) {
@@ -954,11 +882,10 @@ int Builder::weight_shard_span_parts(rad_weight h, const int64_t* lo, const int6
 int Builder::kv_group_zero(rad_kvgroup h) {
     if (finished_) { err(RAD_E_STATE, "kv_group_zero after declare finished"); return RAD_E_STATE; }
     if (h == 0 || h >= prog_.kv_groups.size()) return RAD_E_INVAL;
-    /* PAGED GROUPS ONLY. A zero group is one whose rank computes nothing that reads or writes it,
-     * and a paged group's absence is invisible to the others: they index the shared block table
-     * and this rank has no shard to index. A linear or conv group carries per-sequence state the
-     * snapshot store saves and the step clears on every rank, and a zero-sized one would make
-     * each of those copies a size mismatch. */
+    /* Paged groups only. A zero group is one this rank never reads or writes; for a paged group
+     * the other ranks just index the shared block table. A linear or conv group's per-sequence
+     * state is saved and cleared on every rank, so a zero-sized one would mismatch those
+     * copies. */
     const int kind = prog_.kv_groups[h].decl.kind;
     if (kind != RAD_KV_FULL && kind != RAD_KV_WINDOW) {
         err(RAD_E_INVAL, "kv group '%s': kv_group_zero on a group that is not paged",
@@ -994,32 +921,22 @@ int Builder::decl_name_map(const RadNameMap* m) {
         }
         c.src[i] = intern(m->src[i]);
     }
-    /* AND `src_index`, BECAUSE THIS COPY IS FIELD BY FIELD. Every field added to RadNameMap has to
-     * be added here too, and the cost of missing one is not that the value is lost: `RadNameMap
-     * c{}` value-initialises it to ZERO, and zero means "sub-tensor 0 of this source" while the
-     * ABI's own default and arch/common/rad_arch.h's map_base() both say -1, "the whole tensor".
-     * A dropped field is therefore every map in every model quietly asking for slice 0 of its
-     * source (rad_convert.cpp refuses an index it cannot serve rather than ignoring it). */
+    /* This copy is field by field: a field added to RadNameMap must be added here too. A missed
+     * src_index would stay 0 ("sub-tensor 0") instead of the ABI default -1 ("whole tensor",
+     * also map_base() in arch/common/rad_arch.h), so every map would ask for slice 0. */
     for (int i = 0; i < m->n_src; ++i) c.src_index[i] = m->src_index[i];
     for (int i = m->n_src; i < 8; ++i) c.src_index[i] = -1;
 
-    /* A CONCAT MAP MAY BE DECLARED IN PIECES, AND EVERY OTHER REPEAT IS A BUG.
+    /* A CONCAT map may be declared in pieces; any other repeat is an error.
      *
-     * `src[8]` is the ABI's cap and a sharded checkpoint blows straight through it:
-     * Qwen3.8-Flash-Next stores its 320-million-row n-gram embedding as 128 tensors named
-     * `...ngram_embedding.shard_K.weight`. Growing the array is the wrong answer -- there is one
-     * map per declared weight and the full model declares about fifty thousand of them, so 8 -> 128
-     * would cost ~80 MB of Program to serve one tensor.
+     * `src[8]` is the ABI's cap, and a sharded checkpoint exceeds it: Qwen3.8-Flash-Next stores
+     * its n-gram embedding as 128 tensors `...ngram_embedding.shard_K.weight`. Growing the array
+     * would cost ~80 MB of Program (one map per declared weight, ~50K weights). So successive
+     * CONCAT maps for one name extend it in call order, and rad-convert joins their sources end
+     * to end (map_concat_shards() in arch/common/rad_arch.h).
      *
-     * So successive CONCAT maps for one declared name EXTEND it, in call order, and rad-convert
-     * joins their sources end to end. arch/common/rad_arch.h's map_concat_shards() is the one-line
-     * form; nothing else in the tree needs more than eight.
-     *
-     * Every OTHER repeat is refused rather than merged, and the refusal is the point. A lookup
-     * built with `std::map::emplace` KEEPS THE FIRST and drops the rest without a word, so two
-     * maps for one weight -- a copy-paste, a loop with a constant index -- convert a model whose
-     * weights came from the wrong tensors and say nothing. A merge rule that is a merge rule has
-     * to say which repeats it is not. */
+     * Other repeats are refused: a lookup built with std::map::emplace would silently keep the
+     * first, so a copy-paste mistake would convert weights from the wrong tensors. */
     auto seen = name_map_first_.find(c.declared);
     if (seen != name_map_first_.end()) {
         const RadNameMap& first = prog_.name_map[seen->second];
@@ -1044,11 +961,9 @@ int Builder::decl_name_map(const RadNameMap* m) {
     return RAD_OK;
 }
 
-/* Which buffer the core samples from. Refusing a second call rather than letting the last one win:
- * two plugins declaring into one builder (a target and its drafter, spec §10) both have logits,
- * and silently keeping the second would sample the draft model's distribution into the target's
- * tokens -- fluent wrong text, and nothing would say so. The drafter's own logits are reached
- * through its scope, not through this. */
+/* The buffer the core samples from. A second call is refused rather than winning: a target and
+ * its drafter declaring into one builder (spec §10) both have logits, and keeping the second would
+ * sample the draft distribution. The drafter's logits are reached through its scope. */
 int Builder::declare_logits(rad_buf b) {
     if (finished_) { err(RAD_E_STATE, "declare_logits after declare finished"); return RAD_E_STATE; }
     if (b == RAD_NULL_HANDLE || (size_t)b >= prog_.buffers.size()) {
@@ -1076,10 +991,9 @@ int Builder::declare_logits(rad_buf b) {
     return RAD_OK;
 }
 
-/* The embedding program's output (rad_declare_pooled). Checked here for the logits buffer's
- * reasons, and for shape: the core reads `n_seq` f32 rows of it from the device after every step,
- * so a buffer narrower than a step's sequences, or in another dtype or domain, is refused now
- * rather than read past or misread at the first request. */
+/* The embedding program's output (rad_declare_pooled). Checked as declare_logits is, and for
+ * shape: the core reads `n_seq` f32 rows from the device after every step, so the wrong dtype,
+ * domain or too few rows is refused now rather than misread at the first request. */
 int Builder::declare_pooled(rad_buf b) {
     if (finished_) { err(RAD_E_STATE, "declare_pooled after declare finished"); return RAD_E_STATE; }
     if (b == RAD_NULL_HANDLE || (size_t)b >= prog_.buffers.size()) {
@@ -1115,15 +1029,12 @@ int Builder::declare_pooled(rad_buf b) {
     return RAD_OK;
 }
 
-
-/* WHAT THE ENCODER IS. Checked here, at declare, for the drafter's reason: an encoder is exercised
- * only when a request carries media, so a declaration the engine cannot drive would otherwise
- * surface on the first image as a pass that reads or writes past a buffer.
+/* Validates the encoder at declare: it runs only when a request carries media, so a bad
+ * declaration would otherwise surface on the first image as an out-of-bounds pass.
  *
- * `max_patches` must be what the deployment asked for, because the plugin sized every activation
- * of its tower with RadBuildCtx::max_enc_patches and the core stages up to this many patches; a
- * disagreement is a tower declared for one pass size and driven at another. `out` has to hold a
- * whole pass's rows, since the core reads them back from it. */
+ * `max_patches` must equal RadBuildCtx::max_enc_patches (or max_audio_frames), which the plugin
+ * sized its activations with and the core stages up to. `out` must hold a whole pass's rows, which
+ * the core reads back. */
 int Builder::declare_encoder(const RadEncoderDecl* d) {
     if (finished_) { err(RAD_E_STATE, "declare_encoder after declare finished"); return RAD_E_STATE; }
     if (!d) { err(RAD_E_INVAL, "declare_encoder: null declaration"); return RAD_E_INVAL; }
@@ -1167,8 +1078,7 @@ int Builder::declare_encoder(const RadEncoderDecl* d) {
         return RAD_E_INVAL;
     }
     const RadBufDecl& ob = prog_.buffers[d->out].decl;
-    int64_t numel = 1;
-    for (uint32_t i = 0; i < ob.rank; ++i) numel *= ob.shape[i];
+    const int64_t numel = decl_numel(ob.rank, ob.shape);
     if (ob.dtype != RAD_BF16 || ob.domain != RAD_DOMAIN_DEVICE ||
         numel < d->max_patches / d->merge * d->n_embd) {
         err(RAD_E_INVAL, "declare_encoder '%s': out '%s' must be a device bf16 buffer of at least "
@@ -1183,11 +1093,9 @@ int Builder::declare_encoder(const RadEncoderDecl* d) {
     return RAD_OK;
 }
 
-/* WHAT THE GENERATOR IS. Checked whole here: a generator's every request runs all three of its
- * passes, so a declaration the core cannot drive fails the first request rather than a rare one,
- * and the first request is the wrong place to learn that the plugin sized its image buffer for a
- * smaller picture than it says it makes. The strings are copied: the plugin's storage is not the
- * Program's, and the Program outlives a declare. */
+/* Validates the whole generator at declare rather than at the first request (e.g. an image
+ * buffer too small for the largest picture). The strings are copied because the Program outlives
+ * the plugin's declare-time storage. */
 int Builder::declare_generator(const RadGeneratorDecl* d) {
     if (finished_) { err(RAD_E_STATE, "declare_generator after declare finished"); return RAD_E_STATE; }
     if (!d) { err(RAD_E_INVAL, "declare_generator: null declaration"); return RAD_E_INVAL; }
@@ -1254,8 +1162,7 @@ int Builder::declare_generator(const RadGeneratorDecl* d) {
         return RAD_E_INVAL;
     }
     const RadBufDecl& ob = prog_.buffers[d->image_out].decl;
-    int64_t numel = 1;
-    for (uint32_t i = 0; i < ob.rank; ++i) numel *= ob.shape[i];
+    const int64_t numel = decl_numel(ob.rank, ob.shape);
     const int64_t px = d->max_tokens * d->latent_scale * d->latent_scale;
     if (ob.dtype != RAD_U8 || ob.domain != RAD_DOMAIN_DEVICE || numel < px * d->pixel_channels) {
         err(RAD_E_INVAL, "declare_generator '%s': image_out '%s' must be a device u8 buffer of at "
@@ -1273,8 +1180,8 @@ int Builder::declare_generator(const RadGeneratorDecl* d) {
     g.tmpl_transparent = d->tmpl_transparent ? d->tmpl_transparent : "";
     g.sigmas.assign(d->sigmas, d->sigmas + d->n_sigmas);
     prog_.generator = *d;
-    /* The Program is moved after declare, and a pointer into a moved string is a pointer into the
-     * old one's storage: nothing here may be read through the decl, only through gen_str. */
+    /* The Program is moved after declare, which would invalidate pointers into gen_str, so the
+     * decl's string fields are cleared; read them only through gen_str. */
     RadGeneratorDecl& c = prog_.generator;
     c.name = c.tmpl_text = c.tmpl_edit = c.tmpl_image = c.tmpl_image_sep = nullptr;
     c.drop_prefix = c.tmpl_transparent = nullptr;
@@ -1282,14 +1189,9 @@ int Builder::declare_generator(const RadGeneratorDecl* d) {
     return RAD_OK;
 }
 
-/* WHAT THE DRAFT HEAD IS. Every field is checked here rather than at the first draft pass: a
- * drafter is exercised only once a request is speculating, so a decl that is wrong in a way the
- * engine cannot act on would otherwise surface as acceptance that is quietly zero.
- *
- * `depth` must equal what the deployment was configured for. The plugin was TOLD the number in
- * RadBuildCtx::max_spec and sized its own buffers with it, so a disagreement is not a preference
- * to reconcile -- it is the plugin having declared a graph for one depth and a drafter for
- * another, and the engine would drive the second against the first. */
+/* Validates the draft head at declare rather than at the first draft pass, where a bad decl would
+ * only show as zero acceptance. `depth` must equal RadBuildCtx::max_spec, which the plugin sized
+ * its buffers with. */
 int Builder::declare_drafter(const RadDrafterDecl* d) {
     if (finished_) {
         err(RAD_E_STATE, "declare_drafter after declare finished");
@@ -1333,27 +1235,24 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
             (long long)d->proposal_pitch);
         return RAD_E_INVAL;
     }
-    /* A BLOCK PASS EMBEDS THE MASK ID AT EVERY POSITION IT HAS NOT FILLED. Without one there is
-     * nothing to run, and the failure without this check is a block of whatever token id 0 is. */
+    /* A block pass embeds the mask id at every unfilled position, so it needs one. */
     if (d->kind == RAD_DRAFT_BLOCK && d->mask_token < 0) {
         err(RAD_E_INVAL, "declare_drafter '%s': RAD_DRAFT_BLOCK with no mask_token. Every "
                          "position the block has not filled embeds it; there is nothing to run.",
             nm);
         return RAD_E_INVAL;
     }
-    /* A BLOCK drafter's proposal cannot come from the sampler: the whole block is filled by one
-     * pass and the sampler writes one token a row. SERIAL may use either. */
+    /* A block drafter's proposal cannot come from the sampler, which writes one token per row
+     * while one pass fills the whole block. A serial drafter may use either. */
     if (d->kind == RAD_DRAFT_BLOCK && d->proposal == RAD_NULL_HANDLE) {
         err(RAD_E_INVAL, "declare_drafter '%s': RAD_DRAFT_BLOCK with no proposal buffer. One pass "
                          "fills %d positions and the sampler writes one token a row, so there is "
                          "nowhere for the rest of the block to arrive.", nm, d->depth);
         return RAD_E_INVAL;
     }
-    /* THE BLOCK'S ROW COUNT, defaulted and then checked against the depth it has to carry. The
-     * head runs over the LAST `depth` rows of the block (rad_builder.h), so a block shorter than
-     * the depth names rows that do not exist, and a block more than one row longer than the depth
-     * leaves leading rows that nothing reads -- neither is a convention, both are a mistake in
-     * the plugin, and both produce a drafter whose proposals are simply shifted. */
+    /* The block's row count, defaulted to depth + 1. The head runs over the last `depth` rows
+     * (rad_builder.h), so the block must be depth or depth + 1 rows; anything else shifts the
+     * proposals. */
     int64_t block = d->block;
     if (d->kind == RAD_DRAFT_BLOCK) {
         if (block == 0) block = (int64_t)d->depth + 1;
@@ -1371,12 +1270,10 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
         return RAD_E_INVAL;
     }
 
-    /* THE NAME LIVES IN drafter_name AND ONLY THERE. `drafter.name` is the plugin's pointer, into
-     * storage this program does not own, and pointing it at drafter_name instead would not
-     * survive the program being moved or copied out of the builder: a short name is stored inside
-     * the std::string object itself, so the pointer would name the builder's copy after it is
-     * gone. Left null, a reader that forgets this gets nothing rather than freed memory; the
-     * engine points its own copy of the decl at its own copy of the string. */
+    /* The name lives only in drafter_name. `drafter.name` points into plugin storage, and
+     * pointing it at drafter_name would not survive moving the Program (a short string is stored
+     * inline in the std::string). Left null, a careless reader gets nothing instead of freed
+     * memory; the engine points its own copy of the decl at its own string. */
     prog_.drafter      = *d;
     prog_.drafter_name = nm;
     prog_.drafter.name = nullptr;
@@ -1385,9 +1282,8 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
     return RAD_OK;
 }
 
-/* A SERIAL HEAD THAT READS THE TRUNK'S CACHE AND KEEPS NONE (rad_builder.h). Checked here for the
- * reason declare_drafter checks everything: the driver only reaches the head once a request
- * speculates, and a head staged the wrong way round costs acceptance and says nothing. */
+/* A serial head that reads the trunk's cache and keeps none (rad_builder.h). Validated at declare
+ * for the same reason as declare_drafter. */
 int Builder::drafter_shared_kv(int pos_offset) {
     if (finished_) {
         err(RAD_E_STATE, "drafter_shared_kv after declare finished");
@@ -1419,13 +1315,9 @@ void Builder::note_v(const char* f, va_list ap) {
 
 /* ================================================================== finalise */
 void Builder::finish_weight_uses() {
-    /* Layer offload is a scheduling problem and not a prediction one precisely because this walk
-     * exists: declare enumerated every op with its weight operands in order, so the core knows
-     * the entire future access sequence statically and prefetch is exact (spec §5).
-     *
-     * An op that did not resolve still counts here. That widens a weight's interval by at most the
-     * op the plugin fell back from, and widening it means prefetching earlier and freeing later --
-     * conservative in the safe direction. */
+    /* Declare enumerated every op and its weights in order, so the access sequence is known
+     * statically and prefetch is exact (spec §5). Unresolved ops still count, which can only widen
+     * an interval (prefetch earlier, free later): the safe direction. */
     for (size_t i = 1; i < prog_.ops.size(); ++i) {
         const OpInfo& o = prog_.ops[i];
         for (rad_weight h : o.weights) {
@@ -1437,32 +1329,40 @@ void Builder::finish_weight_uses() {
     }
 }
 
-/* The weight layout pass (spec §4.3).
+/* The weight layout pass (spec §4.3). Each kernel's layout hook, given the weight's encoding and
+ * this rank's planes, states the stored form it wants (e.g. libr4d's gemm_w4a8 wants WMMA fragment
+ * order); the manifest records it and the loader produces it with the same kernel's relayout. A
+ * hook may also refuse an encoding, which becomes a declare error naming weight, encoding and
+ * kernel.
  *
- * Nothing in the core knows that libr4d's gemm_w4a8 wants its codes in WMMA fragment order: libr4d
- * says so through its layout hook, given the weight's encoding and this rank's share of its
- * planes, and the manifest records what it said. The loader produces it with the same kernel's
- * relayout. The hook is also where a kernel REFUSES an encoding it does not read, and that refusal
- * is a declare-time error naming the weight, the encoding and the kernel.
+ * A weight is stored once, so two kernels wanting different stored forms is an error, reported
+ * here rather than as a shape mismatch at load.
  *
- * A weight touched by two kernels that want DIFFERENT stored forms is a real, diagnosable failure
- * and it is named here: a weight is stored once. Discovering that at load, as a shape mismatch,
- * would be much worse. */
+ * Device rows claim first, over every op, and host rows after them. A host row only claims a
+ * weight no device row did: on a card a host row is the fallback of a device kernel that may
+ * relayout, and a different reading there is not an error but a reason the op cannot move to the
+ * host, which the runtime's check_domain_layout decides. On the host backend there are no device
+ * rows, and the host rows' hooks decide the stored form (a weight over several planes is joined
+ * by them, abi/rad_planes.h). */
 void Builder::finish_layouts() {
-    /* Who asked for each weight's layout, so a conflict names both kernels rather than one. */
+    /* Who asked for each weight's layout, so a conflict names both kernels, and on which domain. */
     std::vector<std::string> claimant(prog_.weights.size());
+    std::vector<int> claim_dom(prog_.weights.size(), -1);
+    /* The host kernels that read a weight over several planes without joining them, for the error
+     * when nothing else does. */
+    std::vector<std::string> unjoined(prog_.weights.size());
 
+    for (int d : { (int)RAD_DOMAIN_DEVICE, (int)RAD_DOMAIN_HOST })
     for (size_t i = 1; i < prog_.ops.size(); ++i) {
         const OpInfo& o = prog_.ops[i];
         if (o.weights.empty()) continue;
 
-        /* The hook indexes the schema's POSITIONAL operand list, not the weight list, and
-         * OpInfo::weight_opd is that map -- recorded at declare because RAD_OPD_WTAB makes it
-         * many-to-one, so it is not a function of the weight's index. */
+        /* The hook indexes the schema's positional operand list; OpInfo::weight_opd maps weights
+         * to it. */
         for (size_t wi = 0; wi < o.weights.size(); ++wi) {
             rad_weight h = o.weights[wi];
             if (h == 0 || h >= prog_.weights.size()) continue;
-            /* An optional weight the source does not hold is absent, and no kernel reads it. */
+            /* An optional weight the source lacks is absent; no kernel reads it. */
             if (sources_ && !prog_.weights[h].enc_known && prog_.weights[h].decl.optional)
                 continue;
             int operand = wi < o.weight_opd.size() && o.weight_opd[wi] >= 0
@@ -1470,39 +1370,27 @@ void Builder::finish_layouts() {
 
             for (size_t bi = 0; bi < o.bands.size(); ++bi) {
                 const Band& b = o.bands[bi];
-                for (int d = 0; d < RAD_N_DOMAINS; ++d) {
+                {
                     const Resolved& r = b.dom[d];
                     if (!r || !r.row->info) continue;
                     const RadKernelInfo* ki = r.row->info;
                     WeightInfo& w = prog_.weights[h];
 
-                    /* THIS RANK'S PLANES, as geometry: what the kernel will be handed, minus the
-                     * bytes. */
+                    /* This rank's planes as geometry, without data. */
                     RadTensor t[RAD_ENC_MAX_PLANES];
                     weight_planes(w, t);
 
-                    /* A ROW WITH NO LAYOUT HOOK IS NOT SILENT: it is asserting that it reads the
-                     * selected plane AS IT IS. Reading it as "no opinion" instead admits a whole
-                     * class of bug.
+                    /* A device row with no layout hook claims the selected plane as stored; it is
+                     * not "no opinion". All bands of an op read the same stored bytes, so if one
+                     * band's kernel relayouts and another's does not, the second misreads them
+                     * with a matching byte count. Example: on an fp8 lm_head, logits_gemm_fp8
+                     * (M <= 32) packs codes and scales per row, while logits_gemm_bf16 above it
+                     * would read the E4M3 codes as bf16 and return empty completions once
+                     * batches grow.
                      *
-                     * The bands of one op can resolve to different kernels -- M <= 32 to one and
-                     * M <= 64 to another -- and they all read THE SAME STORED BYTES, because a
-                     * weight is stored once. If one of them relayouts and another does not, the
-                     * second reads the first one's arrangement under a different interpretation,
-                     * and nothing downstream can catch that: the byte count matches.
-                     *
-                     * The shape it takes, on an fp8 lm_head: logits_gemm_fp8 serves M <= 32 and
-                     * asks for codes and scales in one row; the band above it falls to
-                     * logits_gemm_bf16, which has no hook and reads the E4M3 codes as bf16. Such a
-                     * model loads, serves every request under 32 rows correctly, and returns EMPTY
-                     * completions the moment enough sequences batch together.
-                     *
-                     * THE HOST DOMAIN IS EXEMPT from claiming the plane as it is, and that is not
-                     * an oversight. libref reads every weight canonically and declares no hook, so
-                     * every op with a relaying device kernel would collide with its own reference
-                     * fallback and no model would declare at all. The reference reading a
-                     * relayed weight is a real hazard, but it is the one
-                     * rad_gate_reference_kernels already refuses to serve on. */
+                     * A host row with no hook, or one declining the operand, is exempt: it reads
+                     * the planes as the container stores them, and counting it would make every
+                     * relayouting device op conflict with its own fallback. */
                     RadLayout L{};
                     const int st = ki->layout ? ki->layout(r.geom.params(), r.geom.n_params(),
                                                            operand, &w.enc, w.sel, t, w.n_sel, &L)
@@ -1521,10 +1409,16 @@ void Builder::finish_layouts() {
                             enc, rad_strerror(st));
                         continue;
                     }
-                    if (st == RAD_E_UNSUPPORTED && d != RAD_DOMAIN_DEVICE) continue;
+                    if (st == RAD_E_UNSUPPORTED && d != RAD_DOMAIN_DEVICE) {
+                        if (w.n_sel > 1 && unjoined[h].find(ki->name) == std::string::npos)
+                            unjoined[h] += (unjoined[h].empty() ? "" : ", ") + std::string(ki->name);
+                        continue;
+                    }
 
                     const std::string tag = st == RAD_OK ? (L.tag && *L.tag ? L.tag : ki->name)
                                                          : std::string();
+                    /* A device row's form stands; this host row then cannot take the op. */
+                    if (d == RAD_DOMAIN_HOST && claim_dom[h] == RAD_DOMAIN_DEVICE) continue;
                     if (!claimant[h].empty() && w.layout_tag != tag) {
                         err(RAD_E_SHAPE,
                             "weight '%s' is wanted in two stored forms: '%s' by %s and '%s' by %s. "
@@ -1539,6 +1433,7 @@ void Builder::finish_layouts() {
                     }
                     if (!claimant[h].empty()) continue;   /* the same form, asked again */
                     claimant[h] = ki->name;
+                    claim_dom[h] = d;
 
                     if (tag.empty()) {
                         if (w.n_sel != 1)
@@ -1568,8 +1463,8 @@ void Builder::finish_layouts() {
                     for (uint32_t k = 0; k < RAD_MAX_RANK; ++k)
                         w.stored_shape[k] = k < L.rank ? L.shape[k] : 0;
                     if (L.align > 0) w.align = L.align;
-                    /* The hook's byte count wins: it includes whatever padding the layout implies,
-                     * and the core cannot derive that from a shape. */
+                    /* The hook's byte count wins: it includes layout padding the core cannot derive
+                     * from a shape. */
                     if (L.bytes > 0) {
                         w.stored_bytes = L.bytes;
                     } else {
@@ -1590,13 +1485,18 @@ void Builder::finish_layouts() {
     }
 
     /* A weight taking several planes as one operand needs a kernel to join them; one no op reads
-     * has none. */
+     * has none, and neither has one read only by host kernels without a hook for it. */
     for (size_t h = 1; h < prog_.weights.size(); ++h) {
         const WeightInfo& w = prog_.weights[h];
-        if (w.n_sel > 1 && w.identity && claimant[h].empty())
+        if (w.n_sel <= 1 || !w.identity || !claimant[h].empty()) continue;
+        if (unjoined[h].empty())
             err(RAD_E_SHAPE, "'%s' takes %d planes of '%s' as one weight and no op reads it, so "
                              "nothing says how they are stored", w.name.c_str(), w.n_sel,
                 w.source.c_str());
+        else
+            err(RAD_E_SHAPE, "'%s' takes %d planes of '%s' as one weight, and the host kernels "
+                             "reading it (%s) have no layout that joins them (abi/rad_planes.h)",
+                w.name.c_str(), w.n_sel, w.source.c_str(), unjoined[h].c_str());
     }
 }
 
@@ -1606,51 +1506,35 @@ void Builder::finish_kv_groups() {
         const RadKVGroupDecl& d = gi.decl;
 
         if ((d.kind == RAD_KV_FULL || d.kind == RAD_KV_WINDOW) && gi.block_size == 0) {
-            /* The plugin may never have asked. The manifest still needs the answer, and asking
-             * here reports the same diagnostic it would have got. */
+            /* The plugin may never have asked; the manifest still needs the answer. */
             kv_block_size((rad_kvgroup)g);
         }
 
         int64_t elem_n_head = d.n_head_kv > 0 ? d.n_head_kv : 1;
-        /* EVERY LAYER BOUND TO THE GROUP, because that is what a page is. KVManager documents both
-         * of these as covering the whole bundle -- "one page covers every layer bound to the group.
-         * That is where the zero-padding property lives" -- and its own fallback formula multiplies
-         * by the layer count. A figure computed here for ONE layer under-sizes the pool by the
-         * layer count, because that fallback is unreachable whenever the builder supplies a value:
-         * the manager then divides a one-layer page across every bound layer, giving a per-layer
-         * stride that is a fraction of a layer and a layer base pointer that need not even be
-         * 2-byte aligned. It surfaces as an alignment refusal from the attention kernel at the
-         * SECOND bound layer, layer 0 being at offset 0. */
+        /* Sizes cover every layer bound to the group: KVManager defines a page as covering all of
+         * them and divides it across the bound layers. A one-layer figure would make the per-layer
+         * stride a fraction of a layer (misaligned from the second bound layer on). */
         const int64_t n_bound = gi.layers.empty() ? 1 : (int64_t)gi.layers.size();
         switch (d.kind) {
             case RAD_KV_FULL:
             case RAD_KV_WINDOW:
-                /* One block holds K and V for block_size tokens: the pair is the unit the block
-                 * manager allocates, so it is the unit sized here. */
+                /* One block holds K and V for block_size tokens, the block manager's unit. */
                 gi.bytes_per_block =
                     rad_dtype_bytes(d.dtype, 2 * gi.block_size * elem_n_head * d.head_dim) * n_bound;
                 gi.bytes_per_state = 0;
                 break;
             case RAD_KV_LINEAR:
-                /* Per sequence and fixed size: 32 heads of 128x128 fp32 is 2 MiB a layer, which
-                 * is why it cannot be snapshotted per block (spec §7.3). */
+                /* Per sequence, fixed size (32 heads of 128x128 fp32 is 2 MiB a layer), so it
+                 * cannot be snapshotted per block (spec §7.3). */
                 gi.bytes_per_block = 0;
                 gi.bytes_per_state = rad_dtype_bytes(
                     d.dtype, elem_n_head * (d.state_dim[0] ? d.state_dim[0] : 1)
                                          * (d.state_dim[1] ? d.state_dim[1] : 1)) * n_bound;
                 break;
             case RAD_KV_CONV: {
-                /* A rolling window of conv_width-1 + n_spec entries, so a speculative rejection
-                 * is a change of read offset rather than a recompute (spec §10). The window is
-                 * sized for the largest speculative window this deployment was configured for.
-                 *
-                 * EXACTLY THE STATE TENSOR'S EXTENT, conv_window_entries(), and not one more. The
-                 * kernels lay the slots out from the tensor, so an allocation one entry wider a
-                 * slot puts the manager's slot `s` -- the bytes it clears when it hands the slot
-                 * out, and saves and restores at a checkpoint -- over the start of the kernels'
-                 * slot `s + 1`. Handing a slot to a new sequence then zeroes part of a running
-                 * sequence's window. conv_state_index's cursor cycles by the same number, so it
-                 * stays inside the slot. */
+                /* A rolling window of conv_width-1 + max_spec entries, so a speculative rejection
+                 * moves the read offset instead of recomputing (spec §10). Must be exactly
+                 * conv_window_entries(), the state tensor's extent; see its comment. */
                 int64_t entries = conv_window_entries(d, prog_.ctx.max_spec);
                 if (entries <= 0) entries = 1;
                 gi.bytes_per_block = 0;
@@ -1664,10 +1548,9 @@ void Builder::finish_kv_groups() {
         gi.drafter = prog_.meta.n_layers > 0 && !gi.layers.empty() &&
                      gi.layers.front() >= prog_.meta.n_layers;
 
-        /* A group nothing is bound to is a group the block manager cannot size: how many state
-         * instances a sequence owns is the layer count, and assuming one would make the page size
-         * a guess. KVManager::configure refuses it, so it is refused here where the name of the
-         * missing call is still obvious. */
+        /* A group with no bound layers cannot be sized (the layer count is the number of state
+         * instances per sequence). KVManager::configure would refuse it; refuse here, where the
+         * missing call is obvious. */
         if (gi.layers.empty())
             err(RAD_E_STATE,
                 "kv group '%s' has no layers bound: call rad_bind_layer_kv(b, layer, g) for every "
@@ -1677,65 +1560,41 @@ void Builder::finish_kv_groups() {
 }
 
 void Builder::finish_buffer_liveness() {
-    const int32_t last_op = (int32_t)prog_.ops.size() - 1;
-    /* A program that runs a second lane gets a second scratch region with it: see
-     * Program::scratch_regions. The concurrent buffers are how an architecture says it has one. */
+    const int32_t last_op = std::max<int32_t>((int32_t)prog_.ops.size() - 1, 0);
+    /* A second lane, signalled by any concurrent buffer, gets a second scratch region
+     * (Program::scratch_regions). */
     prog_.scratch_regions = concurrent_bufs_.empty() ? 1 : 2;
 
-    for (size_t i = 1; i < prog_.buffers.size(); ++i) {
+    /* Each buffer's first and last declaring op, in one pass over the op lists. */
+    const size_t nb = prog_.buffers.size();
+    std::vector<int32_t> first(nb, -1), last(nb, -1);
+    for (size_t o = 1; o < op_bufs_.size(); ++o)
+        for (const std::vector<rad_buf>* v : { &op_bufs_[o].reads, &op_bufs_[o].writes })
+            for (rad_buf h : *v) {
+                if (first[h] < 0) first[h] = (int32_t)o;
+                last[h] = (int32_t)o;
+            }
+
+    for (size_t i = 1; i < nb; ++i) {
         BufferInfo& b = prog_.buffers[i];
-
-        /* PERSIST survives across steps and DERIVED is written once per step by the core before
-         * any op runs. Both are live at every op by construction, and saying so here rather than
-         * leaving -1 means one rule reads the field and the plan and the dump agree. */
-        if (b.decl.kind != RAD_BUF_TRANSIENT) {
+        /* Live at every op: PERSIST and DERIVED (set explicitly so the plan and the dump read one
+         * rule); a buffer on the second lane, whose declared range does not bound when its bytes
+         * are in use; and one with no declared use, since an op may issue any handle in any
+         * order (--debug-graph reports the cost). */
+        if (b.decl.kind != RAD_BUF_TRANSIENT || concurrent_bufs_.count((rad_buf)i) || first[i] < 0) {
             b.first_def = 0;
-            b.last_use  = last_op > 0 ? last_op : 0;
+            b.last_use  = last_op;
             continue;
         }
+        b.first_def = first[i];
+        b.last_use  = last[i];
 
-        /* The second lane: the declared range is not a bound on when the bytes are in use. */
-        if (concurrent_bufs_.count((rad_buf)i)) {
-            b.first_def = 0;
-            b.last_use  = last_op > 0 ? last_op : 0;
-            continue;
-        }
-
-        int32_t first = -1, last = -1;
-        for (size_t o = 1; o < op_bufs_.size(); ++o) {
-            auto touches = [&](const std::vector<rad_buf>& v) {
-                return std::find(v.begin(), v.end(), (rad_buf)i) != v.end();
-            };
-            if (!touches(op_bufs_[o].reads) && !touches(op_bufs_[o].writes)) continue;
-            if (first < 0) first = (int32_t)o;
-            last = (int32_t)o;
-        }
-
-        if (first < 0) {
-            /* Nothing declared a use. The sound assumption is the whole program: an op may issue
-             * any handle obtained during declare, in any order, so declaration position proves
-             * nothing about when a buffer is read. It costs sharing, and --debug-graph says how
-             * much (see rad_build.h on rad_op_reads/rad_op_writes). */
-            b.first_def = 0;
-            b.last_use  = last_op > 0 ? last_op : 0;
-        } else {
-            b.first_def = first;
-            b.last_use  = last;
-        }
-
-        /* THE LOGITS BUFFER IS READ AFTER THE DECLARED OP LIST AND NOT BY IT. The plugin's lm_head
-         * WRITES it and declares that write, so liveness derived from declarations alone ends its
-         * life at that op -- and everything that actually consumes it comes later: the sampler's
-         * stages (core/sample/sampler.cpp declares its ops with no buffer lists, because its own
-         * planes are PERSIST for the same reason), the logprob readback, and the engine.
-         *
-         * Extending it to the last op is the truthful statement and costs nothing measurable: the
-         * lm_head is at the end of the graph, so the set of buffers still live after it is nearly
-         * empty and nothing that shared with logits before is prevented from doing so. The
-         * undeclared-use guard in core/runtime/issue.cpp is what refuses the untruthful version. */
-        if ((rad_buf)i == prog_.logits_buf && last_op > b.last_use) b.last_use = last_op;
-        /* The pooled output for the same reason: the engine reads it after the last op. */
-        if ((rad_buf)i == prog_.pooled_buf && last_op > b.last_use) b.last_use = last_op;
+        /* The logits buffer is read after the declared op list: the sampler (whose ops declare no
+         * buffer lists; its planes are PERSIST), the logprob readback and the engine. Extend its
+         * life to the last op. The lm_head is at the end of the graph, so this costs almost no
+         * sharing; the undeclared-use guard in core/runtime/issue.cpp enforces it. The pooled
+         * output likewise: the engine reads it after the last op. */
+        if ((rad_buf)i == prog_.logits_buf || (rad_buf)i == prog_.pooled_buf) b.last_use = last_op;
     }
 }
 
@@ -1743,17 +1602,16 @@ int Builder::finish() {
     if (finished_) return status_;
     finished_ = true;
 
-    /* A sizing declare wants its buffers and their liveness and nothing else: its kernels are the
-     * real declare's, already initialised, and its weights and KV groups are never used. */
+    /* A sizing declare needs only buffers and liveness; its kernels are the real declare's and its
+     * weights and KV groups are unused. */
     if (ref_) {
         finish_buffer_liveness();
         return status_;
     }
 
-    /* A WEIGHT DECLARED BEFORE ITS NAME MAP was read as plain in its declared dtype, and its
-     * kernels were chosen for that: the checkpoint or the recipe behind the builder is searched
-     * through the name map, so asking first finds nothing. Asked again now, a source that answers
-     * is that ordering, named rather than served as the wrong encoding. */
+    /* A weight declared before its name-map entry was looked up and not found (sources are
+     * searched through the name map), so it was read as plain and its kernels chosen for that. If
+     * the source answers now, report the ordering rather than serve the wrong encoding. */
     if (sources_)
         for (size_t h = 1; h < prog_.weights.size(); ++h) {
             const WeightInfo& w = prog_.weights[h];
@@ -1769,9 +1627,8 @@ int Builder::finish() {
     finish_weight_uses();
     finish_layouts();
     finish_kv_groups();
-    /* A HEAD DECLARED TO KEEP NO CACHE OF ITS OWN (rad_drafter_shared_kv) is given no history pass:
-     * the scheduler owes it none. A KV group bound at one of its layers -- meta.n_layers and above
-     * are the drafter's -- would then be read without anything ever having written it. */
+    /* A head with no cache of its own (rad_drafter_shared_kv) gets no history pass, so a KV group
+     * bound at one of its layers (meta.n_layers and above) would be read but never written. */
     if (prog_.drafter_shared_kv)
         for (size_t g = 1; g < prog_.kv_groups.size(); ++g)
             for (int l : prog_.kv_groups[g].layers)
@@ -1788,22 +1645,11 @@ int Builder::finish() {
     if (s < 0 && status_ == RAD_OK) status_ = s;
 
     if (!prog_.misses.empty()) {
-        /* Reported whole, at the end, never the first failure at the top (spec §1 step 4). Which
-         * of these is fatal is the engine's call: a device miss covered by a host kernel costs
-         * speed, a host miss costs a placement option, and one covered by neither costs the
-         * model.
-         *
-         * SPLIT BY DOMAIN, because the two counts mean different things and one total means
-         * neither. Every caller of this that is not the engine -- rad-check, rad-tune, rad-convert
-         * -- reads this line and nothing else, so it has to say which kind it found. */
-        /* A device miss a host kernel stands in for is not a hole -- the planner runs it there
-         * (Program::device_holes has the rule, engine_bringup.cpp's miss_report the longer
-         * account). Counting it as a device miss makes a deliberately host-only op open every
-         * run with a warning that names a hole there is not. */
+        /* Reported whole at the end (spec §1 step 4); the engine decides what is fatal. Split by
+         * domain, since the tools read only this line. A device miss a host kernel stands in for
+         * is not a hole (Program::device_holes; engine_bringup.cpp's miss_report). */
         const size_t dev = prog_.device_holes(device_is_host()).size();
-        /* A host-only miss set is not a warning at all -- see the report in engine_bringup.cpp --
-         * so it does not get warned about here either. The device count is the one that means
-         * something to a tool reading this line and nothing else. */
+        /* Host-only misses are not a warning (see engine_bringup.cpp). */
         RAD_LOG_AT(dev ? Log::Warn : Log::Debug,
                    "declare: %zu device band(s) and %zu host band(s) resolved to nothing; "
                    "run with --debug-graph for the full list", dev, prog_.misses.size() - dev);
@@ -1814,8 +1660,8 @@ int Builder::finish() {
 }  /* namespace rad */
 
 /* ================================================================== the C surface */
-/* Every entry point in rad_builder.h. Each is a static_cast and a forward: the handle IS the
- * builder, so there is no table lookup between a plugin's call and the work. */
+/* Every entry point in rad_builder.h: a static_cast and a forward, since the handle is the
+ * builder. */
 extern "C" {
 
 static rad::Builder* B(RadBuilder* b) { return static_cast<rad::Builder*>(b); }
@@ -1867,9 +1713,6 @@ int rad_op_declared(RadBuilder* b, const char* op) {
     return B(b)->op_declared(op);
 }
 
-/* Proposed additions to rad_builder.h -- defined here so the mechanism exists and core-side
- * callers (rad-convert, the tests) can use it. A C plugin cannot until the declarations
- * move into the frozen header. */
 int rad_op_reads(RadBuilder* b, rad_op h, const rad_buf* bufs, int n) {
     if (!b || (!bufs && n)) return RAD_E_INVAL;
     return B(b)->op_reads(h, bufs, n);
@@ -1944,8 +1787,8 @@ void rad_note(RadBuilder* b, const char* f, ...) {
     va_end(ap);
 }
 
-/* ---- model metadata accessors. The free-form key/value the container header carried, which the
- * struct above does not name. The core never interprets these; a plugin reads what it needs. */
+/* ---- model metadata accessors for the container header's free-form key/values. The core never
+ * interprets these; a plugin reads what it needs. */
 static const char* meta_lookup(const RadModelMeta* m, const char* key) {
     if (!m || !key || !m->kv_key || !m->kv_val) return nullptr;
     for (int i = 0; i < m->n_kv; ++i)

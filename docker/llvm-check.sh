@@ -1,11 +1,11 @@
 #!/bin/bash
-# docker/llvm-check.sh BUILD -- the image's HIP compiler held to the two things it is for, on one of
-# the build's own compile commands: r4d_hc_bf16.hip, the file whose code varied from build to build
-# under ROCm's own clang. The command is run again four ways, outputs in a scratch directory:
+# docker/llvm-check.sh BUILD -- check the image's HIP compiler on the build's compile command for
+# r4d_hc_bf16.hip, a file whose device code is not repeatable under ROCm's stock clang. The command
+# is rerun four ways, outputs in a scratch directory:
 #   1. pairing off, by ROCm's clang and by the image's: the device code must match byte for byte,
-#      so the llvm stage's libLLVM is ROCm's but for the patch;
-#   2. pairing on, exactly as the build ran it, twice more by the image's clang: both must match
-#      the build's own object, so the pairing is repeatable.
+#      so the llvm stage's libLLVM is ROCm's apart from the patch;
+#   2. pairing on, as the build ran it, twice by the image's clang: both must match the build's own
+#      object, so pairing is repeatable.
 # A mismatch fails the image build.
 set -euo pipefail
 B=$1
@@ -27,8 +27,8 @@ for a in "${args[@]}"; do
     case "$a" in *amdgpu-enable-vopd*) fail "the build turned VOPD pairing off ($a)" ;; esac
 done
 
-# variant NAME COMPILER [FLAG]: the build's command with this compiler, its object and depfile in
-# the scratch directory, and FLAG appended; then the object's device code as NAME.fb.
+# variant NAME COMPILER [FLAG]: rerun the build's command with COMPILER, object and depfile in the
+# scratch directory and FLAG appended; dump the object's device code to NAME.fb.
 variant() {
     local name=$1 cc=$2 extra=${3:-} i=1
     local v=("$cc")

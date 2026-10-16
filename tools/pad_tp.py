@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """pad_tp.py — pad a Llama/Qwen-style HF safetensors checkpoint to a geometry that divides by a
-tensor-parallel world size, with ZERO weights, so the padded model computes exactly what the
+tensor-parallel world size, with zero weights, so the padded model computes exactly what the
 original does.
 
     pad_tp.py SRC DST --heads 36 --kv-heads 9 [--ff 8448] [--gdn-k 18 --gdn-v 54]
 
 What is padded and why it is exact (fp32-accumulated, zero terms add nothing):
-  attention   k_proj / v_proj gain zero ROWS (new kv heads); q_proj gains zero rows so every kv
+  attention   k_proj / v_proj gain zero rows (new kv heads); q_proj gains zero rows so every kv
               group has the new ratio gqa' = heads'/kv_heads' -- a group that existed keeps its real
-              q heads first, then zero q heads; a new group is all zero. o_proj gains zero COLUMNS
+              q heads first, then zero q heads; a new group is all zero. o_proj gains zero columns
               in the same head order. A zero q head attends uniformly, but its o_proj column is
               zero, so it contributes 0; a zero kv head stores zeros, read only by zero q heads.
   mlp         gate_proj / up_proj gain zero rows, down_proj zero columns: silu(0)*0 = 0.
@@ -175,7 +175,7 @@ def main():
         else:
             st_write_stream(os.path.join(a.dst, fn), meta, items); print(f"  wrote {fn} ({len(items)} tensors)", flush=True)
     if a.sparse:
-        # new shards, ~2 GB each, named to sort BEFORE every original ("model-00000-…" < "model-00001-…")
+        # new shards, ~2 GB each, named to sort before every original ("model-00000-…" < "model-00001-…")
         CH = 2 << 30; chunks = [[]]; acc = 0
         for it in sparse_items:
             if acc + it[3] > CH and chunks[-1]: chunks.append([]); acc = 0

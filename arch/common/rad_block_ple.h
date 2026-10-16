@@ -2,10 +2,10 @@
  *
  * ============================== WHAT IT IS ==============================
  *
- * ONE layer of the model gets a second embedding table, addressed not by the token but by a HASH of
- * the last three. Qwen3.8-Flash-Next's is 320,001,536 rows of 160 -- FOUR FIFTHS OF THE CHECKPOINT,
- * 51 of its 125 billion parameters -- read sixteen rows a token and mixed into the residual stream
- * by a dot product against the stream itself:
+ * One layer has a second embedding table addressed by a hash of the last three tokens.
+ * Qwen3.8-Flash-Next's is 320,001,536 rows of 160 (51 of the checkpoint's 125 billion
+ * parameters), read sixteen rows per token and mixed into the residual stream by a dot product
+ * against the stream:
  *
  *   ids  = ngram_ids(tokens)                     [T, 16]   a hash of the last 3 ids, per head
  *   e    = embed_lookup_q(ids, table, scale)     [T, 2560]  16 x 160, flattened
@@ -15,44 +15,37 @@
  *   out  = ple_conv(gvn, resid = gv, ...)        dilated depthwise conv, silu, and the add
  *   h   += out
  *
- * and it happens BEFORE the attention hyper-connection reads the stream, so `h` here is the wide
- * un-normed residual.
+ * This runs before the attention hyper-connection reads the stream, so `h` is the wide, un-normed
+ * residual.
  *
- * ============================== THE TABLE DECIDES THE SHAPE OF ALL OF THIS ======================
+ * ============================== THE TABLE ==============================
  *
- * 51.2 GB cannot be staged onto a card, so `embed_lookup_q` reads it where --ngram-placement put
- * it: the HOST gather over the container's own mmap or a locked copy in RAM (libavx/avx_ngram.cpp
- * carries that argument in full), or a device kernel reading a pinned copy over the link -- or the
- * card's own copy, on a card that holds it. Either way its result reaches the card through the
- * host arena, 5 KB a token at decode. Three consequences reach this file:
+ * The 51.2 GB table cannot be staged onto a card, so `embed_lookup_q` reads it where
+ * --ngram-placement put it: a host gather over the container's mmap or a locked RAM copy
+ * (libavx/avx_ngram.cpp), a device kernel reading a pinned copy over the link, or a card's own
+ * copy. The result reaches the card through the host arena, 5 KB per token at decode. Hence:
  *
- *   THE TABLE IS A WEIGHT OPERAND, because the planner puts an op on the host only when every
- *   weight operand of it is Site::Host, and decides that from the table's placement. A gather
- *   whose source were an activation could never be placed there.
+ *   The table is a weight operand: the planner places an op on the host only when all its weight
+ *   operands are Site::Host, judged from the table's placement.
  *
- *   ITS BUFFERS ARE HOST DOMAIN. `ids` and `e` are read and written by the host gather when it
- *   runs, so they live in the host arena, which a device gather reads and writes over the link
- *   just as well; everything downstream of `e` is ordinary device work.
+ *   `ids` and `e` are host-domain buffers, written and read by the host gather; a device gather
+ *   accesses them over the link. Everything downstream of `e` is device work.
  *
- *   IT IS 128 CHECKPOINT TENSORS. RadNameMap holds eight sources, so the map is declared in pieces
- *   by map_concat_shards() and the order IS the concatenation -- a permuted table is a model that
- *   loads, runs, and looks up the wrong embeddings.
+ *   It is 128 checkpoint tensors, mapped in pieces by map_concat_shards(); the order is the
+ *   concatenation, and a permuted table silently looks up wrong rows.
  *
- * ============================== TWO STATES, ONE CONTRACT ==============================
+ * ============================== THE TWO ROLLING WINDOWS ==============================
  *
- * The n-gram hash needs the two committed ids in front of the step, and the convolution needs nine
- * timesteps of its input. Both are RAD_KV_CONV rolling windows read at `num_accepted - 1`. They
- * differ in ONE thing: the token window's cold value is EOS and the convolution's is zero, because
- * zero is a real token id. `has_init` says which slots are cold and both ops read it.
+ * The n-gram hash needs the two committed ids before the step, and the convolution nine timesteps
+ * of its input. Both are RAD_KV_CONV windows read at `num_accepted - 1`. The token window's cold
+ * value is EOS, the convolution's zero (zero is a real token id); `has_init` marks cold slots.
  *
- * WHAT A STEP LEAVES IN THE WINDOW DEPENDS ON WHAT KIND OF STEP IT WAS, and the op learns that
- * from whether `num_accepted` is passed (libref/ref_ple.cpp). A decode row may have its drafts
- * rejected, so its window is left in gdn_conv_update's shifted layout, where the next step's read
- * offset picks out the history ending at the last token kept. A prefill chunk commits everything,
- * so its window is its tail at offset zero, which the scheduler's `num_accepted` of 1 for the next
- * step reads. One layout cannot serve both: at offset zero the first holds the history ending at
- * the step's FIRST token and the second the history ending at its LAST. So step() issues both ops
- * once per half of the batch, the way rad_block_gdn_fp8.h issues its two convolutions.
+ * What a step leaves in the window depends on the step, signalled by whether `num_accepted` is
+ * passed (libref/ref_ple.cpp). A decode row may have drafts rejected, so its window uses
+ * gdn_conv_update's shifted layout, where the next read offset selects the history ending at the
+ * last kept token. A prefill chunk commits everything and leaves its tail at offset zero, read by
+ * the next step's `num_accepted` of 1. One layout cannot serve both, so step() issues both ops
+ * once per half of the batch, as rad_block_gdn_fp8.h does.
  */
 #ifndef RAD_BLOCK_PLE_H
 #define RAD_BLOCK_PLE_H
@@ -79,7 +72,7 @@ struct PleLayer {
     };
 
     struct Wire {
-        rad_buf h = 0;   /* [max_tok, hc * n_embd] THE WIDE STREAM, read and added into */
+        rad_buf h = 0;   /* [max_tok, hc * n_embd] the wide stream, read and added into */
     };
 
     struct Src {
@@ -103,7 +96,7 @@ struct PleLayer {
     int    layer_ = 0;
 
     rad_weight w_table = 0, w_scale = 0, w_mult = 0, w_vsz = 0, w_off = 0;
-    /* The table as the checkpoint ships it -- plain bf16, no scale weight -- rather than E4M3. */
+    /* The table is plain bf16 as shipped (no scale weight) rather than E4M3. */
     bool       table_bf16 = false;
     rad_weight w_key = 0, w_value = 0, w_nk = 0, w_nq = 0, w_nc = 0, w_conv = 0;
 
@@ -121,7 +114,7 @@ struct PleLayer {
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, const Config& cfg, int layer,
                  const Wire& wire, const Src& src);
-    /* The hash, issued at the TOP of the step; the rest, at the layer. See step(). */
+    /* The hash, issued at the top of the step; the rest at the layer (see ids()). */
     void ids(RadCtx* c_, const RadBatch* batch) const;
     void step(RadCtx* c_, const RadBatch* batch) const;
 };
@@ -140,7 +133,7 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
         return RAD_E_INVAL;
     }
     /* `heads` is `ngram - 1` equal blocks, one per n-gram order, and `embed_dim` splits evenly
-     * across them. Both are the reference's own constructor checks. */
+     * across heads (the reference's constructor checks). */
     if (c.heads % (c.ngram - 1) || c.embed_dim % c.heads) {
         fprintf(stderr, "radiance: ple: %lld heads over %lld n-gram orders, %lld embed dims -- "
                         "neither divides\n", (long long)c.heads, (long long)(c.ngram - 1),
@@ -151,69 +144,41 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
     if (!src.shard_prefix || !src.shard_suffix || !src.mult || !src.vocab_sizes ||
         !src.offsets || !src.key_proj || !src.value_proj || !src.norm_key || !src.norm_query ||
         !src.norm_conv || !src.conv1d) return RAD_E_INVAL;
-    /* ============================== THE WHOLE LAYER IS REPLICATED UNDER TP ==============================
+    /* ============================== REPLICATED UNDER TP ==============================
      *
-     * Replication is the RIGHT answer here, not a gap: sharding would be the mistake.
+     * The whole layer is replicated and has no collective. The table is addressed by a token hash
+     * every rank computes identically, so a vocabulary shard is useless; and it is Tier::Mapped,
+     * so all ranks gather through one shared row cache over the same file.
      *
-     * THE TABLE IS ADDRESSED BY A HASH OF THE TOKENS, which every rank computes identically, so a
-     * vocabulary shard would give each rank rows it can never be asked for. And it costs NOTHING
-     * to replicate: it is Tier::Mapped, read from the container's own file, so both ranks point at
-     * the same table on the same machine and gather through one row cache they share.
+     * The rest is 63 MiB per rank (key_proj 50, value_proj 12.5, three norm gains, a conv weight).
+     * Column-sharding the projections would shard `gv` and `gvn` across the hyper-connection
+     * streams and need an all-gather per step to save 31 MiB per card. Every rank adds the same
+     * `out` into an identical copy of the stream, so the result stays bit-identical across ranks.
      *
-     * WHAT IS LEFT IS 63 MiB A RANK -- key_proj 50, value_proj 12.5, three norm gains and a conv
-     * weight -- against the 112 GiB of experts TP exists to split here. Column-sharding the
-     * projections would shard `gv` and `gvn` across the hyper-connection streams, and then the
-     * convolution and the residual add would need the full width back: an all-gather a step, to
-     * save 31 MiB a card. Geom::n_embd is "the residual stream, replicated on every rank", and
-     * this layer reads and writes exactly that.
-     *
-     * SO EVERY RANK RUNS THE WHOLE LAYER AND THERE IS NO COLLECTIVE IN IT. Both ranks see the same
-     * token ids, hash them the same way, gather the same rows and add the same `out` into their
-     * own copy of a stream that was already identical -- bit for bit, because the all-reduce that
-     * produced it delivers the same sum to both. The duplicated work is two small GEMMs and one
-     * host gather per rank.
-     *
-     * ---- AND THAT LAST SENTENCE IS TRUE AT DECODE AND EXPENSIVE AT PREFILL ---------------------
-     *
-     * The duplicated gather is `heads` rows a TOKEN, so what is sixteen rows at a decode step is
-     * sixteen thousand at a 1024-token chunk and thirty-two thousand at a 2048 one. A gather that
-     * reads the table through the mapping costs each rank about 70 ms at a 2048-token chunk --
-     * about 7.6% of a prefill step each. The RANKS ARE THREADS IN ONE PROCESS, so the page faults
-     * are shared, but each rank still walks every row, and the step waits for both.
-     *
-     * THAT COST IS PAGE-TABLE POPULATION, NOT I/O. The distinct rows a prefill wants land on
-     * distinct 4 KiB pages -- about ONE USEFUL ROW A PAGE, where a page holds 25 of them -- so a
-     * gather through the mapping pays a fault per row. At decode, with varied text, it is the
-     * other way round: half of every step's rows are new, and the page cache makes the waiting
-     * thread start each of those reads itself. So the kernel keeps the rows in a cache of its own
-     * and reads a miss straight from the file (libavx/avx_ngram.cpp).
-     *
-     * AND THAT CACHE SPLITS THE COLD WORK WITHOUT A COLLECTIVE. Dividing the rows between ranks,
-     * or having one rank gather for both, would need a cross-rank HOST barrier inside a block that
-     * deliberately has no collective in it. The shared cache does not: each rank claims the misses
-     * it reaches first, reads only those, and waits only for rows the other rank has already
-     * claimed -- so a miss is read once, and a late rank finds the rows there. What each rank still
-     * does alone is decode the rows into its own output, which is a table lookup a byte. A
-     * vocabulary shard is still wrong for the reason given above.
+     * The duplicated gather is `heads` rows per token: 16 at decode, 32768 at a 2048-token chunk,
+     * about 70 ms per rank through the mapping (7.6% of a prefill step). That cost is page-table
+     * population, not I/O: a prefill's distinct rows land about one per 4 KiB page (of 25), so the
+     * mapping pays a fault per row. At decode half of each step's rows are new and the page cache
+     * makes the waiting thread start each read. So the kernel keeps its own row cache and reads
+     * misses straight from the file (libavx/avx_ngram.cpp). Ranks share that cache: each claims
+     * and reads the misses it reaches first and waits only for rows another rank has claimed, so
+     * each miss is read once without a cross-rank barrier.
      */
 
     const int64_t HN = hn();
     const int64_t HD = c.head_dim();
 
     /* ---- the table, its scale, and the three hash constants -------------------------------- */
-    /* E4M3 with ONE scale for all 320 million rows -- Qwen3.8-Flash-Next-FP8's own choice, and the
-     * table's statistics say why that works: E4M3 carries its own exponent, a row's dynamic range
-     * is 2.3x, and the scale sits on a three-octave plateau. ONE STORED WEIGHT, `fp8_e4m3*bf16[*x*]`
-     * -- its codes and a one-element scale plane, made by the recipe from the dense checkpoint
-     * (data/recipes/qwen4exp-w4.recipe) -- and the gather takes the two planes as two operands.
-     * The shards are joined along rows by the name map, declared first because it is how the
-     * model is asked what the table is. RAD_ACCESS_VOCAB because it IS a vocabulary table, just
-     * not the token one. */
+    /* E4M3 with one scale for all 320 million rows (Qwen3.8-Flash-Next-FP8's choice; E4M3 has its
+     * own exponent, a row's dynamic range is 2.3x, and the scale sits on a three-octave plateau).
+     * One stored weight, `fp8_e4m3*bf16[*x*]`: codes plus a one-element scale plane, made by the
+     * recipe (data/recipes/qwen4exp-w4.recipe); the gather takes them as two operands. The name map
+     * joins the shards along rows and is declared first, since the encoding is looked up through
+     * it. RAD_ACCESS_VOCAB: it is a vocabulary table, just not the token one. */
     const char* tn = nm.f("blk.%d.ple_ngram.weight", layer);
     RAD_ARCH_TRY(map_concat_shards(b, tn, src.shard_prefix, src.shard_suffix, (int)c.shards, 0));
-    /* OR THE CHECKPOINT'S OWN bf16 TABLE, 102 GB, when the container holds it as it ships: the
-     * same op with no scale (embed_lookup_q's absent scale is one), so it stays a host gather over
-     * the mapping like the E4M3 one -- the gather's row cache serves either row size. */
+    /* Or the checkpoint's own bf16 table (102 GB) when the container holds it as shipped: the same
+     * op with no scale (an absent scale means 1), still a host gather over the mapping. */
     RadEncoding te{};
     table_bf16 = weight_enc(b, tn, &te) && rad_enc_is(&te, "plain") && te.n_planes == 1 &&
                  te.plane[0].dtype == RAD_BF16;
@@ -227,8 +192,8 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
                             RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
     }
 
-    /* I64 AND NOT I32. The multipliers are ~2.4e13 -- the hash's whole point is that a token id
-     * times one of them fills sixty-three bits -- so narrowing them would change every id. */
+    /* I64: the multipliers are ~2.4e13 (a token id times one fills 63 bits), so narrowing them
+     * would change every id. */
     RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.ple_mult", layer), src.mult));
     w_mult = decl_w(b, nm.f("blk.%d.ple_mult", layer), RAD_I64, {c.ngram},
                     RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
@@ -240,8 +205,7 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
                    RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
 
     /* ---- the projections and the three gains ------------------------------------------------ */
-    /* BF16 AND NOT fp8: `modules_to_not_convert` in the FP8 checkpoint names both projections, so
-     * these arrive dense whichever checkpoint is the source. */
+    /* bf16: the FP8 checkpoint's `modules_to_not_convert` names both projections. */
     RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.ple_key.weight", layer), src.key_proj));
     w_key = decl_w(b, nm.f("blk.%d.ple_key.weight", layer), RAD_BF16, {HN, c.embed_dim},
                    RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
@@ -269,15 +233,13 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
         !w_nk || !w_nq || !w_nc || !w_conv) return RAD_E_INVAL;
 
     /* ---- the two rolling windows ------------------------------------------------------------ */
-    /* RAD_KV_CONV is "per-sequence, a rolling window of width-1 + num_spec entries", which is both
-     * of these. The token window's `conv_width` is ngram, so its window is ngram - 1 + n_spec.
+    /* RAD_KV_CONV is a per-sequence rolling window of width-1 + num_spec entries. The token
+     * window's `conv_width` is ngram, so its window is ngram - 1 + n_spec.
      *
-     * THE CHANNEL COUNT IS n_head_kv * head_dim AND NOT state_dim, which is the one field pair a
-     * reader of RadKVGroupDecl gets wrong: `state_dim` is RAD_KV_LINEAR's per-head geometry and
-     * the CONV kind never looks at it. Declared into state_dim, both of these size to zero bytes a
-     * sequence and the KV manager refuses the model at bring-up -- which is the good outcome, but
-     * rad-kbench cannot find it: it synthesises the state operand from the op's own shape function
-     * and never asks the manager for one. */
+     * The channel count is n_head_kv * head_dim, not `state_dim` (RAD_KV_LINEAR's per-head
+     * geometry, ignored by the CONV kind). Set via state_dim, both groups would size to zero and
+     * the KV manager would refuse the model; rad-kbench would not catch it, since it synthesises
+     * the state operand from the op's shape function. */
     {
         RadKVGroupDecl td{};
         td.kind = RAD_KV_CONV;
@@ -290,10 +252,9 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
         RadKVGroupDecl cd{};
         cd.kind = RAD_KV_CONV;
         cd.dtype = g.act_dtype;
-        /* The conv's history is (width-1)*dilation deep, so the GROUP's width -- which the manager
-         * reads as "window = conv_width - 1 + n_spec" -- is that plus one. Passing the raw
-         * conv_width here would size the window for an undilated convolution and the deepest tap
-         * would read a value that was never written. */
+        /* The conv's history is (width-1)*dilation deep, so the group's width (window =
+         * conv_width - 1 + n_spec) is that plus one; the raw conv_width would size an undilated
+         * window and the deepest tap would read unwritten data. */
         cd.conv_width = c.hist() + 1;
         cd.n_head_kv = 1;
         cd.head_dim = HN;           /* [n_states, hc*n_embd, hist + n_spec] */
@@ -304,49 +265,38 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
     RAD_ARCH_TRY(rad_bind_layer_kv(b, layer, kv_conv));
 
     /* ---- buffers ---------------------------------------------------------------------------- */
-    /* HOST DOMAIN for the two the gather touches. `ids` is written by ngram_ids and read by the
-     * gather; `e` is written by the gather and read by one device copy onto the card
-     * (`ple_emb_dev`, below). The host arena is mapped, so the device side of that hand-off is a
-     * link read (core/runtime/ctx.cpp) -- 5 KB a token at decode. Where a device kernel gathers
-     * (--ngram-placement ram or vram, with libr4d loaded) it reads `ids` and writes `e` over the
-     * link too, which costs a round trip of those 5 KB and leaves no host op in the step: the
-     * domain is declared here, before the placement that would say who gathers is decided.
+    /* The two buffers the gather touches are host domain. `ids` is written by ngram_ids and read by
+     * the gather; `e` is written by the gather and copied onto the card (`ple_emb_dev`). The host
+     * arena is mapped, so the device reads it over the link (core/runtime/ctx.cpp), 5 KB per token
+     * at decode. A device gather (--ngram-placement ram or vram, with libr4d) reads `ids` and
+     * writes `e` over the link too; the domain is fixed here, before placement decides who gathers.
      *
-     * `ids` IS PERSIST because it is written at the top of the step and read at this layer: the
-     * buffer plan computes liveness in DECLARED order, where the two ops are neighbours, and a
-     * transient would lend its bytes to anything issued in between. */
+     * `ids` is PERSIST: it is written at the top of the step and read at this layer, but liveness
+     * follows declared order, where the two ops are adjacent, so a transient could be overwritten
+     * in between. */
     {
-        /* TWICE THE STEP'S ROWS: the step's own ids, then the ids of the prompt that follows it
-         * (RadBatch::n_ahead), which the gather hands to its reader to fetch while the step runs. */
+        /* Twice the step's rows: the step's ids, then those of the prompt that follows
+         * (RadBatch::n_ahead), which the gather's reader prefetches while the step runs. */
         RadBufDecl d{};
         d.dtype = RAD_I32; d.rank = 2; d.shape[0] = 2 * g.max_tok; d.shape[1] = c.heads;
         d.kind = RAD_BUF_PERSIST; d.domain = RAD_DOMAIN_HOST;
         b_ids = rad_decl_buffer(b, nm.f("ple_ids"), &d);
 
-        /* [max_tok, embed_dim] AND NOT [max_tok * heads, head_dim], because ONE declared shape has
-         * to serve two readings and only this one does. The gather writes `heads` rows a token and
-         * the projections read one row a token of `embed_dim` -- the same bytes either way -- and
-         * the direction that works is decided by HOW EACH KERNEL FINDS ITS ROW COUNT.
-         *
-         * The gather derives it: r4d_rows_pitch(x, n_embd) is numel / the width the kernel asks
-         * for, so [T, 2560] read at 160 IS T*16 rows of 160. The GEMM does not: gemm_ops takes
-         * M = a->shape[0] and K = a->shape[1] straight off the operand, because a strided rank-3
-         * activation has to be refused rather than folded. So the wide shape serves both and the
-         * tall one serves only the gather: declared tall, the key projection is handed M = T*16,
-         * K = 160 against a [T, 10240] output and refuses the step. */
+        /* [max_tok, embed_dim], not [max_tok * heads, head_dim]: one shape must serve the gather
+         * (`heads` rows per token) and the projections (one `embed_dim` row per token). The gather
+         * derives its row count as numel / width (r4d_rows_pitch), so [T, 2560] read at 160 is
+         * T*16 rows. The GEMM takes M and K from the operand's shape (gemm_ops), so the tall shape
+         * would give it M = T*16, K = 160 and the step would be refused. */
         RadBufDecl e{};
         e.dtype = g.act_dtype; e.rank = 2;
         e.shape[0] = g.max_tok; e.shape[1] = c.embed_dim;
         e.kind = RAD_BUF_TRANSIENT; e.domain = RAD_DOMAIN_HOST;
         b_emb = rad_decl_buffer(b, nm.f("ple_emb"), &e);
     }
-    /* AND ITS COPY ON THE CARD, which is what the two projections read. `e` in the mapped host
-     * arena is a link read, and a GEMM does not read its A operand once: the tiled kernel reads
-     * each row band once a column block, 80 times for the key projection, every one of them a PCIe
-     * round trip or a hit on the copy that round trip left in the card's cache. At a 2048-token
-     * chunk the two projections take about 3.0 and 0.9 ms reading the host arena against 1.4 and
-     * 0.3 ms reading VRAM. One pass of the link into VRAM is 10.5 MB at a chunk and 5 KB a token
-     * at decode. */
+    /* The device copy the projections read. A tiled GEMM reads each A row band once per column
+     * block (80 times for the key projection), so reading `e` from the host arena repeats link
+     * traffic: at a 2048-token chunk the projections take about 3.0 and 0.9 ms from the host arena
+     * versus 1.4 and 0.3 ms from VRAM. The copy is 10.5 MB per chunk, 5 KB per token at decode. */
     b_embd = decl_b(b, nm.f("ple_emb_dev"), g.act_dtype, {g.max_tok, c.embed_dim});
     b_k   = decl_b(b, nm.f("ple_k"),   g.act_dtype, {g.max_tok, HN});
     b_v   = decl_b(b, nm.f("ple_v"),   g.act_dtype, {g.max_tok, g.n_embd});
@@ -356,12 +306,8 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
     if (!b_ids || !b_emb || !b_embd || !b_k || !b_v || !b_gv || !b_gvn || !b_out)
         return RAD_E_INVAL;
 
-    /* NO DERIVED BUFFER FOR THE STATE SLOTS, and that is worth saying because the obvious reading
-     * of the core says otherwise. `conv_state_index` exists, computes exactly the cursor these two
-     * states want, and is called by NO architecture plugin: rad_block_gdn_fp8.h takes
-     * `cv->state_index` straight off RadKVGroupBatch, which the step batch fills PER GROUP. This
-     * block does the same -- one fewer per-step computation, and the same number the working
-     * precedent uses.
+    /* State slots come from RadKVGroupBatch::state_index, filled per group by the step batch, as in
+     * rad_block_gdn_fp8.h; the core's `conv_state_index` is not used.
      *
      * ---- the ops, in the order step() issues them ------------------------------------------- */
     layer_ = layer;
@@ -372,20 +318,16 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
                    RAD_WEIGHTS(w_mult, w_vsz, w_off)),
                {}, {b_ids});
 
-    /* M IS T * heads HERE, not T: the gather fetches one table row per HEAD per token, and the
-     * band this op resolves on is that count. */
-    if (table_bf16)
+    /* M is T * heads: the gather fetches one table row per head per token, and the band resolves
+     * on that count. */
+    {
+        const rad_weight wt[2] = { w_table, w_scale };   /* a bf16 table has no scale plane */
         op_gather = rw(b, RAD_OP(b, "embed_lookup_q",
                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok * c.heads), RAD_INT("n_embd", HD),
                                      RAD_INT("n_vocab", c.rows), RAD_STR("dtype", g.dtype)),
-                          RAD_WEIGHTS(w_table)),
+                          wt, table_bf16 ? 1 : 2),
                       {b_ids}, {b_emb});
-    else
-    op_gather = rw(b, RAD_OP(b, "embed_lookup_q",
-                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok * c.heads), RAD_INT("n_embd", HD),
-                                 RAD_INT("n_vocab", c.rows), RAD_STR("dtype", g.dtype)),
-                      RAD_WEIGHTS(w_table, w_scale)),
-                  {b_ids}, {b_emb});
+    }
 
     op_embd = rw(b, RAD_OP(b, "cast",
                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", c.embed_dim),
@@ -404,8 +346,8 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
                      RAD_WEIGHTS(w_value)),
                  {b_embd}, {b_v});
 
-    /* `q` IS THE INCOMING STREAM ITSELF, un-normed: the op owns all three norms because the third
-     * is taken over bytes it wrote. */
+    /* `q` is the incoming stream, un-normed; the op applies all three norms because the third is
+     * over bytes it writes. */
     op_gate = rw(b, RAD_OP(b, "ple_gate",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                RAD_INT("hc", c.hc), RAD_F64("eps", g.eps),
@@ -420,9 +362,8 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
                     RAD_WEIGHTS(w_conv)),
                 {b_gvn, b_gv}, {b_out});
 
-    /* AND THE ADD INTO THE STREAM. The reference is `hidden_states = hidden_states + ple(...)`,
-     * and `ple(...)` is what ple_conv already produced -- the convolution's residual operand
-     * folded the layer's own `gv + silu(conv)`, so what is left is one add of the whole thing. */
+    /* The add into the stream: `hidden_states + ple(...)`, where ple_conv's residual operand
+     * already produced `gv + silu(conv)`. */
     op_add = rw(b, RAD_OP(b, "add",
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", HN),
                               RAD_STR("dtype", g.dtype)),
@@ -435,26 +376,19 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
     return RAD_OK;
 }
 
-/* THE SLOTS COME OFF THE GROUP BATCH, per group, exactly as the gated delta net reads them. And
- * `has_init` is `ctx_lens`: a sequence with computed tokens behind it has a history, one without
- * has none, which is the same test rad_block_gdn_fp8.h makes of the same field.
+/* Slots come from the group batch, and `has_init` is `ctx_lens` (nonzero means a history), as in
+ * rad_block_gdn_fp8.h.
  *
- * THE TWO WINDOWED OPS ARE ISSUED ONCE PER HALF OF THE STEP. The step is sorted decode-first, so
- * the decode rows are sequences [0, D) holding tokens [0, DT) and the prefill chunks are sequences
- * [D, S) holding the rest (batch_split). The decode half passes `num_accepted`, which is what
- * makes the op leave its window in the layout a partly rejected verify can be read back from; the
- * prefill half passes none, so each chunk leaves its tail at offset zero. A pure step issues one
- * half, so a pure decode step is one launch and only a mixed step pays a second.
+ * The two windowed ops are issued once per half of the step (batch_split: decode sequences
+ * [0, D) with tokens [0, DT) first, then prefill). The decode half passes `num_accepted`, so the
+ * op leaves its window readable after a partial rejection; the prefill half passes none and leaves
+ * each chunk's tail at offset zero. The prefill half gets per-sequence arrays at `+ D` with token
+ * operands at their base (kernels use the absolute offsets in `cu`); the decode half narrows to DT
+ * rows.
  *
- * The prefill half is addressed the way the GDN's is: the per-sequence arrays move to `+ D` and
- * the token operands stay at their base, because each kernel takes a sequence's rows from the
- * ABSOLUTE offsets in `cu`. The decode half is the prefix, so it narrows to DT rows instead. */
-/* THE HASH GOES FIRST IN THE STEP, AHEAD OF EVERY LAYER. It reads the batch's token ids and its
- * own rolling window and nothing the trunk computes, so it can run as soon as the batch has been
- * uploaded. The gather that consumes it runs on the host and has to wait for it; issued here, that
- * wait is for one small kernel, and the layers issued between the two keep the device busy while
- * the host gathers. Issued at the layer, the wait would be for every layer in front of it, and the
- * device would sit idle through the gather. */
+ * ids() runs first in the step, before every layer: it reads only the token ids and its own
+ * window. The host gather that consumes it then waits for one small kernel, and the layers issued
+ * in between keep the device busy during the gather. */
 inline void PleLayer::ids(RadCtx* c_, const RadBatch* batch) const {
     const int64_t T = batch->n_tok;
     const int64_t S = batch->n_seq;
@@ -475,9 +409,9 @@ inline void PleLayer::ids(RadCtx* c_, const RadBatch* batch) const {
                     praw(batch->ctx_lens, RAD_I32, D),
                     praw(batch->num_accepted, RAD_I32, D),
                     brows(b_ids, DT), RAD_NONE);
-    /* THE PROMPT THAT FOLLOWS the last prefill chunk is hashed in the same launch, into the rows
-     * after the step's: `tok` then reaches past the step by that many tokens, and the window the
-     * op leaves behind is the step's alone. */
+    /* The prompt following the last prefill chunk is hashed in the same launch into the rows
+     * after the step's (`tok` reaches A tokens past the step); the window left behind is the
+     * step's alone. */
     const int64_t A = P > 0 ? ahead_rows(batch) : 0;
     if (P > 0)
         RAD_ISSUE_N(c_, op_ids, T,
@@ -494,7 +428,6 @@ inline void PleLayer::ids(RadCtx* c_, const RadBatch* batch) const {
 inline void PleLayer::step(RadCtx* c_, const RadBatch* batch) const {
     const int64_t T = batch->n_tok;
     const int64_t S = batch->n_seq;
-    const int64_t HD = c.head_dim();
 
     const RadKVGroupBatch* cv = kv_batch(batch, kv_conv);
     const int32_t* cv_idx = cv ? cv->state_index : nullptr;
@@ -503,17 +436,14 @@ inline void PleLayer::step(RadCtx* c_, const RadBatch* batch) const {
     batch_split(batch, &D, &DT);
     const int64_t P = S - D;
 
-    /* T ROWS, not T * heads: the buffer is [max_tok, embed_dim] and the gather derives its own
-     * 16-rows-a-token reading out of numel. The op's M band is still T * heads -- that is how many
-     * table rows it fetches -- but the OPERAND is the token count. */
-    /* The ids of the prompt that follows, which the gather's reader fetches while this step
-     * runs, so the next step finds its rows already read. */
+    /* Operands are T rows (the gather derives its per-head rows from numel); the op's M band is
+     * T * heads. The trailing operand is the following prompt's ids, which the gather's reader
+     * prefetches for the next step. */
     const int64_t A = P > 0 ? ahead_rows(batch) : 0;
     RAD_ISSUE_N(c_, op_gather, T * c.heads,
                 brows(b_ids, T), RAD_W(w_table), table_bf16 ? RAD_NONE : RAD_W(w_scale),
                 brows(b_emb, T),
                 A > 0 ? brow_slice(b_ids, T, A, c.heads) : RAD_NONE);
-    (void)HD;
 
     RAD_ISSUE_N(c_, op_embd,  T, brows(b_emb, T), brows(b_embd, T));
     RAD_ISSUE_N(c_, op_key,   T, brows(b_embd, T), RAD_W(w_key),   brows(b_k, T));
@@ -541,9 +471,7 @@ inline void PleLayer::step(RadCtx* c_, const RadBatch* batch) const {
                     RAD_NONE,
                     brows(b_out, T));
 
-    /* M IS T, not T * HN. `add` counts ROWS of `n` -- every other block in this tree issues it
-     * that way -- and the declared band is 1..max_tok. Passing the element count instead lands
-     * outside every band of the op's own bucket table and the run phase refuses the step. */
+    /* M is T rows of `n`, not the element count, matching the declared band 1..max_tok. */
     RAD_ISSUE_N(c_, op_add, T, brows(w.h, T), brows(b_out, T), brows(w.h, T));
 }
 

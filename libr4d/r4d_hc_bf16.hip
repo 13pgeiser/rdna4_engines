@@ -1,11 +1,11 @@
-// r4d_hc_bf16.hip -- the GATED RESIDUAL: hc_enter, hc_read and hc_write.
+// r4d_hc_bf16.hip -- the gated residual (hyper-connections): hc_enter, hc_read and hc_write.
 //
-// Qwen4-Exp carries a residual stream `hc` times the model width and has no pre-norm and no
-// residual add; every block reads a data-dependent mix of the hc sub-streams and writes its output
-// back into all of them with hc data-dependent gains. docs/OPS.md's three rows hold the schema and
-// arch/common/rad_block_hc.h holds the composition. This file is what runs it.
+// Qwen4-Exp carries a residual stream `hc` times the model width, with no pre-norm and no residual
+// add: every block reads a data-dependent mix of the hc sub-streams and writes its output back into
+// all of them with hc data-dependent gains. Schema: docs/OPS.md; composition:
+// arch/common/rad_block_hc.h.
 //
-// ============================== WHY hc_read IS TWO KERNELS AND NOT ONE ==============================
+// ============================== hc_read is two kernels ==============================
 //
 // The read is
 //
@@ -14,51 +14,43 @@
 //     x   = mean_c( sigmoid(W_up @ d)[c] * N[c] )  [n]
 //     inj = 2 * sigmoid(W_inj @ N / hc)            [hc]
 //
-// and `x` depends on ALL of `d`, so no single workgroup can produce a channel of `x` without every
-// column of `d` first. A one-kernel form would need a grid-wide barrier; two kernels with the
-// kernel boundary as the barrier is the same thing without cooperative launch.
+// `x` depends on all of `d`, so no workgroup can produce a channel of `x` before every column of
+// `d` exists. The kernel boundary serves as the grid-wide barrier, without cooperative launch.
 //
-// WHAT DECIDES THE DECOMPOSITION IS THE WEIGHT TRAFFIC, NOT THE ARITHMETIC. At Qwen3.8-Flash-Next's
-// shape (n 2560, hc 4, LR 320) the two mixing matrices are 6.55 MB each, and there are 96
-// connections -- 1.27 GB a step, which at ~600 GB/s is 2.1 ms and is the floor for ANY
-// implementation. The arithmetic is 6.6M MACs a token, which is nothing. So the only thing that
-// matters is that each weight byte is read ONCE per step, and that is what the grids below do:
+// Weight traffic, not arithmetic, decides the decomposition. At Qwen3.8-Flash-Next's shape
+// (n 2560, hc 4, LR 320) each mixing matrix is 6.55 MB and there are 96 connections: 1.27 GB per
+// step, a 2.1 ms floor at ~600 GB/s, against a negligible 6.6M MACs per token. So each weight byte
+// must be read once per step:
 //
 //   kernel A   grid (ceil(LR/64), T). A workgroup owns 64 columns of W_down and reads all of h
-//              once for the norm -- so h is read ceil(LR/64) times a row, 100 KB against the
-//              1.3 MB of W_down the same workgroup reads, and W_down is read exactly once.
-//   kernel B   grid (n/128, T). A workgroup owns 128 CHANNELS, which is hc*128 rows of W_up, so
-//              W_up is read exactly once -- and `u` is never materialised, because the workgroup
-//              holding all hc of a channel's rows can do the mean itself.
+//              for the norm, so W_down is read once and h ceil(LR/64) times per row (100 KB
+//              against 1.3 MB of W_down per workgroup).
+//   kernel B   grid (n/128, T). A workgroup owns 128 channels (hc*128 rows of W_up), so W_up is
+//              read once, and `u` is never materialised because the workgroup holds all hc rows of
+//              a channel and does the mean itself.
 //
-// The fp8 twin of `x` falls out of kernel B for free: 128 channels is exactly one 128-column scale
-// group, so a workgroup owns whole groups and quantises its own with no second pass and no second
-// launch. That is the whole reason the read emits it -- a separate `quant_act_fp8` at each of 96
-// connections is ~0.43 ms of pure launch overhead at this tree's ~4.5 us floor.
+// 128 channels are exactly one fp8 scale group, so kernel B also quantises `x` to fp8 with no
+// extra pass or launch (a separate quant_act_fp8 at 96 connections would cost ~0.43 ms of launch
+// overhead).
 //
-// THE TILED PATH KEEPS THAT PROPERTY, BUT ONLY WITH THE RIGHT TILE. Above ~8 rows the per-row
-// kernels re-read both mixing matrices once a ROW, so the products run TILED -- and a tile over the
-// FLATTENED channel index, 64 consecutive `j`, is 64 channels of ONE sub-stream. The four terms of
-// a channel's mean then live in four different workgroups, so `u` has to be materialised into
-// `ubuf` and a third kernel (`hc_mix`) has to read it back: an extra launch a connection and
-// 1.28 MB of pure round trip with it.
+// Tiled path: above ~8 rows the per-row kernels would re-read both matrices per row, so the
+// products run tiled. A tile over the flattened channel index (64 consecutive `j`) covers one
+// sub-stream, putting a channel's hc terms in different workgroups; `u` must then go through
+// `ubuf` and a third kernel (`hc_mix`), costing a launch and a 1.28 MB round trip per connection.
 //
-// `hc_up_mix_tiled_kernel` tiles over (sub-stream, channel) PAIRS instead. Same bytes of W_up, in
-// hc runs of NT/hc rows rather than one run of NT, and all hc of a channel land in one workgroup
-// again. What it gives up is the free fp8 twin -- a workgroup owns NT/hc = 16 channels where a
-// scale group is 128 -- and an arrival counter buys that back: the last of the eight workgroups
-// covering a group quantises it. Worth 1-2% of the step at multi-sequence decode, for identical
-// output. At the 128-row prefill tile the same pairing is `hc_up_mix_wide_kernel`, which holds a
-// channel's sub-streams in one lane's accumulators instead of in LDS.
+// `hc_up_mix_tiled_kernel` instead tiles over (sub-stream, channel) pairs: the same W_up bytes in
+// hc runs of NT/hc rows, with all hc terms of a channel in one workgroup. A workgroup then owns
+// NT/hc = 16 channels of a 128-wide scale group, so an arrival counter lets the last of the eight
+// workgroups covering a group quantise it (1-2% of the step at multi-sequence decode, same
+// output). At the 128-row prefill tile the same pairing is `hc_up_mix_wide_kernel`, which keeps a
+// channel's sub-streams in one lane's accumulators instead of LDS.
 //
-// ============================== WHAT MUST MATCH THE REFERENCE ==============================
+// ============================== matching the reference ==============================
 //
-// libref/ref_hc.cpp is the oracle and three of its roundings are deliberate rather than incidental
-// -- torch's grouped norm returns `.type_as(x)`, so the REFERENCE MODEL reads a bf16 N in both
-// matrix products and in the final multiply. So this narrows N, narrows `d`, and narrows
-// sigmoid(u) before the multiply, in the same places. The sums of squares are accumulated in f32
-// here and f64 there, which is the one difference, and it is inside any tolerance a bf16 operand
-// carries.
+// libref/ref_hc.cpp is the oracle. torch's grouped norm returns `.type_as(x)`, so the reference
+// model reads a bf16 N in both matrix products and the final multiply. This kernel narrows N, `d`
+// and sigmoid(u) in the same places. Sums of squares are f32 here and f64 there, within bf16
+// tolerance.
 #include <hip/hip_runtime.h>
 
 #include <atomic>
@@ -84,19 +76,12 @@ constexpr int kDownTAMax = 64;   // columns of W_down a workgroup owns, at most
 constexpr int kUpRows  = 64;     // rows of W_up a workgroup owns
 constexpr int kWantWG  = 64;     // workgroups worth launching, when the CU count cannot be read
 
-/* WHAT THIS CALL RETURNS IS NOT THE CU COUNT. `hipDeviceProp_t::multiProcessorCount` reports WGPs
- * on RDNA, and a WGP is two CUs -- the R9700 has 64 CUs in 32 WGPs, which rocminfo confirms as
- * `Compute Unit: 64` -- so every grid sized from this number targets half the part.
- *
- * It is left reporting WGPs deliberately, because the number it feeds is a FLOOR on how many
- * workgroups are worth launching, and doubling that floor here would be a guess. On this kernel a
- * grid of 40, 80 and 160 all measure the same, so the block count is not what binds, and halving
- * `ta` only doubles the redundant work: each workgroup re-reads all of `h` and all of the norm
- * weight (60 KiB at this model's shape) before touching its own columns of W_down. At ta=4 that is
- * 4.8 MB of re-read against 6.55 MB of weight; at ta=8, 2.4 MB.
- *
- * A kernel that IS short of blocks on this part should double the number at its own call site
- * rather than re-titling it here. */
+/* Returns WGPs, not CUs: `hipDeviceProp_t::multiProcessorCount` reports WGPs on RDNA, two CUs
+ * each (the R9700 has 64 CUs in 32 WGPs). Left as is on purpose: it is a floor on workgroups worth
+ * launching, and here grids of 40, 80 and 160 perform the same. Halving `ta` only doubles redundant
+ * work, since each workgroup re-reads all of `h` and the norm weight (60 KiB here) before its own
+ * W_down columns (4.8 MB of re-read at ta=4, 2.4 MB at ta=8). A kernel short of blocks should
+ * double the number at its own call site. */
 static inline int want_wg() {
     static const int v = [] {
         int dev = 0;
@@ -110,21 +95,17 @@ static inline int want_wg() {
 
 constexpr int kUpTB    = 128;    // CHANNELS a workgroup owns -- and one fp8 scale group
 constexpr int kFp8Grp  = 128;
-#ifndef R4D_HC_DOT_U
-#define R4D_HC_DOT_U 4      // 512-byte loads a wave keeps in flight over a long weight row
-#endif
-constexpr int kDotU    = R4D_HC_DOT_U;
+constexpr int kDotU    = 4;      // 512-byte loads a wave keeps in flight over a long weight row
 
 __device__ __forceinline__ float sigmoidf_(float v) { return 1.0f / (1.0f + __expf(-v)); }
 __device__ __forceinline__ float siluf_(float v)    { return v * sigmoidf_(v); }
 __device__ __forceinline__ float nbf(float v)       { return bf2f(f2bf(v)); }
 
-/* BF16 IN WHOLE REGISTERS. gfx12's compiler holds a 16-bit value in a register HALF: eight f2bf
- * results written through a union of shorts are eight half moves before the pack, and a short
- * loaded on its own is a d16 load that leaves the register's other half live, so it waits on that
- * register's last write. These keep every value 32 bits wide -- pairs packed with f2bf2, whose
- * rounding is f2bf's, a pair word's halves read with a shift and a mask, a lone bf16 loaded
- * zero-extended -- and give the same bits. */
+/* bf16 in whole registers. gfx12's compiler holds a 16-bit value in a register half: shorts written
+ * through a union cost a half move each before the pack, and a lone d16 load leaves the other half
+ * live, waiting on that register's last write. These helpers keep values 32 bits wide (pairs packed
+ * with f2bf2, same rounding as f2bf; halves read by shift and mask; lone bf16 loaded zero-extended)
+ * and give the same bits. */
 __device__ __forceinline__ uint4 f2bf8(const float (&f)[8]) {
     return make_uint4(f2bf2(f[0], f[1]), f2bf2(f[2], f[3]), f2bf2(f[4], f[5]), f2bf2(f[6], f[7]));
 }
@@ -136,18 +117,17 @@ __device__ __forceinline__ void bf8_f(r4d_u32x4 v, float (&f)[8]) {
     f[0] = bf16w_lo(v.x); f[1] = bf16w_hi(v.x); f[2] = bf16w_lo(v.y); f[3] = bf16w_hi(v.y);
     f[4] = bf16w_lo(v.z); f[5] = bf16w_hi(v.z); f[6] = bf16w_lo(v.w); f[7] = bf16w_hi(v.w);
 }
-/* Read through a GLOBAL pointer: through a generic one the load is still flat_load_d16_b16. */
+/* Read through a global pointer; through a generic one the load is still flat_load_d16_b16. */
 typedef __attribute__((address_space(1))) const unsigned short* hc_gu16;
 __device__ __forceinline__ uint32_t bfw(const unsigned short* p) { return *(hc_gu16)p; }
 __device__ __forceinline__ float    bfw_f(uint32_t w)            { return __uint_as_float(w << 16); }
 
-/* ---- THE E4M3 MIXING MATRICES (r4d_hc_fp8.h) ------------------------------------------------
+/* ---- E4M3 mixing matrices (r4d_hc_fp8.h) ------------------------------------------------
  *
- * Every kernel below that reads mix_down or mix_up has an F8 form, selected by the stored dtype:
- * a row is its codes and then its f32 group scales, `ld` bytes from the next. The per-row kernels
- * multiply codes in f32 and apply a group's scale to that group's partial sum; the tiled ones
- * decode into their bf16 staging tile, scale applied, and keep the bf16 WMMA. Nothing else about a
- * kernel changes, and the bf16 form of each is compiled from the same text with F8 false. */
+ * Every kernel reading mix_down or mix_up has an F8 form, selected by the stored dtype: a row is
+ * its codes then its f32 group scales, `ld` bytes apart. Per-row kernels multiply codes in f32 and
+ * scale each group's partial sum; tiled kernels decode into their bf16 staging tile with the scale
+ * applied and keep the bf16 WMMA. The bf16 form compiles from the same text with F8 false. */
 
 /* Eight E4M3 codes, two dwords of them, to f32 in order: v_cvt_pk_f32_fp8, two a time. */
 __device__ __forceinline__ void e4m3x8(uint32_t lo, uint32_t hi, float* f) {
@@ -179,12 +159,10 @@ __device__ __forceinline__ uint4 e4m3x8_bf16(const unsigned char* __restrict__ c
     return f2bf8(f);
 }
 
-/* A WAVE'S DOT OF THE NATURAL-ORDER LDS VECTOR WITH ONE E4M3 ROW OF mix_down. A lane takes
- * SIXTEEN consecutive codes of every 512-element step -- one 16-byte load, so a wave's request is
- * 512 bytes as the bf16 dots' are; at eight codes a lane it would be 256, twice the requests for
- * the same bytes. Sixteen share one 128-group, whose scale multiplies the lane's
- * partial sum for the step. kU steps are loaded before the first is summed. K is a multiple of
- * 512. */
+/* A wave's dot of the natural-order LDS vector with one E4M3 row of mix_down. A lane takes sixteen
+ * consecutive codes of every 512-element step (one 16-byte load, so a wave requests 512 bytes like
+ * the bf16 dots). The sixteen share one 128-group, whose scale multiplies the lane's partial sum
+ * for the step. kU steps are loaded before the first is summed. K is a multiple of 512. */
 constexpr long kHc8Step = kWave * 16;
 
 __device__ __forceinline__ float hc8_dot16(const unsigned short* __restrict__ sv, uint4 c) {
@@ -228,10 +206,10 @@ __device__ __forceinline__ float hc8_dot_down(const unsigned short* __restrict__
     return acc;
 }
 
-/* ONE THREAD'S QUARTER OF AN E4M3 ROW OF mix_up against RG rows of `d` in LDS. The quarter is the
- * row's scale group (r4d_hc8::up_group), so its partial sums are complete before the scale is
- * applied and four threads' sums make the row. All of a quarter's sixteen-code loads are issued
- * before the first is used: at lowrank 320 that is five of them, and kMaxQ bounds it at 512. */
+/* One thread's quarter of an E4M3 row of mix_up against RG rows of `d` in LDS. The quarter is the
+ * row's scale group (r4d_hc8::up_group), so its partial sums are complete before scaling, and four
+ * threads' sums make the row. All of a quarter's sixteen-code loads issue before the first is used
+ * (five at lowrank 320); kUpMaxQ bounds lowrank at 512. */
 constexpr int kUpMaxQ = 8;
 template <int RG>
 __device__ __forceinline__ void hc8_dot_up(const float* __restrict__ sd, long lr,
@@ -268,16 +246,15 @@ __device__ __forceinline__ void hc8_dot_up(const float* __restrict__ sd, long lr
     }
 }
 
-/* ON THE VALU, NOT THE LDS CROSSBAR -- r4d_common.h has the measurement. It matters here because
- * the norm prologue reduces `hc + 1` accumulators back to back and `hc` is a runtime bound, so the
- * five exchanges of each are one dependency chain of five times `hc + 1`. Bit-identical: the same
- * lanes in the same order. */
+/* On the VALU, not the LDS crossbar (r4d_common.h). The norm prologue reduces `hc + 1`
+ * accumulators back to back with a runtime `hc`, so the exchanges form one long dependency chain.
+ * Bit-identical: same lanes, same order. */
 __device__ __forceinline__ float wave_sum(float v) { return r4d_wave_sum(v); }
 
 /* ============================================================== hc_enter
  *
- * h[c][i] = x[i], for every stream. One launch a step, and it is its own op because the embedding
- * lookup's weight is [vocab, n] -- a wide output would be a different weight shape. */
+ * h[c][i] = x[i] for every stream. One launch per step; its own op because the embedding lookup's
+ * weight is [vocab, n] and a wide output would need a different weight shape. */
 __global__ __launch_bounds__(kThreads)
 void hc_enter_kernel(const unsigned short* __restrict__ x, unsigned short* __restrict__ h,
                      long rows, long n, int hc, long xrow, long hrow) {
@@ -291,20 +268,18 @@ void hc_enter_kernel(const unsigned short* __restrict__ x, unsigned short* __res
     }
 }
 
-
 /* ============================================================== hc_write
  *
- * h[c][i] += inj[c] * y[i]. In place, on the UNNORMED stream -- the read's normalisation is
- * consumed by the block input and the gates and never enters the residual. */
+ * h[c][i] += inj[c] * y[i], in place on the unnormed stream: the read's normalisation feeds the
+ * block input and gates only, never the residual. */
 __global__ __launch_bounds__(kThreads)
 void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
                      unsigned short* __restrict__ h,
                      long rows, long n, int hc, long yrow, long irow, long hrow) {
     const long r = blockIdx.y;
     if (r >= rows) return;
-    /* THROUGH LDS AND NOT A REGISTER ARRAY. `hc` is a runtime value, so `g[c]` in the inner loop
-     * is a dynamic index into private memory -- which the compiler spills to scratch, turning a
-     * four-element broadcast into a per-element memory round trip. */
+    /* Gains go through LDS, not a register array: with a runtime `hc`, `g[c]` would be a dynamic
+     * private index, which the compiler spills to scratch. */
     __shared__ float s_g[kHcMax];
     if ((int)threadIdx.x < hc) s_g[threadIdx.x] = bf2f(inj[r * irow + threadIdx.x]);
     __syncthreads();
@@ -319,46 +294,30 @@ void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short*
     }
 }
 
-/* A WAVE'S DOT PRODUCT OF THE LDS VECTOR WITH A CONTIGUOUS bf16 ROW, at 512 bytes a load and in
- * the ORDER THE SCALAR FORM SUMMED IN.
+/* A wave's dot product of the LDS vector with a contiguous bf16 row, using 512-byte loads but
+ * summing in the scalar form's order.
  *
- * `for (j = lane; j < HN; j += kWave)` is one 64-BYTE load a wave instruction -- a quarter of what
- * the memory system wants -- and it reaches 219 GB/s on a shape where the lm head gets 631 out of
- * the same part. Eight CONTIGUOUS bf16 a lane is 512 bytes and reaches 554, but it changes which
- * j's a lane owns, and therefore the last bit of every output the kernel writes.
+ * A strided `j = lane` loop issues 64-byte loads per wave instruction (219 GB/s here, against 631
+ * for the lm head). Eight contiguous bf16 per lane (512 bytes) reaches 554 but changes which j a
+ * lane owns, and so the last bit of every output. So the wide load is staged through LDS and each
+ * lane reads back its strided subset, ascending (lane L sums j = L, L+32, ...). This is also
+ * faster than reordering j (8.9 us vs 9.0, scalar 29.9), whose lanes conflict on `sN`'s banks.
+ * `stage` is this wave's own 256-entry slot, so no barrier is needed: a wave's LDS operations
+ * complete in order.
  *
- * So the wide load goes THROUGH LDS and each lane reads back exactly the strided subset it would
- * have loaded itself, ascending: lane L still sums j = L, L+32, L+64, ... The transpose costs
- * nothing and in fact wins -- 8.9 us, against 9.0 for simply reordering which j a lane owns and
- * 29.9 for the scalar form -- because the reordered form's lanes fight over the same LDS banks
- * for `sN` where these do not.
- * `stage` is this wave's own 256-entry slot, so the round trip needs no barrier: a wave's LDS
- * operations complete in order and no other wave reads it.
- *
- * The unaligned row falls back to the scalar loop rather than being refused -- the fast path needs
- * the row 16-byte aligned, which is the base and `HN % 8` together. */
+ * An unaligned row (base or `HN % 8`) falls back to the scalar loop. */
 __device__ __forceinline__ float sv_at(const unsigned short* p, long i) { return bf2f(p[i]); }
 __device__ __forceinline__ float sv_at(const float* p, long i) { return p[i]; }
 
-/* `kU` IS HOW MANY LOADS A WAVE HAS IN FLIGHT, and it is the whole performance of kernel A.
+/* `kU` is how many loads a wave keeps in flight, which sets kernel A's speed. With one load per
+ * iteration the global latency is fully exposed: 40 workgroups of 8 waves keep only 320 x 512 B in
+ * flight, 258 GB/s, while kernel B reaches 504 GB/s on the same bytes because each wave owns eight
+ * rows. Block count (40 to 160) makes no difference; depth does. So kU loads are issued into
+ * registers first (back-to-back global_load_dwordx4), then walked through LDS one at a time.
  *
- * The staged form above issues ONE 512-byte load and then immediately reads the staged bytes back
- * out of LDS, so the global latency is exposed in full on every iteration -- a wave is never
- * waiting on more than one load. Kernel A runs 40 workgroups of 8 waves, so that is 320 loads of
- * 512 bytes in flight against a part that needs some hundreds of KiB to stay fed, which is
- * 25.4 us for 6.55 MB, or 258 GB/s. Kernel B moves the SAME 6.55 MB in 13.0 us (504 GB/s) purely
- * because its waves each own eight rows and so have eight loads outstanding.
- *
- * So the lever is not a wider load, a bigger grid or fewer workgroups -- every block count from 40
- * to 160 lands within 0.2 us of the others. It is depth: issue kU loads into registers FIRST, where
- * they have no dependency on each other and the compiler emits kU back-to-back global_load_dwordx4,
- * and only then walk them through LDS one at a time.
- *
- * BIT-IDENTICAL, and that is why the staging slot is not replicated kU times. Lane L still sums
- * j = L, L+32, ... within a 256-element chunk and still takes the chunks in ascending order; only
- * when the bytes ARRIVE moves. One slot reused kU times costs kU ordered LDS round trips, ~100
- * cycles each, which is what the one global latency already cost -- and replicating the slot would
- * take kernel A's LDS from 25 KiB to 37 KiB and halve the workgroups a CU can hold. */
+ * Bit-identical: the summation order is unchanged, only arrival time moves. The staging slot is
+ * reused kU times (kU ordered LDS round trips, ~100 cycles each) rather than replicated, which
+ * would raise kernel A's LDS from 25 to 37 KiB and halve its occupancy. */
 template <int kU, typename SV>
 __device__ __forceinline__ float wave_dot_lds(const SV* __restrict__ sv,
                                               const unsigned short* __restrict__ wr, long HN,
@@ -397,64 +356,29 @@ __device__ __forceinline__ float wave_dot_lds(const SV* __restrict__ sv,
     return acc;
 }
 
-/* N IS HELD IN LDS TRANSPOSED WITHIN EACH 256-ELEMENT CHUNK, AND THAT IS WORTH A THIRD OF KERNEL A.
+/* Swizzled form: N is held in LDS transposed within each 256-element chunk, and the weight is
+ * transposed by the load.
  *
- * `wave_dot_lds` above reads the STAGED WEIGHT out of LDS strided -- lane L takes jj = L, L+32,
- * ... -- because that is the summation order and it is not negotiable. It reads `sv`, the LDS copy
- * of N, at the SAME strided addresses, and that one is free to move: N is written by this kernel,
- * so the layout is ours to pick.
+ * wave_dot_lds reads N at strided addresses (lane L takes L, L+32, ...). A strided 16-bit LDS read
+ * puts 32 lanes on 16 banks, two cycles for half a cycle's bytes; with the weight's matching reads
+ * the inner loop is 228 instructions for 32 lane-FMAs, and the kernel is issue-bound (M=1 at
+ * 6.55 MB and M=4 at 26.2 MB both take 18.7 us).
  *
- * A strided 16-bit LDS read is the worst access this part has. `ds_load_u16 v, v6 offset:64*t`
- * gives lane L the address 2L + 64t: thirty-two lanes land in sixteen of the thirty-two four-byte
- * banks, two lanes a bank, so the instruction takes two LDS cycles and returns 64 of the 128 bytes
- * a cycle is worth. Eight of them a chunk, for N, and eight more for the weight. Disassembled at
- * this model's shape the inner loop is 228 instructions for 32 lane-FMAs -- 64 ds_load_u16, 42
- * v_lshlrev_b32 (which is what bf2f is) and 60 VALU -- and at 84 blocks that is ~24k cycles a
- * compute unit, which IS the 18.7 us the kernel traces. THE KERNEL IS ISSUE-BOUND, NOT BANDWIDTH-
- * BOUND, and the evidence is that M=1 reading 6.55 MB and M=4 reading 26.2 MB both take 18.7 us.
+ * N layout: within a 256-element chunk, logical p is stored at physical (p % 32) * 8 + (p / 32),
+ * so lane L's eight elements are one conflict-free ds_load_b128. Requires n % 256 == 0 so a chunk
+ * never straddles a sub-stream; otherwise the plain layout and loop are used (the `swz` flag).
+ * Whoever writes N pays: a plain staged copy transposed in LDS would be an 8-way conflict, so
+ * staging and rescale are one pass in which a thread reads its eight `h` and `w` from global and
+ * writes one ds_store_b128. The sum of squares then reads `h` from global (20 KiB a block against
+ * 320 KiB of W_down). Its order is unchanged: thread tid accumulates i = tid, tid + 256, ...
  *
- * So store N so that the eight elements ONE LANE WANTS ARE CONTIGUOUS. Inside a chunk of kPer =
- * 256, logical element p goes to physical (p % 32) * 8 + (p / 32); lane L's eight then sit at
- * physical L*8 .. L*8+7, which is one 16-byte `ds_load_b128` at a 16-byte-aligned address, no
- * conflict, four cycles for the whole 512-byte chunk. Eight ds_load_u16 become one ds_load_b128.
+ * Weight: `global_load_tr_b128` (r4d_common.h) gives lane j of each 8-lane group element j from
+ * all eight lanes' addresses. With L = 8g + i naming `wr + j + 8g + 32i`, lane L receives elements
+ * L, L+32, ... L+224 in ascending order, all 16-byte aligned (`swz` requires `down` aligned). This
+ * removes the staging store and eight conflicting ds_load_u16 per chunk; no `stage` slot is used.
  *
- * BIT-IDENTICAL, and that is the point: lane L still multiplies N[j + L + 32t] by W[j + L + 32t]
- * for t ascending, still sums into its own scalar, and the chunks still ascend. ONLY THE ADDRESS
- * THE VALUE IS FETCHED FROM MOVES. The chunk is 256 and never straddles a sub-stream because
- * n % 256 == 0 is a condition of the path; when it does not hold the kernel keeps the plain layout
- * and the plain loop, which is what the `swz` flag below selects.
- *
- * THE COST LANDS ON WHOEVER WRITES N, and it is why there is no raw copy of `h` into LDS. Writing
- * the transpose out of a plain staged copy would be eight 2-byte LDS stores at stride 16, an
- * EIGHT-way conflict -- worse than what it saves. So the staging and the rescale are ONE pass:
- * a thread owns one (chunk, lane) group, reads its eight `h` and eight `w` straight from global
- * where both are still coalesced across the wave, and writes the group with a single
- * ds_store_b128. That is fewer instructions than a copy-then-rescale, and it costs one extra pass
- * over `h` (20 KiB a block, against the 320 KiB of W_down the same block reads) because the sum of
- * squares has no LDS copy to read and takes `h` from global instead.
- * The reduction's order is untouched: thread tid still accumulates i = tid, tid + 256, ... */
+ * Bit-identical: lane L multiplies the same elements in the same order; only addresses move. */
 template <int kU>
-/* AND THE WEIGHT IS TRANSPOSED BY THE LOAD, WHICH RETIRES THE STAGING SLOT ALTOGETHER.
- *
- * The bank-conflict argument above rules out doing the weight's transpose IN LDS, and nothing
- * more. `global_load_tr_b128` does it in the LOAD instead: the eight lanes of a group each name an
- * address and lane j receives element j from all eight of them (r4d_common.h, and three attention
- * kernels already read V that way).
- *
- * THE ADDRESS THAT MAKES IT THE RIGHT TRANSPOSE. Lane L must own the chunk's elements L, L+32,
- * ... L+224 -- that is the summation order and it is not negotiable. Write L = 8g + i; if lane L
- * names `wr + j + 8g + 32i`, then lane 8g+j receives { wr[j + 8g + j' + 32i] : i = 0..7 } for its
- * own j' = L % 8, which is exactly elements L, L+32, ... in ascending order. Every address is
- * 16-byte aligned because j is a multiple of kPer, 8g and 32i are multiples of 8, and `swz`
- * already requires `down` itself to be.
- *
- * WHAT IT REMOVES: one 16-byte LDS store and EIGHT `ds_load_u16` a chunk, the eight being a
- * two-way bank conflict (lane L reads byte 2L + 64t, so thirty-two lanes land in sixteen banks) --
- * about sixteen of the twenty LDS cycles a chunk that remain once N is one `ds_load_b128`. This
- * path takes no `stage` slot at all.
- *
- * BIT-IDENTICAL: lane L multiplies the same N element by the same weight element in the same
- * order into the same scalar. Only where the weight arrives from moves. */
 __device__ __forceinline__ float wave_dot_swz(const unsigned short* __restrict__ sv,
                                               const unsigned short* __restrict__ wr, long HN,
                                               int lane) {
@@ -489,37 +413,31 @@ __device__ __forceinline__ float wave_dot_swz(const unsigned short* __restrict__
 
 /* ============================================================== mtp_enter
  *
- * THE MULTI-TOKEN-PREDICTION HEAD'S ENTRY, and it is in this file because it is the same shape of
- * problem as hc_read: a wide stream, a grouped norm over it, and a matvec whose weight is the only
- * traffic that matters.
+ * The multi-token-prediction head's entry. It lives here because it has hc_read's shape: a wide
+ * stream, a grouped norm over it, and a matvec whose weight dominates traffic.
  *
  *     ne[j]    = e[j] * rsqrt(mean(e^2) + eps) * (w_e[j] + wadd)
  *     fe[i]    = fc_e[i] . ne
  *     nh[k][j] = h[k*n+j] * rs[k] * (w_h[k*n+j] + wadd)          rs[k] over sub-stream k
  *     x[k*n+i] = fc_h[i] . nh[k] + fe[i]                         for each of the hc sub-streams
  *
- * WHAT DECIDES THE DECOMPOSITION IS THAT fc_h[i] IS READ ONCE AND USED hc TIMES. The two square
- * matrices are 13.1 MB at this model's shape and a draft round issues this once, so the arithmetic
- * (hc + 1 dots of 2560 per output channel) is free and the weight bytes are the whole cost. A
- * workgroup therefore owns kOutTB output CHANNELS, stages `nh` and `ne` in LDS, and walks each
- * weight row ONCE with hc accumulators live -- the alternative, hc calls to wave_dot_lds over the
- * same row, would read fc_h four times and quadruple the only traffic there is.
+ * fc_h[i] is read once and used hc times. The two square matrices are 13.1 MB here and the
+ * arithmetic is negligible, so a workgroup owns kMtpOutTB output channels, stages `nh` and `ne` in
+ * LDS, and walks each weight row once with hc accumulators live (hc separate dots would read fc_h
+ * hc times).
  *
- * The norms are recomputed by every workgroup, which is 25 KB of `h` and `e` against the 327 KB of
- * weights the same workgroup reads -- 7.6%, and the alternative is a second launch and a scratch
- * buffer for five scalars. */
+ * Every workgroup recomputes the norms: 25 KB of `h` and `e` against its 327 KB of weights,
+ * cheaper than a second launch and a scratch buffer for five scalars. */
 constexpr int kMtpOutTB = 32;    // output channels a workgroup owns: 80 blocks at n = 2560
-/* Above this many rows the tiled form below wins, and at one row it cannot -- the per-row kernel
- * already reads the weight once there and is the floor. From two rows up the tiled form is never
- * worse in step time and the kernel itself is up to 2.7x faster a call; at high concurrency the
- * step is flat only because the device is not fully busy there. */
+/* From this many rows the tiled form is used: at one row the per-row kernel reads the weight once
+ * and is the floor; from two rows the tiled form is never worse per step and up to 2.7x faster per
+ * call. */
 constexpr long kMtpTileMinRows = 2;
-/* `nh` + `ne` in LDS, in elements. 64 KiB less the staging slots and the reduction planes. */
+/* `nh` + `ne` in LDS, in elements: 64 KiB less the staging slots and reduction planes. */
 constexpr long kMtpLdsMaxN = 28672;
 
-/* One pass over a weight row with hc accumulators live, staged through LDS exactly as
- * wave_dot_lds does and for the same reason -- a 16-byte lane load reorders which j a lane owns,
- * and that changes the last bit of the sum. Lane L still sums j = L, L+32, L+64, ... */
+/* One pass over a weight row with hc accumulators live, staged through LDS as in wave_dot_lds to
+ * keep the summation order (lane L sums j = L, L+32, ...). */
 template <int kU>
 __device__ __forceinline__ void wave_dot_hc(const unsigned short* __restrict__ sv, long svstride,
                                             int hc, const unsigned short* __restrict__ wr, long n,
@@ -565,21 +483,16 @@ __device__ __forceinline__ void wave_dot_hc(const unsigned short* __restrict__ s
     }
 }
 
-/* BOTH WEIGHT ROWS OF ONE OUTPUT CHANNEL IN ONE PASS, over `nh` and `ne` held TRANSPOSED within
- * each 256-element chunk as wave_dot_swz reads N: a lane's eight elements of a chunk are one
- * ds_load_b128 a stream, and each weight row arrives transposed by global_load_tr_b128. The fc_h
- * row feeds the hc stream accumulators off one load and the fc_e row feeds `ae`, and all 2 kU loads
- * of an iteration are issued before the first is read.
+/* Both weight rows of one output channel in one pass, over `nh` and `ne` held transposed per
+ * 256-element chunk as in wave_dot_swz: a lane's eight elements are one ds_load_b128 per stream,
+ * and each weight row arrives transposed by global_load_tr_b128. The fc_h row feeds the hc stream
+ * accumulators, the fc_e row feeds `ae`; all 2*kU loads of an iteration issue before the first is
+ * read.
  *
- * wave_dot_hc and wave_dot_lds, the plain-layout pair, stage each weight load through LDS and read
- * it and every stream back with strided 16-bit LDS loads -- two-way bank conflicts, 41 LDS
- * instructions a chunk for 40 lane-FMAs, and an accumulator array indexed by the runtime `hc`,
- * which is private memory. Here a chunk is hc + 1 conflict-free LDS loads, and the accumulators
- * are unrolled over kHcMax with the stream count as a guard, so they stay in registers.
- *
- * BIT-IDENTICAL to that pair: each accumulator still sums elements L, L + 32, ... L + 224 of each
- * chunk, chunks ascending, each product the stream value times the weight. That the fc_e dot
- * interleaves with the fc_h ones changes no accumulator's own sequence. */
+ * The plain-layout pair (wave_dot_hc, wave_dot_lds) uses conflicting strided 16-bit LDS reads and
+ * an accumulator array indexed by runtime `hc` (private memory). Here a chunk is hc + 1
+ * conflict-free loads and the accumulators are unrolled over kHcMax with a guard, so they stay in
+ * registers. Bit-identical to that pair: each accumulator's summation order is unchanged. */
 template <int kU>
 __device__ __forceinline__ void wave_dot_mtp_swz(const unsigned short* __restrict__ snh,
                                                  const unsigned short* __restrict__ sne,
@@ -652,16 +565,14 @@ void mtp_enter_kernel(const unsigned short* __restrict__ h, const unsigned short
     const int wave = tid / kWave;
     const int lane = tid % kWave;
 
-    /* ---- the sums of squares. One partial a sub-stream plus the embedding's, in one pass over
-     * both rows -- and the FLAT reading is the same partials added together, which is why `flat`
-     * costs a branch here and nothing anywhere else. */
+    /* ---- sums of squares: one partial per sub-stream plus the embedding's, in one pass. The
+     * `flat` norm adds the same partials together. */
     float part[kHcMax];
 #pragma unroll
     for (int c = 0; c < kHcMax; ++c) part[c] = 0.0f;
     float pe = 0.0f;
-    /* kSsIter ITERATIONS' LOADS ARE ISSUED BEFORE THE FIRST IS SUMMED. One iteration at a time,
-     * each of a thread's ten iterations waits out a load latency before the next is asked for;
-     * this way two do. Same elements, same order into the same accumulators. */
+    /* kSsIter iterations' loads issue before the first is summed, so a thread's ten iterations
+     * wait out two load latencies instead of ten. Same elements, same order. */
     constexpr int kSsIter = 5;
     long i = tid;
     for (; i + (long)(kSsIter - 1) * kThreads < n; i += (long)kSsIter * kThreads) {
@@ -719,21 +630,19 @@ void mtp_enter_kernel(const unsigned short* __restrict__ h, const unsigned short
     }
     __syncthreads();
 
-    /* THE TRANSPOSED LAYOUT, WHEN THE SHAPE ALLOWS IT -- the same condition hc_read_a states:
-     * every 256-element chunk inside one stream, and every weight row 16-byte aligned for the
-     * transposing load. Otherwise the plain layout and the plain loop; both write the same values. */
+    /* Transposed layout when the shape allows (as in hc_read_a): every 256-element chunk inside
+     * one stream and every weight row 16-byte aligned. Otherwise the plain layout; both write the
+     * same values. */
     constexpr long kPer = kWave * 8;
     const bool swz = (n % kPer == 0) && (((uintptr_t)fch & 15u) == 0u)
                   && (((uintptr_t)fce & 15u) == 0u);
 
-    /* ---- the normed vectors, staged bf16. Both are read hc + 1 times below and are what makes
-     * one pass over each weight row enough. */
+    /* ---- the normed vectors, staged bf16, so one pass over each weight row suffices. */
     {
         const float rse = s_rse;
         if (swz) {
             /* A thread owns one (chunk, lane) group: logical elements lane + 32t of its chunk,
-             * written as one 16-byte store at physical lane * 8. The reads stay coalesced across
-             * the wave; see hc_read_a's build for why the transpose is done here and not in LDS. */
+             * written as one 16-byte store at physical lane * 8 (see wave_dot_swz). */
             const int lane8 = tid & (kWave - 1);
             for (int c = -1; c < hc; ++c) {
                 const unsigned short* src = c < 0 ? ep : hp + (long)c * n;
@@ -766,7 +675,7 @@ void mtp_enter_kernel(const unsigned short* __restrict__ h, const unsigned short
     }
     __syncthreads();
 
-    /* ---- the output channels this workgroup owns: one weight row read, hc + 1 dots off it. */
+    /* ---- this workgroup's output channels: one weight row read, hc + 1 dots from it. */
     const long i0 = (long)blockIdx.x * kMtpOutTB;
     for (int t = wave; t < kMtpOutTB; t += kWaves) {
         const long i = i0 + t;
@@ -789,28 +698,22 @@ void mtp_enter_kernel(const unsigned short* __restrict__ h, const unsigned short
     }
 }
 
-/* THE STATIC LDS kernel A declares beside N: the reduction planes and the staging slots. The
- * dynamic allocation for N has to fit in what is left of the workgroup's 64 KiB, so the launcher's
- * bound on hc * n is taken from this number, and the kernel asserts it matches its declarations. */
+/* Kernel A's static LDS beside N (reduction planes and staging slots). N's dynamic allocation must
+ * fit in the rest of 64 KiB, so the launcher bounds hc * n with this; the kernel asserts it. */
 constexpr long kHcReadAStaticLds = (long)(kWaves * kHcMax + kHcMax) * (long)sizeof(float)
                                  + (long)kWaves * kWave * 8 * (long)sizeof(unsigned short);
 
 /* ============================================================== hc_read, kernel A
  *
- * The grouped norm, then `d = silu(W_down @ N / hc)` for this workgroup's `ta` columns. Workgroup
- * 0 also produces the hc inject gains and publishes the per-stream norm scales for kernel B, which
- * cannot recompute them: kernel B reads only its own 128 channels of `h` and a stream's scale is a
- * reduction over all n of them.
+ * The grouped norm, then `d = silu(W_down @ N / hc)` for this workgroup's `ta` columns. One
+ * workgroup also produces the hc inject gains and publishes the per-stream norm scales for kernel
+ * B, which reads only its own 128 channels of `h` and so cannot recompute them.
  *
- * LDS holds N as bf16 -- HN * 2 bytes, 20 KiB at this model's shape -- which is what lets the
- * columns share one pass over `h` and one grouped reduction. It is held TRANSPOSED inside each
- * 256-element chunk; wave_dot_swz above is the whole argument for that, and it is the difference
- * between eight conflicted 16-bit LDS reads a chunk and one ds_load_b128. */
-/* THE WAVES A SIMD: nine for the E4M3 dot, the budget it was tuned at. Left to choose, LLVM 24
- * builds it at 120 VGPRs for twelve waves, which costs 11% at four rows and 20% at seven with the
- * weight read cold -- the shapes a speculative decode step runs. The bf16 form keeps the full
- * range, which is what it is built at without the attribute; pinning it to sixteen changes its
- * code. */
+ * LDS holds N as bf16 (HN * 2 bytes, 20 KiB here), so the columns share one pass over `h` and one
+ * grouped reduction. It is transposed per 256-element chunk; see wave_dot_swz. */
+/* Waves per SIMD: nine for the E4M3 dot, as tuned. Unconstrained, LLVM 24 builds it at 120 VGPRs
+ * for twelve waves, 11-20% slower at the 4-7 rows of a speculative decode step. The bf16 form keeps
+ * the full range; pinning it would change its code. */
 template <bool F8>
 __global__ __launch_bounds__(kThreads)
 __attribute__((amdgpu_waves_per_eu(F8 ? 9 : 1, F8 ? 9 : 16)))
@@ -824,8 +727,7 @@ void hc_read_a_kernel(const unsigned short* __restrict__ h, const float* __restr
     extern __shared__ unsigned short sN[];          /* [hc * n], transposed per 256-element chunk */
     __shared__ float s_part[kWaves][kHcMax];
     __shared__ float s_scale[kHcMax];
-    /* One 256-entry staging slot a wave, for the dot above. 4 KiB, and no barrier: a wave writes
-     * and reads only its own. */
+    /* One 256-entry staging slot per wave (4 KiB); no barrier, a wave uses only its own. */
     __shared__ unsigned short s_stage[kWaves][kWave * 8];
     static_assert(sizeof(s_part) + sizeof(s_scale) + sizeof(s_stage) == kHcReadAStaticLds,
                   "the launcher sizes N's allocation against this kernel's static LDS");
@@ -835,74 +737,31 @@ void hc_read_a_kernel(const unsigned short* __restrict__ h, const float* __restr
     const long r  = blockIdx.y;
     if (r >= rows) return;
     const long HN = (long)hc * n;
-    /* THE INJECT GAINS GET A BLOCK OF THEIR OWN, AND THAT IS A LOAD-BALANCE REQUIREMENT, NOT
-     * TIDINESS.
-     *
-     * Putting them on block 0, which also owns `ta` columns of W_down, is what a naive layout
-     * does. With ta at kWaves the column loop gives every wave exactly one dot product over HN --
-     * except on that block, where waves 0..hc-1 would do a SECOND one for the gains. A kernel
-     * takes as long as its slowest block, so one block at 2x sets the duration of all of them, and
-     * the kernel runs over three times the matvec's own cost at this shape.
-     *
-     * The grid is one wider instead and the last block owns no columns, so every wave in the
-     * kernel does one dot. The output does not move -- the gains and the published scales are the
-     * same arithmetic on the same bytes, and only which block does it changes. */
+    /* The inject gains get a block of their own for load balance. With ta = kWaves every wave does
+     * one dot over HN; adding the gains to a column-owning block would give its waves a second
+     * one, and that slowest block would set the kernel's duration. So the grid is one wider and
+     * the last block owns no columns. */
     const bool pub = (blockIdx.x == gridDim.x - 1);
     const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
     const unsigned short* hp = h + r * hrow;
     const unsigned short* __restrict__ down = (const unsigned short*)downv;
 
-    /* THE TRANSPOSED LAYOUT IS A PROPERTY OF THE SHAPE, NOT A SWITCH. It needs the chunk to sit
-     * inside one sub-stream (n % 256) and every 16-byte group to be aligned in LDS and in `h`. A
-     * model that does not satisfy it keeps the plain layout and the plain loop; nothing else in
-     * the kernel changes, and both write the same N. */
-    /* The E4M3 dot reads N in its natural order, eight consecutive elements a lane, so the
-     * transposed layout is a bf16 form's alone. */
+    /* The transposed layout follows from the shape: the chunk must sit inside one sub-stream
+     * (n % 256) and every 16-byte group be aligned in LDS and in `h`; otherwise the plain layout,
+     * with the same N. The E4M3 dot reads N in natural order, so only the bf16 form transposes. */
     const bool swz = !F8 && (n % kPer == 0) && (((uintptr_t)hp   & 15u) == 0u)
                   && (((uintptr_t)down & 15u) == 0u)
                   && (!injw || ((uintptr_t)injw & 15u) == 0u);
 
-    /* ---- the sums of squares, one stream at a time, straight from `h`. */
-    /* ONE STREAM AT A TIME, which keeps the accumulator a SCALAR. Summing all hc at once needs an
-     * accumulator indexed by `j / n`, and `hc` is a runtime value -- so that array lives in
-     * scratch memory and every element of the row pays a private-memory round trip. */
-    /* THE PREFETCH DEPTH IS THE POINT OF THE LOOP, and it is worth more than its byte count
-     * suggests. This moves 20 KiB against the 320 KiB of W_down the same block reads -- and yet
-     * the norm is 6.7 us of the kernel's 18.7 at the decode grid. The loop is not moving bytes, it
-     * is WAITING: a runtime trip count of ten, a global load feeding an FMA, and nothing else
-     * resident on the compute unit to cover the latency. Issuing eight iterations' loads into
-     * registers first turns eight serial latencies into one. Bit-identical: the same element is
-     * computed from the same inputs in the same order, and only when the load is issued moves.
+    /* ---- sums of squares, one stream at a time, straight from `h`. One stream at a time keeps
+     * the accumulator a scalar; an array indexed by runtime `hc` would live in scratch.
      *
-     * THE PROLOGUE IS LATENCY-BOUND, NOT TRAFFIC-BOUND, and three separate traffic levers are
-     * worth nothing here:
-     *
-     *   LOAD WIDTH. The N-build loop below reads `h` 32 consecutive bf16 at a time and `w` 32
-     *   consecutive f32 -- 64- and 128-byte requests, where wave_dot_lds measures 64 bytes at
-     *   219 GB/s against 554 for the same bytes taken eight contiguous to a lane. Putting both
-     *   operands through the same per-wave LDS staging turns sixteen narrow loads into three
-     *   global_load_b128, bit-identically, and changes the step time by nothing. THE WIDTH
-     *   ARGUMENT IS A DRAM ARGUMENT AND THESE BYTES ARE NOT COLD: `w` is one 40 KiB array every
-     *   block of the grid reads and `h` is 20 KiB read by the blocks of one row, so the norm phase
-     *   moves 6.7 MB across the grid in 6.7 us -- about 1 TB/s, above what this part's DRAM can
-     *   deliver, so it is served out of the 64 MB last level where a narrow request costs a small
-     *   fraction of what it costs at the DRAM boundary. Load width is a lever ONLY where the bytes
-     *   are cold, which is why it is worth 2.5x on the dot's streamed weight and nothing here.
-     *
-     *   BYTE COUNT. The prologue reads `h` TWICE -- once for the sums of squares and again to
-     *   build N -- on top of 40 KiB of f32 norm weight. The second read is removable: sN holds
-     *   nothing until the scale pass writes it, so the first pass can park the RAW bytes there and
-     *   the second read them back, bit-identically (the transposed store is a permutation inside
-     *   one 256-element chunk and a wave owns a whole chunk, so it needs no barrier beyond the
-     *   wave's own lockstep). That takes 80 KiB a block to 60 and is worth zero.
-     *
-     *   DEEPER STAGING. Prefetching the four sub-streams together, 32 loads outstanding instead of
-     *   8, is also within noise.
-     *
-     * What is left is the LATENCY CHAIN and the two barriers: ten dependent iterations, a
-     * block-wide reduction over kWaves partials, and 5.25 waves a SIMD at the decode grid with
-     * nothing else resident to hide any of it. A gain here has to come from concurrency or from
-     * the chain, not from traffic. */
+     * This prologue is latency-bound, not traffic-bound: 20 KiB against the block's 320 KiB of
+     * W_down, yet 6.7 of the kernel's 18.7 us at the decode grid, because ten dependent iterations
+     * wait on loads with nothing else resident. Issuing kPreSs iterations' loads first turns eight
+     * serial latencies into one, bit-identically. Wider loads (these bytes are served from the
+     * 64 MB last-level cache, not DRAM), reading `h` once instead of twice, and deeper prefetch
+     * were all measured as no gain. */
     constexpr int kPreSs = 8;      // n / kThreads is 10 a stream at this shape, and 12 spills
     for (int c = 0; c < hc; ++c) {
         const long cb = (long)c * n;
@@ -924,26 +783,20 @@ void hc_read_a_kernel(const unsigned short* __restrict__ h, const float* __restr
         float ss = 0.0f;
         for (int k = 0; k < kWaves; ++k) ss += s_part[k][tid];
         s_scale[tid] = __frsqrt_rn(ss / (float)n + eps);
-        /* One workgroup publishes; the rest recompute the identical value from the identical
-         * bytes, so which one wins is not a question. */
+        /* One workgroup publishes; the others compute the identical value. */
         if (pub && scaleout) scaleout[r * kHcMax + tid] = s_scale[tid];
     }
     __syncthreads();
 
-    /* ---- N into LDS, narrowed to bf16 exactly where the reference narrows it. */
-    /* PER STREAM, AND NOT `j / n`. `j` and `n` are both long, so `j / n` is a 64-BIT INTEGER
-     * DIVISION per element -- a software sequence on this part -- to recover a value the loop
-     * structure already knows. The map is elementwise, so the scale is a loop-invariant scalar
-     * and every element is computed from the same inputs in the same way: bit-identical. */
+    /* ---- N into LDS, narrowed to bf16 where the reference narrows it. Looped per stream rather
+     * than computing `j / n`, a 64-bit integer division per element (a software sequence here). */
     for (int c = 0; c < hc; ++c) {
         const long  cb = (long)c * n;
         const float sc = s_scale[c];
         if (swz) {
-            /* A THREAD OWNS ONE (chunk, lane) GROUP, which is the transpose: its eight logical
-             * elements are `lane + 32t`, and they are one 16-byte store at physical `q`. A wave's
-             * 32 threads cover exactly one chunk, so `ch` is wave-uniform and the eight `h` and
-             * `w` reads are each 32 consecutive elements -- still coalesced, which the transposed
-             * store is not asking them to give up. */
+            /* A thread owns one (chunk, lane) group: logical elements `lane + 32t`, one 16-byte
+             * store at physical `q`. A wave covers one chunk, so `ch` is wave-uniform and the
+             * `h` and `w` reads stay coalesced. */
             for (long base = 0; base < n; base += (long)kThreads * 8) {
                 const long q = base + (long)tid * 8;
                 if (q >= n) break;
@@ -977,7 +830,7 @@ void hc_read_a_kernel(const unsigned short* __restrict__ h, const float* __restr
     }
     __syncthreads();
 
-    /* ---- this workgroup's columns of W_down. One wave a column, a lane striding by 32. */
+    /* ---- this workgroup's columns of W_down, one wave per column. */
     const float inv_hc = 1.0f / (float)hc;
     const long  k0 = (long)blockIdx.x * ta;
     for (long k = k0 + wave; k < k0 + ta && k < lr; k += kWaves) {
@@ -1007,89 +860,29 @@ void hc_read_a_kernel(const unsigned short* __restrict__ h, const float* __restr
 
 /* ============================================================== hc_read, kernel B1
  *
- * `u = sigmoid(W_up @ d)`, one wave a row of W_up. SEPARATE FROM THE MIX, and the reason is
- * occupancy rather than tidiness: the mix owns 128 CHANNELS, which is hc*128 rows of W_up, so a
- * 2560-wide model gives it twenty workgroups against sixty-four compute units and the matvec runs
- * at a quarter of the machine. Split, this one is HN/64 = 160 workgroups on the same bytes.
+ * `u = sigmoid(W_up @ d)`, one wave per row of W_up. Separate from the mix for occupancy: the mix
+ * owns 128 channels (hc*128 rows of W_up), only twenty workgroups at width 2560 on 64 CUs, while
+ * this kernel runs HN/64 = 160 workgroups on the same bytes. `u` costs a 20 KiB-per-row round trip
+ * through scratch against 6.55 MiB of weight.
  *
- * `u` costs a round trip through scratch -- 20 KiB a row written and read -- against 6.55 MiB of
- * weight, which is the trade.
+ * RG rows share one block and one pass over the weight. With the row on blockIdx.y, a depth-3 MTP
+ * verify (four rows) streams W_up four times; the last-level cache absorbs most of it (1.4x, not
+ * 4x), but needlessly. `d` is 320 floats per row, so RG rows fit in LDS and a wave takes RG dots
+ * from each weight row it loads (~3% of a multi-row step, same output). RG=1 is the one-row case.
  *
- * ---- RG: THE ROWS OF A STEP SHARE ONE BLOCK, NOT ONE BLOCK EACH -------------------------------
+ * At the decode grid this moves 6.55 MB in 14.9 us (440 GB/s; the part reads 621 cold). Measured
+ * slower: four rows in flight per wave (+16%); kUpRows 16 or 128; staging the 64-element tail as
+ * one wide load (+4.6%; both narrow loads hit one 128-byte line); eight consecutive rows per wave
+ * instead of strided (+9.9%; strided rows make a block's eight waves read one contiguous burst);
+ * and register-staging the tail (+13.1%; the compiler hoists the wait in front of the chunk load).
+ * A block-cooperative stage of the span would take 40 KiB of LDS (1 block per CU instead of 7).
  *
- * Putting the row on `blockIdx.y` reads W_up ONCE A ROW. At decode that is the floor and the
- * file's header says so -- but a depth-3 MTP verify is FOUR rows, and four blocks each streaming
- * the same 6.55 MB is 26.2 MB for 6.55 MB of weight. At M=4 that form runs 640 blocks at 1120 GB/s
- * aggregate -- above what the part's DRAM can deliver, so three of the four reads are already
- * being served out of the 64 MB last level. That is why the cost is 1.4x and not 4x, and also why
- * it is worth removing rather than free: the cache is doing work that need not exist, and every
- * byte of it evicts something else.
- *
- * RG rows share ONE pass over the weight. `d` is 320 floats a row -- 1.25 KiB -- so all of them
- * fit in LDS beside the staging slots, and a wave that has the weight row in registers can take
- * RG dot products off it instead of one. The weight traffic drops to 6.55 MB whatever M is, worth
- * about 3% of a multi-row step for identical output, and RG=1 is the one-row case.
- *
- * ---- THIS KERNEL IS AT 440 GB/s, AND FIVE LEVERS ON THAT ARE SLOWER ---------------------------
- *
- * It moves 6.55 MB of W_up in 14.9 us at the decode grid -- 440 GB/s against a part that reads
- * 621 cold. A wave owns eight rows of 640 bytes and takes them ONE at a time, so it has one
- * 512-byte load outstanding, and 160 blocks of 8 waves on 64 compute units is ~10 KiB in flight a
- * CU. That reads exactly like the depth argument wave_dot_lds makes, and it is not. Each of the
- * following is SLOWER, with hc_read_a flat in the same traces as a control:
- *
- *   DEPTH. Four weight rows in flight instead of one (the eight rows are independent, so four
- *   uint4 of register buys four times the bytes outstanding): 17.5 us, worse by 16%.
- *
- *   GRID, IN BOTH DIRECTIONS. kUpRows 64 -> 16 is four times the blocks at the same depth a wave:
- *   15.9 us here, and 112 -> 131 us at prefill. kUpRows 64 -> 128 is HALF the blocks -- 80 of
- *   them, which is where hc_read_a's faster 84 sits -- and is worse again.
- *
- *   LOAD WIDTH AT THE TAIL. `lr` is 320 and a chunk is 256, so wave_dot_lds_rows takes 256
- *   elements as one 512-byte staged load and the last 64 as TWO 64-byte ones. Eight lanes bringing
- *   a uint4 each is the same 128 bytes in ONE request and is 4.6% WORSE. The 219-against-554
- *   figure elsewhere in this file does not reach this tail, because that is a REQUEST-RATE effect
- *   across a 20 KiB row, where the narrow form pays the per-request cost forty times over. A 64-element tail is TWO requests and both land in the SAME 128-byte line -- a
- *   640-byte row is five lines, so `wr + 256` is line-aligned and the second load is an L1 hit.
- *   There is no transaction to save, and the wide form costs one: the scalar pair issues two loads
- *   and waits once, where the staged form issues one load and then waits on a dependent LDS round
- *   trip that eight lane-FMAs cannot hide.
- *
- *   PER-WAVE SEQUENTIALITY. `for (t = wave; t < kUpRows; t += kWaves)` gives a wave rows 5120
- *   bytes apart, where hc_read_a -- the kernel at 546 GB/s -- gives each of its waves ONE 20 KiB
- *   row to walk end to end. Giving each wave eight CONSECUTIVE rows instead, same block and same
- *   bytes, is 9.9% worse. SO THE LOCALITY THAT MATTERS IS ACROSS THE EIGHT WAVES OF A BLOCK AT ONE
- *   INSTANT, NOT ALONG ONE WAVE'S OWN SEQUENCE: strided, the block's eight waves work on eight
- *   ADJACENT rows at the same time and their loads arrive as one contiguous 5 KiB burst;
- *   consecutive, the same eight waves sit 5 KiB apart and the block asks the memory system for
- *   eight scattered pieces. The strided form in the code is the one the part wants.
- *
- *   THE TAIL'S STALL COUNT. At lr = 320 the tail is TWO iterations of a rolled loop the compiler
- *   cannot unroll, because HN is a runtime value, and each is `global_load_u16`,
- *   `s_wait_loadcnt 0x0`, four VALU -- so a row costs THREE dependent global stalls. Issuing the
- *   tail into registers first (an unrolled `tv[8]` with `(i < HN)` masking, one waitcnt serving
- *   all of them) does turn three stalls into two, and is 13.1% worse: the compiler turns the
- *   masked unrolled load into EIGHT conditional basic blocks and sinks the single
- *   `s_wait_loadcnt 0x0` to just after the last of them, BEFORE the chunk's load is issued. The
- *   tail's latency stops being something the chunk's FMAs retire under and becomes a naked stall
- *   at the front, plus six branches a row that do nothing. FEWER STALLS ON A LATENCY-BOUND KERNEL
- *   IS NOT THE SAME AS LESS STALLING.
- *
- * NOTHING THAT CHANGES WHAT ONE WAVE ASKS FOR MOVES THIS KERNEL. A sixth lever would have to be
- * about what the BLOCK asks for, and the arithmetic is at least expressible -- kUpRows * lr * 2
- * is 40960 bytes, exactly ten block-wide passes of 256 threads by 16 bytes, so a cooperative
- * stage of the whole span is one clean loop. It is also 40 KiB of LDS against the 9 KiB this
- * kernel holds, which is 1 block a CU instead of 7, at an occupancy cost that is not measured.
- *
- * BIT-IDENTICAL, and for the same reason wave_dot_lds is: lane L still sums j = L, L+32, ...
- * within a 256-element chunk, still takes the chunks in ascending order, and still accumulates
- * into a per-row scalar. Only the LOOP NEST changes -- rows move from the grid to the innermost
- * position -- and `acc[]` is indexed by an unrolled constant so it stays in registers. A runtime
- * `rows` bound there would put it in scratch, which is the trap hc_write's header records. */
+ * Bit-identical to wave_dot_lds: only the loop nest changes (rows move innermost), and `acc[]` is
+ * indexed by an unrolled constant so it stays in registers; a runtime `rows` bound would put it in
+ * scratch. */
 
-/* RG rows of the LDS vector against ONE contiguous bf16 weight row, the weight read once.
- * `sv_ld` is the row pitch of `sv`; `live` masks the tail group of a row count RG does not
- * divide. */
+/* RG rows of the LDS vector against one contiguous bf16 weight row, read once. `sv_ld` is the row
+ * pitch of `sv`. */
 template <int RG>
 __device__ __forceinline__ void wave_dot_lds_rows(const float* __restrict__ sv, long sv_ld,
                                                   const unsigned short* __restrict__ wr, long HN,
@@ -1129,8 +922,7 @@ void hc_up_kernel(const void* __restrict__ upv, long uld, const unsigned short* 
     if (r0 >= rows) return;
     const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
 
-    /* A dead row of the tail group reads nothing and is zero-filled, so its dot is defined and
-     * its store is dropped below. */
+    /* A dead row of the tail group is zero-filled, so its dot is defined; its store is dropped. */
     for (long k = tid; k < (long)RG * lr; k += kThreads) {
         const long r = k / lr;
         sd[k] = (r0 + r < rows) ? bf2f(dbuf[(r0 + r) * lr + (k - r * lr)]) : 0.0f;
@@ -1138,8 +930,8 @@ void hc_up_kernel(const void* __restrict__ upv, long uld, const unsigned short* 
     __syncthreads();
 
     const long j0 = (long)blockIdx.x * kUpRows;
-    /* THE E4M3 FORM TAKES A ROW FOUR THREADS AT A TIME, a quarter each -- the quarter is the row's
-     * scale group -- so the block's 256 threads cover its 64 rows in one pass. */
+    /* The E4M3 form takes a row four threads at a time, a quarter (one scale group) each, so 256
+     * threads cover the block's 64 rows in one pass. */
     if constexpr (F8) {
         static_assert(kUpRows * 4 == kThreads, "four threads a row of W_up");
         const int  tr = tid >> 2, q4 = tid & 3;
@@ -1159,19 +951,17 @@ void hc_up_kernel(const void* __restrict__ upv, long uld, const unsigned short* 
 #pragma unroll
         for (int r = 0; r < RG; ++r) {
             const float a = wave_sum(acc[r]);
-            /* Narrowed where the reference narrows it: torch's sigmoid output is bf16 before the
-             * multiply, so an f32 `u` here would disagree in the last bit of every channel. */
+            /* Narrowed as in the reference, where the sigmoid output is bf16 before the multiply. */
             if (lane == 0 && r0 + r < rows) ubuf[(r0 + r) * hn + j] = f2bf(sigmoidf_(a));
         }
     }
 }
 
-/* THE ROTATED TWIN OF ONE 128-CHANNEL GROUP, for a consumer whose weight carries a 128-wide
- * Hadamard (the w4a8h expert plane). A wave holds the group four consecutive values a lane -- the
- * layout r4d_fwht_wave<128> transforms in registers -- loaded by the caller from the bf16 the read
- * stored, and quantises the rotated values exactly as the rotated quant_act_fp8 kernel does: the
- * same transform, absmax, scale, clamp and packing, so its consumer cannot tell which op wrote
- * the codes and no separate launch over `x` is needed. */
+/* Rotated fp8 codes of one 128-channel group, for a consumer whose weight carries a 128-wide
+ * Hadamard (the w4a8h expert plane). A wave holds the group four consecutive values per lane (the
+ * r4d_fwht_wave<128> layout), loaded by the caller from the stored bf16, and quantises exactly as
+ * the rotated quant_act_fp8 kernel does (transform, absmax, scale, clamp, packing), so no separate
+ * launch over `x` is needed. */
 __device__ __forceinline__ void hc_rot_group(float* v, int lane, unsigned char* qg, float* sg) {
     r4d_fwht_wave<kUpTB>(v, lane);
     float m = 0.0f;
@@ -1191,21 +981,17 @@ __device__ __forceinline__ void hc_rot_group(float* v, int lane, unsigned char* 
 
 /* ============================================================== hc_read, kernels B and B2 as one
  *
- * hc_up tiles the FLATTENED index, so a workgroup's 64 rows of W_up are 64 channels of ONE
- * sub-stream, the hc terms of a channel's mean land in hc different workgroups, and `u` has to
- * round-trip through `ubuf` into hc_mix. That second launch is a whole dependent dispatch a
- * connection -- on this part a gap longer than either kernel's own work at one row.
+ * hc_up tiles the flattened index, so a channel's hc terms land in different workgroups and `u`
+ * round-trips through `ubuf` into hc_mix, a dependent launch that costs more than either kernel's
+ * work at one row.
  *
- * This workgroup owns 64 / hc CHANNELS in all hc sub-streams instead: the same 64 rows of W_up and
- * the same grid, taken as hc runs of 64 / hc rows, so every term of its channels' means is in its
- * own LDS and `u` never leaves it. What it gives up is the whole 128-channel scale group, and an
- * arrival counter buys that back exactly as hc_up_mix_tiled does: the last of the workgroups
- * covering a group of a row group quantises it, from the bf16 `x` the others wrote.
+ * This workgroup instead owns 64 / hc channels in all hc sub-streams (the same 64 rows of W_up and
+ * grid, as hc runs of 64 / hc rows), so `u` stays in LDS. An arrival counter replaces the whole
+ * 128-channel scale group, as in hc_up_mix_tiled: the last workgroup covering a group of a row
+ * group quantises it from the bf16 `x` the others wrote.
  *
- * BIT-IDENTICAL to the pair. Each row's dot is wave_dot_lds_rows over the same weight row,
- * narrowed where hc_up narrows it; the mean runs over c ASCENDING in hc_mix's expression; and the
- * codes are taken from the same bf16 values against the same amax, which a max reaches in any
- * order. */
+ * Bit-identical to the pair: the same per-row dots and narrowing as hc_up, the mean over c
+ * ascending as in hc_mix, and codes from the same bf16 values and amax. */
 template <int RG, bool F8, bool I8 = false>
 __global__ __launch_bounds__(kThreads)
 void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
@@ -1234,7 +1020,7 @@ void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
     __syncthreads();
 
     /* Row t of this workgroup's slice of W_up is sub-stream t / ipb of channel i0 + t % ipb. The
-     * E4M3 form takes each row four threads at a time, as hc_up_kernel's does. */
+     * E4M3 form takes each row four threads at a time, as in hc_up_kernel. */
     if constexpr (F8) {
         static_assert(kUpRows * 4 == kThreads, "four threads a row of W_up");
         const int  t = tid >> 2, q4 = tid & 3;
@@ -1291,8 +1077,8 @@ void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
         __hip_atomic_store(&ctr[slot], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     __threadfence();
 
-    /* One wave a row: RG is at most the wave count, and a wave's 32 lanes take the group's 128
-     * channels four apiece, which is also one packed dword of codes a lane. */
+    /* One wave per row (RG <= wave count); a lane takes four of the group's 128 channels, one
+     * packed dword of codes. */
     if (wave >= RG) return;
     const long r = r0 + wave;
     if (r >= rows) return;
@@ -1318,16 +1104,12 @@ void hc_up_mix_kernel(const void* __restrict__ upv, long uld,
     }
 }
 
-/* THE GROUP SIZE IS THE ROW COUNT, UP TO EIGHT. RG is a template parameter because `acc[RG]` has
- * to be registers; a runtime bound makes it scratch, and one private-memory round trip an element
- * would cost more than the weight re-read it is here to remove. Every group from 1 to 8 is
- * instantiated, so a row count up to eight is ONE group and the weight is read once: a five- or
- * six-row verify (depth 4 or 5) split as 4 + 1 or 4 + 2 would read W_up twice. The output is the
- * same bytes at any group, because only the loop nest over rows changes.
+/* Row group size: the row count, up to eight. RG is a template parameter so `acc[RG]` stays in
+ * registers. Every size from 1 to 8 is instantiated, so up to eight rows read the weight once
+ * (a five-row verify split 4 + 1 would read W_up twice). Output bytes do not depend on RG.
  *
- * The LDS cap is the real bound: RG rows of `d` are RG*lr floats beside the 4 KiB of staging
- * slots, so a model with a wide low rank gets a smaller group rather than a launch failure -- the
- * largest that fits, one row at a time, since every size below eight is an instantiation. */
+ * LDS bounds it: RG rows of `d` are RG*lr floats beside 4 KiB of staging, so a wide low rank gets
+ * the largest group that fits rather than a launch failure. */
 static inline long hc_up_rg(long long rows, long long lr) {
     constexpr long kLdsCap = 60 * 1024;          /* leave the 4 KiB of staging slots room */
     long rg = rows < 8 ? (rows > 1 ? (long)rows : 1) : 8;
@@ -1337,7 +1119,7 @@ static inline long hc_up_rg(long long rows, long long lr) {
 
 static inline int hc_up_launch(const RadTensor* up, long uld, bool f8, const unsigned short* dbuf,
                                unsigned short* ubuf, long long rows, long long HN, long long lr,
-                               const R4dSink& sk) {
+                               RadStream stream) {
     int emit_rc = RAD_OK;
     const long rg = hc_up_rg(rows, lr);
     const dim3 grid((unsigned)((HN + kUpRows - 1) / kUpRows),
@@ -1345,8 +1127,8 @@ static inline int hc_up_launch(const RadTensor* up, long uld, bool f8, const uns
     const unsigned lds = (unsigned)(rg * lr * sizeof(float));
     const void* upp = up->data;
 #define HC_UP1_CASE(RG_, F8_)                                                                    \
-    emit_rc = R4D_EMIT(sk, (hc_up_kernel<RG_, F8_>), grid, dim3(kThreads), lds, upp, uld, dbuf,   \
-                       ubuf, (long)rows, (long)HN, (long)lr)
+    emit_rc = R4D_EMIT(stream, (hc_up_kernel<RG_, F8_>), grid, dim3(kThreads), lds, upp, uld,    \
+                       dbuf, ubuf, (long)rows, (long)HN, (long)lr)
     switch (rg) {
         case 8:  if (f8) HC_UP1_CASE(8, true); else HC_UP1_CASE(8, false); break;
         case 7:  if (f8) HC_UP1_CASE(7, true); else HC_UP1_CASE(7, false); break;
@@ -1361,8 +1143,8 @@ static inline int hc_up_launch(const RadTensor* up, long uld, bool f8, const uns
     return emit_rc;
 }
 
-/* hc_up_mix_kernel's launch: hc_up's grid and row group, which the counter slots are laid over --
- * (rows / rg) row groups of n / kUpTB scale groups each. */
+/* hc_up_mix_kernel's launch: hc_up's row group; counter slots are (rows / rg) row groups of
+ * n / kUpTB scale groups. */
 static inline int hc_up_mix_launch(const RadTensor* up, long uld, bool f8, bool i8,
                                    const unsigned short* dbuf,
                                    const unsigned short* h, const float* w, const float* scale,
@@ -1371,15 +1153,16 @@ static inline int hc_up_mix_launch(const RadTensor* up, long uld, bool f8, bool 
                                    unsigned int* ctr, long long rows, long long n, int hc,
                                    long long lr, long long hrow, long long xrow, long long qrow,
                                    long long srow, long long rqrow, long long rsrow, float wadd,
-                                   const R4dSink& sk) {
+                                   RadStream stream) {
     int emit_rc = RAD_OK;
     const long rg = hc_up_rg(rows, lr);
     const dim3 grid((unsigned)(n / (kUpRows / hc)), (unsigned)((rows + rg - 1) / rg));
     const unsigned lds = (unsigned)(rg * lr * sizeof(float));
     const void* upp = up->data;
 #define HC_UPMIX_CASE3(RG_, F8_, I8_)                                                            \
-    emit_rc = R4D_EMIT(sk, (hc_up_mix_kernel<RG_, F8_, I8_>), grid, dim3(kThreads), lds, upp, uld,\
-                       dbuf, h, w, scale, x, q, qs, rq, rqs, ctr, (long)rows, (long)n, hc,        \
+    emit_rc = R4D_EMIT(stream, (hc_up_mix_kernel<RG_, F8_, I8_>), grid, dim3(kThreads), lds,     \
+                       upp, uld, dbuf, h, w, scale, x, q, qs, rq, rqs, ctr, (long)rows, (long)n,  \
+                       hc,                                                                        \
                        (long)lr, (long)hrow, (long)xrow, (long)qrow, (long)srow, (long)rqrow,     \
                        (long)rsrow, wadd)
 #define HC_UPMIX_CASE(RG_, F8_)                                                                  \
@@ -1401,11 +1184,11 @@ static inline int hc_up_mix_launch(const RadTensor* up, long uld, bool f8, bool 
 
 /* ============================================================== hc_read, kernel B2
  *
- * `x = mean_c( u[c] * N[c] )` for this workgroup's 128 channels, and their fp8 codes -- 128 is one
- * scale group, so the amax is this workgroup's alone and there is no second pass over the row.
+ * `x = mean_c( u[c] * N[c] )` for this workgroup's 128 channels, plus their fp8 codes: 128 is one
+ * scale group, so the amax needs no second pass.
  *
- * N is rebuilt from `h` and the scales kernel A published rather than carried: 128 channels of it
- * is 512 elements against the 20 KiB the whole row would cost to move. */
+ * N is rebuilt from `h` and kernel A's published scales (512 elements here, against 20 KiB to
+ * carry the whole row). */
 template <bool I8 = false>
 __global__ __launch_bounds__(kThreads)
 void hc_mix_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
@@ -1443,9 +1226,7 @@ void hc_mix_kernel(const unsigned short* __restrict__ h, const float* __restrict
     if (!q) return;
     __syncthreads();
 
-    /* IT QUANTISES WHAT WAS WRITTEN: `s_x` is narrowed to bf16 first, because that is what the
-     * reference reads back and a fused kernel using its f32 accumulator would disagree in the last
-     * bit of every code. */
+    /* Quantise what was written: `s_x` is narrowed to bf16 first, as the reference reads it back. */
     float m = 0.0f;
     for (int t = tid; t < kUpTB; t += kThreads) m = fmaxf(m, fabsf(nbf(s_x[t])));
     m = r4d_wave_max(m);
@@ -1456,7 +1237,7 @@ void hc_mix_kernel(const unsigned short* __restrict__ h, const float* __restrict
     const float sc  = amax > 0.0f ? amax * (1.0f / q8_top<I8>()) : 1.0f;
     const float inv = 1.0f / sc;
     if (tid == 0) qs[r * srow + blockIdx.x] = sc;
-    /* Four codes a lane, packed into one dword, exactly as r4d_quant_act_fp8 does it. */
+    /* Four codes per lane packed into one dword, as in r4d_quant_act_fp8. */
     if (tid < kUpTB / 4) {
         const long c0 = i0 + (long)tid * 4;
         float v[4];
@@ -1464,8 +1245,7 @@ void hc_mix_kernel(const unsigned short* __restrict__ h, const float* __restrict
         const uint32_t pk = q8_pack4<I8>(v[0], v[1], v[2], v[3], inv);
         if (c0 < n) *(unsigned*)(q + r * qrow + c0) = (unsigned)pk;
     }
-    /* The rotated twin from the same narrowed values; the launch refuses a channel count that is
-     * not whole groups, so the group is always full. */
+    /* The rotated codes from the same narrowed values; the launch requires whole groups. */
     if (rq && wave == 0) {
         float v[4];
 #pragma unroll
@@ -1474,78 +1254,50 @@ void hc_mix_kernel(const unsigned short* __restrict__ h, const float* __restrict
     }
 }
 
-/* ==================================================== hc_read, the PREFILL path
+/* ==================================================== hc_read, the tiled path
  *
- * The three kernels above PUT ROWS ON THE GRID: one workgroup a token, and each of them reads the
- * whole of its slice of the mixing matrix. At decode that is exactly right -- there is one row, the
- * weight is read once, and the header's 2.1 ms is the floor. At a prefill chunk it is a disaster:
- * EVERY TOKEN re-reads both 6.55 MB matrices, so 2048 tokens times 96 connections times 13.1 MB is
- * 2.5 TB of weight traffic for a step whose arithmetic is 6.6M MACs a token. On the full Flash-Next
- * that is 56% of a prefill step, nearly twice the MoE.
+ * The kernels above put rows on the grid, so each token reads its whole slice of the mixing
+ * matrices. Right at decode; at a 2048-token prefill chunk it is 2.5 TB of weight traffic per step
+ * (56% of a Flash-Next prefill step).
  *
- * Above a row count the two products run as TILED GEMMs instead. A workgroup owns 128 rows and 64
- * output columns; the weight tile lands in LDS once and is reused by all 128 rows, so the weight is
- * read ceil(rows/128) times a step rather than `rows` times -- 16 passes at a 2048-token chunk
- * instead of 2048. The arithmetic is the same two products; only the ORDER of the sum changes, from
- * a lane-strided partial sum to WMMA's 16-wide fragments, which is the same class of reordering the
- * per-row form already does against the reference's sequential f32 sum.
+ * Above a row threshold the two products run as tiled GEMMs: a workgroup owns 128 rows and 64
+ * output columns and reuses each weight tile across its rows, so the weight is read
+ * ceil(rows/128) times. Only the summation order changes (WMMA fragments instead of lane-strided
+ * partials), the same kind of reordering the per-row form already has against the reference.
  *
- * THE NORM MOVES OUT rather than being carried. The per-row kernel A folds the grouped rmsnorm, the
- * inject gains and the W_down product into one pass because it already holds N in LDS. A tile
- * cannot: N for 128 rows is 2.5 MB. So the scales and the gains get a kernel of their own (one pass
- * over `h`, and injw is 80 KB that stays in L2), and the GEMM rebuilds N as it stages each A tile --
- * which costs nothing, because the tile has to be staged either way and `h` would be read anyway.
+ * The norm moves out: N for 128 rows is 2.5 MB, too big for LDS. The scales get their own kernel
+ * (one pass over `h`) and the GEMM rebuilds N while staging each A tile, which it must stage
+ * anyway.
  *
- * THE COLUMN COUNT IS WHY THIS IS TWO GEMMS AND NOT ONE. `d` is [rows, 320] and `u` is [rows,
- * 10240]; a workgroup that owned a whole 128-channel scale group of the mix would own hc*128 = 512
- * rows of W_up for only its 16 affordable rows of accumulator, and the weight would then be read
- * rows/16 times. What keeps `u` out of memory instead is a workgroup owning sixteen channels of
- * every sub-stream and an arrival counter for the scale group: hc_up_mix_tiled_kernel at the decode
- * tiles, hc_up_mix_wide_kernel at the prefill one.
+ * Two GEMMs, not one: a workgroup owning a whole 128-channel scale group of the mix would own
+ * hc*128 = 512 rows of W_up but only 16 rows of accumulator, re-reading the weight rows/16 times.
+ * Instead a workgroup owns sixteen channels of every sub-stream with an arrival counter for the
+ * scale group (hc_up_mix_tiled_kernel at decode tiles, hc_up_mix_wide_kernel at prefill).
  */
 constexpr int kTNT = 64;            // output columns a workgroup owns: four n tiles
-/* AND IT IS FITTED AT DECODE SHAPES, WHICH COSTS SOMETHING AT PREFILL. The tiled down product's
- * grid is (ncol/kTNT, rows/rt, HN/kc), so `h` is re-read once per COLUMN tile and the weight once
- * per ROW tile. At decode h is 20 KiB against 1.3 MiB of weight and six reads of it are free; at a
- * 2048-row chunk h is 41.9 MB and six reads are 251 MB against 105 MB of weight. The trade
- * inverts and nothing here notices.
- *
- * So the prefill tile does not use it: hc_down_wide_kernel takes kWideNT columns a workgroup.
- * The K-split stays hc_down_kchunk's, counted at kTNT columns: at 2048 rows and 112 columns, splits
- * of 1, 3, 4, 5 and 8 are all slower than the rule's 2 (844 / 797 / 774 / 765 / 766 us a call
- * against 760), and keeping it keeps the bytes. No split at all loses because the grid is then 48
- * workgroups on 64 CUs. */
+/* kTNT is fitted to decode shapes. The tiled down product's grid is (ncol/kTNT, rows/rt, HN/kc), so
+ * `h` is re-read per column tile and the weight per row tile; at decode h is small, but at a
+ * 2048-row chunk six reads of `h` (251 MB) outweigh the weight (105 MB). So the prefill tile uses
+ * hc_down_wide_kernel with kWideNT columns per workgroup, keeping hc_down_kchunk's split counted at
+ * kTNT columns (at 2048 rows, splits of 1, 3, 4, 5 and 8 are all slower than its 2; no split
+ * leaves 48 workgroups on 64 CUs). */
 constexpr int kTKT = 64;            // K staged per pass
-constexpr int kTAP = kTKT + 4;      // LDS row pitch in shorts. 136 B: 8-byte aligned, and the 16
-                                    // lanes of a fragment land on 16 distinct bank pairs (AP 68,
-                                    // the same pitch the kkt solve uses).
-constexpr long kTileMinRows = 64;   // at or above this the 128-row tile fills and the down product
-                                    // needs no K-split: the prefill form.
-constexpr long kDecMinRows  = 8;    // ...and below THIS the per-row kernels still win: there is not
-                                    // enough re-read to pay for hc_scale_inj and the partials.
-                                    // Eight rows is the crossover -- the two forms are level there
-                                    // -- and above it the tiled form pulls away, reaching ~25%
-                                    // of the step by eight concurrent sequences.
+constexpr int kTAP = kTKT + 4;      // LDS row pitch in shorts (136 B): 8-byte aligned, and a
+                                    // fragment's 16 lanes hit 16 distinct bank pairs (as in the
+                                    // kkt solve).
+constexpr long kTileMinRows = 64;   // from here the 128-row tile fills and the down product needs
+                                    // no K-split: the prefill form.
+constexpr long kDecMinRows  = 8;    // below this the per-row kernels win; the two forms are level
+                                    // at eight rows, and the tiled form gains ~25% of the step by
+                                    // eight concurrent sequences.
 
 /* ==================================================== the norm scales, alone
  *
- * THE SCALES GET A GRID, NOT A WORKGROUP. The inject gains ride along as four more columns of the
- * down product (see hc_down_tiled_kernel), so nothing here needs a shared LDS copy of N -- a form
- * that computed the per-stream rsqrt AND the gains off one such copy would have to stage the whole
- * 20 KiB row and walk it a second time for four dot products.
- *
- * With the gains gone the streams are independent, so the grid is (hc, rows) rather than
- * (1, rows): one rsqrt per (row, stream), four times the workgroups, and no LDS staging in front
- * of them. The fused form's 75 VGPRs and 4384 B of LDS are 9 and 32 here.
- *
- * BIT-IDENTICAL to the fused form: the same thread stride over the same values, the same
- * wave_sum, and the same ascending sum over the eight wave partials.
- *
- * IT IS WORTH TENS OF MICROSECONDS A STEP AND NOT MORE. A kernel this short is mostly the ~20%
- * launch ramp this part charges anything under ~13 us, so deleting its WORK can never buy much.
- * Only deleting the LAUNCH would, and that needs the scales computed by something already running
- * -- which the op's private scratch forbids, since the producer of `h` is hc_write, a different op
- * with a different arena. */
+ * The inject gains ride along as extra columns of the down product (hc_down_tiled_kernel), so
+ * streams are independent and the grid is (hc, rows): one rsqrt per (row, stream), no LDS copy of
+ * N. Bit-identical to the fused form: same thread stride, wave_sum and ascending sum over the wave
+ * partials. Removing the launch itself would need `h`'s producer (hc_write, another op with its
+ * own arena) to compute the scales. */
 __global__ __launch_bounds__(kThreads)
 void hc_norm_scale_kernel(const unsigned short* __restrict__ h, float* __restrict__ scaleout,
                           long rows, long n, long hrow, float eps) {
@@ -1566,46 +1318,36 @@ void hc_norm_scale_kernel(const unsigned short* __restrict__ h, float* __restric
     }
 }
 
-/* ==================================================== THE TILE SHAPE IS A FUNCTION OF THE ROWS
+/* ==================================================== tile shape follows the row count
  *
- * One tile shape cannot serve a 2048-token prefill chunk and a 32-row decode batch. RT is what
- * varies: 128 rows a workgroup is right when there are thousands, and at 32 it stages 128 rows
- * of A to use 32 of them AND leaves the down product's grid at ceil(320/64) = FIVE workgroups on
- * a 64-CU part. Forcing the 128-row tile on at decode roughly doubles the step at one sequence
- * and costs ~18% at eight -- which is what `kTileMinRows` protects against, and why simply
- * lowering that bound is not the fix.
+ * RT varies with rows: 128 suits thousands of rows, but at 32 it would stage 128 rows to use 32
+ * and leave the down product five workgroups on 64 CUs (the 128-row tile at decode roughly doubles
+ * the step at one sequence; kTileMinRows guards it).
  *
- * WHICH WAVE OWNS WHICH TILE FOLLOWS FROM RT. With 8 m-tiles there is one a wave and each wave
- * walks every n-tile, which is the 128-row form's mapping. With 2 m-tiles the same rule would idle
- * six waves, so the waves spread over N instead: WM = min(MT, waves) waves across the m-tiles and
- * WN = waves/WM across the n-tiles. RT 128 gives exactly the one-m-tile-a-wave mapping (WM 8,
- * WN 1).
+ * Wave mapping follows RT: WM = min(MT, waves) waves across the m-tiles and WN = waves/WM across
+ * the n-tiles. RT 128 gives one m-tile per wave (WM 8, WN 1).
  *
- * AND THE DOWN PRODUCT NEEDS THE K-SPLIT THAT THE UP PRODUCT DOES NOT. Its output is [rows, 320]
- * -- five 64-column tiles, one workgroup each -- while the up product's is [rows, 10240] and
- * already covers the part at 160. So the down product splits K over blockIdx.z, writes f32
- * partials, and a reduce pass sums them in ASCENDING z and applies the silu. The partial buffer
- * is ksplit * rows * lr floats, 655 KB at the decode band, and the reduce reads it once.
+ * Only the down product splits K: its output is [rows, 320], five 64-column tiles, while the up
+ * product's [rows, 10240] already fills the part. Split blocks write f32 partials over blockIdx.z
+ * (ksplit * rows * lr floats, 655 KB at the decode band) and a reduce pass sums them in ascending z
+ * and applies the silu.
  */
 constexpr int kTKSPLIT_WANT = 128;   // workgroups the down product aims to cover the part with
 
 /* ==================================================== d = silu(W_down @ N / hc), tiled
  *
- * C[RT rows, NT cols] over K = hc*n. The A tile is N, rebuilt from `h` as it is staged: the launch
- * refuses `n % kTKT`, so a K slice never straddles a stream and the scale index is one divide a
- * tile rather than one an element -- the same reason the per-row kernel walks streams outermost.
+ * C[RT rows, NT cols] over K = hc*n. The A tile is N, rebuilt from `h` while staged; the launch
+ * requires n % kTKT == 0, so a K slice never straddles a stream and the scale index is one divide
+ * per tile.
  *
- * `part` non-null is the split-K form: this block owns K in [z*kc, min(HN, (z+1)*kc)) and writes
- * its raw f32 accumulator; the silu and the /hc move to the reduce. With `part` null, z is 0, the
- * block owns all of K and the epilogue applies them itself.
+ * `part` non-null is the split-K form: the block owns K in [z*kc, min(HN, (z+1)*kc)) and writes its
+ * raw f32 accumulator; silu and /hc move to the reduce. With `part` null, z is 0 and the epilogue
+ * applies them.
  *
- * THE INJECT GAINS RIDE ALONG AS FOUR MORE COLUMNS. `inj[c] = 2 sigmoid(W_inj[c] . N / hc)` is a
- * dot of the SAME A matrix this GEMM already has staged, over the same K, and W_inj is [hc, HN] --
- * four more rows of a weight whose other 320 rows are W_down. Computed on its own it costs a whole
- * kernel -- a (1, rows) grid in which four of eight waves walk a 20 KiB row each, ~18 us a call at
- * eight sequences for 3.2 MB. Folded here it is 4/324 of a kernel that is already at bandwidth,
- * and the norm kernel is left with one pass over `h`. `ncol` is lr + hc when there are gains and
- * lr when there are not; columns at or past lr read injw and take the sigmoid epilogue. */
+ * The inject gains ride along as hc more columns: `inj[c] = 2 sigmoid(W_inj[c] . N / hc)` uses the
+ * same staged A, and W_inj [hc, HN] is just more weight rows (a separate kernel would cost ~18 us
+ * at eight sequences). `ncol` is lr + hc with gains, lr without; columns at or past lr read injw
+ * and take the sigmoid epilogue. */
 template <int RT, int NT, bool F8>
 __global__ __launch_bounds__(kThreads)
 void hc_down_tiled_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
@@ -1704,9 +1446,8 @@ void hc_down_tiled_kernel(const unsigned short* __restrict__ h, const float* __r
     }
 }
 
-/* The split-K reduce: ksplit partials summed in ASCENDING z -- a fixed function of the shape, so
- * the result is reproducible -- then the epilogue the tiled form would have applied, which is the
- * silu for a W_down column and the doubled sigmoid for an inject column. */
+/* The split-K reduce: partials summed in ascending z (reproducible), then the epilogue: silu for a
+ * W_down column, doubled sigmoid for an inject column. */
 __global__ __launch_bounds__(kThreads)
 void hc_down_reduce_kernel(const float* __restrict__ part, unsigned short* __restrict__ dout,
                            unsigned short* __restrict__ inj, long rows, long lr, long ncol,
@@ -1714,11 +1455,8 @@ void hc_down_reduce_kernel(const float* __restrict__ part, unsigned short* __res
     const long i   = (long)blockIdx.x * kThreads + threadIdx.x;
     const long tot = rows * ncol;
     if (i >= tot) return;
-    /* EIGHT LOADS BEFORE THE ADDS, which is the whole performance of this kernel and none of its
-     * arithmetic: written as one `s +=` an iteration each load sits behind the previous add, and
-     * a 23-way split is a 23-deep dependent chain of DRAM latency on a 41-workgroup grid. The
-     * batching does not touch the ORDER of the adds, so the answer is the same bytes.
-     * gemm_fp8a8's splitk_reduce_kernel says the same thing at more length. */
+    /* Eight loads before the adds: with one `s +=` per iteration a deep split becomes a dependent
+     * chain of DRAM latency. The add order is unchanged (as in gemm_fp8a8's splitk_reduce_kernel). */
     float s = 0.0f;
     int   z = 0;
     for (; z + 8 <= ksplit; z += 8) {
@@ -1734,42 +1472,30 @@ void hc_down_reduce_kernel(const float* __restrict__ part, unsigned short* __res
     else          inj[r * irow + (col - lr)] = f2bf(2.0f * sigmoidf_(s * inv_hc));
 }
 
-/* THE PREFILL TILE: its rows, the down product's columns a workgroup and the up product's
- * channels a workgroup. 112 columns is three tiles over 320 + 4, the fewest that hold a
- * 128-row A tile and the B tile in LDS twice a CU; measured against 64 and 128 at 129 to 4096
- * rows, it is the fastest at every one. */
+/* The prefill tile: rows, down-product columns per workgroup and up-product channels per
+ * workgroup. 112 columns is three tiles over 320 + 4, the fewest that fit the 128-row A tile and
+ * the B tile in LDS twice per CU; faster than 64 and 128 at 129 to 4096 rows. */
 constexpr int kWideRT = 128, kWideNT = 112, kWideCH = 16;
 
-/* THE PREFILL TILE'S FORM, pinned for a test: 0 is the launcher's rule, 1 the decode tiles'
- * kernels at RT 128 (hc_down_tiled, then hc_up_tiled into `ubuf` and hc_mix), 2 the wide kernels
- * (which then refuse a shape they are not built for), 3 the PF2 form (hc_pf2_launch; refused
- * likewise, and also at a band under kPf2MinRows, whose `u` is not sized for its weight
- * planes). */
+/* The prefill form, pinnable for tests: 0 the launcher's rule, 1 the decode tiles' kernels at
+ * RT 128 (hc_down_tiled, then hc_up_tiled into `ubuf` and hc_mix), 2 the wide kernels (refusing
+ * shapes they are not built for), 3 the PF2 form (hc_pf2_launch; refused likewise, and below
+ * kPf2MinRows, where `u` is not sized for its weight planes). */
 static int g_hc_prefill_form = 0;
 
 /* ==================================================== d = silu(W_down @ N / hc) at the PREFILL tile
  *
- * hc_down_tiled_kernel at RT 128 pays three things at a 2048-row chunk that its decode tiles do not
- * notice:
+ * hc_down_tiled_kernel at RT 128 has three costs at a 2048-row chunk: a sixth 64-column tile
+ * rebuilds the whole A tile and runs every WMMA for four inject columns; every column tile rebuilds
+ * the same N; and slice loads never overlap the WMMAs.
  *
- *   THE INJECT TILE. 320 + 4 columns in 64-column tiles is six tiles, and the sixth stages the
- *   whole A tile -- N rebuilt from h, the costliest part of a slice -- and runs every WMMA of the
- *   tile for four real columns.
- *   THE A TILE ONCE PER COLUMN TILE. Every column tile rebuilds the same N; the fewer the tiles,
- *   the fewer the rebuilds.
- *   NO PREFETCH. A slice's global loads are issued after the previous slice's WMMAs and waited on
- *   before the next, so a workgroup's loads and its matrix work never overlap.
+ * This kernel takes NT columns per workgroup, skips n-tiles past the last real column, and issues
+ * the next slice's global loads into registers before this slice's WMMAs. A thread stages one
+ * fixed 8-wide column of four A rows, so the norm weight is loaded once per slice.
  *
- * So the prefill tile has its own kernel: NT columns a workgroup, the n-tiles past the last real
- * column skipped, and the next slice's global loads issued into registers before this slice's
- * WMMAs. A thread stages one fixed 8-wide column of four A rows, so the norm weight is loaded once
- * a slice rather than once a row.
- *
- * THE ARITHMETIC IS hc_down_tiled_kernel's: the same N, the same decode of W_down, the same 16x16
- * tiles over the same K slices in the same order, and the launch keeps hc_down_kchunk's split --
- * so it is the same bytes, which r4d_selftest checks. hc_read at Qwen3.8-Flash-Next's shape, with
- * hc_up_mix_wide_kernel, against the decode tiles' kernels at RT 128: 767 us a call against 1134
- * at 2048 rows, 396 against 560 at 1024, 106 against 128 at 129. */
+ * Arithmetic and bytes match hc_down_tiled_kernel (same N, W_down decode, 16x16 tiles, K order and
+ * hc_down_kchunk split; r4d_selftest checks). With hc_up_mix_wide_kernel, hc_read at
+ * Qwen3.8-Flash-Next's shape takes 767 us against 1134 at 2048 rows. */
 template <int NT, bool F8>
 __global__ __launch_bounds__(kThreads)
 void hc_down_wide_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
@@ -1785,11 +1511,10 @@ void hc_down_wide_kernel(const unsigned short* __restrict__ h, const float* __re
     constexpr int kRS = kThreads / kKV;                        /* rows between a thread's A rows */
     constexpr int kAV = RT / kRS;
     constexpr int kBV = (NT * kKV + kThreads - 1) / kThreads;
-    /* THE WAVES TILE THE BLOCK TWO WAYS, four over the rows and two over the columns, each holding
-     * two m-tiles and up to four n-tiles. One m-tile a wave across all seven n-tiles read eight
-     * fragments out of LDS for seven WMMA; two by four read six for eight, and the block's LDS
-     * reads a k step fall from 64 fragments to 44. The column halves are four n-tiles and three,
-     * and a wave's half is `wave / kDWM`, so waves w and w + 4 -- one of each -- share a SIMD. */
+    /* Waves tile the block 4 (rows) x 2 (columns), each holding two m-tiles and up to four
+     * n-tiles: six LDS fragment reads per eight WMMA instead of eight per seven, so the block's
+     * reads per k step fall from 64 fragments to 44. A wave's column half is `wave / kDWM`, so
+     * waves w and w + 4 (one of each half) share a SIMD. */
     constexpr int kDWM = 4, kDTM = RT / 16 / kDWM, kDTN = (NT16 + 1) / 2;
     static_assert(kDWM * 2 == kWaves && kDTM * 16 * kDWM == RT && RT % kRS == 0,
                   "the waves cover the tile, whole A rows a pass");
@@ -1927,9 +1652,9 @@ void hc_down_wide_kernel(const unsigned short* __restrict__ h, const float* __re
     }
 }
 
-/* Eight elements of row j of W_up at k, as the bf16 a tiled kernel stages: the stored bf16 itself,
- * or eight E4M3 codes decoded against their group's scale. A group is a multiple of sixteen codes,
- * so eight from a multiple of eight never straddle two. */
+/* Eight elements of row j of W_up at k as staged bf16: the stored bf16, or eight E4M3 codes decoded
+ * with their group's scale. A group is a multiple of sixteen codes, so eight aligned codes never
+ * straddle two groups. */
 template <bool F8>
 __device__ __forceinline__ uint4 hc_up_stage(const void* __restrict__ upv, long uld, long j, long k,
                                             long lr) {
@@ -1943,8 +1668,8 @@ __device__ __forceinline__ uint4 hc_up_stage(const void* __restrict__ upv, long 
 
 /* ==================================================== u = sigmoid(W_up @ d), tiled
  *
- * C[RT rows, NT channels] over K = lowrank. Same tiling; the A tile is `d` straight out of scratch
- * and the K loop is five passes rather than 160. No K-split: hn/NT is already 160 workgroups. */
+ * C[RT rows, NT channels] over K = lowrank. Same tiling; the A tile is `d` straight from scratch
+ * and the K loop is five passes. No K-split: hn/NT is already 160 workgroups. */
 template <int RT, int NT, bool F8>
 __global__ __launch_bounds__(kThreads)
 void hc_up_tiled_kernel(const void* __restrict__ upv, long uld,
@@ -2020,27 +1745,18 @@ void hc_up_tiled_kernel(const void* __restrict__ upv, long uld,
     }
 }
 
-
-/* ==================================== hc_read, kernels B and B2 in ONE launch, tiled
+/* ==================================== hc_read, kernels B and B2 in one launch, tiled
  *
- * `x = mean_c( u[c] * N[c] )` with `u` NEVER MATERIALISED -- which is what this file's header says
- * kernel B is for, and what a tile over the FLATTENED channel index cannot give. A tile of 64
- * consecutive `j` is 64 channels of ONE sub-stream, so the four terms of a channel's mean live in
- * four different workgroups and `ubuf` has to carry them; a tile of (stream, channel) PAIRS puts
- * all hc of a channel in the same workgroup and the mean is local.
+ * `x = mean_c( u[c] * N[c] )` without materialising `u`. The tile is over (stream, channel) pairs,
+ * so all hc terms of a channel's mean are in one workgroup (see the file header).
  *
- * WHAT IT COSTS AND WHAT IT BUYS. The B tile stops being 64 contiguous rows of W_up and becomes hc
- * groups of NT/hc -- same bytes, four runs of 10 KiB instead of one of 40 -- and the fp8 twin
- * cannot fall out of one workgroup, because 128 contiguous channels is one scale group and a
- * workgroup owns NT/hc = 16 of them. That is the arrival counter below: the last of the eight
- * workgroups covering a group quantises it, reading back the 128 bf16 it and its siblings just
- * wrote. The tail is 8 KiB on the same 20 workgroups `hc_mix` would use, NOT on one, which is why
- * it costs less than the launch it saves.
+ * The B tile becomes hc runs of NT/hc rows of W_up (same bytes), and a workgroup owns only
+ * NT/hc = 16 channels of a 128-wide scale group, so an arrival counter lets the last of the eight
+ * covering workgroups quantise the group from the bf16 the others wrote. That tail runs on the
+ * same 20 workgroups hc_mix would use, so it costs less than the launch it saves.
  *
- * BIT-IDENTICAL TO THE UNFUSED PAIR, and every rounding is placed to keep it that way: `u` is
- * narrowed to bf16 before the multiply because hc_mix reads it back out of a bf16 `ubuf`, `N` is
- * narrowed by `nbf` in the same place, both go through LDS as bf16 so the reducer sees exactly the
- * bytes the unfused form loads, and the sum over c runs ASCENDING. */
+ * Bit-identical to the unfused pair: `u` and `N` are narrowed to bf16 where hc_mix would read them
+ * back, both pass through LDS as bf16, and the sum over c ascends. */
 template <int RT, int NT, bool F8, bool I8 = false>
 __global__ __launch_bounds__(kThreads)
 void hc_up_mix_tiled_kernel(const void* __restrict__ upv, long uld,
@@ -2108,11 +1824,9 @@ void hc_up_mix_tiled_kernel(const void* __restrict__ upv, long uld,
             }
         }
     }
-    /* N, IN A COALESCED PASS OF ITS OWN. The (stream, channel) tile is what makes the mean local
-     * and it is also what would wreck this read: in the wmma epilogue consecutive lanes hold
-     * consecutive `t`, which is consecutive SUB-STREAMS, so `h[r * hrow + j]` walks n elements a
-     * lane and every load is its own transaction. Here consecutive threads take consecutive
-     * channels of one sub-stream, exactly as `hc_mix` did. */
+    /* N in a separate coalesced pass: in the WMMA epilogue consecutive lanes hold consecutive
+     * sub-streams, so reading `h` there would stride n elements per lane. Here consecutive threads
+     * take consecutive channels of one sub-stream, as in hc_mix. */
     for (int idx = tid; idx < RT * NT; idx += kThreads) {
         const int  rl = idx / NT, rem = idx - rl * NT;
         const int  c  = rem / ipb, ii = rem - c * ipb;
@@ -2123,7 +1837,7 @@ void hc_up_mix_tiled_kernel(const void* __restrict__ upv, long uld,
             f2bf(bf2f(h[r * hrow + j]) * scalein[r * kHcMax + c] * (w[j] + wadd));
     }
 
-    /* u out of the accumulators, where it is. */
+    /* u from the accumulators. */
     const int e0 = 8 * (lane >> 4), nn = lane & 15;
 #pragma unroll
     for (int im = 0; im < AM; ++im) {
@@ -2157,7 +1871,7 @@ void hc_up_mix_tiled_kernel(const void* __restrict__ upv, long uld,
     }
     if (!q || !ctr) return;
 
-    /* The group's last workgroup quantises it. `nb` is how many cover one 128-channel group. */
+    /* The group's last workgroup quantises it; `nb` workgroups cover one 128-channel group. */
     const int nb = kUpTB / ipb;
     __threadfence();
     __syncthreads();
@@ -2172,8 +1886,8 @@ void hc_up_mix_tiled_kernel(const void* __restrict__ upv, long uld,
         __hip_atomic_store(&ctr[slot], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     __threadfence();
 
-    /* The rotated twin wants a whole wave a row, where the codes below take kThreads / RT threads
-     * a row -- so it walks the tile's rows a wave at a time, before those threads split off. */
+    /* The rotated codes need a whole wave per row, while the codes below use kThreads / RT threads
+     * per row, so the rotation walks the tile's rows a wave at a time first. */
     if (rq) {
         const long gb = (i0 / kUpTB) * kUpTB;
         for (int rl = wave; rl < RT; rl += kWaves) {
@@ -2207,36 +1921,25 @@ void hc_up_mix_tiled_kernel(const void* __restrict__ upv, long uld,
     }
 }
 
-/* ==================================== hc_read, kernels B and B2 in ONE launch at the PREFILL tile
+/* ==================================== hc_read, kernels B and B2 in one launch at the prefill tile
  *
- * AT THE 128-ROW TILE THE PAIRED FORM DOES NOT FIT. hc_up_mix_tiled_kernel keeps `u` out of memory
- * at the decode tiles, but at RT 128 its two staging planes on top of the A tile are 58 KiB of LDS
- * and one workgroup a CU, and the unfused pair -- hc_up_tiled into `ubuf`, hc_mix reading it back
- * -- costs 42 MB written and 42 MB read again a call at a 2048-row chunk, the largest stream the op
- * moves, and a third launch.
+ * At RT 128 hc_up_mix_tiled_kernel's two staging planes plus the A tile take 58 KiB of LDS (one
+ * workgroup per CU), and the unfused pair moves 42 MB through `ubuf` each way per call at a
+ * 2048-row chunk, plus a third launch.
  *
- * NEITHER PLANE IS NEEDED when a LANE holds every sub-stream of a channel. A WMMA accumulator gives
+ * Neither plane is needed when a lane holds every sub-stream of a channel: a WMMA accumulator gives
  * lane `l` column `l & 15` of each 16-column n-tile, so with n-tile `c` holding sub-stream c of the
- * workgroup's sixteen channels, the hc terms of a channel's mean are the same lane's `acc[c]` and
- * the mean is register-local. N is staged once, coalesced, into the A tile's LDS after the K loop is
- * done with it. The workgroup's LDS is the unfused up product's.
+ * workgroup's sixteen channels, a channel's hc terms are one lane's `acc[c]`. N is staged once,
+ * coalesced, into the A tile's LDS after the K loop. LDS use equals the unfused up product's.
  *
- * BIT-IDENTICAL TO THE UNFUSED PAIR: `u` is narrowed to bf16 before the multiply as hc_mix reads it
- * out of `ubuf`, N the same way, and the sum over c runs ascending in the same `a += u * N` form. A
- * 16x16 output tile is computed the same way whichever workgroup computes it.
+ * Bit-identical to the unfused pair: `u` and N are narrowed to bf16 as hc_mix reads them, and the
+ * sum over c ascends in the same `a += u * N` form. fp8 codes come via the arrival counter, as in
+ * hc_up_mix_tiled_kernel.
  *
- * THE FP8 TWIN is the arrival counter's, as in hc_up_mix_tiled_kernel: a workgroup owns 16 of a
- * scale group's 128 channels, and the last of the eight covering a group quantises it for the
- * tile's rows.
- *
- * RT IS THE ROW TILE, MW = RT / 128 m-tiles a wave: 128 here (one m-tile a wave), 256 in the PF2
- * form over the mix_up its prologue decoded (two, so each B fragment read out of LDS feeds two
- * WMMAs). The m-tile loops are the only difference, and at MW 1 each runs once over the same
- * expressions in the same order as a body without them. The accumulators are ONE FLAT ARRAY,
- * acc[mi * HC + c], because at MW 1 that is acc[c] exactly: an [MW][HC] array is the same values
- * but reaches the register allocator in another shape, and gfx1201's code for the 128-row form then
- * moves its zeros in another order. The rows keep their place in a 16-row tile at either RT (a
- * tile starts at a multiple of RT), so both are the same bytes. */
+ * MW = RT / 128 m-tiles per wave: 128 here (one), 256 in the PF2 form over its decoded mix_up (two,
+ * so each B fragment read feeds two WMMAs). The accumulators are one flat array, acc[mi * HC + c],
+ * because an [MW][HC] array changes gfx1201's register allocation for the 128-row form. Rows keep
+ * their place in a 16-row tile at either RT, so both produce the same bytes. */
 template <int HC, bool F8, int RT = kWideRT>
 __global__ __launch_bounds__(kThreads)
 void hc_up_mix_wide_kernel(const void* __restrict__ upv, long uld,
@@ -2257,15 +1960,13 @@ void hc_up_mix_wide_kernel(const void* __restrict__ upv, long uld,
     const long i0 = (long)blockIdx.x * CH;
     if (r0 >= rows) return;
 
-    /* EVERY GLOBAL LOAD IS ISSUED A STEP BEFORE IT IS NEEDED. The mix's `h` -- 42 MB a call at a
-     * 2048-row chunk, the op's largest read, and needed only after the product -- is loaded into
-     * registers before the K loop, so its latency runs under the matrix work instead of after it;
-     * and the loop holds the next slice's A rows and weight codes in registers while this slice's
-     * WMMA runs, as hc_down_wide_kernel does. Only WHEN a load is issued moves: the same bytes reach
-     * the same LDS and the same arithmetic, so the output is the same bytes.
+    /* Every global load is issued a step early. The mix's `h` (42 MB per call at a 2048-row chunk,
+     * needed only after the product) is loaded into registers before the K loop so its latency
+     * hides under the matrix work, and the loop holds the next slice's A rows and weight codes in
+     * registers during this slice's WMMA, as in hc_down_wide_kernel. Output is unchanged.
      *
      * A thread's slots are fixed: A and B rows `tid / 8 + 32 i` at column `(tid % 8) * 8` of a
-     * slice, and for N the (row, sub-stream, eight channels) the idx `tid + 256 i` names. */
+     * slice, and for N the (row, sub-stream, eight channels) that idx `tid + 256 i` names. */
     constexpr int kKV = kTKT / 8;                               /* 16-byte vectors a staged row */
     constexpr int kRS = kThreads / kKV;                         /* rows between a thread's rows */
     constexpr int kAV = RT / kRS, kBV = NT / kRS;
@@ -2342,9 +2043,8 @@ void hc_up_mix_wide_kernel(const void* __restrict__ upv, long uld,
         }
         __syncthreads();
         if (k0 + kTKT < lr) fetch(k0 + kTKT);
-        /* A's fragments are read once a k step and taken to every n-tile, and B's to every m-tile.
-         * Each accumulator still sees its k steps in ascending order, which is all its bytes
-         * depend on. */
+        /* A's fragments are read once per k step and used for every n-tile, B's for every m-tile.
+         * Each accumulator still sees its k steps in ascending order. */
 #pragma unroll
         for (int ks = 0; ks < kTKT / 16; ++ks) {
             v8bf af[MW];
@@ -2395,15 +2095,11 @@ void hc_up_mix_wide_kernel(const void* __restrict__ upv, long uld,
         }
 }
 
-/* THE FP8 CODES OF `x` AT THE PREFILL TILE, and the rotated twin: one wave a (row, 128-channel
- * scale group), after hc_up_mix_wide_kernel. That kernel's workgroup owns sixteen of a group's
- * channels, so quantising inside it means whichever of its eight workgroups arrives last, behind
- * an arrival counter and a device-scope fence in every one of them, walking the group's 128 rows
- * by itself, a row at a time -- 82 of that kernel's 356 us at a 2048-row chunk. This launch is a
- * stream over `x` at memory speed.
- *
- * The same bytes: the amax is an fmaxf reduction, exact in any order, and every code is the same
- * conversion of the same bf16 value by the same scale; the rotated twin is hc_rot_group itself. */
+/* fp8 codes of `x` at the prefill tile, plus the rotated codes: one wave per (row, 128-channel
+ * scale group), after hc_up_mix_wide_kernel. Quantising inside that kernel would leave the last of
+ * eight workgroups walking the group's 128 rows alone behind a counter and fences (82 of its
+ * 356 us at a 2048-row chunk); this launch streams over `x` at memory speed. Same bytes: the amax
+ * is exact in any order and each code converts the same bf16 by the same scale. */
 template <bool I8 = false>
 __global__ __launch_bounds__(kThreads)
 void hc_quant_rows_kernel(const unsigned short* __restrict__ x, unsigned char* __restrict__ q,
@@ -2433,10 +2129,9 @@ void hc_quant_rows_kernel(const unsigned short* __restrict__ x, unsigned char* _
     if (rq) hc_rot_group(t, lane, rq + r * rqrow + base, rqs + r * rsrow + g);
 }
 
-/* The mix finisher's arrival counters, one block a STREAM and not a device -- the same rule
- * gemm_fp8a8's split_ctr states, for the same reason: a self-resetting counter is sound only
- * while two launches of its kernel cannot overlap, and one stream is what guarantees that.
- * Failure to allocate is not an error; the caller runs the unfused pair instead. */
+/* The mix finisher's arrival counters, one block per stream (as gemm_fp8a8's split_ctr): a
+ * self-resetting counter is sound only while two launches of its kernel cannot overlap, which one
+ * stream guarantees. Allocation failure is not an error; the caller runs the unfused pair. */
 constexpr unsigned kMaxMixCtr = 2048;
 
 unsigned int* hc_mix_ctr(RadStream s) {
@@ -2488,8 +2183,8 @@ static inline void hc_up_mix_tiled_launch(int rt, bool f8, bool i8, const void* 
 #undef HC_UM_CASE3
 }
 
-/* The codes of `x` and the rotated twin, after a mix that writes `x` alone: hc_quant_rows_kernel
- * over every (row, scale group). Nothing to do without codes. */
+/* The codes of `x` and the rotated codes, after a mix that writes only `x`: hc_quant_rows_kernel
+ * over every (row, scale group). No-op without codes. */
 static inline void hc_quant_rows_launch(bool i8, const unsigned short* x, unsigned char* q,
                                         float* qs, unsigned char* rq, float* rqs, long rows,
                                         long n, long xrow, long qrow, long srow, long rqrow,
@@ -2523,72 +2218,57 @@ static inline void hc_up_mix_wide_launch(bool f8, bool i8, const void* up, long 
     hc_quant_rows_launch(i8, x, q, qs, rq, rqs, rows, n, xrow, qrow, srow, rqrow, rsrow, s);
 }
 
-/* ==================================================== hc_read, the SECOND PREFILL FORM (PF2)
+/* ==================================================== hc_read, second prefill form (PF2)
  *
- * THE LAUNCHER'S RULE AT A PREFILL CHUNK of kPf2MinRows rows or more whose shape it is built for --
- * hc 4, n a multiple of 256, at most kPf2MaxNT n-tiles of columns -- with either dtype of mixing
- * matrix; pinned form 3 takes it at any 128-row tile of such a band for a test. Every other
- * prefill call is the wide form's. The same five steps as the wide form and the same bytes out of
- * every one of them -- what moves is which workgroup does which part of the work, and how often
- * (711 -> 611 us a call at a 2048-row chunk on gfx1201, E4M3 matrices):
+ * Used for prefill chunks of at least kPf2MinRows rows whose shape fits (hc 4, n a multiple of
+ * 256, at most kPf2MaxNT column n-tiles), with either mixing-matrix dtype; pinned form 3 forces it
+ * at any 128-row tile of such a band. Other prefill calls use the wide form. Same steps and bytes
+ * as the wide form, with the work redistributed (711 -> 611 us per call at a 2048-row chunk on
+ * gfx1201, E4M3 matrices):
  *
- *   THE A OPERAND OF THE DOWN PRODUCT IS BUILT ONCE. hc_down_wide_kernel owns 112 columns, so the
- *   three column tiles of a row tile each rebuild N from `h` -- the norm weight, the scale and the
- *   rounding to bf16, three times for every element of a 42 MB stream. A PF2 workgroup owns 64
- *   rows and EVERY column, so `h` is read and N is built exactly once a call.
- *   THE WEIGHT IS DECODED ONCE. Every row tile of the wide form decodes the E4M3 rows of both
- *   mixing matrices it stages -- sixteen decodes of each matrix a call at a 2048-row chunk. A PF2
- *   call decodes each matrix once, in its prologue, into the `u` scratch, which no fused form
- *   uses. At bf16 the prologue copies mix_down and mix_up is read where it is stored.
- *   THE DOWN PRODUCT'S B OPERAND SKIPS LDS. With every column in one workgroup, each 16-column
- *   n-tile belongs to exactly one wave, so nothing is shared and nothing needs staging: the
- *   prologue writes the decoded matrix in WMMA FRAGMENT ORDER and a wave's fragment is one
- *   512-byte load. Only N goes through LDS, double-buffered, one barrier a slice.
- *   THE UP PRODUCT'S TILE IS 256 ROWS: hc_up_mix_wide_kernel at RT 256 over a bf16 mix_up, two
- *   m-tiles a wave. Each B fragment read out of LDS feeds two WMMAs instead of one, and the weight
- *   is staged and read half as often.
+ *   N is built once: a PF2 workgroup owns 64 rows and every column, where hc_down_wide_kernel's
+ *   three column tiles each rebuild N from `h`.
+ *   Weights are decoded once, in the prologue, into the `u` scratch (no fused form uses it),
+ *   instead of by every row tile. At bf16 the prologue copies mix_down and mix_up is read in place.
+ *   The down product's B skips LDS: each 16-column n-tile belongs to one wave, so the prologue
+ *   writes the decoded matrix in WMMA fragment order and a fragment is one 512-byte load. Only N
+ *   goes through LDS, double-buffered, one barrier per slice.
+ *   The up product uses a 256-row tile (hc_up_mix_wide_kernel at RT 256, two m-tiles per wave),
+ *   so each B fragment read feeds two WMMAs.
  *
- * WHAT KEEPS IT THE SAME BYTES. Every output element is the same chain of 16x16x16 WMMAs over
- * the same fragments in the same order: N is the same expression, the decoded weight is the bf16
- * the wide form stages into LDS, the fragment layout is r4d_gdn_wmma.h's, rows and columns keep
- * their place inside a 16x16 tile, and the down product keeps the K-split of hc_down_kchunk at
- * the 128-row tile, partial for partial, summed by the same reduce. The norm scales are
- * hc_norm_scale_kernel's sums in hc_norm_scale_kernel's order (see the prologue). r4d_selftest
- * compares all three forms byte for byte, at both dtypes.
+ * Same bytes: every output element is the same chain of 16x16x16 WMMAs over the same fragments in
+ * the same order (layout from r4d_gdn_wmma.h), the down product keeps hc_down_kchunk's K-split at
+ * the 128-row tile with the same reduce, and the norm scales match hc_norm_scale_kernel's order.
+ * r4d_selftest compares all three forms byte for byte at both dtypes.
  *
- * THE PLANES' ROOM IS RESERVED, NOT HOPED FOR. r4d_rad_hc_read_scratch sizes `u` for both planes
- * at every band that reaches kPf2MinRows (hc_u_rows), so the rule never meets a `u` too small. */
+ * r4d_rad_hc_read_scratch sizes `u` for both planes at every band reaching kPf2MinRows
+ * (hc_u_rows). */
 constexpr int  kPf2RT      = 64;                 // down product: rows a workgroup, four m-tiles
 constexpr int  kPf2NW      = 3;                  // down product: n-tiles a wave, at most
 constexpr int  kPf2MaxNT   = kWaves * kPf2NW;    // ...so ceil((lr + hc) / 16) <= 24
 constexpr int  kPf2UpRT    = 256;                // up product: rows a workgroup, two m-tiles a wave
 constexpr long kPf2MinRows = 512;                // the rule's floor, and where `u` holds the planes
 
-/* THE PROLOGUE: the per-stream norm scales and the two weight planes, in ONE launch, because
- * the down product needs all three and none of them needs another.
+/* The prologue: per-stream norm scales and the two weight planes in one launch, since the down
+ * product needs all three and none depends on another.
  *
- * Blocks [0, nnb) are the scales, one WAVE a (row, stream). hc_norm_scale_kernel gives a
- * (row, stream) a workgroup: thread t sums the squares of elements t, t + 256, ... in ascending
- * order, each wave folds its 32 sums with r4d_wave_sum, and thread 0 adds the eight wave totals
- * in ascending order. Here lane L loads elements 8L .. 8L + 7 of each 256-element chunk -- so it
- * holds threads 8L .. 8L + 7's running sums, each over the same elements in the same order --
- * and a wave-private slot of LDS turns them back into thread order, so that lane L of the k-th
- * r4d_wave_sum holds thread 32k + L's sum, as wave k's lane L did. Same squares, same sums, same
- * butterfly, same eight adds: the same scale. A wave's LDS operations complete in order and no
- * other wave touches its slot, so the round trip needs no barrier (wave_dot_lds relies on the
- * same rule).
+ * Blocks [0, nnb) compute the scales, one wave per (row, stream), matching hc_norm_scale_kernel
+ * (a workgroup per (row, stream): thread t sums elements t, t + 256, ... ascending, waves fold with
+ * r4d_wave_sum, thread 0 adds the eight wave totals). Here lane L loads elements 8L .. 8L + 7 of
+ * each 256-element chunk, holding threads 8L .. 8L + 7's running sums, and a wave-private LDS slot
+ * puts them back in thread order so lane L of the k-th r4d_wave_sum holds thread 32k + L's sum.
+ * Same sums, same scale. No barrier: a wave's LDS operations complete in order.
  *
- * Blocks [nnb, ...) write the planes, a 16-byte vector an item:
+ * Blocks [nnb, ...) write the planes, a 16-byte vector per item:
  *
- *   `plane`, the down product's B in FRAGMENT ORDER: [ntt][HN/16][32 lanes][8 bf16]. Lane l of
- *   the fragment for n-tile nt and k-step g holds column nt*16 + (l & 15) at k = 16g + 4(l >> 4)
- *   + {0..3, 8..11} -- what frag() reads out of an LDS tile, in the order it reads it. Columns
- *   below lr are mix_down decoded (or copied, at bf16), the next hc the inject weights, and the
- *   pad up to the n-tile clamps to the last real column, as the wide form's staging does.
+ *   `plane`, the down product's B in fragment order: [ntt][HN/16][32 lanes][8 bf16]. Lane l of the
+ *   fragment for n-tile nt and k-step g holds column nt*16 + (l & 15) at k = 16g + 4(l >> 4)
+ *   + {0..3, 8..11}, as frag() reads an LDS tile. Columns below lr are mix_down (decoded, or
+ *   copied at bf16), the next hc the inject weights, and the pad clamps to the last real column,
+ *   as the wide form's staging does.
  *   `udec`, mix_up decoded to plain [HN][lr] bf16 (E4M3 only; a bf16 mix_up is read in place).
  *
- * Every decoded element is f2bf(code * scale) of the same code and the same group scale the wide
- * form's staging multiplies -- the same bf16. */
+ * Every decoded element is f2bf(code * scale) as in the wide form's staging. */
 __global__ __launch_bounds__(kThreads)
 void hc_pf2_prep_kernel(const unsigned short* __restrict__ h, float* __restrict__ scaleout,
                         long rows, long n, int hc, long hrow, float eps, long nnb,
@@ -2606,8 +2286,7 @@ void hc_pf2_prep_kernel(const unsigned short* __restrict__ h, float* __restrict_
         const long r = p / hc;
         const int  c = (int)(p - r * hc);
         const unsigned short* hp = h + r * hrow + (long)c * n;
-        /* Five chunks' loads in flight before the first is summed; the chunks are still summed
-         * in ascending order, so a thread's running sum is the same sequence of adds. */
+        /* Five chunks' loads in flight before the first is summed; summation order is unchanged. */
         constexpr int kU = 5;
         float acc[8];
 #pragma unroll
@@ -2680,18 +2359,16 @@ void hc_pf2_prep_kernel(const unsigned short* __restrict__ h, float* __restrict_
 }
 
 /* d = silu(W_down @ N / hc) and the inject gains, PF2: a workgroup owns 64 rows, every column and
- * one K chunk -- hc_down_kchunk's at the 128-row tile, so the partials are the wide form's.
+ * one K chunk (hc_down_kchunk's at the 128-row tile, so partials match the wide form's).
  *
  * Wave w owns n-tiles w, w + 8 and w + 16 (those below ntt) across all four m-tiles: twelve
- * accumulators, a fragment of B taken to four WMMAs and a fragment of A to three. B comes straight
- * from `plane`, a slice ahead: the loads of the next slice's fragment for a k-step are issued as
- * soon as the WMMAs of this slice's have read it, so they have a whole slice to land. N is built
- * from `h` into one of two LDS tiles while the other is read, one barrier a slice.
+ * accumulators, each B fragment feeding four WMMAs and each A fragment three. B comes straight
+ * from `plane` a slice ahead: the next slice's fragment for a k-step is loaded as soon as this
+ * slice's has been consumed. N is built from `h` into one of two LDS tiles while the other is
+ * read, one barrier per slice.
  *
- * Each accumulator sees the K steps of its chunk in ascending order from zero, its fragments are
- * the ones the wide form's would be, and its element sits at the same place in its 16x16 tile:
- * the same partial, written to the same place, or the same epilogue applied when there is one
- * chunk. */
+ * Each accumulator sees its chunk's K steps in ascending order from zero with the wide form's
+ * fragments, so partials (or the one-chunk epilogue) match. */
 __global__ __launch_bounds__(kThreads)
 void hc_down_pf2_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
                         const uint4* __restrict__ plane, const float* __restrict__ scalein,
@@ -2707,8 +2384,7 @@ void hc_down_pf2_kernel(const unsigned short* __restrict__ h, const float* __res
     static_assert(RT % kRS == 0 && MT * 16 == RT, "whole A rows a pass");
     __shared__ unsigned short sA[2 * RT * kTAP];
 
-    /* `wave` through readfirstlane: the n-tile a wave skips is then a scalar branch around its
-     * WMMAs rather than an EXEC mask over them. */
+    /* `wave` via readfirstlane, so skipping an n-tile is a scalar branch rather than an EXEC mask. */
     const int  tid = threadIdx.x, lane = tid & (kWave - 1);
     const int  wave = __builtin_amdgcn_readfirstlane(tid / kWave);
     const long HN = (long)hc * n, KS = HN / 16;
@@ -2770,9 +2446,9 @@ void hc_down_pf2_kernel(const unsigned short* __restrict__ h, const float* __res
 #pragma unroll
         for (int i = 0; i < NW; ++i) acc[m][i] = (v8f){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
-    /* THE LOOP BODY HAS NO BRANCH ON THE SLICE. The last slice prefetches itself again and stages
-     * into the tile nobody reads next, which costs one slice of redundant loads a call and keeps
-     * every load's wait a straight-line count. */
+    /* No branch on the slice in the loop body: the last slice prefetches itself again into the
+     * unread tile, costing one redundant slice of loads per call but keeping every wait count
+     * straight-line. */
     fetchA(ka);
     stageA(sA);
     __syncthreads();
@@ -2820,48 +2496,38 @@ void hc_down_pf2_kernel(const unsigned short* __restrict__ h, const float* __res
     }
 }
 
-
-/* K per down-product workgroup: enough z-blocks that lr/kTNT * z covers the part, rounded to a
- * whole number of kTKT slices so a slice never straddles a sub-stream. Returns HN when one block
- * already covers K, which is the prefill form and takes the un-split epilogue. */
+/* K per down-product workgroup: enough z-blocks that lr/kTNT * z covers the part, rounded to whole
+ * kTKT slices so a slice never straddles a sub-stream. Returns HN when one block covers K (the
+ * prefill form, un-split epilogue). */
 
 /* ==================================================== mtp_enter, tiled
  *
- * THE PER-ROW FORM READS BOTH SQUARE MATRICES ONCE A ROW, and a draft round at eight concurrent
- * sequences has eight. Its grid is (n/kMtpOutTB, rows) and a workgroup owns 32 output channels of
- * ONE row, so the 26.2 MB of fc_h and fc_e is read `rows` times -- 210 MB a call at eight rows,
- * four times the cost of one. Same shape of problem as the gated residual's, and the same fix.
+ * The per-row form reads both square matrices (26.2 MB) once per row, 210 MB per call at eight
+ * concurrent sequences. As for the gated residual, the fix is a tiled GEMM.
  *
- * AS A GEMM IT IS TWO PRODUCTS SHARING ONE ACCUMULATOR. Number the output rows (r, k) -- one per
- * sub-stream of each token -- and
+ * It is two products sharing one accumulator. With output rows (r, k), one per sub-stream of each
+ * token,
  *
  *     x[(r,k)][i] = nh[(r,k)] . fc_h[i]  +  ne[r] . fc_e[i]
  *
- * is C[R, n] over K = n with R = rows*hc, where the second term's A operand is the same `ne[r]`
- * for all hc of a token's rows. So one tile, two A tiles, two B tiles, one accumulator: the fc_e
- * product is computed hc times instead of once, which costs WMMA slots that are idle anyway and
- * buys the weight being read ONCE.
+ * is C[R, n] over K = n with R = rows*hc; the second term's A operand `ne[r]` repeats for a token's
+ * hc rows. The fc_e product is computed hc times, using otherwise idle WMMA slots, so each weight
+ * is read once.
  *
- * THE NORM SCALES ARE RECOMPUTED PER BLOCK rather than published, because this op has no scratch
- * hook and adding one to the ABI for five floats a row is the wrong trade: `h` and `e` are 25 KiB
- * a row and stay in cache across the 40 blocks, against the 655 KiB of weight each block reads.
- * The reduction order is per output row here and per thread-stride there, so the scales differ in
- * their last bit from the per-row kernel's -- the same class of reassociation the tiled gated
- * residual already carries, on a draft head whose output is a proposal. */
-/* THE COLUMN TILE FOLLOWS THE ROW TILE. The product has no split over K -- its two products share
- * an accumulator, and splitting them would need a reduce launch and a scratch the op does not have
- * -- so the grid is n / NT workgroups a row tile, and each of them sums the squares of every row
- * of its tile before its first weight byte. A narrow tile buys workgroups for the weight stream
- * and pays for them in that prologue, once each; the prologue grows with the row tile. Measured
- * at this model's n = 2560, kbench, us a call:
+ * Norm scales are recomputed per block, since the op has no scratch hook: `h` and `e` (25 KiB per
+ * row) stay in cache against 655 KiB of weight per block. The reduction order differs from the
+ * per-row kernel's, so scales can differ in the last bit; acceptable for a draft head. */
+/* The column tile follows the row tile. There is no K-split (the two products share an
+ * accumulator, and a split would need a reduce launch and scratch), so the grid is n / NT
+ * workgroups per row tile, each summing squares for every row of its tile first. Narrow tiles add
+ * workgroups for the weight stream but repeat that prologue. At n = 2560, us per call:
  *
  *     columns   M=2   M=4   M=8   M=16   M=32
  *       16       68    70    72    124    280
  *       32       48    50    55     92    303
  *       64       60    63    69    103    189
  *
- * so 32 up to the 64-row tile and 64 at the 128-row one. Which workgroup computes a 16x16 output
- * tile changes nothing about how it is computed. */
+ * so 32 up to the 64-row tile and 64 at the 128-row one. The choice does not change any output. */
 constexpr int kMtpTNTNarrow = 32, kMtpTNTWide = 64;
 
 template <int RT, int NT, bool F8>
@@ -2890,21 +2556,15 @@ void mtp_enter_tiled_kernel(const unsigned short* __restrict__ h, const unsigned
     const long j0   = (long)blockIdx.x * NT;
     if (r0 >= R || j0 >= n) return;
 
-    /* ---- the scales, one output row a wave. `flat` sums the whole wide row instead of one
-     * sub-stream, which is the same partials added together.
+    /* ---- the scales, one output row per wave. `flat` sums the whole wide row (the same partials
+     * added together).
      *
-     * THE SUMS OF SQUARES ARE LATENCY CHAINS, AND UNHIDDEN THEY ARE THE KERNEL'S TIME. A lane's
-     * share of a row is 80 loads at this shape, each feeding an add; written as one load an
-     * iteration, every link waits out a full load latency, for every row of the tile, in every
-     * workgroup, before the first weight byte is used -- ~170 us a call at two, four and sixteen
-     * rows alike, where the weight stream is ~50. So a wave keeps its loads in flight: kSsRows rows
-     * at a time, and kSsPre of each row's loads issued before the first is summed.
+     * The sums of squares are latency chains (80 dependent loads per lane per row) and unhidden
+     * they dominated (~170 us per call against ~50 for the weight stream). So a wave keeps loads in
+     * flight: kSsRows rows at a time, kSsPre of each row's loads issued before the first is summed.
+     * The embedding's scale is per token, since a token's hc output rows share `e`.
      *
-     * AND THE EMBEDDING'S SCALE IS A TOKEN'S, NOT A ROW'S: the hc output rows of one token share
-     * `e`, so its sum is taken once a token of the tile rather than hc times.
-     *
-     * Bit-identical: each row is still summed by one wave, a lane still takes j = lane, lane + 32,
-     * ... ascending into one accumulator, and the wave reduction is the same. */
+     * Bit-identical: each row is summed by one wave, lane j = lane, lane + 32, ... ascending. */
     constexpr int kSsPre = 8, kSsRows = 4;
     auto sumsq = [&](const unsigned short* const* p, int nr, long len, float* out) {
         float acc[kSsRows];
@@ -2949,8 +2609,8 @@ void mtp_enter_tiled_kernel(const unsigned short* __restrict__ h, const unsigned
             for (int k = 0; k < nr; ++k)
                 s_rs[rb + k * kWaves] = __frsqrt_rn(ss[k] / (float)hlen + eps);
     }
-    /* The tile's tokens: those of its real rows, and `rows - 1` for the padding rows past R,
-     * which is the last real row's token -- so the tile's tokens are [t0, t1]. */
+    /* The tile's tokens [t0, t1]: those of its real rows; padding rows past R use `rows - 1`, the
+     * last real row's token. */
     const long t0 = r0 / hc;
     const long t1 = ((r0 + RT < R) ? (r0 + RT - 1) : (R - 1)) / hc;
     for (long tb = t0 + wave; tb <= t1; tb += kWaves * kSsRows) {
@@ -2976,13 +2636,11 @@ void mtp_enter_tiled_kernel(const unsigned short* __restrict__ h, const unsigned
 #pragma unroll
         for (int in = 0; in < AN; ++in) acc[im][in] = (v8f){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
-    /* THE NEXT K SLICE IS LOADED INTO REGISTERS WHILE THIS ONE COMPUTES. Staged straight through,
-     * every one of the n / kTKT slices exposes a global latency in full -- nothing else in the
-     * block is runnable while its loads are out, and at decode the grid is a few workgroups a CU.
-     * So a thread's share of slice k + 1 -- the raw `h`, `e` and norm-weight values of its A items
-     * and the weight rows of its B items -- is issued right after slice k is written to LDS, and
-     * waited for at the next write. Only WHEN a byte is loaded moves: the values written to LDS
-     * and every product are the ones the straight form computes. */
+    /* The next K slice is loaded into registers while this one computes; otherwise each of the
+     * n / kTKT slices exposes a full global latency, with few workgroups per CU at decode. A
+     * thread's share of slice k + 1 (raw `h`, `e` and norm-weight values for its A items, weight
+     * rows for its B items) is issued after slice k is written to LDS and awaited at the next
+     * write. Values are unchanged. */
     constexpr int kAI = (RT * (kTKT / 8) + kThreads - 1) / kThreads;
     constexpr int kBI = (NT * (kTKT / 8) + kThreads - 1) / kThreads;
     struct APre { uint4 h, e; float4 wh0, wh1, we0, we1; };
@@ -3012,10 +2670,9 @@ void mtp_enter_tiled_kernel(const unsigned short* __restrict__ h, const unsigned
             return o.v;
         }
     };
-    /* AN A ITEM'S ROWS ARE THE SAME EVERY K STEP: its token and sub-stream are a 64-bit division
-     * by `hc` and its remainder, worked out once here as element offsets. Left in the step, gfx12's
-     * compiler expands the division again every slice -- twenty times over at the 64-row tile and
-     * fifty at the 128-row one -- where LLVM 22 moved it out of the loop. The same addresses. */
+    /* An A item's rows are the same every K step: its token and sub-stream (a 64-bit division by
+     * `hc`) are computed once here as element offsets. Inside the step, gfx12's compiler would
+     * redo the division every slice. */
     uint32_t aoh[kAI], aoe[kAI], aow[kAI], ak8[kAI];
 #pragma unroll
     for (int a = 0; a < kAI; ++a) {
@@ -3109,8 +2766,8 @@ void mtp_enter_tiled_kernel(const unsigned short* __restrict__ h, const unsigned
             if (nt >= NT16) continue;
             const long j = j0 + nt * 16 + nn;
             if (j >= n) continue;
-            /* The eight rows are consecutive output rows: one division for the first, and the
-             * (token, sub-stream) pair stepped from there rather than divided out again a row. */
+            /* The eight rows are consecutive output rows: one division for the first, then the
+             * (token, sub-stream) pair is stepped. */
             const long Rq = r0 + mt * 16 + e0;
             long tq = Rq / hc, kq = Rq % hc;
 #pragma unroll
@@ -3123,35 +2780,28 @@ void mtp_enter_tiled_kernel(const unsigned short* __restrict__ h, const unsigned
 }
 /* ==================================================== mtp_enter from 32 tokens up
  *
- * THE TILED KERNEL ABOVE IS THE SHAPE FOR A FEW ROWS -- a draft round -- and past that it pays
- * three costs in proportion to the rows. It computes the embedding term `ne[r] . fc_e[i]` once for each
- * of a token's hc output rows, because the two products share its accumulator; every one of its
- * 40 column blocks sums the squares of its 128 rows again before its first weight byte; and each
- * of those blocks re-stages and re-normalises the same A rows. At 2048 tokens that is 6.2 ms a
- * chunk, ~22 TF/s of useful work.
+ * The tiled kernel above suits a draft round's few rows; beyond that its costs grow with rows: it
+ * computes the embedding term `ne[r] . fc_e[i]` once per output row, and each of its 40 column
+ * blocks re-sums squares and re-stages the same A rows (6.2 ms per 2048-token chunk).
  *
- * HERE THE TWO PRODUCTS ARE SEPARATE GEMMS. The scales are one pass, a wave a row
- * (mtp_prefill_scale_kernel). The embedding term is a [rows, n] GEMM over the tokens, kept in f32
- * in scratch; the stream term is the [rows * hc, n] GEMM, and its epilogue adds the token's
- * embedding term before the one rounding to bf16. Both are mtp_prefill_gemm_kernel: 128 x 128
- * tiles, eight waves each holding 64 x 32, the next K tile in registers while this one computes,
- * the A tile normalised and the weight rows decoded on the way into LDS.
+ * Here the two products are separate GEMMs. Scales take one pass, a wave per row
+ * (mtp_prefill_scale_kernel). The embedding term is a [rows, n] GEMM kept in f32 scratch; the
+ * stream term is the [rows * hc, n] GEMM whose epilogue adds the token's embedding term before the
+ * single bf16 rounding. Both use mtp_prefill_gemm_kernel: 128 x 128 tiles, eight waves of 64 x 32,
+ * the next K tile in registers during compute, A normalised and weights decoded on the way to LDS.
  *
- * THE BYTES DIFFER FROM THE TILED KERNEL'S. That one adds both products into one accumulator a K
- * step at a time; this one sums each over all of K and adds the two once. Same terms, different
- * rounding, on a head whose output is a draft the trunk verifies -- the tiled gated residual's
- * scales already differ from its per-row form's in the same way. */
-/* THE FORM CHANGES AT 32 TOKENS. Below it the grid is n/128 = 20 blocks and the three launches
- * cost ~100 us whatever the rows; the tiled kernel is under that there and over it above.
- * rad-kbench on the Flash-Next container, us a call (tiled / this form):
+ * Bytes differ from the tiled kernel's (which accumulates both products together per K step);
+ * acceptable for a draft head the trunk verifies. */
+/* The form switches at 32 tokens: below, the grid is n/128 = 20 blocks and the three launches cost
+ * ~100 us regardless of rows. us per call (tiled / this form), Flash-Next:
  *
  *      tokens    8        16       32        64        128       512        2048
  *              52 / 98  88 / 105  182 / 117  267 / 158  433 / 213  1540 / 627  6180 / 2430 */
 constexpr long kMtpPrefillRows = 32;
 
-/* One wave a row: rows [0, R) are the output rows (t, k) over `h` -- sub-stream k of token t, or
- * the whole wide row when `flat` -- and rows [R, R + rows) are the tokens over `e`. A lane sums
- * j = lane, lane + 32, ... in order, eight loads ahead of the adds. */
+/* One wave per row: rows [0, R) are the output rows (t, k) over `h` (sub-stream k of token t, or
+ * the whole wide row when `flat`), rows [R, R + rows) the tokens over `e`. A lane sums j = lane,
+ * lane + 32, ... in order, eight loads ahead of the adds. */
 __global__ __launch_bounds__(kThreads)
 void mtp_prefill_scale_kernel(const unsigned short* __restrict__ h,
                               const unsigned short* __restrict__ e,
@@ -3189,10 +2839,10 @@ void mtp_prefill_scale_kernel(const unsigned short* __restrict__ h,
 #define MP_TM    4                   /* WMMA tiles a wave over M ... */
 #define MP_TN    2                   /* ... and over N: 64 x 32 a wave, 128 x 128 a block */
 
-/* C = normalise(A) @ fc^T for one of the two products. EPASS: A is `e`, one row a token, and the
+/* C = normalise(A) @ fc^T for one of the two products. EPASS: A is `e`, one row per token, and the
  * f32 result goes to `eterm`. Otherwise A is `h` read as rows (t, k), and the result plus the
- * token's `eterm` row is rounded once into `x`. The weight is bf16 rows, or at F8 E4M3 rows with
- * their f32 128-column group scales in each row's tail (r4d_hc_fp8.h), `fld` bytes apart. */
+ * token's `eterm` row is rounded once into `x`. Weights are bf16 rows or, with F8, E4M3 rows with
+ * f32 128-column group scales in each row's tail (r4d_hc_fp8.h), `fld` bytes apart. */
 template <bool F8, bool EPASS>
 __global__ __launch_bounds__(kThreads)
 void mtp_prefill_gemm_kernel(const unsigned short* __restrict__ src, long srow,
@@ -3213,7 +2863,7 @@ void mtp_prefill_gemm_kernel(const unsigned short* __restrict__ src, long srow,
     const long m0 = (long)blockIdx.y * BM, n0 = (long)blockIdx.x * BN;
 
     /* A thread's staging slots: chunk c = tid + 256 i is tile row c / CPR, K offset (c % CPR) * 8.
-     * Per slot the row's source, its gain offset and its scale, fixed for the whole K loop. */
+     * Each slot's row source, gain offset and scale are fixed for the whole K loop. */
     const unsigned short* asrc[AL];
     const float* again[AL];
     float asc[AL];
@@ -3351,22 +3001,13 @@ static inline long long mtp_prefill_bytes(long long rows, long long n, long long
     return al(rows * hc * 4) + al(rows * 4) + al(rows * n * 4);
 }
 
-/* ==================================================== HOW MANY WORKGROUPS THE DOWN PRODUCT GETS
+/* ==================================================== down-product workgroup count
  *
- * THE SPLIT HAS TO COUNT THE ROW TILES, NOT JUST THE COLUMN ONES. Taking `nb` as ceil(ncol/kTNT)
- * alone -- five or six workgroups -- and choosing `ks` to bring that to kTKSPLIT_WANT is right at
- * one row tile and wrong at any other; disabling the split outright at rt = 128, on the grounds
- * that the prefill form does not need it, makes it worse still.
- *
- * WHAT THAT COSTS: rt is 128 at or above kTileMinRows = 64 rows, and a decode step has
- * C * (1 + n_spec) rows -- so SIXTEEN concurrent sequences at depth 3 is exactly 64 rows and falls
- * onto the prefill tile with no split. Six workgroups on a 64-CU part. That is a throughput CLIFF
- * of about 25% at one particular concurrency, invisible from any smaller one, because the usual
- * shape is eight slots and 32 rows.
- *
- * So `nrt` enters here and there is no rt = 128 special case: the split is a function of the WHOLE
- * grid, it turns itself off exactly when the grid is already wide enough (about 2800 rows at this
- * model's ncol), and no row count has a cliff in it. */
+ * The split counts row tiles (`nrt`) as well as column tiles. Counting only ceil(ncol/kTNT) (five
+ * or six workgroups), or disabling the split at rt = 128, leaves a large decode step (e.g. sixteen
+ * sequences at depth 3) with six workgroups on 64 CUs, a ~25% throughput cliff. As a function of
+ * the whole grid, the split turns itself off once the grid is wide enough (about 2800 rows at this
+ * model's ncol). */
 static inline long hc_down_kchunk(long long lr, long long HN, long long nrt) {
     const long long nb     = ((lr + kTNT - 1) / kTNT) * (nrt > 0 ? nrt : 1);
     const long long chunks = (HN + kTKT - 1) / kTKT;
@@ -3375,29 +3016,23 @@ static inline long hc_down_kchunk(long long lr, long long HN, long long nrt) {
     if (want > chunks) want = chunks;
     return (long)(((chunks + want - 1) / want) * kTKT);
 }
-/* THE TILE A ROW COUNT PICKS. One place, because the planner and the call site have to agree.
+/* The row tile for a row count, defined once so the planner and the call site agree.
  *
- * STRICTLY GREATER, and the character matters. A 128-row tile at EXACTLY 64 rows stages 128 rows
- * of A to use 64 -- the staging loop clamps the overshoot to `rows - 1`, so half the LDS traffic
- * and half the WMMA slots go to duplicate rows -- and its 26112 B of LDS puts two workgroups on a
- * WGP where the 64-row tile puts three. It buys nothing in return: the weight is re-read
- * ceil(rows/rt) times and ceil(64/64) is ceil(64/128) is one. Above 64 rows it does halve that
- * re-read and is the right tile. A `>=` here costs several milliseconds a step at exactly the row
- * count where the two tiles are equivalent on traffic. */
+ * Strictly greater than 64: at exactly 64 rows a 128-row tile re-reads the weight just as often
+ * (once) but wastes half its LDS traffic and WMMA slots on clamped duplicate rows, and its 26112 B
+ * of LDS fits two workgroups per WGP instead of three. Do not change to `>=`. */
 static inline int hc_down_rt(long long rows) {
     return (rows > kTileMinRows) ? 128 : (rows > 32 ? 64 : 32);
 }
 
-/* THE PARTIAL BUFFER FOR ANY ROW COUNT UP TO THE BAND'S M, in bytes.
+/* The partial buffer for any row count up to the band's M, in bytes.
  *
- * The planner does not know the step's rows and `ks * rows` is NOT monotone in rows: a smaller row
- * count takes a coarser tile and therefore a DEEPER split, so an endpoint is not the worst case.
- * This walks the band instead. Past the point where the row tiles alone cover the part the split
+ * `ks * rows` is not monotone in rows (fewer rows take a coarser tile and a deeper split), so the
+ * band is walked rather than its endpoints checked. Once row tiles alone cover the part the split
  * is off and the buffer grows linearly, so the walk stops there and takes M as the last candidate.
  *
- * The rule is: derive the split from `lr` on BOTH sides, and size the buffer for the widest `ncol`
- * a gain fold can produce. Breaking it overruns the partial buffer, which the kbench red zone
- * catches. */
+ * Invariant: derive the split from `lr` on both sides and size for the widest `ncol` a gain fold
+ * can produce, or the partial buffer overruns. */
 static inline long long hc_part_bytes(long long M, long long lr, long long HN) {
     const long long ncol = lr + (long long)kHcMax;
     const long long hi   = (M < 4096) ? M : 4096;
@@ -3470,24 +3105,23 @@ static inline void hc_up_tiled_launch(int rt, bool f8, const void* up, long uld,
 #undef HC_UP_CASE
 }
 
-/* THE PF2 FORM'S WEIGHT PLANES in the `u` scratch, in bytes: mix_down (and the inject weights) in
- * fragment order over ntt n-tiles, then -- E4M3 only -- mix_up decoded to [HN][lr] bf16. */
+/* The PF2 form's weight planes in the `u` scratch, in bytes: mix_down (and the inject weights) in
+ * fragment order over ntt n-tiles, then (E4M3 only) mix_up decoded to [HN][lr] bf16. */
 static inline long long pf2_plane_bytes(long long HN, long long lr, long long ntt, bool f8) {
     return ntt * 16 * HN * 2 + (f8 ? HN * lr * 2 : 0);
 }
 
-/* `u`'S ROWS IN THE SCRATCH, [rows][HN] bf16: the band's M, and at a band that reaches the PF2 rule
- * at least the rows its planes take at the widest fold (ncol = lr + hc) and either dtype --
- * ceil((lr + hc) / 16) * 16 + lr. The scratch hook and the launcher both size `u` from this, so the
- * offsets behind it agree, and the rule never finds the planes without room. */
+/* Rows of `u` in the scratch, [rows][HN] bf16: the band's M and, at a band reaching the PF2 rule,
+ * at least the rows its planes need at the widest fold (ncol = lr + hc) and either dtype,
+ * ceil((lr + hc) / 16) * 16 + lr. The scratch hook and the launcher both size `u` from this. */
 static inline long long hc_u_rows(long long M, long long lr, long long hc) {
     const long long pf2 = ((lr + hc + 15) / 16) * 16 + lr;
     return (M >= kPf2MinRows && pf2 > M) ? pf2 : M;
 }
 
-/* THE PF2 FORM, start to finish: prologue, down product, reduce, up product and mix, codes. `wsp`
- * is the plane space -- the `u` buffer, which no fused form uses -- and the caller has checked it
- * holds pf2_plane_bytes() and that hc is 4. Returns a RAD code. */
+/* The PF2 form: prologue, down product, reduce, up product and mix, codes. `wsp` is the plane
+ * space (the `u` buffer); the caller has checked it holds pf2_plane_bytes() and that hc is 4.
+ * Returns a RAD code. */
 static int hc_pf2_launch(bool f8, bool i8, const unsigned short* h, const float* w,
                          const void* down, long dld, const void* up, long uld,
                          const unsigned short* injw, unsigned short* dbuf, float* scale,
@@ -3528,8 +3162,8 @@ static int hc_pf2_launch(bool f8, bool i8, const unsigned short* h, const float*
         if (hipGetLastError() != hipSuccess) return RAD_E_DEVICE;
     }
 
-    /* The up product and mix: the wide kernel at 256 rows over a bf16 mix_up, whose row pitch is
-     * lr -- the decoded plane, or the stored matrix at bf16. */
+    /* The up product and mix: the wide kernel at 256 rows over a bf16 mix_up with row pitch lr
+     * (the decoded plane, or the stored matrix at bf16). */
     hipLaunchKernelGGL((hc_up_mix_wide_kernel<4, false, kPf2UpRT>),
                        dim3((unsigned)(n / kWideCH), (unsigned)((rows + kPf2UpRT - 1) / kPf2UpRT)),
                        dim3(kThreads), 0, (hipStream_t)s, (const void*)ubf, lr,
@@ -3548,10 +3182,9 @@ enum { HCE_X = 0, HCE_H };
 enum { HCW_Y = 0, HCW_INJ, HCW_H };
 enum { HCR_H = 0, HCR_W, HCR_DOWN, HCR_UP, HCR_INJW, HCR_X, HCR_INJ, HCR_Q, HCR_S, HCR_RQ, HCR_RS };
 
-/* The LDS kernel A holds N in, as bf16, beside its own static planes. gfx1201 gives a workgroup
- * 64 KiB, so N may have 64 KiB less kHcReadAStaticLds -- 30576 elements. The row table claims
- * `n <= 7552` and `hc <= 4`, which is 30208 of them, and the shim refuses the rest by name rather
- * than launching a kernel whose shared allocation fails. */
+/* LDS for kernel A's bf16 N beside its static planes: gfx1201 gives a workgroup 64 KiB, so N gets
+ * 64 KiB less kHcReadAStaticLds (30576 elements). The row table claims `n <= 7552` and `hc <= 4`
+ * (30208); the shim refuses larger shapes instead of failing the launch. */
 static const long kHcLdsMaxHN = (65536 - kHcReadAStaticLds) / (long)sizeof(unsigned short);
 
 static int hc_common(const RadArgs* a, const RadTensor* h, long long* rows, long long* n,
@@ -3584,7 +3217,7 @@ extern "C" int r4d_rad_hc_enter(const RadArgs* a, RadStream s) {
     return (int)hipGetLastError();
 }
 
-static int rad_hc_write_body(const RadArgs* a, const R4dSink& sk) {
+extern "C" int r4d_rad_hc_write(const RadArgs* a, RadStream stream) {
     const RadTensor* y   = r4d_opt(a, HCW_Y);
     const RadTensor* inj = r4d_opt(a, HCW_INJ);
     const RadTensor* h   = r4d_opt(a, HCW_H);
@@ -3599,17 +3232,15 @@ static int rad_hc_write_body(const RadArgs* a, const R4dSink& sk) {
     if (yrow < 0 || irow < 0 || yrows < rows || irows < rows) return R4D_NO(RAD_E_STRIDE);
 
     const unsigned blocks = (unsigned)((n + kThreads - 1) / kThreads);
-    return R4D_EMIT(sk, hc_write_kernel, dim3(blocks, (unsigned)rows), dim3(kThreads), 0,
+    return R4D_EMIT(stream, hc_write_kernel, dim3(blocks, (unsigned)rows), dim3(kThreads), 0,
                     (const unsigned short*)y->data,
                     (const unsigned short*)inj->data, (unsigned short*)h->data,
                     (long)rows, (long)n, (int)hc, (long)yrow, (long)irow, (long)hrow);
 }
-R4D_ENTRY(r4d_rad_hc_write, rad_hc_write_body)
-
 
 enum { MTE_H = 0, MTE_E, MTE_WH, MTE_WE, MTE_FCH, MTE_FCE, MTE_X };
 
-static int rad_mtp_enter_body(const RadArgs* a, const R4dSink& sk) {
+extern "C" int r4d_rad_mtp_enter(const RadArgs* a, RadStream stream) {
     int emit_rc = RAD_OK;
     const RadTensor* h   = r4d_opt(a, MTE_H);
     const RadTensor* e   = r4d_opt(a, MTE_E);
@@ -3621,8 +3252,8 @@ static int rad_mtp_enter_body(const RadArgs* a, const R4dSink& sk) {
     if (!h || !e || !wh || !we || !fch || !fce || !x) return R4D_NO(RAD_E_INVAL);
     R4D_DT(h, RAD_BF16); R4D_DT(e, RAD_BF16); R4D_DT(x, RAD_BF16);
     R4D_DT(wh, RAD_F32); R4D_DT(we, RAD_F32);
-    /* BOTH fc MATRICES bf16 OR BOTH E4M3 rows with f32 128-column group scales in each row's tail
-     * (r4d_hc_fp8.h's geometry at K = n), as the stored dtype says. */
+    /* Both fc matrices bf16, or both E4M3 rows with f32 128-column group scales in each row's tail
+     * (r4d_hc_fp8.h at K = n), per the stored dtype. */
     const bool f8 = fch->dtype == RAD_F8E4M3;
     if (f8) { R4D_DT(fce, RAD_F8E4M3); } else { R4D_DT(fch, RAD_BF16); R4D_DT(fce, RAD_BF16); }
 
@@ -3630,9 +3261,8 @@ static int rad_mtp_enter_body(const RadArgs* a, const R4dSink& sk) {
     const int rc = hc_common(a, h, &rows, &n, &hc, &hrow);
     if (rc != RAD_OK) return rc;
     const long long HN = n * hc;
-    /* `nh` and `ne` both live in LDS for the whole of the second phase -- that is what makes one
-     * pass over a weight row enough -- so the wide stream plus one narrow row has to fit beside
-     * the per-wave staging slots. 64 KiB less the 4 KiB of `s_stage` and the reduction planes. */
+    /* `nh` and `ne` stay in LDS for the second phase, so the wide stream plus one row must fit
+     * beside the staging slots and reduction planes in 64 KiB. */
     if ((HN + n) > kMtpLdsMaxN) return R4D_NO(RAD_E_SHAPE);
 
     long long erows = 0, xrows = 0;
@@ -3640,8 +3270,8 @@ static int rad_mtp_enter_body(const RadArgs* a, const R4dSink& sk) {
     const long long xrow = r4d_rows_pitch(x, HN, &xrows);
     if (erow < 0 || xrow < 0 || erows < rows || xrows < rows) return R4D_NO(RAD_E_STRIDE);
     if (r4d_numel(wh) < HN || r4d_numel(we) < n) return R4D_NO(RAD_E_SHAPE);
-    /* A stored row's pitch, in the stored dtype's elements. At E4M3 the DECLARED shape arrives
-     * ([n, n], the stored dtype), so the pitch is derived by the layout's rule -- see hc_read. */
+    /* A stored row's pitch in the stored dtype's elements. At E4M3 the declared shape ([n, n])
+     * arrives, so the pitch comes from the layout rule, as in hc_read. */
     long long fld = n;
     if (f8) {
         if (!r4d_hc8::group_ok(n, r4d_hc8::kDownGroup)) return R4D_NO(RAD_E_SHAPE);
@@ -3655,10 +3285,9 @@ static int rad_mtp_enter_body(const RadArgs* a, const R4dSink& sk) {
     if (!r4d_contig(wh) || !r4d_contig(we) || !r4d_contig(fch) || !r4d_contig(fce))
         return R4D_NO(RAD_E_STRIDE);
 
-    /* `ngroup` == 1 is the FLAT reading -- one rsqrt over the whole wide row instead of one per
-     * sub-stream. The checkpoint fits both and only the acceptance rate can tell them apart, so
-     * the choice travels as a parameter rather than being compiled in. Default is the grouped
-     * form, which is what every gated residual in this architecture does. */
+    /* `ngroup` == 1 is the flat norm: one rsqrt over the whole wide row instead of one per
+     * sub-stream. The checkpoint does not determine which, so it is a parameter; the default is
+     * grouped, as in every gated residual of this architecture. */
     const long long ngroup = r4d_geti_or(a, "ngroup", hc);
     if (ngroup != 1 && ngroup != hc) return R4D_NO(RAD_E_SHAPE);
     const float eps  = (float)r4d_getf(a, "eps", 1e-6);
@@ -3667,35 +3296,30 @@ static int rad_mtp_enter_body(const RadArgs* a, const R4dSink& sk) {
     const unsigned blocks = (unsigned)((n + kMtpOutTB - 1) / kMtpOutTB);
     const size_t   lds    = (size_t)(HN + n) * sizeof(unsigned short);
 
-    /* THE ROW COUNT PICKS THE SHAPE, as it does for the gated residual. One row is the floor and
-     * the per-row kernel is at it; a draft round at eight sequences carries eight rows and pays
-     * eight times the weight. */
+    /* The row count picks the form, as for the gated residual: the per-row kernel is the floor at
+     * one row but re-reads the weight per row. */
     const long R = rows * hc;
     const bool tileable = (n % kTKT) == 0 && (n % 8) == 0 && (hrow % 8) == 0
         && (((uintptr_t)h->data & 15u) == 0u) && (((uintptr_t)e->data & 15u) == 0u)
         && (((uintptr_t)fch->data & 15u) == 0u) && (((uintptr_t)fce->data & 15u) == 0u)
         && (((uintptr_t)wh->data & 15u) == 0u) && (((uintptr_t)we->data & 15u) == 0u)
         && (erow % 8) == 0;
-    /* E4M3 fc rows are read by the TILED kernel at every row count, one row included: at one row
-     * it is 46 us against the per-row bf16 kernel's 54, where a per-row E4M3 dot is 57 --
-     * the per-row kernel's win is its transposed LDS layout, which the codes cannot use. So the
-     * per-row kernel stays bf16's alone, and a shape the tile cannot take is refused. */
+    /* E4M3 fc rows always use the tiled kernel, even at one row (46 us, against 57 for a per-row
+     * E4M3 dot): the per-row kernel's advantage is its transposed LDS layout, which codes cannot
+     * use. A shape the tile cannot take is refused. */
     if (f8 && !tileable) return R4D_NO(RAD_E_SHAPE);
-    /* THE PREFILL FORM from kMtpPrefillRows tokens, on its scratch: a shape the tile takes is one
-     * this form takes, so past the threshold there is no second path. */
+    /* The prefill form from kMtpPrefillRows tokens, on its scratch; it accepts every shape the
+     * tile does. */
     if (rows >= kMtpPrefillRows && tileable) {
         if (!a->scratch || a->scratch_bytes < mtp_prefill_bytes(rows, n, hc))
             return R4D_NO(RAD_E_SCRATCH);
-        /* Three launches over a private scratch, which the descriptor form does not cover; it is
-         * submitted individually (ABI v10), as hc_read's tiled path is. */
-        if (sk.desc) return RAD_E_UNSUPPORTED;
         auto al = [](long long b) { return (b + 255) & ~255LL; };
         float* rs = (float*)a->scratch;
         float* re = (float*)((unsigned char*)a->scratch + al(R * 4));
         float* et = (float*)((unsigned char*)a->scratch + al(R * 4) + al(rows * 4));
         const unsigned sb = (unsigned)((R + rows + kWaves - 1) / kWaves);
         hipLaunchKernelGGL(mtp_prefill_scale_kernel, dim3(sb), dim3(kThreads), 0,
-                           (hipStream_t)sk.stream,
+                           (hipStream_t)stream,
                            (const unsigned short*)h->data, (const unsigned short*)e->data, rs, re,
                            (long)rows, (long)n, (int)hc, ngroup == 1 ? 1 : 0, eps, (long)hrow,
                            (long)erow);
@@ -3703,7 +3327,7 @@ static int rad_mtp_enter_body(const RadArgs* a, const R4dSink& sk) {
         const dim3 gh((unsigned)((n + 127) / 128), (unsigned)((R + 127) / 128));
 #define MTP_PF(F8_, EP_, G_, SRC_, SROW_, GAIN_, RSC_, FC_)                                      \
         hipLaunchKernelGGL((mtp_prefill_gemm_kernel<F8_, EP_>), G_, dim3(kThreads), 0,           \
-                           (hipStream_t)sk.stream, (const unsigned short*)SRC_, (long)SROW_,    \
+                           (hipStream_t)stream, (const unsigned short*)SRC_, (long)SROW_,       \
                            (const float*)GAIN_, RSC_, (const void*)FC_, (long)fld, et,           \
                            (unsigned short*)x->data, (long)rows, (long)n, (int)hc, wadd,         \
                            (long)xrow)
@@ -3722,7 +3346,7 @@ static int rad_mtp_enter_body(const RadArgs* a, const R4dSink& sk) {
         const int nt = rt >= 128 ? kMtpTNTWide : kMtpTNTNarrow;
         const dim3 gm((unsigned)((n + nt - 1) / nt), (unsigned)((R + rt - 1) / rt));
 #define MTP_TILE_CASE(RT_, NT_, F8_)                                                             \
-        emit_rc = R4D_EMIT(sk, (mtp_enter_tiled_kernel<RT_, NT_, F8_>), gm, dim3(kThreads), 0,     \
+        emit_rc = R4D_EMIT(stream, (mtp_enter_tiled_kernel<RT_, NT_, F8_>), gm, dim3(kThreads), 0, \
                            (const unsigned short*)h->data,                                       \
                            (const unsigned short*)e->data, (const float*)wh->data,               \
                            (const float*)we->data, (const void*)fch->data,                       \
@@ -3739,10 +3363,10 @@ static int rad_mtp_enter_body(const RadArgs* a, const R4dSink& sk) {
         }
 #undef MTP_TILE_CASE
         if (emit_rc != RAD_OK) return emit_rc;
-        return sk.desc ? RAD_OK : (int)hipGetLastError();
+        return (int)hipGetLastError();
     }
 
-    emit_rc = R4D_EMIT(sk, mtp_enter_kernel, dim3(blocks, (unsigned)rows), dim3(kThreads), lds,
+    emit_rc = R4D_EMIT(stream, mtp_enter_kernel, dim3(blocks, (unsigned)rows), dim3(kThreads), lds,
                        (const unsigned short*)h->data,
                        (const unsigned short*)e->data, (const float*)wh->data,
                        (const float*)we->data, (const unsigned short*)fch->data,
@@ -3750,12 +3374,11 @@ static int rad_mtp_enter_body(const RadArgs* a, const R4dSink& sk) {
                        (long)rows, (long)n, (int)hc, ngroup == 1 ? 1 : 0, eps, wadd,
                        (long)hrow, (long)erow, (long)xrow);
     if (emit_rc != RAD_OK) return emit_rc;
-    return sk.desc ? RAD_OK : (int)hipGetLastError();
+    return (int)hipGetLastError();
 }
-R4D_ENTRY(r4d_rad_mtp_enter, rad_mtp_enter_body)
 
-/* The prefill form's scratch, for a band that reaches it. `M` is the band's ceiling and the form
- * is chosen per call, so a band reaching kMtpPrefillRows is sized at its ceiling. */
+/* The prefill form's scratch, for a band that reaches it. The form is chosen per call, so a band
+ * reaching kMtpPrefillRows is sized at its ceiling `M`. */
 extern "C" int64_t r4d_rad_mtp_enter_scratch(const RadArgs* a) {
     const long long M  = r4d_geti_or(a, "M", 0);
     const long long n  = r4d_geti_or(a, "n", 0);
@@ -3763,40 +3386,30 @@ extern "C" int64_t r4d_rad_mtp_enter_scratch(const RadArgs* a) {
     if (M <= 0 || n <= 0 || hc <= 0) return R4D_NO(RAD_E_SHAPE);
     return M >= kMtpPrefillRows ? mtp_prefill_bytes(M, n, hc) : 0;
 }
-/* `d` between the two kernels, and the per-stream norm scales beside it. Sized from the BAND's `M`
- * rather than from the operand, because the arena is sized once for the whole band and the launch
- * below checks against the same number -- a scratch hook that answered for the step's actual rows
- * would size the arena for whatever step happened to be asked first. */
+/* `d` between the two kernels, with the per-stream norm scales beside it. Sized from the band's `M`,
+ * not the operand: the arena is sized once per band and the launch checks the same number. */
 extern "C" int64_t r4d_rad_hc_read_scratch(const RadArgs* a) {
     const long long M  = r4d_geti_or(a, "M", 0);
     const long long lr = r4d_geti_or(a, "lowrank", 0);
     const long long n  = r4d_geti_or(a, "n", 0);
     const long long hc = r4d_geti_or(a, "hc", 0);
     if (M <= 0 || lr <= 0 || n <= 0 || hc <= 0) return R4D_NO(RAD_E_SHAPE);
-    /* `d` [M, lowrank] bf16, the per-stream norm scales [M, kHcMax] f32, and `u` [M, hc*n] bf16 --
-     * 20 KiB a row at this model's shape, which is what buys the up-matvec its own grid. A band
-     * that reaches the PF2 rule holds its weight planes in `u` as well, so `u` there has at least
-     * the rows they take (hc_u_rows).
+    /* `d` [M, lowrank] bf16, the per-stream norm scales [M, kHcMax] f32, and `u` [M, hc*n] bf16
+     * (20 KiB per row here; it gives the up matvec its own grid). At a band reaching the PF2 rule
+     * `u` also holds the weight planes (hc_u_rows).
      *
-     * PLUS THE SPLIT-K PARTIALS. Every row count below a few thousand takes a split, so this is
-     * not a decode-only buffer and is not bounded by kTileMinRows -- hc_part_bytes
-     * walks the band because ks * rows is not monotone in rows. */
+     * Plus the split-K partials: every row count below a few thousand splits, so this is not
+     * bounded by kTileMinRows; hc_part_bytes walks the band. */
     const long long HN   = hc * n;
-    /* THE SPLIT MUST BE COMPUTED FROM THE SAME NUMBER IN BOTH PLACES. The call site knows whether
-     * this connection has inject weights and the planner does not, so both derive `kc` from `lr`
-     * alone and the buffer is sized for the widest ncol a fold can produce. Deriving it from ncol
-     * here and from lr there gives two different split counts for the same shape, and the partial
-     * buffer then overruns. */
+    /* The split must come from the same number here and at the call site. Only the call site knows
+     * whether there are inject weights, so both derive `kc` from `lr` and the buffer is sized for
+     * the widest ncol; mismatched derivations overrun the partial buffer. */
     return M * ((long long)lr * 2 + (long long)kHcMax * 4) + hc_u_rows(M, lr, hc) * HN * 2
            + hc_part_bytes(M, lr, HN);
 }
 
-static int rad_hc_read_body(const RadArgs* a, const R4dSink& sk) {
+extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     int emit_rc = RAD_OK;
-    /* The tiled path below launches directly -- it declines to describe -- and takes the stream
-     * as `s`. */
-    const RadStream s = sk.stream;
-    (void)s;
     const RadTensor* h    = r4d_opt(a, HCR_H);
     const RadTensor* w    = r4d_opt(a, HCR_W);
     const RadTensor* down = r4d_opt(a, HCR_DOWN);
@@ -3810,23 +3423,22 @@ static int rad_hc_read_body(const RadArgs* a, const R4dSink& sk) {
     const RadTensor* rqs  = r4d_opt(a, HCR_RS);
     if (!h || !w || !down || !up || !x) return R4D_NO(RAD_E_INVAL);
     R4D_DT(h, RAD_BF16); R4D_DT(w, RAD_F32);
-    /* THE MIXING MATRICES ARE BOTH bf16 OR BOTH E4M3 rows (r4d_hc_fp8.h), and which one is the
-     * stored dtype's to say: the layout hook that wrote them is the one this row resolved to. */
+    /* The mixing matrices are both bf16 or both E4M3 rows (r4d_hc_fp8.h), per the stored dtype
+     * written by this row's layout hook. */
     const bool f8 = down->dtype == RAD_F8E4M3;
     if (f8) { R4D_DT(up, RAD_F8E4M3); } else { R4D_DT(down, RAD_BF16); R4D_DT(up, RAD_BF16); }
     R4D_DT(x, RAD_BF16);
-    /* An inject WEIGHT with no `inj` output is a connection whose two halves disagree about
-     * whether there is a write; refused rather than silently dropped. */
+    /* An inject weight without an `inj` output (or vice versa) is inconsistent and refused. */
     if ((injw != nullptr) != (inj != nullptr)) return R4D_NO(RAD_E_INVAL);
     if (injw) { R4D_DT(injw, RAD_BF16); R4D_DT(inj, RAD_BF16); }
     if ((q != nullptr) != (qs != nullptr)) return R4D_NO(RAD_E_INVAL);
-    /* THE CODES' DTYPE IS THE FORMAT: E4M3 for an fp8 trunk, int8 for an int8 one (gemm_i8a8_*),
-     * the same scale grid either way (r4d_q8.h). The rotated twin below stays E4M3 -- it is the
-     * routed experts' operand, whatever the trunk is. */
+    /* The codes' dtype is the format: E4M3 for an fp8 trunk, int8 for an int8 one (gemm_i8a8_*),
+     * on the same scale grid (r4d_q8.h). The rotated codes stay E4M3, as the routed experts'
+     * operand. */
     if (q && q->dtype != RAD_F8E4M3 && q->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
     if (q) R4D_DT(qs, RAD_F32);
     const bool i8 = q && q->dtype == RAD_I8;
-    /* The rotated twin rides in the plain codes' finisher, so it is refused without them. */
+    /* The rotated codes are produced by the plain codes' finisher, so they require them. */
     if ((rq != nullptr) != (rqs != nullptr) || (rq && !q)) return R4D_NO(RAD_E_INVAL);
     if (rq) { R4D_DT(rq, RAD_F8E4M3); R4D_DT(rqs, RAD_F32); }
 
@@ -3835,15 +3447,13 @@ static int rad_hc_read_body(const RadArgs* a, const R4dSink& sk) {
     if (rc != RAD_OK) return rc;
     const long long HN = n * hc;
     if (HN > kHcLdsMaxHN) return R4D_NO(RAD_E_SHAPE);
-    /* One workgroup owns 128 channels AND the 128-column scale group over them, so a channel count
-     * that is not a whole number of them would split a group across two workgroups -- two amaxes
-     * for one scale. */
+    /* A workgroup owns 128 channels and their scale group, so n must be whole groups. */
     if (n % kUpTB) return R4D_NO(RAD_E_SHAPE);
 
     const long long lr = r4d_geti_or(a, "lowrank", 0);
     if (lr <= 0) return R4D_NO(RAD_E_SHAPE);
-    /* A row's pitch in ELEMENTS of the stored dtype: HN or lr for bf16, the stored row's bytes for
-     * E4M3, whose dot needs K a multiple of its 256-element step and whose up rows split in four
+    /* Row pitch in elements of the stored dtype: HN or lr for bf16, the stored row's bytes for
+     * E4M3, whose dot needs K a multiple of its 256-element step and whose up rows split into four
      * sixteen-code quarters of at most kUpMaxQ loads. */
     long long dld = HN, uld = lr;
     if (f8) {
@@ -3851,10 +3461,9 @@ static int rad_hc_read_body(const RadArgs* a, const R4dSink& sk) {
         if (!r4d_hc8::group_ok(HN, gd) || !r4d_hc8::group_ok(lr, gu) || HN % kHc8Step ||
             gu / 16 > kUpMaxQ)
             return R4D_NO(RAD_E_SHAPE);
-        /* THE DECLARED SHAPE ARRIVES, NOT THE STORED ONE -- a weight's RadTensor is built from
-         * `decl.shape` with the layout's stored dtype, as the fp8 lm_head's is (its launcher says
-         * so at length). So the row pitch is DERIVED here by the layout hook's own rule, and what
-         * guarantees the plane has it is the engine's layout-tag check, run before a byte moves. */
+        /* A weight's RadTensor carries the declared shape with the stored dtype (as for the fp8
+         * lm_head), so the row pitch is derived by the layout hook's rule; the engine's layout-tag
+         * check guarantees the plane matches. */
         if (down->rank != 2 || down->shape[0] != lr || down->shape[1] != HN ||
             up->rank != 2 || up->shape[0] != HN || up->shape[1] != lr)
             return R4D_NO(RAD_E_SHAPE);
@@ -3898,15 +3507,12 @@ static int rad_hc_read_body(const RadArgs* a, const R4dSink& sk) {
     const float eps  = (float)r4d_getf(a, "eps", 1e-6);
     const float wadd = (float)r4d_getf(a, "wadd", 0.0);
 
-    /* THE CHECK IS AGAINST WHAT THIS LAUNCH TOUCHES, NOT AGAINST THE SCRATCH HOOK. The hook walks
-     * the band's row counts to find the worst split -- right once at planning, and a large share
-     * of the issuing thread's time when repeated on every launch. `d`, the scales and `u` sit at
-     * offsets fixed by the band's M; the split-K partials behind them are checked where the
-     * split is known, in the tiled branch below. */
+    /* Check what this launch touches, not the scratch hook's total: the hook walks the band, which
+     * is too slow per launch. `d`, the scales and `u` sit at offsets fixed by the band's M; the
+     * split-K partials are checked in the tiled branch, where the split is known. */
     const long long Mband = r4d_geti_or(a, "M", 0);
     if (Mband <= 0) return R4D_NO(RAD_E_SHAPE);
-    /* `d`, the scales and `u` are all sized from the BAND, so a step wider than the band it was
-     * planned for does not run slowly -- it writes past three buffers. */
+    /* `d`, the scales and `u` are sized from the band; a wider step would overrun them. */
     if (rows > Mband) return R4D_NO(RAD_E_SHAPE);
     const long long ubytes = hc_u_rows(Mband, lr, hc) * HN * 2;
     const long long fixed  = Mband * (lr * 2 + (long long)kHcMax * 4) + ubytes;
@@ -3916,41 +3522,24 @@ static int rad_hc_read_body(const RadArgs* a, const R4dSink& sk) {
     unsigned short* ubuf  = (unsigned short*)((unsigned char*)a->scratch
                                               + Mband * (lr * 2 + kHcMax * 4));
 
-    /* THE COLUMN TILE IS CHOSEN FOR THE GRID AND NOT FOR THE CACHE. A workgroup owning 64 of the
-     * 320 columns is five workgroups at decode, on a part with sixty-four compute units -- which
-     * costs this op an order of magnitude over what its weight traffic says it should. Narrowing
-     * the tile until the grid covers the machine costs one extra pass over `h` per workgroup
-     * (20 KiB against the 1.3 MiB of weight the same workgroup reads at the widest tile), and at
-     * decode that is a megabyte and a half against six and a half of weight.
-     *
-     * IT ONLY EVER NARROWS: rows past kDecMinRows leave this path entirely for the tiled one
-     * below, so the widest tile is never the right answer here and `rows` in the condition is only
-     * ever a one-to-seven-row speculative window. */
+    /* The column tile is chosen to fill the grid: 64 of 320 columns per workgroup would be five
+     * workgroups on 64 CUs. Narrowing costs one extra pass over `h` per workgroup (20 KiB against
+     * up to 1.3 MiB of weight). It only narrows; rows past kDecMinRows take the tiled path, so
+     * `rows` here is a one-to-seven-row speculative window. */
     const bool can_tile = (n % kTKT) == 0 && (HN % 8) == 0 && (lr % 8) == 0 && (hrow % 8) == 0
                           && (((uintptr_t)h->data & 15u) == 0u)
                           && (((uintptr_t)down->data & 15u) == 0u)
                           && (((uintptr_t)up->data & 15u) == 0u);
-    /* THE ROW COUNT PICKS THE SHAPE OF THE OP, and it is not a tuning knob. The per-row kernels
-     * read both mixing matrices once A ROW: one row is the floor, four rows is a 4x re-read that
-     * an issue-bound kernel hides, and THIRTY-TWO -- eight sequences at depth 3 -- is 210 MB a
-     * connection that nothing hides. Left per-row, these two kernels alone account for roughly
-     * 45% of the whole cost of going from one sequence to eight.
-     *
-     * So above kDecMinRows the two products run TILED, and which tile is a function of the rows:
-     * 128 when there are enough to fill it (the prefill form), 32 or 64 below that
-     * with the down product split over K. Below kDecMinRows the per-row kernels still win --
-     * there is not enough re-read to pay for the extra launch and the partials. */
+    /* The row count picks the form. The per-row kernels read both mixing matrices once per row:
+     * four rows is hidden by an issue-bound kernel, but 32 (eight sequences at depth 3) is 210 MB
+     * per connection. So from kDecMinRows the products run tiled, 128 rows when there are enough
+     * (prefill), else 32 or 64 with a K-split down product. Below kDecMinRows the per-row kernels
+     * win. */
     bool fused = false;
     const bool tiled  = can_tile && rows >= kDecMinRows;
-    /* THE TILED PATH DECLINES TO DESCRIBE, and declining is a first-class answer: ABI v10
-     * says a kernel that cannot describe a configuration is submitted individually, which is
-     * correct and merely slower. This path dispatches through three more launch helpers and takes
-     * a second per-stream counter, none of which the descriptor form covers. Declining keeps
-     * hc_read describable on the path decode takes without pretending about the one it does not. */
-    if (tiled && sk.desc) return RAD_E_UNSUPPORTED;
     if (tiled) {
         const int  rt   = hc_down_rt(rows);
-        /* The inject gains are four more columns of the same GEMM when there are any. */
+        /* The inject gains, if any, are hc more columns of the same GEMM. */
         const bool fold = injw != nullptr && inj != nullptr;
         const long ncol = fold ? lr + hc : lr;
         const long nrt  = (rows + rt - 1) / rt;
@@ -3961,13 +3550,11 @@ static int rad_hc_read_body(const RadArgs* a, const R4dSink& sk) {
             return R4D_NO(RAD_E_SCRATCH);
         float*     part = (ks > 1) ? (float*)((unsigned char*)a->scratch + fixed) : nullptr;
 
-        /* THE SECOND PREFILL FORM (hc_pf2_launch), at the 128-row tile and for the same bytes:
-         * the rule from kPf2MinRows rows wherever the shape is one it is built for -- hc 4, n a
-         * multiple of 256, at most kPf2MaxNT column n-tiles -- and the wide form's below that or
-         * at any other shape. Its weight planes live in `u`, which no fused form touches and which
-         * the scratch hook sizes for them at every band the rule reaches, so the room check below
-         * can only refuse the PIN, at a band under kPf2MinRows. The pin refuses a shape the form
-         * is not built for as well, so a test cannot pass on a form it did not ask for. */
+        /* PF2 (hc_pf2_launch) at the 128-row tile, same bytes: used from kPf2MinRows rows when
+         * the shape fits (hc 4, n a multiple of 256, at most kPf2MaxNT column n-tiles), else the
+         * wide form. Its planes live in `u`, sized by the scratch hook at every band the rule
+         * reaches, so the room check can only refuse a pin below kPf2MinRows. A pin also refuses
+         * an unsupported shape, so a test cannot pass on a form it did not ask for. */
         const long ntt       = (ncol + 15) / 16;
         const bool pf2_shape = rt == kWideRT && hc == 4 && (n % kThreads) == 0
                                && ntt <= (long)kPf2MaxNT;
@@ -3988,7 +3575,7 @@ static int rad_hc_read_body(const RadArgs* a, const R4dSink& sk) {
             return prc == RAD_OK ? RAD_OK : R4D_NO(prc);
         }
 
-        /* The per-stream norm scales, on a grid: one workgroup a (row, stream). */
+        /* The per-s norm scales: one workgroup per (row, s). */
         hipLaunchKernelGGL(hc_norm_scale_kernel,
                            dim3((unsigned)hc, (unsigned)rows), dim3(kThreads), 0, (hipStream_t)s,
                            (const unsigned short*)h->data, scale,
@@ -4021,11 +3608,10 @@ static int rad_hc_read_body(const RadArgs* a, const R4dSink& sk) {
             if (hipGetLastError() != hipSuccess) return R4D_NO(RAD_E_DEVICE);
         }
 
-        /* THE UP PRODUCT AND THE MIX IN ONE LAUNCH, when the tile divides into (stream, channel)
-         * pairs and the finisher's counters fit. At the 32- and 64-row tiles that is
-         * hc_up_mix_tiled_kernel. The prefill tile takes hc_up_mix_wide_kernel instead, whose
-         * lanes hold a channel's sub-streams in registers: the pair form's two staging planes on
-         * top of a 128-row A tile would be 58 KiB of LDS and one workgroup a CU. */
+        /* Up product and mix in one launch when the tile divides into (s, channel) pairs and
+         * the finisher's counters fit: hc_up_mix_tiled_kernel at 32- and 64-row tiles,
+         * hc_up_mix_wide_kernel at the prefill tile (registers instead of the 58 KiB of LDS staging
+         * planes). */
         const int ipb = (hc > 0 && (kTNT % hc) == 0) ? kTNT / hc : 0;
         const long ntile = (long)(n / kUpTB) * ((rows + rt - 1) / rt);
         unsigned int* mctr = nullptr;
@@ -4060,28 +3646,17 @@ static int rad_hc_read_body(const RadArgs* a, const R4dSink& sk) {
         if (hipGetLastError() != hipSuccess) return R4D_NO(RAD_E_DEVICE);
     } else {
     long long ta = kDownTAMax;
-    /* TWO PER WGP, WHICH IS ONE PER CU -- and this is the kernel want_wg()'s note anticipates.
-     * `multiProcessorCount` reports WGPs on RDNA and this part has 64 CUs in 32 of them, so a grid
-     * sized to want_wg() alone covers half the machine. At a depth-3 verify that is four rows at
-     * ta = 32, or 44 blocks, which a one-WGP target accepts and a one-CU target does not. Widening
-     * the target is worth ~1.3% of the step at that shape and is inside the noise at one row;
-     * below about 64 blocks the step falls off hard either way, which is the half-idle part
-     * showing up directly.
+    /* Target two workgroups per WGP, i.e. one per CU, since want_wg() returns WGPs (see its note).
+     * A one-WGP target would accept 44 blocks at a depth-3 verify (four rows, ta = 32); the one-CU
+     * target is worth ~1.3% of the step there. Below about 64 blocks the step degrades sharply.
      *
-     * THE LADDER HALVES ta, so it only ever lands on 44 / 84 / 164 blocks. Across every value of ta
-     * at ONE row -- where the median launch of a decode step lives, and where this rule already
-     * runs at its floor of 4 -- the floor IS the optimum, and it is a SHARP one: ta 4 (81 blocks)
-     * is 18.6 us, ta 5 (65 blocks) is +50% and ta 3 (108 blocks) is +76%, while ta 11, 12 and 24
-     * (31, 28 and 15 blocks) all sit within 1.7 us of each other. Whatever ta 4 does right is NOT a
-     * smooth function of the block count -- 65 blocks is worse than both 81 and 31 -- so do not
-     * reason about this grid from CU occupancy or from a balance argument. Leave it at 4.
-     *
-     * BLOCK COUNT IS RULED OUT AS A DIRECTION HERE. With the prologue's traffic worth zero (above)
-     * and the dot already at 546 GB/s, this kernel has no lever left that is not a restructuring. */
+     * The ladder halves ta, landing on 44 / 84 / 164 blocks. At one row ta's floor of 4 (81 blocks,
+     * 18.6 us) is a sharp optimum: ta 5 (65 blocks) is +50%, ta 3 (108) +76%, while ta 11-24 sit
+     * within 1.7 us of each other. Performance is not smooth in block count, so leave ta at 4. */
     while (ta > 4 && ((lr + ta - 1) / ta) * rows < 2 * want_wg()) ta >>= 1;
 
 #define HC_READ_A(F8_)                                                                           \
-    R4D_EMIT(sk, hc_read_a_kernel<F8_>, dim3((unsigned)((lr + ta - 1) / ta) + 1u, (unsigned)rows), \
+    R4D_EMIT(s, hc_read_a_kernel<F8_>, dim3((unsigned)((lr + ta - 1) / ta) + 1u, (unsigned)rows),  \
              dim3(kThreads), (unsigned)(HN * sizeof(unsigned short)),                             \
              (const unsigned short*)h->data, (const float*)w->data, (const void*)down->data,       \
              (long)dld, injw ? (const unsigned short*)injw->data : nullptr, dbuf,                 \
@@ -4090,18 +3665,15 @@ static int rad_hc_read_body(const RadArgs* a, const R4dSink& sk) {
     emit_rc = f8 ? HC_READ_A(true) : HC_READ_A(false);
 #undef HC_READ_A
     if (emit_rc != RAD_OK) return R4D_NO(RAD_E_DEVICE);
-    if (!sk.desc && hipGetLastError() != hipSuccess) return R4D_NO(RAD_E_DEVICE);
+    if (hipGetLastError() != hipSuccess) return R4D_NO(RAD_E_DEVICE);
 
-    /* THE UP PRODUCT AND THE MIX IN ONE LAUNCH whenever a channel's hc rows divide a workgroup's
-     * 64 and the finisher's counters fit -- which at this model's hc of 4 is every row count this
-     * path takes. A counter makes the launch indescribable, as on the tiled path, so a describe
-     * that would need one declines. */
+    /* Up product and mix in one launch whenever hc divides a workgroup's 64 rows and the
+     * finisher's counters fit (always, at this model's hc 4). */
     const long long ipb   = (hc > 0 && (kUpRows % hc) == 0) ? kUpRows / hc : 0;
     const long long slots = ((rows + hc_up_rg(rows, lr) - 1) / hc_up_rg(rows, lr)) * (n / kUpTB);
     unsigned int* mctr = nullptr;
     fused = ipb > 0 && (kUpTB % ipb) == 0 && (n % ipb) == 0 && slots <= (long long)kMaxMixCtr;
     if (fused && q) {
-        if (sk.desc) return RAD_E_UNSUPPORTED;
         mctr = hc_mix_ctr(s);
         fused = (mctr != nullptr);
     }
@@ -4113,16 +3685,16 @@ static int rad_hc_read_body(const RadArgs* a, const R4dSink& sk) {
                                    q ? (float*)qs->data : nullptr,
                                    rq ? (unsigned char*)rq->data : nullptr,
                                    rq ? (float*)rqs->data : nullptr, mctr, rows, n, (int)hc, lr,
-                                   hrow, xrow, qrow, srow, rqrow, rsrow, wadd, sk);
+                                   hrow, xrow, qrow, srow, rqrow, rsrow, wadd, s);
     else
-        emit_rc = hc_up_launch(up, (long)uld, f8, dbuf, ubuf, rows, HN, lr, sk);
+        emit_rc = hc_up_launch(up, (long)uld, f8, dbuf, ubuf, rows, HN, lr, s);
     if (emit_rc != RAD_OK) return R4D_NO(RAD_E_DEVICE);
-    if (!sk.desc && hipGetLastError() != hipSuccess) return R4D_NO(RAD_E_DEVICE);
+    if (hipGetLastError() != hipSuccess) return R4D_NO(RAD_E_DEVICE);
     }
 
     if (!fused) {
 #define HC_MIX_EMIT(I8_)                                                                         \
-        R4D_EMIT(sk, hc_mix_kernel<I8_>,                                                         \
+        R4D_EMIT(s, hc_mix_kernel<I8_>,                                                          \
                  dim3((unsigned)(n / kUpTB), (unsigned)rows),                                    \
                  dim3(kThreads), 0,                                                              \
                  (const unsigned short*)h->data, (const float*)w->data, ubuf, scale,             \
@@ -4137,8 +3709,7 @@ static int rad_hc_read_body(const RadArgs* a, const R4dSink& sk) {
     }
 
     if (emit_rc != RAD_OK) return emit_rc;
-    return sk.desc ? RAD_OK : (int)hipGetLastError();
+    return (int)hipGetLastError();
 }
-R4D_ENTRY(r4d_rad_hc_read, rad_hc_read_body)
 
 extern "C" void r4d_hc_read_pin_prefill(int form) { g_hc_prefill_form = form; }

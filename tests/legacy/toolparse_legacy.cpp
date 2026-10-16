@@ -288,8 +288,7 @@ size_t utf8_cut(const std::string& s) {
         const unsigned char c = (unsigned char)s[k - 1];
         if ((c & 0xC0) == 0x80) { --k; ++back; continue; }
         size_t need = 1;
-        if ((c & 0x80) == 0x00) need = 1;
-        else if ((c & 0xE0) == 0xC0) need = 2;
+        if ((c & 0xE0) == 0xC0) need = 2;
         else if ((c & 0xF0) == 0xE0) need = 3;
         else if ((c & 0xF8) == 0xF0) need = 4;
         else return n;
@@ -317,28 +316,43 @@ std::string chunk(const nlohmann::ordered_json& delta) {
            "\n\n";
 }
 
+/* The new text `cand` adds to `sent`, cut at a UTF-8 boundary unless final, and `sent` advanced
+ * to it; empty when `cand` does not extend `sent` or nothing new is whole yet. */
+std::string grow(std::string& sent, const std::string& cand, bool is_final) {
+    if (!extends(sent, cand)) return std::string();
+    const size_t safe = is_final ? cand.size() : utf8_cut(cand);
+    if (safe <= sent.size()) return std::string();
+    std::string d = cand.substr(sent.size(), safe - sent.size());
+    sent = cand.substr(0, safe);
+    return d;
+}
+
+/* A delta carrying call `i`'s function fields. */
+std::string call_chunk(size_t i, const nlohmann::ordered_json& function) {
+    nlohmann::ordered_json e;
+    e["index"] = (int64_t)i;
+    e["function"] = function;
+    nlohmann::ordered_json d;
+    d["tool_calls"] = nlohmann::ordered_json::array({ e });
+    return chunk(d);
+}
+
 }  /* namespace */
 
 size_t LegacyDeltaStream::push(const std::string& full_text, bool is_final) {
     Answer p = legacy_parse(tp_, full_text, !is_final, want_calls_, terms_);
     size_t out = 0;
-    if (p.reasoning.size() > reasoning_.size() && extends(reasoning_, p.reasoning)) {
-        const size_t safe = is_final ? p.reasoning.size() : utf8_cut(p.reasoning);
-        if (safe > reasoning_.size()) {
-            nlohmann::ordered_json d;
-            d["reasoning_content"] = p.reasoning.substr(reasoning_.size(), safe - reasoning_.size());
-            out += chunk(d).size();
-            reasoning_ = p.reasoning.substr(0, safe);
-        }
+    const std::string r = grow(reasoning_, p.reasoning, is_final);
+    if (!r.empty()) {
+        nlohmann::ordered_json d;
+        d["reasoning_content"] = r;
+        out += chunk(d).size();
     }
-    if (p.content.size() > content_.size() && extends(content_, p.content)) {
-        const size_t safe = is_final ? p.content.size() : utf8_cut(p.content);
-        if (safe > content_.size()) {
-            nlohmann::ordered_json d;
-            d["content"] = p.content.substr(content_.size(), safe - content_.size());
-            out += chunk(d).size();
-            content_ = p.content.substr(0, safe);
-        }
+    const std::string c = grow(content_, p.content, is_final);
+    if (!c.empty()) {
+        nlohmann::ordered_json d;
+        d["content"] = c;
+        out += chunk(d).size();
     }
     for (size_t i = 0; i < p.calls.size(); ++i) {
         const ToolCall& tc = p.calls[i];
@@ -350,25 +364,13 @@ size_t LegacyDeltaStream::push(const std::string& full_text, bool is_final) {
             nlohmann::ordered_json f;
             f["name"] = tc.name;
             f["arguments"] = "";
-            nlohmann::ordered_json e;
-            e["index"] = (int64_t)i;
-            e["function"] = f;
-            nlohmann::ordered_json d;
-            d["tool_calls"] = nlohmann::ordered_json::array({ e });
-            out += chunk(d).size();
+            out += call_chunk(i, f).size();
         }
-        if (!extends(args_[i], tc.arguments)) continue;
-        const size_t safe = is_final ? tc.arguments.size() : utf8_cut(tc.arguments);
-        if (safe <= args_[i].size()) continue;
+        const std::string a = grow(args_[i], tc.arguments, is_final);
+        if (a.empty()) continue;
         nlohmann::ordered_json f;
-        f["arguments"] = tc.arguments.substr(args_[i].size(), safe - args_[i].size());
-        nlohmann::ordered_json e;
-        e["index"] = (int64_t)i;
-        e["function"] = f;
-        nlohmann::ordered_json d;
-        d["tool_calls"] = nlohmann::ordered_json::array({ e });
-        out += chunk(d).size();
-        args_[i] = tc.arguments.substr(0, safe);
+        f["arguments"] = a;
+        out += call_chunk(i, f).size();
     }
     return out;
 }

@@ -6,44 +6,40 @@
  *                  [--walks N] [--walk-steps N] [--passes N] [--seed N]
  *                  [--oracle cold|all|off]
  *
- * WHY A TOOL AND NOT ONLY A TEST. The mask engine is a precomputed plan over a vocabulary, and
- * how large a key's remainder is, how many keys a grammar needs and what a mask costs are all
- * properties of the vocabulary's real piece-length and byte distributions. A synthetic vocabulary
- * in ctest exercises the same code paths and is held to the same oracle, but it cannot say what a
- * quarter-million-piece byte-level vocabulary costs. This runs the real thing.
+ * A tool as well as a test: mask cost, key remainder sizes and key counts depend on the real
+ * vocabulary's piece-length and byte distributions. ctest's synthetic vocabulary covers the same
+ * code against the same oracle but cannot measure a quarter-million-piece byte-level vocabulary.
  *
- * WHAT IT RUNS, for each grammar -- the chat template's tool-call grammar with parallel tool calls
- * off and on, a set of JSON-schema grammars, and any client GBNF given on the command line:
+ * For each grammar (the chat template's tool-call grammar with parallel tool calls off and on, a
+ * set of JSON-schema grammars, and any client GBNF given) it runs:
  *
- *   compile     from nothing, on a program no earlier run warmed: wall time, what the plan holds,
- *               and what the process's resident set grew by;
- *   replay      realistic outputs (four agent tool calls; a document per schema) tokenised and
- *               driven exactly as Sampler::build_step drives a constrained sequence at depth-3
- *               speculation -- push, accept the drafts, mask every position, roll back, accept --
- *               timing the host work of each step, first on the cold program and then warm;
- *   walks       random walks that take admissible tokens from the mask, draft a speculative window
- *               of up to three tokens (mostly admissible, sometimes not), verify it as the engine
- *               does and accept the verified prefix;
- *   oracle      every mask computed rather than served from the cache (or every mask, with
- *               --oracle all) compared bit for bit, and by status, with upstream's candidate walk.
+ *   compile     from a cold program: wall time, plan contents, and resident-set growth;
+ *   replay      realistic outputs (four agent tool calls; a document per schema) driven exactly as
+ *               Sampler::build_step drives a constrained sequence at depth-3 speculation (push,
+ *               accept the drafts, mask every position, roll back, accept), timing each step's
+ *               host work cold and then warm;
+ *   walks       random walks that draft a window of up to three tokens (mostly admissible), verify
+ *               it as the engine does and accept the verified prefix;
+ *   oracle      every computed mask (or every mask, with --oracle all) compared bit for bit and by
+ *               status with upstream's candidate walk.
  *
- * THE TIMING AND THE ORACLE ARE TWO PASSES, each over a program compiled for it, taking the same
- * walks. The oracle rescans the whole vocabulary per stack and churns through tens of megabytes
- * doing it, and a mask timed right after one is timed with every cache line it needs evicted --
- * which says something about the oracle and nothing about the engine.
+ * Timing and oracle are separate passes over separately compiled programs, taking the same walks:
+ * the oracle rescans the vocabulary per stack and would evict the caches a timed mask needs.
  *
- * It reports mask latency cold (computed) and warm (served from the program's cache) as
- * p50/p99/max -- computed masks at a state carrying a split character separately, since they are
- * served from the vocabulary's resume index -- the replay's per-step cost, compile time, memory
- * and every mismatch, and exits 1 if there was one. With --oracle off it is a latency run only.
+ * Reports cold (computed) and warm (cached) mask latency as p50/p99/max, with computed masks at a
+ * state carrying a split character listed separately (they come from the vocabulary's resume
+ * index); plus per-step replay cost, compile time, memory and every mismatch. Exits 1 on any
+ * mismatch. With --oracle off it is a latency run only.
  */
 #include "gbnf_oracle.h"
+#include "iface.h"
 
 #include "rad_internal.h"
 #include "sample/gbnf.h"
 #include "sample/grammar.h"
 #include "sample/vocab_view.h"
 #include "text/chat.h"
+#include "text/token_view.h"
 #include "text/tokenizer.h"
 
 #include <nlohmann/json.hpp>
@@ -69,34 +65,6 @@ namespace {
 
 /* ================================================================== the vocabulary */
 
-/* The engine's view of a real vocabulary, built the way core/engine_bringup.cpp builds it: pieces
- * are what the decoder chain writes to the output stream, special tokens rendered. */
-class RealView final : public VocabView {
-public:
-    int init(std::shared_ptr<const Vocab> v) {
-        v_ = std::move(v);
-        RAD_TRY(tok_.init(v_));
-        pieces_.resize((size_t)v_->n_tokens());
-        for (int32_t i = 0; i < v_->n_tokens(); ++i)
-            pieces_[(size_t)i] = tok_.piece(i, /*render_special=*/true);
-        return RAD_OK;
-    }
-    int32_t n_tokens() const override { return v_ ? v_->n_tokens() : 0; }
-    const std::string& token_piece(int32_t id) const override {
-        static const std::string kEmpty;
-        return (id >= 0 && (size_t)id < pieces_.size()) ? pieces_[(size_t)id] : kEmpty;
-    }
-    bool is_eog(int32_t id) const override { return v_ && v_->is_eog(id); }
-    int  tokenize(const std::string& s, std::vector<int32_t>* out) const override {
-        return out ? tok_.encode(s, *out, false, false) : RAD_E_INVAL;
-    }
-    const Tokenizer& tok() const { return tok_; }
-
-private:
-    std::shared_ptr<const Vocab> v_;
-    Tokenizer                    tok_;
-    std::vector<std::string>     pieces_;
-};
 
 std::string slurp(const std::string& p, bool* ok) {
     std::ifstream f(p, std::ios::binary);
@@ -147,15 +115,15 @@ struct Dist {
 enum class OracleMode { Off, Cold, All };
 
 struct Run {
-    const RealView* view = nullptr;
+    const TokenView* view = nullptr;
     OracleMode      oracle = OracleMode::Cold;
     int64_t         n_words = 0;
     Dist            cold, cold_split, warm;
     int64_t         compared = 0, mismatches = 0;
     std::vector<int32_t> structural;   /* pieces that carry structure, to steer the walks */
 
-    /* One mask, timed and classified by whether the program had to compute it -- or, on the
-     * oracle's pass, held to the oracle and not timed. */
+    /* One mask: timed and classified as computed or cached, or on the oracle pass, compared and
+     * not timed. */
     int mask(const GbnfGrammar& g, uint32_t* m, const char* where, double* engine_ms = nullptr) {
         const uint64_t w0 = g.masks_walked();
         const bool     split = g.partial().n_remain > 0;
@@ -272,8 +240,8 @@ std::string go_file() {
     return s;
 }
 
-/* Four calls an agent makes, in the XML-parameter tool-call syntax. A template with another
- * syntax does not admit them and is exercised by the walks alone. */
+/* Four agent tool calls in the XML-parameter syntax. Templates with another syntax are exercised
+ * by the walks only. */
 std::vector<std::string> tool_call_texts() {
     return {
         "<tool_call>\n<function=bash>\n<parameter=command>\n"
@@ -292,9 +260,9 @@ std::vector<std::string> tool_call_texts() {
     };
 }
 
-/* JSON schemas of the shapes response_format and tool arguments take, each with a document it
- * admits, written the way a model writes one. The converter emits required properties before
- * optional ones, and reads an empty schema as any object, so the documents do too. */
+/* JSON schemas shaped like response_format and tool arguments, each with an admitted document as a
+ * model would write it. The converter puts required properties before optional ones and reads an
+ * empty schema as any object; the documents follow suit. */
 struct SchemaCase { const char* name; const char* schema; std::vector<std::string> docs; };
 
 std::vector<SchemaCase> schema_cases() {
@@ -384,8 +352,8 @@ uint64_t xorshift(uint64_t& s) {
     return s;
 }
 
-/* A fresh copy of the grammar text: a trailing comment changes the program cache's key and not
- * the grammar, so the compile and every mask start from nothing. */
+/* A fresh copy of the grammar text: a trailing comment changes the program cache key but not the
+ * grammar, so the compile and every mask start cold. */
 std::string fresh(const std::string& text) {
     static int n = 0;
     return text + "\n# rad-gbnf-check run " + std::to_string(++n) + "\n";
@@ -442,12 +410,11 @@ Replay replay(Run& run, GbnfGrammar& g, const std::vector<int32_t>& toks, const 
     return r;
 }
 
-/* Random walks through the grammar: each step drafts a window of up to three tokens, mostly from
- * what the mask admits, masks every position of it, verifies it the way the engine does and
- * accepts the verified prefix and one more. Returns the masks taken. */
+/* Random walks: each step drafts up to three tokens (mostly admissible), masks every position,
+ * verifies as the engine does and accepts the verified prefix plus one. Returns the masks taken. */
 int64_t walks(Run& run, const std::string& text, int n_walks, int n_steps, uint64_t seed,
               const char* where) {
-    const RealView& v = *run.view;
+    const TokenView& v = *run.view;
     const int32_t n_tok = v.n_tokens();
     int64_t masks = 0;
     for (int w = 0; w < n_walks; ++w) {
@@ -505,7 +472,7 @@ struct Totals {
 void run_grammar(Run& base, Totals& tot, const std::string& label, const std::string& text,
                  const std::vector<std::string>& docs, int passes, int n_walks, int n_steps,
                  uint64_t seed) {
-    const RealView& v = *base.view;
+    const TokenView& v = *base.view;
     std::printf("\n== %s: %zu bytes of GBNF\n", label.c_str(), text.size());
 
     /* Compile from nothing. */
@@ -546,8 +513,7 @@ void run_grammar(Run& base, Totals& tot, const std::string& label, const std::st
         texts.push_back(std::move(toks));
     }
 
-    /* The timing pass, on the program just compiled: the first replay pass is the first request
-     * that ever used the grammar; later passes are warm. */
+    /* Timing pass on the program just compiled: the first replay pass is cold, later ones warm. */
     Run run;
     run.view = base.view;
     run.oracle = OracleMode::Off;
@@ -590,8 +556,8 @@ void run_grammar(Run& base, Totals& tot, const std::string& label, const std::st
     tot.cold_split.merge(run.cold_split);
     tot.warm.merge(run.warm);
 
-    /* The oracle's pass, on a second program compiled from nothing, over the same replays and
-     * walks: every mask the timing pass computed is computed again here and compared. */
+    /* Oracle pass on a second cold program over the same replays and walks; every mask the
+     * timing pass computed is recomputed and compared. */
     if (base.oracle == OracleMode::Off) return;
     const std::string oracle_text = fresh(text);
     Run orc;
@@ -634,18 +600,28 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); std::exit(2); }
             return argv[++i];
         };
+        auto num = [&](const char* flag, int64_t lo, int64_t hi) {
+            return rad_flag_int("rad-gbnf-check", flag, next().c_str(), lo, hi);
+        };
         if (a == "--tokenizer") tok_path = next();
         else if (a == "--template") tpl_path = next();
         else if (a == "--tokenizer-config") cfg_path = next();
         else if (a == "--schema") schema_files.push_back(next());
         else if (a == "--gbnf") gbnf_files.push_back(next());
-        else if (a == "--walks") n_walks = std::atoi(next().c_str());
-        else if (a == "--walk-steps") n_steps = std::atoi(next().c_str());
-        else if (a == "--passes") passes = std::atoi(next().c_str());
-        else if (a == "--seed") seed = (uint64_t)std::strtoull(next().c_str(), nullptr, 10);
+        else if (a == "--walks") n_walks = (int)num(a.c_str(), 0, INT32_MAX);
+        else if (a == "--walk-steps") n_steps = (int)num(a.c_str(), 0, INT32_MAX);
+        else if (a == "--passes") passes = (int)num(a.c_str(), 0, INT32_MAX);
+        else if (a == "--seed") seed = (uint64_t)num(a.c_str(), 0, INT64_MAX);
         else if (a == "--oracle") {
             const std::string m = next();
-            oracle = m == "all" ? OracleMode::All : m == "off" ? OracleMode::Off : OracleMode::Cold;
+            if (m == "all") oracle = OracleMode::All;
+            else if (m == "off") oracle = OracleMode::Off;
+            else if (m == "cold") oracle = OracleMode::Cold;
+            else {
+                std::fprintf(stderr, "rad-gbnf-check: --oracle takes cold, all or off, not '%s'\n",
+                             m.c_str());
+                return 2;
+            }
         } else { usage(); return 2; }
     }
     if (tok_path.empty() || tpl_path.empty()) { usage(); return 2; }
@@ -655,8 +631,8 @@ int main(int argc, char** argv) {
                    "tokenizer_config.json";
     }
 
-    /* The report prints every compile itself, so the engine's per-compile line is left out,
-     * and stdout is line-buffered so that a warning cannot land in the middle of a report line. */
+    /* The report prints compiles itself, so the engine's per-compile line is suppressed; stdout is
+     * line-buffered so warnings cannot land mid-line. */
     rad::log_set_level(rad::Log::Warn);
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
 
@@ -668,7 +644,7 @@ int main(int argc, char** argv) {
     }
     auto vocab = std::make_shared<Vocab>();
     if (vocab->load(std::move(vb)) < 0) return 2;
-    RealView view;
+    TokenView view;
     if (view.init(vocab) < 0) return 2;
     const double rss_vocab = rss_mib();
 

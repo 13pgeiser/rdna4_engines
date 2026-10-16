@@ -1,14 +1,13 @@
-/* aql_blit.hip -- the copy and fill kernels the AQL backend dispatches for rad_memcpy_async,
- * rad_memcpy_2d_async and rad_memset_async.
+/* aql_blit.hip -- copy and fill kernels behind rad_memcpy_async, rad_memcpy_2d_async and
+ * rad_memset_async on the AQL backend.
  *
- * A copy on this backend is a kernel on the stream's own queue, the same as HIP's blit path: the
- * alternative is the DMA engine, which is a second queue to order against with signals and costs
- * more in latency than a small copy takes to run. Every address these kernels see is one the GPU
- * can reach directly -- device memory, a peer's, or pinned host memory; pageable host memory is
- * staged by the caller.
+ * A copy is a kernel on the stream's own queue, like HIP's blit path. The DMA engine would be a
+ * second queue to order against with signals, and its latency exceeds a small copy's run time.
+ * Every address is GPU-reachable (device, peer or pinned host memory); the caller stages
+ * pageable host memory.
  *
- * The launchers go through hipLaunchKernel like any plugin's, and the backend intercepts that, so
- * these kernels are dispatched exactly as a kernel library's are.
+ * The launchers go through hipLaunchKernel, which the backend intercepts, so these kernels are
+ * dispatched like any kernel library's.
  */
 #include <hip/hip_runtime.h>
 
@@ -24,8 +23,8 @@ constexpr uint64_t kMaxBlocks = 2048;
 
 typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
 
-/* Four loads in flight a thread before the first store: a copy that reads pinned host memory is
- * link-latency bound, and one outstanding load a thread leaves most of the link idle. */
+/* Four loads in flight per thread before the first store: a copy from pinned host memory is
+ * link-latency bound, and one outstanding load per thread leaves most of the link idle. */
 __global__ __launch_bounds__(kThreads) void aql_copy16(const u32x4* __restrict__ src,
                                                        u32x4* __restrict__ dst, uint64_t n) {
     const uint64_t stride = (uint64_t)gridDim.x * kThreads;
@@ -37,15 +36,12 @@ __global__ __launch_bounds__(kThreads) void aql_copy16(const u32x4* __restrict__
     for (; i < n; i += stride) dst[i] = src[i];
 }
 
-/* A COPY THAT READS OR WRITES ACROSS THE LINK IS ONE WORKGROUP OF FOUR WAVES.
+/* A copy across the link (pinned host memory) is one workgroup of four waves.
  *
- * The link delivers ~29 GB/s whatever the grid, so the only question is how few waves reach that,
- * because every wave a copy holds is one the compute queue's kernels do not get while the copy
- * crawls along at link speed. A wide link copy -- 16 workgroups of 256 threads, 128 waves -- costs
- * a prefill whose stager keeps a copy running beside every layer ~15%: hc_read at a 2048-row chunk
- * takes 1154 us a call with such copies running and 609 without, because its down product is
- * exactly one wave of workgroups on the part and any slot a copy holds pushes some of it into a
- * second. Link bandwidth by grid, one card, 89 MB from pinned host memory:
+ * The link delivers ~29 GB/s regardless of grid size, so the copy should hold as few waves as
+ * possible: every wave it holds is denied to compute kernels for the copy's duration (a wide link
+ * copy beside each layer slows a staged prefill by ~15%). Link bandwidth by grid, one card,
+ * 89 MB from pinned host memory:
  *
  *     16 x 256 threads, 4 loads in flight    28.9 GB/s
  *      1 x 256 threads, 16 in flight         28.9
@@ -54,11 +50,10 @@ __global__ __launch_bounds__(kThreads) void aql_copy16(const u32x4* __restrict__
  *      1 x  64 threads,  8 in flight         10.4
  *
  * 32 KiB in flight is several times the link's bandwidth-delay product; fewer threads leave the
- * link idle, and 32 loads a thread spill. Non-temporal loads and stores change nothing: it is the
- * slots, not the caches.
+ * link idle and 32 loads per thread spill. Non-temporal loads and stores make no difference.
  *
- * The last round loads clamped rather than guarded, so its loads are all in flight at once: a
- * guarded load waits for the one before it. */
+ * The last round clamps its load indices instead of guarding them, so all its loads are in flight
+ * at once; a guarded load waits for the one before it. */
 constexpr int kLinkThreads = 128, kLinkDepth = 16;
 constexpr uint64_t kLinkByteBlocks = 16;
 
@@ -119,11 +114,11 @@ __global__ __launch_bounds__(kThreads) void aql_copy2d1(const unsigned char* __r
     }
 }
 
-/* A RANGED COPY: the first `prefix_blocks` workgroups move the prefix as aql_copy16 does, and each
- * workgroup after them one range. A range is four-byte aligned only, so it moves in words, sixteen
- * a thread a round: every load of a round is issued before its first store, since each is a read
- * across the link, and the loads past the range's end read its last word rather than branch
- * around the load -- a guarded load waits for the one before it. */
+/* Ranged copy: the first `prefix_blocks` workgroups copy the prefix as aql_copy16 does, and each
+ * later workgroup copies one range. Ranges are only 4-byte aligned, so they move in words, 16 per
+ * thread per round, with all loads issued before the first store (each is a read across the
+ * link). Loads past the range end clamp to its last word instead of branching, since a guarded
+ * load waits for the one before it. */
 constexpr int kRangeWords = 16;
 
 __global__ __launch_bounds__(kThreads) void aql_copy_ranges(const u32x4* __restrict__ src16,
@@ -199,8 +194,8 @@ extern "C" int rad_aql_blit_copy(void* dst, const void* src, uint64_t bytes, voi
             hipLaunchKernelGGL(aql_copy16, dim3(blocks_for(n, 4 * kThreads)), dim3(kThreads), 0,
                                s, (const u32x4*)src, (u32x4*)dst, n);
     } else {
-        /* Unaligned: byte copies, one byte a thread in flight, so across the link they take
-         * sixteen workgroups rather than the one narrow workgroup of the aligned path. */
+        /* Unaligned: byte copies have one byte per thread in flight, so across the link they
+         * use 16 workgroups instead of the aligned path's one. */
         const uint64_t cap = link ? kLinkByteBlocks : kMaxBlocks;
         hipLaunchKernelGGL(aql_copy1, dim3(blocks_for(bytes, 4 * kThreads, cap)), dim3(kThreads),
                            0, s, (const unsigned char*)src, (unsigned char*)dst, bytes);

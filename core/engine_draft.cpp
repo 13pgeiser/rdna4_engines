@@ -1,12 +1,8 @@
 /* engine_draft.cpp -- the two drafter drivers (spec §10).
  *
- * A draft head runs as EXTRA PASSES after the trunk step has been sampled and committed, and
- * there are two shapes of it: SERIAL runs `depth` dependent passes, BLOCK runs a context pass and
- * then one pass that fills the whole block. Which one this program has is what the architecture
- * plugin DECLARED (rad_declare_drafter); nothing in this file knows what model it is.
- *
- * Split out of the step loop's file because both drivers are the same idea from the loop's point
- * of view -- one call after commit -- and neither is on the trunk path. See engine_priv.h.
+ * A draft head runs as extra passes after the trunk step. SERIAL runs `depth` dependent passes;
+ * BLOCK runs a context pass, then one pass that fills the whole block. The architecture plugin
+ * declares which (rad_declare_drafter); nothing here depends on the model.
  */
 #include "engine_priv.h"
 
@@ -16,7 +12,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -24,8 +19,8 @@
 namespace rad {
 
 /* ------------------------------------------------------------------ the card's step state */
-/* Every rank's StepSlots, zeroed, and its sorted end-of-generation ids; and the pinned host copy
- * of rank 0's slots that the step reads back. Once, at start: nothing on the step path allocates. */
+/* Every rank's zeroed StepSlots and sorted end-of-generation ids, and the pinned host copy of rank
+ * 0's slots the step reads back. Allocated once at start, so the step path never allocates. */
 int Engine::step_state_init() {
     std::vector<int32_t> eog;
     if (vocab_) eog = vocab_->eog();
@@ -73,41 +68,27 @@ void Engine::step_state_fini() {
 
 /* ------------------------------------------------------------------ the serial driver
  *
- * `RAD_DRAFT_SERIAL`: one forward pass of the head per drafted token, after the trunk step. Round 1
- * consumes the token the sampler chose and the hidden state of the position that token came from,
- * and which position that is depends on how many drafts the verify accepted. Its pass is the
- * history pass, which the head runs anyway and whose rows already include that position
- * (RadBatch::draft_out_ids).
+ * RAD_DRAFT_SERIAL: one head pass per drafted token after the trunk step (MTP, EAGLE, Medusa).
+ * Round 1 consumes the sampled token and the hidden state of the position it came from, which
+ * depends on how many drafts were accepted; it runs in the history pass, whose rows include that
+ * position (RadBatch::draft_out_ids).
  *
- * THE CARD DECIDES THAT, NOT THE HOST (sched/advance.h). Behind the trunk's sampler every rank
- * runs the acceptance itself and keeps what it implies in its StepSlots; every draft pass is then
- * staged with its positions and tokens left to the card, and an advance in front of the pass fills
- * them in. So the host issues the whole step -- trunk, history, every round -- without waiting for
- * any of it, and reads the step back once, after the last round. Reading the sampled ids back and
- * staging round 1 from them instead would leave the card idle for a wake, a readback, a commit and
- * a batch build on every step.
+ * The card, not the host, resolves those positions (sched/advance.h): behind the trunk's sampler
+ * every rank runs the acceptance into its StepSlots, and an advance before each draft pass fills
+ * in its positions and tokens. So the host issues the whole step (trunk, history, every round)
+ * without waiting and reads back once after the last round, instead of idling the card for a
+ * readback, commit and batch build per step.
  *
- * Every pass is an ordinary step: a RadBatch run through the same barrier and the same sampler
- * chain. What makes it a draft pass is `draft_pass`, which the architecture plugin reads to run
- * the head instead of the trunk.
- *
- * The tokens go out through set_draft(), the same door the prompt-lookup drafter uses, so the
- * next step cannot tell them apart -- and a sequence the head declined leaves n_draft at 0,
- * which is exactly the case where the n-gram drafter gets its turn.
- *
- * NOTHING HERE NAMES A MODEL. An MTP head has this shape, and an EAGLE or Medusa head declares
- * RAD_DRAFT_SERIAL and runs on it unchanged.
+ * Each pass is an ordinary RadBatch through the same barrier and sampler chain; `draft_pass`
+ * tells the plugin to run the head. Tokens go out through set_draft(), like prompt lookup's; a
+ * sequence the head declined keeps n_draft 0, leaving it to the n-gram drafter.
  */
 bool Engine::serial_drafting() const {
-    /* THE BISECT KNOB COVERS BOTH DRIVERS. RADIANCE_NO_DRAFT means "propose nothing" -- it is
-     * how a speculative deployment is compared against itself with the drafts taken out, which
-     * separates "is the deferred state right" from "is the rollback right". */
-    static const bool no_draft = std::getenv("RADIANCE_NO_DRAFT") != nullptr;
-    return drafter_.kind == RAD_DRAFT_SERIAL && drafter_.depth > 0 && !no_draft;
+    return drafter_.kind == RAD_DRAFT_SERIAL && drafter_.depth > 0;
 }
 
-/* One advance on every rank, against the build the scheduler just produced -- over its first
- * `rows` rows when that is given, and all of them otherwise. */
+/* One advance on every rank against the scheduler's latest build, over its first `rows` rows
+ * when given, else all. */
 int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
     for (size_t i = 0; i < ranks_.size(); ++i) {
         Rank& rk = *ranks_[i];
@@ -136,46 +117,35 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
     return RAD_OK;
 }
 
-/* THE STEP'S DRAFT PASSES, ISSUED BEHIND IT WITHOUT WAITING FOR IT. Called once the trunk step's
- * ranks have joined: acceptance on every rank, the sampled ids on their way to the host before a
- * draft round can overwrite them, then the history pass and every round, and last the final
- * proposal into the slots and the slots on their way back. Nothing here synchronises; the step's
- * one wait is collect_step's. */
-int Engine::issue_serial_drafter(int step, const RadBatch* b, StepOut& so) {
+/* Issue the step's draft passes behind it, without waiting. After the trunk's ranks join: the
+ * acceptance on every rank, the sampled-id readback (before a round can overwrite them), the
+ * history pass and every round, then the final proposal into the slots and their readback.
+ * Nothing synchronises here; collect_step has the step's one wait. */
+int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_rounds_ = 0;
     serial_rows_   = 0;
     serial_done_   = 0;
-    /* A step that may be followed by one issued ahead needs the card's acceptance whether or not
-     * anything drafts: that step's rows continue from it. */
+    /* A step issued ahead continues from the card's acceptance, so run it even without drafts. */
     if (!serial_drafting()) {
         if (pipelining_) RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
         return RAD_OK;
     }
 
     RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
-    RAD_TRY(collect_issue(b, so));
+    RAD_TRY(collect_issue(so));
 
     int rounds = drafter_.depth;
     serial_row_.resize((size_t)cfg_.max_seqs);
-    /* `n` counts the rows that can DRAFT. It can be zero while the history pass still has work:
-     * a sequence three chunks into a long prompt has hidden states the head's attention will need
-     * and no token to propose from yet. */
+    /* `n` counts rows that can draft. It can be zero while the history pass still has work (a
+     * mid-prompt sequence has hidden states the head needs but no token to propose from). */
     const int n = sched_.serial_begin(&rounds, serial_row_.data(), (int)serial_row_.size());
     if (rounds <= 0) return RAD_OK;
     serial_rounds_ = rounds;
     serial_rows_   = n;
 
-    /* RADIANCE_DEBUG_STAGE: WHERE A DRAFT PASS'S HOST TIME GOES. It splits the pass four ways --
-     * the batch and its advance, the greedy sampler chain, and the BARRIER PAIR that hands the
-     * pass to the rank threads and waits for them to finish issuing -- and prints a running mean
-     * of each:
-     *
-     *   D draft: <n> passes -- batch, sampler, release, issue, in us a pass
-     *
-     * All four are host time the device spends running the pass before, so they cost the step
-     * nothing until their sum exceeds a pass's device time.
-     *
-     * Off by default; four clock reads a pass when it is on. */
+    /* RADIANCE_DEBUG_STAGE: running means of a draft pass's host time: batch + advance, greedy
+     * sampler chain, barrier release and issue. They cost the step nothing until their sum exceeds
+     * the previous pass's device time. */
     static const bool stg = std::getenv("RADIANCE_DEBUG_STAGE") != nullptr;
     static double a_batch = 0, a_samp = 0, a_rel = 0, a_iss = 0;
     static long   n_pass = 0;
@@ -186,23 +156,18 @@ int Engine::issue_serial_drafter(int step, const RadBatch* b, StepOut& so) {
         const auto tA = std::chrono::steady_clock::now();
         const RadBatch* db = sched_.serial_batch(rd, step);
         if (!db) { if (rd == 0) continue; break; }
-        /* PASS 0 IS THE HISTORY PASS: the head attends to its own K and V, nothing else in the
-         * engine writes them, and a prefill leaves them untouched. It is also DRAFT ROUND 1 for
-         * every row that drafts -- that round's inputs are the last row of the row's history run
-         * (RadBatch::draft_out_ids) -- so it ends in the lm_head over those rows. Round r >= 2
-         * embeds the token round r-1 proposed, and the advance takes it from that round's
-         * proposal buffer on the card. */
+        /* Pass 0 is the history pass, writing the head's own K and V (nothing else does). It is
+         * also draft round 1 for drafting rows, whose inputs are the last row of their history run
+         * (RadBatch::draft_out_ids), so it ends in the lm_head over those rows. Round r >= 2 embeds
+         * round r-1's proposal, which the advance takes from the proposal buffer on the card. */
         const int drafted = rd == 0 ? (int)db->n_draft_out : n;
         RAD_TRY(advance_all(rd == 0 ? ADV_HIST : ADV_ROUND, rd, rd > 0));
         const auto tB = std::chrono::steady_clock::now();
 
-        /* GREEDY, AND NOT THE REQUEST'S SAMPLER. A draft is a proposal the target then verifies
-         * greedily (core/sample/accept.h), so sampling it at the request's temperature would
-         * spend that request's RNG stream on tokens that may never be emitted and lower
-         * acceptance for nothing. Scheduler-thread work, before the release, like build_step.
-         *
-         * A head with its own proposal buffer samples nothing at all, so its chain is zero rows
-         * wide -- the same chain the history pass builds, for the same reason. */
+        /* Greedy, not the request's sampler: the target verifies against its own draw
+         * (core/sample/accept.h), so sampling a draft would spend the request's RNG stream and
+         * lower acceptance. A head with its own proposal buffer samples nothing (a zero-row
+         * chain). */
         for (auto& rk : ranks_) {
             int s = rk->sampler.build_greedy(drafter_.proposal ? 0 : drafted);
             if (s < 0) {
@@ -214,10 +179,8 @@ int Engine::issue_serial_drafter(int step, const RadBatch* b, StepOut& so) {
         const auto tC = std::chrono::steady_clock::now();
         issue_what_.store(kIssueAll, std::memory_order_release);
         step_batch_.store(db, std::memory_order_release);
-        /* THE TWO CROSSINGS ARE NOT THE SAME MEASUREMENT and timing them together hides which.
-         * The first RELEASES -- the rank threads are already parked on it, so the drafter is last
-         * in and returns as soon as it has notified, which prices the wake. The second WAITS for
-         * them to finish issuing the pass, so it prices the ISSUE. */
+        /* Timed separately: the first crossing releases the parked ranks (the wake), the second
+         * waits for them to finish issuing (the issue). */
         barrier_->arrive_and_wait();
         const auto tC2 = std::chrono::steady_clock::now();
         barrier_->arrive_and_wait();
@@ -236,19 +199,18 @@ int Engine::issue_serial_drafter(int step, const RadBatch* b, StepOut& so) {
             a_rel   += us(tC2 - tC).count();
             a_iss   += us(tD - tC2).count();
             if (++n_pass % 400 == 0)
-                std::fprintf(stderr, "D draft: %ld passes -- batch %.1f, sampler %.1f, "
-                                     "release %.1f, issue %.1f us a pass\n",
-                             n_pass, a_batch / (double)n_pass, a_samp / (double)n_pass,
-                             a_rel / (double)n_pass, a_iss / (double)n_pass);
+                RAD_INFO("draft: %ld passes; batch %.1f, sampler %.1f, release %.1f, issue %.1f us "
+                         "a pass", n_pass, a_batch / (double)n_pass, a_samp / (double)n_pass,
+                         a_rel / (double)n_pass, a_iss / (double)n_pass);
         }
         if (rd > 0) serial_done_ = rd;
         else if (drafted > 0) serial_done_ = 1;
     }
     if (serial_done_ <= 0 || n <= 0) return RAD_OK;
 
-    /* The last round's proposal, which no later round takes, into the slots; and rank 0's slots
-     * back to the host behind it. Over the drafting rows alone: at depth 1 the last pass is the
-     * history pass, whose rows after them only owed history (Scheduler::serial_batch). */
+    /* The last round's proposal into the slots, then rank 0's slots back to the host. Only the
+     * drafting rows: at depth 1 the last pass is the history pass, whose later rows only carried
+     * history (Scheduler::serial_batch). */
     RAD_TRY(advance_all(ADV_TAKE, serial_done_, true, n));
     Rank& r0 = *ranks_[0];
     RAD_TRY(rad_memcpy_async(slots_host_, r0.step_slots,
@@ -256,10 +218,9 @@ int Engine::issue_serial_drafter(int step, const RadBatch* b, StepOut& so) {
     return RAD_OK;
 }
 
-/* AFTER COMMIT: the host's acceptance against the card's, then the proposals out through
- * set_draft and the history watermark moved. The card's acceptance positioned every draft pass,
- * so a disagreement is a defect in one of the two rules and the step is refused rather than
- * served with drafts from the wrong positions. */
+/* After commit: check the host's acceptance against the card's, publish the proposals through
+ * set_draft, and move the history watermark. The card's acceptance positioned every draft pass,
+ * so a disagreement is a defect and the step is refused. */
 int Engine::finish_serial_drafter(const StepOut& so) {
     if (!serial_drafting() || serial_rounds_ <= 0) return RAD_OK;
     const StepPlan& plan = sched_.plan();
@@ -289,11 +250,8 @@ int Engine::finish_serial_drafter(const StepOut& so) {
             draft_out_[(size_t)i * (size_t)rounds + (size_t)(rd - 1)] = S.tok[rd];
     }
     for (int i = 0; i < serial_rows_; ++i) {
-        /* A REQUEST THE SAMPLER WILL NOT SPECULATE ON GETS NO DRAFT. That is a constraining
-         * grammar whose backend cannot snapshot its state: the mask for draft position i depends
-         * on which of 0..i-1 were accepted, and the sampler refuses the whole step rather than
-         * masking against a state the sequence is not in -- which would be a hard failure on the
-         * next step rather than a skipped draft here. */
+        /* No draft for a request the sampler will not speculate on (a constraining grammar that
+         * cannot snapshot its state); the sampler would refuse the next step otherwise. */
         if (!r0.sampler.allows_speculation(serial_row_[(size_t)i].seq)) continue;
         sched_.set_draft(serial_row_[(size_t)i].seq,
                          &draft_out_[(size_t)i * (size_t)rounds], done);
@@ -303,37 +261,26 @@ int Engine::finish_serial_drafter(const StepOut& so) {
 
 /* ------------------------------------------------------------------ the block driver
  *
- * `RAD_DRAFT_BLOCK`: the same slot in the step as the serial driver and a completely different
- * shape. SERIAL is one forward a drafted token, each embedding what the last one proposed. A
- * BLOCK drafter is block-diffusion: ONE backbone pass over a block of `block` positions -- an
- * anchor and `block - 1` masked slots -- proposes `depth` tokens together, so depth is free and
- * there are no rounds to chain. `block` is the drafter's own (it is `depth + 1` when the anchor
- * row predicts nothing and `depth` when it does; rad_builder.h has both conventions).
+ * RAD_DRAFT_BLOCK (block diffusion, e.g. DFlash2): one backbone pass over `block` positions (an
+ * anchor and `block - 1` masked slots) proposes `depth` tokens at once, with no rounds. `block` is
+ * the drafter's own: depth + 1 when the anchor row predicts nothing, depth when it does
+ * (rad_builder.h). Two passes:
  *
- * What there is instead is TWO passes with different shapes, and the split is what a
- * block-diffusion architecture asks for:
+ *   Context pass: mirrors the trunk step just run. The drafter projects the trunk's tapped hidden
+ *   states and stores K and V for those positions in its own cache, over exactly the trunk's rows
+ *   in order.
  *
- *   THE CONTEXT PASS mirrors the trunk step that just ran. The drafter reads the trunk's tapped
- *   hidden states, projects them, and stores K and V for those positions in a cache of its own --
- *   so it runs over exactly the rows the trunk produced, in exactly that order.
+ *   Query pass: the drafter's layers over the block fill every masked position. Its own selector
+ *   writes the tokens to the plugin's `proposal` buffer, which is why RAD_DRAFT_BLOCK requires
+ *   one.
  *
- *   THE QUERY PASS runs the drafter's own layers over the block and fills every masked position.
- *   The tokens land in the buffer the plugin named as `proposal` -- not in the sampler's, because
- *   what chooses here is the drafter's own selector and it is not a sampler. That is why
- *   RAD_DRAFT_BLOCK requires a proposal buffer and RAD_DRAFT_SERIAL does not.
- *
- * They go out through set_draft() like every other proposal, so nothing downstream can tell a
- * block draft from a prompt-lookup one.
+ * Proposals go out through set_draft() like every other.
  */
 int Engine::run_block_drafter(int step) {
     if (drafter_.kind != RAD_DRAFT_BLOCK || drafter_.depth <= 0) return RAD_OK;
-    static const bool no_draft = std::getenv("RADIANCE_NO_DRAFT") != nullptr;
-    if (no_draft) return RAD_OK;
 
     const int steps = drafter_.depth;
-    /* THE ROW COUNT IS THE DRAFTER'S, not `depth + 1`. Both are legal and the plugin knows which
-     * one its checkpoint was trained in; rad_builder.h has the two conventions side by side, and
-     * declare_drafter has already defaulted and checked this. */
+    /* The row count is the drafter's (defaulted and checked by declare_drafter). */
     const int block = drafter_.block > 0 ? (int)drafter_.block : drafter_.depth + 1;
     std::vector<Scheduler::BlockRow> rows((size_t)cfg_.max_seqs);
     const int n = sched_.block_begin(block, steps, (int)drafter_.window, drafter_.mask_token,
@@ -347,41 +294,8 @@ int Engine::run_block_drafter(int step) {
         return RAD_E_STATE;
     }
 
-    /* THE BISECT. RADIANCE_DRAFT_RAW=<buffer> drafts column 0 of that buffer instead of the
-     * drafter's proposal, which for DFlash2 (`df_cand`) is the draft head's own argmax at every
-     * mask row with the selector's walk thrown away. The two halves of such a drafter fail the
-     * same way from the outside -- acceptance near zero, output still exactly correct -- and they
-     * are otherwise hard to tell apart: if the backbone is sound the argmax already accepts, and
-     * if it is not, no path through the candidates can save it. Debug-only, and it makes the
-     * drafter WORSE when everything works, which is the point.
-     *
-     * A NAME, because the buffer is the plugin's own and the core has no business knowing which
-     * drafters have an intermediate worth reading. The match is on the suffix, since a drafter
-     * declares into a scope; being a debug knob that names one buffer, that is exactly as precise
-     * as it needs to be. */
-    static const char* const raw_name = std::getenv("RADIANCE_DRAFT_RAW");
-    if (raw_name && *raw_name && !raw_buf_) {
-        const std::string want(raw_name);
-        for (size_t i = 1; i < r0.program.buffers.size(); ++i) {
-            const std::string& nm = r0.program.buffers[i].name;
-            if (nm.size() >= want.size() &&
-                nm.compare(nm.size() - want.size(), want.size(), want) == 0) {
-                raw_buf_ = (rad_buf)i;
-                break;
-            }
-        }
-        if (!raw_buf_) {
-            RAD_ERR("RADIANCE_DRAFT_RAW=%s names no buffer in this program", raw_name);
-            return RAD_E_NOTFOUND;
-        }
-        RAD_INFO("drafter '%s': proposing column 0 of `%s` instead of `%s` (RADIANCE_DRAFT_RAW)",
-                 drafter_.name, r0.program.buffers[raw_buf_].name.c_str(),
-                 r0.program.buffers[drafter_.proposal].name.c_str());
-    }
-
-    /* Neither pass samples: the context pass produces no logits at all, and the query pass ends in
-     * the drafter's own selector. A zero-row sampler chain is what the serial driver's history
-     * pass builds for the same reason. */
+    /* Neither pass samples (no logits in the context pass; the query pass has its own selector),
+     * so the sampler chain is zero rows. */
     auto run_pass = [&](const RadBatch* db, const char* what) -> int {
         for (auto& rk : ranks_) {
             int s = rk->sampler.build_greedy(0);
@@ -398,52 +312,27 @@ int Engine::run_block_drafter(int step) {
         if (s < 0)
             RAD_ERR("drafter '%s': %s pass of step %d failed: %s -- the engine cannot continue",
                     drafter_.name, what, step, rad_strerror(s));
-        /* THE PROBE HAS TO SEE INSIDE THESE TOO. A drafter that runs as extra passes leaves every
-         * one of its buffers holding the PREVIOUS step's values at the moment the step loop dumps,
-         * so reading them there answers a question one iteration out of date -- which is how a
-         * context pass that produces NaN reads as a query pass that consumes it. */
-        if (s >= 0 && (int)log_level() >= (int)Log::Trace)
-            dump_buffers(r0.ctx, step, std::getenv("RADIANCE_DUMP_BUF"), what);
+        /* Probe after each pass; by the step loop's dump these buffers hold stale values. */
+        if (s >= 0) dump_buffers(r0.ctx, step, what);
         return s;
     };
 
-    /* THE CONTEXT PASS RUNS EVEN WHEN NOTHING CAN DRAFT. A sequence three chunks into a long
-     * prompt has hidden states the drafter's attention will need and no token to anchor on yet --
-     * exactly the case where skipping it would leave a hole nothing ever fills. */
-    /* RADIANCE_DRAFT_NOCTX=1 runs no context pass at all, so the query block attends to whatever
-     * the drafter's KV cache already held. It answers one question and it is the question that
-     * splits the drafter in half: if acceptance does not move, the conditioning is not reaching
-     * the query pass and the backbone is drafting from the anchor token alone. */
-    static const bool no_ctx = std::getenv("RADIANCE_DRAFT_NOCTX") != nullptr;
-    if (!no_ctx)
-        if (const RadBatch* cb = sched_.block_context(step)) RAD_TRY(run_pass(cb, "context"));
+    /* The context pass runs even when nothing drafts: a mid-prompt sequence has hidden states the
+     * drafter will need, and skipping would leave a permanent hole in its cache. */
+    if (const RadBatch* cb = sched_.block_context(step)) RAD_TRY(run_pass(cb, "context"));
 
-    /* EMPTY UNTIL THIS CALL'S QUERY PASS FILLS IT. It is a member, so a query batch that could
-     * not be built would otherwise leave the previous step's proposals standing -- published
-     * below as this step's, and sized for however many rows drafted then, which may be fewer
-     * than drafted now. */
+    /* Cleared so a query batch that could not be built does not republish the previous step's
+     * proposals. */
     draft_out_.clear();
     if (n > 0) {
         if (const RadBatch* qb = sched_.block_query(step)) {
             RAD_TRY(run_pass(qb, "query"));
-            draft_out_.assign((size_t)n * (size_t)steps, 0);
-            const rad_buf from = raw_buf_ ? raw_buf_ : drafter_.proposal;
-            void* src = (from == drafter_.proposal) ? prop : r0.ctx.buf_ptr(from);
-            if (!src) {
-                RAD_ERR("`%s` was declared but never planned",
-                        r0.program.buffers[from].name.c_str());
-                return RAD_E_STATE;
-            }
-            /* A raw buffer is [row][width] and the proposal is [seq][steps]: one may be strided
-             * candidate count and the other is dense, so the bisect copies the whole candidate
-             * plane and takes column zero rather than pretending the two have the same shape. */
-            const int64_t k = raw_buf_ ? r0.program.buffers[from].decl.shape[1] : 1;
-            const int64_t n_raw = (int64_t)n * steps * k;
+            const int64_t n_raw = (int64_t)n * steps;
             int32_t* const raw = readback_.reserve(n_raw);
             if (!raw) return RAD_E_NOMEM;
-            RAD_TRY(rad_memcpy_async(raw, src, n_raw * 4, r0.ctx.stream()));
+            RAD_TRY(rad_memcpy_async(raw, prop, n_raw * 4, r0.ctx.stream()));
             RAD_TRY(rad_stream_sync(r0.ctx.stream()));
-            for (size_t i = 0; i < draft_out_.size(); ++i) draft_out_[i] = raw[i * (size_t)k];
+            draft_out_.assign(raw, raw + n_raw);
         }
     }
     sched_.block_end();
@@ -456,6 +345,5 @@ int Engine::run_block_drafter(int step) {
     }
     return RAD_OK;
 }
-
 
 }  /* namespace rad */

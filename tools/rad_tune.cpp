@@ -1,21 +1,15 @@
-/* rad-tune -- benchmark every point of each kernel's declared space at the graph's ACTUAL shapes and write
- * the cache the selector consults at declare.
+/* rad-tune -- benchmark every point of each kernel's declared tuning space at the shapes the graph
+ * actually issues, and write the cache the selector consults at declare.
  *
- * Constraint matching finds a kernel that is CORRECT for a geometry. Within one kernel there are
- * usually many tile configurations and the right one is a property of the shape and the machine --
- * vllm-radiance ships moe-configs/ and fp8-configs/ for exactly this, hand-tuned per shape
- * (spec §15). This tool is the one mechanism, and tunecache.h is the one format. The alternative
- * is every plugin inventing its own tuning tool and its own file, and the engine being unable to
- * say why a shape is slow.
+ * Constraint matching finds a correct kernel for a geometry; within it, the best tile configuration
+ * depends on shape and machine (spec §15). This tool is the single tuning mechanism and tunecache.h
+ * the single format, so plugins need no tuning tools of their own.
  *
- * It tunes THE SHAPES THIS MODEL ACTUALLY ISSUES, not a swept grid: declare already enumerated
- * every (kernel, geometry) pair the graph will ever reach, per band, so Program::tune_requests is
- * the exact work list. A sweep would measure shapes nothing runs and miss the one that matters.
+ * The work list is Program::tune_requests: every (kernel, geometry) pair the declared graph can
+ * reach, per band, rather than a swept grid.
  *
- * Two properties of the measurement loop: a candidate's time is the MEDIAN over reps rather than
- * its best, because a best-of hides a candidate that is fast when the clock is up and slow
- * otherwise; and the SPREAD is reported beside it, so a measurement taken across a clock ramp is
- * visible rather than silently believed.
+ * A candidate's time is the median over reps, not the best (a best-of hides clock-dependent
+ * candidates), and the spread is reported so a measurement across a clock ramp is visible.
  */
 #include "kfixture.h"
 #include "opshapes.h"
@@ -53,9 +47,9 @@ void usage() {
         "      --max-tok N    the max_tok declare is run at (default 8192)\n"
         "      --tp N         tensor-parallel width to declare at (default 1). The shapes a\n"
         "                     sharded deployment runs are not the shapes tp=1 runs.\n"
-        "      --num-speculative-tokens N\n"
-        "                     draft depth to declare at; default is the container's own, which\n"
-        "                     is what puts the DRAFTER's kernels in the measured graph at all.\n"
+        "      --num-speculative-tokens N|auto\n"
+        "                     draft depth to declare at (default auto: the container's own). It puts\n"
+        "                     the drafter's kernels in the measured graph.\n"
         "      --dry-run      list what would be measured and stop\n"
         "  -v, --verbose      print every candidate, not just the winner\n"
         "  -h, --help\n");
@@ -67,32 +61,26 @@ struct DevBuf {
     ~DevBuf() { if (p) rad_dev_free(p, RAD_MEM_DEVICE); }
 };
 
-/* How far a candidate may sit from the defaults and still be the same computation. A different
- * split-K count reduces in a different ORDER, and at K=5120 in fp32 that moves the last bits;
-  * 1e-3 relative sits two orders above what such a reorder costs, and far below a transposed tile
-  * or a dropped k slice, which are the failures this exists to catch. */
+/* Maximum relative difference from the defaults. A different split-K count reorders the reduction
+ * and moves the last bits (at K=5120 in fp32); 1e-3 is two orders above that and far below a
+ * transposed tile or a dropped k slice. */
 constexpr double kVariantTol = 1e-3;
 
-
-/* THE CANDIDATES: every legal point in the kernel's declared space, at THIS geometry.
+/* The candidates: every legal point of the kernel's declared space at this geometry, as the cross
+ * product of its axes (a hand-written list of points can silently have holes). `tune_valid` prunes
+ * points this geometry cannot run, e.g. a split that does not divide K; a pruned point is a skip,
+ * not a failure.
  *
- * A cross product, and that is exactly the point of declaring axes instead of listing
- * combinations. A hand-written list of points over a multi-axis space has holes in it, and a hole
- * is invisible from the outside: a ladder that skips a value silently runs the next tile up, so a
- * shape with 40 rows of work gets a 64-row tile and nothing says so. A product has no holes.
- *
- * `tune_valid` prunes what this geometry cannot run -- a split that does not divide K, a block
- * wider than the machine allows -- which is the half a product of independent lists cannot say.
- * A pruned candidate is a SKIP and not a failure: a kernel may serve a subset of its own space.
- *
- * The first candidate is always the all-defaults point, so the comparison the caller makes is
- * against what an untuned install would have run.
+ * The all-defaults point, the baseline an untuned install runs, is moved to index 0 and
+ * `*has_defaults` set. It is absent only when tune_valid pruned it.
  */
 enum { kMaxCandidates = 4096 };
 
 static std::vector<std::vector<std::pair<std::string, int64_t>>>
-tune_candidates(const RadKernelInfo* k, const Geometry& g, int64_t* space_size) {
+tune_candidates(const RadKernelInfo* k, const Geometry& g, int64_t* space_size,
+                bool* has_defaults) {
     std::vector<std::vector<std::pair<std::string, int64_t>>> out;
+    *has_defaults = false;
     if (!k || k->n_tunables <= 0) return out;
 
     int64_t total = 1;
@@ -122,21 +110,19 @@ tune_candidates(const RadKernelInfo* k, const Geometry& g, int64_t* space_size) 
         out.push_back(point);
     }
 
-    /* The all-defaults point first, so index 0 is always the baseline an untuned install runs.
-     * It is in the list by construction -- the loader refuses a default that is not one of the
-     * axis's own values -- unless tune_valid prunes it at this geometry, which is a kernel saying
-     * it cannot serve this shape on its defaults and is worth seeing rather than hiding. */
+    /* The loader requires each default to be one of its axis's values, so the all-defaults point
+     * is in the product unless tune_valid pruned it. */
     for (size_t i = 0; i < out.size(); ++i) {
         bool all_default = true;
         for (int a = 0; a < k->n_tunables; ++a)
             if (out[i][(size_t)a].second != k->tunables[a].deflt) { all_default = false; break; }
-        if (all_default) { std::swap(out[0], out[i]); break; }
+        if (all_default) { std::swap(out[0], out[i]); *has_defaults = true; break; }
     }
     return out;
 }
-/* Every OUT and INOUT operand's bytes, after one launch at the geometry `g` -- which CARRIES the
- * candidate point, because a tuned value is an ordinary parameter. This is what a candidate is
- * compared against the defaults with. */
+
+/* Every OUT and INOUT operand's bytes after one launch at `g`, which carries the candidate point as
+ * ordinary parameters. Used to compare a candidate with the defaults. */
 int capture_outputs(const KernelRow& row, std::vector<RadTensor>& t,
                     const Geometry& g, const RadOpSchema* schema,
                     const std::vector<OpdShape>& sh, RadStream stream,
@@ -159,9 +145,8 @@ int capture_outputs(const KernelRow& row, std::vector<RadTensor>& t,
     if (row.info->launch(&a, stream) < 0) return RAD_E_SHAPE;
     if (stream && rad_stream_sync(stream) < 0) return RAD_E_STATE;
 
-    /* SIZED FIRST, THEN COPIED. Growing the destination between async copies reallocates it while
-     * the earlier ones are still in flight, writing into a freed block -- which is a double-free
-     * at the next resize and a corrupted comparison before that. */
+    /* Size the destination before copying: growing it between async copies would reallocate it
+     * under copies still in flight. */
     size_t total = 0;
     for (size_t k = 0; k < sh.size() && k < (size_t)schema->n_operands; ++k) {
         const int role = schema->operands[k].role;
@@ -185,8 +170,8 @@ int capture_outputs(const KernelRow& row, std::vector<RadTensor>& t,
     return RAD_OK;
 }
 
-/* The largest relative difference over the captured outputs, widened to f32 through the operand's
- * own dtype -- a bf16 output compared as raw bytes would call every one-ulp rounding a failure. */
+/* The largest relative difference over the captured outputs, widened to f32 through each operand's
+ * dtype. */
 double max_rel_diff(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b,
                     const std::vector<OpdShape>& sh, const RadOpSchema* schema) {
     if (a.size() != b.size() || a.empty()) return a.size() == b.size() ? 0.0 : 1.0;
@@ -209,9 +194,8 @@ double max_rel_diff(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b
             den += (double)fa[(size_t)i] * (double)fa[(size_t)i];
         }
         const double rel = den > 0 ? std::sqrt(num / den) : (num > 0 ? 1.0 : 0.0);
-        /* A NaN is the largest disagreement there is, and `rel > worst` is false for it: taken
-         * as a maximum it would vanish and a candidate that writes NaN would agree with the
-         * defaults. Returned as it is, the caller's `!(err <= tol)` rejects it. */
+        /* Return NaN directly: `rel > worst` is false for it, so a max would drop it. The caller's
+         * `!(err <= tol)` rejects it. */
         if (std::isnan(rel)) return rel;
         if (rel > worst) worst = rel;
         at += (size_t)bytes;
@@ -219,11 +203,9 @@ double max_rel_diff(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b
     return worst;
 }
 
-/* One measurement, in microseconds per launch, at the geometry `g` -- which CARRIES the candidate
- * point, because a tuned value is an ordinary parameter. Negative means the kernel refused the
- * shape, which is information and not a failure: a kernel is allowed to serve a subset of its own
- * cross product, and the entry point is where that is rejected (spec 2.1). tune_valid prunes what
- * it can from the geometry alone; this is where the rest shows up. */
+/* Median microseconds per launch at `g` (which carries the candidate point). Negative means the
+ * kernel refused the shape at its entry point (spec 2.1), which is allowed: tune_valid prunes only
+ * what the geometry alone can rule out. */
 double time_point(const KernelRow& row, std::vector<RadTensor>& t,
                   const Geometry& g, int reps, int iters,
                   RadStream stream, double* spread_pct) {
@@ -231,9 +213,7 @@ double time_point(const KernelRow& row, std::vector<RadTensor>& t,
     a.t = t.data(); a.n_t = (int)t.size();
     a.p = g.params(); a.n_p = g.n_params();
     a.rank = 0; a.world_size = 1;
-    /* THE SCRATCH IS DEVICE MEMORY TOO, for the same reason the operands are: a split-K GEMM
-     * writes its partial planes into it from the device, so a host allocation is an address the
-     * kernel cannot write. */
+    /* Scratch must be device memory: e.g. a split-K GEMM writes its partial planes there. */
     DevBuf scratch;
     if (row.info->scratch) {
         const int64_t need = row.info->scratch(&a);
@@ -246,19 +226,13 @@ double time_point(const KernelRow& row, std::vector<RadTensor>& t,
         }
     }
 
-    /* A warm launch first, and its status is the one that decides whether this candidate serves the
-     * shape at all. Timing a launch that returns negative measures the rejection. */
+    /* A warm-up launch; its status decides whether this candidate serves the shape at all. */
     const int s = row.info->launch(&a, stream);
     if (s < 0) return (double)s;
     if (stream && rad_stream_sync(stream) < 0) return (double)RAD_E_STATE;
 
-    /* THE CLOCK STOPS AFTER THE DEVICE DOES. Every launch here is ASYNCHRONOUS, so enqueueing
-     * `iters` of them and reading the clock without the sync below measures the host's submission
-     * cost and nothing else: sub-microsecond, and flat across every shape in the table -- a 16-row
-     * GEMM and a 2048-row one land within a few percent of each other, orders of magnitude below
-     * the memory bound of either. Without the sync the tuner picks its winners out of submission
-     * noise, and a cache full of numbers that cannot happen is worse than no cache, because
-     * someone reads it. */
+    /* Stop the clock only after the device finishes: launches are asynchronous, so without the
+     * sync this would time host submission only. */
     std::vector<double> us;
     us.reserve((size_t)reps);
     for (int r = 0; r < reps; ++r) {
@@ -293,25 +267,32 @@ int main(int argc, char** argv) {
                                  std::exit(2); }
             return argv[++i];
         };
+        auto num = [&](const char* w, int64_t lo, int64_t hi) {
+            return rad_flag_int("rad-tune", w, next(w), lo, hi);
+        };
         if (a == "-h" || a == "--help") { usage(); return 0; }
         else if (a == "-m" || a == "--model") model = next("--model");
         else if (a == "--home")    home = next("--home");
         else if (a == "--kernels") hierarchy = rad_split_list(next("--kernels"));
         else if (a == "--op")      op_filter = next("--op");
         else if (a == "--machine") machine = next("--machine");
-        else if (a == "--reps")    reps = std::atoi(next("--reps"));
-        else if (a == "--iters")   iters = std::atoi(next("--iters"));
-        else if (a == "--max-tok") max_tok = std::atoll(next("--max-tok"));
-        else if (a == "--tp")      tp   = std::atoi(next("--tp"));
-        else if (a == "--num-speculative-tokens") spec = std::atoi(next("--num-speculative-tokens"));
+        else if (a == "--reps")    reps = (int)num("--reps", 1, INT32_MAX);
+        else if (a == "--iters")   iters = (int)num("--iters", 1, INT32_MAX);
+        else if (a == "--max-tok") max_tok = num("--max-tok", 1, INT64_MAX);
+        else if (a == "--tp")      tp   = (int)num("--tp", 1, INT32_MAX);
+        else if (a == "--num-speculative-tokens") {
+            /* `auto` is the container's own depth, as the engine's flag of this name reads it. */
+            const char* v = next("--num-speculative-tokens");
+            spec = std::string(v) == "auto"
+                       ? -1 : (int)rad_flag_int("rad-tune", "--num-speculative-tokens", v, 0,
+                                                INT32_MAX);
+        }
         else if (a == "--dry-run") dry = true;
         else if (a == "-v" || a == "--verbose") verbose = true;
         else { std::fprintf(stderr, "rad-tune: unrecognised argument '%s'. Try --help.\n",
                             a.c_str()); return 2; }
     }
     if (model.empty()) { usage(); return 2; }
-    if (reps < 1 || iters < 1) { std::fprintf(stderr, "rad-tune: --reps and --iters must be >= 1\n");
-                                 return 2; }
 
     RadFile f;
     if (f.open(model.c_str()) < 0) return 1;
@@ -347,12 +328,8 @@ int main(int argc, char** argv) {
     for (auto& s : kv) vp.push_back(s.c_str());
     meta.n_kv = (int)kk.size(); meta.kv_key = kp.data(); meta.kv_val = vp.data();
 
-    /* THE GRAPH HAS TO BE THE ONE THE DEPLOYMENT RUNS, or the shapes measured are not the shapes
-     * served. Two things decide that: the tensor-parallel width, which HALVES every sharded N, and
-     * the speculative depth, which is what puts the drafter in the graph at all. A declare at
-     * world_size 1 and max_spec 0 measures a program no `--tp 2` serve ever runs, with no drafter
-     * kernels in it -- and the drafter's shapes appear in no other model's tuning table either,
-     * so nothing else would cover them. */
+    /* Declare the graph the deployment runs: the tensor-parallel width sets every sharded N, and
+     * the speculative depth decides whether the drafter (and its shapes) is in the graph. */
     RadBuildCtx ctx{};
     ctx.rank = 0; ctx.world_size = tp; ctx.max_tok = max_tok;
     RadArchProbe probe{};
@@ -360,11 +337,9 @@ int main(int argc, char** argv) {
     ctx.max_spec = spec >= 0 ? spec : probe.draft_depth;
     ctx.max_seqs = 256; ctx.max_ctx = meta.n_ctx_train; ctx.scope = "";
 
-    /* EVERY RANK DECLARES AT ONCE, on its own thread and its own device, exactly as Engine does
-     * and for the reason stated there: kernel init() runs from declare, and a collective's init is
-     * a RENDEZVOUS -- libr4d's all-reduce publishes this rank's peer scratch pointer and then
-     * waits for the others. Declaring rank 0 alone at world_size 2 does not fail; it HANGS. Only
-     * rank 0's program is kept, because that is the one whose shapes get measured. */
+    /* Every rank declares concurrently on its own thread and device, as Engine does: kernel init()
+     * runs from declare, and a collective's init is a rendezvous (libr4d's all-reduce waits for
+     * its peers), so declaring rank 0 alone would hang. Only rank 0's program is measured. */
     Program prog;
     {
         std::vector<Program> progs((size_t)tp);
@@ -392,9 +367,8 @@ int main(int argc, char** argv) {
 
     if (machine.empty()) machine = rad_machine_key();
 
-    /* Read from the first home on the search path that has a cache for this machine, written to
-     * the first home on it: an installation's cache is the starting point, and the operator's own
-     * home is where the measurements land. */
+    /* Load from the first home on the search path with a cache for this machine; save to the
+     * first home on the path. */
     const std::string rel = TuneCache::rel_path(machine);
     const std::string src = rad_home_file(home, rel);
     const std::string save_home = rad_home_dirs(home).front();
@@ -415,16 +389,12 @@ int main(int argc, char** argv) {
         return nullptr;
     };
 
-    /* An op's schema, to size operands. tune_requests carries the kernel and the geometry but not
-     * the op's operand list, so it is looked up by the kernel's own op name. */
+    /* tune_requests lacks the operand list, so schemas are looked up by the kernel's op name. */
     int measured = 0, skipped = 0, single = 0;
     std::map<std::string, int> skip_why;
 
-    /* ONE STREAM FOR THE WHOLE RUN, and the measurement depends on having it: launching on the
-     * null stream and reading the clock times the host's submission and not the device's work.
-     * On the no-ROCm build the device layer is a host stub: the allocations are host memory, the
-     * launches are synchronous, and the sync is a no-op, so this path is the same shape either
-     * way rather than a second one. */
+    /* One explicit stream for the run; timing on the null stream would measure host submission.
+     * Without ROCm the device layer is a synchronous host stub, so the same path works. */
     RadStream stream = nullptr;
     if (rad_stream_create(&stream, 0) < 0) {
         std::fprintf(stderr, "rad-tune: could not create a stream: %s\n", rad_dev_last_error());
@@ -441,14 +411,18 @@ int main(int argc, char** argv) {
         const std::string op = row->info->op;
         if (!op_filter.empty() && op.rfind(op_filter, 0) != 0) continue;
 
-        /* THE CANDIDATE LIST IS THE DECLARED SPACE, pruned by the kernel's own tune_valid. A row
-         * with no axes has nothing to choose between: its launch is its only instantiation and an
-         * untuned install is therefore already running it, so writing a row for it would be a
-         * measurement nobody consults. */
+        /* A kernel with at most one candidate has nothing to choose; no row is written. */
         int64_t space = 0;
-        const auto cands = tune_candidates(row->info, tr.geom, &space);
+        bool has_defaults = false;
+        const auto cands = tune_candidates(row->info, tr.geom, &space, &has_defaults);
         const int n_var = (int)cands.size();
         if (n_var <= 1) { ++single; continue; }
+        if (!has_defaults) {
+            skip_why[tr.plugin + "/" + tr.kernel + "  (tune_valid rejects the defaults: no "
+                     "reference to check candidates against)"]++;
+            ++skipped;
+            continue;
+        }
 
         const RadOpSchema* schema = reg.schema(op);
         if (!schema) { skip_why[op + "  (no schema)"]++; ++skipped; continue; }
@@ -458,9 +432,21 @@ int main(int argc, char** argv) {
         for (const char* k : { "M", "q_len" }) if (tr.geom.get_i(k, &mv)) { M = (int64_t)mv; break; }
         if (M <= 0) M = 1;
 
+        /* Operand shapes as rad-kbench takes them: the reference library's description (which
+         * defines the op), then the kernel's own, then the fallback table in opshapes.h. */
         std::vector<OpdShape> sh;
-        if (rad_operand_shapes(op, tr.geom, schema->n_operands, M, &sh) < 0) {
-            skip_why[op + "  (no shape recipe; see tools/opshapes.h)"]++;
+        int shst = RAD_E_UNSUPPORTED;
+        for (const Plugin& p : reg.plugins()) {
+            if (p.kind != RAD_PLUGIN_KERNEL || !p.reference) continue;
+            if (const KernelRow* rr = reg.select_in(p.name, op, tr.geom, RAD_DOMAIN_HOST))
+                shst = rad_operand_shapes_hook(rr->info, tr.geom, schema->n_operands, &sh);
+            break;
+        }
+        if (shst < 0) shst = rad_operand_shapes_hook(row->info, tr.geom, schema->n_operands, &sh);
+        if (shst < 0) shst = rad_operand_shapes(op, tr.geom, schema->n_operands, M, &sh);
+        if (shst < 0) {
+            skip_why[op + "  (neither the reference nor the kernel describes its operands, and "
+                          "tools/opshapes.h has no recipe)"]++;
             ++skipped;
             continue;
         }
@@ -472,14 +458,9 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        /* THE INPUTS ARE DRAWN BY kf_draw, THE SAME DRAW rad-kbench CHECKS WITH, and that is what
-         * puts each operand inside the domain its recipe states. A length is a constant and not a
-         * draw: `seqused` is the context an attention reads, and drawn as an index into the
-         * previous operand's rows it is a context of nothing, which is where every `splits`
-         * candidate would be timed. Cumulative lengths are the batch's shape, a scatter's
-         * destinations are distinct and a block table indexes its own range. A candidate timed
-         * outside that domain is timed on work the model never hands it, and the winner is cached
-         * for the work it does. */
+        /* Inputs come from kf_draw, the same draw rad-kbench checks with, so each operand stays in
+         * the domain its recipe states (constant `seqused`, cumulative lengths, distinct scatter
+         * destinations, in-range block tables) and candidates are timed on realistic work. */
         std::vector<KfOperand> kop(sh.size());
         for (size_t k = 0; k < sh.size(); ++k) {
             KfOperand& d = kop[k];
@@ -491,19 +472,17 @@ int main(int argc, char** argv) {
             d.is_index   = sh[k].is_index;
             d.idx_unique = sh[k].idx_unique;
             d.idx_cu     = sh[k].idx_cu;
+            d.idx_prefix = sh[k].idx_prefix;
+            d.idx_history = sh[k].idx_history;
             d.idx_max    = sh[k].idx_max;
             d.idx_const  = sh[k].idx_const;
             d.fill_chunk = sh[k].fill_chunk;
         }
         const int64_t vocab_rows = kf_vocab_rows(kop);
 
-        /* One set of buffers, reused across candidates: they must see the same bytes or the
-         * comparison is between two shapes as much as between two tilings.
-         *
-         * ON THE DEVICE. `store` is the host-side draw and only ever the source of a copy; what
-         * goes into RadTensor::data is the device allocation. Handing a device kernel a host
-         * address here does not announce itself -- without a synchronisation point nothing reports
-         * it at all -- so the two must not be confused. */
+        /* One set of device buffers shared by all candidates, so they all see the same bytes.
+         * `store` is the host-side draw, only ever a copy source; RadTensor::data must be the
+         * device allocation (a host address would fail silently). */
         std::vector<std::vector<uint8_t>> store(sh.size());
         std::vector<DevBuf>               dev(sh.size());
         std::vector<RadTensor>            t(sh.size());
@@ -527,18 +506,15 @@ int main(int argc, char** argv) {
         if (!ok) { skip_why[op + "  (an operand has a plugin-private dtype the core cannot "
                                  "size)"]++; ++skipped; continue; }
 
-        /* ONE GEOMETRY PER CANDIDATE, and it is the ONLY way the point reaches the kernel: the
-         * core does exactly this at issue, appending the chosen values to the resolved geometry so
-         * a launch reads `sk` with the same rad_args_geti() it reads `M` with. Built once, up
-         * front, so the measure loop below is a pure timing loop. */
+        /* One geometry per candidate, built up front. As at issue, the chosen values are appended
+         * to the resolved geometry, so a launch reads `sk` via rad_args_geti() like `M`. */
         std::vector<Geometry> gv((size_t)n_var);
         for (int v = 0; v < n_var; ++v) {
             gv[(size_t)v] = tr.geom;
             for (const auto& kv : cands[(size_t)v]) gv[(size_t)v].set_i(kv.first.c_str(), kv.second);
         }
 
-        /* Each candidate is timed over `reps` reps and reported as the median, with the spread
-         * kept beside it so a measurement taken across a clock ramp is visible. */
+        /* Median over `reps`, with the spread. */
         std::vector<double> best_us((size_t)n_var, -1.0), spread((size_t)n_var, 0.0);
         for (int v = 0; v < n_var; ++v) {
             double sp = 0;
@@ -546,31 +522,27 @@ int main(int argc, char** argv) {
             spread[(size_t)v] = sp;
         }
 
-        /* ---- AND EACH ONE HAS TO AGREE WITH THE DEFAULTS BEFORE IT CAN WIN ON SPEED.
+        /* ---- each candidate must agree with the defaults before it can win on speed.
          *
-         * A candidate is a tile configuration, and no other check in this tree exercises one past
-         * the defaults -- numeric selftests launch the first arm. So without this comparison a
-         * point that computes the wrong answer quickly is a point this tool crowns, and the cache
-         * is consulted at declare: the model then serves wrong numbers with nothing to say so. The
-         * failure is not loud either. A tuned arm that is subtly wrong shows up as degraded output
-         * quality -- lost speculative acceptance, say -- rather than as an error.
-         *
-         * CANDIDATE 0 IS THE ALL-DEFAULTS POINT, guaranteed by tune_candidates, and it is the
-         * reference because it is what an untuned install runs (spec §15) -- so "agrees with the
-         * defaults" is exactly the property that makes the cache safe to enable. The tolerance is
-         * loose, because a different split-K count reduces in a different ORDER and that moves the
-         * last bits legitimately; what it catches is a point that is wrong, not one that rounds
-         * differently. */
+         * No other check exercises non-default tile configurations, and a subtly wrong winner
+         * would be served from the cache, showing up only as degraded output quality. Candidate 0,
+         * the all-defaults point (what an untuned install runs, spec §15), is the reference.
+         * kVariantTol allows the last-bit changes of a reordered reduction. */
         std::vector<uint8_t> ref;
         std::vector<double>  verr((size_t)n_var, 0.0);
-        for (int v = 0; v < n_var; ++v) {
+        if (best_us[0] <= 0 || capture_outputs(*row, t, gv[0], schema, sh, stream, &ref) < 0) {
+            skip_why[tr.plugin + "/" + tr.kernel + "  (the defaults refused the shape: no "
+                     "reference to check candidates against)"]++;
+            ++skipped;
+            continue;
+        }
+        for (int v = 1; v < n_var; ++v) {
             if (best_us[(size_t)v] <= 0) continue;
             std::vector<uint8_t> got;
             if (capture_outputs(*row, t, gv[(size_t)v], schema, sh, stream, &got) < 0) {
                 best_us[(size_t)v] = (double)RAD_E_STATE;
                 continue;
             }
-            if (v == 0) { ref = std::move(got); continue; }
             verr[(size_t)v] = max_rel_diff(ref, got, sh, schema);
             if (!(verr[(size_t)v] <= kVariantTol)) best_us[(size_t)v] = (double)RAD_E_SHAPE;
         }
@@ -581,7 +553,7 @@ int main(int argc, char** argv) {
                 win = v;
 
         if (win < 0) {
-            std::printf("  %-22s %-46s NO CANDIDATE SERVED IT (%s/%s, %d tried of %lld)\n",
+            std::printf("  %-22s %-46s no candidate served it (%s/%s, %d tried of %lld)\n",
                         op.c_str(), tr.geom.str().c_str(), tr.plugin.c_str(), tr.kernel.c_str(),
                         n_var, (long long)space);
             ++skipped;
@@ -598,7 +570,7 @@ int main(int argc, char** argv) {
                                 nm.c_str(), best_us[(size_t)v], spread[(size_t)v], verr[(size_t)v],
                                 v == win ? "  <-" : "");
                 else if (!(verr[(size_t)v] <= kVariantTol))
-                    std::printf("      %-32s REJECTED: disagrees with the defaults by %.3g\n",
+                    std::printf("      %-32s rejected: disagrees with the defaults by %.3g\n",
                                 nm.c_str(), verr[(size_t)v]);
                 else
                     std::printf("      %-32s refused: %s\n", nm.c_str(),
@@ -609,10 +581,8 @@ int main(int argc, char** argv) {
         tr_out.kernel   = tr.kernel;
         tr_out.plugin   = tr.plugin;
         tr_out.choice   = wname;
-        /* THE KEY IS THE GEOMETRY WITHOUT THE POINT. `tr.geom` is the untouched instantiation --
-         * the dims the caller asked for -- and the chosen axes live in `choice`. Keying on `gv`
-         * instead would write a row the selector can never find, because at issue it looks the
-         * instantiation up BEFORE it knows what to choose. */
+        /* Key on the geometry without the point (the chosen axes are in `choice`): the selector
+         * looks the instantiation up before it knows what to choose. */
         tr_out.geom     = tr.geom_key;
         tr_out.us       = best_us[(size_t)win];
         tr_out.measured = TuneCache::now_iso8601();

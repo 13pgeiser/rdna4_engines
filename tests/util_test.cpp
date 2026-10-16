@@ -1,13 +1,10 @@
-/* util_test.cpp -- core/util/rad_util.cpp, the bedrock every other translation unit links against, and
- * core/util/stallwatch.cpp, which reports where a phase that has gone quiet waits.
+/* util_test.cpp -- core/util/rad_util.cpp, which every other translation unit links against, and
+ * core/util/stallwatch.cpp, which reports where a phase that has gone quiet is waiting.
  *
- * WHY THIS FILE EXISTS. Nothing here is interesting on its own, and every one of these is small
- * enough to read and believe -- which is what leaves such code untested. The two that are not
- * merely cosmetic are `Geometry` and `constraint_holds`, and they decide WHICH KERNEL RUNS. A
- * geometry that hands a kernel dangling parameter pointers, or a constraint that holds when it
- * should not, does not fail -- it selects a different implementation, which produces plausible
- * output on a path nobody is looking at. The rest are here because a formatter that rounds the
- * wrong way makes every report that prints a size disagree with every other one.
+ * `Geometry` and `constraint_holds` decide which kernel runs. A geometry that hands a kernel
+ * dangling parameter pointers, or a constraint that holds when it should not, does not fail: it
+ * selects a different implementation that produces plausible output. The formatters are checked
+ * because a size rounded the wrong way makes reports disagree with each other.
  *
  * No device, no model, no core: one translation unit and its header.
  */
@@ -17,6 +14,7 @@
 #include "util/stallwatch.h"
 
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <condition_variable>
 #include <dlfcn.h>
@@ -45,15 +43,15 @@ TEST(align_up_rounds_up_and_leaves_an_exact_multiple_alone) {
 TEST(humanb_changes_unit_at_the_boundary_and_not_before) {
     CHECK_EQ(humanb(0), std::string("0 B"));
     CHECK_EQ(humanb(1), std::string("1 B"));
-    /* 1023 IS STILL BYTES. A ladder that switched a unit early would print "1.00 KiB" for a
-     * number below a kibibyte, and every size in every report is read against the others. */
+    /* 1023 is still bytes. Every size in every report is read against the others, so the unit
+     * must not switch early. */
     CHECK_EQ(humanb(1023), std::string("1023 B"));
     CHECK_EQ(humanb(1024), std::string("1.00 KiB"));
     CHECK_EQ(humanb(1536), std::string("1.50 KiB"));
     CHECK_EQ(humanb(1048576), std::string("1.00 MiB"));
     CHECK_EQ(humanb(1073741824ll), std::string("1.00 GiB"));
     CHECK_EQ(humanb(1099511627776ll), std::string("1.00 TiB"));
-    /* THE LADDER STOPS AT TiB and says so in TiB rather than inventing a unit. */
+    /* The ladder stops at TiB rather than inventing a unit. */
     CHECK_EQ(humanb(1125899906842624ll), std::string("1024.00 TiB"));
 }
 
@@ -61,9 +59,9 @@ TEST(fmt_sizes_its_own_buffer) {
     CHECK_EQ(fmt("%d", 7), std::string("7"));
     CHECK_EQ(fmt("%s=%lld", "M", 64ll), std::string("M=64"));
     CHECK_EQ(fmt("%s", ""), std::string(""));
-    /* LONGER THAN ANY FIXED BUFFER SOMEBODY MIGHT HAVE REACHED FOR. It measures with vsnprintf
-     * first, so there is no cap to find -- but a regression to a stack buffer would truncate
-     * here and nowhere else, and the strings this formats include whole selection tables. */
+    /* Longer than any plausible fixed buffer. fmt measures with vsnprintf first, so there is no
+     * cap; a regression to a stack buffer would truncate here, and fmt formats whole selection
+     * tables. */
     const std::string big = fmt("%s", std::string(10000, 'x').c_str());
     CHECK_EQ(big.size(), (size_t)10000);
     CHECK_EQ(big.front(), 'x');
@@ -74,17 +72,16 @@ TEST(rad_mono_ns_moves_forward_and_is_not_the_wall_clock) {
     const uint64_t a = rad_mono_ns();
     CHECK(a > 0);
     uint64_t b = a;
-    /* Spin rather than sleep: the property is that it advances at all, and a test that sleeps
-     * for it is a test that takes a millisecond to assert one comparison. */
+    /* Spin rather than sleep: the property is only that it advances. */
     for (int i = 0; i < 1000000 && b == a; ++i) b = rad_mono_ns();
     CHECK(b >= a);
-    /* Not a Unix timestamp. A monotonic clock counts from an arbitrary epoch -- usually boot --
-     * and anything comparing it against time() would be comparing two different origins. */
+    /* Not a Unix timestamp: a monotonic clock counts from an arbitrary epoch (usually boot), so
+     * comparing it against time() would mix two origins. */
     CHECK(a < 1000000000000000000ull);
 }
 
-/* SPLIT_WS SPLITS ON COMMAS TOO, which its name does not say and RAD_C_IN depends on: a kernel
- * writing RAD_CIN("dtype", "bf16,fp8") and one writing "bf16 fp8" mean the same set. */
+/* split_ws also splits on commas, which RAD_C_IN depends on: a kernel writing
+ * RAD_CIN("dtype", "bf16,fp8") and one writing "bf16 fp8" mean the same set. */
 TEST(split_ws_takes_spaces_tabs_and_commas) {
     auto v = split_ws("a b c");
     CHECK_EQ(v.size(), 3u);
@@ -101,8 +98,8 @@ TEST(split_ws_takes_spaces_tabs_and_commas) {
     CHECK_EQ(std::string(v[1]), std::string("b"));
     CHECK_EQ(std::string(v[2]), std::string("c"));
 
-    /* An empty set is empty rather than one empty token, or a constraint naming no values would
-     * hold for a geometry whose value is the empty string. */
+    /* An empty set has no tokens, not one empty token; otherwise a constraint naming no values
+     * would hold for a geometry whose value is the empty string. */
     CHECK_EQ(split_ws("").size(), 0u);
     CHECK_EQ(split_ws("   ,, \t ").size(), 0u);
     CHECK_EQ(split_ws("one").size(), 1u);
@@ -134,8 +131,8 @@ TEST(geometry_stores_by_kind_and_a_reader_of_the_wrong_kind_misses) {
     CHECK(g.get_f("eps", &d));
     CHECK_NEAR(d, 1e-6, 1e-12);
 
-    /* THE KIND IS PART OF THE MATCH. get_i on a string slot missing is what makes a constraint
-     * naming a float key fail rather than comparing against a truncation of it. */
+    /* The kind is part of the match: get_i on a string or float slot misses, so a constraint on a
+     * float key fails instead of comparing against a truncation. */
     CHECK(!g.get_i("dtype", &i));
     CHECK(!g.get_i("eps", &i));
     CHECK(!g.get_f("M", &d));
@@ -173,15 +170,15 @@ TEST(the_param_view_is_rebuilt_after_a_mutation) {
     CHECK_EQ(g.n_params(), 1);
     CHECK_EQ(g.params()[0].ival, 8ll);
 
-    /* The view is built by the writes, so the question is whether every write rebuilds it. A stale
-     * view hands a kernel the geometry it was resolved against rather than the one it is run on. */
+    /* Every write must rebuild the view; a stale view hands a kernel the geometry it was resolved
+     * against rather than the one it runs on. */
     g.set_i("M", 9);
     CHECK_EQ(g.params()[0].ival, 9ll);
     g.set_i("N", 4096);
     CHECK_EQ(g.n_params(), 2);
 
-    /* A string param carries sval and an integer one carries a null sval, which is what lets a
-     * kernel tell "not set" from "the empty string". */
+    /* A string param carries sval and an integer one a null sval, so a kernel can tell "not set"
+     * from "the empty string". */
     g.set_s("dtype", "bf16");
     const RadParam* p = g.params();
     int seen = 0;
@@ -197,10 +194,9 @@ TEST(the_param_view_is_rebuilt_after_a_mutation) {
     CHECK_EQ(seen, 1);
 }
 
-/* THE COPY MUST OWN ITS OWN STRINGS, and the header says why at length: the view holds char*
- * into the object's own storage, so a copy that took the view along with the storage would
- * hand a kernel pointers into the source -- which dies first about as often as not, since every
- * Resolved holds a Geometry and every Band holds two. */
+/* A copy must own its strings. The view holds char* into the object's own storage, so a copy
+ * that took the view along would hand a kernel pointers into the source, which often dies first
+ * (every Resolved holds a Geometry and every Band holds two). */
 TEST(a_copied_geometry_points_into_itself_and_not_at_the_source) {
     Geometry a;
     a.set_s("dtype", "w4a8");
@@ -254,46 +250,51 @@ TEST(a_moved_geometry_does_not_leave_the_view_pointing_at_a_stolen_buffer) {
     CHECK_EQ(b.n_params(), 0);
 }
 
-/* READING A GEOMETRY WRITES NOTHING, so one that nobody is writing can be read from any number of
- * threads. The sizing declares of one rank run side by side and every one of them reads the real
- * program's op geometries (Engine::probe_arena_levels); a view built lazily on first read was a
- * write each of them made, and two threads clearing and filling one vector corrupted the heap at
- * startup. Each round reads a fresh geometry -- a moved one, as every OpInfo's is -- from eight
- * threads released together, and every reader must see the whole view and the same one. */
+/* Reading a geometry writes nothing, so one nobody is writing can be read from any number of
+ * threads. A rank's sizing declares run side by side and all read the program's op geometries
+ * (Engine::probe_arena_levels); a view built lazily on first read would be a concurrent write.
+ * Each round reads a fresh, moved geometry (as every OpInfo's is) from eight threads released
+ * together, and every reader must see the whole view and the same one. */
 TEST(a_geometry_read_from_many_threads_at_once_is_not_written) {
+    /* Eight threads kept for every round. Each round main publishes the geometry and all nine meet
+     * at a barrier, whose completion releases the eight readers together; they meet again when
+     * done. A barrier rather than a spin, so a loaded machine's scheduler is not fought. */
     constexpr int kThreads = 8, kRounds = 400;
-    int bad = 0;
-    for (int round = 0; round < kRounds && bad == 0; ++round) {
-        Geometry src;
-        src.set_s("dtype", "fp8_e4m3_with_a_name_past_the_short_string_buffer");
-        for (int k = 0; k < 12; ++k) src.set_i(fmt("key_%d", k), k * 1000 + round);
-        const Geometry g = std::move(src);
-
-        std::atomic<int> ready{0};
-        std::atomic<bool> go{false};
-        std::vector<const RadParam*> seen(kThreads, nullptr);
-        std::vector<int> ok(kThreads, 0);
-        std::vector<std::thread> th;
-        for (int t = 0; t < kThreads; ++t)
-            th.emplace_back([&, t] {
-                ready.fetch_add(1);
-                while (!go.load()) {}
-                const RadParam* p = g.params();
-                const int n = g.n_params();
+    std::barrier sync(kThreads + 1);
+    const Geometry* g = nullptr;
+    int round = 0;
+    std::vector<const RadParam*> seen(kThreads, nullptr);
+    std::vector<int> ok(kThreads, 0);
+    std::vector<std::thread> th;
+    for (int t = 0; t < kThreads; ++t)
+        th.emplace_back([&, t] {
+            for (int r = 0; r < kRounds; ++r) {
+                sync.arrive_and_wait();
+                const RadParam* p = g->params();
+                const int n = g->n_params();
                 bool good = n == 13 && std::string(p[0].key) == "dtype" && p[0].sval &&
                             std::string(p[0].sval).rfind("fp8_e4m3", 0) == 0;
                 for (int k = 0; good && k < 12; ++k)
-                    good = p[k + 1].kind == RAD_P_INT && p[k + 1].ival == k * 1000 + round &&
+                    good = p[k + 1].kind == RAD_P_INT && p[k + 1].ival == k * 1000 + r &&
                            std::string(p[k + 1].key) == fmt("key_%d", k);
                 seen[t] = p;
                 ok[t] = good;
-            });
-        while (ready.load() < kThreads) {}
-        go.store(true);
-        for (auto& x : th) x.join();
+                sync.arrive_and_wait();
+            }
+        });
+    int bad = 0;
+    for (round = 0; round < kRounds; ++round) {
+        Geometry src;
+        src.set_s("dtype", "fp8_e4m3_with_a_name_past_the_short_string_buffer");
+        for (int k = 0; k < 12; ++k) src.set_i(fmt("key_%d", k), k * 1000 + round);
+        const Geometry moved = std::move(src);
+        g = &moved;
+        sync.arrive_and_wait();
+        sync.arrive_and_wait();
         for (int t = 0; t < kThreads; ++t)
             if (!ok[t] || seen[t] != seen[0]) ++bad;
     }
+    for (auto& x : th) x.join();
     CHECK_EQ(bad, 0);
 }
 
@@ -339,8 +340,8 @@ TEST(the_four_integer_constraints_compare_the_way_they_read) {
     CHECK(!constraint_holds(c_div("M", 5), g));
 }
 
-/* A DIVISOR OF ZERO IS NOT "DIVIDES EVERYTHING", it is a kernel-set typo. Answering true would
- * route every geometry to that row, which is the widest possible band by accident. */
+/* A divisor of zero is a kernel-set typo, not "divides everything". Answering true would route
+ * every geometry to that row. */
 TEST(a_zero_divisor_holds_for_nothing_rather_than_faulting) {
     Geometry g;
     g.set_i("M", 64);
@@ -350,8 +351,8 @@ TEST(a_zero_divisor_holds_for_nothing_rather_than_faulting) {
     CHECK(constraint_holds(c_div("Z", 16), g));     /* zero is divisible by anything non-zero */
 }
 
-/* A CONSTRAINT WHOSE KEY THE GEOMETRY DOES NOT CARRY DOES NOT HOLD. The header names what this
- * buys: a row that constrains an optional parameter serves only a caller that states it. */
+/* A constraint on a key the geometry does not carry does not hold, so a row that constrains an
+ * optional parameter serves only callers that state it. */
 TEST(an_absent_key_fails_every_constraint) {
     Geometry g;
     g.set_i("M", 64);
@@ -362,9 +363,8 @@ TEST(an_absent_key_fails_every_constraint) {
     CHECK(!constraint_holds(c_in("hops", "1 2"), g));
 }
 
-/* A FLOAT PARAMETER CAN NEVER SATISFY ONE, and that is the intended answer rather than an
- * oversight: a tolerance is not a predicate, and a kernel discriminating on eps to that precision
- * has a bug. */
+/* A float parameter never satisfies a constraint, by design: a tolerance is not a predicate, and
+ * a kernel that discriminates on eps has a bug. */
 TEST(a_float_parameter_satisfies_no_constraint) {
     Geometry g;
     g.set_f("eps", 1e-6);
@@ -382,8 +382,8 @@ TEST(a_set_constraint_matches_a_string_and_an_integers_decimal_form) {
     CHECK(constraint_holds(c_in("dtype", "bf16 fp8"), g));
     CHECK(constraint_holds(c_in("dtype", "bf16,fp8"), g));
     CHECK(!constraint_holds(c_in("dtype", "bf16 w4a8"), g));
-    /* A PREFIX IS NOT A MEMBER. Matching "fp8" against a set containing "fp8e5" would route a
-     * kernel compiled for one encoding at another. */
+    /* A prefix is not a member: matching "fp8" against "fp8e5m2" would route a kernel compiled
+     * for one encoding to another. */
     CHECK(!constraint_holds(c_in("dtype", "fp8e5m2"), g));
 
     /* The integer form, which is what makes RAD_CIN("causal", "0 1") work. */
@@ -413,9 +413,9 @@ TEST(an_unknown_constraint_operator_holds_for_nothing) {
     CHECK(!constraint_holds(c, g));
 }
 
-/* THE MISS COLUMN OF THE SELECTION TABLE (spec §16). Its job is to say which kernel was rejected
- * and why in terms an operator can act on, so it has to name the key, the bound and the value --
- * and it has to distinguish "your number is wrong" from "you did not supply that number at all". */
+/* The miss column of the selection table (spec §16) says which kernel was rejected and why in
+ * terms an operator can act on: the key, the bound and the value, and whether the value was
+ * wrong or not supplied at all. */
 TEST(constraint_why_names_the_key_the_bound_and_what_was_there) {
     Geometry g;
     g.set_i("M", 64);
@@ -447,31 +447,6 @@ TEST(constraint_why_names_the_key_the_bound_and_what_was_there) {
 
 /* ================================================================== StallWatch */
 
-namespace {
-/* Everything written to stderr while `f` runs. */
-template <class F> std::string capture_stderr(F f) {
-    std::fflush(stderr);
-    char path[] = "/tmp/rad_util_test_XXXXXX";
-    const int fd = mkstemp(path);
-    const int saved = dup(2);
-    dup2(fd, 2);
-    f();
-    std::fflush(stderr);
-    dup2(saved, 2);
-    close(saved);
-    std::string out;
-    if (FILE* r = std::fopen(path, "r")) {
-        char buf[4096];
-        size_t n;
-        while ((n = std::fread(buf, 1, sizeof buf, r)) > 0) out.append(buf, n);
-        std::fclose(r);
-    }
-    close(fd);
-    unlink(path);
-    return out;
-}
-}  // namespace
-
 TEST(a_syscall_line_names_the_call_and_a_kfd_ioctl_by_its_name) {
     CHECK_EQ(stall_decode_syscall("running"), std::string("running"));
     CHECK_EQ(stall_decode_syscall("-1 0x7ffd1000 0x7f0012345678"), std::string("not in a system call"));
@@ -492,24 +467,39 @@ TEST(a_syscall_line_names_the_call_and_a_kfd_ioctl_by_its_name) {
     close(fd);
 }
 
-/* Relative to the module's load base, the number addr2line takes, which is not the file offset
- * where the linker placed a segment elsewhere than its file position. */
+/* Offsets are relative to the module's load base, which is what addr2line takes; that differs
+ * from the file offset where the linker placed a segment away from its file position. */
 TEST(an_address_is_named_by_its_module_and_its_offset_from_the_load_base) {
-    const uintptr_t a = (uintptr_t)&capture_stderr<void (*)()>;
+    const uintptr_t a = (uintptr_t)&stderr_of;
     Dl_info di{};
     CHECK(dladdr((void*)a, &di) != 0);
     CHECK_EQ(stall_module_offset(a), fmt("util_test+0x%lx", (unsigned long)(a - (uintptr_t)di.dli_fbase)));
 }
 
 /* A thread that waits on a lock with nothing logged is reported once the quiet has passed: what
- * it is in, and its stack through this binary's frames. */
+ * it is in, and its stack through this binary's frames. The thread waits on a condition variable
+ * until a helper sees the report's line logged, so it is in the wait whenever the watch looks and
+ * the case ends as soon as the report is out. */
 TEST(a_quiet_phase_names_the_wait_and_the_stack_of_the_thread_in_it) {
-    const std::string out = capture_stderr([] {
+    const std::string out = stderr_of([] {
         std::mutex mu;
         std::condition_variable cv;
-        std::unique_lock<std::mutex> lk(mu);
-        StallWatch w("probe", 300);
-        cv.wait_for(lk, std::chrono::milliseconds(1600));
+        bool reported = false;
+        const uint64_t before = log_last_line_ns();
+        std::thread watcher([&] {
+            const uint64_t give_up = rad_mono_ns() + 10'000'000'000ull;
+            while (log_last_line_ns() == before && rad_mono_ns() < give_up)
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            std::lock_guard<std::mutex> g(mu);
+            reported = true;
+            cv.notify_all();
+        });
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            StallWatch w("probe", 40);
+            cv.wait(lk, [&] { return reported; });
+        }
+        watcher.join();
     });
     CHECK(out.find("probe: nothing has been logged for") != std::string::npos);
     CHECK(out.find("futex") != std::string::npos);
@@ -517,17 +507,18 @@ TEST(a_quiet_phase_names_the_wait_and_the_stack_of_the_thread_in_it) {
     CHECK(out.find("util_test+0x") != std::string::npos);
 }
 
-/* A phase that keeps logging is not quiet, however long it runs. */
+/* A phase that keeps logging is not quiet, however long it runs: logging every 5 ms for twice the
+ * 150 ms quiet interval (a 30x margin on each gap) is never reported. */
 TEST(a_phase_that_logs_is_never_reported) {
-    const std::string out = capture_stderr([] {
-        StallWatch w("probe", 400);
-        for (int i = 0; i < 12; ++i) {
+    const std::string out = stderr_of([] {
+        StallWatch w("probe", 150);
+        for (int i = 0; i < 60; ++i) {
             RAD_INFO("probe: step %d", i);
-            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     });
     CHECK(out.find("nothing has been logged") == std::string::npos);
-    CHECK(out.find("probe: step 11") != std::string::npos);
+    CHECK(out.find("probe: step 59") != std::string::npos);
 }
 
 RAD_TEST_MAIN()

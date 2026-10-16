@@ -1,19 +1,10 @@
-# rad_add_plugin / rad_hipify -- the ONE definition of how a source file becomes a loadable
-# radiance plugin, shared by the in-tree build and by an out-of-tree one.
+# rad_add_plugin / rad_hipify -- the single definition of how sources become a loadable radiance
+# plugin, shared by the in-tree and out-of-tree builds.
 #
-# This file is included from two different worlds. The top-level CMakeLists.txt includes it while
-# the ABI target is being built in this very tree; the installed radiance-config.cmake includes it
-# after pulling the same target in as an import from radianceTargets.cmake. It is a file of its own
-# because a third party who runs find_package(radiance) needs it as much as the tree does: the
-# single call that decides what a plugin links, where it lands, and how its device sources reach
-# hipcc cannot be a private detail of radiance's own build, or every out-of-tree plugin has to
-# reinvent it by reading our CMakeLists.
-#
-# Copying the function into the package config instead is the worse option. Two copies of the rule
-# that fixes the plugin layout drift, and the drift does not present as a build error: it presents
-# as a plugin that loads in the tree it was written in and is silently absent everywhere else,
-# because it was emitted one directory level away from where the loader scans. So there is one
-# file, and both worlds include it.
+# The top-level CMakeLists.txt includes it while building the ABI target; the installed
+# radiance-config.cmake includes it after importing that target from radianceTargets.cmake. Keep
+# one copy: a drifted duplicate would emit plugins where the loader does not scan, with no build
+# error.
 #
 # What an includer must set first:
 #   radiance::abi      the ABI interface target -- an in-tree ALIAS, or the imported target
@@ -22,37 +13,30 @@
 #   RAD_GPU_TARGETS    the offload architectures this build targets. Any gfx name; a library that
 #                      serves only some of them narrows the list with rad_plugin_gpu_targets()
 #   RAD_HIP_RUNTIME    the amdhip64 library a device plugin links
-# The top-level file sets all five as it detects them. radiance-config.cmake sets all five from what
-# the install recorded, so that an out-of-tree plugin is compiled against the same runtime as the
-# engine that will dlopen it; its GPU targets are the consumer's to name (-DRAD_GPU_TARGETS) and
-# default to the ones the engine was built for.
+# The top-level file sets all five as it detects them. radiance-config.cmake sets them from what the
+# install recorded, so an out-of-tree plugin uses the engine's runtime; its GPU targets default to
+# the engine's and can be overridden with -DRAD_GPU_TARGETS.
 #
-# And one an includer MAY set:
+# Optional:
 #   RAD_PLUGIN_INSTALL_HOME  the $RADIANCE_HOME `cmake --install` puts a plugin under. Unset in
-#                      the tree, where a plugin installs beside the engine under the same prefix;
-#                      radiance-config.cmake sets it to the found installation's home, so a plugin
-#                      built out of tree installs where that engine's loader scans.
+#                      the tree (plugins install beside the engine under the same prefix);
+#                      radiance-config.cmake sets it to the found installation's home.
 #   RAD_HIP_VOPD_REPEATABLE  ON when the HIP compiler's VOPD pairing is repeatable; unset is OFF,
 #                      which turns the pairing off on LLVM 24 (rad_hip_repeatable, below).
 
-# For CMAKE_INSTALL_DATADIR, below. Idempotent, and included here rather than left to the includer
-# because this file is what needs it: a consumer project has no reason to have included it, and the
-# install destination would silently become the relative path "radiance/kernels" -- interpreted
-# against the prefix, so it lands in <prefix>/radiance/kernels and the loader never looks there.
+# For CMAKE_INSTALL_DATADIR. Included here because a consumer may not have; without it plugins
+# would install to <prefix>/radiance/<kind>, where the loader never looks.
 include(GNUInstallDirs)
 
-# What radiance's own tree sets for every plugin it builds, for a plugin built on its own against
-# an installed radiance: C++20, and a build type that optimises when none was asked for. Every
-# plugin directory in radiance's tree opens with the same few lines a third party's does --
+# The tree's defaults for a plugin built standalone: C++20 and an optimised build type when none was
+# given. Every plugin directory, in tree or not, opens with:
 #
-#   if(NOT COMMAND rad_add_plugin)          # on its own, not inside radiance's tree
+#   if(NOT COMMAND rad_add_plugin)          # standalone, not inside radiance's tree
 #     cmake_minimum_required(VERSION 3.21)
 #     project(mylib LANGUAGES CXX)          # CXX HIP for device code
 #     find_package(radiance REQUIRED)
 #     rad_plugin_defaults()
 #   endif()
-#
-# -- so the libraries radiance ships are built and installed exactly as anyone else's are.
 macro(rad_plugin_defaults)
   if(NOT CMAKE_CXX_STANDARD)
     set(CMAKE_CXX_STANDARD 20)
@@ -63,10 +47,24 @@ macro(rad_plugin_defaults)
   endif()
 endmacro()
 
-# A kernel, architecture or quantiser plugin: one call, so a new plugin is a directory and a line.
-# `kind` is the $RADIANCE_HOME directory the engine scans for it. An installed plugin must name one
-# of the three the engine scans -- a misspelt kind would build, install, and never be loaded; the
-# test plugins, which are never installed (RAD_PLUGIN_INSTALL below), use directories of their own.
+# CMake leaves two HIP rule variables empty. Without CMAKE_DEPFILE_FLAGS_HIP, Ninja records no
+# header as a dependency of a .hip object (`ninja -t deps` shows #deps 0), so editing a header
+# relinks a plugin around stale objects, which can leave engine and plugin disagreeing on a
+# signature. Without CMAKE_INCLUDE_SYSTEM_FLAG_HIP, SYSTEM include directories reach .hip sources as
+# `-I` and their warnings become ours. A macro, so the variables land in the caller's scope; values
+# already set are kept.
+macro(rad_hip_rule_fixes)
+  if(NOT CMAKE_DEPFILE_FLAGS_HIP)
+    set(CMAKE_DEPFILE_FLAGS_HIP "-MD -MT <DEP_TARGET> -MF <DEP_FILE>")
+  endif()
+  if(NOT CMAKE_INCLUDE_SYSTEM_FLAG_HIP)
+    set(CMAKE_INCLUDE_SYSTEM_FLAG_HIP "-isystem ")
+  endif()
+endmacro()
+
+# Build a kernel, architecture or quantiser plugin. `kind` is the $RADIANCE_HOME directory the engine
+# scans for it; an installed plugin must use one of the three, or it would never be loaded. Test
+# plugins (never installed, see RAD_PLUGIN_INSTALL) use their own directories.
 function(rad_add_plugin name kind)
   cmake_parse_arguments(P "" "" "SOURCES;HIP_SOURCES;LIBS;INCLUDES;GPU_TARGETS" ${ARGN})
   if((NOT DEFINED RAD_PLUGIN_INSTALL OR RAD_PLUGIN_INSTALL) AND
@@ -77,37 +75,29 @@ function(rad_add_plugin name kind)
   endif()
   set(srcs ${P_SOURCES})
   if(P_HIP_SOURCES AND NOT RAD_HIP_FOUND)
-    # Said rather than skipped in silence: a kernel library whose device sources were dropped
-    # builds, installs, and has rows with no kernels behind them.
+    # Warn: a kernel library without its device sources still installs, with rows that have no
+    # kernels behind them.
     message(WARNING
       "rad_add_plugin(${name}) was given HIP_SOURCES but this radiance has no device build "
       "(RAD_HIP_FOUND is OFF), so they are left out. A radiance configured without ROCm, or on a "
       "machine with no card and no -DRAD_GPU_TARGETS, has none.")
   endif()
   if(RAD_HIP_FOUND AND P_HIP_SOURCES)
-    # The HIP language has to be enabled by the project that owns the target, not by us:
-    # enable_language() is a project-scope decision and a library file that reaches out and enables
-    # a language behind the consumer's back changes their compiler set. In-tree the top-level file
-    # does it. Out-of-tree it is one line in the consumer's CMakeLists, and the failure without it
-    # is "Cannot find source file" or a source compiled as C++ with --offload-arch on the command
-    # line, neither of which names the missing enable_language(HIP).
+    # The owning project must enable HIP itself; enable_language() is project scope and changes the
+    # consumer's compiler set. Without it CMake fails with errors that do not name the cause, so
+    # check here.
     get_property(_rad_langs GLOBAL PROPERTY ENABLED_LANGUAGES)
     if(NOT "HIP" IN_LIST _rad_langs)
       message(FATAL_ERROR
         "rad_add_plugin(${name}) was given HIP_SOURCES but the HIP language is not enabled in this "
-        "project. Add `enable_language(HIP)` after project() -- radiance cannot enable it for you, "
-        "because the language a project compiles in is the project's own decision.")
+        "project. Add `enable_language(HIP)` after project(); the project must enable it itself.")
     endif()
     set_source_files_properties(${P_HIP_SOURCES} PROPERTIES LANGUAGE HIP)
-    # EVERY DEVICE SOURCE NAMES ITS OWN COMPILATION UNIT ID, from the plugin's name and the
-    # source's path inside the plugin's directory. Left to clang, the ID is a hash of the absolute
-    # input path, the output path and the command line, so one source built in two directories --
-    # the tree and an out-of-tree build of the same plugin -- gets two IDs. The ID becomes a symbol
-    # (__hip_cuid_<hash of it>) whose name is not of fixed length, and a longer one shifts the code
-    # object's read-only data and with it every PC-relative address .text forms into it: the same
-    # instructions, different bytes. Named from what identifies the unit and nothing about where it
-    # was built, the ID is the same wherever the plugin is built and still differs between any two
-    # sources, which is the property clang needs of it.
+    # Each device source gets a compilation unit ID from the plugin name and its relative path.
+    # clang's default hashes absolute paths and the command line, and the resulting
+    # __hip_cuid_<hash> symbol has variable length, which shifts read-only data and every
+    # PC-relative address into it. A location-independent ID keeps code objects identical wherever
+    # the plugin is built, while still unique per source.
     foreach(src ${P_HIP_SOURCES})
       get_filename_component(_rad_abs "${src}" ABSOLUTE)
       file(RELATIVE_PATH _rad_rel "${CMAKE_CURRENT_SOURCE_DIR}" "${_rad_abs}")
@@ -120,11 +110,8 @@ function(rad_add_plugin name kind)
   add_library(${name} MODULE ${srcs})
   target_link_libraries(${name} PRIVATE radiance::abi ${P_LIBS})
   target_include_directories(${name} PRIVATE ${P_INCLUDES})
-  # The build tree is a working $RADIANCE_HOME, and it is created here rather than assumed: a
-  # LIBRARY_OUTPUT_DIRECTORY that does not exist is created by the build, but the engine scans the
-  # directory at startup and an out-of-tree build with one kernel plugin and no architectures would
-  # otherwise have no architectures/ for the scan to find and fail at the scan rather than at the
-  # lookup.
+  # The build tree is a working $RADIANCE_HOME. Create the kind directory at configure time: the
+  # engine scans it at startup, and a missing one fails the scan rather than the lookup.
   file(MAKE_DIRECTORY ${RAD_PLUGIN_OUT}/${kind})
   set_target_properties(${name} PROPERTIES
     PREFIX "" OUTPUT_NAME "${name}"
@@ -133,16 +120,9 @@ function(rad_add_plugin name kind)
     rad_hipify(${name} ${P_GPU_TARGETS})
   endif()
 
-  # ...and so is the install tree, in the same shape. RAD_DEFAULT_HOME points at
-  # <prefix>/share/radiance, and without this rule nothing is installed into it, so the only
-  # $RADIANCE_HOME that works is somebody's build directory. A plugin built and not installed is the
-  # same class of defect as a plugin built and never loaded.
-  #
-  # RAD_PLUGIN_INSTALL is the opt-out, and it has exactly one in-tree user: core/plugin/testplugin
-  # (set in core/CMakeLists.txt, where that subtree is reached), whose .so files exist to be
-  # refused, to conflict, to report a stale ABI and to stand in for a card. Shipping those
-  # into a prefix would put rows into a real installation that implement nothing -- see the same
-  # argument, made about the build tree, in core/plugin/testplugin/CMakeLists.txt.
+  # The install tree has the same shape, under RAD_DEFAULT_HOME (<prefix>/share/radiance).
+  # RAD_PLUGIN_INSTALL=OFF opts out; its only in-tree user is core/plugin/testplugin (set in
+  # core/CMakeLists.txt), whose plugins must never reach a real installation.
   if(NOT DEFINED RAD_PLUGIN_INSTALL)
     set(RAD_PLUGIN_INSTALL ON)
   endif()
@@ -156,18 +136,15 @@ function(rad_add_plugin name kind)
   endif()
 endfunction()
 
-# REPEATABLE DEVICE CODE ON LLVM 24. ROCm 10.1's clang (AMD clang 24) does not compile the same
-# source to the same code twice. Its post-RA scheduler pairs VALU instructions for dual issue
-# (VOPD), and the pairing pass (GCNVOPDUtils.cpp) caches each load's transitive load dependencies;
-# fusing a pair adds edges behind that cache, and which entries were cached before a fusion
-# follows the iteration order of a pointer-keyed set -- heap addresses. So every compile can pair
-# differently: r4d_hc_bf16.hip came out with a different .text on each of three builds, a kernel's
-# speed depends on which build it came from, and no comparison between two builds can be trusted.
-# LLVM 22 (ROCm 7.2) pairs without that cache and is repeatable.
+# Repeatable device code on LLVM 24. ROCm 10.1's clang (AMD clang 24) is not deterministic: the
+# post-RA VOPD pairing pass (GCNVOPDUtils.cpp) caches each load's transitive load dependencies, a
+# fusion adds edges behind that cache, and which entries are cached follows the iteration order of
+# a pointer-keyed set. So two compiles can pair differently, giving different .text and speed.
+# LLVM 22 (ROCm 7.2) has no such cache and is repeatable.
 #
-# The image builds its compiler's libLLVM with the cache dropped after every fusion
-# (docker/llvm-vopd-pairing.patch) and says so with RAD_HIP_VOPD_REPEATABLE=ON. Any other LLVM 24
-# has the pairing turned off: repeatable, at a price -- 1.4 to 3.5% on the fp8 prefill tiles.
+# The docker image patches libLLVM to drop the cache after every fusion
+# (docker/llvm-vopd-pairing.patch) and sets RAD_HIP_VOPD_REPEATABLE=ON. Any other LLVM 24 gets VOPD
+# disabled, which costs 1.4 to 3.5% on the fp8 prefill tiles.
 function(rad_hip_repeatable tgt)
   if(CMAKE_HIP_COMPILER_ID STREQUAL "Clang" AND CMAKE_HIP_COMPILER_VERSION VERSION_GREATER_EQUAL 24
      AND NOT RAD_HIP_VOPD_REPEATABLE)
@@ -175,29 +152,23 @@ function(rad_hip_repeatable tgt)
   endif()
 endfunction()
 
-# Mark a target's device sources as HIP and pin the architecture. -ffp-contract=off is mandatory
-# for any quantised cross-rank op: two ranks see the two dequantised products in the opposite order
-# and contracting either into an FMA makes them disagree by ~1 ULP, which breaks the
-# replicated-state invariant.
+# Set a target's HIP architectures and device flags. -ffp-contract=off is mandatory for any
+# quantised cross-rank op: two ranks sum the dequantised products in opposite order, and an FMA on
+# either side makes them differ by ~1 ULP, breaking the replicated-state invariant.
 function(rad_hipify tgt)
-  # Any extra arguments are the architectures THIS target is compiled for, which is how a library
-  # that serves one generation stays out of the build for the others. With none given the target
-  # takes the whole build's list.
+  # Extra arguments narrow the architectures for this target; default is RAD_GPU_TARGETS.
   set(arches "${ARGN}")
   if(NOT arches)
     set(arches "${RAD_GPU_TARGETS}")
   endif()
   set_target_properties(${tgt} PROPERTIES HIP_ARCHITECTURES "${arches}")
   target_compile_options(${tgt} PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-ffp-contract=off>)
-  # THE DEVICE OPTIMISATION LEVEL, ON THE TARGET, because CMake supplies no usable one for HIP:
-  # depending on its version CMAKE_HIP_FLAGS_<CONFIG> is empty -- the kernels compile at -O0 with
-  # asserts live -- or the host-style '-O2 -g'. The top-level CMakeLists.txt sets the variables for
-  # the tree; a plugin built out of tree gets the same levels here, after the toolchain's flags on
-  # the command line, so they win. A later -O replaces an earlier one but a later -O does not undo
-  # -g, so the levels outside Debug end in -g0: device debug info costs compile time, inhibits
-  # scheduling, and makes an out-of-tree build's code objects differ from the tree's. NDEBUG is not
-  # decoration on the device: an assert is a hostcall, and the engine's queues provide no hostcall
-  # buffer (docs/PLUGIN.md). RAD_HIP_FLAGS_<CONFIG> overrides, as it does in the tree.
+  # Device optimisation level, set on the target because CMake's CMAKE_HIP_FLAGS_<CONFIG> is,
+  # depending on version, empty (-O0 with asserts) or host-style '-O2 -g'. These come after the
+  # toolchain flags, so they win. Non-Debug levels end in -g0 because a later -O does not undo -g,
+  # and device debug info slows compiles, inhibits scheduling and changes code objects. NDEBUG is
+  # required: a device assert is a hostcall, and the engine's queues have no hostcall buffer
+  # (docs/PLUGIN.md). RAD_HIP_FLAGS_<CONFIG> overrides, as in the tree.
   foreach(cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
     if(RAD_HIP_FLAGS_${cfg})
       set(lvl "${RAD_HIP_FLAGS_${cfg}}")
@@ -211,24 +182,17 @@ function(rad_hipify tgt)
     separate_arguments(lvl)
     target_compile_options(${tgt} PRIVATE "$<$<AND:$<COMPILE_LANGUAGE:HIP>,$<CONFIG:${cfg}>>:${lvl}>")
   endforeach()
-  # AN UNCOMPRESSED FAT BINARY, because the engine reads the code object out of it itself
-  # (core/device/aql_code.cpp) and refuses a compressed one -- at the first launch, as a kernel
-  # failure. A toolchain or a CMAKE_HIP_FLAGS that turns compression on is overridden here.
+  # Uncompressed fat binary: the engine extracts the code object itself (core/device/aql_code.cpp)
+  # and rejects a compressed one at first launch. This overrides any toolchain setting.
   target_compile_options(${tgt} PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--no-offload-compress>)
   target_link_options(${tgt} PRIVATE $<$<LINK_LANGUAGE:HIP>:--no-offload-compress>)
   target_link_libraries(${tgt} PRIVATE ${RAD_HIP_RUNTIME})
   rad_hip_repeatable(${tgt})
 endfunction()
 
-# Narrow RAD_GPU_TARGETS to the architectures ONE kernel library actually serves. A library states
-# its coverage as regular expressions -- "^gfx12" for a generation, "^gfx1201$" for a single chip --
-# and gets back the intersection with what this build is targeting, which may be empty.
-#
-# AN EMPTY RESULT IS NOT AN ERROR. It means this build's cards are served by some other kernel
-# library, and the right response is for the plugin to skip itself and say so, leaving the rest of
-# the tree to configure normally. A kernel library that failed the configure instead would make
-# every card it does not cover an unbuildable project rather than an unserved one -- which is the
-# opposite of what a plugin boundary is for.
+# Narrow RAD_GPU_TARGETS to the architectures one kernel library serves, given as regular
+# expressions ("^gfx12" for a generation, "^gfx1201$" for a chip). The result may be empty; the
+# plugin should then skip itself with a message rather than fail the configure.
 function(rad_plugin_gpu_targets out)
   set(keep "")
   foreach(t ${RAD_GPU_TARGETS})

@@ -16,15 +16,15 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
     int64_t R = 0, C = 0;
     rad_enc_view(rank, shape, &R, &C);
 
-    /* THE VIEW THE DECLARATION IS IN: one plane's own extents, or the logical ones for several. A
-     * shard is cut in it, because that is the space the plugin declared its share and its stacked
-     * parts in -- a block-fp8 scale plane's parts are 1/128 of its weight's. */
+    /* The shard is cut in the view the declaration uses: one plane's own extents, or the logical
+     * ones for several planes. That is where the plugin declared its share and stacked parts; a
+     * block-fp8 scale plane's parts are 1/128 of its weight's. */
     const bool single = w.n_sel == 1;
     const bool whole = world <= 1 || w.decl.shard == RAD_SHARD_NONE;
-    /* A RESHAPE: one whole plane of single elements, a byte or more each, declared under another
-     * shape of the same count (decl_weight admits it). Its row-major bytes are the same, so the
-     * entry is seen the way the declaration sees it. A shard of one would be a different cut, and
-     * a sub-byte row pads, so neither is a reshape. */
+    /* A reshape: one whole plane of single elements (a byte or more each) declared under another
+     * shape with the same element count, which decl_weight admits. The row-major bytes are
+     * identical, so the entry takes the declared shape. A shard would be a different cut and a
+     * sub-byte row pads, so neither is a reshape. */
     if (single && whole) {
         const RadEncPlane& p0 = enc.plane[w.sel[0]];
         if (p0.kind == RAD_PLANE_TILED && p0.block[0] == 1 && p0.block[1] == 1 &&
@@ -42,13 +42,11 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
     if (whole) {
         view.push_back({ 0, VR, 0, VC });
     } else {
-        /* A sharded weight is a projection matrix in almost every case, and refusing anything
-         * else is better than guessing which dimension a rank owns -- with TWO exceptions that
-         * are not guesses. A rank-1 weight sharded by ROW is a contiguous slice of a vector, one
-         * value per head, and the head count is what the world size divides; in the [1, n] view
-         * that is a column cut. And a weight whose inner dimensions are all 1 is the matrix of its
-         * first and last -- a depthwise conv kernel [C, 1, K] is [C, K] -- so its rows are the
-         * ones the view already has. */
+        /* A sharded weight must be a matrix; anything else is refused rather than guessing which
+         * dimension a rank owns, with two exceptions. A rank-1 weight sharded by ROW is a
+         * contiguous slice of a per-head vector, which is a column cut in the [1, n] view. A
+         * weight whose inner dimensions are all 1 is the matrix of its first and last (a
+         * depthwise conv kernel [C, 1, K] is [C, K]). */
         uint32_t mat = rank;
         for (uint32_t i = 1; i + 1 < rank; ++i)
             if (shape[i] == 1) --mat;
@@ -69,14 +67,14 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
                                            (long long)c0, (long long)c1, (long long)VC));
             view.push_back({ 0, VR, c0, c1 });
         } else {
-            /* CONTIGUOUS WITHIN EACH STACKED PART. The weight may be several projections
-             * concatenated along dim 0 -- [gate|up], or the delta net's [q|k|v] -- and a rank owns
-             * a slice of EACH of them, not a contiguous slice of the stack. The parts are THIS
-             * RANK'S rows, so a part is `world` times as many rows in the entry. */
+            /* Contiguous within each stacked part. The weight may be several projections
+             * concatenated along dim 0 ([gate|up], the delta net's [q|k|v]), and a rank owns a
+             * slice of each, not a contiguous slice of the stack. Declared parts are this rank's
+             * rows, so a part has `world` times as many rows in the entry. */
             const int np = w.decl.n_row_parts > 1 ? w.decl.n_row_parts : 1;
             if (w.n_part_spans > 0) {
-                /* PER-PART SPANS: the plugin stated each stacked part's rows in the container
-                 * and this rank's [lo, hi) of it, so the parts need not be equal. */
+                /* Per-part spans: the plugin states each stacked part's rows in the container
+                 * and this rank's [lo, hi) of it, so parts may differ in size. */
                 if (w.n_part_spans != np)
                     return refuse(fmt("%d per-part spans for %d stacked parts", w.n_part_spans, np));
                 int64_t sum = 0, soff = 0;
@@ -142,13 +140,13 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
                 if (enc_plane_rect(p, R, C, q.r0, q.r1, q.c0, q.c1, &pq, &m) != RAD_OK)
                     return refuse(m);
             }
-            /* A plane every slice carries whole -- a table, a per-tensor scale -- is the same
-             * rectangle for every stacked part, and is taken once. */
+            /* A plane every slice carries whole (a table, a per-tensor scale) yields the same
+             * rectangle for every stacked part; take it once. */
             if (pq.row0 == last.row0 && pq.rows == last.rows && pq.col0 == last.col0 &&
                 pq.cols == last.cols)
                 continue;
             last = pq;
-            /* A share is copied as bytes, so both of its column ends have to land on one. */
+            /* A share is copied as bytes, so both column ends must fall on a byte boundary. */
             if ((pq.col0 * bits) % 8 || ((pq.col0 + pq.cols) * bits % 8 && pq.col0 + pq.cols != pc))
                 return refuse(fmt("columns [%lld, %lld) of the %s '%s' plane do not fall on whole "
                                   "bytes", (long long)pq.col0, (long long)(pq.col0 + pq.cols),

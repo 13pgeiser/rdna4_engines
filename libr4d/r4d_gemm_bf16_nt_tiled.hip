@@ -3,30 +3,21 @@
 // C[M,N] = A[M,K] @ W[N,K]^T, bf16 in and out, fp32 accumulate: gemm_bf16_nt_m64's arithmetic in a
 // block shape that reuses what it loads.
 //
-// WHY THE SKINNY KERNEL IS THE WRONG SHAPE ABOVE 64 ROWS. It gives a wave one 16-wide N tile and
-// reads every fragment straight from global memory, so each WMMA costs an activation fragment
-// load, and every N tile re-reads the whole activation. That is the right trade at decode, where
-// the weight is the cost; at a 2048-row prefill chunk the activation is the larger operand and it
-// is read N/16 times. Measured at M = 2048, K = 2560: the MoE router (N 512) 224 us, ~24 TF/s, and
-// the PLE key projection (N 10240) 3.5 ms, ~31 TF/s, at the kernel's untuned point -- and no point
-// of its space reaches 50.
+// The skinny kernel reads every fragment from global memory and re-reads the whole activation per
+// N tile: right at decode, where the weight is the cost, but at a 2048-row prefill chunk the
+// activation is read N/16 times and no configuration reaches 50 TF/s.
 //
-// HERE a block of eight waves stages a BM x 64 activation tile and a BN x 64 weight tile through
-// LDS, and each wave computes a (BM/2) x (BN/4) patch from them: every staged fragment feeds
-// TM or TN WMMA instead of one. The next K tile is loaded into registers while the current one is
-// computed, so the global latency sits behind four k steps of WMMA.
+// Here a block of eight waves stages a BM x 64 activation tile and a BN x 64 weight tile through
+// LDS, and each wave computes a (BM/2) x (BN/4) patch, so each staged fragment feeds TM or TN WMMA.
+// The next K tile is loaded into registers while the current one is computed.
 //
-// BYTE-IDENTICAL TO gemm_bf16_nt_m64, and that is a contract rather than a coincidence. That
-// kernel splits K into SK slices, accumulates each slice from zero with one WMMA per 16 K in
-// ascending order, and sums the slices in ascending order starting from 0.f. This one issues the
-// same WMMA sequence for every output tile, with the same fragment layout, and at the end of each
-// slice adds the slice into a running fp32 sum that started at 0.f -- the same additions in the
-// same order. SK comes from the same automatic rule (cfg_for), so an op whose band moves from one
-// row to the other changes no bit of its output. What differs is only where the operands sit
-// between global memory and the matrix unit.
+// Contract: byte-identical to gemm_bf16_nt_m64. Both accumulate each of SK slices from zero with
+// one WMMA per 16 K in ascending order, using the same fragment layout, and sum the slices in
+// ascending order from 0.f. SK comes from the same rule (cfg_for), so an op moving between the two
+// rows changes no output bit.
 //
-// Fragment rows are CLAMPED, as in the skinny kernel: a tile that runs past M or N re-reads the
-// last valid row, computes a result nobody stores, and never touches memory it does not own.
+// Fragment rows are clamped as in the skinny kernel: rows past M or N re-read the last valid row
+// and their results are never stored.
 #include "r4d.h"
 #include "r4d_gemm_args.h"
 #include "r4d_common.h"
@@ -35,10 +26,9 @@
 #include <cstdint>
 
 #define BT_BK 64                // K per staged tile: four WMMA k steps
-// THE LDS ROW PITCH, in elements: 144 bytes. A fragment read has sixteen lanes on sixteen rows at
-// one k, each reading 8 bytes; at 36 dwords a row the sixteen land on distinct bank pairs, and the
-// upper half-wave's +2 dwords lands between them. 144 is also a multiple of 16, so a staged
-// 16-byte chunk is one aligned ds_store_b128.
+// LDS row pitch in elements (144 bytes). A fragment read is sixteen lanes on sixteen rows, 8 bytes
+// each; at 36 dwords per row they land on distinct bank pairs, and the upper half-wave's +2 dwords
+// fall between them. 144 is a multiple of 16, so a staged chunk is one aligned ds_store_b128.
 #define BT_PITCH (BT_BK + 8)
 #define BT_WM 2                 // waves over M
 #define BT_WN 4                 // waves over N
@@ -58,21 +48,19 @@ __global__ __launch_bounds__(256) void r4d_gemm_bf16_nt_tiled_kernel(
 
   const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
   const int wm = wave / BT_WN, wn = wave % BT_WN;
-  // THE GRID RUNS IN GROUPS OF 8 ACTIVATION BANDS, M fastest inside a group. Blocks are
-  // dispatched in flattened-id order, and the launch's x-fastest grid swept every weight band for
-  // each activation band, reading the whole weight once per 128 rows: free while it sits in the
-  // 64 MB MALL, and half the rate once it does not (N 12288 x K 4096, 96 MB, ran at 68 TFLOP/s
-  // where N 8192 ran at 118). A group keeps its bands' weight tiles shared by the blocks in
-  // flight and reads the weight once a group. Small grids take it too: with fewer bands than a
-  // group the order is plain M-fastest, which is what reads the weight once.
+  // Blocks are remapped into groups of 8 activation bands, M fastest within a group. Blocks
+  // dispatch in flattened-id order; x-fastest order would read the whole weight once per 128 rows,
+  // which halves the rate once the weight exceeds the 64 MB MALL. A group shares weight tiles among
+  // blocks in flight and reads the weight once per group; with fewer bands than a group the order
+  // is plain M-fastest.
   constexpr unsigned kGroupM = 8;
   const unsigned per = kGroupM * gridDim.x, lin = blockIdx.y * gridDim.x + blockIdx.x;
   const unsigned first = lin / per * kGroupM, r = lin % per;
   const unsigned gm = min(gridDim.y - first, kGroupM);
   const int m0 = (int)(first + r % gm) * BM, n0 = (int)(r / gm) * BN;
 
-  // Staging: chunk c = tid + 256 i is row c / CPR, elements (c % CPR) * 8 of it. Eight threads
-  // cover a row's 128 bytes, so a warp's loads are four whole lines.
+  // Staging: chunk c = tid + 256 i is row c / CPR, elements (c % CPR) * 8. Eight threads cover a
+  // row's 128 bytes, so a wave's loads are four whole lines.
   unsigned aoff[AL], woff[WL];
   unsigned short* adst[AL];
   unsigned short* wdst[WL];
@@ -140,10 +128,9 @@ __global__ __launch_bounds__(256) void r4d_gemm_bf16_nt_tiled_kernel(
       for (int i = 0; i < TM; ++i)
 #pragma unroll
         for (int j = 0; j < TN; ++j) acc[i][j] = mma(af[i], bf[j], acc[i][j]);
-      /* A K STEP'S FRAGMENT READS, THEN ITS PRODUCTS, as the scheduler's groups. Left to itself,
-       * gfx12's compiler spreads each step's LDS reads among the previous step's WMMAs and waits on
-       * them early; grouped, the 128 x 128 tile measured 6 to 9% faster than LLVM 22's schedule at
-       * Flash-Next's shapes (M 384 to 2048, K 2560, N 2560 and 10240). */
+      /* Schedule each k step's fragment reads, then its products. Otherwise the compiler spreads
+       * LDS reads among the previous step's WMMAs and waits on them early; grouping is 6-9% faster
+       * on the 128 x 128 tile at M 384..2048, K 2560. */
       __builtin_amdgcn_sched_group_barrier(0x100, TM + TN, 0);    /* DS reads */
       __builtin_amdgcn_sched_group_barrier(0x008, TM * TN, 0);    /* WMMA */
       if constexpr (SPLIT) {
@@ -179,13 +166,10 @@ __global__ __launch_bounds__(256) void r4d_gemm_bf16_nt_tiled_kernel(
     }
 }
 
-// THE TWO TILES, and the rule between them. A block walks the whole of K alone, so its time is a
-// floor -- ~40 us at K = 2560 -- and a grid too small to fill the part pays it with idle CUs:
-// at M = 200, N = 512 the 128 x 128 tile is an eight-block grid. Measured at K = 2560 (us, 128 x
-// 128 / 64 x 64): M 2048 N 512 66 / 114, N 2560 341 / 644, N 10240 1627 / 2661; M 500 N 512 41 / 31,
-// N 2560 92 / 163; M 200 N 512 39 / 26, N 2560 66 / 72; M 80 N 2560 50 / 45. The large tile wins
-// once its grid is 32 blocks, half the part's CUs, and loses by less than the small one does
-// below that. (64 x 128 and 128 x 64 gain no more than a few percent over these.)
+// Tile choice. A block walks all of K alone, so its time is a floor (~40 us at K = 2560), and a
+// grid too small to fill the part leaves CUs idle (M = 200, N = 512 is eight 128 x 128 blocks).
+// At K = 2560 the 128 x 128 tile wins once its grid reaches 32 blocks (half the CUs) and loses by
+// less than the 64 x 64 tile does below that. 64 x 128 and 128 x 64 gain only a few percent.
 enum { kBtLargeGrid = 32 };
 
 int r4d_gemm_bf16_nt_tiled_arm(int M, int N) {
@@ -221,8 +205,7 @@ extern "C" int r4d_rad_gemm_bf16_tiled(const RadArgs* a, RadStream s) {
   GemmOps g;
   int rc = gemm_ops(a, &g, 0);
   if (rc != RAD_OK) return rc;
-  // THE SPLIT IS THE SKINNY ROW'S, resolved by the same rule from the same arguments, which is
-  // what keeps the two rows' outputs identical.
+  // The skinny row's split rule with the same arguments keeps the two rows' outputs identical.
   Cfg c;
   rc = cfg_for(a, g.K, g.M, 16, BR_FLAT, &c, (g.N + 15) / 16);
   if (rc != RAD_OK) return rc;

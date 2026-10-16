@@ -1,26 +1,24 @@
 /* rad-convert -- safetensors or GGUF in, .rad out.
  *
- * A .rad holds each logical weight as the canonical planes of its ENCODING (spec §4.1, §4.2):
- * which kernel library rearranges them at load, and how, is not this tool's concern, and nothing
- * here knows any kernel's layout. What it does is quantise. A RECIPE maps logical weight names to
- * quantiser plugins and their options (spec §4.4); the first rule that matches a weight decides
- * it, and a weight no rule matches keeps the checkpoint's own encoding -- which has to be one the
- * engine serves as it is (bf16, f16, f32, block-scaled FP8), or the recipe is incomplete and the
- * weight is named.
+ * A .rad holds each logical weight as the canonical planes of its encoding (spec §4.1, §4.2);
+ * kernel layouts are applied at load, not here. A recipe maps logical weight names to quantiser
+ * plugins and options (spec §4.4); the first matching rule decides. An unmatched weight keeps the
+ * checkpoint's encoding, which must be one the engine serves directly (bf16, f16, f32,
+ * block-scaled FP8), or the weight is reported.
  *
- * IT STILL RUNS DECLARE, for two reasons. The architecture plugin's name map is the only thing
- * that knows which checkpoint tensors make a declared weight -- fusions, alternatives, expert
- * slices. And declare is where every resolved kernel's layout hook is asked about the encoding
- * the recipe plans (rad_weight_encoding answers with it): a recipe nothing can serve is refused
- * before a byte is written, by the same check the engine makes at load.
+ * Declare still runs: the architecture plugin's name map says which checkpoint tensors make each
+ * weight (fusions, alternatives, expert slices), and each resolved kernel's layout hook is asked
+ * about the planned encoding (via rad_weight_encoding), so an unservable recipe is refused before
+ * anything is written, by the same check the engine makes at load.
  *
- * Every weight it quantises is measured against its source through the core's decoder, and the
- * worst are reported: a format change that cannot be ranked is one nobody can argue about.
+ * Every quantised weight is measured against its source through the core's decoder, and the worst
+ * are reported.
  */
 #include "iface.h"
 #include "format/checkpoint.h"
 #include "format/encoding.h"
 #include "format/imatrix.h"
+#include "format/quantise.h"
 #include "format/recipe.h"
 #include "plugin/registry.h"
 #include "text/tokenizer.h"
@@ -51,8 +49,7 @@ namespace {
 
 bool file_exists(const std::string& p) { std::ifstream f(p); return (bool)f; }
 
-/* `blk.12.attn_q.weight` -> 12; -1 for a model-level name. The convention is GGUF's, and an
- * imatrix's names follow it. */
+/* `blk.12.attn_q.weight` -> 12; -1 for a model-level name (GGUF naming, as in an imatrix). */
 int32_t layer_from_name(const std::string& n) {
     if (n.rfind("blk.", 0) != 0) return -1;
     size_t i = 4, v = 0;
@@ -61,77 +58,11 @@ int32_t layer_from_name(const std::string& n) {
     return (int32_t)v;
 }
 
-/* ================================================================== the recipe, typed */
-/* A rule with its quantiser found and its options typed by that quantiser's own table, once: a
- * misspelt key is refused before declare, not discovered at the forty-thousandth weight. The
- * RadParam strings point into `keys` and `vals`, which never change after build(). */
-struct Compiled {
-    const RecipeRule*       rule = nullptr;
-    const RadQuantizerInfo* q = nullptr;
-    std::vector<std::string> keys, vals;
-    std::vector<RadParam>   params;
-
-    int build(const RecipeRule& r, Registry& reg, std::string* why) {
-        rule = &r;
-        const Registry::QuantRow* row = reg.quantizer(r.quantizer);
-        if (!row || !row->info) {
-            std::string have;
-            for (const auto& qr : reg.quantizers())
-                if (qr.info) have += std::string(have.empty() ? "" : ", ") + qr.info->name;
-            *why = r.origin + ": no quantiser '" + r.quantizer + "' is loaded (" +
-                   (have.empty() ? std::string("none are -- is $RADIANCE_HOME/quantizers there?")
-                                 : "loaded: " + have) + ")";
-            return RAD_E_NOTFOUND;
-        }
-        q = row->info;
-        keys.reserve(r.options.size());
-        vals.reserve(r.options.size());
-        for (const auto& [k, v] : r.options) {
-            const RadQuantOption* opt = nullptr;
-            for (int i = 0; i < q->n_options; ++i)
-                if (k == q->options[i].key) opt = &q->options[i];
-            if (!opt) {
-                std::string takes;
-                for (int i = 0; i < q->n_options; ++i)
-                    takes += std::string(i ? ", " : "") + q->options[i].key;
-                *why = r.origin + ": " + q->name + " takes no option '" + k + "' (it takes " +
-                       takes + ")";
-                return RAD_E_INVAL;
-            }
-            char* end = nullptr;
-            if (opt->type == RAD_P_INT) {
-                const long long x = std::strtoll(v.c_str(), &end, 0);
-                if (!end || *end) { *why = r.origin + ": " + k + "=" + v + " is not an integer";
-                                    return RAD_E_INVAL; }
-                keys.push_back(k);
-                vals.push_back(v);
-                params.push_back(RAD_INT(nullptr, x));
-            } else if (opt->type == RAD_P_F64) {
-                const double x = std::strtod(v.c_str(), &end);
-                if (!end || *end) { *why = r.origin + ": " + k + "=" + v + " is not a number";
-                                    return RAD_E_INVAL; }
-                keys.push_back(k);
-                vals.push_back(v);
-                params.push_back(RAD_F64(nullptr, x));
-            } else {
-                keys.push_back(k);
-                vals.push_back(v);
-                params.push_back(RAD_STR(nullptr, nullptr));
-            }
-        }
-        for (size_t i = 0; i < params.size(); ++i) {
-            params[i].key = keys[i].c_str();
-            if (params[i].kind == RAD_P_STR) params[i].sval = vals[i].c_str();
-        }
-        return RAD_OK;
-    }
-};
-
 /* ================================================================== the plan */
 /* One logical weight this run writes: where it comes from, what decides it, what it becomes. */
 struct Logical {
     CkptWeight      src;
-    const Compiled* rule = nullptr;
+    const CompiledRule* rule = nullptr;
     RadEncoding     enc{};
     int             status = RAD_OK;
     std::string     why;
@@ -156,41 +87,13 @@ RadQuantWeight quant_weight(const Logical& L, const float* importance) {
     return qw;
 }
 
-/* Movement-unit order: model-level weights first, then each layer's own, then its experts in id
- * order with their slots adjacent -- which is what makes base + id * stride true. */
+/* Movement-unit order: model-level weights, then each layer's own, then its experts in id order
+ * with their slots adjacent, so experts are addressable as base + id * stride. */
 bool plan_less(const Logical* a, const Logical* b) {
     auto key = [](const Logical* p) {
         return std::make_tuple(p->layer < 0 ? -1 : p->layer, p->expert, p->slot, p->src.name);
     };
     return key(a) < key(b);
-}
-
-/* THE IMATRIX'S COLUMN IMPORTANCES FOR A WEIGHT, when it has them: its sum of squared inputs a
- * column, per call. The imatrix names a tensor the GGUF way without its suffix, and keeps a MoE
- * layer's experts as one entry -- so `blk.5.ffn_down_exps.9.weight` is expert 9 of
- * `blk.5.ffn_down_exps`. Empty when nothing matches or the widths disagree. */
-std::vector<float> importance_of(const ImatrixFile& im, const std::string& name, int64_t cols) {
-    std::vector<float> out;
-    std::string base = name;
-    if (base.size() > 7 && base.compare(base.size() - 7, 7, ".weight") == 0)
-        base.resize(base.size() - 7);
-    int64_t ex = 0;
-    const ImatrixEntry* e = im.find(base);
-    if (!e) {
-        const size_t dot = base.find_last_of('.');
-        if (dot == std::string::npos) return out;
-        char* end = nullptr;
-        ex = std::strtoll(base.c_str() + dot + 1, &end, 10);
-        if (!end || *end || dot + 1 == base.size()) return out;
-        e = im.find(base.substr(0, dot));
-        if (!e || ex >= e->n_expert) return out;
-    }
-    if (!e->sum2 || e->cols != cols) return out;
-    double calls = e->counts ? (double)e->counts[ex] : (double)e->ncall;
-    if (calls <= 0) calls = 1;
-    out.resize((size_t)cols);
-    for (int64_t j = 0; j < cols; ++j) out[(size_t)j] = (float)(e->sum2[ex * cols + j] / calls);
-    return out;
 }
 
 void usage() {
@@ -231,7 +134,8 @@ void usage() {
         "                       first of bf16, fp8 at which every op resolves -- the container\n"
         "                       is the same at either, so this only picks the kernels it checks\n"
         "      --max-spec N     the max_spec declare is run at (default 4, or the block a\n"
-        "                       drafter states); 0 leaves a draft head out\n"
+        "                       drafter states; a number given here is used as given); 0\n"
+        "                       leaves a draft head out\n"
         "      --reuse FILE     a container converted earlier from the SAME checkpoint. A weight\n"
         "                       it holds with the same encoding, quantiser, options and shape is\n"
         "                       copied from it instead of quantised again\n"
@@ -250,6 +154,25 @@ void usage() {
         "  -h, --help\n");
 }
 
+/* Runs fn(a, m, &why) over rows [a, a + m) covering [0, n): in about 256 pieces across threads, or
+ * as one call when !parallel. Returns RAD_E_FORMAT with the first failure's message in *why. */
+template <class F>
+int for_row_pieces(int64_t n, bool parallel, std::string* why, F fn) {
+    const int64_t piece = parallel ? std::max<int64_t>(1, (n + 255) / 256) : n;
+    const int64_t np = (n + piece - 1) / piece;
+    int rc = RAD_OK;
+#pragma omp parallel for schedule(dynamic, 1) if (parallel)
+    for (int64_t p = 0; p < np; ++p) {
+        const int64_t a = p * piece, m = std::min(piece, n - a);
+        std::string w1;
+        if (fn(a, m, &w1) != RAD_OK) {
+#pragma omp critical(rad_convert_err)
+            if (rc == RAD_OK) { rc = RAD_E_FORMAT; *why = w1; }
+        }
+    }
+    return rc;
+}
+
 }  /* namespace */
 
 int main(int argc, char** argv) {
@@ -260,6 +183,7 @@ int main(int argc, char** argv) {
     int64_t  max_ctx = 0;            /* 0: the checkpoint's training context */
     static const int kMaxSpecDefault = 4;
     int      max_spec = kMaxSpecDefault;
+    bool     max_spec_given = false;
     int      report_n = 20;
     bool     verbose = false, plan_only = false, list_quant = false;
     std::string reuse_path, changed_path;
@@ -273,6 +197,9 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { std::fprintf(stderr, "rad-convert: %s needs a value\n", what);
                                  std::exit(2); }
             return argv[++i];
+        };
+        auto num = [&](const char* what, int64_t lo, int64_t hi) {
+            return rad_flag_int("rad-convert", what, next(what), lo, hi);
         };
         if (a == "-h" || a == "--help") { usage(); return 0; }
         else if (a == "-o" || a == "--out") out = next("--out");
@@ -293,12 +220,13 @@ int main(int argc, char** argv) {
             }
             set_kv.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
         }
-        else if (a == "--max-tok")   max_tok = std::atoll(next("--max-tok"));
-        else if (a == "--max-ctx")   max_ctx = std::atoll(next("--max-ctx"));
-        else if (a == "--max-spec")  max_spec = std::atoi(next("--max-spec"));
+        else if (a == "--max-tok")   max_tok = num("--max-tok", 1, INT64_MAX);
+        else if (a == "--max-ctx")   max_ctx = num("--max-ctx", 0, INT64_MAX);
+        else if (a == "--max-spec")  { max_spec = (int)num("--max-spec", 0, INT32_MAX);
+                                       max_spec_given = true; }
         else if (a == "--draft-model") draft_dir = next("--draft-model");
         else if (a == "--plan-only") plan_only = true;
-        else if (a == "--report")    report_n = std::atoi(next("--report"));
+        else if (a == "--report")    report_n = (int)num("--report", 0, INT32_MAX);
         else if (a == "--reuse")     reuse_path = next("--reuse");
         else if (a == "--changed")   changed_path = next("--changed");
         else if (a == "--in-place")  in_place = true;
@@ -358,8 +286,8 @@ int main(int argc, char** argv) {
         if (out.empty()) out = reuse_path;
     }
     if (in.empty() || out.empty()) { usage(); return 2; }
-    /* THE OUTPUT IS OPENED WITH O_TRUNC. Pointed at the --reuse container it would empty the file
-     * every weight is about to be copied from; --in-place is the way to write into that file. */
+    /* The output is opened with O_TRUNC, so it must not be the --reuse container unless
+     * --in-place is given. */
     if (!reuse_path.empty()) {
         struct stat so{}, sr{};
         const bool same = ::stat(out.c_str(), &so) == 0 && ::stat(reuse_path.c_str(), &sr) == 0 &&
@@ -392,22 +320,22 @@ int main(int argc, char** argv) {
     Checkpoint ck;
     if (ck.open(in) < 0) return 1;
     MetaOwn& meta = ck.meta();
-    /* The drafter merges BEFORE declare: the architecture plugin decides whether to declare a
-     * draft block by looking for `draft.architectures` in the table. */
+    /* Merge the drafter before declare: the architecture plugin declares a draft block only if
+     * `draft.architectures` is present. */
     if (!draft_dir.empty()) {
         if (ck.add_draft(draft_dir, "draft.") < 0) return 1;
         RAD_INFO("drafter  %s (%s)", draft_dir.c_str(),
                  rad_meta_gets(&meta.m, "draft.architectures", "?"));
     }
     if (!arch_override.empty()) meta.arch = arch_override;
-    /* --set, added after the checkpoint's own config and the drafter's, so an operator's key is
-     * the last word. Declare reads RadModelMeta and so does the engine's, from the container's
-     * header, so a choice that changes the graph is stated once and held at both. */
+    /* --set is applied last, so it overrides the checkpoint's and drafter's config. Declare here
+     * and in the engine both read RadModelMeta from the container header, so the value holds for
+     * both. */
     for (const auto& kv : set_kv) meta.set(kv.first, kv.second);
-    /* ...AND THE DESCRIPTOR FOLLOWS. The plugin pair is derived from quantization_config, so a
-     * --set of it re-derives the pair rather than leaving the container stating one format and
-     * selecting the plugin of another: a bf16 checkpoint whose recipe writes Qwen's block fp8 is
-     * converted for qwen35_fp8 by stating what that release states. */
+    /* The quantisation descriptor (which selects the plugin pair) is derived from
+     * quantization_config, so a --set of it re-derives the descriptor. E.g. a bf16 checkpoint
+     * whose recipe writes Qwen's block fp8 targets qwen35_fp8 by setting what that release
+     * states. */
     for (const auto& kv : set_kv)
         if (kv.first.rfind("quantization_config.", 0) == 0) {
             meta.quant = quant_descriptor(meta);
@@ -415,13 +343,12 @@ int main(int argc, char** argv) {
             break;
         }
 
-    /* THE CONTAINER --reuse NAMES, read with pread and never paged through its mapping. */
+    /* The --reuse container, read with pread, never through its mapping. */
     RadFile reuse;
     if (!reuse_path.empty() && reuse.open(reuse_path.c_str()) != RAD_OK) return 1;
-    /* THE TENSORS --changed NAMES: a checkpoint that differs from the --reuse container's own in
-     * these and nowhere else -- a weight edit, a fine-tune of some matrices. --reuse matches a
-     * weight on how it was converted and not on its source bytes, so without this list it would
-     * copy the old weight for every one of them. */
+    /* --changed lists the checkpoint tensors that differ from the --reuse container's source
+     * (e.g. a partial fine-tune). --reuse matches on how a weight was converted, not on its
+     * source bytes, so without the list it would copy the stale weights. */
     std::unordered_set<std::string> changed, changed_read;
     if (!changed_path.empty()) {
         std::ifstream cf(changed_path);
@@ -438,9 +365,8 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    /* EXTENDED, NOT RE-DECIDED. The container's radiance.* keys are the convert-time choices its
-     * weights were made under, and a run that keeps those weights declares under the same ones.
-     * `radiance.encoder` is not a choice; this run derives it. */
+    /* --in-place inherits the container's radiance.* keys (the convert-time choices its weights
+     * were made under), except `radiance.encoder`, which this run derives. */
     int inherited = 0;
     if (in_place) {
         for (int64_t i = 0; i < reuse.meta_count(); ++i) {
@@ -455,8 +381,7 @@ int main(int argc, char** argv) {
             ++inherited;
         }
     }
-    /* Published once more, unconditionally: every merge above may have moved the strings the
-     * previous finish() pointed at. */
+    /* Always re-publish: the merges above may have moved the strings finish() pointed at. */
     meta.finish();
     if (inherited)
         RAD_INFO("--in-place: %d radiance.* key(s) carried over from %s", inherited,
@@ -483,15 +408,15 @@ int main(int argc, char** argv) {
                 "recipe is checked against");
         return 1;
     }
-    /* AN IMPORTED QUANTISATION IS RECORDED AS THE DESCRIPTOR OF THE PLUGIN THAT SERVES IT: every
-     * weight states its own encoding in the container, and the engine selects by exact match. */
+    /* An imported quantisation is recorded as the descriptor of the plugin serving it; the engine
+     * selects by exact match, and each weight states its own encoding. */
     if (imported) {
         meta.quant = plugins.arch_quant;
         meta.finish();
     }
     Registry& reg = rad_tools_registry();
-    std::deque<Compiled> compiled;
-    std::map<const RecipeRule*, const Compiled*> by_rule;
+    std::deque<CompiledRule> compiled;
+    std::map<const RecipeRule*, const CompiledRule*> by_rule;
     for (const RecipeRule& r : recipe.rules()) {
         compiled.emplace_back();
         std::string why;
@@ -508,40 +433,31 @@ int main(int argc, char** argv) {
     ctx.rank = 0;
     ctx.world_size = 1;
     ctx.max_tok = max_tok;
-    /* THE CONTEXT BOUND IS A DECLARE INPUT: an architecture whose graph changes shape with it --
-     * Qwen3.8-Flash-Next's QSA is exactly dense attention up to its indexer budget and a different
-     * attention above -- can refuse to declare at the checkpoint's own number. */
+    /* The context bound is a declare input: an architecture whose graph depends on it (e.g.
+     * Qwen3.8-Flash-Next's QSA, dense up to its indexer budget) may refuse some values. */
     ctx.max_seqs = 256;
     ctx.max_ctx = max_ctx > 0 ? max_ctx : meta.m.n_ctx_train;
     ctx.scope = "";
-    /* NON-ZERO ON PURPOSE: a container carries every weight any deployment of the model could ask
-     * for, so a draft head is declared even though converting is not drafting. A drafter trained
-     * for one block says so (rad_arch_probe), as it does for `--num-speculative-tokens auto`. */
-    if (max_spec == kMaxSpecDefault) {
-        RadArchProbe probe{};
-        (void)rad_tools_probe(plugins, meta.m, &probe);
-        if (probe.draft_depth > 0 && probe.draft_depth_fixed) {
-            max_spec = probe.draft_depth;
-            RAD_INFO("declaring at max_spec %d, the only depth this drafter serves", max_spec);
-        }
+    RadArchProbe probe{};
+    (void)rad_tools_probe(plugins, meta.m, &probe);
+    /* Non-zero on purpose: the container carries every weight any deployment may need, including
+     * the draft head. A drafter trained for one fixed depth reports it via rad_arch_probe, which
+     * replaces the default but not a depth the command line states. */
+    if (!max_spec_given && probe.draft_depth > 0 && probe.draft_depth_fixed) {
+        max_spec = probe.draft_depth;
+        RAD_INFO("declaring at max_spec %d, the only depth this drafter serves", max_spec);
     }
     ctx.max_spec = max_spec;
-    /* AND THE ENCODER, for the draft head's reason. */
+    /* Likewise declare the encoders, the vision tower at the engine's default patch bound. */
     if (rad_meta_geti(&meta.m, "vision_config.patch_size", 0) > 0) {
         ctx.max_enc_patches = 16384;
-        RadArchProbe probe{};
-        (void)rad_tools_probe(plugins, meta.m, &probe);
         if (probe.enc_merge > 1) ctx.max_enc_patches -= ctx.max_enc_patches % probe.enc_merge;
     }
-    {
-        RadArchProbe probe{};
-        (void)rad_tools_probe(plugins, meta.m, &probe);
-        ctx.max_audio_frames = probe.audio_frames > 0 ? probe.audio_frames : 0;
-    }
+    ctx.max_audio_frames = probe.audio_frames > 0 ? probe.audio_frames : 0;
 
-    /* THE ENCODING EVERY WEIGHT WILL HAVE, answered to declare as rad_weight_encoding: the
-     * recipe's when a rule matches, the checkpoint's own when it is trivial. Remembered once
-     * answered; a name the name map does not know yet is not, since declare may map it later. */
+    /* Each weight's planned encoding, answered to declare via rad_weight_encoding: the recipe's
+     * when a rule matches, else the checkpoint's own when trivial. Answers are memoised, except
+     * not-found names, which declare may map later. */
     std::map<std::string, Logical> logical;
     auto plan_weight = [&](const std::string& name, const Program& prog, bool optional,
                            Logical** out) -> int {
@@ -562,7 +478,7 @@ int main(int argc, char** argv) {
             const int st = L.rule->q->encoding(L.rule->params.data(), (int)L.rule->params.size(),
                                                &qw, &L.enc);
             if (st == RAD_E_UNSUPPORTED && (L.src.trivial || L.src.imported)) {
-                /* declined -- a norm under a pattern meant for matrices -- and kept as it is */
+                /* declined (e.g. a norm under a matrix pattern): keep as is */
                 L.rule = nullptr;
                 L.enc = L.src.enc;
             } else if (st != RAD_OK) {
@@ -602,8 +518,8 @@ int main(int argc, char** argv) {
         return n;
     };
 
-    /* AN OP THAT RESOLVED IN NO DOMAIN has no kernel to read its weights, so nothing has checked
-     * the encoding planned for them. Device holes alone are placement options, not refusals. */
+    /* Ops resolved in no domain: nothing has checked their weights' planned encoding. Device-only
+     * holes are placement options, not refusals. */
     auto dead_ops = [](const Program& p) {
         size_t n = 0;
         for (size_t i = 1; i < p.ops.size(); ++i) {
@@ -614,11 +530,9 @@ int main(int argc, char** argv) {
         }
         return n;
     };
-    /* THE CACHE WIDTH IS A SERVE CHOICE the container does not record: the weights and their
-     * encodings are the same at either, and only the kernels that check them differ -- an
-     * attention that writes an fp8 cache may have no bf16 form. Unnamed, the first width at which
-     * every op resolves is the one checked against; if none does, the one with the fewest holes
-     * is reported. */
+    /* The KV cache width is a serve-time choice the container does not record; only the kernels
+     * differ (an fp8-cache attention may have no bf16 form). Without --kv-cache-dtype, check
+     * against the first width at which every op resolves, else report the one with fewest holes. */
     const std::vector<int> widths = kv_dtype != RAD_DT_INVALID
                                         ? std::vector<int>{ kv_dtype }
                                         : std::vector<int>{ RAD_BF16, RAD_F8E4M3 };
@@ -681,7 +595,7 @@ int main(int argc, char** argv) {
                     L->slot, g.layer, g.expert, g.slot);
             ++bad;
         }
-        /* THE ENCODING DECLARE CHOSE KERNELS FOR IS THE ONE THAT WILL BE WRITTEN. */
+        /* The encoding declare chose kernels for must be the one written. */
         if (!w.enc_known || !rad_enc_equal(&w.enc, &L->enc)) {
             RAD_ERR("'%s' was declared over an encoding of '%s' other than the one planned for "
                     "it", w.name.c_str(), w.source.c_str());
@@ -735,16 +649,14 @@ int main(int argc, char** argv) {
     RAD_TRY(in_place ? w.begin_append(out.c_str(), reuse) : w.begin(out.c_str()));
 
     w.set_arch(meta.arch);
-    /* An extended container keeps its name: the checkpoint this run reads its new weights from
-     * need not be the one it was made from. */
+    /* An extended container keeps its name; this run's checkpoint need not be its original. */
     w.set_model_name(in_place ? std::string(reuse.str(reuse.header().model_name))
                               : (meta.name.empty() ? meta.arch : meta.name));
     w.set_quant(meta.quant);
     w.set_recipe(in_place && recipe.empty() ? std::string(reuse.str(reuse.header().recipe))
                                             : recipe.text());
-    /* The checkpoint as its last two path components -- for a Hugging Face download, the
-     * repository id. The rest of the path is where one machine keeps its models, and a container
-     * is meant to leave that machine. */
+    /* Record the checkpoint as its last two path components (a Hugging Face repository id), not
+     * a machine-local path. */
     std::string ck_id = ck.path();
     while (ck_id.size() > 1 && ck_id.back() == '/') ck_id.pop_back();
     if (const size_t a = ck_id.find_last_of('/'); a != std::string::npos && a > 0)
@@ -769,8 +681,8 @@ int main(int argc, char** argv) {
     w.meta_f("rms_eps",        meta.m.rms_eps);
     w.meta_f("rope_theta",     meta.m.rope_theta);
     for (int i = 0; i < meta.m.n_kv; ++i) w.meta_s(meta.m.kv_key[i], meta.m.kv_val[i]);
-    /* THE CONTAINER CARRIES AN ENCODER'S WEIGHTS: what `--mm-max-patches auto` keys on. */
-    /* The encoders the container carries, by name: a vision tower, an audio encoder, or both. */
+    /* The encoders the container carries, by name (vision, audio or both); `--mm-max-patches auto`
+     * keys on this. */
     {
         std::string enc;
         if (prog.encoder.modalities != 0) enc = prog.encoder_name;
@@ -781,23 +693,18 @@ int main(int argc, char** argv) {
 
     /* ---------------------------------------------------------------- the weights
      *
-     * EVERY WEIGHT IS ADDED FIRST, IN PLAN ORDER, AND WRITTEN AFTER IN ANY ORDER. Adding one is
-     * what places it -- its planes' offsets in the blob follow from the ones before it -- and that
-     * is the only part of the writer with an order; a plane write is a pwrite at its own offset.
-     * So the writing is parallel: a Flash-Next checkpoint is 49152 expert slices of a few
-     * megabytes each, and one at a time -- decode, a quantiser's OpenMP region too short to
-     * amortise its own fork, the error -- it keeps about four of thirty-two cores busy for an
-     * hour.
+     * All weights are added first in plan order, which fixes their plane offsets; plane writes are
+     * then pwrites at their own offsets in any order, so writing is parallel (a Flash-Next
+     * checkpoint is 49152 expert slices of a few MB each).
      *
-     * A SMALL WEIGHT IS ONE THREAD'S. The pool takes them in plan order, which is roughly file
-     * order, and nested parallelism is off, so a quantiser's own OpenMP region runs on the thread
-     * that called it. A LARGE ONE IS EVERY THREAD'S: those run after, one at a time, with the
-     * decode, the quantiser and the error each parallel over rows -- a 51 GB n-gram table, an
-     * lm_head, the attention linears. */
+     * Small weights run one per thread, in plan order (roughly file order); nested parallelism is
+     * off, so a quantiser's OpenMP region stays on its calling thread. Large weights (n-gram
+     * table, lm_head, attention linears) run afterwards one at a time, with decode, quantise and
+     * error each parallel over rows. */
 #ifdef _OPENMP
     omp_set_max_active_levels(1);
 #endif
-    constexpr int64_t kChunk = (int64_t)64 << 20;
+    constexpr int64_t kChunk = kQuantBandBytes;     /* copies and joins move this much at once */
     constexpr int64_t kSmall = (int64_t)32 << 20;   /* f32 bytes one thread quantises alone */
 
     struct Job {
@@ -826,9 +733,9 @@ int main(int argc, char** argv) {
         for (int k = 0; k < L.enc.n_planes; ++k)
             plane_total += rad_enc_plane_bytes(&L.enc.plane[k], L.src.rows, L.src.cols);
 
-        /* --- REUSED: the same encoding, quantiser, options and shape in the --reuse container
-         * are the same planes, given the same checkpoint -- which --reuse leaves to the operator,
-         * since nothing in either container records a Hessian's contents. */
+        /* --- Reused: the same encoding, quantiser, options and shape in the --reuse container give
+         * the same planes, assuming the same checkpoint (the operator's responsibility; neither
+         * container records e.g. a Hessian's contents). */
         const RadFileEntry* re = reuse.is_open() ? reuse.find(ww.name) : nullptr;
         const bool reads_changed =
             !changed.empty() && ckpt_reads_any(L.src, changed, &changed_read);
@@ -865,8 +772,7 @@ int main(int argc, char** argv) {
         if (idx < 0) { w.abort(); return 1; }
         jobs.push_back(Job{ Lp, idx, re, plane_total });
     }
-    /* A NAME NO WEIGHT READS changes nothing, so it is a typo or a tensor this program does not
-     * convert -- and either way the operator believes a weight is being converted that is not. */
+    /* A --changed name no weight reads is a typo or an unconverted tensor; refuse it. */
     if (!changed.empty()) {
         std::vector<std::string> unread;
         for (const std::string& n : changed)
@@ -883,8 +789,8 @@ int main(int argc, char** argv) {
     }
 
     /* ---------------------------------------------------------------- vocab */
-    /* core/text interprets the declared chain and serialises it; the writer places it and owns the
-     * one string blob its token text goes into. */
+    /* core/text interprets and serialises the declared chain; the writer places it and owns the
+     * string blob holding token text. */
     struct WriterSink : StringSink {
         RadWriter* w;
         rad_stroff intern(std::string_view s) override { return w->intern_string(s); }
@@ -895,9 +801,9 @@ int main(int argc, char** argv) {
     if (!tokjson.empty()) {
         if (parse_tokenizer_json(tokjson.c_str(), vb) < 0) { w.abort(); return 1; }
     } else if (ck.is_gguf()) {
-        /* GGUF has no declared chain, only the pre-tokeniser NAME llama.cpp derived by hashing the
-         * original tokenizer.json. core/text reconstructs from that name where it can and REFUSES
-         * where it cannot -- point --tokenizer at the real file when this fails. */
+        /* GGUF has no declared chain, only the pre-tokeniser name llama.cpp derived by hashing the
+         * original tokenizer.json. core/text reconstructs from the name where it can and refuses
+         * otherwise (then pass --tokenizer). */
         if (vocab_from_gguf(ck.gguf(), vb) < 0) {
             RAD_ERR("pass --tokenizer <tokenizer.json> to bake the declared chain instead of the "
                     "one a pre-tokeniser name implies.");
@@ -914,8 +820,7 @@ int main(int argc, char** argv) {
         w.abort();
         return 1;
     }
-    /* Serialised at section offset 0: the writer does not know where the section lands until it
-     * has sized the string blob this call is still growing, so finish() rebases. */
+    /* Serialised at section offset 0; finish() rebases once the string blob is sized. */
     std::vector<uint8_t> vocab_blob;
     if (vocab_serialize(vb, sink, 0, vocab_blob) < 0) { w.abort(); return 1; }
     if (w.set_vocab_section(vocab_blob.data(), (int64_t)vocab_blob.size()) < 0) {
@@ -925,8 +830,7 @@ int main(int argc, char** argv) {
 
     /* ---------------------------------------------------------------- expert profile */
     if (im.entries().size()) {
-        /* Shares are per layer, so the planner compares experts within a layer rather than
-         * across layers with different token counts. */
+        /* Shares are normalised per layer, so experts are compared within a layer. */
         std::map<int, std::vector<std::pair<int, double>>> per_layer;
         for (const auto& e : im.entries()) {
             if (e.n_expert <= 1 || !e.counts) continue;
@@ -954,10 +858,9 @@ int main(int argc, char** argv) {
             w.add_profile(pr.layer, pr.expert, pr.share);
         }
 
-    /* EVERY TABLE IS COMPLETE NOW -- the weights placed, the vocab and the profile in -- so the
-     * blob can be written where it will stay rather than spilled and copied in at the end, which
-     * on a 113 GiB container is minutes of the disk doing nothing but move it (RadWriter::seal).
-     * An extended container already writes in place. */
+    /* All tables are complete, so seal: the blob is then written in its final place rather than
+     * spilled and copied at the end (RadWriter::seal). An extended container already writes in
+     * place. */
     if (!in_place && w.seal() < 0) { w.abort(); return 1; }
 
     std::atomic<int64_t> written{0}, reused{reused_inplace}, n_reused{n_inplace};
@@ -965,19 +868,9 @@ int main(int argc, char** argv) {
     /* Read `n` rows from `r0` of a checkpoint weight as f32, the rows split across threads. */
     auto rows_f32 = [](const CkptWeight& src, int64_t r0, int64_t n, float* out,
                        std::string* why) -> int {
-        const int64_t piece = std::max<int64_t>(1, (n + 255) / 256);
-        const int64_t np = (n + piece - 1) / piece;
-        int rc = RAD_OK;
-#pragma omp parallel for schedule(dynamic, 1)
-        for (int64_t p = 0; p < np; ++p) {
-            const int64_t a = p * piece, m = std::min(piece, n - a);
-            std::string w1;
-            if (ckpt_rows_f32(src, r0 + a, m, out + a * src.cols, &w1) != RAD_OK) {
-#pragma omp critical(rad_convert_err)
-                if (rc == RAD_OK) { rc = RAD_E_FORMAT; *why = w1; }
-            }
-        }
-        return rc;
+        return for_row_pieces(n, true, why, [&](int64_t a, int64_t m, std::string* w1) {
+            return ckpt_rows_f32(src, r0 + a, m, out + a * src.cols, w1);
+        });
     };
 
     /* One weight, start to finish. Its own buffers, so any thread may run it. */
@@ -1008,9 +901,9 @@ int main(int argc, char** argv) {
             return RAD_OK;
         }
 
-        /* --- KEPT AS THE CHECKPOINT HOLDS IT: each plane's bytes from the mapped source, joined
-         * where the name map joins pieces. A join along rows is the pieces one after another, so
-         * each goes straight from the mapping; any other join is assembled a chunk at a time. */
+        /* --- Kept as the checkpoint holds it, joining pieces where the name map does. A row join
+         * is the pieces in sequence, written straight from the mapping; other joins are assembled
+         * a chunk at a time. */
         if (!L.rule) {
             for (int k = 0; k < L.enc.n_planes; ++k) {
                 const std::vector<const SrcTensor*>& src = k == 0 ? L.src.pieces : L.src.scales;
@@ -1055,139 +948,67 @@ int main(int argc, char** argv) {
             return RAD_OK;
         }
 
-        /* --- QUANTISED, a block of rows at a time. The quantiser says how many rows one call
-         * may take (0: all of them); the converter takes a multiple of that near 64 MiB of f32,
-         * so a 51 GB table streams and a GPTQ weight is handed whole. A plane banded by rows is
-         * written as each block lands; a plane that covers every row -- a codebook, a per-tensor
-         * scale -- is held until the last call has written it. */
-        const Compiled& c = *L.rule;
-        const std::vector<float> imp = imat_path.empty()
-                                           ? std::vector<float>()
-                                           : importance_of(im, name, L.src.cols);
+        /* --- Quantised a band of rows at a time, by the loop core/format/quantise.h describes. */
+        const CompiledRule& c = *L.rule;
+        std::vector<float> imp;
+        if (!imat_path.empty()) (void)im.importance_for(name, L.src.cols, &imp);
         const RadQuantWeight qw = quant_weight(L, imp.empty() ? nullptr : imp.data());
-        {
-            /* the group is known now and the encoding was chosen without it: it may not move */
-            RadEncoding again{};
-            if (c.q->encoding(c.params.data(), (int)c.params.size(), &qw, &again) != RAD_OK ||
-                !rad_enc_equal(&again, &L.enc)) {
-                RAD_ERR("'%s': %s answers with another encoding once it is told the weight's "
-                        "movement group, and declare could not tell it that. An encoding may "
-                        "depend on the weight's name and shape, not on where it is placed.",
-                        name.c_str(), c.q->name);
-                return RAD_E_STATE;
-            }
-        }
-        const int64_t R = L.src.rows, C = L.src.cols;
-        int64_t rb = c.q->row_block ? c.q->row_block(c.params.data(), (int)c.params.size(), &qw)
-                                    : 0;
-        if (rb <= 0 || rb > R) rb = R;
-        int64_t blk = rb;
-        if (rb < R) {
-            const int64_t want = std::max<int64_t>(1, kChunk / std::max<int64_t>(C * 4, 1));
-            blk = std::max<int64_t>(rb, want - want % rb);
-            if (blk > R) blk = R;
-        }
-        const int np = L.enc.n_planes;
-        std::vector<int64_t> prow_bytes((size_t)np), pband((size_t)np);
-        std::vector<std::vector<uint8_t>> whole((size_t)np), band((size_t)np);
-        bool misaligned = false;
-        for (int k = 0; k < np; ++k) {
-            const RadEncPlane& p = L.enc.plane[k];
-            int64_t pr = 0, pc = 0;
-            rad_enc_plane_dims(&p, R, C, &pr, &pc);
-            prow_bytes[(size_t)k] = rad_enc_row_bytes(p.dtype, pc);
-            const bool banded = p.kind == RAD_PLANE_TILED && p.block[0] > 0;
-            pband[(size_t)k] = banded ? p.block[0] : 0;
-            if (banded && blk < R && blk % p.block[0]) misaligned = true;
-            if (!banded) whole[(size_t)k].assign((size_t)(pr * prow_bytes[(size_t)k]), 0);
-        }
-        if (misaligned) {
-            RAD_ERR("'%s': %s takes %lld rows a call, which splits a block of its own encoding's "
-                    "scales", name.c_str(), c.q->name, (long long)rb);
-            return RAD_E_SHAPE;
-        }
-        /* Measured through the decoder every reader uses: the core's for plain and affine, the
-         * quantiser's own hook for a scheme of its own (core/format/encoding.h). A quantiser's
-         * decoder is not promised to be reentrant, so its rows are decoded in one call. */
+        const int64_t C = L.src.cols;
+        /* Error is measured through the decoder readers use: the core's for plain and affine, the
+         * quantiser's hook for its own scheme (core/format/encoding.h). Quantiser decoders need
+         * not be reentrant, so those rows are decoded in one call. */
         bool core_decodes = true;
         const bool own_scheme = !rad_enc_is(&L.enc, "plain") && !rad_enc_is(&L.enc, "affine");
-        std::vector<float> f, ref, dec;
+        std::vector<float> dec;
         double num = 0, den = 0, num_i = 0, den_i = 0;
-        for (int64_t r0 = 0; r0 < R; r0 += blk) {
-            const int64_t n = std::min(blk, R - r0);
-            f.resize((size_t)(n * C));
+        QuantIo io;
+        io.read = [&](int64_t r0, int64_t n, float* out, std::string* why) {
+            return rows_f32(L.src, r0, n, out, why);
+        };
+        io.write = [&](int k, int64_t off, const void* data, int64_t bytes) {
+            return w.write_plane(idx, k, off, data, bytes);
+        };
+        /* The error over exactly these rows. */
+        io.band = [&](int64_t, int64_t n, const float* ref, const void* const* pd) {
+            if (!core_decodes) return;
+            EncodedView v;
             std::string why;
-            if (rows_f32(L.src, r0, n, f.data(), &why) != RAD_OK) {
-                RAD_ERR("'%s': %s", name.c_str(), why.c_str());
-                return RAD_E_FORMAT;
+            enc_view(L.enc, n, C, pd, &v);
+            dec.resize((size_t)(n * C));
+            const int drc = for_row_pieces(n, !own_scheme, &why,
+                                           [&](int64_t a, int64_t m, std::string* w1) {
+                return enc_decode_rows(v, a, m, dec.data() + a * C, w1);
+            });
+            if (drc != RAD_OK) {
+                RAD_WARN("'%s': nothing decodes what %s wrote (%s); its error is not reported",
+                         name.c_str(), c.q->name, why.c_str());
+                core_decodes = false;
+                return;
             }
-            ref = f;                               /* a quantiser may rotate its input in place */
-            std::vector<void*> ptr((size_t)np);
-            for (int k = 0; k < np; ++k) {
-                if (!pband[(size_t)k]) { ptr[(size_t)k] = whole[(size_t)k].data(); continue; }
-                const int64_t rows_k = (n + pband[(size_t)k] - 1) / pband[(size_t)k];
-                band[(size_t)k].assign((size_t)(rows_k * prow_bytes[(size_t)k]), 0);
-                ptr[(size_t)k] = band[(size_t)k].data();
+            const float* pi = imp.empty() ? nullptr : imp.data();
+            const int64_t cnt = n * C;
+#pragma omp parallel for reduction(+ : num, den, num_i, den_i) schedule(static)
+            for (int64_t i = 0; i < cnt; ++i) {
+                const double d = (double)ref[(size_t)i] - dec[(size_t)i];
+                const double x = ref[(size_t)i];
+                num += d * d;
+                den += x * x;
+                if (pi) {
+                    const double wj = pi[i % C];
+                    num_i += wj * d * d;
+                    den_i += wj * x * x;
+                }
             }
-            const int st = c.q->quantize(c.params.data(), (int)c.params.size(), &qw, f.data(),
-                                         r0, n, ptr.data());
+        };
+        {
+            std::string why;
+            const int st = quantise_weight(*c.q, c.params.data(), (int)c.params.size(), qw, L.enc,
+                                           kQuantBandBytes, io, &why);
             if (st != RAD_OK) {
-                RAD_ERR("'%s': %s could not quantise rows [%lld, %lld): %s", name.c_str(),
-                        c.q->name, (long long)r0, (long long)(r0 + n), rad_strerror(st));
+                RAD_ERR("'%s': %s", name.c_str(), why.c_str());
                 return st;
             }
-            for (int k = 0; k < np; ++k) {
-                if (!pband[(size_t)k]) continue;
-                if (w.write_plane(idx, k, (r0 / pband[(size_t)k]) * prow_bytes[(size_t)k],
-                                  band[(size_t)k].data(), (int64_t)band[(size_t)k].size()) !=
-                    RAD_OK)
-                    return RAD_E_IO;
-            }
-            /* THE ERROR, through the core's decoder over exactly these rows. */
-            if (core_decodes) {
-                EncodedView v;
-                const void* const* pd = (const void* const*)ptr.data();
-                enc_view(L.enc, n, C, pd, &v);
-                dec.resize((size_t)(n * C));
-                const int64_t piece = own_scheme ? n : std::max<int64_t>(1, (n + 255) / 256);
-                const int64_t npc = (n + piece - 1) / piece;
-                int drc = RAD_OK;
-#pragma omp parallel for schedule(dynamic, 1) if (!own_scheme)
-                for (int64_t p = 0; p < npc; ++p) {
-                    const int64_t a = p * piece, m = std::min(piece, n - a);
-                    std::string w1;
-                    if (enc_decode_rows(v, a, m, dec.data() + a * C, &w1) != RAD_OK) {
-#pragma omp critical(rad_convert_err)
-                        if (drc == RAD_OK) { drc = RAD_E_FORMAT; why = w1; }
-                    }
-                }
-                if (drc != RAD_OK) {
-                    RAD_WARN("'%s': nothing decodes what %s wrote (%s); its error is not "
-                             "reported", name.c_str(), c.q->name, why.c_str());
-                    core_decodes = false;
-                } else {
-                    const float* pi = imp.empty() ? nullptr : imp.data();
-                    const int64_t cnt = n * C;
-#pragma omp parallel for reduction(+ : num, den, num_i, den_i) schedule(static)
-                    for (int64_t i = 0; i < cnt; ++i) {
-                        const double d = (double)ref[(size_t)i] - dec[(size_t)i];
-                        const double x = ref[(size_t)i];
-                        num += d * d;
-                        den += x * x;
-                        if (pi) {
-                            const double wj = pi[i % C];
-                            num_i += wj * d * d;
-                            den_i += wj * x * x;
-                        }
-                    }
-                }
-            }
         }
-        for (int k = 0; k < np; ++k)
-            if (!pband[(size_t)k] &&
-                w.write_plane(idx, k, 0, whole[(size_t)k].data(),
-                              (int64_t)whole[(size_t)k].size()) != RAD_OK)
-                return RAD_E_IO;
         if (core_decodes && den > 0) L.err = std::sqrt(num / den);
         if (core_decodes && den_i > 0) L.err_imp = std::sqrt(num_i / den_i);
         written += j.bytes;

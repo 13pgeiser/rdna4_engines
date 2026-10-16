@@ -2,34 +2,32 @@
 // r4d_gemm_w4a8_nt_m64 reads, in one pass over the row -- optionally with the residual junction
 // in front of it: a post-norm on the branch output, the residual add and a scalar on the sum.
 //
-// WHY.  A w4a8 linear needs its activation as int8 codes in the GEMM's fragment order with one f32
-// scale per row (r4d_quant_act_i8), and the producer of that activation is a norm.  Unfused, a
-// model whose linears take that grid issues the norm and the quantiser as two dispatches, and a
+// A w4a8 linear needs its activation as int8 codes in the GEMM's fragment order with one f32 scale
+// per row (r4d_quant_act_i8), produced by a norm. Unfused that is two dispatches, and a
 // sandwich-norm model (Gemma 2/3/4) issues four or five at every residual junction:
 //
 //     rmsnorm(branch; w_post) -> add(residual) -> [scale] -> rmsnorm(residual; w) -> quant_act_i8
 //
-// each one a single workgroup over one row at a decode batch, so the step pays the dispatch, not
-// the bytes.  This is that chain as one dispatch.
+// each a single workgroup per row at decode, so the step pays for dispatches, not bytes. This is
+// the chain as one dispatch.
 //
-// BYTE-IDENTICAL TO THE CHAIN IT REPLACES, not merely close, because the engine's greedy output is
-// compared byte for byte across builds.  What makes that hold:
+// Byte-identical to the chain, because the engine's greedy output is compared byte for byte across
+// builds:
 //
-//   * every intermediate the chain stores in bf16 is rounded to bf16 here too, and the next stage
-//     reads the rounded value: the post-norm output, the residual sum, the scaled residual and the
-//     norm output the quantiser takes its absmax and codes over;
-//   * both sums of squares are taken by the same partition the standalone norm uses -- the width
-//     r4d_act_threads(M, n) picks, thread t folding columns t, t+THR, ... in ascending order, then
-//     r4d_wave_sum and the waves in order through LDS (r4d_model_bf16.hip's rmsnorm_kernel and
-//     block_sum, which this copies rather than shares only because that one lives in another unit);
-//   * the arithmetic of every element is written the way the standalone kernels write it --
-//     `x * s * (g + wadd)`, `a + b`, `x * scalar`, `fmaxf(m, 1e-8f) / 127.f` -- and the library is
-//     built with -ffp-contract=off, so no stage picks up an fma the chain does not have.
+//   * every intermediate the chain stores in bf16 is rounded to bf16 here and the next stage reads
+//     the rounded value: the post-norm output, the residual sum, the scaled residual and the norm
+//     output the quantiser reduces over;
+//   * both sums of squares use the standalone norm's partition: the width r4d_act_threads(M, n)
+//     picks, thread t folding columns t, t+THR, ... in order, then r4d_wave_sum and the waves in
+//     order through LDS (copied from r4d_model_bf16.hip's rmsnorm_kernel and block_sum, which live
+//     in another unit);
+//   * each element's arithmetic matches the standalone kernels (`x * s * (g + wadd)`,
+//     `a + b`, `x * scalar`, `fmaxf(m, 1e-8f) / 127.f`), under -ffp-contract=off.
 //
-// THE RESIDUAL IS READ AND WRITTEN, and nothing else reads it before this kernel is done: each
-// thread rewrites only the columns it read, so the second pass reads its own writes back.
+// The residual is read and written; each thread rewrites only the columns it read, so the second
+// pass reads its own writes back.
 //
-// Returns a negative code rather than throwing, for the reason given in r4d_gemm_fp8a8.hip.
+// Returns a negative code instead of throwing, for the reason given in r4d_gemm_fp8a8.hip.
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_emit.h"
@@ -44,8 +42,8 @@ constexpr uint32_t kWave = 32;
 __device__ __forceinline__ float bf2f(uint16_t h) { return __uint_as_float((uint32_t)h << 16); }
 
 // The standalone norm's reduction, verbatim (r4d_model_bf16.hip): the wave butterfly, then the
-// waves summed IN ORDER by every thread out of LDS.  `lds` must not be reused by a second
-// reduction without a barrier between them -- the kernel below gives each its own array.
+// waves summed in order by every thread from LDS. `lds` must not be reused by a second reduction
+// without a barrier in between; the kernel below gives each its own array.
 template <uint32_t NW>
 __device__ __forceinline__ float block_sum(float v, float* lds) {
     v = r4d_wave_sum(v);
@@ -67,9 +65,9 @@ __device__ __forceinline__ float gain(const void* w, uint32_t i, bool f32) {
 // SCL:  the sum is multiplied by the [1] scalar before it is stored and normalised.
 // `ybuf` holds the row's norm output for the fragment-order store, which reads across threads.
 //
-// THE ROW BODY, from the junction on: `s1` is the post-norm's factor, already reduced over `xr` by
-// the caller (the plain kernel below takes it off the row; the all-reduce form takes it off the
-// reduced sum it has just stored). l2 and lm are this function's own reduction planes.
+// The row body from the junction on: `s1` is the post-norm's factor, already reduced over `xr` by
+// the caller (the plain kernel takes it off the row; the all-reduce form off the reduced sum it has
+// just stored). l2 and lm are this function's own reduction planes.
 template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR>
 __device__ __forceinline__ void junction_row(
     const uint16_t* __restrict__ xr, uint16_t* __restrict__ rr, const void* __restrict__ w,
@@ -151,13 +149,13 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_i8_kernel(
 }
 
 // ---------------------------------------------------------------------------------------------
-// THE SAME JUNCTION WITH THE TWO-RANK ALL-REDUCE THAT ALWAYS PRECEDES IT: the branch output is a
-// rank's partial sum of a column-sharded linear (o_proj, down_proj), and the post-norm is of the
-// WHOLE sum. ar_rmsnorm_quant_fp8's handshake, exact wire only: each block pushes the rows it owns
-// into the peer's scratch slot as 16B words, publishes its flag, waits for the peer's, and reduces
-// `f2bf(mine + peer)` back into `x` -- the bytes the standalone exact all-reduce stores, fp32 add
-// commuting exactly so both ranks agree -- on the post-norm's own sum-of-squares pass. A block owns
-// whole rows, one a block at a decode batch.
+// The same junction with the two-rank all-reduce that precedes it: the branch output is a rank's
+// partial sum of a column-sharded linear (o_proj, down_proj), and the post-norm is of the whole
+// sum. ar_rmsnorm_quant_fp8's handshake, exact wire only: each block pushes its rows into the
+// peer's scratch slot as 16B words, publishes its flag, waits for the peer's, and reduces
+// `f2bf(mine + peer)` back into `x` (the standalone exact all-reduce's bytes; the fp32 add
+// commutes, so both ranks agree) during the post-norm's sum-of-squares pass. A block owns whole
+// rows, one per block at decode.
 #define R4D_ARQ8_SPIN_MAX 4000000000ULL
 
 __device__ __forceinline__ void arq8_store_rel(unsigned int* p, unsigned int v) {
@@ -240,7 +238,7 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_kernel(
 //   7 scalar    [1]    optional       multiplies the sum; needs the residual
 enum { RQ_X = 0, RQ_RES, RQ_W, RQ_Q, RQ_S, RQ_Y, RQ_WP, RQ_SC };
 
-static int rad_rmsnorm_quant_i8_body(const RadArgs* a, const R4dSink& sk) {
+extern "C" int r4d_rad_rmsnorm_quant_i8(const RadArgs* a, RadStream stream) {
     int emit_rc = RAD_OK;
     const RadTensor* x  = r4d_opt(a, RQ_X);
     const RadTensor* rs = r4d_opt(a, RQ_RES);
@@ -271,14 +269,14 @@ static int rad_rmsnorm_quant_i8_body(const RadArgs* a, const R4dSink& sk) {
     const size_t lds = (size_t)n * sizeof(uint16_t);
     if (lds > 60 * 1024) return R4D_NO(RAD_E_SHAPE);
 
-    // THE SAME WIDTH AS rmsnorm_bf16 AND quant_act_i8 PICK, from the same function: it decides
-    // which columns a thread folds into each sum of squares, which is the byte-identity.
+    // The same width rmsnorm_bf16 and quant_act_i8 pick, from the same function: it decides which
+    // columns a thread folds into each sum of squares, hence the byte-identity.
     const int thr = r4d_act_threads((int)M, (int)n);
     const float eps  = (float)r4d_getf(a, "eps", 1e-6);
     const float wadd = (float)r4d_getf(a, "wadd", 0.0);
     const uint32_t scf = sc ? (sc->dtype == RAD_F32) : 0u;
 
-#define R4D_RQI8_T(WF, RS, PO, SC, T) emit_rc = R4D_EMIT(sk,                                     \
+#define R4D_RQI8_T(WF, RS, PO, SC, T) emit_rc = R4D_EMIT(stream,                                 \
     (rmsnorm_quant_i8_kernel<WF, RS, PO, SC, T>), dim3((uint32_t)M), dim3(T), lds,               \
     (const uint16_t*)r4d_p(x), (uint16_t*)r4d_wp(rs), r4d_p(w), r4d_p(wp), r4d_p(sc), scf,       \
     (signed char*)r4d_wp(q), (float*)r4d_wp(s), (uint16_t*)r4d_wp(y), (uint32_t)n, eps, wadd,    \
@@ -301,7 +299,6 @@ static int rad_rmsnorm_quant_i8_body(const RadArgs* a, const R4dSink& sk) {
 #undef R4D_RQI8_T
     return emit_rc;
 }
-R4D_ENTRY(r4d_rad_rmsnorm_quant_i8, rad_rmsnorm_quant_i8_body)
 
 // The fused all-reduce form's launch. The IPC arguments are r4d_ar_oneshot_2rank_exact's -- the
 // double-buffered scratch, the per-block flags and the device-resident sequence counters -- and the

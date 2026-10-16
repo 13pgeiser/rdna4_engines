@@ -1,30 +1,25 @@
-// WHAT A DISPATCH COSTS THE HOST TO SUBMIT, and what capturing a fixed sequence saves.
+// Host cost of submitting a dispatch, and what capturing a fixed sequence saves.
 //
-// Capture is usually priced against the DEVICE-side gap between dependent kernels, which on this
-// part is well under a microsecond and not worth chasing. That is the wrong question for the MTP
-// draft loop. There the HOST is on the critical path: every pass embeds the token the previous
-// pass sampled, so nothing overlaps the submit, and the device sits idle for the whole of it. The
-// trunk never pays that, because it runs well over a thousand dispatches ahead of the device.
+// The device-side gap between dependent kernels is well under a microsecond on this part. In the
+// MTP draft loop the host is on the critical path instead: each pass embeds the token the previous
+// pass sampled, so nothing overlaps the submit and the device idles through it. The trunk runs
+// over a thousand dispatches ahead of the device and never pays this. So this times the submit
+// loop itself, separate from the sync.
 //
-// So this measures the HOST half: the wall time of the submit loop itself, separated from the sync.
+// Every arm runs once per iteration in one loop: clock and scheduler drift between runs exceeds
+// the differences being measured.
 //
-// EVERY ARM RUNS ONCE PER ITERATION, IN ONE LOOP. Clock and scheduler state drift between runs by
-// more than the differences being measured, so arms taken in sequence are not comparable to each
-// other; sharing one loop is what makes them comparable.
-//
-//   individual   45 separate hipLaunchKernelGGL, one per op, as an uncaptured pass issues them.
-//   graph        one captured graph replayed. The floor, and unreachable: the pass is not static.
+//   individual   45 separate hipLaunchKernelGGL, as an uncaptured pass issues them.
+//   graph        one captured graph replayed. The floor; unreachable, since the pass is not static.
 //   graph+Kset   replay after rewriting K nodes. About ten of the draft pass's 45 issues move an
-//                operand pointer every step, and three of those (qsa_work, qsa_score, qsa_select)
-//                also move a SHAPE, because the QSA extents grow with context and no arena
-//                discipline makes them stand still. This is the shape a real implementation has.
-//   graph+Kg+s   the same with the params READ BACK from the node first, because the engine holds
-//                no launch geometry of its own -- the shim marshals its own kernel arguments and
-//                the runtime never sees the signature. If this costs what Kset costs, that
-//                ignorance is free and the design needs no ABI change.
+//                operand pointer every step, and three (qsa_work, qsa_score, qsa_select) also
+//                move a shape, because the QSA extents grow with context.
+//   graph+Kg+s   the same, reading the params back from the node first, because the engine holds
+//                no launch geometry (the shim marshals its own arguments). If this costs what
+//                Kset costs, no ABI change is needed.
 //   recap+updat  re-issue the whole pass under capture and hipGraphExecUpdate the exec. Needs no
-//                knowledge of which arg slot moved at all, so it is the smallest engine change --
-//                if appending a node is cheap enough to pay for itself.
+//                knowledge of which arg moved, so it is the smallest engine change, if appending
+//                nodes is cheap enough.
 //
 //   clang++ -x hip -O3 -std=c++17 --offload-arch=gfx1201 graphrate.hip -o graphrate
 //   ./graphrate 45 300 10
@@ -38,11 +33,9 @@
 
 __global__ void tiny(float* p) { if (threadIdx.x == 0) p[blockIdx.x] = 1.0f; }
 
-/* THE SAME KERNEL WITH A REAL ARGUMENT LIST. An engine issue costs several times what `tiny`
- * above submits in, and the difference has two possible homes: HIP marshalling more arguments, or
- * the plugin shim's own prologue (band checks, grid derivation, the switch that picks a template
- * instantiation). They call for completely different work, so they have to be told apart. This
- * signature is r4d_qsa_score_bf16's, argument for argument: six pointers and nine scalars. */
+/* `tiny` with a real argument list, to separate HIP's argument marshalling from the shim's own
+ * prologue (band checks, grid derivation, template switch) as the cause of an engine issue costing
+ * several times `tiny`. The signature matches r4d_qsa_score_bf16: six pointers, nine scalars. */
 __global__ void fat(const float* q, const float* bk, const int* bt, const int* cu, const int* nc,
                     float* out, int n, int heads, int nb, int nseq, int bpw, int q_ld, int bk_ld,
                     int bt_ld, int out_ld) {
@@ -50,12 +43,10 @@ __global__ void fat(const float* q, const float* bk, const int* bt, const int* c
         out[blockIdx.x] = (float)(n + heads + nb + nseq + bpw + q_ld + bk_ld + bt_ld + out_ld);
 }
 
-/* A kernel SLOW ENOUGH TO BACK THE QUEUE UP. Every arm above syncs each iteration, so the command
- * ring is always empty and a submit only ever costs what the runtime spends writing it. A serving
- * engine is not in that state: the host runs far ahead of a device that is nearly always busy, and
- * a submit into a FULL ring waits for the device to retire a slot. If backpressure is what an
- * engine's launch cost actually is, then the shim prologue is not the story and no amount of
- * host-side tidying moves it. */
+/* Slow enough to back the queue up. The other arms sync each iteration, so the command ring is
+ * empty and a submit costs only the runtime's write. A serving engine runs far ahead of a busy
+ * device, and a submit into a full ring waits for the device to retire a slot; if that dominates,
+ * host-side shim tidying cannot help. */
 __global__ void slow(float* p, int n) {
     float a = (float)threadIdx.x;
     for (int i = 0; i < n; ++i) a = fmaf(a, 1.0000001f, 1.0f);
@@ -67,7 +58,7 @@ static double us_since(clk::time_point a, clk::time_point b) {
     return std::chrono::duration<double, std::micro>(b - a).count();
 }
 
-/* The median, not the mean: one descheduled iteration is worth thirty clean ones to a mean. */
+/* Median, not mean: a single descheduled iteration skews a mean. */
 static double med(std::vector<double>& v) {
     if (v.empty()) return 0.0;
     std::sort(v.begin(), v.end());
@@ -113,9 +104,8 @@ int main(int argc, char** argv) {
     std::vector<double> a_ind, a_fat, a_err, a_gra, a_set, a_gs, a_rec, a_cap, a_upd;
     a_ind.reserve(iters);
 
-    /* Warm the clocks, the runtime's lazy module load, and every path below. The cards
-     * idle-suspend, so a timed loop that starts cold reads the governor ramping rather than the
-     * steady-state rate -- worth most of a factor of two. */
+    /* Warm the clocks, the runtime's lazy module load and every path below. The cards
+     * idle-suspend, and a cold start times the clock governor ramping (up to ~2x). */
     for (int w = 0; w < 400; ++w) {
         for (int i = 0; i < N; ++i) hipLaunchKernelGGL(tiny, dim3(1), dim3(64), 0, s, d);
         for (int i = 0; i < N; ++i)
@@ -134,10 +124,9 @@ int main(int argc, char** argv) {
         hipGraphDestroy(g2);
     }
 
-    /* FOUR GRAPHS OVER THE SAME 45 NODES, because that is the shape the real pass has: three
-     * all-reduces and a gather cut it into segments, and a graph launch costs about the same
-     * whatever it contains. Whether that fixed cost, paid once per segment, eats the whole saving
-     * is what decides whether capturing the pass pays at all. */
+    /* Four graphs over the same 45 nodes: three all-reduces and a gather cut the real pass into
+     * segments. A graph launch has a roughly fixed cost whatever it contains, paid per segment,
+     * and that may eat the saving. */
     hipGraphExec_t gef[4] = {nullptr, nullptr, nullptr, nullptr};
     {
         const int seg[4] = {3, 17, 13, 12};
@@ -161,10 +150,8 @@ int main(int argc, char** argv) {
         hipStreamSynchronize(s);
         a_ind.push_back(us_since(t0, t1));
 
-        /* ---- fifteen arguments, with the error check libr4d puts after every launch. There are
-         * dozens of those call sites across the library and a single op's path can make several of
-         * them. If hipGetLastError is a cheap TLS read this arm sits on top of the one above; if
-         * it is not, it is a tax on every dispatch in the library. */
+        /* ---- fifteen arguments plus the hipGetLastError check libr4d makes after every launch;
+         * one op's path can make several. Prices that check against the plain 15-argument arm. */
         t0 = clk::now();
         for (int i = 0; i < N; ++i) {
             hipLaunchKernelGGL(fat, dim3(1), dim3(64), 0, s, d, d, (const int*)d,
@@ -175,10 +162,9 @@ int main(int argc, char** argv) {
         hipStreamSynchronize(s);
         a_err.push_back(us_since(t0, t1));
 
-        /* ---- fifteen arguments through hipLaunchKernel + kernelParams: EXACTLY what a shim's
-         * R4D_EMIT does on its LAUNCH path. Every ordinary dispatch pays this while a graph only
-         * pays back on replay, so if this sits above `fat` the kernelParams path costs the normal
-         * path more than it can save the captured one. */
+        /* ---- fifteen arguments through hipLaunchKernel + kernelParams, as R4D_EMIT's launch path
+         * does. Every ordinary dispatch pays this while a graph only pays back on replay, so if
+         * it costs more than `fat` it loses more on the normal path than it saves on capture. */
         t0 = clk::now();
         for (int i = 0; i < N; ++i) {
             void* pv[15];
@@ -202,7 +188,7 @@ int main(int argc, char** argv) {
         hipStreamSynchronize(s);
         a_fat.push_back(us_since(t0, t1));
 
-        /* ---- the same 45 nodes as FOUR graphs, plus the five dispatches the cuts leave behind */
+        /* ---- the same 45 nodes as four graphs, plus the five dispatches the cuts leave behind */
         t0 = clk::now();
         for (int q = 0; q < 4; ++q) hipGraphLaunch(gef[q], s);
         for (int i = 0; i < 5; ++i) hipLaunchKernelGGL(tiny, dim3(1), dim3(64), 0, s, d);
@@ -258,15 +244,14 @@ int main(int argc, char** argv) {
         a_rec.push_back(us_since(t0, t1));
     }
 
-    /* ---- SUBMIT UNDER BACKPRESSURE. The same launch, but the device cannot keep up, so the ring
-     * fills and stays full. Reported per dispatch against the empty-ring arms above. */
+    /* ---- Submit under backpressure: the device cannot keep up, so the ring stays full. */
     std::vector<double> a_bp;
     for (int w = 0; w < 20; ++w) {
         for (int i = 0; i < N; ++i) hipLaunchKernelGGL(slow, dim3(8), dim3(256), 0, s, d, 4000);
         hipStreamSynchronize(s);
     }
     for (int it = 0; it < iters; ++it) {
-        /* Do NOT sync: let the queue stay deep across iterations, the way a decode step does. */
+        /* No sync: the queue stays deep across iterations, as in a decode step. */
         const auto t0 = clk::now();
         for (int i = 0; i < N; ++i) hipLaunchKernelGGL(slow, dim3(8), dim3(256), 0, s, d, 4000);
         const auto t1 = clk::now();

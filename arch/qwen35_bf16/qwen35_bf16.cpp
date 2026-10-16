@@ -1,45 +1,38 @@
 /* qwen35_bf16 -- Qwen3.5 / 3.6 / 3.8 dense, bf16 weights and bf16 activations.
  *
- * Qwen3.5, Qwen3.6 and Qwen3.8 dense models all report the architecture id `qwen35`, and
- * `qwen35moe` is the same graph with a routed FFN. Dimensions come from model metadata, so this
- * one file serves every size in the family -- 0.8B through 27B. docs/ARCHITECTURES.md has the
- * geometry and the traps that stay plausible when they are wrong.
+ * Qwen3.5, 3.6 and 3.8 dense models report the architecture id `qwen35`; `qwen35moe` is the same
+ * graph with a routed FFN. Dimensions come from metadata, so this file serves every size (0.8B to
+ * 27B). docs/ARCHITECTURES.md has the geometry and its plausible-but-wrong traps.
  *
- * One plugin implements one architecture id for one quantisation scheme (spec §2.4). A
- * `qwen35_w8a8` sibling is a different directory that composes the same blocks against
- * rmsnorm_had_quant_i8, gemm_nt_q and gdn_gated_norm_had_quant_i8 -- not a branch in here. That is
- * why the declare function below is a list of what runs, in order, with no branch on quant in it.
+ * One plugin implements one architecture id for one quantisation scheme (spec §2.4); a quantised
+ * variant is a separate plugin composing the same blocks against other ops (e.g.
+ * rmsnorm_had_quant_i8, gemm_nt_q), so declare() below has no branch on quantisation.
  *
  * ============================== WHAT IT SERVES ==============================
  *
- * The unquantised release -- Qwen3.8-27B in bf16, quantisation descriptor "" -- served at its own
- * precision: every projection a bf16 GEMM. The block-scaled fp8 release is qwen35_fp8's, which
- * declares the same graph over fp8 linears. The lm_head here is declared at whatever the model
- * holds it as, so a container whose recipe made it block fp8 reads it through the fp8 logits
- * kernel and a checkpoint loaded as it stands through the bf16 one.
+ * The unquantised release (quantisation descriptor ""), every projection a bf16 GEMM. The
+ * block-scaled fp8 release is qwen35_fp8's. The lm_head is declared at whatever the model holds,
+ * so a recipe-made block-fp8 head uses the fp8 logits kernel.
  *
  * ============================== THE SHAPE, AT 27B ==============================
  *
- *   64 layers, full_attention_interval 4 -> layers 3,7,...,63 are FULL ATTENTION (16 of them),
- *                                           the other 48 are GATED DELTA NET
- *   hidden 5120   ffn 17408   vocab 248320   (lm_head NOT tied)
- *   24 heads / 4 kv heads / head_dim 256  -> GQA 6, and head_dim is READ, not derived:
- *                                            n_embd / n_head is 213 and every shape after it
- *                                            would be wrong.
+ *   64 layers, full_attention_interval 4 -> layers 3,7,...,63 are full attention (16 of them),
+ *                                           the other 48 are gated delta net
+ *   hidden 5120   ffn 17408   vocab 248320   (lm_head not tied)
+ *   24 heads / 4 kv heads / head_dim 256  -> GQA 6; head_dim is read, not derived
+ *                                            (n_embd / n_head would be 213)
  *   attn_output_gate -> q_proj is [n_embd, 2 * n_head * head_dim], query and gate interleaved
  *   partial_rotary_factor 0.25 -> MROPE over the first 64 of 256 head dims, theta 1e7
  *   linear: 16 key heads / 48 value heads of 128, conv width 4, fp32 recurrent state
  *
  * ============================== WHAT THIS PLUGIN DOES NOT DECLARE ==============================
  *
- * The MTP / NextN head (one extra decoder block plus fc, enorm, hnorm) is real scope and is NOT
- * here. It does not block text generation, and it has to be declared from tensor names read off
- * the checkpoint -- a name map written from memory is a model that loads half its weights and
- * says nothing. It sits BESIDE the trunk under an `mtp.` prefix of its own, so
- * `nextn_predict_layers` is not subtracted from the layer count (see declare()), and declaring
- * the MTP block as a trunk layer would run it in the main pass, which is a different model.
+ * The MTP / NextN head (one extra decoder block plus fc, enorm, hnorm) is not declared here; it
+ * is not needed for text generation. It sits beside the trunk under its own `mtp.` prefix, so
+ * `nextn_predict_layers` is not subtracted from the layer count (see declare()); running it as a
+ * trunk layer would be a different model.
  *
- * The VISION TOWER (27 blocks, hidden 1152, 16 heads of 72, patch 16, out 5120) is declared
+ * The vision tower (27 blocks, hidden 1152, 16 heads of 72, patch 16, out 5120) is declared
  * through arch/common/rad_block_vit.h, only when the container carries one and the deployment
  * asked for media.
  */
@@ -55,10 +48,8 @@ namespace qwen35_bf16 {
 
 using namespace rad::arch;
 
-/* One trunk layer. A hybrid model's layer is one of two kinds and the plugin holds both structs
- * rather than a union: they are small, and a variant would buy nothing except a cast at every use.
- * `full` is the only branch in step(), and it is a branch on the MODEL, not on a configuration --
- * the same layer is the same kind on every step and in every deployment. */
+/* One trunk layer, of one of two kinds; both small structs are held rather than a union. `full`
+ * is the only branch in step(), and it is fixed per layer by the model. */
 struct Layer {
     int           full = 0;
     AttnGatedBF16 attn;
@@ -97,64 +88,9 @@ struct Model {
     std::vector<Layer> layers;
 };
 
-/* Declare runs once per rank, in one process, on the rank's own thread (spec §1, §9). A single
- * static Model would have rank 1's declare overwrite rank 0's handles; this is indexed by rank and
- * read back in step() with rad_rank(). */
+/* Declare runs once per rank, in one process, on the rank's own thread (spec §1, §9), so the
+ * model state is indexed by rank and read back in step() with rad_rank(). */
 static Model g_model[MAX_RANKS];
-
-/* Layer kind. llama.cpp is ground truth: `is_recr(i) = (i < n_main) && ((i + 1) % interval != 0)`,
- * so with interval 4 the FULL-ATTENTION layers are 3, 7, ... and everything else is linear. */
-static inline bool is_full_attention(int64_t l, int64_t interval) {
-    return interval > 0 && ((l + 1) % interval == 0);
-}
-
-static int check_layer_schedule(const RadModelMeta* meta, int64_t n_layer, int64_t interval) {
-    const char* s = rad_meta_gets(meta, "qwen35.layer_types", nullptr);
-    if (!s) s = rad_meta_gets(meta, "text_config.layer_types", nullptr);
-    if (!s) s = rad_meta_gets(meta, "layer_types", nullptr);
-    if (!s || !*s) return RAD_OK;
-
-    int64_t l = 0;
-    for (const char* p = s; *p; ) {
-        while (*p == ' ') ++p;
-        if (!*p) break;
-        const char* tok = p;
-        while (*p && *p != ' ') ++p;
-        const size_t len = (size_t)(p - tok);
-
-        const bool says_full = len == 14 && std::strncmp(tok, "full_attention", 14) == 0;
-        const bool says_lin  = len == 16 && std::strncmp(tok, "linear_attention", 16) == 0;
-        if (!says_full && !says_lin) {
-            fprintf(stderr, "radiance: qwen35: layer_types[%lld] is '%.*s'; this plugin knows "
-                            "'full_attention' and 'linear_attention' and will not guess at a "
-                            "third kind of layer.\n", (long long)l, (int)len, tok);
-            return RAD_E_UNSUPPORTED;
-        }
-        /* Past the trunk is the MTP block, which the array may or may not include; it is not a
-         * trunk layer and its kind is the drafter's business (see declare_draft). */
-        if (l >= n_layer) break;
-        if (says_full != is_full_attention(l, interval)) {
-            fprintf(stderr, "radiance: qwen35: the container says layer %lld is %s, and "
-                            "full_attention_interval %lld makes it %s. The interval rule is "
-                            "llama.cpp's and it is not a property of this family -- a model whose "
-                            "layer_types differ from it would be built with the wrong layers "
-                            "linear, and would load and generate fluent text from an architecture "
-                            "that is not the one in the checkpoint. Read layer_types directly "
-                            "before serving this model.\n",
-                    (long long)l, says_full ? "full_attention" : "linear_attention",
-                    (long long)interval,
-                    is_full_attention(l, interval) ? "full_attention" : "linear_attention");
-            return RAD_E_UNSUPPORTED;
-        }
-        ++l;
-    }
-    if (l && l < n_layer) {
-        fprintf(stderr, "radiance: qwen35: layer_types names %lld layers and the model has %lld. "
-                        "A short schedule is not a schedule.\n", (long long)l, (long long)n_layer);
-        return RAD_E_UNSUPPORTED;
-    }
-    return RAD_OK;
-}
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
@@ -165,7 +101,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.nm = Names(ctx->scope);
     RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16));
 
-    /* A routed model is a different graph, not a flag on this one. qwen35moe_bf16 serves it. */
+    /* A routed model is a different graph, served by the qwen35moe plugin. */
     if (meta->n_expert > 0) {
         fprintf(stderr, "radiance: qwen35_bf16 refuses a checkpoint with %lld experts; that is "
                         "qwen35moe\n", (long long)meta->n_expert);
@@ -175,9 +111,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     Geom&  g  = m.g;
     Names& nm = m.nm;
 
-    /* ---- geometry that RadModelMeta does not name, read from the container's free-form header.
-     * Both spellings are accepted: a .rad converted from the FP8 safetensors carries the
-     * HuggingFace keys and one converted from a GGUF carries llama.cpp's. */
+    /* ---- geometry RadModelMeta does not name, from the container's free-form header. Both
+     * spellings are accepted: HuggingFace keys (from safetensors) and llama.cpp's (from GGUF). */
     bool have_interval = false;
     const int64_t interval = meta_int2(meta, "qwen35.full_attention_interval",
                                        "full_attention_interval", 4, &have_interval);
@@ -189,43 +124,32 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 (long long)interval, (long long)nextn, (long long)g.n_layer);
         return RAD_E_INVAL;
     }
-    RAD_ARCH_TRY(check_layer_schedule(meta, g.n_layer, interval));
-    /* EVERY DECLARED LAYER IS A TRUNK LAYER. `mtp_num_hidden_layers` is NOT part of
-     * `num_hidden_layers` in this family -- Qwen3.8-27B-FP8 ships layers-0..63 under
-     * `model.language_model.layers.N` and its one MTP block separately, under an `mtp.` prefix of
-     * its own, in mtp.safetensors. Subtracting it here would drop layer 63, which is a
-     * full-attention layer, and the model would answer with the trunk one layer short: still a
-     * distribution, still self-consistent op by op, and wrong. `nextn` is kept for the note below,
-     * which is the only thing the count is good for until the MTP head is declared. */
+    RAD_ARCH_TRY(check_layer_schedule("qwen35", meta_text_gets(meta, "layer_types", nullptr),
+                                      g.n_layer, interval, {"full_attention"}));
+    /* Every declared layer is a trunk layer: `mtp_num_hidden_layers` is not part of
+     * `num_hidden_layers` in this family (the MTP block ships separately under `mtp.`).
+     * Subtracting it would drop full-attention layer 63 and silently run a trunk one layer short.
+     * `nextn` is used only for the note below. */
     m.n_main = g.n_layer;
 
-    /* Qwen3.5's norms are GemmaRMSNorm: `x_hat * (1 + w)`, not `x_hat * w`. vLLM says so by
-     * importing it under the family's own name -- `from ...layernorm import GemmaRMSNorm as
-     * Qwen3_5RMSNorm` -- and the checkpoint says so too: `input_layernorm.weight` sits around 0.07
-     * to 0.29, which is a gain of 1.1 to 1.3 the right way round and a five-to-ten-times shrink
-     * the wrong way. It applies to input_layernorm, post_attention_layernorm, the model's final
-     * norm and the q/k head norms -- and NOT to the delta net's ssm_norm, which is a plain
-     * RMSNormGated with gains around 0.88.
-     *
-     * The checkpoint answers two of the three families by itself: the layer norms (0.07..0.29)
-     * and the q/k head norms (partly NEGATIVE) can only be `1 + w`. The model's FINAL norm sits at
-     * 0.68..0.96, which reads as either, and takes `1 + w` because the reference implementation
-     * does. */
+    /* Qwen3.5's norms are GemmaRMSNorm, `x_hat * (1 + w)` (vLLM imports GemmaRMSNorm as
+     * Qwen3_5RMSNorm). This covers input_layernorm, post_attention_layernorm, the final norm and
+     * the q/k head norms, but not the delta net's ssm_norm, a plain RMSNormGated (gains ~0.88).
+     * The checkpoint confirms it: layer norm weights of 0.07..0.29 and partly negative q/k norm
+     * weights only make sense as `1 + w`. The final norm (0.68..0.96) is ambiguous and follows the
+     * reference implementation. */
     g.wadd    = 1.0f;
     g.wadd_qk = 1.0f;
     const float final_wadd = 1.0f;
 
-    /* The rotary width. partial_rotary_factor 0.25 over head_dim 256 is 64, and a container that
-     * omits it is refused rather than defaulted to head_dim: a full rotation is a different model
-     * and its symptom is fluent wrong text, which is exactly what spec §17 is about. */
+    /* The rotary width: partial_rotary_factor 0.25 over head_dim 256 is 64. A container that
+     * omits it is refused rather than defaulted to a full rotation, which would give fluent wrong
+     * text (spec §17). */
     m.n_rot = meta_int2(meta, "qwen35.rope.dimension_count", "rope_dimension_count", 0);
     if (m.n_rot <= 0) {
-        /* BOTH SPELLINGS, because the family uses both. Qwen3.8-27B-FP8 states
-         * `partial_rotary_factor` at the text_config level AND inside `rope_parameters`;
-         * Qwen3.5-0.8B states it ONLY inside `rope_parameters`, and rad-convert flattens nested
-         * config with a dot. Reading only one spelling refuses a container of the same
-         * architecture with "no usable rotary width", which is a true statement about the key and
-         * a false one about the model. */
+        /* Both spellings occur in this family: Qwen3.8-27B-FP8 states `partial_rotary_factor`
+         * at the top level and inside `rope_parameters`, Qwen3.5-0.8B only inside
+         * `rope_parameters` (rad-convert flattens nested config with a dot). */
         double prf = rad_meta_getf(meta, "partial_rotary_factor", 0.0);
         if (!(prf > 0.0)) prf = rad_meta_getf(meta, "rope_parameters.partial_rotary_factor", 0.0);
         if (prf > 0.0) m.n_rot = (int64_t)(g.head_dim * prf);
@@ -263,10 +187,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 (long long)gc.head_v, (long long)gc.conv_width);
         return RAD_E_INVAL;
     }
-    /* The chunked scan's tile length. Not a model parameter: it is libr4d's
-     * gdn_chunk_scan_k128_v128_c64_bf16, and it is also the interval a linear-state checkpoint is
-     * snapshotted at (spec §7.3). Note that gdn_conv_prep takes it while gdn_chunk_scan derives it
-     * from the kernel, and nothing checks that the two agree. */
+    /* The chunked scan's tile length, not a model parameter: libr4d's
+     * gdn_chunk_scan_k128_v128_c64_bf16, and also the linear-state checkpoint interval
+     * (spec §7.3). Note: gdn_conv_prep takes it while gdn_chunk_scan derives it from the kernel,
+     * and nothing checks that the two agree. */
     gc.chunk = 64;
 
     int s;
@@ -280,13 +204,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     const int64_t v_dim    = gc.v_dim();
     const int64_t conv_dim = gc.conv_dim();
 
-    /* ---- THREE KV groups, which is why hybrid KV groups are first-class rather than an
-     * extension (spec §7.2). Every layer is bound to the group it owns state in, below: a group
-     * with no bound layers is a declare error, because how many state instances a sequence holds
-     * is the layer count and assuming one would make the page size a guess.
+    /* ---- three KV groups (spec §7.2). Every layer is bound below to the group it owns state
+     * in; a group with no bound layers is a declare error, since the bound layer count is how
+     * many state instances a sequence holds.
      *
-     * The block size is NOT declared for the full-attention group -- it comes off the resolved
-     * attention kernel's constraints and is read back with rad_kv_block_size() inside the block. */
+     * The full-attention group's block size is not declared: it comes from the resolved attention
+     * kernel and is read back with rad_kv_block_size() inside the block. */
     RadKVGroupDecl fd{};
     fd.kind      = RAD_KV_FULL;
     fd.dtype     = rad_kv_cache_dtype(ctx, RAD_BF16);
@@ -295,12 +218,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.kv_full = rad_decl_kv_group(b, nm.f("kv_attn"), &fd);
     g.kv_dtype = rad_dtype_name(fd.dtype);
 
-    /* The recurrent state is fp32 because that is the only state width libr4d has a kernel for
-     * (gdn_recurrent_update_k128_v128_bf16_fp32state) and what `mamba_ssm_dtype: float32` asks
-     * for. It costs 48 x 128 x 128 x 4 = 3 MiB a layer and 144 MiB across the 48 linear layers,
-     * PER SEQUENCE, which is the largest single number in this deployment's memory plan.
-     * An fp16 state would halve that and cost a little step time, but declaring it here would be
-     * declaring a geometry no kernel serves, so it waits for the kernel. */
+    /* The recurrent state is fp32, as `mamba_ssm_dtype: float32` asks; an f16 state changes the
+     * generated text (qwen35_fp8.cpp). It costs 48 x 128 x 128 x 4 = 3 MiB per layer, 144 MiB
+     * across the 48 linear layers per sequence, the largest item in the memory plan. */
     RadKVGroupDecl sd{};
     sd.kind         = RAD_KV_LINEAR;
     sd.dtype        = RAD_F32;
@@ -309,7 +229,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     sd.state_dim[1] = gc.head_k;
     m.kv_state = rad_decl_kv_group(b, nm.f("kv_gdn_state"), &sd);
 
-    /* The conv window: conv_width-1 + n_spec entries of the whole convolved row, counted in HEADS
+    /* The conv window: conv_width-1 + n_spec entries of the whole convolved row, counted in heads
      * so the channel split never straddles a q/k/v boundary at any tensor-parallel width. */
     RadKVGroupDecl cd{};
     cd.kind       = RAD_KV_CONV;
@@ -319,18 +239,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     cd.conv_width = gc.conv_width;
     m.kv_conv = rad_decl_kv_group(b, nm.f("kv_gdn_conv"), &cd);
 
-    /* ---- activation buffers, sized at max_tok because that is the worst step. Every layer of a
-     * kind shares these: layers that share a geometry share the buffer, and the buffer plan's
-     * liveness analysis over the declared read and write sets is what makes one arena enough
-     * (spec §3.1, §8). */
+    /* ---- activation buffers, sized at max_tok (the worst step) and shared by every layer of a
+     * kind; liveness analysis over the declared read and write sets fits them in one arena
+     * (spec §3.1). */
     m.b_x       = decl_b(b, nm.f("x"),        g.act_dtype, {g.max_tok, g.n_embd});
     m.b_h       = decl_b(b, nm.f("h"),        g.act_dtype, {g.max_tok, g.n_embd});
 
-    /* The query-and-gate projection is declared RANK 3, [tokens, heads, 2*head_dim], because that
-     * is what makes the interleaving addressable: the query is the first head_dim columns of the
-     * last dimension and the gate is the second head_dim, so both are ordinary column slices whose
-     * row stride is the declared width. Flattened to [tokens, 2*q_dim] the same bytes describe a
-     * per-head view no operand can name. */
+    /* The query-and-gate projection is rank 3, [tokens, heads, 2*head_dim], so the per-head
+     * interleaving is addressable: query and gate are the first and second head_dim columns of the
+     * last dimension, i.e. ordinary column slices. Flattened, no operand could name them. */
     m.b_qg      = decl_b(b, nm.f("attn_qg"),  g.act_dtype, {g.max_tok, g.n_head, 2 * g.head_dim});
     m.b_k       = decl_b(b, nm.f("attn_k"),   g.act_dtype, {g.max_tok, kv_dim});
     m.b_v       = decl_b(b, nm.f("attn_v"),   g.act_dtype, {g.max_tok, kv_dim});
@@ -343,45 +260,37 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_gq      = decl_b(b, nm.f("gdn_q"),    g.act_dtype, {g.max_tok, gc.n_head_k, gc.head_k});
     m.b_gk      = decl_b(b, nm.f("gdn_k"),    g.act_dtype, {g.max_tok, gc.n_head_k, gc.head_k});
     m.b_gv      = decl_b(b, nm.f("gdn_v"),    g.act_dtype, {g.max_tok, gc.n_head_v, gc.head_v});
-    /* The decay, beta and the chunk inverse are f32 and not bf16. The decay is a cumulative sum
-     * whose intra-chunk span reaches hundreds of nats on real prefill inputs; a bf16 running sum
-     * loses the low bits of exactly the quantity every decay factor is an exponent of. */
+    /* Decay and beta are f32: the decay is a cumulative sum whose intra-chunk span reaches
+     * hundreds of nats on real prefill inputs, and a bf16 running sum would lose the low bits that
+     * every decay factor exponentiates. */
     m.b_gdec    = decl_b(b, nm.f("gdn_g"),    RAD_F32,     {g.max_tok, gc.n_head_v});
     m.b_beta    = decl_b(b, nm.f("gdn_beta"), RAD_F32,     {g.max_tok, gc.n_head_v});
-    /* BF16, not f32: gdn_kkt_solve writes this plane as bf16 and gdn_chunk_scan reads it as bf16
-     * (libr4d's own row text, and the casts in both .hip files). See qwen35_fp8.cpp. */
+    /* bf16, not f32: gdn_kkt_solve writes this plane as bf16 and gdn_chunk_scan reads it as
+     * bf16. */
     m.b_kkt     = decl_b(b, nm.f("gdn_kkt"),  RAD_BF16,    {g.max_tok, gc.n_head_v, gc.chunk});
     m.b_go      = decl_b(b, nm.f("gdn_o"),    g.act_dtype, {g.max_tok, gc.n_head_v, gc.head_v});
 
     m.b_gate_up = decl_b(b, nm.f("gate_up"),  g.act_dtype, {g.max_tok, 2 * g.n_ff});
     m.b_ffn     = decl_b(b, nm.f("ffn"),      g.act_dtype, {g.max_tok, g.n_ff});
-    /* The lm_head runs over the SAMPLED ROWS, not over every token of the chunk. `max_logit_rows`
-     * is one row per sequence, or one per verified draft position per sequence -- at 248320 vocab
-     * that is the difference between 63 MiB and 8 GiB, and between one GEMM per sequence and one
-     * per token. `b_hout` is where gather_rows puts the hidden states it selects; it is narrow
-     * (n_embd, not n_vocab) which is why gathering before the GEMM and not after is the whole
-     * point. */
+    /* The lm_head runs over the sampled rows only: `max_logit_rows` is one row per sequence, or
+     * per verified draft position. At 248320 vocab that is 63 MiB of logits instead of 8 GiB.
+     * gather_rows selects the hidden states into the narrow `b_hout` (n_embd wide) before the
+     * GEMM. */
     m.b_hout    = decl_b(b, nm.f("h_out"),    g.act_dtype, {g.max_logit_rows, g.n_embd});
     m.b_logits  = decl_b(b, nm.f("logits"),   RAD_F32,     {g.max_logit_rows, g.n_vocab});
     RAD_ARCH_TRY(rad_declare_logits(b, m.b_logits));
 
-    /* ---- vocabulary edges.
-     * BOTH ENDS OF THE VOCABULARY ARE ROW-SHARDED. Replicating the embedding while sharding the
-     * lm_head would put 248320 x 5120 in bf16 -- 2.43 GiB -- on every rank, for a table each rank
-     * uses a slice of. `embed_lookup` takes a `vocab_offset`: a rank gathers the ids in its own
-     * slice, writes a zero row for every id belonging to another rank, and the all_reduce below
-     * sums the ranks into x. lm_head is sharded because the sampler runs a distributed top-k and full
-     * logits are never gathered anywhere (spec §9, §13); the embedding is sharded because the
-     * other end of the same vocabulary already was. */
+    /* ---- vocabulary edges, both row-sharded. The lm_head is sharded because the sampler runs a
+     * distributed top-k and full logits are never gathered (spec §9, §13); replicating the
+     * embedding would cost 248320 x 5120 bf16 (2.43 GiB) per rank. `embed_lookup` takes a
+     * `vocab_offset`: a rank gathers the ids in its slice and writes zero rows for the rest, and
+     * the all_reduce below sums the ranks into x. */
     RAD_ARCH_TRY(map_copy(b, nm.f("token_embd.weight"),
                           nm.ckpt("model.language_model.embed_tokens.weight")));
     RAD_ARCH_TRY(map_copy(b, nm.f("output_norm.weight"),
                           nm.ckpt("model.language_model.norm.weight")));
-    /* This model does NOT tie its lm_head -- `tie_word_embeddings: false`, and the checkpoint
-     * ships lm_head.weight beside the embedding. The second source is for the small members of the
-     * family that do tie; first source present wins, and without it a family whose members differ
-     * only in tying needs two plugins. The maps come first: they are how the model is asked what
-     * each weight is. */
+    /* The 27B does not tie its lm_head (`tie_word_embeddings: false`); the second source serves
+     * the small family members that do. The first source present wins. */
     RAD_ARCH_TRY(map_copy_alt(b, nm.f("output.weight"), nm.ckpt("lm_head.weight"),
                               nm.ckpt("model.language_model.embed_tokens.weight")));
 
@@ -389,10 +298,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                      RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
     m.w_out_norm = decl_w(b, nm.f("output_norm.weight"), RAD_F32, {g.n_embd},
                           RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
-    /* ROW-SHARDED with the vocabulary: g.n_vocab is THIS RANK'S share and rad_arch.h says what
-     * the split is and what it buys. The two change together. Declared at its codes' dtype: bf16
-     * as the checkpoint ships it, E4M3 where a recipe made it block fp8 -- and the logits kernel
-     * that reads that encoding is the one selected. */
+    /* Row-sharded with the vocabulary: g.n_vocab is this rank's share (rad_arch.h). Declared at
+     * its codes' dtype (bf16 as shipped, E4M3 where a recipe made it block fp8), which selects the
+     * logits kernel. */
     m.w_lm_head = decl_w(b, nm.f("output.weight"),
                          weight_codes_dtype(b, nm.f("output.weight"), RAD_BF16),
                          {g.n_vocab, g.n_embd}, RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
@@ -403,12 +311,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                    RAD_INT("vocab_offset", g.vocab_off)),
                         RAD_WEIGHTS(m.w_tok)),
                     {}, {m.b_x});
-    /* THE ENCODER'S ROWS, over the lookup and before its reduction (MediaRows says why). */
+    /* The encoder's rows overwrite the lookup before its reduction (see MediaRows). */
     m.media = VisionTower::present(meta) && ctx->max_enc_patches > 0;
     if (m.media) RAD_ARCH_TRY(m.mrows.declare(b, g.max_tok, g.n_embd, m.b_x));
-    /* EXACT, and not g.wire_exact: this sums DISJOINT rows -- every token comes from exactly one
-     * rank and the others contribute zeros -- so a lossy wire would be loss on a value that is
-     * already the answer, not a bandwidth trade against a partial product. */
+    /* Always exact, not g.wire_exact: this sums disjoint rows (each token from one rank, zeros
+     * from the others), so a lossy wire would only add error. */
     if (g.world > 1)
         m.op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
                                RAD_PARAMS(RAD_INT("world_size", g.world),
@@ -417,7 +324,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                RAD_NOWEIGHTS),
                            {m.b_x}, {m.b_x});
 
-    /* ---- the layers. This loop is the model card. */
+    /* ---- the layers. */
     AttnGatedBF16::Wire aw{};
     aw.x = m.b_x; aw.h = m.b_h; aw.qg = m.b_qg; aw.k = m.b_k; aw.v = m.b_v;
     aw.q = m.b_q; aw.gate = m.b_gate; aw.attn = m.b_attn;
@@ -491,7 +398,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                          RAD_WEIGHTS(m.w_lm_head)),
                      {m.b_hout}, {m.b_logits});
 
-    /* ---- what a reader of --debug-graph should be told, in the plugin's own words. */
+    /* ---- notes for --debug-graph. */
     rad_note(b, "rank %d/%d: %lld trunk layers, %lld full attention + %lld gated delta net, "
                 "n_head=%lld n_head_kv=%lld head_dim=%lld n_ff=%lld vocab=[%lld,%lld)",
              g.rank, g.world, (long long)m.n_main,
@@ -503,27 +410,21 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              (long long)gc.n_head_k, (long long)gc.head_k, (long long)gc.n_head_v,
              (long long)gc.head_v, (long long)gc.conv_width, (long long)gc.chunk,
              (long long)conv_dim, (long long)gc.in_dim());
-    rad_note(b, "ssm_a_log carries A_log AS A LOG: the kernels form -exp(A_log)*softplus(a+dt). "
-                "A container built from a GGUF has ssm_a = -exp(A_log) already applied and must "
-                "undo it, or every head's decay collapses");
-    rad_note(b, "rope is mrope over %lld of %lld head dims, sections [11,11,10]; RadBatch carries "
-                "one position component per token, so the three sections see the same position -- "
-                "exact for text, wrong for an image span",
-             (long long)m.n_rot, (long long)g.head_dim);
+    rad_note(b, "ssm_a_log holds A_log itself: the kernels form -exp(A_log) * softplus(a + dt), "
+                "so a GGUF's ssm_a = -exp(A_log) must be converted back");
+    rad_note(b, "rope: %s over %lld of %lld head dims%s%s", g.rope_mode, (long long)m.n_rot,
+             (long long)g.head_dim, g.rope_mc ? ", sections " : "", g.rope_sections);
     if (!have_interval)
         rad_note(b, "the container did not state full_attention_interval; assuming %lld, which "
                     "makes layers 3,7,... full attention", (long long)interval);
-    rad_note(b, "logits are computed for the %lld sampled rows of a step, not for all %lld "
-                "tokens: RadBatch::out_ids names them and gather_rows selects the hidden states "
-                "before the lm_head, which is the difference between 63 MiB and 8 GiB at this "
-                "vocabulary", (long long)g.max_logit_rows, (long long)g.max_tok);
+    rad_note(b, "logits for at most %lld sampled rows a step (of %lld tokens): gather_rows "
+                "selects RadBatch::out_ids before the lm_head", (long long)g.max_logit_rows,
+             (long long)g.max_tok);
     if (nextn > 0)
-        rad_note(b, "%lld MTP/NextN layer(s) sit BESIDE the %lld trunk layers -- under an `mtp.` "
-                    "prefix of their own, not as layers %lld.. -- and are NOT declared: this "
-                    "plugin serves the trunk only",
-                 (long long)nextn, (long long)m.n_main, (long long)m.n_main);
+        rad_note(b, "the %lld MTP/NextN layer(s) under `mtp.` are not declared: this plugin "
+                    "serves the trunk only", (long long)nextn);
 
-    /* THE VISION TOWER, LAST, so its activations share the arena with every buffer above. */
+    /* The vision tower, last, so its activations share the arena with every buffer above. */
     if (m.media) RAD_ARCH_TRY(m.vit.declare(b, meta, ctx, nm, g.n_embd, (int)g.n_layer + 64));
     return RAD_OK;
 }
@@ -531,7 +432,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = g_model[rad_rank(c)];
 
-    /* AN ENCODER PASS RUNS THE VISION TOWER AND NOTHING ELSE (RadBatch::enc). */
+    /* An encoder pass runs only the vision tower (RadBatch::enc). */
     if (batch->enc) {
         m.vit.step(c, batch);
         return;
@@ -555,9 +456,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
     RAD_ISSUE(c, m.op_final_norm,
               brows(m.b_x, batch->n_tok), RAD_W(m.w_out_norm), brows(m.b_h, batch->n_tok));
 
-    /* The lm_head runs on the rows the sampler asked for and on nothing else. A prefill chunk in
-     * the middle of a long prompt sets n_out to zero: it finishes no sequence, so there is no
-     * distribution to draw from and the widest GEMM in the model is not issued at all. */
+    /* The lm_head runs only on the rows the sampler asked for; a mid-prompt prefill chunk has
+     * n_out zero and skips it. */
     if (batch->n_out > 0) {
         RAD_ISSUE_N(c, m.op_gather, batch->n_out,
                     brows(m.b_h, batch->n_tok),

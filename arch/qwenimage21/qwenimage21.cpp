@@ -4,22 +4,22 @@
  *
  * Three networks behind one prompt (diffusers' QwenImage21Pipeline):
  *
- *   THE CONDITIONING NETWORK is Qwen3-VL-8B-Instruct, unchanged: its vision tower (with the three
- *   deepstack taps) reads the reference pictures, its 36-layer language model reads the prompt,
- *   and what the generator conditions on is the LAST LAYER'S OUTPUT BEFORE THE FINAL NORM, minus
- *   the fixed system turn the template starts with.
+ *   Conditioning network: Qwen3-VL-8B-Instruct, unchanged. Its vision tower (with the three
+ *   deepstack taps) reads the reference pictures and its 36-layer language model reads the
+ *   prompt. The generator conditions on the last layer's output before the final norm, minus the
+ *   template's fixed system turn.
  *
- *   THE DENOISER is a 7.1B single-stream diffusion transformer over one joint sequence: the
+ *   Denoiser: a 7.1B single-stream diffusion transformer over one joint sequence: the
  *   conditioning's text rows (through `txt_in`), each reference picture's latent tokens in place of
- *   its vision slots (through `img_in`, four latent rows a slot), and the image being made. 32
+ *   its vision slots (through `img_in`, four latent rows per slot), and the image being made. 32
  *   blocks of `h += tanh(g1) attn(LN(h)(1 + s1)); h += tanh(g2) mlp(LN(h)(1 + s2))`, the four
- *   modulation rows from ONE projection of the timestep embedding shared by every block. Attention
- *   is block-causal: text causal, a picture's rows bidirectional, every row sees all earlier ones.
- *   The conditioning is modulated at t = 0, so its keys and values do not depend on the step --
- *   they are computed once (a COND pass) and cached in this plugin's KV group, and each DENOISE
- *   pass runs only the image's rows against them.
+ *   modulation rows coming from one projection of the timestep embedding shared by every block.
+ *   Attention is block-causal: text causal, a picture's rows bidirectional, every row sees all
+ *   earlier ones. The conditioning is modulated at t = 0, so its keys and values do not depend on
+ *   the step: they are computed once (a COND pass) and cached in this plugin's KV group, and each
+ *   DENOISE pass runs only the image's rows against them.
  *
- *   THE DECODER is a 2-D VAE: 64 latent channels, 16x down, RGBA in and out. Its encoder turns the
+ *   Decoder: a 2-D VAE, 64 latent channels, 16x down, RGBA in and out. Its encoder turns the
  *   reference pictures (and a picture being repainted) into latents on the COND pass; its decoder
  *   turns a finished latent into pixels on a DECODE pass.
  *
@@ -29,20 +29,20 @@
  *
  * ============================== WHAT IS QUANTISED ==============================
  *
- * One plugin serves a bf16 container and a block-fp8 one: every linear of the language model and
- * of the DiT's blocks is a LinearFP8, which reads whatever the container holds (rad_fp8.h), and the
- * model is bf16 throughout when the first DiT projection is plain. The small linears around them --
- * txt_in, img_in, the timestep MLP, the shared modulation, norm_out, proj_out -- and the vision
- * tower and the VAE are bf16 in both: they are read once a pass or less, and the recipe keeps them.
+ * One plugin serves bf16 and block-fp8 containers: every linear of the language model and of the
+ * DiT's blocks is a LinearFP8, which reads whatever the container holds (rad_fp8.h), and the model
+ * is bf16 throughout when the first DiT projection is plain. The small linears around them
+ * (txt_in, img_in, the timestep MLP, the shared modulation, norm_out, proj_out), the vision tower
+ * and the VAE stay bf16 in both, since they are read once per pass or less.
  *
  * ============================== TENSOR PARALLEL ==============================
  *
  * The language model and the DiT blocks are split by heads and by feed-forward width, an
- * all-reduce after each output projection. Everything else is replicated and runs on every rank:
- * the embedding table, the vision tower, the small linears, the sampler and the VAE encoder --
- * each is once a pass and smaller than the collective a split would cost. The decoder is split
- * after its mid-block, by rows (see `Vae::band_from`), and every rank ends with the same pixels;
- * the core reads rank 0's.
+ * all-reduce after each output projection. Everything else is replicated and runs on every rank
+ * (the embedding table, the vision tower, the small linears, the sampler and the VAE encoder),
+ * since each runs once per pass and costs less than the collective a split would add. The decoder
+ * is split by rows after its mid-block (see `Vae::band_from`); every rank ends with the same
+ * pixels, and the core reads rank 0's.
  */
 #include <arch/rad_arch.h>
 #include <arch/rad_fp8.h>
@@ -65,27 +65,27 @@ using namespace rad::arch;
 /* The largest image: 2400 x 1792 pixels, the widest preset the model card lists, 16800 latent
  * tokens. 2048 x 2048 (16384) is the native size and the default. */
 enum { kMaxImageTokens = 16800 };
-/* Reference pictures: at most ten a request, each resized to 1024 x 1024 pixels of area. */
+/* Reference pictures: at most ten per request, each resized to 1024 x 1024 pixels of area. */
 enum { kMaxRefs = 10, kRefArea = 1024 * 1024 };
 /* Images a request may ask for, and so the lanes of latent state. */
 enum { kMaxLanes = 16 };
-/* A reference picture's latent tokens at most: its area over 16 x 16, a little over for its sides'
- * rounding (the driver's own bound, core/gen/driver.cpp). */
+/* The most latent tokens of a reference picture: its area over 16 x 16, plus slack for its sides'
+ * rounding (the driver's bound, core/gen/driver.cpp). */
 static inline int64_t ref_tokens_max() { return (int64_t)kRefArea / 256 * 11 / 10 + 64; }
 
 static const char* kSysPrompt = "Comprehend and analyze the provided prompt.";
 
 /* ================================================================== the VAE as a recorded graph
  *
- * AN IMAGE'S SIZE IS A REQUEST'S, so the VAE's ops are declared once for the largest image and
- * issued with the real one's extents: every image operand is a raw [height, width * channels]
- * view of its buffer (docs/OPS.md, "Image generation"), and its extents follow from the pass's
- * picture size and the stage's scale. `Vae` records each op with what it needs to rebuild its
- * operands, so declare() and step() walk the same list and cannot disagree.
+ * Image size varies per request, so the VAE's ops are declared once for the largest image and
+ * issued with the actual extents: every image operand is a raw [height, width * channels] view of
+ * its buffer (docs/OPS.md, "Image generation"), with extents from the pass's picture size and the
+ * stage's scale. `Vae` records each op with what it needs to rebuild its operands, so declare()
+ * and step() walk the same list.
  *
- * EVERY OUTPUT IS A BUFFER OF ITS OWN, sized for its stage. The planner shares storage between
- * the ones whose lives do not overlap, which is the whole of the memory plan: no buffer is reused
- * by hand. The ops are issued in the order they were declared, which is what makes that sound. */
+ * Every output is its own buffer, sized for its stage; the planner shares storage between those
+ * whose lives do not overlap, and no buffer is reused by hand. This is sound because ops are issued
+ * in declaration order. */
 struct VImg {
     rad_buf buf = 0;
     int64_t ch = 0;
@@ -110,13 +110,13 @@ struct Vae {
     int64_t     base_px = 0;     /* pixels at level 0, the largest any pass hands it */
     int         n_buf = 0;
     int         first_group = 0;
-    /* THE BANDED TAIL. From op `band_from` on, every output pixel reads a bounded window of rows
-     * above and below it -- 3x3 convolutions, nearest upsampling, per-pixel norms and adds, the
-     * depth-to-space shortcuts -- so a rank can run the tail on its own band of level-0 rows plus
-     * `halo` rows a side and get its band's pixels bit for bit: the rows a conv's zero padding
-     * spoils at a band's edge never reach the band. The ops before it hold the mid-block's
-     * attention, which reads every pixel, and run whole. `whole` is what they wrote, which the
-     * tail reads at the band's row offset. -1: no tail. */
+    /* The banded tail. From op `band_from` on, every output pixel reads a bounded window of rows
+     * (3x3 convolutions, nearest upsampling, per-pixel norms and adds, depth-to-space shortcuts),
+     * so a rank can run the tail on its band of level-0 rows plus `halo` rows per side and get its
+     * band's pixels bit for bit: rows spoiled by a conv's zero padding at the band edge never reach
+     * the band. The ops before it include the mid-block's attention, which reads every pixel, and
+     * run whole; `whole` holds their outputs, read by the tail at the band's row offset. -1: no
+     * tail. */
     int                  band_from = -1;
     int64_t              halo = 0;
     std::vector<rad_buf> whole;
@@ -389,11 +389,20 @@ struct DitLayer {
     rad_op     op_kq = 0, op_attn_q = 0;
 };
 
+/* Weight groups (movement units) by network. The text encoder's layers take 0.. and the DiT's
+ * blocks kGrpDit + 1..; declare refuses a network deep enough to run into the next range. */
+enum : int {
+    kGrpTxtIn  = 1000,   /* txt_in */
+    kGrpVaeEnc = 1100,
+    kGrpVaeDec = 1200,
+    kGrpDit    = 2000,   /* the DiT's model-level weights */
+    kGrpVision = 3000,
+};
+
 struct Model {
     Names nm{""};
     Geom  gt{}, gd{};          /* the language model's and the DiT's geometry, per rank */
     int64_t max_ref_rows = 0;  /* every reference picture's latent tokens together */
-    int64_t n_cond_max = 0;    /* conditioning rows: the text, or one picture's latents */
     bool  media = false;
     VisionTower vit{};
     rad_kvgroup kv = 0;
@@ -401,7 +410,7 @@ struct Model {
     /* ---- the language model */
     rad_weight w_tok = 0;
     rad_op  op_embed = 0, op_mm = 0, op_ds[VisionTower::MAX_DS] = {};
-    rad_buf b_tx = 0, b_tq = 0, b_tkv = 0, b_th2 = 0, b_tgu = 0;
+    rad_buf b_tx = 0, b_tkv = 0, b_th2 = 0, b_tgu = 0;
     ActFP8  a_th{}, a_tattn{}, a_tffn{};
     std::vector<TeLayer> te;
 
@@ -431,7 +440,7 @@ struct Model {
     rad_buf b_v = 0;
 
     /* ---- the per-image state (PERSIST) and what crosses passes */
-    rad_buf b_state = 0, b_prev = 0, b_inp = 0, b_mask = 0, b_img = 0, b_txt_keep = 0, b_reflat = 0;
+    rad_buf b_state = 0, b_prev = 0, b_inp = 0, b_mask = 0, b_img = 0, b_reflat = 0;
     rad_op  op_lstore_lat = 0, op_lstore_mask = 0, op_enc_aff = 0, op_dec_aff = 0, op_rgba = 0;
     /* More than one rank: the decoder's bands gathered, and the bytes made from the gather. */
     rad_op  op_bands = 0, op_rgba_bands = 0;
@@ -520,8 +529,8 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     const int64_t T = g.max_tok;
     const int64_t q_dim = g.q_dim(), kv_dim = g.kv_dim();
 
-    /* The embedding is REPLICATED: a rank looks up every token itself, so no collective sums it,
-     * and the rows the vision tower replaces are overwritten on every rank alike. */
+    /* The embedding is replicated: each rank looks up every token itself, so no collective sums
+     * it, and the vision tower's rows overwrite it identically on every rank. */
     RAD_ARCH_TRY(map_copy(b, nm.f("te.token_embd.weight"),
                           nm.ckpt("model.language_model.embed_tokens.weight")));
     m.w_tok = decl_w(b, nm.f("te.token_embd.weight"), RAD_BF16, { g.n_vocab_all, g.n_embd },
@@ -653,9 +662,9 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                        { m.b_tx, m.b_th2 }, { m.b_tx });
     }
 
-    /* ---- txt_in, over every prompt row. Its output crosses the conditioning's segments, each of
-     * which runs the DiT's blocks over the same buffers, so it is PERSIST. */
-    const int gti = 1000;
+    /* ---- txt_in, over every prompt row. Its output must survive across the conditioning's
+     * segments, each of which runs the DiT's blocks over the same buffers, so it is PERSIST. */
+    const int gti = kGrpTxtIn;
     const int64_t D = m.gd.n_embd;
     m.b_txa = decl_b(b, nm.f("txt.a"), RAD_BF16, { T, D });
     m.b_txb = decl_b(b, nm.f("txt.b"), RAD_BF16, { T, D });
@@ -686,7 +695,7 @@ static int declare_encoder(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     v.b = b;
     v.scope = "venc";
     v.down = true;
-    v.first_group = 1100;
+    v.first_group = kGrpVaeEnc;
     /* The largest picture the encoder reads: a repainted one at the largest output size. */
     v.base_px = (int64_t)kMaxImageTokens * 256;
     const int64_t base = rad_meta_geti(meta, "vae.base_dim", 96);
@@ -757,7 +766,7 @@ static int declare_decoder(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     v.b = b;
     v.scope = "vdec";
     v.down = false;
-    v.first_group = 1200;
+    v.first_group = kGrpVaeDec;
     v.base_px = kMaxImageTokens;
     const int64_t base = rad_meta_geti(meta, "vae.decoder_base_dim", 144);
     const std::vector<double> mult = meta_list(meta, "vae.dim_mult");
@@ -815,9 +824,10 @@ static int declare_decoder(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         fprintf(stderr, "radiance: qwenimage21: the decoder after its mid-block is not row-local\n");
         return RAD_E_INVAL;
     }
-    /* THE BANDS, GATHERED. A band is ceil(H / world) latent rows and the split is taken only where
-     * a band and its two halos are under the whole -- so H > 2 * halo, which bounds W and with it
-     * the largest band: under kMaxImageTokens / world + kMaxImageTokens / (2 * halo) tokens. */
+    /* The bands, gathered. A band is ceil(H / world) latent rows, and the split is taken only where
+     * a band plus its two halos is smaller than the whole, so H > 2 * halo, which bounds W and
+     * thus the largest band: under kMaxImageTokens / world + kMaxImageTokens / (2 * halo)
+     * tokens. */
     const int world = m.gt.world;
     if (world > 1) {
         const int64_t bpx = (kMaxImageTokens / world + kMaxImageTokens / (2 * v.halo) + 1) * 256;
@@ -844,7 +854,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     const int64_t T = g.max_tok;
     const int64_t D = g.n_embd, hd = g.head_dim, qd = g.q_dim();
     const int64_t C = rad_meta_geti(meta, "transformer.in_channels", 64);
-    const int gx = 2000;   /* the DiT's model-level weights' group; its blocks are 2001.. */
+    const int gx = kGrpDit;
 
     /* ---- the timestep: [cos | sin] of t * 1000 over 256 channels, an MLP to D, then the shared
      * modulation (four D-wide rows) and norm_out's scale, each through a silu. */
@@ -970,13 +980,12 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         return i8 ? rw(b, op, { m.b_qkv, m.b_k8, m.b_ks }, { m.a_attn.x })
                   : rw(b, op, { m.b_qkv }, { m.a_attn.x });
     };
-    /* THE DENOISING ATTENTION'S SCORES IN INT8 where the linears are fp8: the keys quantised per
-     * (token, head) by quant_act_i8g, the query inside the op. The score product is about half the
-     * attention's issue and runs at twice the rate in int8; the picture moves by less than it moves
-     * between two exact attention implementations (Qwen-Image 2.1 at 1024^2 in diffusers, int8
-     * scores against exact ones: 36.2 dB PSNR, where diffusers' own SDPA kernels differ from each
-     * other by 32.6 to 34.4). The conditioning pass, run once a request, keeps bf16, and so does a
-     * bf16 container. */
+    /* The denoising attention's scores in int8 where the linears are fp8: keys quantised per
+     * (token, head) by quant_act_i8g, the query inside the op. The score product is about half of
+     * the attention and runs at twice the rate in int8. The image changes less than between two
+     * exact attention implementations (at 1024^2: 36.2 dB PSNR against exact scores, while
+     * diffusers' SDPA kernels differ from each other by 32.6 to 34.4 dB). The conditioning pass
+     * (once per request) and a bf16 container keep bf16. */
     const bool qk8 = !g.w_bf16;
     if (qk8) {
         m.b_k8 = decl_b(b, nm.f("dit.k8"), RAD_I8, { T, qd });
@@ -987,7 +996,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     for (int64_t l = 0; l < g.n_layer; ++l) {
         DitLayer& L = m.dit[(size_t)l];
         const int li = (int)l;
-        const int grp = 2001 + li;
+        const int grp = kGrpDit + 1 + li;
         const char* pre = "transformer.transformer_blocks";
         RAD_ARCH_TRY(rad_bind_layer_kv(b, li, m.kv));
         RAD_ARCH_TRY(map_copy(b, nm.f("dit.blk.%d.q_norm.weight", li),
@@ -1016,7 +1025,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                 RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("head_dim", hd),
                                            RAD_INT("n_head", g.n_head),
                                            RAD_INT("n_head_kv", g.n_head_kv),
-                                           RAD_F64("theta", 10000.0), RAD_F64("eps", eps),
+                                           RAD_F64("theta", g.theta), RAD_F64("eps", eps),
                                            RAD_STR("mode", "gptj_blocks"),
                                            RAD_INT("rotary_dim", hd),
                                            RAD_STR("sections", sections)),
@@ -1105,13 +1114,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     gd.n_embd     = gd.head_dim * gd.n_head_all;
     gd.n_ff_all   = gd.n_embd * rad_meta_geti(meta, "transformer.mlp_ratio", 3);
     gd.eps        = (float)rad_meta_getf(meta, "transformer.eps", 1e-6);
-    gd.theta      = 10000.0f;
+    gd.theta      = 10000.0f;   /* diffusers' QwenEmbedRope fixes it; the config does not say */
     gd.rope_mc    = false;
     RAD_ARCH_TRY(divide_or_fail(gd.n_head_all, gd.world, "transformer.num_attention_heads",
                                 &gd.n_head));
     gd.n_head_kv = gd.n_head;
     gd.kv_off = 0;
     RAD_ARCH_TRY(divide_or_fail(gd.n_ff_all, gd.world, "the DiT's feed-forward width", &gd.n_ff));
+    if (m.gt.n_layer >= kGrpTxtIn || gd.n_layer >= kGrpVision - kGrpDit) {
+        fprintf(stderr, "radiance: qwenimage21: %lld text-encoder and %lld DiT layers overrun the "
+                        "weight-group ranges\n", (long long)m.gt.n_layer, (long long)gd.n_layer);
+        return RAD_E_UNSUPPORTED;
+    }
     if (rad_meta_geti(meta, "transformer.context_in_dim", 4096) != m.gt.n_embd) {
         fprintf(stderr, "radiance: qwenimage21: the DiT reads %lld-wide conditioning and the text "
                         "encoder writes %lld\n",
@@ -1180,7 +1194,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* ---- in issue order: the tower, the language model, the encoder, the DiT, the decoder.
      * (Vae says why the order matters.) */
     m.media = VisionTower::present(meta) && ctx->max_enc_patches > 0;
-    if (m.media) RAD_ARCH_TRY(m.vit.declare(b, meta, ctx, nm, m.gt.n_embd, 3000, true));
+    if (m.media) RAD_ARCH_TRY(m.vit.declare(b, meta, ctx, nm, m.gt.n_embd, kGrpVision, true));
     RAD_ARCH_TRY(declare_te(b, meta, m));
     RAD_ARCH_TRY(declare_encoder(b, meta, m));
     RAD_ARCH_TRY(declare_dit(b, meta, m));
@@ -1278,7 +1292,7 @@ static void step_te(RadCtx* c, const RadBatch* batch, const Model& m) {
         L.down.step(c, m.a_tffn, m.b_th2, T);
         if (L.op_ar2) RAD_ISSUE_N(c, L.op_ar2, T * g.n_embd, brows(m.b_th2, T), RAD_NONE);
         RAD_ISSUE(c, L.op_add2, brows(m.b_tx, T), brows(m.b_th2, T), brows(m.b_tx, T));
-        /* DEEPSTACK: tap l's rows join the hidden state at the vision slots after layer l. */
+        /* Deepstack: tap l's rows join the hidden state at the vision slots after layer l. */
         if (m.media && nmm > 0 && l < m.vit.n_ds)
             RAD_ISSUE_N(c, m.op_ds[l], nmm, brows(m.vit.b_ds[l], nmm),
                         praw(batch->mm_rows, RAD_I32, nmm), brows(m.b_tx, T));
@@ -1304,16 +1318,15 @@ static void step_temb(RadCtx* c, const Model& m, const float* t, int64_t S) {
  * (`bt` / `used`) and its own rows, causal or not; the rows' keys and values stored at `slot`
  * when it is given.
  *
- * TWO HALVES, THE ALL-REDUCES ON THE SECOND LANE. With more than one rank, a denoising pass of one
- * entry runs everything after the attention -- the output projection, the norm, the feed-forward
- * -- and the next block's norm and qkv projection over the rows in two halves, and each half's
- * all-reduce goes to lane 1 while lane 0 computes the other half. Every op between two attentions
- * is row-local, so a half computes exactly the bits the whole would. The attention stays whole:
- * every query reads every key. One entry only, because the norms find a row's modulation by its
- * entry, and with a single entry every row of either half is entry 0's; several entries run
+ * Two halves, all-reduces on the second lane. With more than one rank, a denoising pass of one
+ * entry runs everything after the attention (output projection, norm, feed-forward) and the next
+ * block's norm and qkv projection over the rows in two halves; each half's all-reduce goes to lane
+ * 1 while lane 0 computes the other half. Every op between two attentions is row-local, so a half
+ * computes exactly the bits the whole would. The attention stays whole: every query reads every
+ * key. One entry only, because the norms find a row's modulation by its entry; several entries run
  * unsplit. Lane 0 waits for a half's all-reduce just before its first reader, and that wait is
- * issued before the next all-reduce goes to lane 1 -- a join orders a lane behind everything
- * issued on the other, so in the other order it would wait for both. */
+ * issued before the next all-reduce goes to lane 1: a join orders a lane behind everything issued
+ * on the other, so the reverse order would wait for both. */
 static void step_blocks(RadCtx* c, const Model& m, int64_t R, int64_t S, const RadOperand& cu,
                         const RadOperand& pos, const RadOperand& bt, const RadOperand& used,
                         const int32_t* slot, bool causal) {
@@ -1526,8 +1539,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
             return;
         }
         /* The mid-block whole, then this rank's band of latent rows [a, a + band) with `halo` rows
-         * a side; its pixels sit (a - lo) * 16 rows into the tail's output. The last band may be
-         * short, and what the gather moves past the picture's last row nobody reads. */
+         * per side; its pixels sit (a - lo) * 16 rows into the tail's output. The last band may be
+         * short; whatever the gather moves past the picture's last row is never read. */
         m.dec.issue(c, H, W, cu, nullptr, 0, (size_t)m.dec.band_from);
         const int64_t a = rank * band;
         const int64_t lo = std::max<int64_t>(0, a - halo), hi = std::min<int64_t>(H, a + band + halo);
@@ -1547,8 +1560,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
 }
 
 /* ================================================================== the probe */
-/* The rows a pass carries -- one image at the largest size with guidance, so two entries -- and
- * the vision patches of ten reference pictures at 1024 x 1024 of area. */
+/* The rows a pass carries (one image at the largest size with guidance, so two entries) and the
+ * vision patches of ten reference pictures at 1024 x 1024 of area. */
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
     out->gen_rows = 2 * (int64_t)kMaxImageTokens;

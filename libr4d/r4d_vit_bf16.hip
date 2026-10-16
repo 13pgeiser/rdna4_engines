@@ -1,20 +1,14 @@
-// r4d_vit_bf16.hip -- the three ops a vision tower needs that no language model here does: a layer
-// norm with a bias, the learned-grid position embedding, and a biased GEMM with the linear layer's
-// activation and residual folded into its store.
+// r4d_vit_bf16.hip -- vision-tower ops: layer norm with bias, learned-grid position embedding, and
+// a biased GEMM with the activation and residual folded into its store.
 //
-// THE ARITHMETIC IS libref's (ref_elementwise.cpp, ref_gemm.cpp), and where libref rounds, this
-// rounds in the same place: every accumulation is f32, every store is round-to-nearest-even bf16,
-// and the GEMM's epilogue rounds after the biased product, again after the activation and again
-// after the residual -- the three tensors the unfused chain would have written. A fused form that
-// kept f32 across those seams would be a little more accurate and a different function.
+// Arithmetic matches libref (ref_elementwise.cpp, ref_gemm.cpp), rounding where it rounds: f32
+// accumulation, RTNE bf16 stores, and the GEMM epilogue rounds after the biased product, after the
+// activation and after the residual, as the unfused chain would.
 //
-// WHY THE GEMM IS NOT gemm_bf16_nt_tiled. That kernel is byte-identical to the skinny one by
-// construction (split-K slices summed in a fixed order) and serves K in whole 64-element tiles; a
-// tower's MLP projects to 4304 and back, which is 16 elements past a tile, and its linear layers
-// all carry a bias. So this is the same block shape -- eight waves over an LDS-staged 64-deep K
-// tile, the next tile prefetched into registers -- with a K tail staged as zeros, no split, and the
-// epilogue in the store. It serves tall activations: a tower runs one pass over thousands of
-// patches, never a decode row.
+// Not gemm_bf16_nt_tiled: that kernel needs K in whole 64-element tiles (a tower MLP's 4304 is 16
+// past one) and has no bias. This uses the same block shape (eight waves over an LDS-staged 64-deep
+// K tile, next tile prefetched into registers) with a zero-staged K tail, no split-K, and the
+// epilogue in the store. Meant for tall activations (thousands of patches).
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_emit.h"
@@ -54,9 +48,9 @@ __device__ __forceinline__ float ldw(const void* p, uint32_t i) {
 }
 
 // ---------------------------------------------------------------------------- layernorm
-// ref_layernorm: y = (x - mean) * rsqrt(var + eps) * w + b, biased variance, TWO PASSES over the
-// row -- the mean first, then the squared deviations -- because the one-pass E[x^2] - E[x]^2 is
-// catastrophically worse on a residual whose mean is large against its spread. One block a row.
+// ref_layernorm: y = (x - mean) * rsqrt(var + eps) * w + b, biased variance, two passes (mean, then
+// squared deviations); one-pass E[x^2] - E[x]^2 cancels badly when the mean is large relative to
+// the spread. One block per row.
 template <bool WF32>
 __global__ __launch_bounds__(kThr) void layernorm_kernel(
     const unsigned short* __restrict__ x, const void* __restrict__ w, const void* __restrict__ b,
@@ -82,9 +76,9 @@ __global__ __launch_bounds__(kThr) void layernorm_kernel(
 }
 
 // ---------------------------------------------------------------------------- grid_embed
-// ref_grid_embed: a side x side table of rows resampled bilinearly to row m's grid (corners on the
-// table's corners, edge taps clamped), the four taps summed in f32 in libref's order, rounded,
-// added to x and rounded again. `coord` is [4, planes] -- row, column, grid height, grid width.
+// ref_grid_embed: a side x side table resampled bilinearly to row m's grid (corners aligned, edge
+// taps clamped), four taps summed in f32 in libref's order, rounded, added to x and rounded again.
+// `crd` is [4, planes]: row, column, grid height, grid width.
 template <bool TF32>
 __global__ __launch_bounds__(kThr) void grid_embed_kernel(
     unsigned short* __restrict__ x, const void* __restrict__ tab, const int32_t* __restrict__ crd,
@@ -122,9 +116,8 @@ __global__ __launch_bounds__(kThr) void grid_embed_kernel(
 
 // ---------------------------------------------------------------------------- grid_embed_aa
 // ref_grid_embed_aa: torch's antialiased half-pixel bilinear resample (SigLIP2's position table).
-// Thread 0 lays out the row's two tap lists -- at most `side` each -- in LDS; every thread then
-// takes channels, summing the taps in libref's order (a row of columns, then the rows), and the sum
-// is rounded once before the add.
+// Thread 0 builds the row's two tap lists (at most `side` each) in LDS; threads then take channels,
+// summing taps in libref's order (columns within a row, then rows), rounded once before the add.
 __device__ __forceinline__ int aa_taps(int at, int size, int side, float* w, int* lo) {
     size = size < 1 ? 1 : size;
     at = at < 0 ? 0 : (at >= size ? size - 1 : at);
@@ -174,9 +167,9 @@ __global__ __launch_bounds__(kThr) void grid_embed_aa_kernel(
 
 // ---------------------------------------------------------------------------- gemm_nt_bias
 #define VB_BK 64
-#define VB_PITCH (VB_BK + 8)      // 144-byte LDS rows: gemm_bf16_nt_tiled's bank argument
+#define VB_PITCH (VB_BK + 8)      // 144-byte LDS rows, as in gemm_bf16_nt_tiled (bank spread)
 
-// TM x TN WMMA tiles a wave, eight waves as 2 x 4: BM = 2*TM*16, BN = 4*TN*16. ACT: 0 none,
+// TM x TN WMMA tiles per wave, eight waves as 2 x 4: BM = 2*TM*16, BN = 4*TN*16. ACT: 0 none,
 // 1 exact GELU, 2 tanh GELU.
 template <int TM, int TN, int ACT, bool RES, bool BF32>
 __global__ __launch_bounds__(256) void vit_gemm_kernel(
@@ -195,8 +188,8 @@ __global__ __launch_bounds__(256) void vit_gemm_kernel(
     const int wm = wave / 4, wn = wave % 4;
     const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
 
-    // Staging: chunk c = tid + 256 i is row c / CPR, elements (c % CPR) * 8 of it. Rows past M
-    // or N re-read the last valid row and compute a result nobody stores.
+    // Staging: chunk c = tid + 256 i is row c / CPR, elements (c % CPR) * 8. Rows past M or N
+    // re-read the last valid row; their results are not stored.
     unsigned aoff[AL], woff[WL];
     int ae[AL], we[WL];
     unsigned short* adst[AL];
@@ -226,8 +219,8 @@ __global__ __launch_bounds__(256) void vit_gemm_kernel(
 #pragma unroll
         for (int j = 0; j < TN; ++j) acc[i][j] = (v8f)(0.f);
 
-    // THE K TAIL IS STAGED AS ZEROS: K is a multiple of 8, so a 16-byte chunk is wholly inside K
-    // or wholly past it, and a zero chunk contributes exactly nothing to the dot products.
+    // The K tail is staged as zeros: K is a multiple of 8, so a 16-byte chunk is wholly inside or
+    // wholly past K.
     const r4d_u32x4 zero = (r4d_u32x4)(0u);
     r4d_u32x4 ra[AL], rw[WL];                       // registers; uint4 would sit in scratch
 #pragma unroll
@@ -266,8 +259,8 @@ __global__ __launch_bounds__(256) void vit_gemm_kernel(
         }
     }
 
-    // Lane l holds column (l & 15) of a tile and rows 8 (l >> 4) + e. The residual is read at the
-    // element it is added to, by the thread that stores it, so `R` may be `C` itself.
+    // Lane l holds column (l & 15) of a tile and rows 8 (l >> 4) + e. The residual is read by the
+    // thread that stores the same element, so R may alias C.
 #pragma unroll
     for (int i = 0; i < TM; ++i)
 #pragma unroll
@@ -296,14 +289,14 @@ __global__ __launch_bounds__(256) void vit_gemm_kernel(
 /* ------------------------------------------------------------------ layernorm */
 enum { LN_X = 0, LN_W, LN_B, LN_Y };
 
-static int rad_layernorm_body(const RadArgs* a, const R4dSink& sk) {
+extern "C" int r4d_rad_layernorm(const RadArgs* a, RadStream stream) {
     const RadTensor* x = r4d_opt(a, LN_X);
     const RadTensor* w = r4d_opt(a, LN_W);
     const RadTensor* b = r4d_opt(a, LN_B);
     const RadTensor* y = r4d_opt(a, LN_Y);
     if (!x || !w || !y) return R4D_NO(RAD_E_INVAL);
     if (x->dtype != RAD_BF16 || y->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
-    /* The gain and the bias share one width, read off the operand: f32 or bf16. */
+    /* Gain and bias share one dtype, f32 or bf16. */
     if (w->dtype != RAD_F32 && w->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
     if (b && b->dtype != w->dtype) return R4D_NO(RAD_E_DTYPE);
     if (!r4d_contig(w) || (b && !r4d_contig(b))) return R4D_NO(RAD_E_STRIDE);
@@ -317,20 +310,19 @@ static int rad_layernorm_body(const RadArgs* a, const R4dSink& sk) {
     if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
     const float eps = (float)r4d_getf(a, "eps", 1e-5);
     if (w->dtype == RAD_F32)
-        return R4D_EMIT(sk, layernorm_kernel<true>, dim3((uint32_t)M), dim3(kThr), 0,
+        return R4D_EMIT(stream, layernorm_kernel<true>, dim3((uint32_t)M), dim3(kThr), 0,
                         (const unsigned short*)r4d_p(x), r4d_p(w), r4d_p(b),
                         (unsigned short*)r4d_wp(y), (uint32_t)n, eps, (uint32_t)x_ld,
                         (uint32_t)y_ld);
-    return R4D_EMIT(sk, layernorm_kernel<false>, dim3((uint32_t)M), dim3(kThr), 0,
+    return R4D_EMIT(stream, layernorm_kernel<false>, dim3((uint32_t)M), dim3(kThr), 0,
                     (const unsigned short*)r4d_p(x), r4d_p(w), r4d_p(b),
                     (unsigned short*)r4d_wp(y), (uint32_t)n, eps, (uint32_t)x_ld, (uint32_t)y_ld);
 }
-R4D_ENTRY(r4d_rad_layernorm, rad_layernorm_body)
 
 /* ------------------------------------------------------------------ grid_embed */
 enum { GE_X = 0, GE_TAB, GE_CRD };
 
-static int rad_grid_embed_body(const RadArgs* a, const R4dSink& sk) {
+extern "C" int r4d_rad_grid_embed(const RadArgs* a, RadStream stream) {
     const RadTensor* x   = r4d_opt(a, GE_X);
     const RadTensor* tab = r4d_opt(a, GE_TAB);
     const RadTensor* crd = r4d_opt(a, GE_CRD);
@@ -350,17 +342,16 @@ static int rad_grid_embed_body(const RadArgs* a, const R4dSink& sk) {
     if (M <= 0) return R4D_NO(RAD_E_SHAPE);
     const uint32_t plane = (uint32_t)crd->shape[1];
     if (tab->dtype == RAD_F32)
-        return R4D_EMIT(sk, grid_embed_kernel<true>, dim3((uint32_t)M), dim3(kThr), 0,
+        return R4D_EMIT(stream, grid_embed_kernel<true>, dim3((uint32_t)M), dim3(kThr), 0,
                         (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
                         (uint32_t)n, (int)side, (uint32_t)x_ld, plane);
-    return R4D_EMIT(sk, grid_embed_kernel<false>, dim3((uint32_t)M), dim3(kThr), 0,
+    return R4D_EMIT(stream, grid_embed_kernel<false>, dim3((uint32_t)M), dim3(kThr), 0,
                     (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
                     (uint32_t)n, (int)side, (uint32_t)x_ld, plane);
 }
-R4D_ENTRY(r4d_rad_grid_embed, rad_grid_embed_body)
 
 /* grid_embed_aa: grid_embed's operands and checks, the antialiased resample. */
-static int rad_grid_embed_aa_body(const RadArgs* a, const R4dSink& sk) {
+extern "C" int r4d_rad_grid_embed_aa(const RadArgs* a, RadStream stream) {
     const RadTensor* x   = r4d_opt(a, GE_X);
     const RadTensor* tab = r4d_opt(a, GE_TAB);
     const RadTensor* crd = r4d_opt(a, GE_CRD);
@@ -381,19 +372,18 @@ static int rad_grid_embed_aa_body(const RadArgs* a, const R4dSink& sk) {
     const uint32_t plane = (uint32_t)crd->shape[1];
     const size_t lds = (size_t)(2 * side) * sizeof(float);
     if (tab->dtype == RAD_F32)
-        return R4D_EMIT(sk, grid_embed_aa_kernel<true>, dim3((uint32_t)M), dim3(kThr), lds,
+        return R4D_EMIT(stream, grid_embed_aa_kernel<true>, dim3((uint32_t)M), dim3(kThr), lds,
                         (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
                         (uint32_t)n, (int)side, (uint32_t)x_ld, plane);
-    return R4D_EMIT(sk, grid_embed_aa_kernel<false>, dim3((uint32_t)M), dim3(kThr), lds,
+    return R4D_EMIT(stream, grid_embed_aa_kernel<false>, dim3((uint32_t)M), dim3(kThr), lds,
                     (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
                     (uint32_t)n, (int)side, (uint32_t)x_ld, plane);
 }
-R4D_ENTRY(r4d_rad_grid_embed_aa, rad_grid_embed_aa_body)
 
 /* ------------------------------------------------------------------ gemm_nt_bias */
 enum { GB_A = 0, GB_W, GB_BIAS, GB_RES, GB_Y };
 
-static int rad_gemm_nt_bias_body(const RadArgs* a, const R4dSink& sk) {
+extern "C" int r4d_rad_gemm_nt_bias(const RadArgs* a, RadStream stream) {
     const RadTensor* A = r4d_opt(a, GB_A);
     const RadTensor* W = r4d_opt(a, GB_W);
     const RadTensor* B = r4d_opt(a, GB_BIAS);
@@ -431,7 +421,7 @@ static int rad_gemm_nt_bias_body(const RadArgs* a, const R4dSink& sk) {
     }
     const bool res = R != nullptr, bf32 = B->dtype == RAD_F32;
 
-    /* The large tile once its grid reaches half the part, as gemm_bf16_nt_tiled chooses. */
+    /* The large tile once its grid reaches 32 workgroups, as gemm_bf16_nt_tiled chooses. */
     const long long g128 = ((N + 127) / 128) * ((M + 127) / 128);
     const bool big = g128 >= 32;
     const int bt = big ? 128 : 64;
@@ -442,8 +432,9 @@ static int rad_gemm_nt_bias_body(const RadArgs* a, const R4dSink& sk) {
     auto Cp = (unsigned short*)r4d_wp(Y);
     const void* Bp = r4d_p(B);
 #define VB_L(TM, TN, AC, RS, BF)                                                                  \
-    return R4D_EMIT(sk, (vit_gemm_kernel<TM, TN, AC, RS, BF>), grid, block, 0, Ap, (unsigned)lda, \
-                    Wp, (unsigned)K, Bp, Rp, (unsigned)ldr, Cp, (unsigned)ldc, (int)M, (int)K,     \
+    return R4D_EMIT(stream, (vit_gemm_kernel<TM, TN, AC, RS, BF>), grid, block, 0, Ap,          \
+                    (unsigned)lda, Wp, (unsigned)K, Bp, Rp, (unsigned)ldr, Cp, (unsigned)ldc,      \
+                    (int)M, (int)K,                                                                \
                     (int)N)
 #define VB_ACT(TM, TN, RS, BF)                                                                    \
     do {                                                                                          \
@@ -460,4 +451,3 @@ static int rad_gemm_nt_bias_body(const RadArgs* a, const R4dSink& sk) {
 #undef VB_ACT
 #undef VB_L
 }
-R4D_ENTRY(r4d_rad_gemm_nt_bias, rad_gemm_nt_bias_body)

@@ -1,15 +1,14 @@
 /* relayout_parity_test.cpp -- a kernel's relayout of libquant's planes is the stored form the
  * kernel reads, pinned byte for byte.
  *
- * A container holds a quantiser's canonical planes and the kernel only arranges them at load
+ * A container holds a quantiser's canonical planes; the kernel only arranges them at load
  * (spec.md §4.3). For every stored format, libquant's planes passed through the kernel's relayout
- * are held to a recorded FNV-1a hash of the stored bytes -- the hashes are what the containers in
- * service were quantised to, so a recipe reconverts one without moving a single served bit, and a
- * relayout or quantiser edit that changes a format fails here rather than as a quality drift no
- * test downstream is sharp enough to see. Where the kernel can be read back, the inverse has to
- * give the planes back exactly.
+ * are pinned to a recorded FNV-1a hash of the stored bytes. The hashes match the containers in
+ * service, so a recipe reconverts one without moving a served bit, and a relayout or quantiser
+ * edit that changes a format fails here instead of as a quality drift no downstream test can
+ * see. Where the kernel has an inverse, it must give the planes back exactly.
  *
- * libr4d needs a HIP toolchain to build and its layouts do not, so their host sources are compiled
+ * libr4d needs a HIP toolchain to build but its layouts do not, so their host sources are compiled
  * into this test (tests/CMakeLists.txt). The n-gram table's hook is libavx's, from the plugin.
  */
 #include "quant_fixture.h"
@@ -29,19 +28,14 @@ struct Hooks {
     RadUnrelayoutFn unrelayout = nullptr;
 };
 
-uint64_t fnv(const std::vector<uint8_t>& b, uint64_t h = 0xcbf29ce484222325ull) {
-    for (uint8_t c : b) h = (h ^ c) * 0x100000001b3ull;
-    return h;
-}
-
-/* Two hashes into one, order-sensitive -- a XOR would cancel two equal planes to zero. */
+/* Two hashes into one, order-sensitive (XOR would cancel two equal planes to zero). */
 uint64_t chain(uint64_t a, uint64_t b) {
     for (int i = 0; i < 8; ++i) a = (a ^ ((b >> (8 * i)) & 0xFF)) * 0x100000001b3ull;
     return a;
 }
 
-/* The planes `roles` names, as the loader will hand them to a relayout: dense [rows, cols] in each
- * plane's own elements. `bufs` replaces the data when given -- the inverse's destinations. */
+/* The planes `roles` names, as the loader hands them to a relayout: dense [rows, cols] in each
+ * plane's own elements. `bufs`, when given, replaces the data (the inverse's destinations). */
 struct Selection {
     std::vector<int> sel;
     std::vector<RadTensor> t;
@@ -76,7 +70,7 @@ struct Op {
     std::vector<const char*> roles;
 };
 
-/* THE CHECK. Quantise `w` with libquant, store each operand through the kernel's hooks, invert.
+/* The check: quantise `w` with libquant, store each operand through the kernel's hooks, invert.
  * Returns the hash of everything stored, in operand order. */
 uint64_t stored(const char* label, const Hooks& nf, Opts kp, const char* quant,
                 Opts qo, const char* wname, int64_t R, int64_t C, const std::vector<float>& w,
@@ -125,7 +119,7 @@ uint64_t stored(const char* label, const Hooks& nf, Opts kp, const char* quant,
     return h;
 }
 
-/* A golden: the stored bytes' hash as the containers in service hold them. */
+/* A golden: the hash of the stored bytes as the containers in service hold them. */
 void golden(const char* label, uint64_t got, uint64_t want) {
     if (got != want)
         std::fprintf(stderr, "    %s: stored hash 0x%016llxull, recorded 0x%016llxull\n", label,
@@ -133,8 +127,8 @@ void golden(const char* label, uint64_t got, uint64_t want) {
     CHECK_EQ(got, want);
 }
 
-/* The edges every scale rule has a case for: a zero block, an all-positive one and an all-negative
- * one -- an asymmetric grid widens each to take in zero -- at blocks (0, 0), (1, 1) and (2, 0) of a
+/* The edges every scale rule handles: a zero block, an all-positive one and an all-negative one
+ * (an asymmetric grid widens each to include zero), at blocks (0, 0), (1, 1) and (2, 0) of a
  * [br x bc] grid, clipped to the weight. */
 void edges(std::vector<float>& w, int64_t R, int64_t C, int64_t br, int64_t bc) {
     auto block = [&](int64_t bi, int64_t bj, int sign) {
@@ -228,7 +222,7 @@ TEST(the_fp8_hyper_connection_and_mtp_rows) {
     Opts kp;
     kp.i("n", n).i("hc", hc).i("lowrank", lr);
     {
-        /* mix_down: [lowrank, hc*n], 128 columns a scale */
+        /* mix_down: [lowrank, hc*n], a scale per 128 columns */
         const std::vector<float> w = weight(lr, hc * n, 14, 1, 128);
         Opts g;
         g.s("codes", "fp8_e4m3").i("group", 128).s("scale", "f32");
@@ -237,7 +231,7 @@ TEST(the_fp8_hyper_connection_and_mtp_rows) {
                0x62a46db4dbf831aeull);
     }
     {
-        /* mix_up: [hc*n, lowrank], a quarter of the row a scale */
+        /* mix_up: [hc*n, lowrank], a scale per quarter row */
         const std::vector<float> w = weight(hc * n, lr, 15, 1, lr / 4);
         Opts g;
         g.s("codes", "fp8_e4m3").i("group", lr / 4).s("scale", "f32");
@@ -285,9 +279,9 @@ TEST(dense_int4_symmetric_and_asymmetric) {
     }
 }
 
-/* ParoQuant's int5: u5 codes as w4's nibble plane plus a fifth-bit plane, the (scale, zero) dwords
- * of the asymmetric w4 grid -- read back exactly; and a zero point that is not a 5-bit code refused,
- * since the int8 prefill kernel reads five bits of it where the f16 one reads the whole value. */
+/* ParoQuant's int5: u5 codes as w4's nibble plane plus a fifth-bit plane, with the asymmetric w4
+ * grid's (scale, zero) dwords, read back exactly. A zero point that is not a 5-bit code is
+ * refused, since the int8 prefill kernel reads five bits of it where the f16 one reads all of it. */
 TEST(dense_int5_asymmetric) {
     NEED_LIBQUANT();
     const int64_t N = 64, K = 256;
@@ -394,10 +388,10 @@ TEST(moe_codebook_experts_both_classes) {
 
 TEST(moe_codebook_experts_at_e4m3_scales_a_64) {
     NEED_LIBQUANT();
-    /* w4nl64a8h: the codebook's codes, stored as w4nla8h stores them, and an E4M3 scale a
-     * (row, 64 of K) under one fixed f32 -- the scale view selects both, the relayout checks the
-     * second is the kernel's constant and stores the E4M3 plane as it is, and the inverse gives
-     * back both. A second level of any other value is refused when its bytes are relaid. */
+    /* w4nl64a8h: the codebook's codes, stored as w4nla8h stores them, and an E4M3 scale per
+     * (row, 64 of K) under one fixed f32. The scale view selects both; the relayout checks the
+     * second is the kernel's constant and stores the E4M3 plane as is; the inverse gives back
+     * both. A second level of any other value is refused when its bytes are relaid. */
     const int64_t N = 64, K = 256, N1 = 48, K1 = 128;
     const std::vector<float> w = weight(N, K, 21, 1, 128);
     const std::vector<float> w1 = weight(N1, K1, 22, 1, 128);
@@ -436,7 +430,7 @@ TEST(moe_codebook_experts_at_e4m3_scales_a_64) {
 
 TEST(moe_codebook_experts_at_e4m3_scales_a_32) {
     NEED_LIBQUANT();
-    /* w4nl32a8h: the 64-wide form's planes at a scale a 32 of K, four E4M3 bytes a 128. */
+    /* w4nl32a8h: the 64-wide form's planes at a scale per 32 of K, four E4M3 bytes per 128. */
     const int64_t N = 64, K = 256, N1 = 48, K1 = 128;
     const std::vector<float> w = weight(N, K, 21, 1, 128);
     const std::vector<float> w1 = weight(N1, K1, 22, 1, 128);
@@ -465,10 +459,9 @@ TEST(moe_codebook_experts_at_e4m3_scales_a_32) {
 TEST(moe_codebook_experts_at_five_bits) {
     NEED_LIBQUANT();
     /* w5nl64a8h: u5 codes into libquant's 32-entry w5nl table at w4nl64a8h's scales. The codes
-     * view relays each row into its nibbles and its sign bits, the scale view is the 64-wide
-     * form's, and the inverse gives back the packed codes and the table. A table that is not the
-     * kernel's is refused when its bytes are relaid, and the four-bit encoding is not this
-     * dtype's. */
+     * view relays each row into nibbles and sign bits, the scale view is the 64-wide form's, and
+     * the inverse gives back the packed codes and the table. A table other than the kernel's is
+     * refused when its bytes are relaid, and the four-bit encoding is not this dtype's. */
     const int64_t N = 64, K = 256, N1 = 48, K1 = 128;
     const std::vector<float> w = weight(N, K, 21, 1, 128);
     const std::vector<float> w1 = weight(N1, K1, 22, 1, 128);
@@ -512,13 +505,12 @@ TEST(moe_codebook_experts_at_five_bits) {
 
 namespace {
 
-/* WHAT THE OP ORACLE READS FOR A RE-LAID WEIGHT, got the way Ctx::oracle_unrelayout gets it: the
- * stored bytes back through the kernel's own inverse into the selected planes, and those through
- * the core's enc_selection_logical into the values a dense reference multiplies -- f32 here, held
- * to the same values read straight off the quantiser's planes: a code as itself or as its table
- * entry, a scale times the levels above it. A selection the core cannot read on its own is a
- * weight the oracle has to decline, and the E4M3 scale views were one. A view stored as it is has
- * nothing to invert and is handed over unchanged. */
+/* What the op oracle reads for a relaid weight, obtained as Ctx::oracle_unrelayout does: the
+ * stored bytes back through the kernel's inverse into the selected planes, then through the
+ * core's enc_selection_logical into the f32 values a dense reference multiplies. These must equal
+ * the values read straight off the quantiser's planes (a code as itself or as its table entry, a
+ * scale times the levels above it). A selection the core cannot read alone is a weight the oracle
+ * must decline. A view stored as is has nothing to invert and is passed through unchanged. */
 void oracle_reads(const char* label, const Hooks& nf, Opts kp, int operand, const Quantised& q,
                   int64_t R, int64_t C, const std::vector<const char*>& roles) {
     Selection s = select(q, R, C, roles);
@@ -601,11 +593,11 @@ std::vector<MoeFmt> moe_formats() {
 
 }  /* namespace */
 
-/* THE FOUR CLASSES ARE THE TWO-CLASS HOOKS ONE CLASS FURTHER ALONG. moe_gemm_q_mod4's class q is
- * operands 2/3 at N/K for q = 0 and 2q+4/2q+5 at N_q/K_q after it, and each is stored, and read
- * back, exactly as moe_gemm_q's hooks store an expert of that geometry -- codes and scales, in
- * every four-bit format, at four class geometries. Then what the op oracle reads through each
- * class's inverse, codes and E4M3 scale views alike, and through the two-class op's own. */
+/* The four-class hooks are the two-class hooks extended. moe_gemm_q_mod4's class q is operands 2/3
+ * at N/K for q = 0 and 2q+4/2q+5 at N_q/K_q after it, and each is stored and read back exactly as
+ * moe_gemm_q's hooks store an expert of that geometry: codes and scales, in every four-bit format,
+ * at four class geometries. Then the op oracle reads through each class's inverse (codes and E4M3
+ * scale views alike) and through the two-class op's own. */
 TEST(moe_four_classes_store_and_read_back_as_two_classes_do) {
     NEED_LIBQUANT();
     const int64_t Nq[4] = { 64, 128, 64, 48 }, Kq[4] = { 256, 256, 128, 128 };
@@ -649,9 +641,9 @@ TEST(moe_four_classes_store_and_read_back_as_two_classes_do) {
 
 TEST(moe_int4_gptq_against_a_calibration_hessian) {
     NEED_LIBQUANT();
-    /* Correlated activations, so the Hessian is far from diagonal and the error feedback moves
-     * codes rounding alone would not -- checked below, or a GPTQ that silently fell back to
-     * rounding would pass as parity. */
+    /* Correlated activations, so the Hessian is far from diagonal and error feedback moves codes
+     * that rounding alone would not. Checked below, so a GPTQ that silently fell back to rounding
+     * cannot pass as parity. */
     const int64_t N = 64, K = 256, T = 1024;
     const std::vector<float> w = weight(N, K, 23, 1, 128);
     const std::vector<float> z = draw(T * K, 24);
@@ -669,11 +661,12 @@ TEST(moe_int4_gptq_against_a_calibration_hessian) {
         for (int64_t i = 0; i < K; ++i)
             for (int64_t j = 0; j < K; ++j)
                 h[(size_t)(i * K + j)] += x[(size_t)(t * K + i)] * x[(size_t)(t * K + j)];
-    char dir[] = "/tmp/rad_relayout_parity_XXXXXX";
-    REQUIRE(mkdtemp(dir) != nullptr);
+    const TempDir td("rad_relayout_parity");
+    REQUIRE(!td.path.empty());
+    const char* dir = td.path.c_str();
     const std::string path = std::string(dir) + "/gram.r0.blk.5.ffn_down_exps.bin";
-    /* The Gram of `x` as it stands -- the model's own domain -- so the rotated recipe below reads it
-     * rotated into its own, as it would a bf16 model's calibration. */
+    /* The Gram of `x` as it stands (the model's own domain), so the rotated recipe below rotates
+     * it into its own domain, as it would a bf16 model's calibration. */
     REQUIRE(write_gram(path, K, T, h, 0));
 
     const char* name = "blk.5.ffn_down_exps.9.weight";
@@ -694,17 +687,17 @@ TEST(moe_int4_gptq_against_a_calibration_hessian) {
         golden(rot ? "gptq w4a8h" : "gptq w4a8", hg,
                rot ? 0x761cbdd0aff4adedull : 0x4a4db9378ca02303ull);
     }
-    std::remove(path.c_str());
-    rmdir(dir);
 }
 
+/* The build makes libavx on every x86-64 and on no other machine. */
 TEST(the_ngram_table_is_the_canonical_plane) {
+#if !defined(__x86_64__)
+    SKIP("libavx is x86-64 only");
+#endif
     NEED_LIBQUANT();
-    void* so = dlopen((home() + "/kernels/libavx.so").c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (!so) {
-        std::fprintf(stderr, "  SKIP no libavx under %s\n", home().c_str());
-        return;
-    }
+    const std::string avx = home() + "/kernels/libavx.so";
+    void* so = dlopen(avx.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!so) ARTIFACT_MISSING(avx + " (does not load: " + dlerror() + ")");
     Hooks nf;
     nf.layout = (RadLayoutFn)dlsym(so, "avx_layout_ngram");
     REQUIRE(nf.layout != nullptr);
@@ -773,8 +766,8 @@ TEST(a_kernel_refuses_an_encoding_it_does_not_read) {
     CHECK_EQ(lay(r4d_rad_layout_moe_w4, nlk, B, q_i4r, { "codes" }), RAD_E_DTYPE);
     CHECK_EQ(lay(r4d_rad_layout_moe_w4, nlk, B, q_nl, { "codes" }), RAD_E_SHAPE);
     CHECK_EQ(lay(r4d_rad_layout_moe_w4, nlk, B, q_nl, { "codes", "table" }), RAD_OK);
-    /* ANOTHER TABLE OF THE SAME SHAPE declares -- an encoding cannot say what its table holds --
-     * and is refused when its bytes are relaid, before the kernel could decode them as w4nl */
+    /* Another table of the same shape passes declare (an encoding cannot say what its table
+     * holds) and is refused when its bytes are relaid, before the kernel decodes them as w4nl */
     CHECK_EQ(lay(r4d_rad_layout_moe_w4, nlk, B, q_nf4, { "codes", "table" }), RAD_OK);
     {
         Selection s = select(q_nf4, N, K, { "codes", "table" });
@@ -788,10 +781,8 @@ TEST(a_kernel_refuses_an_encoding_it_does_not_read) {
     }
 }
 
-RAD_TEST_MAIN()
-
-/* ParoQuant's rotation pairs are stored as they are -- and refused at load when a stage is not a
- * pairing of its own group's 128 columns, which the rotate kernels would index out of bounds. */
+/* ParoQuant's rotation pairs are stored as they are, and refused at load when a stage is not a
+ * pairing within its own group's 128 columns, which the rotate kernels would index out of bounds. */
 TEST(givens_pairs_are_stored_as_they_are_and_checked) {
     const int64_t K = 256, R = 2;                    /* two groups, two stages */
     RadEncoding e = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
@@ -836,9 +827,9 @@ TEST(givens_pairs_are_stored_as_they_are_and_checked) {
     }
 }
 
-/* ParoQuant's dense rotation matrices are the "t.dense" table rad-convert composed (checkpoint_test pins the
- * composition by hash): the layout takes the table as stored, byte for byte, and refuses a view of anything
- * else -- the pairs and angles, which it would have to compose, included. */
+/* ParoQuant's dense rotation matrices are the "t.dense" table rad-convert composed (checkpoint_test
+ * pins the composition by hash). The layout takes the table as stored, byte for byte, and refuses
+ * a view of anything else, including the pairs and angles it would have to compose. */
 TEST(givens_dense_layout_is_the_stored_table) {
     const int64_t K = 256, P = 2, G = 128;
     RadEncoding e = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
@@ -863,3 +854,5 @@ TEST(givens_dense_layout_is_the_stored_table) {
     RadTensor two[2] = { t, t };
     CHECK(r4d_rad_layout_gdense(kp.data(), kp.n(), 1, &e, sel2, two, 2, &L) != RAD_OK);
 }
+
+RAD_TEST_MAIN()

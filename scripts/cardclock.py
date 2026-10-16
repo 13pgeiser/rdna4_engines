@@ -1,43 +1,38 @@
 #!/usr/bin/env python3
 # cardclock.py -- what holds each card's clock under a sustained load, and which card sets the step.
 #
-# A tensor-parallel step ends when its slowest rank finishes: every rank waits for the others in the
-# all-reduce. So the clock that decides decode speed is the LOWEST of the cards', and on a
-# workstation card under a sustained load the firmware -- not the engine -- picks that clock: the
-# power limit (PPT), a temperature limit, a current limit. The same image then reads several percent
-# apart from one boot to the next, depending on which card heats first and how hard its power limit
-# bites. This puts a number on that:
+# A tensor-parallel step ends when the slowest rank finishes the all-reduce, so decode speed follows
+# the lowest card clock. Under sustained load the firmware picks that clock (power limit PPT,
+# temperature or current limits), so the same image can differ by several percent between boots
+# depending on which card heats first. This script:
 #
 #   * drives a sustained greedy load at --conc against a live server (or, with --watch, only samples
-#     while something else drives it -- real traffic on a deployment), and reports tok/s per --window
-#     seconds;
-#   * beside it, the engine's own step counters per window (/metrics): step ms, tokens per decode step,
-#     draft acceptance, busy share and host gap per step -- so a slow window is attributed to slower
-#     steps, to the text (fewer tokens a step), or to the host, before anyone blames a clock. The
-#     engine's tok/s counts every request the server ran in the window, the load's only this script's:
-#     a gap between the two is someone else's traffic;
+#     while other traffic drives it) and reports tok/s per --window seconds;
+#   * reports the engine's step counters per window from /metrics (step ms, tokens per decode step,
+#     draft acceptance, busy share, host gap per step), so a slow window is attributed to slower
+#     steps, the text (fewer tokens per step) or the host. The engine's tok/s counts every request
+#     the server ran, the load's only this script's; a difference is other traffic;
 #   * reads every AMD card's SMU metrics table (/sys/class/drm/card*/device/gpu_metrics) ten times a
-#     second: clocks, temperatures (edge, hotspot, memory, the GFX/SOC/MEM voltage regulators), power,
-#     fan, and the throttler bits the firmware itself sets -- READ-ONLY, no root needed;
-#   * names the card the step waits for and what holds it, and the setting that addresses that;
-#   * --json saves a run; --compare puts two of them side by side (before / after a setting change).
+#     second: clocks, temperatures (edge, hotspot, memory, GFX/SOC/MEM voltage regulators), power,
+#     fan and the firmware's throttler bits. Read-only, no root needed;
+#   * names the card the step waits for, what holds it, and the setting that addresses it;
+#   * --json saves a run; --compare shows two runs side by side (before / after a setting change).
 #
 #   scripts/cardclock.py [--port 8100] [--conc 8] [--seconds 180] [--gen 1024] [--json run.json]
 #   scripts/cardclock.py --watch [--seconds 300] [--json run.json]
 #   scripts/cardclock.py --compare before.json after.json
 #
-# Reading the throttler bits: a bit counts only when it is set under load AND the card's clock is
-# lower while it is set. Some firmware keeps a bit set all the time -- on Radeon AI PRO R9700
-# (gfx1201) TEMP_HOTSPOT reads set at idle and at 45 C with no effect on the clock -- so a bit that
-# the idle baseline also shows is listed and ignored.
+# Throttler bits: a bit counts only when it is set under load and the clock is lower while it is
+# set. Some firmware keeps a bit set permanently (on the Radeon AI PRO R9700, gfx1201, TEMP_HOTSPOT
+# is set at idle and at 45 C with no effect on the clock), so a bit the idle baseline also shows is
+# listed and ignored.
 #
-# Changing a setting this points at (power1_cap, fan target, voltage offset) is a write to the SMU:
-# do it ONLY while no process holds /dev/kfd -- stop the server first. On a gfx1201 box such a write
-# under load has reset the machine. Check with `sudo find /proc/[0-9]*/fd -lname /dev/kfd`, not
-# `lsof /dev/kfd`: lsof on the host does not see a containerised server's handle (the container's
-# /dev/kfd is its own node). None of these settings survive a reboot. Undervolts in
-# particular must be proven under a SUSTAINED hot load, not a short test: an offset that passes a
-# minute-long selftest can wedge a card twenty minutes into real traffic once it runs at 90 C.
+# Changing a suggested setting (power1_cap, fan target, voltage offset) writes to the SMU: do it
+# only while no process holds /dev/kfd. On gfx1201 such a write under load can reset the machine.
+# Check with `sudo find /proc/[0-9]*/fd -lname /dev/kfd`; host lsof does not see a containerised
+# server's handle (the container's /dev/kfd is its own node). None of these settings survive a
+# reboot. Prove an undervolt under a sustained hot load: an offset that passes a minute-long
+# selftest can wedge a card after twenty minutes at 90 C.
 #
 # Needs Linux amdgpu with a gpu_metrics v1.3 table (RDNA3 / RDNA4 discrete cards); a card with any
 # other layout is skipped rather than misread.
@@ -108,8 +103,8 @@ def find_cards():
         if not re.fullmatch(r"card\d+", dev.split("/")[-2]): continue
         if rd(dev + "/vendor") != "0x1002" or not os.path.exists(dev + "/gpu_metrics"): continue
         c = Card(dev)
-        # ANOTHER LAYOUT IS ANOTHER KIND OF PART, not a reason to stop: an APU's integrated graphics
-        # beside the discrete cards reports a v2.x table, and the engine does not serve on it.
+        # Skip, do not stop, on another layout: an APU's integrated graphics reports a v2.x table and
+        # the engine does not serve on it.
         try:
             size, fr, cr = struct.unpack_from("<HBB", open(dev + "/gpu_metrics", "rb").read(4))
             if (fr, cr) != (1, 3) or size != 120:
@@ -184,8 +179,8 @@ def engine_windows(snaps, t0, t1, w):
 def load(a, base, model):
     done, stop, stall = [], threading.Event(), {}
     def worker(i):
-        # --seed: every run sends the same prompts in the same order per stream (the text drives speculation, so a
-        # run-to-run A/B wants it fixed); without it, a fresh mix each run
+        # --seed fixes each stream's prompt sequence across runs (the text drives speculation, so A/B runs need it
+        # fixed); without it, each run gets a fresh mix
         rnd = random.Random(i * 7919 + (a.seed if a.seed is not None else int(time.time())))
         while not stop.is_set():
             t0 = time.time(); tag, topic = rnd.getrandbits(48), rnd.randrange(len(TOPICS))

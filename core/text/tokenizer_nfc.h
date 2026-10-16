@@ -1,13 +1,12 @@
 /* tokenizer_nfc.h -- NFC for the tokeniser's normaliser chain, applied only where it can change
- * something. Byte for byte what unorm_utf8(text, false, true) returns; see tokenizer_nfc.cpp for
- * why normalising the stretches around the codepoints that are not NFC boundaries is the same as
- * normalising the whole text. */
+ * something. The result is byte for byte unorm_utf8(text, false, true); tokenizer_nfc.cpp explains
+ * why normalising only the stretches around non-boundary codepoints is equivalent. */
 #pragma once
 #include <string>
 
 namespace rad {
 
-/* Normalise `text` in place. False when it was already NFC and has not been touched. */
+/* Normalise `text` in place. Returns false when it was already NFC and is untouched. */
 bool tok_nfc(std::string& text);
 
 }  /* namespace rad */

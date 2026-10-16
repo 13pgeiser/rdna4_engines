@@ -1,34 +1,23 @@
 // R4D vision-encoder attention: dense, non-causal, head_dim 72, bf16 in and out.
 //
-// This is the same transposed core as the paged prefill kernel -- S^T = K.Q^T, so the wave32
-// column-distributed accumulator gives each lane exactly ONE query row and the softmax state is
-// lane-private. That choice is worth more here than it is at head_dim 256, because it is what
-// removes the QK-C-fragment -> PV-A-fragment transpose of P through LDS: the C fragment of S^T
-// (lane holds query `c`, keys 8h+i) IS the B fragment the PV matmul wants (P^T, key rows,
-// query columns). A formulation that carries that LDS round trip instead does not get past torch
-// SDPA for this shape.
+// Same transposed core as the paged prefill kernel: S^T = K.Q^T, so each lane of the wave32
+// column-distributed accumulator owns one query row and the softmax state is lane-private. The C
+// fragment of S^T (lane holds query c, keys 8h+i) is the B fragment of P.V (P^T), so P never goes
+// through LDS; with that round trip this shape does not beat torch SDPA.
 //
-// head_dim 72 is carried natively as 5 k-tiles of 16 = 80, with dims 72..79 structurally zero:
-// the Q fragment of the last tile is zeroed on the h==1 half, the last 8 columns of every staged
-// K row are zeroed once, and the last tile's output store is taken only by the h==0 half (the
-// h==1 half would run off the end of the 72-element row). 80/72 = 11% of padded WMMA work, the
-// same overhead the 64+16 Triton split pays.
+// head_dim 72 runs as 5 k-tiles of 16 = 80, with dims 72..79 zero: the last Q tile is zeroed on
+// the h==1 half, the last 8 columns of every staged K row are zeroed once, and only the h==0 half
+// stores the last output tile (h==1 would run past the 72-element row). 11% padded WMMA work.
 //
-// What differs from the paged kernel, beyond the geometry:
-//   * K and V are contiguous [tokens, heads, 72] bf16, so there is no block table, no descale and
-//     no fp8 widening -- the whole two-round-trip staging problem that cost the paged kernel 20%
-//     is simply absent. K is fetched 16 bytes per thread; V is transposed into LDS with
-//     global_load_tr_b128 exactly as there.
-//   * Non-causal: no per-row key limit. Only the last key tile is masked, and the branch is
-//     workgroup-uniform rather than per-wave.
-//   * Varlen over segments: one launch covers every image in the batch (grid.z), so the caller
-//     does not split by cu_seqlens and concatenate.
+// Differences from the paged kernel:
+//   * K and V are contiguous [tokens, heads, 72] bf16: no block table, descale or fp8 widening.
+//     K is fetched 16 bytes per thread; V is transposed into LDS with global_load_tr_b128.
+//   * Non-causal: only the last key tile is masked, with a workgroup-uniform branch.
+//   * Varlen: one launch covers every image in the batch (grid.z over cu_seqlens segments).
 //
-// The 16-bit operand format is f16, for the reason in r4d_dt16.h: gfx1201 has no bf16 convert, so
-// the softmax's f32 -> 16-bit pack is 1 instruction per pair instead of ~6. A bf16 operand build
-// stays reachable (V_O_F16 off) because it makes the K/V staging a pure byte copy; it is the
-// slower of the two overall, and the option exists so the trade can be re-checked after a geometry
-// change rather than assumed.
+// Operands are f16 (r4d_dt16.h: gfx1201 has no bf16 convert, so packing P costs 1 instruction per
+// pair instead of ~6). A bf16 build (V_O_F16 off) makes K/V staging a byte copy but is slower
+// overall; it is kept so the trade can be rechecked after a geometry change.
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_common.h"
@@ -43,30 +32,15 @@
 #define V_O_DOT2   16384   // v_dot2_f32_f16 row sum off the packed P
 #define V_O_GPREV 1048576  // next tile's V fetched into registers across the m-tile loop
 #define V_O_LDSB  2097152  // LDS-scoped barrier instead of __syncthreads()
-// GPREK: the same register prefetch for K. Unlike the paged kernel -- which sits at 240 VGPRs and
-// spills any second prefetch, so a wait lands on it immediately and it stops being a prefetch --
-// this geometry runs at ~130, and the K fetch is only three uint4. Without it the tile's global
-// load is issued between the two barriers with only the V LDS stores to cover it.
+// GPREK: register prefetch for K too. The paged kernel (240 VGPRs) would spill it; this one runs at
+// ~130 and the K fetch is three uint4. Without it the K load sits between the barriers with only
+// the V LDS stores to cover it.
 #define V_O_GPREK 4194304
-// MIXFMT: bf16 operands for QK, f16 for PV. The two matmuls have opposite conversion costs. K and
-// V arrive as bf16 and are staged through LDS, so an f16 LDS carries a bf16 -> f16 convert per
-// element (3 VALU per dword) on the staging path; but P is produced in f32 by the softmax every
-// m-tile, and f32 -> bf16 is ~6 VALU of software RTNE against ONE v_cvt_pkrtz_f16_f32. Splitting
-// the formats takes the cheap side of both: K is copied into LDS as raw bf16 with no conversion
-// at all and the query is converted once at load, while V and P stay f16. Accuracy is unchanged --
-// K and V are bf16 sources, so both widenings are exact.
+// MIXFMT: bf16 operands for QK, f16 for PV. Staging bf16 K into an f16 LDS costs a convert per
+// element (3 VALU per dword), while packing f32 P to bf16 costs ~6 VALU vs one v_cvt_pkrtz_f16_f32.
+// So K is copied raw as bf16 (query converted once), and V and P stay f16. Both widenings are exact.
 #define V_O_MIXFMT 8388608
 
-// Pricing probes, wrong on purpose. A probe that changes the DATAFLOW measures nothing (making p
-// constant makes s dead and deletes the QK loop), so each of these deletes work while leaving every
-// value's producer-consumer chain intact. Count the emitted instructions before believing a number.
-#ifndef V_ABL
-#define V_ABL 0
-#endif
-#define V_ABL_EXP    1   // the 8 v_exp_f32 per m-tile become the identity
-#define V_ABL_STAGE  2   // no K/V fetch or LDS store inside the tile loop (barriers kept)
-#define V_ABL_MAX    4   // no running-max test and no lazy rescale
-#define V_ABL_LDS    8   // every K/V fragment read once before the tile loop and reused
 
 // bf16 dword -> 16-bit dword in the target format, with the query scale folded in.
 template<class D, int FOLDQ, int F16>
@@ -90,10 +64,6 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
     constexpr int DOT2  = ((OPT & V_O_DOT2) && F16) ? 1 : 0;
     constexpr int GPREV = (OPT & V_O_GPREV) ? 1 : 0;
     constexpr int LDSB  = (OPT & V_O_LDSB)  ? 1 : 0;
-    constexpr int ABL_EXP   = (V_ABL & V_ABL_EXP)   ? 1 : 0;
-    constexpr int ABL_STAGE = (V_ABL & V_ABL_STAGE) ? 1 : 0;
-    constexpr int ABL_MAX   = (V_ABL & V_ABL_MAX)   ? 1 : 0;
-    constexpr int ABL_LDS   = (V_ABL & V_ABL_LDS)   ? 1 : 0;
     constexpr int GPREK = (OPT & V_O_GPREK) ? 1 : 0;
     constexpr int MIXF  = (OPT & V_O_MIXFMT) ? 1 : 0;
     typedef DT16<F16> D;                       // V and P: the format the softmax packs into
@@ -108,9 +78,8 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
     constexpr int ROWS  = NWARPS * 16 * QB;
     constexpr int MT    = TILE / 16;
     constexpr int NTHR  = NWARPS * 32;
-    // Row strides padded by 8 shorts: 16-byte aligned (a 16-byte LDS access at an 8-byte-aligned
-    // address splits back into two b64) and off the bank period, which puts both fragment reads
-    // at the 8-distinct-bank-group minimum.
+    // Row strides padded by 8 shorts: 16-byte aligned (an 8-byte-aligned 16-byte LDS access splits
+    // into two b64) and off the bank period, so both fragment reads hit 8 distinct bank groups.
     constexpr int KSTR  = HDP + 8;
     constexpr int VSTR  = TILE + 8;
     constexpr int KGRP  = TILE / 8;         // eight-key groups per tile; a power of two
@@ -135,16 +104,14 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
     const int s0 = cu[seq], slen = cu[seq + 1] - s0;
     if (slen <= 0 || qb * ROWS >= slen) return;
 
-    // Elements between consecutive tokens, per operand: heads * HD for a dense [tokens, heads,
-    // 72] tensor, and the projection's row for a column slice of a fused [q|k|v] one.
+    // q_ld, k_ld, v_ld, o_ld are token pitches in elements: heads * HD for a dense tensor, or the
+    // projection row for a column slice of a fused [q|k|v] one.
     const float mul = scale * 1.44269504089f;
 
     // ---- the query fragments, held for the life of the workgroup -----------------------------
-    // A warp owns QB tiles of 16 query rows rather than one. Every K and V fragment read out of
-    // LDS is then consumed by QB WMMAs instead of one, which is the point: at QB = 1 this kernel
-    // issues ten ds_load_b128 per ten WMMAs, and LDS delivers less per cycle than the matrix
-    // units consume. The accumulator is only 8 VGPRs per output tile, so the second query tile is
-    // affordable where it would not be at head_dim 256.
+    // A warp owns QB tiles of 16 query rows, so each K/V fragment read from LDS feeds QB WMMAs. At
+    // QB = 1 there is one ds_load_b128 per WMMA, and LDS delivers less per cycle than the matrix
+    // units consume. The accumulator is 8 VGPRs per output tile, so QB > 1 is affordable here.
     int  qpos[QB];
     bool live[QB];
     fragK qf[QB][NKS];
@@ -156,9 +123,8 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
         const uint16_t* qp = gq + (long)(s0 + qrow) * q_ld + (long)hd * HD;
         #pragma unroll
         for (int t = 0; t < NKS; ++t) {
-            // The padded half of the last k-tile: dims 72..79 do not exist. Zeroing the query
-            // side is not enough on its own -- the K side is zeroed too, because a WMMA
-            // contracts, and NaN * 0 would poison the whole score row rather than one element.
+            // Padded half of the last k-tile (dims 72..79). K is zeroed too: the WMMA contracts,
+            // so a NaN * 0 there would poison the whole score row.
             if (t == NKS - 1 && h == 1) { qf[b][t] = DK::mk(make_uint2(0, 0), make_uint2(0, 0)); continue; }
             const uint4 u = *(const uint4*)(qp + 16 * t + 8 * h);
             qf[b][t] = DK::mk(make_uint2(r4d_vit_qcvt<DK, FOLDQ, MIXF ? 0 : F16>(u.x, mul),
@@ -168,7 +134,7 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
         }
     }
 
-    // The padded lanes of the staging buffers, written once: staging only ever fills dims 0..71.
+    // Zero the padding of the staging buffers once; staging only fills dims 0..71.
     #pragma unroll 1
     for (int i = tid; i < TILE; i += NTHR) *(uint4*)&sK[i * KSTR + HD] = make_uint4(0, 0, 0, 0);
     #pragma unroll 1
@@ -178,14 +144,14 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
     v8f acc[QB][NKS];
     #pragma unroll
     for (int b = 0; b < QB; ++b) {
-        m_ref[b] = ABL_MAX ? 0.0f : -3.0e38f;
-        soff[b]  = ABL_MAX ? PSHIFT : (PSHIFT + 3.0e38f);
+        m_ref[b] = -3.0e38f;
+        soff[b]  = PSHIFT + 3.0e38f;
         l_i[b]   = 0.0f;
         #pragma unroll
         for (int t = 0; t < NKS; ++t) acc[b][t] = (v8f){0, 0, 0, 0, 0, 0, 0, 0};
     }
 
-    // ---- staging, split into a global FETCH (to registers) and an LDS STORE -------------------
+    // ---- staging, split into a global fetch (to registers) and an LDS store -------------------
     const int vj = tid & 7, lgi = tid >> 3;
     uint4 kregA[KPA], kregB[KPB], vreg[VPASS];
 
@@ -232,9 +198,8 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
         }
     };
 
-    // V is read transposed straight out of global memory: the eight lanes of a group each name a
-    // different key row at the same 8 dims, and global_load_tr_b128 hands lane j the column for
-    // dim d0+j across all eight of them -- one contiguous 16-byte LDS row of V^T per lane.
+    // V is read transposed from global: a group's eight lanes name eight key rows at the same 8
+    // dims, and global_load_tr_b128 gives lane j dim d0+j across all eight, one 16-byte row of V^T.
     auto fetchV = [&](int k0) {
         #pragma unroll
         for (int r = 0; r < VPASS; ++r) {
@@ -263,32 +228,22 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
         }
     };
 
-    fragK kb0; frag16 vb0;
-    if (ABL_LDS) {
-        const uint4 u = *(const uint4*)(&sK[c * KSTR] + 8 * h);
-        kb0 = DK::mk(make_uint2(u.x, u.y), make_uint2(u.z, u.w));
-        const uint4 w = *(const uint4*)(&sV[c * VSTR] + 8 * h);
-        vb0 = D::mk(make_uint2(w.x, w.y), make_uint2(w.z, w.w));
-    }
-
     const int ntiles = (slen + TILE - 1) / TILE;
-    if (GPREV && !ABL_STAGE) fetchV(0);
-    if (GPREK && !ABL_STAGE) fetchK(0);
+    if (GPREV) fetchV(0);
+    if (GPREK) fetchK(0);
 
     for (int ti = 0; ti < ntiles; ++ti) {
         const int k0 = ti * TILE;
         const bool tail = (k0 + TILE > slen);
         if (LDSB) lds_barrier(); else __syncthreads();
-        if (!ABL_STAGE) {
-            if (!GPREK) fetchK(k0);
-            if (!GPREV) fetchV(k0);
-            storeV();          // V first: already in registers, so it covers K's load wait
-            storeK();
-        }
+        if (!GPREK) fetchK(k0);
+        if (!GPREV) fetchV(k0);
+        storeV();              // V first: already in registers, so it covers K's load wait
+        storeK();
         if (LDSB) lds_barrier(); else __syncthreads();
-        // Issued here, before the WMMAs below; the wait that consumes it is past the next barrier.
-        if (GPREV && !ABL_STAGE && ti + 1 < ntiles) fetchV(k0 + TILE);
-        if (GPREK && !ABL_STAGE && ti + 1 < ntiles) fetchK(k0 + TILE);
+        // Issued before the WMMAs below; consumed after the next barrier.
+        if (GPREV && ti + 1 < ntiles) fetchV(k0 + TILE);
+        if (GPREK && ti + 1 < ntiles) fetchK(k0 + TILE);
 
         #pragma unroll 1
         for (int mt = 0; mt < MT; ++mt) {
@@ -303,7 +258,6 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
                     #pragma unroll
                     for (int j = 0; j < PF; ++j) {
                         if (g + j < NKS) {
-                            if (ABL_LDS) { kb[j] = kb0; continue; }
                             const uint4 u = *(const uint4*)(krow + 16 * (g + j));
                             kb[j] = DK::mk(make_uint2(u.x, u.y), make_uint2(u.z, u.w));
                         }
@@ -324,8 +278,7 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
                 #pragma unroll
                 for (int e = 0; e < 8; ++e) sc[e] = FOLDQ ? s[b][e] : s[b][e] * mul;
 
-                // Non-causal: only the last tile can hold keys past the end of the segment, and
-                // the test is workgroup-uniform rather than per-row.
+                // Non-causal: only the last tile can hold keys past the segment end.
                 if (tail) {
                     const int kbase = k0 + mt * 16 + 8 * h;
                     #pragma unroll
@@ -335,7 +288,7 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
                 float smax = sc[0];
                 #pragma unroll
                 for (int e = 1; e < 8; ++e) smax = fmaxf(smax, sc[e]);
-                if (!ABL_MAX && wave_any(smax > m_ref[b] + PGROW)) {
+                if (wave_any(smax > m_ref[b] + PGROW)) {
                     const float rmax  = fmaxf(smax, swap16(smax));
                     const float mnew  = fmaxf(fmaxf(m_ref[b], rmax), -3.0e38f);
                     const float alpha = ex2(m_ref[b] - mnew);
@@ -351,7 +304,7 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
                 float pv[8], lsum = 0.0f;
                 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
-                    const float p = ABL_EXP ? (sc[e] + soff[b]) : ex2(sc[e] + soff[b]);
+                    const float p = ex2(sc[e] + soff[b]);
                     pv[e] = p;
                     if (!DOT2) lsum += p;
                 }
@@ -367,8 +320,7 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
                         l_i[b] = __builtin_amdgcn_fdot2(__builtin_bit_cast(v2hf, pw[e]), one,
                                                         l_i[b], false);
                 }
-                // QK left lane (c,h) holding keys 8h+e of query c. That IS the B fragment of
-                // P^T for the PV matmul, so no exchange and no LDS round trip.
+                // Lane (c,h) holds keys 8h+e of query c, which is already the B fragment of P^T.
                 p16[b] = D::mk(make_uint2(pw[0], pw[1]), make_uint2(pw[2], pw[3]));
             }
 
@@ -380,7 +332,6 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
                     #pragma unroll
                     for (int j = 0; j < PF; ++j) {
                         if (g + j < NKS) {
-                            if (ABL_LDS) { vb[j] = vb0; continue; }
                             const uint4 u = *(const uint4*)(vbase + (g + j) * 16 * VSTR);
                             vb[j] = D::mk(make_uint2(u.x, u.y), make_uint2(u.z, u.w));
                         }
@@ -405,8 +356,7 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
         uint16_t* op = go + (long)(s0 + qpos[b]) * o_ld + (long)hd * HD;
         #pragma unroll
         for (int dt = 0; dt < NKS; ++dt) {
-            // The last tile covers dims 64..79; the h==1 half of it is padding and would store
-            // past the end of a 72-element row.
+            // The last tile's h==1 half (dims 72..79) is padding and would store past the row.
             if (dt == NKS - 1 && h == 1) continue;
             uint32_t tw[4];
             #pragma unroll
@@ -419,44 +369,24 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
 }
 
 // ---- entry point -----------------------------------------------------------------------------
-// Two instantiations, chosen on the segment length. Both are the same kernel; they differ only in
-// how many query rows a workgroup owns. ROWS 256 is the argmin from 1K patches upward, but it
-// quantises badly below that -- at 576 patches it leaves a workgroup two thirds dead and reaches
-// only 1.33x the Triton kernel where ROWS 128 reaches 1.76x. The crossover sits between 576 and
-// 1024; 768 is the midpoint and neither instantiation is far off at that length.
-//
-// Every geometry constant is overridable, so a retuned build is one -D away, and V_SPLIT = 0
-// forces every length through the large instantiation.
-#ifndef V_NWARPS
+// Two instantiations of the same kernel, chosen by segment length; they differ in query rows per
+// workgroup. ROWS 256 is fastest from 1K patches up but quantises badly below (at 576 patches a
+// workgroup is two thirds idle: 1.33x Triton vs 1.76x for ROWS 128). The crossover is between 576
+// and 1024; V_SPLIT 768 is the midpoint.
 #define V_NWARPS 16          // large instantiation: ROWS = 256
-#endif
-#ifndef V_TILE
 #define V_TILE 128
-#endif
-#ifndef V_QB
 #define V_QB 1
-#endif
-#ifndef V_SNWARPS
 #define V_SNWARPS 8          // small instantiation: ROWS = 128
-#endif
-#ifndef V_STILE
 #define V_STILE 64
-#endif
-#ifndef V_SQB
 #define V_SQB 1
-#endif
-#ifndef V_SPLIT
 #define V_SPLIT 768
-#endif
-// F16 | FOLDQ | PF4 | SGB | DOT2 | GPREV | LDSB | GPREK. MIXFMT is off: it performs identically
-// here, and one operand format with one WMMA variant is the simpler thing to keep.
-#ifndef V_OPT
+// F16 | FOLDQ | PF4 | SGB | DOT2 | GPREV | LDSB | GPREK. MIXFMT is off: same speed, and one
+// operand format is simpler.
 #define V_OPT 7362569
-#endif
 
-// q, k, v, o are [total_tokens, heads, 72] contiguous bf16; cu_seqlens is [num_seqs + 1] int32 and
-// bounds one image (or one attention window) per entry, so a whole batch is one launch. max_seqlen
-// is the host-side bound on those lengths -- the kernel reads the device-side cu_seqlens itself.
+// q, k, v, o are [total_tokens, heads, 72] contiguous bf16; cu_seqlens is [num_seqs + 1] int32, one
+// image (or attention window) per segment. max_seqlen is a host-side bound on the lengths; the
+// kernel reads the device-side cu_seqlens.
 extern "C" int r4d_attn_vit_h72_bf16(const void* q, const void* k, const void* v, void* o,
                                      const void* cu_seqlens, int num_seqs, int max_seqlen,
                                      int heads, int head_dim, float scale, void* stream)
@@ -466,9 +396,9 @@ extern "C" int r4d_attn_vit_h72_bf16(const void* q, const void* k, const void* v
                                          head_dim, scale, ld, ld, ld, ld, stream);
 }
 
-// The same, each operand at its own token pitch in elements -- a column slice of a fused [q|k|v]
-// projection reads at the projection's row. Every pitch and every head offset stays a multiple of
-// 8 elements, which is what the 16-byte K and V fetches need.
+// As above, each operand at its own token pitch in elements (e.g. a column slice of a fused
+// [q|k|v] projection). Pitches and head offsets must be multiples of 8 elements for the 16-byte
+// K and V fetches.
 extern "C" int r4d_attn_vit_h72_strided_bf16(const void* q, const void* k, const void* v, void* o,
                                              const void* cu_seqlens, int num_seqs, int max_seqlen,
                                              int heads, int head_dim, float scale, int q_ld,
@@ -489,8 +419,8 @@ extern "C" int r4d_attn_vit_h72_strided_bf16(const void* q, const void* k, const
                            (const int*)cu_seqlens, heads, scale, q_ld, k_ld, v_ld, o_ld);       \
     } while (0)
 
-    if (V_SPLIT > 0 && max_seqlen < V_SPLIT) V_LAUNCH(V_SNWARPS, V_STILE, V_SQB);
-    else                                     V_LAUNCH(V_NWARPS,  V_TILE,  V_QB);
+    if (max_seqlen < V_SPLIT) V_LAUNCH(V_SNWARPS, V_STILE, V_SQB);
+    else                      V_LAUNCH(V_NWARPS,  V_TILE,  V_QB);
 #undef V_LAUNCH
 
     hipError_t e = hipGetLastError();
@@ -498,8 +428,7 @@ extern "C" int r4d_attn_vit_h72_strided_bf16(const void* q, const void* k, const
     return 0;
 }
 
-// The geometry this build is compiled for: head_dim, the two query-block heights, and the length
-// at which the launcher switches between them.
+// Compiled geometry: head_dim, the two query-block heights, and the switch length.
 extern "C" void r4d_attn_vit_dims(int* head_dim, int* rows_large, int* rows_small, int* split) {
     if (head_dim)    *head_dim    = 72;
     if (rows_large)  *rows_large  = V_NWARPS * 16 * V_QB;
@@ -508,10 +437,6 @@ extern "C" void r4d_attn_vit_dims(int* head_dim, int* rows_large, int* rows_smal
 }
 
 // ============================================================== the plugin ABI entry points
-//
-// The operand reader is r4d_attn_args.h, a header this kernel family shares because the paged
-// geometries implement one op and take one operand list. See libr4d/r4d_args.h for why there is no
-// adapter directory between the core and these launches.
 
 /* ------------------------------------------------------------------ dense (vision) */
 
@@ -526,25 +451,21 @@ extern "C" int r4d_rad_attn_vit(const RadArgs* a, RadStream s) {
     if (!q || !k || !v || !cu || !o) return R4D_NO(RAD_E_INVAL);
     if (!r4d_contig(cu)) return R4D_NO(RAD_E_STRIDE);
 
-    /* [tokens, heads, 72] dense, or [tokens, heads * 72] read at its own row pitch -- a column
-     * slice of a fused projection. The width of a row is the operand's; its pitch is what the
-     * kernel steps by. */
+    /* [tokens, heads, 72] dense, or [tokens, heads * 72] at its own row pitch (a column slice of
+     * a fused projection). */
     const long long head_dim = r4d_geti_or(a, "head_dim", q->rank == 3 ? q->shape[2] : 72);
     if (head_dim != 72) return R4D_NO(RAD_E_SHAPE);
-    /* Every key of a segment is attended to; a window would be ignored, so it is refused. */
-    if (r4d_geti_or(a, "window", 0) != 0) return R4D_NO(RAD_E_INVAL);
-    auto rows = [&](const RadTensor* t, long long* n_tok, long long* n_head, long long* ld) {
-        long long width = 1;
-        for (uint32_t i = 1; i < t->rank; ++i) width *= t->shape[i];
-        if (t->rank < 2 || width % head_dim) return false;
-        *n_head = width / head_dim;
-        *ld = r4d_rows_pitch(t, width, n_tok);
-        return *ld >= 0;
-    };
+    /* The kernel attends every key of a segment, its bounds read as they stand, so a window,
+     * blocks or a cu_seqlens in finer units are refused. */
+    if (r4d_geti_or(a, "window", 0) != 0 || r4d_geti_or(a, "block", 0) != 0 ||
+        r4d_geti_or(a, "cu_div", 1) != 1)
+        return R4D_NO(RAD_E_INVAL);
     long long total = 0, heads = 0, q_ld = 0;
     long long tk = 0, hk = 0, k_ld = 0, tv = 0, hv = 0, v_ld = 0, to = 0, ho = 0, o_ld = 0;
-    if (!rows(q, &total, &heads, &q_ld) || !rows(k, &tk, &hk, &k_ld) ||
-        !rows(v, &tv, &hv, &v_ld) || !rows(o, &to, &ho, &o_ld))
+    if (!r4d_head_rows(q, head_dim, &total, &heads, &q_ld) ||
+        !r4d_head_rows(k, head_dim, &tk, &hk, &k_ld) ||
+        !r4d_head_rows(v, head_dim, &tv, &hv, &v_ld) ||
+        !r4d_head_rows(o, head_dim, &to, &ho, &o_ld))
         return R4D_NO(RAD_E_STRIDE);
     if (hk != heads || hv != heads || ho != heads) return R4D_NO(RAD_E_SHAPE);
     if (tk < total || tv < total || to < total) return R4D_NO(RAD_E_SHAPE);
@@ -552,9 +473,8 @@ extern "C" int r4d_rad_attn_vit(const RadArgs* a, RadStream s) {
 
     const int num_seqs = (int)(cu->shape[0] - 1);
 
-    /* max_seqlen selects the query-block height and is a bound, not a length: the kernel reads the
-     * device-side cu_seqlens itself. Absent, the total token count is a valid bound and picks the
-     * tall instantiation -- a speed choice, never a correctness one. */
+    /* max_seqlen is a bound that selects the query-block height (speed only); the kernel reads
+     * device-side cu_seqlens. Defaults to the total token count. */
     long long msl = r4d_geti_or(a, "max_seqlen", 0);
     if (msl <= 0) msl = total;
 
@@ -564,5 +484,6 @@ extern "C" int r4d_rad_attn_vit(const RadArgs* a, RadStream s) {
                                                 num_seqs, (int)msl, (int)heads, (int)head_dim,
                                                 scale, (int)q_ld, (int)k_ld, (int)v_ld, (int)o_ld,
                                                 s);
-    return e == 0 ? RAD_OK : R4D_NO(e == -3 ? RAD_E_STRIDE : RAD_E_DEVICE);
+    if (e == 0) return RAD_OK;
+    return R4D_NO(e == -3 ? RAD_E_STRIDE : e <= -100 ? RAD_E_DEVICE : RAD_E_SHAPE);
 }

@@ -13,35 +13,33 @@
  * spellings and the turn terminators; under a fixtures root they are found as
  * Qwen3.8-Flash-Next (or Qwen3.8-27B-FP8), Qwen3.6-35B-A3B-FP8 and MiniCPM5-2B.
  *
- * WHAT THE CTEST SUITE CANNOT DO, and this does. tests/chatparse_test cuts replies at synthetic
- * boundaries because the tokenizers are too big to commit. Here every reply is tokenised by the
- * model's own tokenizer and decoded token by token through the same Detokenizer, with the same
- * preserved control tokens, as the server -- so the parser is fed the pieces it is fed in
- * production, split exactly where the model's tokens split them. On every reply:
+ * Unlike tests/chatparse_test, which cuts replies at synthetic boundaries (the tokenizers are too
+ * big to commit), every reply here is tokenised by the model's own tokenizer and decoded token by
+ * token through the server's Detokenizer with the same preserved control tokens, so the parser
+ * sees production pieces. Per reply it checks:
  *
  *   * the differential verdict against the legacy path (tests/legacy/, "old" in the report;
  *     chatdiff::judge);
- *   * the streaming contract at the token boundaries (chatdiff::check_stream);
- *   * the legacy path's own stream -- the accumulated reply re-parsed at every token, diffed
- *     against what it had sent -- against its buffered answer, counting where the two disagree.
+ *   * the streaming contract at token boundaries (chatdiff::check_stream);
+ *   * the legacy path's own stream (the reply re-parsed at every token, diffed against what it
+ *     sent) against its buffered answer.
  *
- * And the cost: a long reply streamed token by token through the SSE layer, legacy ("old")
- * against streaming ("new"), and the streaming parser alone at sizes the legacy path cannot reach
- * in reasonable time.
- *
- * And the whole host cost of a streamed token, by component: the decoder, the server's text
- * bookkeeping, the parser, the reader bridge, the chunk JSON, and the tool-call grammar the
- * sampler drives (accept_token, and fill_mask once triggered) in prose, call structure, string
- * values and typed values -- with every SSE event held to nlohmann's own serialisation of it.
+ * It also times a long reply streamed through the SSE layer, legacy ("old") against streaming
+ * ("new"), and the streaming parser alone at sizes the legacy path cannot reach; and the host cost
+ * of one streamed token by component (decoder, server text bookkeeping, parser, reader bridge,
+ * chunk JSON, and the tool-call grammar's accept_token / fill_mask), with every SSE event checked
+ * against nlohmann's serialisation.
  *
  * Exit status is non-zero when any reply breaks the contract or a verdict is not allowed. */
 #include "chatdiff.h"
+#include "iface.h"
 #include "sample/grammar.h"
 #include "sample/vocab_view.h"
 #include "server/adapters.h"
 #include "server/json_partial.h"
 #include "server/oai.h"
 #include "text/chatfmt.h"
+#include "text/token_view.h"
 #include "text/tokenizer.h"
 
 #include <nlohmann/json.hpp>
@@ -82,13 +80,17 @@ double since(clk::time_point t0) {
     return std::chrono::duration<double>(clk::now() - t0).count();
 }
 
-std::vector<size_t> sizes(const char* s) {
+/* "a,b,c" as byte counts, each a whole number >= 1; exits 2 naming `flag` on anything else. */
+std::vector<size_t> sizes(const char* flag, const char* s) {
     std::vector<size_t> v;
-    for (const char* p = s; *p;) {
-        v.push_back((size_t)std::strtoull(p, nullptr, 10));
-        const char* c = std::strchr(p, ',');
-        if (!c) break;
-        p = c + 1;
+    const std::string all = s;
+    size_t at = 0;
+    while (at <= all.size()) {
+        size_t c = all.find(',', at);
+        if (c == std::string::npos) c = all.size();
+        v.push_back((size_t)rad_flag_int("rad-chatparse", flag, all.substr(at, c - at).c_str(), 1,
+                                         INT64_MAX));
+        at = c + 1;
     }
     return v;
 }
@@ -109,8 +111,8 @@ struct Tok {
         return tok.init(vocab);
     }
 
-    /* Tokenise as the model would have written the reply -- control tokens as themselves -- and
-     * decode it back one token at a time the way the server does. */
+    /* Tokenise as the model would have written the reply (control tokens as themselves) and
+     * decode it one token at a time as the server does. */
     std::vector<std::string> pieces(const std::string& text,
                                     const std::vector<std::string>& preserved) const {
         std::vector<int32_t> ids;
@@ -170,11 +172,9 @@ void check_reply(const Bench& b, const Tok& t, const std::string& written, const
     ty->bytes += text.size();
     if (text != written) {
         ++ty->decoder_changed;
-        /* The decoder suppresses control tokens by design, and a reply may hold ones the format
-         * does not use. What must never go missing is a marker the format is MADE of -- that is
-         * the failure that turns a call into prose -- so a reply that lost one is shown. The turn
-         * terminators are control tokens the decoder never renders, and a marker overlapping one
-         * (`>` inside `<|im_end|>`) is not a marker the reply wrote. */
+        /* The decoder suppresses control tokens by design. A lost format marker, though, turns a
+         * call into prose, so such replies are shown. Turn terminators are never rendered, and a
+         * marker overlapping one (`>` inside `<|im_end|>`) does not count. */
         std::vector<std::pair<size_t, size_t>> terms;
         for (const std::string& t : b.model().terminators)
             for (size_t at = written.find(t); at != std::string::npos; at = written.find(t, at + 1))
@@ -287,36 +287,6 @@ Timing time_old(const Bench& b, const std::vector<std::string>& pieces) {
 
 /* ------------------------------------------------------------------ the per-token breakdown */
 
-/* The sampler's view of the real vocabulary, built as core/engine_bringup.cpp builds it: pieces
- * are what the decoder chain writes to the output stream, special tokens rendered. */
-class RealView final : public VocabView {
-public:
-    int init(std::shared_ptr<const Vocab> v) {
-        v_ = std::move(v);
-        RAD_TRY(tok_.init(v_));
-        pieces_.resize((size_t)v_->n_tokens());
-        for (int32_t i = 0; i < v_->n_tokens(); ++i)
-            pieces_[(size_t)i] = tok_.piece(i, /*render_special=*/true);
-        return RAD_OK;
-    }
-    int32_t n_tokens() const override { return v_ ? v_->n_tokens() : 0; }
-    const std::string& token_piece(int32_t id) const override {
-        static const std::string kEmpty;
-        return (id >= 0 && (size_t)id < pieces_.size()) ? pieces_[(size_t)id] : kEmpty;
-    }
-    bool is_eog(int32_t id) const override { return v_ && v_->is_eog(id); }
-    int tokenize(const std::string& s, std::vector<int32_t>* out) const override {
-        return out ? tok_.encode(s, *out, false, false) : RAD_E_INVAL;
-    }
-    int tokenize_special(const std::string& s, std::vector<int32_t>* out) const override {
-        return out ? tok_.encode(s, *out, false, true) : RAD_E_INVAL;
-    }
-
-private:
-    std::shared_ptr<const Vocab> v_;
-    Tokenizer                    tok_;
-    std::vector<std::string>     pieces_;
-};
 
 double median(std::vector<double> v) {
     std::sort(v.begin(), v.end());
@@ -333,9 +303,8 @@ std::string per(const std::vector<double>& secs, size_t units) {
     return b;
 }
 
-/* Every SSE event in `out` must be exactly what nlohmann writes for the value it carries: the
- * payload parsed and dumped again gives the same bytes. A chunk writer that is not a DOM is held
- * to the DOM's output this way. Returns the events that are not. */
+/* Every SSE event in `out` must round-trip byte for byte through nlohmann parse and dump, which
+ * holds the non-DOM chunk writer to the DOM's output. Returns the events that do not. */
 size_t sse_not_canonical(const std::string& out, size_t* events) {
     size_t bad = 0;
     for (size_t at = 0; at < out.size();) {
@@ -352,13 +321,11 @@ size_t sse_not_canonical(const std::string& out, size_t* events) {
     return bad;
 }
 
-/* THE HOST COST OF ONE STREAMED TOKEN, by component, on the real tokenizer: the decoder, the
- * server's text bookkeeping, the reply reader, the chunk JSON, and the tool-call grammar the
- * sampler runs (accept_token, and fill_mask once it has triggered). Each component runs over the
- * whole reply on its own, `reps` times; the medians are reported, with the spread. Returns the
- * contract violations it saw: chunks that are not canonical JSON, or a grammar that refused the
- * reply. */
-int breakdown(const Bench& b, const Tok& tk, const RealView& view, int reps) {
+/* Host cost of one streamed token by component, on the real tokenizer: decoder, server text
+ * bookkeeping, reply reader, chunk JSON, and the tool-call grammar (accept_token, and fill_mask once
+ * triggered). Each runs over the whole reply `reps` times; medians and spread are reported. Returns
+ * the contract violations: non-canonical chunk JSON, or a grammar that refused the reply. */
+int breakdown(const Bench& b, const Tok& tk, const TokenView& view, int reps) {
     const Model& m = b.model();
     /* A long write with string values, and calls with integer and boolean values. */
     std::string text = long_reply(m, 262144);
@@ -407,8 +374,8 @@ int breakdown(const Bench& b, const Tok& tk, const RealView& view, int reps) {
         }
         t_detok.push_back(since(c0));
 
-        /* The server's side of a token: the choice's text grows, and the stable prefix -- a
-         * UTF-8 boundary, no half escape -- is what goes to the stream. */
+        /* Server side of a token: the choice text grows, and its stable prefix (UTF-8 boundary,
+         * no half escape) is streamed. */
         c0 = clk::now();
         {
             std::string acc;
@@ -478,8 +445,8 @@ int breakdown(const Bench& b, const Tok& tk, const RealView& view, int reps) {
     std::printf("     %zu SSE events, %zu not canonical\n", events, bad);
     int violations = (int)bad;
 
-    /* The grammar, as the server builds it for this request and the sampler drives it, one token
-     * at a time: a mask for every position once the grammar constrains, then the token. */
+    /* The grammar as the server builds it and the sampler drives it: once it constrains, a mask
+     * per position, then the token. */
     ChatGrammarRequest gq;
     gq.tools = &agent_tools();
     gq.generation_prompt = b.prompt().generation_prompt;
@@ -572,13 +539,13 @@ int main(int argc, char** argv) {
             if (eq == std::string::npos) { std::fprintf(stderr, "--model name=dir\n"); return 2; }
             want.push_back({ v.substr(0, eq), v.substr(eq + 1) });
         } else if (a == "--fuzz" && i + 1 < argc) {
-            fuzz = std::atoi(argv[++i]);
+            fuzz = (int)rad_flag_int("rad-chatparse", "--fuzz", argv[++i], 0, INT32_MAX);
         } else if (a == "--long" && i + 1 < argc) {
-            old_sizes = sizes(argv[++i]);
+            old_sizes = sizes("--long", argv[++i]);
         } else if (a == "--reps" && i + 1 < argc) {
-            reps = std::max(1, std::atoi(argv[++i]));
+            reps = (int)rad_flag_int("rad-chatparse", "--reps", argv[++i], 1, INT32_MAX);
         } else if (a == "--new-long" && i + 1 < argc) {
-            new_sizes = sizes(argv[++i]);
+            new_sizes = sizes("--new-long", argv[++i]);
         } else if (a[0] != '-') {
             const std::pair<const char*, std::vector<const char*>> layout[] = {
                 { "qwen3.8", { "Qwen3.8-Flash-Next", "Qwen3.8-27B-FP8" } },
@@ -689,7 +656,7 @@ int main(int argc, char** argv) {
                         nw.parser / text.size() * 1e9, nw.parser / p.size() * 1e6);
         }
 
-        RealView view;
+        TokenView view;
         if (view.init(tk.vocab) < 0) return 1;
         violations += breakdown(b, tk, view, reps);
     }

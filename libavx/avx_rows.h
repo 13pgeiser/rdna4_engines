@@ -1,13 +1,11 @@
-/* avx_rows.h -- the quantised embedding gather's two halves: the row source, compiled once at the
- * baseline, and the row decode, compiled per ISA level.
+/* avx_rows.h -- the quantised embedding gather, split in two: the row source, compiled once at
+ * the baseline, and the row decode, compiled per ISA level.
  *
- * embed_lookup_q over an E4M3 table into bf16 is a gather of rows that are, most of the time, not in
- * memory at all: the n-gram table it exists for is tens of gigabytes in a container that is mapped
- * and never loaded. Getting the bytes is the whole cost and is the same work at every ISA level --
- * a row cache every thread shares, direct reads for its misses, a reader thread that runs a step
- * ahead -- so that half is avx_ngram.cpp, compiled baseline, with one row cache for the process
- * whatever level runs. Turning a row's codes into bf16 is the half that differs per level, so the
- * level's kernel hands its own decoder in. */
+ * embed_lookup_q over an E4M3 table into bf16 serves the n-gram table, tens of gigabytes in a
+ * mapped container that is never loaded, so fetching the rows is the whole cost. That half (a
+ * shared row cache, direct reads for misses, a reader thread one step ahead) is the same at every
+ * level and lives in avx_ngram.cpp, with one row cache per process. Decoding codes to bf16 differs
+ * per level, so each level's kernel passes its own decoder. */
 #ifndef RAD_AVX_ROWS_H
 #define RAD_AVX_ROWS_H
 
@@ -47,13 +45,12 @@ int row_gather(const RowGather& g, RowDecode decode);
 
 }  /* namespace avx */
 
-/* What the table must be: the E4M3 plane with ONE scale, or a plain bf16 one, stored as it is
- * (avx_ngram.cpp). */
+/* The table must be an E4M3 plane with one scale, or plain bf16, stored as is (avx_ngram.cpp). */
 extern "C" int avx_layout_ngram(const RadParam*, int, int, const RadEncoding*, const int*,
                                 const RadTensor*, int, RadLayout*);
 
-/* Whether this process can read the table's rows: refused, with the reason on stderr, where it may
- * not make an io_uring ring (avx_ngram.cpp). */
+/* Refuses, with the reason on stderr, when this process may not create an io_uring ring and so
+ * cannot read the table's rows (avx_ngram.cpp). */
 extern "C" int avx_init_ngram(const RadParam*, int, int, int, void**);
 
 #endif /* RAD_AVX_ROWS_H */

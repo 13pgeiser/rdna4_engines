@@ -1,33 +1,25 @@
 #!/bin/sh
-# Prefill throughput against a server that is ALREADY RUNNING, and nothing else.
+# Prefill throughput of the server already running on $P.
 #
-# WHY IT IS NOT A SERVE HARNESS. Prefill speed is a property of the deployment's flags -- the
-# chunk, the tensor-parallel width, the expert/cache split -- so a harness that brings its own
-# server measures the flags it chose rather than the ones in use. This one attaches to whatever is
-# on $P and reports what that server does; use scripts/fnserve.sh to put one there.
+# Prefill speed depends on the deployment's flags (chunk, tensor-parallel width, expert/cache
+# split), so this attaches to a running server instead of starting its own; scripts/fnserve.sh
+# starts one.
 #
-# THE PROMPT IS PROSE, NOT RANDOM WORDS. A generated word of random letters is three tokens rather
-# than one, so a token target computed from a word count is off by a factor of three -- and, worse,
-# a stream of tokens the model has never seen together routes differently through a mixture of
-# experts than text does, which is the thing a prefill measurement is mostly measuring. The corpus
-# is the repository's own markdown, repeated to length.
+# The prompt is the repository's markdown, repeated to length. Random-letter words tokenize at
+# about three tokens each and route through the experts differently from real text, which skews a
+# MoE prefill measurement.
 #
-# THE PREFIX CACHE MAKES A SECOND REP FREE, so every rep opens with a different nonce. A cache
-# matches from the START of the prompt, so a leading nonce invalidates the whole match while a
-# trailing one would leave every block but the last a hit -- and the run would report a prefill
-# rate for work that was never done. `cached_tokens` is printed so that this is visible rather
-# than assumed.
+# Every rep starts with a different nonce so the prefix cache cannot serve it: the cache matches
+# from the start of the prompt, so a trailing nonce would leave all but the last block a hit.
+# `cached_tokens` is printed to show this.
 #
-# THE CARD'S CLOCK IS PART OF THE MEASUREMENT. Prefill drifts downward over a sustained run as the
-# part heats, monotonically and across runs as well as within them, so a single number is not
-# comparable across runs taken at different times. Temperature and sclk are printed beside every
-# rep for the same reason a bench prints its build id: without them a thermostat reads as a
-# regression.
+# Prefill slows as the card heats, within and across runs, so temperature and sclk are printed
+# beside every rep; a number without them is not comparable across runs.
 #
 #   P=8100 N=8000 REPS=3 scripts/fnpf.sh
 #
-# N is a token TARGET reached through an assumed bytes-per-token; the rate is computed from the
-# `prompt_tokens` the server reports, so the approximation does not enter the answer.
+# N is a token target reached through an assumed bytes-per-token; the rate uses the server's
+# reported `prompt_tokens`, so the approximation does not affect it.
 P="${P:-8100}"
 H="${H:-127.0.0.1}"
 N="${N:-8000}"
@@ -37,10 +29,9 @@ ROOT="${ROOT:-$(dirname "$0")/..}"
 URL="http://$H:$P"
 CORPUS="${CORPUS:-/dev/shm/fnpf-corpus.txt}"
 
-# One corpus, built once and reused, so successive runs prefill the same bytes. GROWN when a
-# later run wants more than the last one did: `head -c` on a corpus that is too short silently
-# returns what there is, so a sweep that raised N would report a rate for a prompt it did not
-# send -- and the prompt_tokens column makes that visible only to a reader who was looking.
+# One corpus, built once and reused, so successive runs prefill the same bytes. It is grown when a
+# run needs more: `head -c` on a short corpus silently returns less, and the run would report a
+# rate for a shorter prompt than intended.
 want=$((N * BPT + 4096))
 if [ "$(wc -c < "$CORPUS" 2>/dev/null || echo 0)" -lt "$want" ]; then
     : > "$CORPUS"

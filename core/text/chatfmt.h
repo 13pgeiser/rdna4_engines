@@ -1,59 +1,51 @@
-/* chatfmt.h -- how a model spells a turn: reasoning, tool calls, arguments. As DATA.
+/* chatfmt.h -- how a model spells a turn (reasoning, tool calls, arguments), as data.
  *
- * Everything the engine knows about a model's reply syntax is in one plain struct, ChatFormat,
- * and everything that depends on that syntax is DERIVED from it: the streaming reply parser
- * (chatparse.h), the lazy tool-call grammar and the literal words that trigger it (below), and the
- * tokens the decoder must render as text so the parser can see the structure. A new model is
- * supported by stating its format once.
+ * Everything the engine knows about a model's reply syntax is in one struct, ChatFormat, and
+ * everything that depends on it is derived from it: the streaming reply parser (chatparse.h), the
+ * lazy tool-call grammar and its trigger words, and the tokens the decoder must render as text so
+ * the parser can see the structure.
  *
- * TWO PRODUCERS, IN ORDER OF PRECEDENCE.
+ * Two producers, in order of precedence:
  *
  *   1. The architecture plugin, through the optional `rad_arch_chat_format` export
- *      (abi/rad_builder.h). A plugin that knows its model's syntax says so and nothing is guessed.
+ *      (abi/rad_builder.h).
  *   2. Analysis of the chat template. llama.cpp's differential analyser renders the template with
  *      and without a reasoning block, a call and its arguments, and diffs the renders to find the
- *      delimiters (vendor/llama/common/chat-diff-analyzer.cpp). Its derived MARKERS are read here;
+ *      delimiters (vendor/llama/common/chat-diff-analyzer.cpp). Its derived markers are read here;
  *      its PEG parser is not used.
  *
- * If neither yields a format the parser can run, the model still chats -- the reply is content --
- * but a request that sends tools is refused, naming why. There is no second parser to fall back
- * to: a reply format the engine cannot describe is a reply it cannot read, and saying so at
- * admission is better than returning a call as prose.
+ * If neither yields a format the parser can run, the model still chats (the reply is content) but
+ * a request with tools is refused, naming why. There is no fallback parser.
  *
- * THE FAMILY THIS DESCRIBES is the tagged one, which covers every model this engine serves:
+ * Tagged family:
  *
  *   Qwen3.6 / Qwen3.8    <tool_call>\n<function=NAME>\n<parameter=ARG>\nVALUE\n</parameter>\n
  *                        </function>\n</tool_call>
  *   MiniCPM5             <function name="NAME"><param name="ARG">VALUE</param></function>
  *
- * A call's name is written between a prefix and a suffix and it ends with its own close; each
- * argument is a name between a prefix and a suffix and a value ending at its own suffix; calls may
- * be wrapped one by one. Arguments are typed by the tool's JSON schema: a string-typed argument is
- * the raw text (optionally CDATA-wrapped), any other type is JSON, and text that does not parse as
- * JSON is taken raw -- a model writing into an XML tag writes Python as often as JSON.
+ * A call's name sits between a prefix and a suffix and the call ends with its own close; each
+ * argument is a name between a prefix and a suffix, then a value ending at its own suffix; calls
+ * may be wrapped one by one. Arguments are typed by the tool's JSON schema: a string-typed one is
+ * raw text (optionally CDATA-wrapped), any other type is JSON, and text that does not parse as
+ * JSON is taken raw, since models often write Python literals into a tag.
  *
- * THE OBJECT FAMILY writes a call as its name and one object holding the arguments
- * (ChatArgs::Object):
+ * Object family (ChatArgs::Object): a call is its name and one object holding the arguments.
  *
  *   Gemma 4              <|tool_call>call:NAME{key:<|"|>text<|"|>,n:3}<tool_call|>
  *
- * The object is JSON or a dialect of it -- strings between two declared delimiters with their
- * text verbatim, keys written bare -- and the arguments a client receives are that object in
- * JSON. Here the values carry their own types, so no schema is consulted to read them; a bare
- * word that is no JSON literal or number is read as a string, as a typed argument that is not
- * JSON is in the tagged family.
+ * The object is JSON or a dialect of it (strings verbatim between two declared delimiters, bare
+ * keys), and the client receives it as JSON. Values carry their own types, so no schema is
+ * consulted; a bare word that is not a JSON literal or number is read as a string.
  *
- * The analyser also recognises formats outside these families (a JSON object per call with its
- * name inside it, call ids). For those chat_format_from_template keeps the reasoning split and
- * names why tool calls are refused, and a model that needs one gets it by adding the shape to the
- * parser, not by a fallback. */
+ * The analyser also recognises formats outside these families (a JSON object per call with the
+ * name inside it, call ids). For those, chat_format_from_template keeps the reasoning split and
+ * names why tool calls are refused; supporting one means adding the shape to the parser. */
 #pragma once
 #include "rad_internal.h"
 
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstdint>
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -70,10 +62,10 @@ enum class ChatValue : uint32_t {
 
 /* Whether the reply starts inside a reasoning block. The numbering is the ABI's. */
 enum class ChatThink : uint32_t {
-    /* Search the rendered generation prompt for `reasoning_open`: whatever follows its first
-     * occurrence is the start of the reply's own text. A template that opens the block for the
-     * model (Qwen writes "<think>\n" at the end of the prompt) and one that closes it again when
-     * thinking is off ("<think>\n\n</think>\n\n") are both read correctly this way. */
+    /* Search the rendered generation prompt for `reasoning_open`; what follows its first
+     * occurrence is the start of the reply's text. Handles both a template that opens the block
+     * for the model (Qwen ends the prompt with "<think>\n") and one that closes it again when
+     * thinking is off ("<think>\n\n</think>\n\n"). */
     FromPrompt = 0,
     Always     = 1,  /* the reply is inside a reasoning block from its first byte */
     Never      = 2,  /* the model opens its own block, if any */
@@ -95,35 +87,34 @@ struct ChatFormat {
      * and the close ends it. */
     std::string reasoning_open;
     std::string reasoning_close;
-    /* Literals that end an UNCLOSED block when a call starts there. A model that forgets to close
-     * its reasoning and goes straight to a call must not have the call swallowed as reasoning.
-     * Must name the call opener (`call_open`) when non-empty. */
+    /* Literals that end an unclosed block when a call starts there, so a model that skips the
+     * close and goes straight to a call does not have the call read as reasoning. When non-empty,
+     * must include the call opener (`call_open`). */
     std::vector<std::string> reasoning_breaks;
     ChatThink   reasoning_in_prompt = ChatThink::FromPrompt;
-    /* A block may also open later in the reply -- after the answer, between calls -- and is read
-     * as reasoning there; a close with no block open is dropped. Gemma 4 writes an empty block
-     * after its answer now and then, and a lone close. Needs `reasoning_open`. */
+    /* A block may also open later in the reply (after the answer, between calls) and is read as
+     * reasoning there; a close with no block open is dropped. Gemma 4 sometimes writes an empty
+     * block after its answer, or a lone close. Needs `reasoning_open`. */
     bool        reasoning_anywhere = false;
 
     /* ------------------------------------------------------------------ tool calls
      * `name_prefix` is what opens a call (after `call_open`, when there is one). Empty means the
      * format has no tool calls. */
-    std::string section_open, section_close;  /* around ALL calls; not read yet, must be empty */
-    /* Between two calls beyond whitespace. Tagged calls are self-delimiting, so this is empty;
-     * a JSON-array format would say ", ". Not read yet, must be empty. */
+    std::string section_open, section_close;  /* around all calls; not read yet, must be empty */
+    /* Between two calls, beyond whitespace (a JSON-array format would use ", "). Tagged calls are
+     * self-delimiting. Not read yet, must be empty. */
     std::string call_separator;
-    /* Around EACH call: "<tool_call>\n", "</tool_call>". When set, a call written without it --
-     * name_prefix alone -- is still read as a call, leniently (chatparse.h). */
+    /* Around each call: "<tool_call>\n", "</tool_call>". When set, a call written without it
+     * (name_prefix alone) is still read as a call (chatparse.h). */
     std::string call_open, call_close;
-    /* "<function=", ">\n". In the object family name_suffix may be empty: the name then ends
-     * where the object begins, at its `{`. */
+    /* "<function=", ">\n". In the object family name_suffix may be empty; the name then ends at
+     * the object's `{`. */
     std::string name_prefix, name_suffix;
     std::string call_end;                     /* "</function>\n"; may be empty for an object */
 
-    /* How the arguments are written. Object: the arg_* fields below are empty, and these three
-     * describe the object's dialect -- a string delimiter besides JSON's `"`, between which the
-     * text is verbatim ("<|\"|>" twice for Gemma 4; empty for JSON strings only), and whether a
-     * key may be written bare. */
+    /* How the arguments are written. For Object the arg_* fields below are empty and these three
+     * describe the dialect: a string delimiter besides JSON's `"` with verbatim text between
+     * ("<|\"|>" twice for Gemma 4; empty for JSON strings only), and whether keys may be bare. */
     ChatArgs    args_form = ChatArgs::Tagged;
     std::string object_string_open, object_string_close;
     bool        object_bare_keys = false;
@@ -135,13 +126,13 @@ struct ChatFormat {
 
     ChatValue   string_value = ChatValue::Cdata;  /* a string-typed argument: Raw or Cdata */
     ChatValue   other_value  = ChatValue::Json;   /* any other type: Json */
-    /* One newline at each end of a value is punctuation: the template writes the value on its own
-     * lines, and exactly the first and last newline belong to the tags. A tag that ends with its
-     * newline (Qwen's `>\n`) has written the first one already, and the value starts after it. */
+    /* One newline at each end of a value belongs to the tags, since the template writes the
+     * value on its own lines. A tag that ends with its newline (Qwen's `>\n`) has already
+     * consumed the first one. */
     bool        value_newlines = true;
 
-    /* The literal words that start constrained decoding of a call. Empty means no lazy grammar:
-     * the reply is unconstrained and the parser reads whatever arrives. */
+    /* Literal words that start constrained decoding of a call. Empty means no lazy grammar: the
+     * reply is unconstrained. */
     std::vector<std::string> triggers;
 
     bool has_reasoning() const { return !reasoning_close.empty(); }
@@ -150,22 +141,22 @@ struct ChatFormat {
 };
 
 /* Can the streaming parser run this format? RAD_OK, or RAD_E_UNSUPPORTED with *why naming the
- * field. A format with no tool calls is valid (reasoning split only); a format with tool calls
- * must describe them completely enough that every delimiter is unambiguous. */
+ * field. A format without tool calls is valid (reasoning split only); one with tool calls must
+ * make every delimiter unambiguous. */
 int chat_format_check(const ChatFormat& f, std::string* why);
 
-/* The plugin's declaration, copied out of the ABI struct. Fields past the plugin's
- * `struct_size` read as their zero. Returns RAD_E_INVAL with *why when the struct is unusable. */
+/* Copy the plugin's declaration out of the ABI struct. Fields past the plugin's `struct_size`
+ * read as zero. RAD_E_INVAL with *why when the struct is unusable. */
 int chat_format_from_abi(const RadChatFormat* in, ChatFormat* out, std::string* why);
 
 /* Derive the format from a chat template by the vendored differential analysis.
  *
- * RAD_OK with *out filled. A template whose tool calls the analysis found but this family cannot
- * express still yields its reasoning split, with the tool fields empty and *tools_refused saying
- * why -- the model chats, and a request with tools is refused with that sentence. RAD_E_UNSUPPORTED
- * with *why when the template routes to one of llama.cpp's hand-written handlers, whose formats
- * the analysis does not describe at all; RAD_E_FORMAT when the template does not compile. An
- * empty source is the ChatML fallback, which has neither reasoning nor calls. */
+ * RAD_OK with *out filled. If the analysis finds tool calls this family cannot express, the
+ * reasoning split is still returned with the tool fields empty and *tools_refused saying why;
+ * requests with tools are then refused with that sentence. RAD_E_UNSUPPORTED with *why when the
+ * template routes to one of llama.cpp's hand-written handlers, which the analysis does not
+ * describe; RAD_E_FORMAT when the template does not compile. An empty source is the ChatML
+ * fallback, which has neither reasoning nor calls. */
 int chat_format_from_template(const std::string& jinja, const std::string& bos,
                               const std::string& eos, ChatFormat* out,
                               std::string* tools_refused, std::string* why);
@@ -175,21 +166,19 @@ std::string chat_format_describe(const ChatFormat& f);
 
 /* ================================================================== grammar
  *
- * The GBNF that constrains a reply to the format, generated from the description. For a tool
- * request it is LAZY: the reply is free until one of `triggers` appears, and from there the
- * grammar admits the call syntax with each argument constrained by its schema. For a response
- * format, and for a request that requires a call, it is the whole reply. Rule names and structure
- * follow the vendored generator so the two produce the same grammar for a template-analysed
- * format. */
+ * The GBNF that constrains a reply to the format. For a tool request it is lazy: the reply is free
+ * until one of `triggers` appears, then the grammar admits the call syntax with each argument
+ * constrained by its schema. For a response format, or a request that requires a call, it covers
+ * the whole reply. Rule names and structure follow the vendored generator, so both produce the
+ * same grammar for a template-analysed format. */
 struct ChatGrammarRequest {
     const nlohmann::ordered_json* tools = nullptr;        /* the request's tools, or null */
     const nlohmann::ordered_json* json_schema = nullptr;  /* a response format's schema, or null */
     std::string generation_prompt;
     bool        parallel_tool_calls = true;
     bool        extract_reasoning = true;  /* reasoning_format != "none" */
-    /* tool_choice "required" or a named function: the grammar is the whole reply rather than lazy,
-     * the reasoning block and then the calls with nothing after them, and `only_tool` (when set)
-     * narrows the calls to that one function. */
+    /* tool_choice "required" or a named function: the grammar covers the whole reply (reasoning,
+     * then calls, nothing after), and `only_tool` when set restricts calls to that function. */
     bool        require_call = false;
     std::string only_tool;
 };
@@ -200,15 +189,18 @@ struct ChatGrammar {
     std::vector<std::string> trigger_words;
 };
 
+/* A tool the grammar and the reply parser both read, {"type":"function","function":{...}}; both
+ * skip any other. */
+bool chat_function_tool(const nlohmann::ordered_json& tool);
+
 /* RAD_OK, or RAD_E_INVAL with *why when a tool or schema cannot be expressed. */
 int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, ChatGrammar* out,
                         std::string* why);
 
-/* The markers the decoder must render as text for the parser to see them: a format built from
- * control tokens reaches the parser with its structure gone otherwise, because the decoder
- * suppresses control tokens. Every non-empty delimiter, whitespace-trimmed, deduplicated, in the
- * order the vendored analyser lists them -- a marker that is not a single token is harmless, the
- * decoder only compares it with the spellings of control tokens. */
+/* The markers the decoder must render as text so the parser sees them; the decoder otherwise
+ * suppresses control tokens, and a format built from them would lose its structure. Every
+ * non-empty delimiter, whitespace-trimmed and deduplicated, in the vendored analyser's order. A
+ * multi-token marker is fine: the decoder only compares markers with control-token spellings. */
 std::vector<std::string> chat_format_markers(const ChatFormat& f);
 
 }  /* namespace rad */

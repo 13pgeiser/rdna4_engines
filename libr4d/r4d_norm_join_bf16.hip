@@ -1,46 +1,40 @@
-/* r4d_norm_join_bf16.hip -- Gemma 4's sandwich-norm joins, each one kernel instead of a chain of small ones.
+/* r4d_norm_join_bf16.hip -- Gemma 4's sandwich-norm joins, each one kernel instead of a chain.
  *
- * A decode step of the 26B-A4B launches ~250 rmsnorms and ~90 adds a step, each a few hundred
- * bytes of work behind a full launch: --profile-ops measured 2.0 ms and 0.85 ms of a 16.6 ms step.
- * Two places in every layer are pure chains of them:
+ * A 26B-A4B decode step launches ~250 rmsnorms and ~90 adds, each a few hundred bytes of work
+ * behind a full launch (about 2.0 and 0.85 ms of a 16.6 ms step). Two places per layer are pure
+ * chains of them:
  *
  *   norm_add_norm    the attention's join:   t = norm(a) * w_a;  x += t;  y = norm(x) * w_y
  *                    (post_attention_layernorm, the residual add, pre_feedforward_layernorm)
  *   join_add_scale   the feed-forward's:     d' = norm(d) * w_d;  r' = norm(r) * w_r;
  *                    j = norm(d' + r') * w_j;  x = (x + j) * s;  and optionally y = norm(x) * w_n
  *                    (post_feedforward_layernorm_1 and _2, the arms' sum, post_feedforward_layernorm,
- *                    the residual add, layer_scalar -- and the NEXT layer's input_layernorm, or the
- *                    final norm after the last layer, which read the x this writes)
+ *                    the residual add, layer_scalar, and the next layer's input_layernorm or the
+ *                    final norm, which read the x this writes)
  *
- * THE SAME FUNCTION AS THE CHAIN, ROUNDING FOR ROUNDING. Every value the chain stores as bf16 is
- * rounded to bf16 here at the same point, and every element is computed with libr4d's own
- * expression: a norm is bf16((v * rsqrtf(mean(v^2) + eps)) * g), an add bf16(u + v), a scale
- * bf16(x * s). The one thing that can differ is the ORDER the sum of squares is added in -- libr4d
- * picks its block width from a measured table -- which moves the f32 norm factor by an ulp at most
- * and, rarely, a bf16 output by one ulp. The arch plugin asks for these first and falls back to
- * the chain where nothing serves them (gemma4.cpp).
+ * Same function as the chain, rounding for rounding: every value the chain stores as bf16 is
+ * rounded here at the same point, with libr4d's own expressions (a norm is
+ * bf16((v * rsqrtf(mean(v^2) + eps)) * g), an add bf16(u + v), a scale bf16(x * s)). Only the
+ * order of the sum of squares can differ (libr4d picks its block width from a table), moving the
+ * f32 norm factor by at most an ulp and, rarely, a bf16 output by one. The arch plugin falls back
+ * to the chain where nothing serves these (gemma4.cpp).
  *
- * AND THE ROUTED ARM'S TWO INPUTS (norm_add_norm_route). The 26B-A4B's router reads norm(x) * w_r *
- * hidden^-0.5 and its experts norm(x) * w_e, quantised to E4M3 -- two more launches a layer
- * (`rmsnorm`, `rmsnorm_quant_fp8`), each reading back the x norm_add_norm has just written and
- * taking the sum of squares norm_add_norm has just taken. The route form writes both from the norm
- * factor it holds: the router's row by libr4d's rmsnorm expression, ((x * s) * w) * mult, and the
- * experts' codes as libr4d's rmsnorm_quant_fp8 writes them -- the bf16-rounded norm, a scale of
- * amax * (1 / 448) a 128 columns (1 where the group is all zero), the value times its reciprocal
- * clamped to +-448, one v_cvt_pk_fp8_f32. Element i is thread i % 256 at slot i / 256, so a group
- * is four waves at one slot: a wave's max, then the four.
+ * norm_add_norm_route also writes the routed arm's two inputs: the router's norm(x) * w_r *
+ * hidden^-0.5 and the experts' norm(x) * w_e quantised to E4M3, which would otherwise be two more
+ * launches (`rmsnorm`, `rmsnorm_quant_fp8`) re-reading x and redoing its sum of squares. The router
+ * row uses libr4d's rmsnorm expression, ((x * s) * w) * mult; the codes match rmsnorm_quant_fp8:
+ * the bf16-rounded norm, a scale of amax * (1 / 448) per 128 columns (1 for an all-zero group),
+ * value times reciprocal clamped to +-448, one v_cvt_pk_fp8_f32. Element i is thread i % 256 at
+ * slot i / 256, so a group is four waves at one slot: a wave max, then the four.
  *
- * One 256-thread block a row: a decode step is a handful of rows, so the row is latency-bound and
- * a block's three reductions beat seven launches. Values a later stage reuses stay in registers
- * (PER a thread, 12 to n = 3072 and kMaxPer = 24 to 6144; the row table says so).
+ * One 256-thread block per row: a decode step is a handful of rows, so the row is latency bound
+ * and three block reductions beat seven launches. Values a later stage reuses stay in registers
+ * (PER per thread: 12 up to n = 3072, kMaxPer = 24 up to 6144; the row table enforces it).
  *
- * EVERY LOAD IS ISSUED FIRST. A barrier is a fence, so a load written after a reduction waits for
- * it: the first version fetched the gains, the residual and the layer scalar phase by phase and
- * paid a global round trip for each on top of the reductions -- 17.8 us for join_add_scale and 13.2
- * for norm_add_norm at decode under --profile-ops, against ~7 for a launch that does nothing. Now
- * the row's every operand is in flight at once, the two arm norms share one barrier pair, and a
- * thread holds the elements it touches and no more. Nothing about the arithmetic moved: the same
- * expressions in the same order, a sum's extra terms past n were +0.
+ * Every load is issued first. A barrier is a fence, so a load written after a reduction waits for
+ * it and pays a global round trip per phase. All of the row's operands are in flight at once, the
+ * two arm norms share one barrier pair, and a thread holds only the elements it touches. Sums over
+ * the padding past n add +0.
  */
 #include <hip/hip_runtime.h>
 

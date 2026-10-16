@@ -1,38 +1,32 @@
-# Radiance — user guide
+# radiance user guide
 
-Radiance is an inference server: it loads a model and answers OpenAI-compatible HTTP requests.
-This guide takes you from an empty machine to a running server, and then through operating one.
+radiance is an inference server: it loads a model and answers OpenAI-compatible HTTP requests. This
+guide covers building it, getting a model in, serving it and operating the server. The engine, the
+tools and the build are C++, CMake and shell; nothing needs Python.
 
-There is no Python anywhere — not in the engine, not in the tools, not in the build. Everything
-below is C++, CMake and shell.
-
-**Where to go from here**
-
-| If you want | Read |
+| To | Read |
 |---|---|
-| to get something running | this file, in order |
-| every flag of one tool | [TOOLS.md](TOOLS.md) |
-| to write a kernel library for your card | [PLUGIN.md](PLUGIN.md) |
-| to know why it is built this way | `../spec.md` — the design, and it is binding |
+| get something running | this file, in order |
+| see every flag of one tool | [TOOLS.md](TOOLS.md) |
+| write a kernel library for your card | [PLUGIN.md](PLUGIN.md) |
+| know why it is built this way | `../spec.md`, the binding design |
 
 ---
 
-## 0. The whole thing in five commands
+## 0. Quick start
 
 ```sh
 ./build.sh                                          # build and test
 export RADIANCE_HOME=$PWD/build/radiance_home
 
-scripts/hfget.sh Qwen/Qwen3.8-Flash-Next ~/ckpt     # get a checkpoint
-build/bin/rad-convert ~/ckpt -o ~/m.rad \
-    --recipe data/recipes/qwen4exp-w4.recipe        # quantise it into a container
-build/bin/radiance --model ~/m.rad --port 8000      # serve it
+scripts/hfget.sh Qwen/Qwen3.8-Flash-Next /srv/models/ckpt      # get a checkpoint
+build/bin/rad-convert /srv/models/ckpt -o /srv/models/m.rad \
+    --recipe data/recipes/qwen4exp-w4.recipe                   # quantise it into a container
+build/bin/radiance --model /srv/models/m.rad --port 8000       # serve it
 ```
 
-A checkpoint served at its own precision needs no container at all: `radiance --model ~/ckpt`
+A checkpoint served at its own precision needs no container: `radiance --model /srv/models/ckpt`
 reads it as it stands (§3.4).
-
-Then:
 
 ```sh
 curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
@@ -40,36 +34,34 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
   | jq -r '.choices[0].message.content'
 ```
 
-and open `http://localhost:8000/` for the dashboard. Everything below is the detail behind those
-five lines.
+The dashboard is at `http://localhost:8000/`.
 
 ---
 
 ## 1. Install
 
-**Or skip this section and run the container image**: `docker/build.sh` builds the engine inside
-the ROCm toolchain image, tests it and produces an image that needs only Docker and the `amdgpu`
-driver on the host. [`DOCKER.md`](DOCKER.md) covers it, along with ready compose files per model.
+To avoid building on the host, use the container image: `docker/build.sh` builds and tests the
+engine in the ROCm toolchain image and produces an image that needs only Docker and the `amdgpu`
+driver. [`DOCKER.md`](DOCKER.md) covers it, with compose files per model.
 
-### 1.1 What you need
+### 1.1 Requirements
 
 | | |
 |---|---|
-| **Required** | Linux, a C++20 compiler, CMake 3.21+, Ninja, pthreads |
-| **Optional** | ROCm with `hipcc`, for AMD device kernels. Without it you get the host backend. Set `ROCM_PATH` if it is not at `/opt/rocm` |
-| **With a card** | Resizable BAR on (Above 4G Decoding and Resizable BAR in the firmware setup): the host writes every dispatch's arguments into VRAM, and startup refuses a card whose memory the CPU cannot reach |
-| **Optional** | OpenMP, used by the host kernel libraries if present |
-| **For the shell harnesses** | `curl` and `jq` |
+| Required | Linux, a C++20 compiler, CMake 3.21+, Ninja, pthreads |
+| Optional | ROCm with `hipcc`, for AMD device kernels; without it you get the host backend. Set `ROCM_PATH` if ROCm is not at `/opt/rocm` |
+| With a card | Resizable BAR on (Above 4G Decoding and Resizable BAR in the firmware setup). The host writes every dispatch's arguments into VRAM, and startup refuses a card whose memory the CPU cannot reach |
+| Optional | OpenMP, used by the host kernel libraries if present |
+| Optional | `clang++` (or ROCm's), for `tests/r4d_emu` when the C++ compiler is g++; CMake 3.25+ for `CMakePresets.json` |
+| Shell harnesses | `curl` and `jq` |
 
-Everything else is vendored in `vendor/` — the HTTP server, the JSON library and the llama.cpp
-lifts. There is nothing to `apt install` beyond a toolchain.
+The HTTP server, the JSON library and the llama.cpp parts are vendored in `vendor/`.
 
-**A machine with no GPU is a supported configuration.** The host backend is a real implementation,
-not a stub: the core, scheduler, planner, tokeniser, server and `libref` all run through it and
-the full test suite passes. It is slow, and it will not serve a production model — but it is a
-complete development and inspection environment. A build with ROCm, or the container image, runs
-the same host backend on a machine where no card is visible: the GPU library's kernels are left out
-there and every op takes its host kernel.
+A machine with no GPU is supported. The host backend is complete: the core, scheduler, planner,
+tokeniser and server run on it, `libavx` (AVX-512 and AVX2 kernels, chosen at run time) serves
+every shipped model, and the full test suite passes. Small models run at interactive speed on a
+desktop CPU; the 27B and larger models run far more slowly than on a card. A ROCm build, or the container image, uses it on a machine where no card is
+visible: the GPU library's kernels are left out and every op takes its host kernel.
 
 ### 1.2 Build
 
@@ -78,48 +70,104 @@ git clone <repo> radiance && cd radiance
 ./build.sh
 ```
 
-That configures, builds and runs the tests. It detects your situation: if `hipcc` is present and a
-card can be enumerated, device kernels are compiled for that card's architecture; otherwise you
-get the host backend.
-
-Options:
+`build.sh` configures, builds and runs the fast tests (§1.3). If `hipcc` is present and a card can
+be enumerated, device kernels are compiled for that card's architecture; otherwise you get the host
+backend.
 
 ```sh
 ./build.sh -c          # wipe the build directory first
 ./build.sh --no-hip    # force the host backend even where hipcc exists
 ./build.sh --debug     # -DCMAKE_BUILD_TYPE=Debug
-./build.sh --asan      # AddressSanitizer
+./build.sh --asan      # AddressSanitizer + UBSan, host backend, in build-asan/
+./build.sh --tsan      # ThreadSanitizer, host backend, in build-tsan/
 ./build.sh -b mybuild  # build into mybuild/ instead of build/
 ```
 
-Or drive CMake yourself:
+Or with CMake directly (`CMakePresets.json` names the same three configurations: `cmake --preset
+default`, `asan` or `tsan`):
 
 ```sh
 cmake -S . -B build -G Ninja
 cmake --build build -j
-ctest --test-dir build --output-on-failure
+ctest --test-dir build -L fast -j8 --output-on-failure
 ```
 
 ### 1.3 Check that it works
 
+The tests are grouped into tiers by label, and `CMakePresets.json` names the usual runs. A preset
+reads `build/`; add `--test-dir mybuild` for another tree (CMake 3.30+), or pass the labels shown.
+Times are wall clock on a 16-core (32-thread) host build with other work running:
+
+| Run | Selects | Time |
+|---|---|---|
+| `ctest --preset fast` (`-L fast -j8`) | the inner loop; what `build.sh` runs | about 10 s |
+| `ctest --preset host` (`-LE 'gpu\|oot' -j8`) | everything that runs without a card | about 1.5 minutes, most of it `r4d_emu_attn_sweep` and, after libref changes, `kbench_ref` |
+| `ctest --preset gpu` (`-L gpu`) | the tests that need a card, one at a time | minutes |
+| `ctest --preset perf` (`-L perf`) | the wall-clock checks, each alone | seconds |
+| `ctest --preset full` | every test | the above plus `oot` |
+| `ctest --preset asan` | the fast tier in `build-asan/` (`./build.sh --asan` first) | about 4 minutes |
+
+| Label | Tests |
+|---|---|
+| `unit` | one binary per `tests/*_test.cpp` except `engine_e2e_test`, always on the host backend (`ROCR_VISIBLE_DEVICES=99`) |
+| `fast` | every test with none of `slow`, `gpu`, `oot`, `perf`, `e2e` and `kbench` |
+| `perf` | `<binary>_perf`: a binary's cases named `perf_...`, which assert wall-clock costs; each runs alone |
+| `e2e` | `engine_e2e_test`: the `radiance` binary serving tiny synthetic checkpoints on the host backend |
+| `kbench` | `kbench`, `kbench_moe` and `kbench_ref`, the kernel replays (below) |
+| `slow` | `kbench_ref`, `r4d_selftest` and `r4d_emu_attn_sweep` |
+| `gpu` | `device_test_card`, `mem_test_card`, `place_test_card`, `runtime_test_card`, `device_test_nosvm`, `r4d_selftest`, and `kbench`/`kbench_moe` when libr4d is built; one at a time, and a server must not hold the card |
+| `oot` | `oot_plugins`: every bundled plugin rebuilt out of tree against an install |
+| `r4d_emu` | libr4d kernel sources run on the host by a SIMT emulator; registered where a clang++ is found |
+
+Each binary built on `tests/rad_test.h` takes the same arguments:
+
 ```sh
-ctest --test-dir build --output-on-failure        # everything (a few minutes)
-ctest --test-dir build -LE slow                   # the fast inner loop (~1 s)
-ctest --test-dir build -LE gpu                    # skip anything needing a card
+build/tests/gbnf_test --list                   # its cases
+build/tests/gbnf_test oracle -tool             # the cases containing "oracle" but not "tool"
+build/tests/gbnf_test --shard 1/4              # every fourth case, from the second
+RAD_TEST_FILTER=oracle build/tests/gbnf_test   # patterns from the environment
+RAD_TEST_LEVEL=2 build/tests/gbnf_test         # the exhaustive sizes, where a test has them
 ```
 
-Three of them are worth knowing by name, because they are the ones that actually check kernels:
+A case taking 0.1 s or more prints its time, and a binary ends with its wall and CPU time and its
+three slowest cases. A binary that checked nothing exits 77, which ctest reports as skipped, not
+passed. ctest sets, for each unit test:
 
-- **`kbench` / `kbench_moe`** (label `slow`) replay a recorded fixture — every kernel every loaded
-  library supplies, checked against `libref`'s recorded answers on seeded inputs. **No model file is
-  needed**, which is what makes this runnable on a build machine. It also regression-tests `libref`
-  itself, which a live oracle never can.
-- **`r4d_selftest`** (labels `slow`, `gpu`) checks libr4d's fusion claims by `memcmp` against the
-  unfused kernels it says it replaces.
-- **`ops_doc`** (fast) checks that `docs/OPS.md` still agrees with what the plugins declare. A
-  document that is wrong is worse than one that is missing, because it is read instead of the source.
+- `OMP_WAIT_POLICY=passive` and `OMP_NUM_THREADS=4`: the host kernel libraries' OpenMP teams spin
+  at every barrier by default, which makes a 0.2 s test take a minute on a busy machine.
+- `RAD_TEST_STRICT=1`: a plugin or fixture this build makes that a test cannot find fails it; run by
+  hand, the test skips.
+- `RAD_TEST_TMPDIR=build/tmp`: where `radtest::tmpdir()` is made. It is removed when the binary
+  passes and kept, with its path printed, when it fails.
+- `RAD_TEST_CPU_BUDGET=10`: a binary that spends more CPU seconds than this fails, so a slow case or
+  a spinning thread pool is caught when it lands. `tests/CMakeLists.txt` lists the few binaries
+  allowed more. Sanitised and Debug builds have no budget.
 
-You can also run the kernel check by hand:
+The sanitised tiers are host-only. `./build.sh --asan` builds `build-asan/` with AddressSanitizer
+and UBSan and runs the fast tier there; `--tsan` does the same with ThreadSanitizer in
+`build-tsan/`, where OpenMP runs one thread because libgomp is not instrumented. The `r4d_emu`
+tests are compiled without a sanitiser in both.
+
+The tests that check kernels:
+
+- `kbench` / `kbench_moe` (label `kbench`) replay a recorded fixture: every kernel every loaded
+  library other than `libref` supplies, checked against `libref`'s recorded answers on seeded
+  inputs. They need no model file. `--strict` fails a stale case (one whose operands or schema
+  moved, or that the reference no longer serves or now describes differently), and `--coverage`
+  fails when a kernel row the fixture reached (`data/kbench_rows/`) is no longer reached.
+- `kbench_ref` (labels `kbench`, `slow`) replays `libref` against its own recordings at tolerance
+  zero, so any change to the reference shows before it becomes the next recording's target. Its
+  answers are cached under `$RADIANCE_HOME/cache/kbench` by `libref`'s build, so an unchanged
+  `libref` replays in seconds.
+- `r4d_selftest` (labels `slow`, `gpu`) checks libr4d's fusions by `memcmp` against the unfused
+  kernels they replace.
+- `avx_check` (fast) compares libavx with libref op by op at every ISA level the CPU supports.
+- `r4d_emu_*` (fast, `r4d_emu_attn_sweep` slow) run libr4d's kernels on the host: those with no
+  libref oracle (the windowed attention, the sandwich-norm joins, expert_scale, pair_argmax), and
+  the QSA block selection's four kernels against libref's rule.
+- `ops_doc` (fast) checks that `docs/OPS.md` agrees with what the plugins declare.
+
+The kernel check by hand:
 
 ```sh
 build/bin/rad-kbench --home build/radiance_home --max-cases 1
@@ -133,19 +181,18 @@ cmake --build build -j
 sudo cmake --install build
 ```
 
-What lands where:
-
 ```
 <prefix>/bin/                      radiance, rad-convert, rad-info,
                                    rad-kbench, rad-tune, rad-schemas, rad-tokcheck
-<prefix>/include/                  the ABI headers — all a plugin compiles against
+<prefix>/libexec/radiance/         hfget.sh, the downloader behind --model <owner/name> (§3.1)
+<prefix>/include/radiance/         the ABI headers, all a plugin compiles against
 <prefix>/lib/cmake/radiance/       the package config, for find_package(radiance)
 <prefix>/share/radiance/           $RADIANCE_HOME: kernels/, architectures/, quantizers/, kernels*.rkb
 ```
 
 ### 1.5 `$RADIANCE_HOME`
 
-This is the directory the engine and every tool scan at startup:
+The directory the engine and every tool scan at startup:
 
 ```
 $RADIANCE_HOME/
@@ -156,26 +203,26 @@ $RADIANCE_HOME/
   tune/            per-machine tuning caches rad-tune writes
 ```
 
-It defaults to the install prefix's `share/radiance`. Override it with `--radiance-home DIRS` or the
-`RADIANCE_HOME` environment variable — a search path: homes separated by `:`, the first winning,
-each holding any of the directories above. A directory of your own plugins goes ahead of an
-installation's without copying it, and `rad-info --plugins` prints what the path offers:
+It defaults to the install prefix's `share/radiance`. `--radiance-home DIRS` or `RADIANCE_HOME`
+override it with a search path: homes separated by `:`, the first winning, each holding any of the
+directories above, so a directory of your own plugins can go ahead of an installation's.
+`rad-info --plugins` prints what the path offers:
 
 ```sh
 RADIANCE_HOME=$HOME/radiance-plugins:/opt/radiance/share/radiance rad-info --plugins
 ```
 
-**Running from a build tree**, the home is `build/radiance_home` and the plugins are already in it:
+In a build tree the home is `build/radiance_home`:
 
 ```sh
 export RADIANCE_HOME=$PWD/build/radiance_home
 build/bin/radiance --model m.rad
 ```
 
-Adding support for a new card means dropping an `.so` into `kernels/` — not forking the engine.
-The engine's own device code is built for every AMD GPU family, so one engine binary starts on any
-card; a kernel library whose code objects hold nothing for the card is left out of selection when
-it loads, and says so. `docs/PLUGIN.md` §10 is a library for a card the engine has never seen.
+Supporting a new card takes an `.so` in `kernels/`, not a fork of the engine. The engine's own device
+code is built for every AMD GPU family, so one binary starts on any card; a kernel library with no
+code object for the card leaves itself out of selection at load and says so. `docs/PLUGIN.md` §10
+walks through a library for a card the engine has never seen.
 
 ### 1.6 Building for a card you do not have
 
@@ -185,59 +232,59 @@ Device kernels are compiled for the architectures the machine reports. To target
 cmake -S . -B build -G Ninja -DRAD_GPU_TARGETS='gfx1201;gfx1200'
 ```
 
-Which of those actually get kernels is decided by the libraries present; each one declares the
-architectures it serves and stays out of a build targeting anything else. The engine's own device
-code is built for every family's generic target besides, whatever is named here.
+Each kernel library declares the architectures it serves and stays out of a build targeting anything
+else. The engine's own device code is built for every family's generic target regardless.
 
 ---
 
-## 2. Five things to know before you start
+## 2. Concepts
 
-**1. A model is a checkpoint served as it stands, or a `.rad` container.** A checkpoint whose
-weights are bf16, f16, f32, block-scaled fp8 or Quark's MXFP4 is served at that precision straight
-from its directory. Anything that needs quantising is quantised once, by `rad-convert` and a recipe, into a
-container. A container holds each weight as the planes of its *encoding* — codes, scales, zero
-points, a rotation — in one canonical arrangement, plus the tokeniser, the chat template, the
-metadata, the recipe it was quantised with and optionally a draft head. No kernel library is named
-in either: the kernels rearrange the planes into their own layouts as the model loads, so a kernel
-library can change without a reconvert.
+**1. A model is a checkpoint served as it stands, or a `.rad` container.** A checkpoint whose weights
+are bf16, f16, f32, block-scaled fp8 or Quark's MXFP4 is served at that precision from its directory.
+Anything that needs quantising is quantised once, by `rad-convert` and a recipe, into a container. A
+container holds each weight as the planes of its encoding (codes, scales, zero points, a rotation) in
+one canonical arrangement, plus the tokeniser, the chat template, the metadata, the recipe and
+optionally a draft head. Neither names a kernel library: kernels rearrange the planes into their own
+layouts at load, so a kernel library can change without a reconvert.
 
-**2. Kernels are plugins, and the order matters.** The engine resolves every op in the model
-against an ordered list of kernel libraries: first one that matches an op wins. `--kernels
-mylib,libref` names the libraries to use and their order; a library it leaves out is not loaded.
-With no list, every library found loads, and the loader puts one that declares itself a reference
-implementation last.
-
-Three ship with the tree:
+**2. Kernels are plugins, and their order matters.** Every op is resolved against an ordered list of
+kernel libraries; the first that matches wins. `--kernels mylib,libref` names the libraries to load,
+in order; a library it leaves out is not loaded. Without a list every library found loads, with one
+that declares itself a reference implementation last.
 
 | library | |
 |---|---|
-| `libr4d` | the device library: AMD RDNA4 (`gfx12xx`). Paged and dense attention, gated delta net, all-reduce over P2P or a host-memory mailbox, skinny and tiled quantised GEMM, rotate-and-quantise fusions. Built when ROCm is present and the build targets a `gfx12` card |
-| `libref` | every op naively and generically. The last-resort fallback **and** the correctness oracle `rad-kbench` measures against |
-| `libavx` | the host library: the same vocabulary in hand-written x86 SIMD, dispatched by CPU feature at load. Serves every op placed on the host, the n-gram embedding's gather among them. Built on x86-64 |
+| `libr4d` | the device library for AMD RDNA4 (`gfx12xx`): paged and dense attention, gated delta net, all-reduce over P2P or a host-memory mailbox, skinny and tiled quantised GEMM, rotate-and-quantise fusions. Built when ROCm is present and the build targets a `gfx12` card |
+| `libref` | every op, naively and generically: the last-resort fallback and the correctness oracle `rad-kbench` measures against |
+| `libavx` | the host library: the same vocabulary in x86 SIMD, dispatched by CPU feature at load. Serves every op placed on the host, including the n-gram embedding's gather. Built on x86-64 |
 
-A library states the architectures it serves and stays out of a build targeting anything else, so a
-tree configured for a card it does not cover still builds and still runs.
+A library that does not cover the configured card stays out of the build, so the tree still builds
+and runs.
 
-**3. Architectures are plugins too.** `arch/<id>/` declares a model family's graph. Six ship:
+**3. Architectures are plugins too.** `arch/<id>/` declares a model family's graph:
 
 | plugin | serves |
 |---|---|
-| `llama_fp8`, `llama_dense_fp8` | LLaMA-shaped decoders — MiniCPM5, Llama 3, anything reporting `model_type: llama` |
+| `llama_fp8`, `llama_dense_fp8` | LLaMA-shaped decoders: MiniCPM5, Llama 3, anything reporting `model_type: llama` |
 | `qwen35_bf16` | Qwen3.5 / 3.6 / 3.8 dense (0.8B–27B), bf16 |
 | `qwen35_fp8` | the same, block-scaled fp8 |
 | `qwen35moe_fp8` | Qwen3.5 / 3.6 MoE (35B-A3B), 256 experts, 8 a token |
-| `qwen4exp_fp8` | Qwen4-Exp / Qwen3.8-Flash-Next — hybrid Gated DeltaNet + gated attention, 512 experts |
+| `qwen4exp_fp8` | Qwen4-Exp / Qwen3.8-Flash-Next: hybrid Gated DeltaNet + gated attention, 512 experts |
+| `gemma4` | Gemma 4 text decoders (26B-A4B MoE and the dense members): bf16 trunk, routed experts bf16 or block fp8, and the DFlash drafter |
+| `gemma4_bf16` | Gemma 4 dense in bf16, with its vision tower |
+| `lfm2_bf16` | LiquidAI LFM2 and LFM2-VL in bf16, including d1 (§5.13) |
+| `embgemma2` | EmbeddingGemma 2, an embedding model (§5.6) |
+| `qwenimage21` | Qwen-Image 2.1 and 2.1-Turbo, an image model (§5.6) |
+| `qwen3asr_bf16` | Qwen3-ASR, speech to text from the checkpoint as it ships (§5.14) |
 
-**4. Falling back to the reference library is a fatal error, not a warning.** `libref` implements
-every op naively and generically. It is the oracle and the last resort. If your model resolves any
-op to it, the engine **refuses to start** and names the ops, because serving from it would be
-orders of magnitude slow with nothing in the output to say so. That list of ops is exactly the
-work a new kernel library has to do. `--debug-accept-reference-kernels` overrides it for bring-up.
+**4. Falling back to the reference library is fatal.** If any op resolves to `libref`, the engine
+refuses to start and names the ops, because serving from it is orders of magnitude slower with nothing
+in the output to say so. That list is the work a new kernel library has to do.
+`--debug-accept-reference-kernels` overrides it for bring-up.
 
-**5. Every pool is budgeted explicitly.** There is no profiling pass and no utilisation fraction.
-The trade between KV blocks and resident weights is real, workload-dependent and **yours to make**.
-An engine that quietly re-optimises the split is an engine whose benchmarks do not reproduce.
+**5. Every pool is budgeted explicitly.** There is no profiling pass and no utilisation fraction. The
+trade between KV blocks and resident weights depends on the workload and is the operator's to make;
+a split the engine re-optimised on its own would make benchmarks irreproducible.
 
 ---
 
@@ -246,163 +293,177 @@ An engine that quietly re-optimises the split is an engine whose benchmarks do n
 ### 3.1 Download a checkpoint
 
 ```sh
-scripts/hfget.sh Qwen/Qwen3.8-Flash-Next ~/models/Qwen/Qwen3.8-Flash-Next
+scripts/hfget.sh Qwen/Qwen3.8-Flash-Next /srv/models/Qwen/Qwen3.8-Flash-Next
 ```
 
-`curl` and `jq`, nothing else. Re-running resumes: a file whose local size already matches is
-skipped and a short one is continued. It also skips duplicate weight formats — if a repo carries
-`.safetensors` it will not also pull the `.bin`, the ONNX export and the GGUF.
+It needs only `curl` and `jq`. Re-running resumes: a file whose local size matches is skipped and a
+short one is continued. When a repo carries `.safetensors`, other weight formats (`.bin`, ONNX, GGUF,
+...) are not fetched. `HF_TOKEN` authenticates a gated or private repo; `HFGET_JOBS` sets concurrency
+(default 4). A complete fetch records each file's content key (its LFS sha256, or a small file's size)
+in `.hfget-manifest`, so the next run also fetches a file that changed at the same size. The
+free-space check counts only what is still to fetch.
 
-Set `HF_TOKEN` for a gated or private repo. `HFGET_JOBS` sets concurrency (default 4).
-
-A complete fetch records each file's content key (its LFS sha256, or the size of a small file) in
-`.hfget-manifest`, so the next run also fetches a file that changed at the same size. The free-space
-check counts only what is still to fetch.
-
-**The server can do this itself.** `--model` takes a repo id where it would take a path:
+`--model` also takes a repo id:
 
 ```sh
 radiance --model StillDeadcode/minicpm5-2b-fp8 --port 8000
 ```
 
-It runs the same script (installed beside the binary, in `libexec/radiance/`) into
+The server runs the same script (installed in `libexec/radiance/`) into
 `--download-dir/<owner>/<name>` before bring-up, then serves the one `.rad` at the repo's top level,
 or the directory as a checkpoint (§3.4) when it holds none. A repo with several containers is
-refused by name; pass the file. Every start checks the hub and fetches what changed. A start that
-cannot read the listing, or whose update does not fit, serves the copy a complete earlier fetch
-left and says so; a transfer that fails part-way stops startup. A path that exists is always a
+refused, naming them; pass the file. Every start checks the hub and fetches what changed. A start that
+cannot read the listing, or whose update does not fit on disk, serves the copy a complete earlier
+fetch left and says so; a transfer that fails part-way stops startup. A path that exists is always a
 path, and a name ending in `.rad`, `.safetensors`, `.gguf` or `.json` is never looked up.
 
 ### 3.2 Convert it
 
 ```sh
-rad-convert ~/models/Qwen/Qwen3.8-27B-FP8 -o ~/models/rad/q38-27b-fp8.rad --home $RADIANCE_HOME
+rad-convert /srv/models/Qwen/Qwen3.8-27B-FP8 -o /srv/models/rad/q38-27b-fp8.rad --home $RADIANCE_HOME
 ```
 
-Input is a `.gguf`, a `.safetensors`, or a directory holding a checkpoint. What happens: the
-architecture plugin declares the model's graph and its name map says which checkpoint tensors make
-each weight; every op is resolved against the kernel hierarchy and every resolved kernel is asked
-whether it reads the encoding each weight will have; then each weight is written once, as its
-encoding's planes, and the tokeniser and chat template are baked in.
+Input is a `.gguf`, a `.safetensors`, an index or a checkpoint directory. The architecture plugin
+declares the graph and maps checkpoint tensors to weights, every op is resolved and each kernel is
+asked whether it reads its weight's encoding, then each weight is written once as its encoding's
+planes, with the tokeniser and chat template.
 
-**A recipe decides what is quantised.** With none, every weight keeps the checkpoint's encoding,
-which is right for a bf16 or block-fp8 checkpoint served at its own precision. A model whose served
-form needs quantisation work — Flash-Next's four-bit experts, an fp8 head made from a bf16 one —
-names it in rules from weight names to quantisers:
+**A recipe decides what is quantised**, in rules from weight names to quantisers. Without one,
+every weight keeps the checkpoint's encoding, which suits a bf16 or block-fp8 checkpoint served at
+its own precision. Flash-Next's four-bit experts need one:
 
 ```sh
-rad-convert ~/models/Qwen/Qwen3.8-Flash-Next -o ~/models/rad/flashnext-w4.rad \
+rad-convert /srv/models/Qwen/Qwen3.8-Flash-Next -o /srv/models/rad/flashnext-w4.rad \
     --recipe data/recipes/qwen4exp-w4.recipe --home $RADIANCE_HOME
 ```
 
-`qwen4exp-w4.recipe` rounds the experts to nearest and needs nothing but the checkpoint. The
-production Flash-Next container, `w4nl64-i8lm.rad`, is built by
-`data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe`, whose expert rule is GPTQ against recorded Grams:
-it expands `$CALIB` from the environment, so it is run as `CALIB=DIR rad-convert ...` with `DIR`
-holding a calibration run's files. The recipe's header and [MOE-W4.md](MOE-W4.md) say what that
-directory must hold and how it is recorded.
-
 ```
-# data/recipes/... -- PATTERN  QUANTISER  OPTIONS; the first match decides
-blk.*.ffn_*_exps.*.weight   gptq  codes=i4 group=128 scale=bf16 transform=fwht128 calib=$CALIB
-output.weight               rtn   codes=fp8_e4m3 block=128x128 scale=bf16
-blk.*.weight                rtn   codes=fp8_e4m3 block=128x128 scale=bf16
+# data/recipes/qwen4exp-w4.recipe (excerpt): PATTERN  QUANTISER  OPTIONS; the first match decides
+blk.*.ffn_*_exps.*.weight            rtn  codes=i4 group=128 scale=bf16 transform=fwht128
+blk.*.attn_qg.weight                 rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+output.weight                        rtn  codes=fp8_e4m3 block=128x128 scale=bf16
 ```
 
-Every weight it quantises is measured against the source and the worst are printed. The recipe
-syntax, the quantisers and their options are in [TOOLS.md](TOOLS.md#recipes).
+`qwen4exp-w4.recipe` rounds the experts to nearest and needs only the checkpoint. The production
+Flash-Next container, `w4nl64-i8lm.rad`, is built by `data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe`,
+whose expert rule is GPTQ against recorded Grams. It expands `$CALIB` from the environment, so it
+runs as `CALIB=DIR rad-convert ...` with `DIR` holding a calibration run's files; the recipe's header
+and [MOE-W4.md](MOE-W4.md) say what that directory holds and how it is recorded.
 
-Because it runs the same declare phase the engine does, everything that can refuse has refused by
-the time the I/O starts — including a recipe no loaded kernel can serve. On a large checkpoint that
-I/O is an hour, so check the plan first:
+Every quantised weight is measured against the source and the worst are printed. The recipe syntax,
+the quantisers and their options are in [TOOLS.md](TOOLS.md#recipes).
+
+`rad-convert` runs the engine's declare phase, so anything that would be refused (including a
+recipe no loaded kernel can serve) is refused before the I/O, which takes an hour on a large
+checkpoint. To check the plan only:
 
 ```sh
 rad-convert <checkpoint> -o out.rad --recipe r.recipe --plan-only -v
 ```
 
-Useful variants:
+Other conversions:
 
 ```sh
 # Merge a separate drafter checkpoint (DSpark, DFlash2) into the container
-rad-convert $SRC -o out.rad --draft-model ~/models/openbmb/MiniCPM5-2B-DSpark
+rad-convert $SRC -o out.rad --draft-model /srv/models/openbmb/MiniCPM5-2B-DSpark
 
 # Re-quantise some weights and copy the rest from an earlier container
 rad-convert $SRC -o new.rad --recipe new.recipe --reuse old.rad
 
-# A bf16 Qwen3.8-27B -- the base release or a finetune of it -- as Qwen's block fp8: the recipe
-# writes the linears, and --set states the format, which is what selects the fp8 plugin
-rad-convert ~/models/ukisai/Swift-1.5-Qwen3.8-27b -o swift-27b-fp8.rad \
-    --draft-model ~/models/z-lab/Qwen3.8-27B-DFlash2 --recipe data/recipes/q38-27b-fp8block-df2.recipe \
+# A bf16 Qwen3.8-27B (the base release or a finetune) as Qwen's block fp8: the recipe writes the
+# linears, and --set states the format, which selects the fp8 plugin
+rad-convert /srv/models/ukisai/Swift-1.5-Qwen3.8-27b -o swift-27b-fp8.rad \
+    --draft-model /srv/models/z-lab/Qwen3.8-27B-DFlash2 --recipe data/recipes/q38-27b-fp8block-df2.recipe \
     --set quantization_config.quant_method=fp8 --set quantization_config.fmt=e4m3 \
     --set "quantization_config.weight_block_size=128 128" --set quantization_config.activation_scheme=dynamic
 
 # gemma-4-26B-A4B-it with z-lab's DFlash drafter, the routed experts' gate_up as block fp8 (served by
 # arch/gemma4; docs/ARCHITECTURES.md says why down stays bf16 unless the experts were padded to 768)
-rad-convert ~/models/google/gemma-4-26B-A4B-it -o gemma4-26b-a4b-df.rad \
-    --draft-model ~/models/z-lab/gemma-4-26B-A4B-it-DFlash --recipe data/recipes/gemma4-26b-a4b-df.recipe
+rad-convert /srv/models/google/gemma-4-26B-A4B-it -o gemma4-26b-a4b-df.rad \
+    --draft-model /srv/models/z-lab/gemma-4-26B-A4B-it-DFlash --recipe data/recipes/gemma4-26b-a4b-df.recipe
 
 # Qwen-Image 2.1 or 2.1-Turbo, an image model (§5.6): the diffusers pipeline directory is the
-# checkpoint -- text encoder, DiT, VAE and the tokenizer together. fp8 blocks for the text encoder
-# and the DiT (17 GB, one card or two), or the checkpoint's bf16 (31 GB, two cards)
-rad-convert ~/models/Qwen/Qwen-Image-2.1 -o qwen-image-2.1-fp8.rad \
+# checkpoint (text encoder, DiT, VAE and tokenizer). fp8 blocks for the text encoder and the DiT
+# (17 GB, one card or two), or the checkpoint's bf16 (31 GB, two cards)
+rad-convert /srv/models/Qwen/Qwen-Image-2.1 -o qwen-image-2.1-fp8.rad \
     --recipe data/recipes/qwen-image-2.1-fp8.recipe
-rad-convert ~/models/Qwen/Qwen-Image-2.1-Turbo -o qwen-image-2.1-turbo-fp8.rad \
+rad-convert /srv/models/Qwen/Qwen-Image-2.1-Turbo -o qwen-image-2.1-turbo-fp8.rad \
     --recipe data/recipes/qwen-image-2.1-fp8.recipe
 ```
 
 A checkpoint directory's `model.safetensors.index.json` decides which shard each tensor is read
-from. A finetune that changed only some tensors can be assembled from them and the base model: its
-changed tensors in shards of their own, links to the base model's shards for the rest, and an index
-that points each name at its copy. A name two shards hold that no index entry settles is refused.
+from, so a finetune that changed only some tensors can be assembled from shards of its changed
+tensors, links to the base model's shards, and an index pointing each name at its copy. A name held
+by two shards and not settled by the index is refused.
 
-The conversions of record live in `scripts/convfn.sh` and `scripts/convdspark.sh`, with their
-recipes in `data/recipes/`.
+The conversions of record are `scripts/convfn.sh` and `scripts/convdspark.sh`, with their recipes in
+`data/recipes/`.
 
-**A release someone else already quantised is read as it ships.** Four forms are imported weight
-by weight, so their quantised linears need no recipe rule:
+**A release someone else quantised is read as it ships.** These forms are imported weight by
+weight (`Checkpoint::Import`, core/format/checkpoint.h). rad-convert writes each quantised linear
+in the encoding below unless a recipe rule names it; a rule re-quantises from the exact
+dequantisation where the architecture's kernels read another form, and NVFP4 always needs one:
 
 | `quantization_config` | read as | |
 |---|---|---|
 | `quark`, MXFP4 weights (fp4, per_group 32, e8m0) | `fp4_e2m1*e8m0[1x32]` | byte for byte: the same codes and exponents. A checkpoint of this form is also served as it stands (§3.4) |
-| `paroquant_mxfp4` (z-lab's ParoQuant on the MXFP4 grid: `format mxfp4`, `mxfp4_block 32`, `group_size 128`) | `fp4_e2m1*e8m0[1x32]/givens` | the codes and exponents byte for byte, plus the learned rotation as the encoding's `givens` tables: per checkpoint tensor the Givens pairs (made whole-row columns), angles and `1 / channel_scales`, a fused gate\|up or qkv\|z carrying one set a part. Convert-time only (the tables are built, not mapped); served by the rotating activation quantiser `givens_dense_quant` and the ordinary MXFP4 GEMM (docs/OPS.md). Its fp8 heads and embedding (one f32 scale a row) are read exactly, for a recipe's `cast`/`rtn` rule |
-| `paroquant`, `format int5-bitplane` (bits 5, group 128) and z-lab's plain `paroquant` (bits 4, group 128) | `u5*f16[1x128]-u8[1x128]/givens` and `u4*f16[1x128]-u8[1x128]/givens` | the AWQ-packed low nibbles (plus the fifth-bit plane) re-laid as a code bit stream along K, the f16 scales and the integer zero points transposed to `[N, K/128]`, and the rotation as the `givens` tables above. Convert-time only; served by `givens_rotate` and `gemm_nt_q` at `w5a16` / `w4a16_asym` over an f16 activation (docs/OPS.md) |
+| `paroquant_mxfp4` (z-lab's ParoQuant on the MXFP4 grid: `format mxfp4`, `mxfp4_block 32`, `group_size 128`) | `fp4_e2m1*e8m0[1x32]/givens` | the codes and exponents byte for byte, plus the learned rotation as the encoding's `givens` tables: per checkpoint tensor the Givens pairs (made whole-row columns), angles and `1 / channel_scales`, a fused gate\|up or qkv\|z carrying one set a part. Convert-time only (the tables are built, not mapped); served by the rotating activation quantiser `givens_dense_quant` and the MXFP4 GEMM (docs/OPS.md). Its fp8 heads and embedding (one f32 scale a row) are read exactly, for a recipe's `cast`/`rtn` rule |
+| `paroquant`, `format int5-bitplane` (bits 5, group 128) and z-lab's plain `paroquant` (bits 4, group 128) | `u5*f16[1x128]-u8[1x128]/givens` and `u4*f16[1x128]-u8[1x128]/givens` | the AWQ-packed low nibbles (plus the fifth-bit plane) re-laid as a code bit stream along K, the f16 scales and integer zero points transposed to `[N, K/128]`, and the rotation as the `givens` tables above. Convert-time only; served by `givens_rotate` and `gemm_nt_q` at `w5a16` / `w4a16_asym` over an f16 activation (docs/OPS.md) |
+| `compressed-tensors`, `format: pack-quantized` with every config group 4-bit `int` weights, `symmetric`, `strategy: group`, not `dynamic`, no `actorder` and no `input_activations` (e.g. Google's Gemma 4 QAT w4a16-ct) | `i4*<scale>[1xG]`, G the groups' one group size | `X.weight_packed` (int32 `[N, K/8]`, eight codes a word from the low bits, offset 8) made signed, beside `X.weight_scale` (`[N, K/G]`, f16, bf16 or f32) as shipped. A zero point is refused by name, and an `X.weight_shape` must state the codes' `[N, K]`. Convert-time only; `data/recipes/gemma4-31b-dense-w4a8.recipe` re-quantises the group-32 release to the group-128 grid the w4a8 kernels read |
 | `auto-round` with `packing_format: auto_round:auto_gptq`, and `gptq` (v1) | `i4*bf16[1x128]` or `i8*bf16[1x128]` | the GPTQ-packed codes transposed and made signed, the f16 scales rounded to bf16. Symmetric, group 128 or a multiple of it (per channel included), no act-order. Convert-time only, because the scales are not served as shipped |
+| `compressed-tensors` with an `nvfp4-pack-quantized` config group (`weights`: 4-bit float, group 16) | `fp4_e2m1*f32[1x16]` | the packed e2m1 codes beside an f32 scale per 16 of K, `weight_scale / weight_global_scale`: the global scale is a divisor, as compressed-tensors' dequantise and vLLM read it. Each piece keeps its own global, so a fused gate\|up reads both exactly. No kernel serves NVFP4, so every NVFP4 weight takes a recipe rule (`data/recipes/q38-27b-nvfp4-df2.recipe` makes it MXFP4) |
+| `compressed-tensors` whose config groups are all `float-quantized` with 8-bit `float` weights | `fp8_e4m3*<scale>[1x*]` or `[RxC]` | nothing is imported: each `X.weight` reads stock as FP8 with `X.weight_scale` beside it, one scale a row (`[N, 1]` or `[N]`, the channel strategy) or a block plane; a per-tensor scale is refused at the weight. The quantisation is still the tool's, so the family's quantised plugin serves it |
 
 The width is read per tensor, so a release mixing int4 experts with int8 projections imports both.
-What an import cannot read — an asymmetric zero point, an act-order index, a group under 128 — is
-refused by name at the weight. The release's `quantization_config` names the tool, not a served
-form, so it is kept in the container as `imported_quantization_config.*`, and the model is served by
-its family's quantised plugin (`qwen35_fp8` for Qwen3.8-27B; `qwen4exp_fp8` for Flash-Next).
+A mixed-precision release (NVFP4 MLPs beside FP8 or bf16 linears, the usual NVFP4 layout) reads
+every weight by its own form: a weight without `X.weight_packed` is not NVFP4 and reads stock, its
+`float-quantized` FP8 with the per-row (`[N, 1]`) or block scale beside it. A compressed-tensors
+release whose groups are all `float-quantized` FP8 reads the same way, with nothing to import.
+What an import cannot read (an asymmetric zero point, an act-order index, a group under 128, a
+missing or zero global scale, a compressed-tensors format not listed here) is refused by name. The release's `quantization_config` names the tool, not a served
+form, so it is kept as `imported_quantization_config.*`, and the model is served by its family's
+quantised plugin (`qwen35_fp8` for Qwen3.8-27B, `qwen4exp_fp8` for Flash-Next).
 
 A weight the architecture declares in another form than the release holds still takes a rule: the
-recipe dequantises the import exactly and quantises from that. The recipes of record:
+recipe dequantises the import exactly and quantises from that. A rule names the target form, not
+the source, so one recipe covers a mixed release in one pass. NVFP4 to MXFP4 rounds twice (e4m3
+scales per 16 to a power of two per 32), so it loses more than MXFP4 made from the bf16 original:
+against the block-fp8 Qwen3.8-27B on the same four documents, unsloth's NVFP4 release made MXFP4
+scores mean KL 0.287 and top-1 agreement 87.5%, AMD's calibrated Quark MXFP4 container 0.206 and
+89.3%. Prefer the Quark container unless you need that particular checkpoint. The recipes of
+record:
 
 ```sh
 # AMD's Quark AWQ-MXFP4 Qwen3.8-27B with the DFlash2 drafter
-rad-convert ~/models/amd/Qwen3.8-27B-Quark-AWQ-MXFP4 --draft-model ~/models/z-lab/Qwen3.8-27B-DFlash2 \
+rad-convert /srv/models/amd/Qwen3.8-27B-Quark-AWQ-MXFP4 --draft-model /srv/models/z-lab/Qwen3.8-27B-DFlash2 \
     --recipe data/recipes/q38-27b-quark-mxfp4-df2.recipe -o q38-27b-quark-mxfp4-df2.rad
 
 # A ParoQuant MXFP4 Qwen3.8-27B (rotated MXFP4 trunk imported with its rotations; fp16 parts cast to bf16)
-rad-convert ~/models/MisterSnrub/Qwen3.8-27B-PARO-MXFP4-v2 --draft-model ~/models/z-lab/Qwen3.8-27B-DFlash2 \
+rad-convert /srv/models/MisterSnrub/Qwen3.8-27B-PARO-MXFP4-v2 --draft-model /srv/models/z-lab/Qwen3.8-27B-DFlash2 \
     --recipe data/recipes/q38-27b-paro-mxfp4-df2.recipe -o q38-27b-paro-mxfp4-df2.rad
 
 # ParoQuant int5 (Launch80/Qwen3.8-27B-PARO-int5) and z-lab's int4 (z-lab/Qwen3.8-27B-PARO): same recipe
-rad-convert ~/models/Launch80/Qwen3.8-27B-PARO-int5 --draft-model ~/models/z-lab/Qwen3.8-27B-DFlash2 \
+rad-convert /srv/models/Launch80/Qwen3.8-27B-PARO-int5 --draft-model /srv/models/z-lab/Qwen3.8-27B-DFlash2 \
     --recipe data/recipes/q38-27b-paro-mxfp4-df2.recipe -o q38-27b-paro-int5-df2.rad
 
+# unsloth's NVFP4 Qwen3.8-27B with the DFlash2 drafter: the NVFP4 MLPs and the FP8 linears beside
+# them made MXFP4 by one recipe, the head block fp8
+rad-convert /srv/models/unsloth/Qwen3.8-27B-NVFP4 --draft-model /srv/models/z-lab/Qwen3.8-27B-DFlash2 \
+    --recipe data/recipes/q38-27b-nvfp4-df2.recipe -o q38-27b-nvfp4-df2.rad
+
 # An AutoRound int4 Qwen3.8-Flash-Next: its experts imported, its int4 projections made int8
-rad-convert ~/models/ukisai/Swift-1.5-Qwen3.8-Flash-Next-W4A16-AutoRound \
+rad-convert /srv/models/ukisai/Swift-1.5-Qwen3.8-Flash-Next-W4A16-AutoRound \
     --recipe data/recipes/qwen4exp-autoround-i8-hc8m.recipe -o swift-autoround.rad
 ```
 
-### 3.3 Look at what you built
+### 3.3 Inspect a container
 
 ```sh
-rad-info ~/models/rad/flashnext-w4.rad
+rad-info /srv/models/rad/flashnext-w4.rad
 ```
 
 ```
-flashnext-w4.rad
+/srv/models/rad/flashnext-w4.rad
   format        RAD2, 166.4 GiB, little-endian
   architecture  qwen4exp
   model         Qwen3.8-Flash-Next
@@ -411,35 +472,35 @@ flashnext-w4.rad
   created by    rad-convert ...
 
   section          offset        bytes    count
-  strings             256      1.2 MiB        -
-  metadata        1258752      8.4 KiB      214
+  strings            256      1.2 MiB        -
+  metadata       1258752      8.4 KiB      214
   ...
 ```
 
 `rad-info` opens the file read-only and loads no plugins. It lists every weight with its encoding
-and what made it — the checkpoint as it stood, or the recipe rule's quantiser and options.
+and what made it: the checkpoint as it stood, or the recipe rule's quantiser and options.
 
 ```sh
-rad-info --meta m.rad                  # just the metadata table
+rad-info --meta m.rad                  # the metadata table
 rad-info --vocab m.rad                 # vocab summary and normaliser chain
 rad-info --recipe m.rad                # the recipe it was converted with
 rad-info -v m.rad                      # every tensor
 ```
 
-### 3.4 Or skip the container
+### 3.4 Serving a checkpoint without a container
 
 ```sh
-radiance --model ~/models/Qwen/Qwen3.8-27B-FP8
+radiance --model /srv/models/Qwen/Qwen3.8-27B-FP8
 ```
 
-`--model` takes a checkpoint directory, a `.safetensors`, an index or a `.gguf`, and serves it at
-its own precision. Its `config.json` (or the GGUF header) is the metadata, the `tokenizer.json` and
-chat template beside it are the tokeniser, and `generation_config.json` gives the sampling defaults.
-The weights are read once, at load, by every relayout worker at once.
+`--model` takes a checkpoint directory, a `.safetensors`, an index or a `.gguf`, and serves it at its
+own precision. `config.json` (or the GGUF header) is the metadata, the `tokenizer.json` and chat
+template beside it are the tokeniser, and `generation_config.json` gives the sampling defaults. The
+weights are read once at load, by all relayout workers in parallel.
 
-**Nothing is quantised at load.** A weight the architecture plugin reads in another encoding than
-the checkpoint holds is named at startup, and the remedy is a container with a recipe that says
-what it becomes. MiniCPM5-2B is one: OpenBMB ships it in bf16, and `llama_dense_fp8` reads fp8.
+Nothing is quantised at load. A weight the architecture plugin reads in another encoding than the
+checkpoint holds is named at startup, and needs a container with a recipe. MiniCPM5-2B is one case:
+OpenBMB ships it in bf16, and `llama_dense_fp8` reads fp8.
 
 What a container has that a checkpoint does not:
 
@@ -450,19 +511,19 @@ What a container has that a checkpoint does not:
 | a placement profile | worth about a point of expert hit rate |
 
 A GGUF is read when its architecture plugin maps llama.cpp's tensor names; the shipped plugins map
-HuggingFace's, so a model of a shipped architecture is converted from its safetensors release.
+Hugging Face's, so a model of a shipped architecture is converted from its safetensors release.
 
 ---
 
 ## 4. Serve it
 
-### 4.1 The simplest run
+### 4.1 Minimal run
 
 ```sh
-radiance --model ~/models/rad/flashnext-w4.rad
+radiance --model /srv/models/rad/flashnext-w4.rad
 ```
 
-It claims the card (less `--gpu-headroom-mib`, default 96 MiB), splits it between weights and KV
+It claims the card less `--gpu-headroom-mib` (default 96 MiB), splits it between weights and KV
 cache, loads, and serves on `http://0.0.0.0:8000`. The startup log states every budget before
 anything is allocated.
 
@@ -470,233 +531,196 @@ anything is allocated.
 radiance --model m.rad --port 8100 --host 127.0.0.1
 ```
 
-### 4.2 Look before you leap
+### 4.2 Checking the plan
 
 ```sh
 radiance --model m.rad --debug-graph
 ```
 
-Prints the entire declared graph — every op, the kernel each one resolved to, and why — then exits
-without serving. This is the first thing to run against a new container or a new kernel library.
+Prints the declared graph (every op, the kernel it resolved to, and why) and exits without serving.
+Run it first against a new container or a new kernel library.
 
 ```sh
-radiance --model m.rad --debug-selection    # just the selection table
-radiance --model m.rad --debug-placement    # just the placement plan
+radiance --model m.rad --debug-selection    # the selection table only
+radiance --model m.rad --debug-placement    # the placement plan only
 ```
 
-### 4.3 Memory: how the card gets split
+### 4.3 Memory: how the card is split
 
-The card is split into **resident weights** and the **paged KV pool**, and the engine derives the
-split from the card and the model; no flag states either pool. What you move are its inputs:
-`--gpu-headroom-mib` leaves card space alone, `--max-model-len` and `--max-num-seqs` bound the
-cache, and `--host-pool-mib` decides which experts must stay on the card. The startup receipt
-prints every term. On a machine with no visible card (the host backend) half of RAM stands in for
-the card and is split the same way; the weights pool is then host memory, holding the weights a
-host kernel cannot read where the container stores them.
+The card is split into resident weights and the paged KV pool. The engine derives the split from the
+card and the model; no flag states either pool. Its inputs: `--gpu-headroom-mib` leaves card space
+alone, `--max-model-len` and `--max-num-seqs` bound the cache, and `--host-pool-mib` decides which
+experts must stay on the card. The startup receipt prints every term. With no visible card (the host
+backend) half of RAM stands in for the card and is split the same way; the weights pool is then host
+memory, holding the weights a host kernel cannot read where the container stores them.
 
-The non-expert weights come off the top of what is claimed. The rest — the `elastic` line of the startup receipt — is shared by
-the expert slab and the KV cache, and no flag divides it:
+The non-expert weights come off the top. The rest (the receipt's `elastic` line) is shared by the
+expert slab and the KV cache:
 
-- **The cache lends** under `--placement auto` or `expert_tiered`, without `--deterministic`, on a
-  device with virtual memory management. The experts keep on the card exactly what the pinned host
-  pool (`--host-pool-mib`) cannot hold, plus one expert unit of packing slack; they have nowhere
-  else to be. The cache takes everything else, up to what it could ever address
-  (`--max-num-seqs` x `--max-model-len`), and every block no live request holds is lent back to the
-  expert slab in place. The prefill staging region comes out of the cache's side.
-- **Without a lender** — `--deterministic`, a stated `--placement all_vram` or `layer_offload`, or
-  no virtual memory management — a block the cache does not use would sit empty, so the experts
-  come first and the cache keeps one `--max-model-len` sequence.
+- **With a lending cache** (`--placement auto` or `expert_tiered`, no `--deterministic`, a device
+  with virtual memory management), the experts keep on the card what the pinned host pool cannot
+  hold, plus one expert unit of packing slack. The cache takes the rest, up to what it could ever
+  address (`--max-num-seqs` x `--max-model-len`), and lends every block no live request holds back
+  to the expert slab in place. The prefill staging region comes out of the cache's side.
+- **Without a lender** (`--deterministic`, an explicit `--placement all_vram` or `layer_offload`, or
+  no virtual memory management), the experts come first and the cache keeps one `--max-model-len`
+  sequence.
 
 The cache never gets less than one `--max-model-len` sequence, and when both sides fit, both are
-whole. With a lending cache, `--host-pool-mib` is what moves the split: a larger pool takes experts
-off the card and gives the cache more.
+whole. With a lending cache, a larger `--host-pool-mib` takes experts off the card and gives the
+cache more.
 
-**The next layer's experts are fetched ahead at decode.** The experts kept only in the pinned host
-pool are read across the link by the routed GEMMs that need them, while those GEMMs run. At each
-routed layer of a decode pass of up to 16 rows, the engine applies the *next* routed layer's router
-to this layer's router input -- it predicts that layer's choice well -- and the card's second DMA
-engine copies the two likeliest experts that are only in the pool onto the card while the rest of
-this layer runs. Just before the next layer's GEMMs, their weight tables point at the copies that
-have landed, so those GEMMs read them from VRAM. A copy holds the bytes of the pool slot it was made
-from, so this changes no output; a copy that lands late is not used. It is on wherever the pool
-holds experts (`--placement expert_tiered` or `auto`), off under `--deterministic` and where the
-device backend has no second DMA engine, and the startup log says which (`expert prefetch on` /
-`off`). It costs one hardware queue and a ring of six expert units on the card, both in the VRAM
-receipt (`hardware queues`, `expert prefetch`).
+**Next-layer expert prefetch.** Experts held only in the pinned host pool are read across the link by
+the routed GEMMs that need them. At each routed layer of a decode pass of up to 16 rows, the engine
+applies the next routed layer's router to this layer's router input, which predicts that layer's
+choice well, and the card's second DMA engine copies the two likeliest pool-only experts onto the
+card while the layer runs. The next layer's GEMMs read the copies that have landed from VRAM; a copy
+holds the pool slot's bytes, so outputs do not change, and a late copy is not used.
 
-It pays only where the steps use enough of what it copies, so it measures that: every 2048
-predictions it looks at the share of its copies the steps routed, and under 30% it rests -- no
-prediction, no copy -- for 8192 passes before measuring again (`expert prefetch resting`, once, in
-the log). On Qwen3.8-Flash-Next at `--tp 1` with the `flashnext-tp1` flags the steps use about half
-of the copies, and the decode step goes from 29.0 to 28.0 ms at one sequence and from 101.3 to 95.3
-ms at four. At `--tp 2` each card keeps most of its experts and the pool holds the ones the steps
-rarely route; under a quarter of the copies were used, it was a loss, and the prefetch rests there.
+It is on wherever the pool holds experts (`--placement expert_tiered` or `auto`), and off under
+`--deterministic` or without a second DMA engine; the log says which (`expert prefetch on` / `off`).
+It costs one hardware queue and a ring of six expert units on the card (receipt lines `hardware
+queues` and `expert prefetch`). Every 2048 predictions it checks the share of its copies the steps
+routed; under 30% it rests (no prediction, no copy) for 8192 passes and logs `expert prefetch
+resting` once. On Qwen3.8-Flash-Next at `--tp 1` with the `flashnext-tp1` flags about half the
+copies are used, and the decode step goes from 29.0 to 28.0 ms at one sequence and from 101.3 to
+95.3 ms at four. At `--tp 2` each card keeps most of its experts, under a quarter of the copies are
+used, and the prefetch rests.
 
-**An uneven world re-splits its cheaper ranks.** The split above is worked out once, for the rank
-whose cache costs most, and one block table serves every rank. Where a rank's cache costs less per
-token -- an attention-zero rank at `--tp 3` keeps no attention cache -- it gets, under
-`expert_tiered`, a KV pool that pages exactly the common token count and the
-difference in its weights pool, up to every one of its weights resident; the startup log names the
-rank and both sizes (`kv: rank N's cache costs ...`). It holds with or without a lending cache:
-under `--deterministic`, or on a device without virtual memory management, the bytes that rank
-would never page go to its experts all the same. A rank whose cache costs as much per token as the dearest
-rank's is never re-split -- which at `--tp 2` and `--tp 4` is every rank. A rank that costs less and
-keeps the common split says why on the same `kv: rank N's cache costs ...` line. Every rank still
-allocates its whole `--host-pool-mib`, a re-split rank whose weights all fit on the card included,
-and that rank's log says its pinned host pool holds no weights ([`TP3.md`](TP3.md) §1).
+**Uneven ranks.** The split is computed for the rank whose cache costs most, and one block table
+serves every rank. A rank whose cache costs less per token (an attention-zero rank at `--tp 3` keeps
+no attention cache) gets, under `expert_tiered`, a KV pool that pages exactly the common token count,
+and the difference goes to its weights, up to all of them resident, with or without a lending cache.
+The log names the rank and both sizes (`kv: rank N's cache costs ...`), or says on the same line why
+a cheaper rank kept the common split. At `--tp 2` and `--tp 4` every rank costs the same and nothing
+is re-split. Every rank still allocates its whole `--host-pool-mib`; a re-split rank whose weights
+all fit on the card logs that its pinned host pool holds no weights ([`TP3.md`](TP3.md) §1).
 
-**The cache's size decides whether multi-turn works.** The KV side is not only concurrency: prefix
-caching holds a finished sequence's blocks so the next turn can reuse them. When the pool cannot
-hold the *live sessions*, the cache drops prefixes the next turn wanted and that turn re-prefills
-its whole context. At long contexts that is two orders of magnitude of time-to-first-token.
-Measured on Qwen3.8-Flash-Next at a 200K context with two ~184K-token sessions and byte-identical
-text, the second turn took 173.0 s at a 0.0% prefix hit with a pool that could not hold both
-sessions, and 3.0 s at 99.0% with one that could. The fall-off is sharp, and `kv_util` shows a
-pool approaching it.
+**Cache size and multi-turn.** Prefix caching holds a finished sequence's blocks for the next turn.
+When the pool cannot hold the live sessions, it drops prefixes the next turn wanted and that turn
+re-prefills its whole context. On Qwen3.8-Flash-Next at a 200K context with two ~184K-token sessions,
+the second turn took 173.0 s at a 0.0% prefix hit with a pool too small for both sessions, and 3.0 s
+at 99.0% with one large enough. The fall-off is sharp; `kv_util` shows a pool approaching it.
 
-To size it yourself: work out what a token of context costs across **all** paged groups for your
-model (the startup log prints this), multiply by the context you actually serve, multiply by the
-sessions you want live at once, and compare that with the cache the receipt reports. The cache
-already has everything the experts can do without; a larger `--host-pool-mib` (RAM permitting) or
-`--kv-cache-dtype fp8` gives it more.
+To size it: multiply what a token of context costs across all paged groups (the startup log prints
+it) by the context you serve and by the sessions you want live at once, and compare with the cache
+the receipt reports. The cache already has everything the experts can spare; a larger
+`--host-pool-mib` (RAM permitting) or `--kv-cache-dtype fp8` gives it more. For example, on
+Qwen3.8-Flash-Next two paged groups share one token axis, `kv_attn` at 26.00 KiB and `kv_qsa_bkey` at
+3.25 KiB per 4-token block, so a token costs 7.32 KiB and a 200K-token sequence 1.43 GiB. A
+prefix-cached session occupies about 1.8x its context in pool tokens, so two live 184K sessions need
+~662K pool tokens.
 
-Worked, on Qwen3.8-Flash-Next: two paged groups share one token axis — `kv_attn` at 26.00 KiB and
-`kv_qsa_bkey` at 3.25 KiB per 4-token block — so a token of context costs **7.32 KiB**, and a
-200K-token sequence is 1.43 GiB. A prefix-cached session occupies roughly 1.8x its context in pool
-tokens, so two live 184K sessions want ~662K pool-tokens. That is the number the KV side has to
-clear.
-
-What is claimed is not all of the card. The **activation arena** — scratch for the largest step
-the engine may run — is taken off the budget *before* it is split, so it is paid for by both
-sides. It grows with `--max-num-batched-tokens`, which is why raising the prefill chunk costs
-resident experts (§4.5).
-
-**Most of the arena is lent back while the steps are small.** A decode step is a few dozen rows
-of the 2048 a prefill chunk carries, so the engine asks the architecture plugin to declare its
-activations again at smaller step sizes (the decode rows rounded up to a power of two and at least
-256, then four times that, up to the step budget) and packs each into the bottom of the arena. While the recent steps fit a smaller size, the top of the arena holds expert
-weights; the first step that needs more takes it back before it runs — a change of address for
-the units there, not a copy. Startup prints what each size lends (`activation arena: lends ...`).
-A plugin opts in (`RadArchProbe::shape_probe_ok`); one that does not keeps its whole arena.
+**The activation arena**, scratch for the largest step the engine may run, comes off the budget
+before the split, so both sides pay for it. It grows with `--max-num-batched-tokens`, which is why a
+larger prefill chunk costs resident experts (§4.5). While steps are small most of it is lent back: the
+architecture plugin declares its activations again at smaller step sizes (the decode rows rounded up
+to a power of two, at least 256, then each level 4x the one below, up to the step budget), each packed
+into the bottom of the arena. While recent steps fit a smaller size, the top of the arena holds expert
+weights; the first larger step takes it back before it runs (an address change, not a copy). Startup
+prints what each size lends (`activation arena: lends ...`). A plugin opts in with
+`RadArchProbe::shape_probe_ok`; one that does not keeps its whole arena.
 
 Related flags:
 
 ```sh
---gpu-headroom-mib 96      # VRAM left unclaimed on every card
---kv-cache-dtype fp8       # halve what a token of context costs (a real quantisation)
---host-pool-mib 8192       # pinned host tier for weights
---embedding-placement vram  # keep the token embedding on the card (below)
---ngram-placement ram       # an n-gram table in RAM instead of read from disk (below)
+--gpu-headroom-mib 96         # VRAM left unclaimed on every card
+--kv-cache-dtype fp8          # halve what a token of context costs (a real quantisation)
+--host-pool-mib 8192          # pinned host tier for weights
+--embedding-placement vram    # keep the token embedding on the card (below)
+--ngram-placement ram         # an n-gram table in RAM instead of read from disk (below)
 --vision-tower-placement ram  # the encoder towers in host memory, their VRAM to the KV cache (below)
---weights-disk-tier       # stream what fits neither from the container; needs O_DIRECT
+--weights-disk-tier           # stream what fits neither from the container; needs O_DIRECT
 ```
 
-**Two lookup tables have a placement of their own**, because a step reads only M of their rows and
-never the whole table, so a tier below the card serves them at little or no cost:
+**Lookup tables.** A step reads only M rows of a lookup table, so a tier below the card serves it
+cheaply. Two have their own placement:
 
 | | `vram` | `ram` | `disk` |
 |---|---|---|---|
 | `--embedding-placement` | on the card, with the other weights | pinned host memory of its own, read over the link in place (the default) | refused |
 | `--ngram-placement` | on the card, every card holding all of it | a copy in RAM made at load, read by the card over the link | read from the container through a row cache |
 
-The embedding defaults to `ram`; the n-gram table defaults to `auto`, the fastest tier that has
-room once every other weight is placed. Startup prints what each resolved to and why. A tier the
-flag names that cannot be honoured stops the server with the reason.
+The n-gram table defaults to `auto`, the fastest tier with room once every other weight is placed.
+Startup prints what each table resolved to and why; a named tier that cannot be honoured stops the
+server with the reason.
 
-**The token embedding** is the largest model-level weight a dense model has -- 248320 x 5120 in bf16
-is 1.18 GiB a card at `--tp 2`. By default (`ram`) it is pinned in host memory of its own, every
-rank its own shard, on top of `--host-pool-mib` -- the experts' pool keeps all of that -- and the
-lookup reads a step's rows over the link in place, so the table costs no VRAM and the KV pool and
-the experts get its share. The table is found by what reads it: a model-level weight only
-`embed_lookup` reads. A head tied to it is read by a GEMM too and is never moved, since it would
-stream whole every step, so such a model keeps it on the card; so does a host that cannot pin it
-(available memory and memory cgroups, after the pools, with 4 GiB to spare). Startup says which
-and why. Naming `ram` turns either case into a refusal; `vram` keeps the table on the card.
-`disk` is refused: the lookup writes activations the card reads, and a host kernel reading the
-container cannot write them.
+*The token embedding* is a dense model's largest model-level weight: 248320 x 5120 in bf16 is 1.18
+GiB a card at `--tp 2`. Under `ram` each rank pins its own shard in host memory on top of
+`--host-pool-mib`, and the lookup reads a step's rows over the link, so the table costs no VRAM. The
+table is the model-level weight only `embed_lookup` reads. A model whose head is tied to it keeps it
+on the card (the head's GEMM would stream it whole every step), and so does a host that cannot pin
+it (available memory and memory cgroups, after the pools, with 4 GiB to spare); startup says which.
+An explicit `ram` turns either case into a refusal. `disk` is refused: the lookup writes activations
+the card reads, which a host kernel reading the container cannot do.
 
 ```sh
 radiance --model m.rad --tp 2 --embedding-placement vram   # the table on the cards
 ```
 
-**The encoder towers** -- a vision tower, and an audio encoder where a model has one -- are read
-once an image, a clip or a recording, never on a text step. On the card (`vram`, the default) they
-are weights like any other and the KV pool is carved from what is left: Qwen3.8-27B's vision tower
-is 0.86 GiB a card, about 24,000 tokens of fp8 context. `--vision-tower-placement ram` pins them in
-host memory of their own, every rank a whole tower, on top of `--host-pool-mib`, and their kernels
-read the weights over the link in place: that VRAM goes to the KV cache, and every image costs one
-read of the tower over the link (about 55 ms for 0.86 GiB on PCIe 4.0 x16). Text-only requests do
-not touch it. A tower is every weight the model's architecture declares read once per request.
-`ram` is refused, naming the reason, where the model has no tower, where `--mm-max-patches 0`
-declared none, or where the host cannot pin it.
+*The encoder towers* (vision, and audio where a model has one) are read once per image, clip or
+recording, never on a text step. Under `vram`, the default, they are ordinary weights: Qwen3.8-27B's
+vision tower is 0.86 GiB a card, about 24,000 tokens of fp8 context. `--vision-tower-placement ram`
+pins a whole tower per rank in host memory, on top of `--host-pool-mib`, and its kernels read the
+weights over the link. That VRAM goes to the KV cache, and each image costs one read of the tower
+over the link (about 55 ms for 0.86 GiB on PCIe 4.0 x16). A tower is every weight the architecture
+declares read once per request. `ram` is refused, with the reason, where the model has no tower,
+where `--mm-max-patches 0` declared none, or where the host cannot pin it.
 
 ```sh
 radiance --model qwen3.8-27b-fp8.rad --tp 1 --vision-tower-placement ram
 ```
 
-**An n-gram table** (Qwen3.8-Flash-Next's is 47.7 GiB) is read a few rows a token, which is why it
-can live off the card at all. `disk` reads its rows from the container through a row cache and
-direct reads on the host; about half of a step's rows are first-seen, so steps wait on the drive.
-`ram` copies the whole table into host memory at load -- 12 to 40 s more startup, depending on the
-page cache -- and every gather reads memory: the card's own gather kernel reads a pinned copy over
-the link, so a step has no host work in it at all. `vram` puts it on the card, every card holding
-all of it, which needs a card that large. `ram` needs the table's size in memory after the pinned
-host pools and the prefix cache's host tier, with 4 GiB to spare, and room under every memory cgroup
-the process sits in; it refuses the start short of either and names which. `auto` takes the first
-of `vram`, `ram` and `disk` that holds the table. Without a device kernel for the gather (a build
-with no libr4d), the table is read on the host: `vram` is refused, and `ram` is a copy in locked
-huge pages, which also needs a memlock limit that large (`--ulimit memlock=-1` in Docker,
-`LimitMEMLOCK=infinity` under systemd).
+*An n-gram table* (Qwen3.8-Flash-Next's is 47.7 GiB) is read a few rows a token. `disk` reads rows
+from the container through a row cache with direct reads on the host; about half of a step's rows
+are first-seen, so steps wait on the drive. `ram` copies the table into host memory at load (12 to
+40 s more startup, depending on the page cache) and the card's gather kernel reads the pinned copy,
+so a step has no host work. `vram` puts all of it on every card. `ram` needs the table's size free
+after the pinned host pools and the prefix cache's host tier, with 4 GiB to spare, under every
+memory cgroup the process sits in, and refuses the start otherwise. `auto` takes the first of `vram`,
+`ram` and `disk` that holds the table. Without a device kernel for the gather (no libr4d) the table is
+read on the host: `vram` is refused, and `ram` is a copy in locked huge pages, which also needs a
+memlock limit that large (`--ulimit memlock=-1` in Docker, `LimitMEMLOCK=infinity` under systemd).
 
-**A model larger than the card and the host pool together still serves with
-`--weights-disk-tier`** -- and every step is then paced by the drive, which is the trade the flag
-names. A routed expert that fits neither VRAM nor the pinned pool lives in the container and
-nowhere else; before each routed layer's first expert op, on every pass, the engine reads all of
-that layer's on-disk experts into one of two VRAM buffers (a router's picks are not known on the
-host, and a prefill chunk routes to nearly all of them anyway). The two buffers come out of the
-weight budget -- the plan report's `file buffers` line -- and the reads go through four 32 MiB
-pinned windows out of `--host-pool-mib` as long runs of the container, skipping resident experts.
-What it is for: serving a checkpoint as it ships to calibrate or compare against, not a
-production deployment. The bf16 Qwen3.8-Flash-Next (335 GiB) runs at two cards this way at about
-28 s a step, and that step costs the same at one token as at 32K, so give it large prefill steps:
+**`--weights-disk-tier`** serves a model larger than the card and the host pool together, with every
+step paced by the drive. A routed expert that fits neither lives only in the container. Before each
+routed layer's first expert op, on every pass, the engine reads all that layer's on-disk experts into
+one of two VRAM buffers (a router's picks are not known on the host, and a prefill chunk routes to
+nearly all of them). The buffers come out of the weight budget (the plan's `file buffers` line), and
+the reads go through four 32 MiB pinned windows out of `--host-pool-mib`, as long runs that skip
+resident experts. It is meant for running a checkpoint as shipped, to calibrate or compare against.
+The bf16 Qwen3.8-Flash-Next (335 GiB) runs on two cards at about 28 s a step, the same at one token as
+at 32K, so use large prefill steps:
 
 ```sh
-rad-convert ~/models/Qwen/Qwen3.8-Flash-Next -o flashnext-bf16.rad --max-ctx 4096   # no recipe: bf16
+rad-convert /srv/models/Qwen/Qwen3.8-Flash-Next -o flashnext-bf16.rad --max-ctx 4096   # no recipe: bf16
 radiance --model flashnext-bf16.rad --tp 2 --placement expert_tiered --weights-disk-tier \
     --host-pool-mib 12288 --deterministic --gpu-headroom-mib 768 \
     --max-num-seqs 32 --max-num-batched-tokens 32768 --num-speculative-tokens 0
 ```
 
-A production server leaves the flag off, so a budget that does not fit is refused at startup
-rather than served from the drive.
+Without the flag, a budget that does not fit is refused at startup.
 
-**The KV pool is elastic on every run and there is no flag for it.** It holds the blocks it is
-actually using plus a buffer it derives — one prefill chunk, or the largest shortfall the
-admission path has met in the last few seconds, whichever is larger — and the expert plane grows
-into whatever it releases. A pool that held every block it was carved for whether or not a token
-was in it would, on a model whose experts do not fit, stream weight over the link for the whole
-run to pay for cache nobody is using.
+**The KV pool is always elastic.** It holds the blocks in use plus a buffer (one prefill chunk, or
+the largest shortfall admission met in the last few seconds, whichever is larger), and the expert
+plane grows into what it releases, so a model whose experts do not fit never streams weights to pay
+for unused cache.
 
-What it leans on is `--gpu-headroom-mib`. That reserve is what the card keeps for allocations
-this engine does not make — chief among them a kernel's code object, which HIP loads on the
-kernel's *first launch*, not at startup. A card with too little of it left collides with the
-first kernel that has never run: a draft head's, a sampler chain's, whatever the early requests
-did not reach. It fails its load and faults inside the HIP runtime, which arrives as a segfault in
-a kernel that is correct, on a server that had been serving fine.
+**Headroom.** `--gpu-headroom-mib` is kept for allocations the engine does not make, chiefly a
+kernel's code object, which HIP loads at the kernel's first launch. With too little left, the first
+kernel that has never run (a draft head's, a sampler chain's) fails its load and faults inside the
+HIP runtime: a segfault in a correct kernel on a server that had been serving.
 
-Startup checks what is left once everything is allocated (`card N settled at ... free`). Memory
-taken after the budget read the card — another process on it, such as a desktop, or a driver
-allocation — comes out of the headroom, and the line says how much. It warns only when the room
-left for first launches is under the 96 MiB the engine allows for its own, and then names the
-`--gpu-headroom-mib` value that clears it: what is left rises one for one with the flag, so that
-value is a fixed point. A larger headroom that lost part of itself to another process is reported
-on the INFO line and not warned.
+Once everything is allocated, startup logs `card N settled at ... free`. Memory taken after the budget
+read the card (another process such as a desktop, or a driver allocation) comes out of the headroom,
+and the line says how much. It warns when the room left for first launches is under the 96 MiB the
+engine allows for its own, naming the `--gpu-headroom-mib` value that clears it (what is left rises
+one for one with the flag); a larger headroom that lost part of itself is reported at INFO.
 
-What the engine itself allocates after the card is read is charged before the split, so it never
-comes out of the headroom: the step staging, the KV tiers' copy staging, and its hardware queues.
-A queue costs more than its ring — the driver backs each one with VRAM of its own, 33 MiB on an
-R9700 — so startup measures one and the receipt's `hardware queues` line shows how many a card
-holds at that price.
+What the engine allocates after reading the card is charged before the split, not to the headroom:
+the step staging, the KV tiers' copy staging and the hardware queues. The driver backs each queue
+with VRAM beyond its ring (33 MiB on an R9700), so startup measures one and the receipt's `hardware
+queues` line shows the count and price.
 
 ### 4.4 Long context
 
@@ -704,42 +728,37 @@ holds at that price.
 radiance --model m.rad --max-model-len 200000 --kv-cache-dtype fp8 --max-num-seqs 8
 ```
 
-`--max-model-len` does not reserve anything per request — it sets the worst case the pool is sized
-against. `0` takes the model's training context.
+`--max-model-len` reserves nothing per request; it is the worst case the pool is sized against. `0`
+takes the model's training context.
 
-`--kv-cache-dtype fp8` is an E4M3 cache with per-(sequence, head) descales. It halves what a token
-of context costs, which at a production context is most of the pool. It is a real quantisation and
-the model computes a slightly different function with it, so it is stated rather than inferred.
-Every architecture serves both widths, and the flag sets every attention cache of the deployment —
-a drafter's (DSpark, DFlash2) as well as the trunk's. The delta-net state and the QSA indexer's
-key tail are recurrent state rather than an attention cache and keep their own widths.
+`--kv-cache-dtype fp8` is an E4M3 cache with per-(sequence, head) descales. It halves what a token of
+context costs, which at a production context is most of the pool. It is a real quantisation that
+changes the output slightly, so it is only ever set explicitly. Every architecture serves both
+widths, and the flag sets every attention cache of the deployment, a drafter's (DSpark, DFlash2)
+included. The delta-net state and the QSA indexer's key tail are recurrent state and keep their own
+widths.
 
-**Many sequences against a long context.** `--max-num-seqs` runs to 32 on every model here, and
-what it costs is not context — a sequence holds only the blocks its tokens occupy — but what exists
-per sequence whether it is used or not:
+**Many sequences.** Every model here serves `--max-num-seqs` up to 32. A sequence holds only the
+blocks its tokens occupy, but two costs exist per sequence regardless:
 
-- **Recurrent state.** On a hybrid model every sequence owns its delta-net state, and with
-  speculation two copies of it. Qwen3.8-Flash-Next keeps 54 MiB a copy on each card, so 32
-  sequences take 3.4 GiB of the cache share before a single token is cached. The 27B in bf16,
-  with no experts to give way, then holds about 117K tokens of attention cache, less than one 200K
-  request, and startup warns that a longer one would be refused. The 27B in FP8 holds 2.8
-  full-length sessions at 32, the 35B-A3B ten.
-- **Block tables.** The step batch's tables are carved for every sequence at the full context.
-  They are charged to the VRAM budget (`step staging` in the startup receipt), so they come out of
-  the cache share and not out of `--gpu-headroom-mib`.
+- **Recurrent state.** On a hybrid model every sequence owns its delta-net state, two copies with
+  speculation. Qwen3.8-Flash-Next keeps 54 MiB a copy on each card, so 32 sequences take 3.4 GiB of
+  the cache share. The 27B in bf16, with no experts to give way, then holds about 117K tokens of
+  attention cache, less than one 200K request, and startup warns that a longer one would be refused.
+  The 27B in FP8 holds 2.8 full-length sessions at 32, the 35B-A3B ten.
+- **Block tables.** The step batch's tables are carved for every sequence at the full context and
+  charged to the VRAM budget (`step staging` in the receipt), so they come out of the cache share.
 
-The startup line `the pool backs N% of the worst case ... M full-length sessions` counts only the
-part of the pool that holds context, so M is the number to compare with the sessions you expect
-to keep live. With `--tp-wire wht6`, a decode step above the row count startup names is
-all-reduced lossily like a prefill chunk, which a busy step reaches: at 8 sequences and depth 3,
-Flash-Next's decode steps are already over it.
+The line `kv: the pool backs N% of the worst case ... M full-length sessions` counts only the part of
+the pool that holds context; compare M with the sessions you expect to keep live. With `--tp-wire
+wht6`, a decode step above the row count startup names is all-reduced lossily like a prefill chunk;
+at 8 sequences and depth 3, Flash-Next's decode steps are above it.
 
-### 4.5 Prefill speed: the chunk
+### 4.5 Prefill chunk size
 
-A long prompt is prefilled in chunks, and `--max-num-batched-tokens` is how big one is. It is the
-single biggest lever on time-to-first-token on a mixture-of-experts model, because a chunk sweeps
-the whole expert plane once however many tokens are in it — so four times the chunk is a quarter
-of the sweeps.
+A long prompt is prefilled in chunks of at most `--max-num-batched-tokens`. On a mixture-of-experts
+model this is the largest lever on time to first token: a chunk sweeps the whole expert plane once
+however many tokens it carries.
 
 ```sh
 radiance --model m.rad --max-num-batched-tokens 2048
@@ -749,92 +768,141 @@ On a 48-layer MoE at 200K context on two cards, prompts of 8K and 24K tokens:
 
 | chunk asked for | 512 | 1024 | **2048** | 4096 |
 |---|---|---|---|---|
-| chunk actually run | 512 | 1024 | **2048** | 2048 |
+| chunk run | 512 | 1024 | **2048** | 2048 |
 | prefill | 1750 tok/s | 2200 | **2706** | 2620 |
 
-At full context the same change is the difference between waiting and waiting a lot: a
-185,253-token prompt prefills in **91 s at a 2048 chunk against 138 s at 512**.
+A 185,253-token prompt prefills in 91 s at a 2048 chunk and 138 s at 512.
 
-**The 4096 column is the trap, and the engine warns about it.** On a hybrid model the chunk is
-clamped to `--checkpoint-interval` (2048 by default) *before* the token budget, so asking for 4096
-runs 2048 chunks and pays for 4096 anyway: the activation arena grows with the budget and is
-charged to the VRAM budget *before* it is split between weights and KV, so the expert plane loses
-residency for a chunk it never got. Startup prints which of the two bound it:
+**The checkpoint interval caps the chunk.** On a hybrid model a prompt's chunk is clamped to
+`--checkpoint-interval` (default 2048) before the token budget, so asking for 4096 runs 2048-token
+chunks with an activation arena sized for 4096, and the expert plane loses residency for a chunk it
+never gets (§4.3). Startup prints which bound applies:
 
 ```
 chunk geometry: quantum 64 (attn block ..., state chunk ...), checkpoint interval 2048,
 max_tok 4096 -> prefill chunks of at most 2048 (the checkpoint interval, not the budget)
 ```
 
-Read that line, and `RADIANCE_LOG_STEPS=1` prints the token count of every step if you want to see
-it per step.
+`RADIANCE_LOG_STEPS=1` prints the token count of every step. Raising both
+(`--max-num-batched-tokens 4096 --checkpoint-interval 4096`) runs 4096 chunks but gave 2610 tok/s
+against 2748, because the arena took another 239 resident experts (9219 to 8980). Where prefill is
+bound by the link carrying non-resident experts, a larger chunk stops paying once it costs residency.
 
-Raising both — `--max-num-batched-tokens 4096 --checkpoint-interval 4096`, which does run 4096
-chunks — does not help either: 2610 tok/s against 2748, because the arena takes
-another 239 resident experts (9219 to 8980) and the extra amortisation does not pay for them. On
-a model whose prefill is bound by the link carrying non-resident experts, the chunk stops winning
-as soon as it starts costing residency.
+A longer chunk holds the device longer per step, but the prefill a decode step waits behind finishes
+sooner: four decoders with a long prompt beside them finished in 29.5 s at a 2048 chunk and 31.9 s at
+512.
 
-**It does not cost the requests already running.** A longer chunk holds the device longer per
-step, so a decode step queued behind one waits longer — but the prefill it is queued behind
-finishes sooner, and that is the larger term. Four decoders with a long prompt landing beside
-them finished in 29.5 s at a 2048 chunk against 31.9 s at 512.
+**Decoders beside a chunk: `--prefill-interleave N`.** A step that carries a chunk takes the
+chunk's time, and every sequence decoding beside it waits that long for its next token. With
+`--prefill-interleave 2`, after a step that carried a chunk while other sequences were decoding,
+the next two steps carry decode rows only and admit nothing, then the next chunk is scheduled. The prompt's time to first token grows by those steps and the
+decoders keep their cadence. A lone prefill is not held, nor is the step after a prompt's last
+chunk. `0` (the default) schedules as before. `/stats` counts the decode-only steps the hold
+inserted as `steps_held`, `/metrics` as `radiance:engine_steps_held_total`.
 
-**Nor does a long prefill lock out the work behind it** (`--busy-prefill-chunk`, default `auto`).
-A chunk used to take every token the step had left, so for the whole of a long prompt's prefill —
-a minute or more at 256K — a decode row behind it in the batch got no rows and a request that
-arrived was not even admitted: a mostly-cached turn that needed a few hundred tokens waited for
-somebody else's prompt to finish. Now, when other work is pending in a step, the chunk leaves it
-room: one row plus the draft window for every decode row behind it, and a share of the budget
-(an eighth, at least one quantum) for each prefill behind it and for the next request waiting to
-start. It never drops under the smallest step the prefill stager overlaps (1025 tokens by
-default), because under that every routed layer reads its pooled experts synchronously and the
-prefill slows far more than the shared step saves; and where holding a chunk back for a waiting
-request or another prefill would leave a short remainder before the checkpoint boundary, the
-interval is split into two staged halves instead. Decode rows alone only take their few tokens: the
-chunk ends a quantum short of the boundary and the next step finishes it, the same pair of steps a
-prefill already runs when decode rows are ahead of it. A prompt with nothing beside it is planned exactly as before. `off` restores the old
-behaviour; `--busy-prefill-chunk N` holds a shared chunk to N tokens (the startup line warns when
-N is under the stager's step). `radiance:engine_prefill_chunks_capped_total` counts the chunks
-held back.
+**A prefill alone in its step can carry several intervals** (`--prefill-span N`, default 1). A
+chunk ends on every checkpoint interval, so a prompt is otherwise prefilled one interval a step.
+With
 
-**And check it did not cost you the prefix cache.** The arena it grows is charged before the
-split (§4.3), so the KV pool shrinks a little — here 516,864 → 499,920 pool tokens, 3.3% — and
-§4.3's cliff is sharp enough that 3% is worth confirming rather than assuming. On this shape it
-costs nothing: two ~180K sessions, first turns back to back, then the first session's second turn.
+```sh
+radiance --model m.rad --max-num-batched-tokens 4096 --prefill-span 2
+```
 
-| chunk | session A turn 1 | session B turn 1 | A turn 2 | cached | evictions |
-|---|---|---|---|---|---|
-| 512 | 137.7 s | 130.0 s | 1.42 s | 178,176 of 179,585 | 0 |
-| 2048 | **90.6 s** | **93.2 s** | **0.97 s** | 178,176 of 179,585 | 0 |
+a prefill that is alone in its step carries up to N intervals a step, from the prompt's second
+interval on (the first is never spanned). Every other step -- one with decode rows, another prefill,
+or a request waiting to be admitted -- is planned at the shared budget, `--max-num-batched-tokens`
+less the extra intervals (here 2048), as without the span, `--busy-prefill-chunk` included. The
+checkpoints at a span's end and at a prompt's tail are written where a span of 1 writes them, so a
+follow-up turn resumes where it did. Startup states both budgets:
 
-Identical hit, no evictions, `kv_util` 0.70 → 0.73. Turn one is 34% faster and turn two stays
-where it was. Do this on your own shape before you keep the change: `prefix_hit_rate` and
-`prefix_evictions` on `/stats` are the two numbers, and the failure looks like turn two taking
-as long as turn one.
+```
+chunk geometry: a prefill alone in its step spans up to 2 intervals from its second interval on;
+every other step is planned at 2048 tokens
+```
 
-**What it does cost is decode, and it is small.** The 239 resident experts the arena takes have to
-come from somewhere, and steady-state decode is where. Decode step time from `scripts/cstep2.sh`,
-which divides by the decode step counter rather than by wall clock, two passes each, generations
-long enough that no sequence retires inside the window:
+Flash-Next (`qwen4exp_fp8`) runs a spanned step in pieces of one MoE pass (2048 rows): every
+connection read takes a pass, and the indexer's score plane stays a pass tall and is scored in
+windows. Above two ranks the step is also pipelined: everything row-local runs a pass at a time and
+every all-reduce goes out on the second lane, beside the other piece's work (at TP4 a chunk's 97
+tiered-int8 all-reduces are about a quarter of its time). Each piece then computes what a 2048-token
+chunk computes, so at the default `--checkpoint-interval 2048` greedy output is that of
+`--max-num-batched-tokens 2048`. At two ranks the gated residual's fused write takes every
+all-reduce, so a spanned step runs as one wider step; there, at one rank, and on every other
+architecture, a spanned step is a wider chunk and may differ from 2048 chunks at tie level.
 
-| chunk | one stream | eight streams |
+On Flash-Next (`fp8-iq4r-moe`, R9700 at 215 W, fp8 KV, MTP 3, `--tp-wire wht6`), the change in time
+to the first token of one prompt, `--max-num-batched-tokens 4096 --prefill-span 2` against
+`--max-num-batched-tokens 2048`:
+
+| prompt | TP4, all_vram | TP2, expert_tiered, 12 GiB host pool |
 |---|---|---|
-| 512 | 22.35 / 22.29 ms/step | 39.52 / 40.52 ms/step |
-| 2048 | 22.42 / 22.48 ms/step | 39.52 / 40.73 ms/step |
+| 2K | +0.4 % | -6.1 % |
+| 8K | +4.1 % | -1.0 % |
+| 18K | +8.0 % | +2.3 % |
+| 64K | +9.3 % | +9.0 % |
+| 250K | +8.8 % | +49.1 % |
 
-**+0.6% on a single-stream decode step**; at eight streams the difference is 0.11 ms, below what
-the harness resolves. Against a prefill that is 55% faster and a first turn that goes from 138 s
-to 91 s, that is the right side of the trade — but it is a real cost and it lands on every turn,
-so measure it on your own shape rather than taking the sign on faith.
+A positive figure is a shorter time. The gain depends on the box and the container: on another
+2x R9700 at 210 W serving the w4nl64 Flash-Next container at TP2 (`expert_tiered`, 12 GiB host
+pool), the same span took 2.61 s against 2.56 s to the first token of an 18K-token prompt and
+10.72 s against 10.55 s at 75K, and `--max-num-batched-tokens 8192 --prefill-span 4` took 3.30 s
+and 10.82 s. Measure the prompts you serve before turning it on at two ranks.
 
-**Changing it changes the text.** A different chunk is a different batch shape, so the sums inside
-a prefill run in a different order, and at a tie that is a different token. A fixed prompt at a
-fixed seed gives one answer at 512 and a different one at 2048, and each is byte-identical across
-runs and server restarts at its own setting. Reproducibility holds *at a configuration*, which is what it claims; this flag is part of the
-configuration in the same way `--tp` and `--num-speculative-tokens` are. Pin it before you record
-anything you intend to compare against later.
+What it costs:
 
+- **The checkpoints inside a span are not written.** A later request that shares only part of a
+  prompt -- a long system prompt with a different question -- resumes up to one interval earlier.
+- **Activation memory.** The arena is sized for N-interval steps. On Flash-Next the largest buffer,
+  the score plane, and the connection reads' scratch stay a pass tall; at TP4 and 256K context the
+  KV pool goes from 12.42 GiB a card at a 2048 budget to 12.14 (11.53 for a 4096 budget without the
+  span).
+- **Decode steps.** The step's token, position, output and slot-map arrays are carved for the budget
+  and uploaded whole every step, so at 4096 a decode step uploads twice the bytes it does at 2048.
+- **Expert residency, where routed experts are in host memory** (`--placement expert_tiered`). The
+  span's extra rows are VRAM the expert slab does not get (320 MiB a card on Flash-Next at TP2).
+  Every step but a spanned one runs at an arena level of the shared size, which lends those rows to
+  the slab and keeps the prefill stager's ring right above its own buffers. A prefill there spans
+  only from eight intervals (16K tokens on), where the span starts to win. Startup says so:
+
+  ```
+  scheduler: --prefill-span: a prefill spans when it is 16384 tokens or longer -- routed experts
+  are read from host memory, and the arena a spanned step takes is room they lose for it
+  ```
+
+A model without an interval grid (no linear state, or window snapshots at a prompt's end, as on
+Gemma 4) spans nothing; there the flag only plans every step but a lone prefill at the shared
+budget, and startup warns.
+
+**Sharing a step** (`--busy-prefill-chunk`, default `auto`). When other work is pending, a prefill
+chunk leaves room for one row plus the draft window per decode row behind it, and a share of the
+budget (an eighth, at least one quantum) for each prefill behind it and for the next request waiting
+to start, so a long prompt (a minute or more at 256K) does not starve decode rows or admission. The
+chunk never drops under the smallest step the prefill stager overlaps (one more than the largest
+arena level, named on the startup line `prefill staging: ...`); below that every routed layer reads
+its pooled experts synchronously and the prefill slows far more than sharing saves. Where holding a
+chunk back would leave a short remainder before the checkpoint boundary, the interval is split into
+two staged halves instead. Decode rows alone take only their few tokens: the chunk ends a quantum
+short of the boundary and the next step finishes it. A prompt with nothing beside it is unaffected.
+`off` lets a chunk take the whole step; `N` holds a shared chunk to N tokens (startup warns when N is
+under the stager's step). `radiance:engine_prefill_chunks_capped_total` counts the chunks held back.
+
+**Check the prefix cache after changing the chunk.** The larger arena shrinks the KV pool (here
+516,864 to 499,920 pool tokens, 3.3%), and §4.3's cliff is sharp. With two ~180K sessions (first
+turns back to back, then the first session's second turn), a 512 chunk took 137.7 s, 130.0 s and
+1.42 s, and 2048 took 90.6 s, 93.2 s and 0.97 s; both cached 178,176 of 179,585 tokens with no
+evictions, and `kv_util` went from 0.70 to 0.73. Check your own shape with `prefix_hit_rate` and
+`prefix_evictions` on `/stats`; the failure looks like turn two taking as long as turn one.
+
+**The cost is decode.** The 239 experts the arena displaces slow steady-state decode. Measured
+with `scripts/cstep2.sh` (decode step time from the decode step counter, no sequence retiring inside
+the window), a 2048 chunk against 512 cost 0.6% of a single-stream decode step (22.3 to 22.4 ms) and
+nothing measurable at eight streams (about 40 ms).
+
+**Changing it changes the text.** A different chunk is a different batch shape, so the sums inside a
+prefill run in a different order, and at a tie that is a different token. Each setting is
+byte-identical across runs and restarts; reproducibility holds per configuration, and this flag is
+part of the configuration like `--tp` and `--num-speculative-tokens`. Pin it before recording
+anything you will compare against later.
 
 ### 4.6 Speculative decoding
 
@@ -846,153 +914,135 @@ radiance --model m.rad --num-speculative-tokens 0   # off
 radiance --model m.rad --num-speculative-tokens 3   # a stated depth
 ```
 
-There is **no `--draft-model`**. This engine loads its drafter from the container — merge one at
-conversion time with `rad-convert --draft-model DIR`, or use an MTP head that already ships inside
-the target checkpoint, which needs no flag at all. Passing `--draft-model` to the engine is an
-error that says so rather than being quietly ignored.
-
-When you measure speculation, **measure step time, not tokens per second.**
+The drafter comes from the container: merge one with `rad-convert --draft-model DIR`, or use an MTP
+head inside the target checkpoint, which needs no flag. `radiance --draft-model` is an error that
+says so. Measure speculation by step time, not tokens per second.
 
 A drafter with a sliding window over its own cache (DFlash2) keeps that cache outside the prefix
-cache, so a prefix hit leaves it with nothing to attend to for the cached part of the prompt, and
-it cannot draft until its window has slid past the hit. On the follow-up turn of a chat that is
-most of the reply. Such a hit is therefore ended one drafter window before the end of the prompt,
-at a checkpoint: the window is recomputed, which costs that much prefill, and the drafter drafts
-from the first token. The reply is the same either way. A hit whose nearest checkpoint below that
-point would give back more than two windows is kept whole. `radiance:draft_refills_total` counts
-the hits ended early and `radiance:draft_refill_tokens_total` the tokens they recomputed.
+cache, so after a prefix hit it cannot draft until its window has slid past the hit, which on a
+chat's follow-up turn is most of the reply. Such a hit is therefore ended one drafter window before
+the end of the prompt, at a checkpoint, and the window is recomputed; the reply is the same. A hit
+whose nearest checkpoint below that point would give back more than two windows is kept whole.
+`radiance:draft_refills_total` counts the hits ended early and `radiance:draft_refill_tokens_total`
+the tokens recomputed.
 
-**One depth for every request is a compromise; `--draft-window adaptive` lets the text decide.**
-Acceptance depends on the text: code and JSON keep accepting deep into the window, prose and
-summaries fall off after a position or two. With the adaptive window, `--num-speculative-tokens` is
-the ceiling and the engine keeps a smoothed acceptance per draft position for every sequence:
+**Adaptive window.** Code and JSON keep accepting deep into the window; prose falls off after a
+position or two. With `--draft-window adaptive`, `--num-speculative-tokens` is the ceiling and the
+engine keeps a smoothed acceptance per draft position for every sequence:
 
 ```sh
 radiance --model m.rad --num-speculative-tokens 6 --draft-window adaptive
 ```
 
-A serial draft head runs as many rounds as the deepest window in the step, so the depth is chosen
-for the step, not for one sequence: each step's head depth is the one that maximises the tokens all
-its sequences are expected to emit over what such a step costs. The cost is measured as the server
-runs — the time of every decode step, by its depth and by how many sequences it carried — so there
-is nothing to enter; a depth not yet measured is priced from the nearest one that was. Under that
-depth each sequence stops at the first draft that would be emitted — it and every draft before it
-accepted — less than one time in ten, so a prose reply beside a code reply does not pay verify rows
-for drafts nobody takes. The depth moves only after eight steps and for a two-percent gain, because
-every new window is a new pass shape and a new recording. A new sequence starts from what the
-sequences before it finished on, each counted once.
+A serial draft head runs as many rounds as the deepest window in the step, so the depth is chosen per
+step: the one that maximises the tokens its sequences are expected to emit over the measured cost of
+such a step (every decode step's time by depth and sequence count; an unmeasured depth is priced from
+the nearest measured one). Under that depth each sequence stops at the first draft whose chance of
+being emitted is under one in ten. The depth moves only after eight steps and for a 2% gain, since
+each new window is a new pass shape and a new recording. A new sequence starts from what earlier
+sequences finished on.
 
-The adaptive window is the serial draft head's policy. With a block drafter, with prompt lookup
-alone, or with speculation off the window stays fixed, and the server says so at startup. Prompt
-lookup proposals made when the head declines are counted in the acceptance metrics but do not move
-the head's window. At temperature 0 the text is that of a fixed depth wherever fixed depths agree
-with each other; above 0 it is distribution-exact. `radiance:draft_depth_adaptive` and
-`radiance:draft_verify_depth_total` (§6.3) show where the windows stand. The default is `fixed`.
+The adaptive window needs a serial draft head; with a block drafter, prompt lookup alone, or
+speculation off, the window stays fixed and startup says so. Prompt-lookup proposals made when the
+head declines count in the acceptance metrics but do not move the window. At temperature 0 the text
+is that of a fixed depth wherever fixed depths agree; above 0 it is distribution-exact.
+`radiance:draft_depth_adaptive` and `radiance:draft_verify_depth_total` (§6.3) show the windows.
 
-### 4.7 Two cards
+### 4.7 Multiple cards
 
 ```sh
 radiance --model m.rad --tp 2
 radiance --model m.rad --tp 2 --tp-wire wht6 --tp-wire-min-kb 128
 ```
 
-`--tp-wire` chooses the cross-rank all-reduce payload. `exact` (default) is the bf16 all-reduce.
-`wht6` accepts a lossy wire: a Walsh-Hadamard-rotated 6-bit payload, 2.4× smaller over PCIe. The
-sum a rank receives is then not the sum it would have received and nothing downstream can tell,
-which is why it is a named flag and not a heuristic.
+`--tp-wire` chooses the all-reduce payload. `exact` (default) is bf16. `wht6` is lossy: a
+Walsh-Hadamard-rotated 6-bit payload, 2.4x smaller over PCIe. The sum a rank receives is then not
+the exact sum and nothing downstream can detect it, so it is an explicit flag. `--tp-wire-min-kb` is
+the size below which messages stay exact; 128 KiB keeps single-sequence decode exact and compresses
+prefill.
 
-`--tp-wire-min-kb` is the floor below which messages are still served exactly — 128 KiB leaves
-single-sequence decode exact and compresses prefill, which is where the win is.
+At three and four ranks `wht6` selects tiered int8 over a two-shot all-reduce, both hops quantised
+(at three ranks the shards are whole 32-element groups, one uneven where the message does not
+divide), with the same floor. Eight ranks have no lossy wire; `--tp 8 --tp-wire wht6` stops at
+startup naming the all-reduce it found no kernel for, and `--tp-wire exact`. The exact wire at three,
+four and eight ranks is one-shot up to 1 MiB a message and two-shot above it, which sends
+2·(ranks−1)/ranks of the message per rank instead of (ranks−1) times it, with the same bits.
 
-At three and four ranks `wht6` selects a different lossy wire with the same floor: tiered int8
-over a two-shot all-reduce, both hops quantised (at three the shards are whole 32-element groups,
-one group uneven where the message does not divide). Eight ranks have no lossy wire, and
-`--tp 8 --tp-wire wht6` stops at startup naming the all-reduce it found no kernel for, and
-`--tp-wire exact`. The exact wire at three, four and eight ranks is one-shot up to 1 MiB a message
-and two-shot above it, which sends 2·(ranks−1)/ranks of the message per rank instead of
-(ranks−1) times it; the two produce the same bits.
+On a model with a gated residual (Qwen3.8-Flash-Next) the all-reduce runs inside the residual's
+write, with the MoE gather in front of it. At two ranks the rotated forms of `ar_hc_write` and
+`ar_gather_hc_write` produce the same bytes as the unfused chain on either wire; there `wht6` gains
+5.6–6.3% of prefill at a 2048-token chunk (20K prompt 5556 to 5908 tok/s; a 23K extension at 81K
+depth 4998 to 5278) and 1.3% of the eight-stream decode step, and one-stream decode stays exact. At
+four ranks only the exact wire has a fused form, used for decode and verify steps of up to
+`--max-num-seqs` x (1 + `--num-speculative-tokens`) rows; prefill chunks and tiered-int8 messages run
+the unfused chain.
 
-On a model with a gated residual (Qwen3.8-Flash-Next) the all-reduce rides inside the residual's
-write, with the MoE gather in front of it. At two ranks that holds on either wire: the rotated
-forms of `ar_hc_write` and `ar_gather_hc_write` produce the same bytes as the unfused chain on the
-same wire. There `wht6` is worth +5.6–6.3% of prefill at a 2048-token chunk (20K prompt 5556 →
-5908 tok/s; a 23K extension at 81K depth 4998 → 5278) and −1.3% of the eight-stream decode step;
-one-stream decode stays exact. At four ranks only the exact wire has a fused form, and it takes
-the decode and verify steps — up to `--max-num-seqs` × (1 + `--num-speculative-tokens`) rows. A
-prefill chunk, and a message that goes out on the tiered-int8 wire, runs the unfused chain, where
-the all-reduce's own size choice between one-shot and two-shot applies.
+**Cards without peer access.** The all-reduce kernels normally write into the other card's memory
+directly (P2P). At launch radiance asks the driver whether each pair of cards can, and logs the
+answer; the IOMMU setting, the PCIe topology and any switch between the cards decide. Where a pair
+cannot, the same kernels run with their exchange buffers in pinned host memory: each card writes its
+share to host RAM over its own link and reads the others' back. The startup line names the failed
+pairs, and the selection report names the `_host` rows that took the collectives. The results are the
+same bytes; a message crosses two links instead of one. On two R9700s on PCIe 4.0 that is within
+run-to-run noise for decode at one and four streams, and 2–10% on a 23.6K-token prefill, since there
+the peer link is no faster than the host link. Cards whose host link is narrower than their peer
+link pay more.
 
-**Cards that cannot reach each other's memory still serve.** The all-reduce kernels normally push
-into the other card's memory directly (peer to peer, P2P). At launch radiance asks the driver,
-for every pair of the cards it will use, whether that works, and logs the answer. Whether it does
-is decided by the platform: the IOMMU setting, the PCIe topology, and whether the cards sit behind
-a switch that allows peer traffic. When some pair cannot, the same kernels run with their
-exchange buffers in pinned host memory instead: every card writes its share to host RAM over its
-own link and reads the others' back the same way, and no card touches another card's VRAM. The
-startup line names the pairs that failed, and the selection report names the `_host` rows that
-took the collectives. The results are the same bytes either way; the cost is a message crossing
-two links instead of one. On two R9700s on PCIe 4.0 that cost is within run-to-run noise for
-decode, at one stream and at four, and 2–10% on a 23.6K-token prefill, because there the peer
-link is no faster than the host link. A machine whose cards reach host memory over a narrower
-link than they reach each other pays more.
+`--p2p` overrides the driver. `off` takes the host-memory path even where the driver reports peer
+access, for a board where peer traffic is broken or slow. `on` requires peer access and stops at
+startup, naming the pairs, if the driver refuses any. `auto`, the default, trusts the driver.
 
-`--p2p` overrides the driver's answer. `off` takes the host-memory path even where the driver
-reports peer access, for a board where peer traffic is broken or slow while the driver still says
-it works. `on` takes the peer-to-peer kernels and stops at startup, naming the pairs, if the driver
-refuses any of them, so a deployment measured on P2P never quietly serves on host memory. `auto`,
-the default, trusts the driver.
+### 4.8 Host tier for finished conversations
 
-### 4.8 Finished conversations: copied to host, VRAM given up on demand
+By default a finished conversation's KV blocks stay in VRAM, held by the prefix cache, until evicted
+under pressure; an evicted prefix is re-prefilled next turn.
 
-By default a finished conversation's KV blocks stay in VRAM, held by the prefix cache, until the
-cache evicts them under pressure — and an evicted prefix is re-prefilled from scratch next turn.
+With a host tier, a conversation is copied to host memory when its request finishes and keeps its
+VRAM copy. Its VRAM can then be given up at no cost, and is, as soon as something wants it (the
+expert slab's loan, or a request the pool cannot otherwise serve). A conversation that returns
+before that resumes from VRAM; one that returns after is restored from host memory and keeps its host
+copy, so its next turn copies only what that turn added. A full host tier drops its least recently
+used conversations. Nothing is written to a drive.
 
-With a host tier, a conversation is **copied** to host memory the moment its request finishes, and
-keeps its VRAM copy. From then on it is *clean*: its VRAM can be given up for nothing, and it is,
-as soon as something wants it — the expert slab's loan, or a request the pool cannot otherwise
-serve. A conversation that comes back before that resumes from VRAM; one that comes back after is
-restored from host memory and keeps its host copy, so its next turn copies only what that turn
-added. There is no idle threshold on the way out of VRAM.
-
-A full host tier drops its least recently used conversations to make room. Nothing is written to a
-drive: the prefix cache lives in VRAM and host memory only.
-
-**Every stored conversation expires.** One that no request has used for `--prefix-cache-ttl`
-seconds (an hour by default) is taken out of whichever tier holds it — its VRAM blocks go back to
-the pool, its host slot back to the arena, its snapshots back to the store. It is not moved
-anywhere first. A conversation in use stays: a hit or a new turn counts as a use, and a system
-prompt that several conversations share stays for as long as any of them is used.
+Every stored conversation expires: one unused for `--prefix-cache-ttl` seconds is removed from
+whichever tier holds it (VRAM blocks to the pool, host slot to the arena, snapshots to the store). A
+hit or a new turn counts as a use, and a system prompt shared by several conversations stays while
+any of them is used.
 
 ```sh
 radiance --model m.rad --prefix-cache-mib 8192 --prefix-cache-ttl 3600
 ```
 
-- `--prefix-cache-mib N` — **this is the switch.** Without a size, nothing is copied. It holds
-  attention blocks only; a hybrid model's linear-state snapshots are in host memory already, in the
-  `--checkpoint-slots` store. Size it for the conversations you expect to come back: one that does
-  not fit is prefilled again.
-- `--prefix-cache-ttl S` — seconds an unused conversation is kept (default 3600). `0` keeps
-  everything until the memory is wanted.
-- Recovering a 200K-token turn costs a copy over PCIe; recomputing it costs minutes.
+- `--prefix-cache-mib N` enables the host tier, up to N MiB. It holds attention blocks only; a hybrid
+  model's linear-state snapshots are already in host memory, in the `--checkpoint-slots` store. A
+  conversation larger than the tier keeps its start there and is prefilled again past it once VRAM
+  gives the rest up; the startup log warns when the tier holds less than one `--max-model-len`
+  conversation and says how many MiB would, and a `kv tiers: ... got no host copy` line appears when
+  it happens (`/sessions` `moved.held_back`).
+- `--prefix-cache-ttl S`: seconds an unused conversation is kept (default 3600); `0` keeps it until
+  the memory is wanted.
 
-On a hybrid model the recurrent state matters as much as the attention blocks — restoring the
-blocks alone leaves the session re-running every linear layer over its whole transcript, which
-every hit-rate counter reports as a hit. The snapshots never take VRAM: each is copied to host
-memory after the step that produced it and back before the step that resumes from it. `/sessions` shows what is stored, where, and whether the
-linear half is being served.
+Restoring a 200K-token turn costs a copy over PCIe; recomputing it costs minutes.
 
-### 4.9 What a request that leaves a field out gets
+On a hybrid model the recurrent state matters as much as the attention blocks: restoring the blocks
+alone re-runs every linear layer over the whole transcript, which hit-rate counters still report as a
+hit. Snapshots never take VRAM: each is copied to host memory after the step that produced it and
+back before the step that resumes from it. `/sessions` shows what is stored, where, and whether the
+linear half is served.
 
-Every default below applies only to a request that does not name the field. A request that names
-it wins. Without any of these flags, the server behaves exactly as it always has.
+### 4.9 Request defaults
 
-**Temperature, top-k, top-p, min-p.** First one that exists wins:
+Each default applies only to a request that does not name the field.
 
-1. `--temp` / `--top-k` / `--top-p` / `--min-p` on the command line
-2. `--generation-config PATH` — a `generation_config.json`
+**Temperature, top-k, top-p, min-p**, in order of precedence:
+
+1. `--temp` / `--top-k` / `--top-p` / `--min-p`, field by field
+2. `--generation-config PATH`, a `generation_config.json`
 3. `<model>.generation.json` beside the container
 4. the container's own `generation.*` metadata
 5. the built-in defaults
+
+Of sources 2 to 4, the first that states anything is used whole.
 
 ```sh
 radiance --model m.rad --temp 0.7 --top-p 0.8 --top-k 20
@@ -1001,115 +1051,104 @@ radiance --model m.rad --temp 0.7 --top-p 0.8 --top-k 20
 **The rest of the sampler** has a flag per field, spelled like the request field:
 `--presence-penalty`, `--frequency-penalty`, `--repetition-penalty`, `--repeat-last-n`,
 `--typical-p`, `--dry-multiplier`, `--dry-base`, `--dry-allowed-length`, `--dry-penalty-last-n`,
-`--dry-sequence-breakers` (a JSON array), `--xtc-probability`, `--xtc-threshold`. They are checked
-against the same ranges a request is, at startup:
+`--dry-sequence-breakers` (a JSON array), `--xtc-probability`, `--xtc-threshold`, checked at startup
+against the ranges a request is held to:
 
 ```sh
 radiance --model m.rad --presence-penalty 1.5 --repetition-penalty 1.05
 ```
 
-**How much a request may generate.**
-
-- `--default-max-tokens N` sets `max_tokens` for a request that sends none. The default, `auto`,
-  is whatever the context leaves after the prompt, as in vLLM. Many clients send no `max_tokens`,
-  and a reasoning model can think for thousands of tokens before it answers: a small default ends
-  those answers inside the reasoning, with a `finish_reason: "length"` that chat clients do not
-  show.
-- `--max-tokens-cap N` is the most any request may generate. A larger `max_tokens` is cut to it
-  rather than refused, and the reply ends with `finish_reason: "length"`, the same as the context
-  bound (§5.8).
+**Generation length.** `--default-max-tokens N` sets `max_tokens` for a request that sends none. The
+default, `auto`, is what the context leaves after the prompt, as in vLLM: many clients send no
+`max_tokens`, and a small default ends a reasoning model's answer inside its reasoning, with a
+`finish_reason: "length"` chat clients do not show. `--max-tokens-cap N` is the most any request may
+generate; a larger `max_tokens` is cut to it, not refused, and the reply ends with `finish_reason:
+"length"` (§5.8).
 
 ```sh
 radiance --model m.rad --default-max-tokens auto --max-tokens-cap 32768
 ```
 
-**Chat template variables.** `--chat-template-kwargs` hands variables to the chat template on
-every chat request, the way a request's own `chat_template_kwargs` does:
+**Chat template variables.** `--chat-template-kwargs` passes variables to the chat template on every
+chat request, as a request's `chat_template_kwargs` does:
 
 ```sh
 radiance --model m.rad --chat-template-kwargs '{"enable_thinking": false}'
 radiance --model m.rad --chat-template-kwargs @template-vars.json
 ```
 
-- It takes a JSON object, or `@FILE` to read one. Give it more than once and a later key replaces
-  an earlier one.
+- It takes a JSON object, or `@FILE`. It may be repeated; a later key replaces an earlier one.
 - A key the request's own `chat_template_kwargs` names is the request's.
-- Thinking is one setting with three spellings. A request that says anything about thinking
-  (`enable_thinking`, at the top level or in `chat_template_kwargs`, or `reasoning_effort`)
-  replaces the server's `enable_thinking`. One that names a `reasoning_effort` replaces the
-  server's effort too.
-- `messages`, `tools`, `bos_token`, `eos_token` and `add_generation_prompt` are refused: the
-  server sets those itself.
-- At startup a one-message chat is rendered with the variables. A value the template refuses
-  stops startup with the template's own message, instead of failing every request.
-- `/tokenize` renders `messages` with the same variables, so the count it gives is the prompt
-  chat serves.
+- A request that says anything about thinking (`enable_thinking` at the top level or in
+  `chat_template_kwargs`, or `reasoning_effort`) replaces the server's `enable_thinking`; one that
+  names a `reasoning_effort` replaces the server's effort too.
+- `messages`, `tools`, `bos_token`, `eos_token` and `add_generation_prompt` are refused: the server
+  sets them.
+- At startup a one-message chat is rendered with the variables; a value the template refuses stops
+  startup with the template's message.
+- `/tokenize` renders `messages` with the same variables.
 
-**`--reasoning-effort` is worth knowing about.** It is the default for chat requests that do not
-set one, and the value goes to the model's chat template verbatim — so the legal set is the
-template's. Qwen3.8 takes `xhigh|medium|low` and **defaults to `xhigh`**, which on a short task can
-spend the entire token budget inside `<think>` and return a turn with empty content and
-`finish_reason: "length"`. `"none"` turns thinking off. It cannot be combined with a
-`reasoning_effort` or `enable_thinking` key in `--chat-template-kwargs`. A value the template
-refuses is a warning at startup: requests that send their own effort still work.
+**`--reasoning-effort`** is the default for chat requests that set none, passed to the chat template
+verbatim, so the legal set is the template's. Qwen3.8 takes `xhigh|medium|low` and defaults to
+`xhigh`, which on a short task can spend the whole token budget inside `<think>` and return empty
+content with `finish_reason: "length"`. `"none"` turns thinking off. It cannot be combined with a
+`reasoning_effort` or `enable_thinking` key in `--chat-template-kwargs`. A value the template refuses
+is a startup warning.
 
 ```sh
 radiance --model m.rad --reasoning-effort medium
 ```
 
-**The template's set is probed at startup** by rendering each of `low`, `medium`, `high`, `xhigh`
-and `max`, and startup names the ones it takes. `/server_info` publishes them as
-`capabilities.reasoning_efforts` (with `none` and `minimal`, which are the server's own; `null`
-when the template takes any word). A request outside the set gets a 400 with `param:
-"reasoning_effort"`, `code: "unsupported_value"` and the set in `error.supported`, rather than the
-template's traceback.
+At startup the template is probed with `low`, `medium`, `high`, `xhigh` and `max`, and the ones it
+takes are logged and published on `/server_info` as `capabilities.reasoning_efforts` (with the
+server's own `none` and `minimal`; `null` when the template takes any word). A request outside the set
+gets a 400 with `param: "reasoning_effort"`, `code: "unsupported_value"` and the set in
+`error.supported`.
 
-**`--reasoning-effort-map FROM=TO,...`** rewrites a request's effort before the template sees it,
-for a client that always sends a word of OpenAI's ladder. Qwen3.8 has no `high`, so:
+**`--reasoning-effort-map FROM=TO,...`** rewrites a request's effort before the template sees it, for
+clients that send OpenAI's levels. Qwen3.8 has no `high`, so:
 
 ```sh
 radiance --model m.rad --reasoning-effort-map high=xhigh
 ```
 
-It applies to both spellings (`reasoning_effort` and `chat_template_kwargs.reasoning_effort`), and
-before `none` and `minimal` are read, so `minimal=low` keeps thinking on. A `TO` the template
-refuses stops startup.
+It applies to `reasoning_effort` and `chat_template_kwargs.reasoning_effort`, before `none` and
+`minimal` are read, so `minimal=low` keeps thinking on. A `TO` the template refuses stops startup.
 
-**`--thinking-token-budget N`** caps the reasoning instead of its depth. At N tokens inside the
-reasoning block the block is closed, by masking the next position to its end token
-(`</think>`), and the answer follows. This makes a client's `max_tokens` buy an answer, where
-otherwise the reasoning could use all of it. It is the default for chat requests that send no
-`thinking_token_budget` of their own (§5.2). It needs a reasoning block that ends in a single
-token, as Qwen's and MiniCPM's do. On a model whose block does not, startup stops and says why.
+**`--thinking-token-budget N`** caps the reasoning length: at N tokens inside the reasoning block the
+next position is masked to the block's end token (`</think>`) and the answer follows. It is the
+default for chat requests that send no `thinking_token_budget` (§5.2), and needs a reasoning block
+that ends in a single token, as Qwen's and MiniCPM's do; otherwise startup stops and says why.
 
-**`--reasoning-format none`** leaves a reasoning block inline in `content` instead of returning it
-as `reasoning_content`, for a client that reads it there.
+**`--reasoning-format none`** leaves a reasoning block inline in `content` instead of returning it as
+`reasoning_content`.
 
-`/server_info` lists every effective default under `request_defaults` (§6.2), and startup prints
-one line naming each one the command line moved.
+`/server_info` lists every effective default under `request_defaults` (§6.2), and startup logs one
+line naming each default the command line changed.
 
 ### 4.10 Every flag
 
-`radiance --help` prints this table. Grouped here by what you are doing:
+`radiance --help` prints these. Grouped by purpose:
 
 **Model and plugins**
 
 | flag | |
 |---|---|
-| `--model PATH` | the `.rad` container, a checkpoint served as it stands (§3.4), or a Hugging Face repo id fetched before startup (§3.1) (**required**) |
+| `--model PATH` | required: the `.rad` container, a checkpoint served as it stands (§3.4), or a Hugging Face repo id fetched before startup (§3.1) |
 | `--download-dir DIR` | where a repo id is fetched to. Default `$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf` |
-| `--radiance-home DIR` | where `kernels/` and `architectures/` live |
-| `--kernels LIST` | the kernel libraries to use, comma-separated, first wins; a library not named is not loaded. Default: every library found |
+| `--radiance-home DIRS` | where `kernels/`, `architectures/` and `quantizers/` live; homes separated by `:` are searched in order, the first winning (§1.5) |
+| `--kernels LIST` | the kernel libraries to use, separated by `,` or `:`, first wins; a library not named is not loaded. Default: every library found |
 
 **Batch shape**
 
 | flag | default | |
 |---|---|---|
 | `--max-num-batched-tokens N` | 8192 | largest token count one step may carry |
-| `--busy-prefill-chunk MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows behind it and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
+| `--prefill-interleave N` | 0 (off) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64 |
+| `--busy-prefill-chunk MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
 | `--max-num-seqs N` | 256 | largest number of sequences one step may carry |
 | `--max-model-len N` | 0 | context bound; 0 takes the model's training context |
-| `--rope-scaling SPEC` | — | `yarn:FACTOR[:ORIG]`: static YaRN over the container's own rotary keys, no reconvert; `none` takes a checkpoint's YaRN off ([YARN.md](YARN.md)) |
+| `--rope-scaling SPEC` | the checkpoint's | `yarn:FACTOR[:ORIG]`: static YaRN over the container's own rotary keys, no reconvert; `none` takes a checkpoint's YaRN off ([YARN.md](YARN.md)) |
 
 **Memory**
 
@@ -1118,16 +1157,16 @@ one line naming each one the command line moved.
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
 | `--kv-cache-dtype T` | bf16 | `bf16` or `fp8` |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |
-| `--embedding-placement WHERE` | ram | `ram` or `vram`: the token embedding pinned in host memory beside `--host-pool-mib` and read in place, or on the card. See §4.3 |
-| `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container. See §4.3 |
-| `--vision-tower-placement WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `--host-pool-mib` and read in place once an image. See §4.3 |
+| `--embedding-placement WHERE` | ram | `ram` or `vram`: the token embedding pinned in host memory beside `--host-pool-mib` and read in place, or on the card (§4.3) |
+| `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3) |
+| `--vision-tower-placement WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `--host-pool-mib` and read in place once an image (§4.3) |
 | `--weights-disk-tier` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
 
-**Idle session tiers**
+**Host tier for finished conversations**
 
 | flag | default | |
 |---|---|---|
-| `--prefix-cache-mib N` | 0 (off) | copy finished conversations' KV to host memory |
+| `--prefix-cache-mib N` | 0 (off) | copy finished conversations' KV to host memory, up to N MiB (§4.8) |
 | `--prefix-cache-ttl S` | 3600 | seconds an unused conversation is kept, in VRAM or host memory; `0` never expires |
 
 **Placement and state**
@@ -1137,9 +1176,10 @@ one line naming each one the command line moved.
 | `--placement MODE` | auto | `all_vram`, `layer_offload`, `expert_tiered`, `auto` |
 | `--deterministic` | off | pin placement to the loader's plan, so the resident set cannot change under the heat engine |
 | `--checkpoint-interval N` | 2048 | linear-attention state checkpoint interval, in tokens |
-| `--checkpoint-slots N` | 8 | linear-state (hybrid) or sliding-window snapshots the server may hold at once, **in total**, not per sequence. They live in pinned host memory, not VRAM: one slot is a snapshot of every rank's shard (113 MB on Flash-Next at `--tp 2`; on Gemma 4 31B the 1024-token window of every sliding layer, 406 MiB at `--tp 2`), allocated at startup. A snapshot is copied off the card after the step that produced it and back before the step that resumes from it. A full store retires its least recently used snapshot |
+| `--prefill-span N` | 1 | checkpoint intervals one step may carry of a prefill alone in its step, from the prompt's second interval on; needs `--max-num-batched-tokens` of N intervals. Every other step is planned at the budget less the extra intervals, and the checkpoints inside a span are not written (§4.5) |
+| `--checkpoint-slots N` | 8 | linear-state (hybrid) or sliding-window snapshots the server may hold at once, in total, not per sequence. They live in pinned host memory, allocated at startup: one slot is a snapshot of every rank's shard (113 MB on Flash-Next at `--tp 2`; on Gemma 4 31B the 1024-token window of every sliding layer, 406 MiB at `--tp 2`). A full store retires its least recently used snapshot. A store the host memory cannot hold or pin stops the start, and a table placed in host memory leaves room for it; `0` serves with none, every prefix hit then prefilling from the start |
 | `--checkpoint-policy NAME` | geometric-backoff | also `tip-only`, `keep-all` |
-| `--no-prefix-cache` | — | disable prefix caching |
+| `--no-prefix-cache` | prefix cache on | disable prefix caching |
 
 **Parallel**
 
@@ -1147,7 +1187,7 @@ one line naming each one the command line moved.
 |---|---|---|
 | `--tp N` | 1 | tensor-parallel ranks |
 | `--tp-wire MODE` | exact | `exact` or `wht6`, the lossy wire (§4.7) |
-| `--tp-wire-min-kb N` | 128 | smallest all-reduce the lossy wire is used for |
+| `--tp-wire-min-kb N` | 128 | smallest all-reduce, in KiB, the lossy wire is used for |
 | `--p2p MODE` | auto | `auto` asks the driver, `on` requires peer access, `off` exchanges through host memory (§4.7) |
 
 **Speculation**
@@ -1156,7 +1196,7 @@ one line naming each one the command line moved.
 |---|---|---|
 | `--num-speculative-tokens N` | auto | speculative window; 0 disables. The ceiling under `--draft-window adaptive` |
 | `--draft-window MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, serial draft heads only (§4.6) |
-| `--draft-model PATH` | — | **not implemented** — merge at convert time |
+| `--draft-model PATH` | | not implemented: merge the drafter at convert time |
 
 **Server**
 
@@ -1164,12 +1204,12 @@ one line naming each one the command line moved.
 |---|---|---|
 | `--host ADDR` | 0.0.0.0 | listen address |
 | `--port N` | 8000 | listen port |
-| `--api-key KEY` | — | require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but `/health`, `/v1/health`, `/ping` and the dashboard page (§6.6) |
-| `--served-model-name NAME` | container's name | the model id `/v1/models` lists, the metrics carry and a response names when its request named none. A request may name any model; the one loaded serves it |
+| `--api-key KEY` | none | require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but `/health`, `/v1/health`, `/ping` and the dashboard page (§6.6) |
+| `--served-model-name NAME` | container's name | the model id `/v1/models` lists, the metrics carry and a response names when its request named none. A request may name any model; the loaded one serves it |
 | `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card |
-| `--override-chat-template PATH` | container's | a Jinja chat template file served in place of the one the container carries. The reply format (reasoning markers, tool calls) is derived from it too, unless the architecture plugin declares one. An unreadable or empty file stops startup |
+| `--override-chat-template PATH` | container's | a Jinja chat template file served in place of the container's. The reply format (reasoning markers, tool calls) is derived from it too, unless the architecture plugin declares one. An unreadable or empty file stops startup |
 | `--max-queued-requests N` | 8 × `--max-num-seqs` | requests admitted and unfinished at once; past it, 429 |
-| `--http-threads N` | one per core, at least 4 | HTTP workers kept while idle |
+| `--http-threads N` | one per hardware thread, at least 4 | HTTP workers kept while idle |
 | `--read-timeout S` | 30 | seconds a client may go silent while sending a request |
 | `--write-timeout S` | 600 | seconds one write to a client may block |
 | `--keep-alive-timeout S` | 5 | seconds an idle connection is held open between requests |
@@ -1177,43 +1217,43 @@ one line naming each one the command line moved.
 | `--retry-after S` | 1 | the `Retry-After` a 429 carries |
 | `--no-cors` | CORS on | send no CORS headers (§6.6) |
 
-**Request defaults and bounds** — what a request that leaves a field out gets (§4.9). A request
-that names the field wins.
+**Request defaults and bounds** (§4.9). A request that names the field wins.
 
 | flag | default | |
 |---|---|---|
-| `--generation-config PATH` | — | sampler defaults from a `generation_config.json` |
-| `--temp F`, `--top-k N`, `--top-p F`, `--min-p F` | from container | sampler defaults |
+| `--generation-config PATH` | none | sampler defaults from a `generation_config.json` |
+| `--temp F`, `--top-k N`, `--top-p F`, `--min-p F` | from the model | sampler defaults; unset, they come from the sources in §4.9 |
 | `--presence-penalty F`, `--frequency-penalty F` | 0 | [-2, 2] |
 | `--repetition-penalty F`, `--repeat-last-n N` | 1, 64 | > 0; ≥ -1 (-1 is all) |
 | `--typical-p F` | 1 | (0, 1] |
-| `--dry-multiplier F`, `--dry-base F`, `--dry-allowed-length N`, `--dry-penalty-last-n N` | 0, 1.75, 2, -1 | DRY; a multiplier of 0 is off |
+| `--dry-multiplier F`, `--dry-base F`, `--dry-allowed-length N`, `--dry-penalty-last-n N` | 0, 1.75, 2, -1 | DRY; a multiplier of 0 is off, the base ≥ 1, the allowed length ≥ 1, a last-n of -1 is the whole context |
 | `--dry-sequence-breakers JSON` | `["\n", ":", "\"", "*"]` | a JSON array of at most 16 strings |
 | `--xtc-probability F`, `--xtc-threshold F` | 0, 0.1 | [0, 1] |
 | `--default-max-tokens N` | `auto` | `max_tokens` for a request that sends none; `auto` is what the context leaves |
-| `--max-tokens-cap N` | none | the most any request may generate; a larger `max_tokens` is cut to it, not refused |
+| `--max-tokens-cap N` | 0 (none) | the most any request may generate; a larger `max_tokens` is cut to it, not refused |
 | `--max-n N` | the larger of 8 and `--max-num-seqs` | the largest `n` a request may ask for |
 | `--max-stop-strings N`, `--max-stop-bytes N` | 64, 4096 | how many stop strings a request may send, and how long each may be |
-| `--chat-template-kwargs JSON` | — | variables for the chat template on every chat request; a JSON object or `@FILE`, repeatable |
+| `--chat-template-kwargs JSON` | none | variables for the chat template on every chat request; a JSON object or `@FILE`, repeatable |
 | `--reasoning-effort S` | template's own | default `reasoning_effort` for chat |
-| `--reasoning-effort-map MAP` | — | `FROM=TO,...`: a request's `reasoning_effort` rewritten before the template sees it; `TO` is checked at startup |
+| `--reasoning-effort-map MAP` | none | `FROM=TO,...`: a request's `reasoning_effort` rewritten before the template sees it; `TO` is checked at startup. Repeatable |
 | `--thinking-token-budget N` | none | default `thinking_token_budget` for chat: the reasoning block is closed at N tokens |
 | `--reasoning-format MODE` | auto | `auto` returns reasoning as `reasoning_content`; `none` leaves it inline in `content` |
 
-**Media** — each replaces what the container's preprocessor configuration states. They do nothing
-for a model that takes no images or video.
+**Media.** Each replaces what the container's preprocessor configuration states, and does nothing for
+a model that takes no images or video. A Qwen-VL container that states none uses 2 frames a second,
+4 to 768 frames and 768 tokens a frame.
 
 | flag | default | |
 |---|---|---|
 | `--image-min-pixels N`, `--image-max-pixels N` | container's | the band an image is resized into; one encoder pass (`--mm-max-patches`) still bounds the top |
 | `--video-min-pixels N`, `--video-max-pixels N` | container's | the same for a video's sampled frames together |
-| `--video-fps F` | container's, else 2 | frames sampled per second of video |
-| `--video-min-frames N`, `--video-max-frames N` | container's, else 4 and 768 | the fewest and most frames sampled from a video |
-| `--video-max-frame-tokens N` | container's, else 768 | the most prompt tokens one frame may become; 0 is no cap. A token-budget processor (Gemma 4's) takes 70, 140, 280, 560 or 1120 |
+| `--video-fps F` | container's | frames sampled per second of video |
+| `--video-min-frames N`, `--video-max-frames N` | container's | the fewest and most frames sampled from a video |
+| `--video-max-frame-tokens N` | container's | the most prompt tokens one frame may become; 0 is no cap. A token-budget processor (Gemma 4's) takes 70, 140, 280, 560 or 1120 |
 | `--image-tokens N` | container's | a token-budget processor's image budget (Gemma 4's: 70, 140, 280, 560, 1120); a request's `image_tokens` overrides it. The pixel-band flags are refused on such a model |
 | `--max-source-pixels N` | 67108864 | the largest image or frame the decoder accepts, before any resize |
 
-**Quality measurement** — instead of serving; see [TOOLS.md](TOOLS.md#the-kl-mode)
+**Quality measurement**, instead of serving; see [TOOLS.md](TOOLS.md#the-kl-mode)
 
 | flag | |
 |---|---|
@@ -1226,54 +1266,57 @@ for a model that takes no images or video.
 
 | flag | |
 |---|---|
-| `--debug-graph` | print the declared graph and exit |
+| `--debug-graph` | print the declared graph and the selection table, and exit |
 | `--debug-selection` | print the selection table |
 | `--debug-placement` | print the placement plan |
-| `--debug-accept-reference-kernels` | serve even when ops resolve to `libref`. **Not a production configuration** |
+| `--debug-accept-reference-kernels` | serve even when ops resolve to `libref`. Not a production configuration |
 | `--profile-ops` | per-op device timing |
-| `--live` | the live terminal view |
+| `--live` | the live terminal view (§6.4) |
 | `-v` / `-vv` | verbose / very verbose |
 
 ---
 
-## 5. Talk to it
+## 5. API
 
-### 5.1 The endpoints
+### 5.1 Endpoints
 
 | | |
 |---|---|
 | `POST /v1/chat/completions` | chat, with tools, reasoning and streaming |
 | `POST /v1/completions` | raw text completion |
 | `POST /v1/embeddings` | needs a model with an embedding head, else 501 |
-| `POST /v1/images/generations`, `POST /v1/images/edits` | OpenAI's images API, needs an image model (Qwen-Image 2.1), else 501 — §5.6 |
-| `POST /v1/systemone` | LiquidAI d1's decisions over a state: named yes/no, choice and score questions answered as probabilities, nothing generated; needs a container converted as d1, else 501 — §5.12 |
-| `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic's Messages API, for Claude Code and the Anthropic SDKs — §5.9 |
-| `POST /v1/responses`, `POST /v1/responses/input_tokens` | OpenAI's Responses API, for Codex and the OpenAI SDKs' `responses` client — §5.9 |
-| `POST /completion`, `/completions`, `POST /infill` | llama-server's native completion and fill-in-the-middle, for llama.vim, llama.vscode and the clients built on llama-server's own API — §5.9 |
-| `GET /v1/models`, `/v1/models/:id` | what is loaded, with `max_model_len` (the context it serves) and `root` (the `--model` path), as vLLM reports them, and `capabilities` (the same object `/server_info` reports); `:id` answers the entry itself, as OpenAI's retrieve does |
+| `POST /v1/images/generations`, `POST /v1/images/edits` | OpenAI's images API; needs an image model (Qwen-Image 2.1), else 501 (§5.6) |
+| `POST /v1/systemone` | LiquidAI d1's decisions over a state: named yes/no, choice and score questions answered as probabilities, nothing generated; needs a container converted as d1, else 501 (§5.13) |
+| `POST /v1/audio/transcriptions` | OpenAI's speech to text, for a model whose plugin transcribes (Qwen3-ASR), else 501 (§5.14) |
+| `GET /v1/realtime` (WebSocket) | OpenAI's realtime transcription session: audio streamed in, the words back as they are spoken (§5.14) |
+| `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic's Messages API, for Claude Code and the Anthropic SDKs (§5.9, §5.11) |
+| `POST /v1/responses`, `POST /v1/responses/input_tokens` | OpenAI's Responses API, for Codex and the OpenAI SDKs' `responses` client (§5.9) |
+| `POST /completion`, `/completions`, `POST /infill` | llama-server's native completion and fill-in-the-middle, for llama.vim, llama.vscode and clients of llama-server's own API (§5.9) |
+| `GET /v1/models`, `/v1/models/:id` | what is loaded, with `max_model_len` (the context it serves) and `root` (the `--model` path) as vLLM reports them, and `capabilities` (the same object `/server_info` reports); `:id` returns the entry itself, as OpenAI's retrieve does |
 | `GET /health`, `/v1/health`, `/ping`, `POST /ping` | liveness |
 | `GET /load` | current load |
 | `GET /version` | server version |
-| `GET /props` | llama-server's props for the clients built against it: `n_ctx`, `total_slots`, `modalities`, `model_path`, the chat template and its capabilities, `bos_token`/`eos_token`, and the request defaults under llama-server's names |
-| `POST /apply-template` | the prompt a chat request renders to, as llama-server answers it |
+| `GET /props` | llama-server's props: `n_ctx`, `total_slots`, `modalities`, `model_path`, the chat template and its capabilities, `bos_token`/`eos_token`, and the request defaults under llama-server's names |
+| `POST /apply-template` | the prompt a chat request renders to, as llama-server returns it |
 | `POST /v1/chat/completions/input_tokens` | how many tokens that prompt is |
 | `GET /server_info` | the whole configuration of the running engine |
-| `GET /diagnostics` | the startup report as JSON — every option and its source, the hardware read again now, the findings — §7.1. Without `--api-key` it answers only a client on the same machine (§6.6) |
+| `GET /diagnostics` | the startup report as JSON: every option and its source, the hardware read again now, the findings (§7.1). Without `--api-key` it answers only a client on the same machine (§6.6) |
 | `GET /metrics` | Prometheus |
 | `POST /tokenize`, `POST /detokenize` | vLLM's shape (`prompt` or `messages` in, `prompt` out) and llama-server's (`content` in and out, `with_pieces`) |
-| `GET /get_tokenizer_info` | |
+| `GET /get_tokenizer_info` | the tokeniser's configuration |
 | `POST /reset_prefix_cache` | drop every cached prefix |
 | `GET /` or `/dashboard` | the web dashboard |
 | `GET /stats`, `/graph`, `/sessions` | the JSON the dashboard is drawn from |
 
-Method spellings follow vLLM's, including the ones that look odd: `/tokenize` is POST because its
-input is a body, and `/ping` answers both GET and POST because different load balancers send
-different ones. As llama-server does, `/chat/completions`, `/embeddings` and `/models` answer without the `/v1`
-too, for a client configured with the bare host as its base URL -- and `/completions` without it is
+Methods follow vLLM's: `/tokenize` is POST because its input is a body, and `/ping` answers GET and
+POST because load balancers differ. As in llama-server, `/chat/completions`,
+`/chat/completions/input_tokens`, `/embeddings`, `/images/generations`, `/images/edits`,
+`/audio/transcriptions`, `/models`, `/responses` and `/responses/input_tokens` also answer without
+`/v1`, for a client configured with the bare host as its base URL; `/completions` without `/v1` is
 llama-server's native completion, as it is there. A path nothing serves is a JSON 404.
 
-A text prompt to `/v1/completions`, `/v1/embeddings` or `/tokenize` reads the model's control
-tokens as tokens, as vLLM and llama.cpp do: a client that renders its own chat template can send
+A text prompt to `/v1/completions`, `/v1/embeddings` or `/tokenize` reads the model's control tokens
+as tokens, as vLLM and llama.cpp do: a client that renders its own chat template can send
 `<|im_start|>user\n…` and the model sees the turn markers. The BOS the model declares is prepended
 unless the prompt already opens with it.
 
@@ -1290,10 +1333,10 @@ curl -s http://localhost:8000/v1/chat/completions \
   }' | jq -r '.choices[0].message.content'
 ```
 
-If the container carries no chat template this endpoint answers **501** and the startup log says
-so — use `/v1/completions` instead.
+If the container carries no chat template this endpoint answers 501 and the startup log says so; use
+`/v1/completions` instead.
 
-**Turning thinking off.** Three spellings reach the server for one question; all work:
+**Turning thinking off.** Any of three spellings works:
 
 ```json
 {"chat_template_kwargs": {"enable_thinking": false}}
@@ -1303,26 +1346,24 @@ so — use `/v1/completions` instead.
 
 Reasoning text comes back in `choices[].message.reasoning_content`, separate from `content`.
 
-**Reasoning counts against `max_tokens`**, as in OpenAI's API, vLLM and llama.cpp: every
-generated token does. A reply that runs out inside its reasoning comes back with empty
-`content` and `finish_reason: "length"`. `usage.completion_tokens_details.reasoning_tokens` says
-how many of `completion_tokens` were reasoning, the block's end token included, so a client can
-tell that case from a model that answered nothing.
+**Reasoning counts against `max_tokens`**, as in OpenAI's API, vLLM and llama.cpp. A reply that runs
+out inside its reasoning has empty `content` and `finish_reason: "length"`;
+`usage.completion_tokens_details.reasoning_tokens` (the block's end token included) tells that case
+from a model that answered nothing.
 
-**Capping the reasoning.** `thinking_token_budget` (vLLM's name; `thinking_budget`, Qwen's, is
-read as the same field) is how many tokens the reasoning may run to. At that count the block is
-closed and the model answers from what it has reasoned so far:
+**Capping the reasoning.** `thinking_token_budget` (vLLM's name; Qwen's `thinking_budget` is read as
+the same field) is how many tokens the reasoning may run to. At that count the block is closed and
+the model answers from what it has reasoned so far:
 
 ```json
 {"max_tokens": 4096, "thinking_token_budget": 2048}
 ```
 
-The count starts after the opening `<think>`. A reasoning block that ends sooner is not
-affected. The close is forced by the sampler, so it holds under speculative decoding and at any
-temperature. A `grammar` or `response_format` that does not allow the close at some position
-keeps that position, and the close comes at the next position that allows it. The budget and
-`reasoning_tokens` need the block's end to be one token. A model whose end is not one token
-reports no `completion_tokens_details` and refuses a budget with a 400 that says why.
+The count starts after the opening `<think>`. The sampler forces the close, so it holds under
+speculative decoding and at any temperature; where a `grammar` or `response_format` does not allow
+it, the close comes at the next position that does. The budget and `reasoning_tokens` need the
+block's end to be one token; otherwise the response has no `completion_tokens_details` and a budget
+is refused with a 400 that says why.
 
 ### 5.3 Streaming
 
@@ -1334,7 +1375,11 @@ curl -N http://localhost:8000/v1/chat/completions \
        "stream_options":{"include_usage":true}}'
 ```
 
-Server-sent events, OpenAI's delta format, terminated by `data: [DONE]`.
+Server-sent events in OpenAI's delta format, terminated by `data: [DONE]`. Nothing is sent while
+the prompt is read: the first event, the `role: assistant` chunk, goes out when the first token
+is generated, as vLLM and llama-server send it, so a client that times its first event
+(llama-benchy's `ttfr`) measures the time to the first token. `return_progress` adds
+llama-server's `prompt_progress` chunks during the prompt (§5.7).
 
 ### 5.4 Tool calls
 
@@ -1360,21 +1405,18 @@ curl -s http://localhost:8000/v1/chat/completions \
 ```
 
 Calls come back in `message.tool_calls` with `finish_reason: "tool_calls"`. No `<function>` or
-`<param>` markup ever reaches `content`. `scripts/mctools.sh` and `scripts/mcstream.sh` assert
-exactly that, including on raw streamed fragments — content cannot be retracted once sent, so a
-repair applied at the end is not a fix.
+`<param>` markup reaches `content`, streamed fragments included; `scripts/mctools.sh` and
+`scripts/mcstream.sh` check this.
 
 A tool's `parameters` schema shapes the grammar the call is written under. A property whose schema
-accepts no value — `false`, or `{"not": {}}`, which is how TypeBox and Arktype export `never` — is
-an argument no call writes. Any other `not` is refused with a 400 naming it: the grammar cannot
-express a complement, and dropping the constraint silently would serve a call the tool forbids.
+accepts no value (`false`, or `{"not": {}}`, as TypeBox and Arktype export `never`) is never written.
+Any other `not` is refused with a 400 naming it, since the grammar cannot express a complement.
 
-Length bounds are held exactly: `maxLength`, `minLength`, `maxItems` and `minItems` up to about
-200,000, which costs the first request carrying the tool under a second to compile on a
-quarter-million-token vocabulary and nothing per token after that. A bound past 2^31 (as
-`Number.MAX_SAFE_INTEGER` is) is no bound, since no context holds that much. One in between is
-refused with a 400 naming the property's rule and the count. The same holds for `response_format`
-schemas and `{m,n}` in a GBNF grammar.
+`maxLength`, `minLength`, `maxItems` and `minItems` are held exactly up to about 200,000 (under a
+second to compile on the first request carrying the tool, at a quarter-million-token vocabulary, and
+nothing per token after). A bound past 2^31 (such as `Number.MAX_SAFE_INTEGER`) is treated as none;
+one in between is refused with a 400 naming the rule and the count. The same holds for
+`response_format` schemas and `{m,n}` in a GBNF grammar.
 
 ### 5.5 Constrained output
 
@@ -1393,21 +1435,19 @@ schemas and `{m,n}` in a GBNF grammar.
 -d '{"model":"m","prompt":"...","grammar":"root ::= \"yes\" | \"no\""}'
 ```
 
-**On chat, a constraint passes through the chat template and may not survive it.** The template
-gets to rewrite or drop `grammar` and `response_format` — a tool-calling template produces its own
-grammar, for instance — so whether a constraint can be enforced is a property of the model's
-template and not only of the server. When the one you asked for is not there at the end, the
-request is **refused**:
+**On chat, a constraint passes through the chat template.** The template may rewrite or drop
+`grammar` and `response_format` (a tool-calling template produces its own grammar, for instance), so
+whether a constraint can be enforced depends on the model's template. When the requested constraint
+is not there after rendering, the request is refused:
 
 ```
 grammar: this model's chat template produced no grammar for it, so the constraint could not
 be enforced
 ```
 
-That is §5.8's rule doing its job -- a field that would change the answer is honoured or
-refused, never dropped: an unconstrained 200 would leave you
-parsing free prose against a schema you were told was enforced. `/v1/completions` has no template
-in the way, so the same grammar works there — which is why the example above uses it.
+(`response_format:` for a schema.) This is §5.8's rule: a field that would change the answer is
+honoured or refused, never dropped. `/v1/completions` has no template in the way, so the same grammar
+works there, which is why the example above uses it.
 
 ### 5.6 Completions, embeddings, images, tokenising
 
@@ -1432,13 +1472,13 @@ curl -s http://localhost:8000/tokenize -H 'Content-Type: application/json' \
 ```
 
 `/tokenize` takes one of `prompt`, `messages` or llama-server's `content` (a string, or strings and
-token ids mixed, with its `add_special` and `parse_special` and their defaults); the `content`
-form answers `tokens` as llama-server does, as `{id, piece}` objects with `with_pieces`.
-`/detokenize` answers the text as both `prompt` (vLLM) and `content` (llama-server).
+token ids mixed, with its `add_special` and `parse_special` and their defaults); the `content` form
+returns `tokens` as llama-server does, as `{id, piece}` objects with `with_pieces`. `/detokenize`
+returns the text as both `prompt` (vLLM) and `content` (llama-server).
 
-**An embedding model** (EmbeddingGemma 2) serves `/v1/embeddings` and nothing else; completions and
-chat answer 501. One input is one vector, and an input is never split: it has to fit one step
-(`--max-num-batched-tokens`), and a longer one is refused with `context_length_exceeded`.
+**An embedding model** (EmbeddingGemma 2) serves `/v1/embeddings` only; completions and chat answer
+501. One input is one vector and must fit one step (`--max-num-batched-tokens`); a longer one is
+refused with `context_length_exceeded`.
 
 ```sh
 # text, a batch of texts, or token ids
@@ -1465,19 +1505,22 @@ curl -s http://localhost:8000/v1/embeddings -H 'Content-Type: application/json' 
         "input_audio":{"data":"<base64 wav>","format":"wav"}}]}]}'
 ```
 
-`input` is a string, an array of token ids, one array of content parts, or a batch of any of
-those. A content part is `text`, `image_url`, `video_url`, `input_audio` (wav, mp3, flac, ogg,
-opus, m4a, aac, webm or aiff, base64) or `audio_url`; media comes as `data:` URLs, never fetched.
-An image becomes up to 280 tokens by default (`--image-tokens`, or a request's `image_tokens`: 70,
-140, 280, 560 or 1120), a video one frame a second, at most 32 frames of 140 tokens
-(`--video-fps`, `--video-max-frames`, `--video-max-frame-tokens`), and audio 25 tokens a second,
-cut at 30 seconds. `prompt_name` takes the names the model's sentence-transformers configuration
-states (`query`, `document`, `Retrieval-query`, `STS`, ...) and applies to text and content-part
-inputs; a model that states a default prompt applies it when the request names none.
+`input` is a string, an array of token ids, one array of content parts, or a batch of any of those.
+A content part is `text`, `image_url`, `video_url`, `input_audio` (wav, mp3, flac, ogg, opus, m4a,
+aac, webm or aiff, base64) or `audio_url`; media comes as `data:` URLs and is never fetched. An image
+becomes up to 280 tokens by default (`--image-tokens`, or a request's `image_tokens`: 70, 140, 280,
+560 or 1120), a video one frame a second, at most 32 frames of 140 tokens (`--video-fps`,
+`--video-max-frames`, `--video-max-frame-tokens`), and audio 25 tokens a second, cut at 30 seconds.
+`prompt_name` takes the names the model's sentence-transformers configuration states (`query`,
+`document`, `Retrieval-query`, `STS`, ...) and applies to text and content-part inputs; a model that
+states a default prompt applies it when the request names none.
 
-**An image model** (Qwen-Image 2.1 or 2.1-Turbo) serves OpenAI's images API and nothing else;
-completions, chat and embeddings answer 501. Clients written against OpenAI's images endpoints
-(Open WebUI, the OpenAI SDKs) work as they are; the picture always comes back in the response.
+**An image model** (Qwen-Image 2.1 or 2.1-Turbo) serves OpenAI's images API only; completions, chat
+and embeddings answer 501. OpenAI images clients (Open WebUI, the OpenAI SDKs) work unchanged; the
+picture always comes back in the response. The engine sizes the step, batch and context for an image
+model itself (`--max-num-batched-tokens` and `--max-model-len` from the model's largest pass,
+`--max-num-seqs` 16), keeps any of the three given on the command line, and turns off drafting and
+the prefix cache.
 
 ```sh
 # a picture from a prompt: b64_json, 2048x2048 unless `size` says otherwise
@@ -1512,91 +1555,89 @@ curl -sN http://localhost:8000/v1/images/generations -H 'Content-Type: applicati
 | `stream`, `partial_images` | OpenAI's `image_generation.partial_image` / `image_edit.partial_image` events, 0..3 previews of the clean picture the step predicts, then `.completed` |
 | `image`, `image[]`, `mask` | an edit's pictures (png, jpeg, webp; up to ten) and the first picture's mask: alpha below 128 is where the picture may change |
 
-`response_format: url` is refused: nothing here stores a picture to serve later. The response
-carries `usage` (input tokens: the prompt and the pictures' tokens; output: latent tokens) and
-each picture's `seed` and `revised_prompt` (the prompt as given).
+`response_format: url` is refused, since nothing here stores a picture to serve later. The response
+carries `usage` (input tokens: the prompt and the pictures' tokens; output: latent tokens) and each
+picture's `seed` and `revised_prompt` (the prompt as given).
 
-On two cards the step's two all-reduces of the image's rows (128 MB each at 2048x2048, over the
-cards' link) run on a second stream: the rows go through each block in two halves, and one half's
-all-reduce travels while the card computes the other's. `--tp-wire wht6` sends them as 6-bit and
-makes a picture about 9% faster still (2048x2048, 40 steps: 61 -> 56 s; Turbo 12.9 -> 11.9 s, at
-1024x1024 2.6 -> 2.2 s), within a dB of the exact wire against diffusers. Exact is the default.
-The VAE decoder is split by rows across the cards after its mid-block, with the same pixels.
+On two cards each step's two all-reduces of the image's rows (128 MB each at 2048x2048) run on a
+second stream, overlapped with compute by sending the rows through each block in two halves.
+`--tp-wire wht6` sends them as 6-bit and makes a picture about 9% faster (2048x2048, 40 steps: 61 to
+56 s; Turbo 12.9 to 11.9 s, at 1024x1024 2.6 to 2.2 s), within a dB of the exact wire against
+diffusers; exact is the default. The VAE decoder is split by rows across the cards after its
+mid-block, with the same pixels.
 
 On an fp8 container the denoising attention computes its scores in int8 (about 16% faster
-attention); a picture moves by less than switching between two exact attention implementations
-moves it. A bf16 container keeps bf16 scores.
+attention); a picture moves by less than switching between two exact attention implementations moves
+it. A bf16 container keeps bf16 scores.
 
-Two cards (`--tp 2`) are the fastest picture; two servers of one card each make the most
-pictures an hour (each takes 1.7x as long and there are two). A card runs these models at its
-300 W limit, in the DiT's GEMMs and attention alike.
+`--tp 2` gives the fastest picture; two one-card servers give the most pictures an hour (each takes
+1.7x as long). A card runs these models at its 300 W limit.
 
-A reference picture costs 4096 rows of the conditioning's KV cache at the model's 1024x1024
-reference area -- its latent rows, which take its vision tokens' places. One card holds the fp8
-container and a cache of 20256 rows: four pictures with their prompt. Two cards (`--tp 2`) hold
-all ten the model takes, and the bf16 container. A request the cache can never hold is a 400
-that says how many rows it needed. The models are under Qwen's research license,
-non-commercial.
+A reference picture costs 4096 rows of the conditioning's KV cache at the model's 1024x1024 reference
+area (its latent rows replace its vision tokens). One card holds the fp8 container and a cache of
+20256 rows: four pictures with their prompt. Two cards hold all ten the model takes, and the bf16
+container. A request the cache can never hold is a 400 naming the rows it needed. The models are
+under Qwen's research license, non-commercial.
 
 ### 5.7 Request fields
 
 | field | notes |
 |---|---|
-| `model` | accepted and not enforced — one server serves one model |
+| `model` | accepted and not enforced: one server serves one model |
 | `messages` / `prompt` / `input` | chat / completion / embedding |
-| `max_tokens`, `max_completion_tokens`, `n_predict` | default: what the context leaves after the prompt (`--default-max-tokens`); -1 is llama-server's "no limit", the same without the default. Clamped to what the context leaves, and to `--max-tokens-cap`, rather than refused — see §5.8 |
+| `max_tokens`, `max_completion_tokens`, `n_predict` | default: what the context leaves after the prompt (`--default-max-tokens`); -1 is llama-server's "no limit", the same without the default. Clamped to what the context leaves, and to `--max-tokens-cap`, rather than refused (§5.8) |
 | `temperature` | [0, 2] |
 | `top_p` | (0, 1] |
-| `top_k` | ≥ 0, 0 disables |
+| `top_k` | ≥ 0; 0 is the 1024 most likely tokens, the sampler's candidate width |
 | `min_p`, `typical_p` | |
 | `presence_penalty`, `frequency_penalty` | [-2, 2] |
 | `repetition_penalty` (or `repeat_penalty`), `repeat_last_n` | |
 | `xtc_probability`, `xtc_threshold` | |
 | `dry_multiplier`, `dry_base`, `dry_allowed_length`, `dry_penalty_last_n`, `dry_sequence_breakers` | |
-| `seed` | absent means "pick one" — **not** seed 0 |
-| `n` | 1 to `--max-n`, by default the larger of 8 and `--max-num-seqs`. Fan-out over the same prompt; the prefix cache makes it nearly free after the first |
+| `seed` | absent means "pick one", not seed 0 |
+| `n` | 1 to `--max-n` (by default the larger of 8 and `--max-num-seqs`). Fan-out over the same prompt; the prefix cache makes it nearly free after the first |
 | `priority` | |
 | `stop` | a string or an array; at most 64 strings of 4096 bytes (`--max-stop-strings`, `--max-stop-bytes`) |
 | `ignore_eos` | generate to `max_tokens` whatever the model emits |
 | `stream`, `stream_options.include_usage` | |
 | `timings_per_token`, `return_progress` | llama-server's: `timings` on every chunk, and `prompt_progress` chunks while the prompt is read |
-| `samplers` | llama-server's sampler order, names or letters. A stage it leaves out is off. The chain here is penalties, DRY, top-k, top-p, min-p, typical, XTC with temperature first (the default) or last (llama-server's default), so a list in either of those orders is honoured and any other is refused by name |
+| `samplers` | llama-server's sampler order, names or letters. A stage it leaves out is off. The chain here is penalties, DRY, top-k, top-p, min-p, typical, XTC, with temperature first (the default) or last (llama-server's default), so a list in either order is honoured and any other is refused by name |
 | `session_id` | OpenRouter's conversation id: labels the conversation on `/sessions` and the dashboard |
-| `logprobs`, `top_logprobs`, `n_probs` | each generated token's logprob and up to 20 alternatives — see §5.11. Chat: `logprobs: true` with `top_logprobs` alternatives (0 when absent); completions: `logprobs: N`; any endpoint: llama-server's `n_probs: N`, which wins. Not with `echo` (the prompt's logprobs are not computed) |
+| `logprobs`, `top_logprobs`, `n_probs` | each generated token's logprob and up to 20 alternatives (§5.12). Chat: `logprobs: true` with `top_logprobs` alternatives (0 when absent); completions: `logprobs: N`; any endpoint: llama-server's `n_probs: N`, which wins. Not with `echo` (the prompt's logprobs are not computed) |
 | `tools`, `tool_choice`, `parallel_tool_calls` | chat only. `tool_choice` is `auto`, `none`, `required` or `{"type":"function","function":{"name":...}}`; the last two hold the whole reply to calls (after the reasoning block), the named form to that one function, and cannot be combined with `response_format` or `grammar` |
 | `add_generation_prompt`, `chat_template_kwargs` | chat only |
-| `continue_final_message` | chat only. A conversation ending in an assistant message is continued rather than answered, as llama-server and the Anthropic API do -- the reply carries that message's text and what follows it. `true`, `"content"` or `"reasoning_content"` names it explicitly; `add_generation_prompt: true` opens a new turn instead |
+| `continue_final_message` | chat only. A conversation ending in an assistant message is continued rather than answered, as llama-server and the Anthropic API do; the reply carries that message's text and what follows it. `true`, `"content"` or `"reasoning_content"` names it explicitly; `add_generation_prompt: true` opens a new turn instead |
 | `reasoning_format` | chat only, llama-server's: `none` keeps the reasoning in `content`; `auto` and `deepseek` split it into `reasoning_content`, the default |
 | `reasoning_effort`, `enable_thinking` | chat only. The levels are the template's (`capabilities.reasoning_efforts` on `/server_info`); `none` and `minimal` turn thinking off |
-| `thinking_token_budget`, `thinking_budget`, `thinking_budget_tokens`, `reasoning_budget_tokens` | chat only. ≥ 0: the reasoning tokens after which the block is closed — see §5.2; -1 is none. Default `--thinking-token-budget`, else none |
+| `thinking_token_budget`, `thinking_budget`, `thinking_budget_tokens`, `reasoning_budget_tokens` | chat only. ≥ 0: the reasoning tokens after which the block is closed (§5.2); -1 is none. Default `--thinking-token-budget`, else none |
 | `preserve_thinking` | chat only. The chat template variable of that name, as llama.cpp maps it; Qwen3.6 and later keep earlier turns' reasoning in the prompt with it |
 | `response_format`, `json_schema` | chat only. `json_schema` is llama-server's shorthand: the schema itself. Mutually exclusive with `grammar` |
-| `functions`, `function_call` | chat only: OpenAI's deprecated spellings of `tools` and `tool_choice`. The reply answers in the old shape too: one call at most, as `message.function_call` with `finish_reason: "function_call"`; the next turn's assistant `function_call` and `function` message are read as the call and its result |
-| `grammar` | a GBNF grammar directly. On chat it passes through the chat template and a template that drops it makes the request a refusal — see §5.5 |
+| `functions`, `function_call` | chat only: OpenAI's deprecated spellings of `tools` and `tool_choice`. The reply uses the old shape too: one call at most, as `message.function_call` with `finish_reason: "function_call"`; the next turn's assistant `function_call` and `function` message are read as the call and its result |
+| `grammar` | a GBNF grammar. On chat it passes through the chat template, and a template that drops it makes the request a refusal (§5.5) |
 | `echo` | `/v1/completions` only |
+| `preserved_tokens` | `/v1/completions` only, llama-server's: control tokens the completion's text keeps. On chat it is guarded (§5.8) |
 | `encoding_format` | `/v1/embeddings` only: `float` or `base64` |
 | `dimensions`, `prompt_name`, `image_tokens` | `/v1/embeddings` only (an embedding model, §5.6). `dimensions` truncates to the first N and renormalises; it cannot exceed the model's width |
 
-Any field the request omits keeps the deployment default (§4.9). A field the request names wins.
+A field the request omits takes the deployment default (§4.9).
 
-### 5.8 What a field this server does not implement does
+### 5.8 Unimplemented fields
 
-Four kinds of field, and the rule they serve is that **a request that returns 200 had every field
-that could change its answer honoured**:
+The rule: a request that returns 200 had every field that could change its answer honoured. Fields
+fall into four kinds:
 
-- **Accepted** — the table above, in OpenAI's, vLLM's and llama-server's spellings.
-- **Inert** — fields that change nothing about the answer, accepted and ignored: OpenAI's and
-  OpenRouter's bookkeeping (`user`, `metadata`, `store`, `service_tier`, `safety_identifier`,
-  `prompt_cache_key`, `prediction`), and llama-server's knobs for its own speed and slots
-  (`cache_prompt`, `id_slot`, `n_cache_reuse`, `backend_sampling`, `reasoning_control`, `n_keep`,
-  `n_discard`, `speculative.*`, ...). The prefix cache and speculation here are the server's own
-  and never change the output.
-- **Guarded** — known, not implemented, and able to change the answer. llama-server's clients send
-  every one of them on every request at its off value, so each is accepted there and refused,
-  naming it, at any other:
+- **Accepted**: the table above, in OpenAI's, vLLM's and llama-server's spellings.
+- **Inert**: fields that cannot change the answer, accepted and ignored. OpenAI's and OpenRouter's
+  bookkeeping (`user`, `metadata`, `store`, `service_tier`, `safety_identifier`, `prompt_cache_key`,
+  `prediction`), and llama-server's knobs for its own speed and slots (`cache_prompt`, `id_slot`,
+  `n_cache_reuse`, `backend_sampling`, `reasoning_control`, `n_keep`, `n_discard`, `speculative.*`,
+  ...). The prefix cache and speculation here are the server's own and never change the output.
+- **Guarded**: known, not implemented, and able to change the answer. llama-server's clients send
+  them on every request at their off value, so each is accepted there and refused, by name, at any
+  other:
 
 ```json
-{"error": {"message": "mirostat: mirostat is not one of the device samplers (spec 13); it is accepted only at 0, where it does nothing", ...}}
+{"error": {"message": "mirostat: mirostat is not one of the device samplers; it is accepted only at 0, where it does nothing", ...}}
 ```
 
 | guarded | accepted at | because |
@@ -1604,104 +1645,90 @@ that could change its answer honoured**:
 | `logit_bias` | empty | the device sampler has no per-token bias stage |
 | `mirostat` | 0 | not one of the device samplers |
 | `top_n_sigma` | ≤ 0 | not one of the device samplers |
-| `dynatemp_range` | 0 | not one of the device samplers |
+| `dynatemp_range` | ≤ 0 | not one of the device samplers |
 | `min_keep` | 0 | the cuts keep no minimum count |
 | `post_sampling_probs` | false | logprobs are the raw distribution's; the sampler's are not returned |
-| `best_of` | 1 | not implemented |
+| `best_of` | ≤ 1 | not implemented |
 | `suffix` | empty | infilling through `/v1/completions` is not implemented |
-| `lora` | empty | explicitly out of scope |
+| `lora` | empty | out of scope |
 | `modalities`, `audio` | `["text"]`, null | output other than text is not implemented |
-| `n_indent`, `t_max_predict_ms`, `return_tokens` | 0, 0, false | not implemented |
-| `grammar_lazy`, `grammar_triggers`, `preserved_tokens` | off, empty | the chat format decides them |
+| `n_indent`, `t_max_predict_ms`, `return_tokens` | 0, ≤ 0, false | not implemented (`return_tokens` is served on `/completion`, §5.9) |
+| `grammar_lazy`, `grammar_triggers`, `preserved_tokens` | off, empty, empty | the chat format decides them |
 
-- **Anything else is ignored**, as llama-server and vLLM ignore it: a field this server has never
-  heard of is a client's own extension far more often than a request it misunderstood. The names
-  are logged at debug.
+- **Anything else is ignored**, as llama-server and vLLM ignore it: an unknown field is far more often
+  a client's own extension than a misunderstood request. The names are logged at debug.
 
-**The one exception is `max_tokens`.** If `prompt + max_tokens` would exceed the context, the
-server clamps `max_tokens` to what is left and serves the request:
+**The exception is `max_tokens`.** If `prompt + max_tokens` would exceed the context, the server
+clamps `max_tokens` to what is left and serves the request:
 
 ```
 prompt 72,170 + max_tokens 128,000  >  200,000 context
                                     ->  served with max_tokens 127,830
 ```
 
-It is an exception because the other keys are *settings* — dropping one serves a different model
-than the caller asked for — and this one is a *bound*, whose whole purpose is to stop generation
-early and which the context was going to stop earlier anyway. Refusing would not produce more
-tokens than clamping does; it would produce none. The completion ends with `finish_reason:
-"length"` and `usage` reports what it actually got, so the caller can still see what happened, and
-`-v` logs the adjustment.
+The other fields are settings, and dropping one serves a different request than the caller asked
+for. `max_tokens` is a bound whose purpose is to stop generation early, and the context stops it
+earlier anyway; refusing would produce no tokens instead of fewer. The completion ends with
+`finish_reason: "length"`, `usage` reports what it got, and `-v` logs the adjustment.
 
-A prompt that does not fit **on its own** is still a 400 — there is no window to generate into, so
-no `max_tokens` would have made it servable — and the error names how many tokens have to go:
+A prompt that does not fit on its own is still a 400 (`code: "context_length_exceeded"`, with
+`n_prompt_tokens` and `n_ctx`), since no `max_tokens` would make it servable. The message names how
+many tokens have to go:
 
 ```
-prompt: 220470 prompt tokens does not fit the 200000 token context, which leaves nothing to
-generate into; shorten the prompt by at least 20471 tokens
+This model's maximum context length is 200000 tokens: the request (220470 tokens) exceeds the
+available context size (200000 tokens) and leaves nothing to generate into; shorten the prompt by
+at least 20471 tokens
 ```
 
-At the boundary, where an off-by-one would hide: a 198,729-token prompt asking for `max_tokens`
-128,000 against a 200,000 context is served, generates **1,271** tokens — exactly the room left —
-and ends `finish_reason: "length"`. `POST /tokenize` is how to size a prompt that
-precisely without running the model.
-
----
-
+At the boundary: a 198,729-token prompt asking for `max_tokens` 128,000 against a 200,000 context is
+served, generates 1,271 tokens (the room left) and ends with `finish_reason: "length"`. `POST
+/tokenize` sizes a prompt that precisely without running the model.
 
 ### 5.9 Anthropic's, OpenAI's Responses and llama-server's native APIs
 
-`POST /v1/messages` takes Anthropic's request and answers in Anthropic's shapes, streamed
-(`message_start`, content blocks, `message_delta`, `message_stop`) or not, so Claude Code and the
-Anthropic SDKs work against radiance as they do against llama-server:
+`POST /v1/messages` is Anthropic's Messages API, streamed (`message_start`, content blocks,
+`message_delta`, `message_stop`) or not, for Claude Code and the Anthropic SDKs:
 
 ```sh
 ANTHROPIC_BASE_URL=http://localhost:8000 ANTHROPIC_API_KEY="$KEY" claude
 ```
 
-It is translated into the chat request it means and served by the chat path, so the template
-defaults, refusals and limits are the chat endpoint's. `system` (a string or text blocks), text and
-image blocks, `tool_use` and `tool_result`, client tools and `tool_choice`, `stop_sequences`,
-`thinking` (`enabled` with a `budget_tokens`, `disabled`, `adaptive`) and `metadata.user_id` (the
-conversation's label on `/sessions`) are honoured. A conversation that ends in an assistant message
-is continued, and the answer carries what follows it. Thinking blocks come back with an empty
-`signature`. Claude Code's per-request billing stamp at the head of the system prompt is held
-constant, as llama-server holds it, or no turn could reuse the prefix of the one before.
-`document` blocks and Anthropic's server tools (`web_search_…`, `code_execution_…`) run on
-Anthropic's side and are refused by name. `POST /v1/messages/count_tokens` answers the prompt's
-length. The key may come as `X-Api-Key` (§6.6).
+It is translated into a chat request, so the chat endpoint's template defaults, refusals and
+limits apply; §5.11 lists what it reads, takes and refuses. `POST /v1/messages/count_tokens`
+returns the prompt's length. The key may come as `X-Api-Key` (§6.6).
 
 `POST /v1/responses` is OpenAI's Responses API, translated the same way: `instructions` and `input`
 (a string, or message, `function_call`, `function_call_output` and `reasoning` items) become the
-conversation, `max_output_tokens` and `reasoning.effort` and `text.format` the chat request's
-fields, and every field the Responses API does not define passes through to the chat request as it
-does in llama-server (`chat_template_kwargs`, `top_k`, ...). The answer is a response object, or
-its event stream with every event's `output_index`, `content_index` and `sequence_number`; a reply
-cut at `max_output_tokens` is `incomplete`. Function tools are offered to the model; the built-in
-tools (web search, file search, computer use) and freeform custom tools have no counterpart here
-and are left out, as llama-server leaves them out. Responses are not stored, so
-`previous_response_id` is refused: send the conversation as `input`. What a response object
-cannot carry is refused rather than computed and dropped: `n` other than 1, and logprobs
-(`include` naming `message.output_text.logprobs`, `top_logprobs`, `logprobs`, `n_probs`) --
-`/v1/chat/completions` serves those. A failed generation ends the stream in
-`response.failed`, as one on `/v1/messages` ends in Anthropic's `error` event.
+conversation; `max_output_tokens`, `reasoning.effort` and `text.format` become the chat request's
+fields; and every field the Responses API does not define passes through to the chat request, as in
+llama-server (`chat_template_kwargs`, `top_k`, ...). The answer is a response object, or its event
+stream with every event's `output_index`, `content_index` and `sequence_number`, opening with
+`response.created` and `response.in_progress` at once, as OpenAI's and vLLM's do: they report the
+response object, not output. A reply cut at
+`max_output_tokens` is `incomplete`. Function tools are offered to the model; built-in tools (web
+search, file search, computer use) and freeform custom tools are left out, as in llama-server.
+Responses are not stored, so `previous_response_id` is refused: send the conversation as `input`.
+What a response object cannot carry is refused: `n` other than 1, and logprobs (`include` naming
+`message.output_text.logprobs`, `top_logprobs`, `logprobs`, `n_probs`), which
+`/v1/chat/completions` serves. A failed generation ends the stream in `response.failed`, as one on
+`/v1/messages` ends in Anthropic's `error` event.
 
 `POST /completion` (and `/completions` without `/v1`, as llama-server names it) is llama-server's
-native completion: a prompt string, token ids, or strings and ids mixed as one prompt; the
-request fields of §5.7; and llama-server's answer -- `content`, `stop_type` (`eos`, `limit`,
-`word`), `stopping_word`, `tokens_predicted`, `tokens_evaluated`, `generation_settings`,
-`timings`, and the generated ids with `return_tokens`. A stream is its chunks with the ids that
-made each, then the final result, with no `[DONE]`. `POST /infill` completes between
-`input_prefix` and `input_suffix`, with `input_extra` (files, `{filename, text}`) and `prompt`, in
-the repository-level fill-in-the-middle layout llama-server builds, byte for byte. It needs a model
-with fill-in-the-middle tokens (the Qwen, StarCoder, DeepSeek and CodeLlama spellings are
-recognised) and answers 501 without them; the extra files give way first when the prompt does not
-fit.
-### 5.10 What a response says about its own speed
+native completion: a prompt string, token ids, or strings and ids mixed as one prompt; the request
+fields of §5.7; and llama-server's answer: `content`, `stop_type` (`eos`, `limit`, `word`),
+`stopping_word`, `tokens_predicted`, `tokens_evaluated`, `generation_settings`, `timings`, and the
+generated ids with `return_tokens`. A stream is its chunks with the ids that made each, then the
+final result, with no `[DONE]`. `POST /infill` completes between `input_prefix` and `input_suffix`,
+with `input_extra` (files, `{filename, text}`) and `prompt`, in the repository-level
+fill-in-the-middle layout llama-server builds, byte for byte. It needs a model with fill-in-the-middle
+tokens (the Qwen, StarCoder, DeepSeek and CodeLlama spellings are recognised) and answers 501
+without them; the extra files give way first when the prompt does not fit.
 
-Every chat and completion response carries a top-level `timings` object for the request. It uses
-llama.cpp's field names, so a proxy or dashboard built against llama-server (llama-swap's activity
-view, for one) reads it unchanged:
+### 5.10 Response timings
+
+Every chat and completion response carries a top-level `timings` object with llama.cpp's field
+names, so tools built against llama-server (llama-swap's activity view, for one) read it unchanged:
 
 ```json
 "timings": {
@@ -1716,31 +1743,99 @@ view, for one) reads it unchanged:
 
 | field | meaning |
 |---|---|
-| `prompt_n` | prompt tokens this request computed. Tokens the prefix cache supplied are not in it |
+| `prompt_n` | prompt tokens this request computed; tokens the prefix cache supplied are not in it |
 | `cache_n` | prompt tokens the prefix cache supplied. `prompt_n + cache_n` is the prompt |
-| `prompt_ms` | from the first step the scheduler gave the request to its first token: the prefill. The time it waited for admission is not in it |
-| `prompt_per_second`, `prompt_per_token_ms` | `prompt_n` over `prompt_ms`. A prompt the cache mostly supplied computes few tokens, so this is the speed of the prefill that actually ran, not the prompt length over the time to first token |
+| `prompt_ms` | from the first step the scheduler gave the request to its first token: the prefill. The wait for admission is not in it |
+| `prompt_per_second`, `prompt_per_token_ms` | `prompt_n` over `prompt_ms`: the speed of the prefill that ran, not the prompt length over the time to first token |
 | `predicted_n` | tokens generated, the same as `usage.completion_tokens` |
 | `predicted_ms` | from the first generated token to the last |
-| `predicted_per_second`, `predicted_per_token_ms` | the `predicted_n − 1` tokens after the first, over `predicted_ms`. The first token is the prefill's product. It is the same figure as `/metrics`' time per output token, and with speculative decoding it counts every token a step accepts |
-| `draft_n`, `draft_n_accepted` | speculative tokens proposed for this request and how many were accepted. Present when any were proposed, as llama.cpp does |
-| `ttft_ms` | the server's time to first token: from the moment it had the whole request body to the first generated token. It holds parsing the request, rendering the chat template, tokenising, the wait for admission and the prefill. The time the body took to reach the server is not in it, so a client on a slow link can tell the server's share of the time it measured from the network's. Not a llama.cpp field |
+| `predicted_per_second`, `predicted_per_token_ms` | the `predicted_n − 1` tokens after the first, over `predicted_ms` (the first token is the prefill's product). The same figure as `/metrics`' time per output token; with speculative decoding it counts every token a step accepts |
+| `draft_n`, `draft_n_accepted` | speculative tokens proposed for this request and how many were accepted. Present when any were proposed, as in llama.cpp |
+| `ttft_ms` | the server's time to first token: from having the whole request body to the first generated token, covering parsing, chat template rendering, tokenising, the wait for admission and the prefill. The time the body took to arrive is not in it, so a client on a slow link can separate the server's share from the network's. Not a llama.cpp field |
 | `total_ms` | from the same moment to the last generated token: `ttft_ms + predicted_ms`. Not a llama.cpp field |
 
-Milliseconds are wall-clock milliseconds, and the rates are tokens per second. A rate whose count
-or time is zero is `null`. A request with several choices (`n`, or a batch of prompts) sums the
-counts, and each time runs from the earliest choice's start to the latest choice's end.
+Times are wall-clock milliseconds and rates are tokens per second. A rate whose count or time is
+zero is `null`. A request with several choices (`n`, or a batch of prompts) sums the counts, and each
+time runs from the earliest choice's start to the latest choice's end.
 
-When streaming, each choice's final chunk (the one with `finish_reason`) carries its own
-`timings`, whether or not the request asked for `stream_options.include_usage`. The usage chunk,
-when asked for, carries the request's. `/metrics` stays the aggregate surface (§6.3). It sums
-the same quantities over every request, so it cannot say which request they belong to.
+When streaming, each choice's final chunk (the one with `finish_reason`) carries its own `timings`,
+whether or not the request asked for `stream_options.include_usage`; the usage chunk, when asked
+for, carries the request's. `/metrics` (§6.3) sums the same quantities over all requests.
 
-### 5.11 Logprobs
+### 5.11 Anthropic's Messages API
 
-The numbers are the **raw distribution's** — the logits as the model wrote them, before any
-penalty, temperature, grammar mask or cut — which is what OpenAI and llama-server report. Each
-generated token carries its own logprob and its `top_logprobs` most likely alternatives, at most 20.
+A `/v1/messages` request is translated into the chat request it means and served by the chat
+path, so its template, grammar, sampler and their refusals apply.
+
+```sh
+curl -s http://localhost:8000/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: anything' \
+  -d '{
+    "model": "m",
+    "max_tokens": 200,
+    "messages": [{"role": "user", "content": "Explain merge sort briefly."}]
+  }' | jq '.content[0].text, .stop_reason, .usage'
+```
+
+From Claude Code, name the model as it is served:
+
+```sh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
+export ANTHROPIC_API_KEY=local            # any value, unless the server runs with --api-key
+export ANTHROPIC_MODEL=qwen3.8-flash-next # the --served-model-name
+claude
+```
+
+**The request.** Anthropic's API refuses a field it does not define, and so does this endpoint:
+each field is read, taken without effect, or refused by name.
+
+| field | here |
+|---|---|
+| `system` | a string or text blocks; with the system messages at the head of `messages`, one system message |
+| `messages` | text and image blocks (a base64 image as a `data:` URL; a `url` source is refused, as the server fetches nothing), `tool_use`, `tool_result` (a tool message, ahead of the user's own words), `thinking` (the turn's reasoning); `redacted_thinking` is dropped; `document` blocks and server tool results are refused. A conversation ending in an assistant message is continued |
+| `role: "system"` in `messages` | after the head of the conversation, its text joins a user message at its position, since templates read a system message only at the head: as a text block ahead of the user message right after it, else after the one right before it, else as a user message of its own, so no two user turns follow each other. `clear_at: "next_user_message"` stops rendering it once a later user message (a `tool_result`-only one included) exists. An effort-only message (no text, `output_config: {"effort": ...}`) sets the effort from the next user message on. Blocks other than text (`tool_addition`, ...) are refused |
+| `tools`, `tool_choice` | client tools; server tools (`web_search_…`, `code_execution_…`) are refused. `tool_choice` as an object (`auto`, `any`, `tool`, `none`, `disable_parallel_tool_use`) or a string (`"auto"`, `"none"`, `"any"`); `any` is the chat path's `required` (§5.4) |
+| `max_tokens`, `temperature`, `top_p`, `top_k`, `stop_sequences`, `stream` | as on the chat path; `max_tokens` is optional there too |
+| `thinking` | `enabled` (its `budget_tokens` is the chat request's `thinking_token_budget`), `adaptive`, `disabled`, `between_tools` (off). `display` and `block_binding` are taken: the reasoning comes back whole, with an empty `signature` |
+| `output_config` | `effort` (`low`, `medium`, `high`, `xhigh`, `max`) is the chat request's `reasoning_effort`, which the template reads in its own level names: a level it does not take is refused with the ones it does, and `--reasoning-effort-map` renames them (§4.9). `format` (`{"type": "json_schema", "schema": ...}`, or the older top-level `output_format`) is a `response_format` (§5.5). `task_budget` is taken |
+| `context_management` | validated; the conversation is served as sent, and the answer says so: `"context_management": {"applied_edits": []}`, on `message_delta` in a stream |
+| `thread` | `create` is served as any request; `continue` is refused, since no conversation is stored |
+| `metadata` | `user_id` is the conversation's label on `/sessions` |
+| `service_tier`, `inference_geo`, `speed`, `cache_control`, `diagnostics`, `safeguards`, `fallbacks`, `context_hint` | taken; none can change the answer here. `cache_control` on a block is dropped too |
+| `mcp_servers`, `container` | refused |
+| anything else | refused: `"<field>: Extra inputs are not permitted ..."`, Anthropic's own words, which Claude Code matches to retry without a beta field it can drop |
+
+Claude Code's per-request billing stamp at the head of the system prompt is held constant, as
+llama-server does, so each turn can reuse the previous turn's prefix.
+
+**The answer** is an Anthropic message: `content` blocks in the order the reply produced them
+(`thinking`, `text`, `tool_use`), `stop_reason` (`end_turn`, `tool_use`, `max_tokens`,
+`stop_sequence`) and Anthropic's usage split: `input_tokens` without what the prefix cache
+supplied, `cache_read_input_tokens` with it, and `cache_creation_input_tokens` 0, since no cache
+entry is written on a request's behalf. A continued conversation is answered with what follows its
+last message.
+
+**The stream** is Anthropic's events, without `[DONE]`. Nothing is sent while the prompt is read:
+`message_start` (the message with no content; its `input_tokens` is the whole prompt) goes out
+when the first token is generated, so a client that times its first event measures the time to
+the first token, as on `/v1/chat/completions` (§5.3). Then per block `content_block_start`,
+`content_block_delta` and `content_block_stop`, with indices over the whole message (a reply
+that thinks, answers and calls a tool is blocks 0, 1 and 2), then
+`message_delta` (`stop_reason`, `stop_sequence` and the final usage split) and `message_stop`. A
+thinking block opens with an empty `signature` and closes with an empty `signature_delta`; a tool
+block opens with the id and name the server minted, and its input follows as `input_json_delta`.
+A failed generation ends in an `error` event, with no `message_stop`.
+
+**Errors** on `/v1/messages` and the paths below it are in Anthropic's envelope,
+`{"type":"error","error":{"type":"invalid_request_error","message":"..."}}`, the transport's own
+401, 404, 405 and 413 included.
+
+### 5.12 Logprobs
+
+The numbers are the raw distribution's (the logits as the model wrote them, before any penalty,
+temperature, grammar mask or cut), as OpenAI and llama-server report them. Each generated token
+carries its own logprob and its `top_logprobs` most likely alternatives, at most 20.
 
 ```bash
 curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
@@ -1756,43 +1851,40 @@ Qwen3.5-0.8B, thinking off:
                  {"id":12675,"token":"Hi","bytes":[72,105],"logprob":-1.3188}]}
 ```
 
-- **Chat** answers in OpenAI's shape, with llama-server's `id` beside each token; a stream carries
-  each token's entry on the chunk that carries its text.
-- **`/v1/completions`** answers OpenAI's legacy arrays (`tokens`, `token_logprobs`, `top_logprobs`
-  as one `{text: logprob}` object a token, `text_offset`) and llama-server's `content` array beside
-  them.
-- **`/completion`** (`n_probs`) answers llama-server's `completion_probabilities`.
+- Chat answers in OpenAI's shape, with llama-server's `id` beside each token; a stream carries each
+  token's entry on the chunk that carries its text.
+- `/v1/completions` answers OpenAI's legacy arrays (`tokens`, `token_logprobs`, `top_logprobs` as one
+  `{text: logprob}` object a token, `text_offset`) and llama-server's `content` array beside them.
+- `/completion` (`n_probs`) answers llama-server's `completion_probabilities`.
 - A token that ends inside a UTF-8 character has the readable part as `token` and every byte in
-  `bytes`, as llama-server does. A stop string's own tokens are not reported, since their text never
+  `bytes`, as in llama-server. A stop string's own tokens are not reported, since their text never
   went out.
 
-Speculation is unaffected — every verified position is scored, and an accepted draft is the token
-the model drew there. The cost is a top-k's worth of work for each row that asks
-(`sample_logprobs`, docs/OPS.md): about 0.12 ms a step on an R9700 at a 248K vocabulary, on the
-card. The chosen token's logprob is exact when it is among the raw top 20; otherwise it is
-recovered from the value it was drawn at by undoing temperature, DRY and the penalties, which
-agrees to float rounding.
+Speculation does not affect logprobs: every verified position is scored, and an accepted draft is the
+token the model drew there. The cost is an on-card top-k for each row that asks (`sample_logprobs`,
+docs/OPS.md), about 0.12 ms a step on an R9700 at a 248K vocabulary. The chosen token's
+logprob is exact when it is among the raw top 20; otherwise it is recovered from the value it was
+drawn at by undoing temperature, DRY and the penalties, which agrees to float rounding.
 
-**Where llama-server differs:** `logprobs: true` without `top_logprobs` returns 20 alternatives
-there and none here, which is OpenAI's default. The values themselves agree with llama-server's to
-bf16 rounding (within 0.1 on Qwen3.5-0.8B, sampled tokens far down the tail included).
+Differences from llama-server: `logprobs: true` without `top_logprobs` returns 20 alternatives there
+and none here, which is OpenAI's default. The values agree with llama-server's to bf16 rounding
+(within 0.1 on Qwen3.5-0.8B, sampled tokens far down the tail included).
 
-### 5.12 Decisions: `/v1/systemone`
+### 5.13 Decisions: `/v1/systemone`
 
-LiquidAI's d1-3B is a decision model on LFM2-VL. It is given a state — text, any JSON value,
-pictures, or a mix — and named questions, and each answer is read off the model's distribution at
-the position after the assistant header: `yes`/`no` for a `noul`, one code an option for a
-`choice`, a digit a level for a `score`. Nothing is generated, so an answer is always in its
-schema. The request and response are d1's own (`api.py` in the model's repository), and the
-prompt it renders is d1's `prompt.py` string for string, since the model was trained on exactly
-those.
+LiquidAI's d1-3B is a decision model on LFM2-VL. Given a state (text, any JSON value, pictures, or a
+mix) and named questions, each answer is read off the model's distribution at the position after the
+assistant header: `yes`/`no` for a `noul`, one code per option for a `choice`, a digit per level for
+a `score`. Nothing is generated, so an answer always fits its schema. The request and response are
+d1's own (`api.py` in the model's repository), and the rendered prompt is d1's `prompt.py` string for
+string, as the model was trained on it.
 
-The endpoint answers only a container that says it is d1, which the checkpoint does not: convert
-it with `--set decision.type=d1`. d1's prompt text, which radiance carries, is Liquid AI's under the
-LFM Open License v1.0, as the model is (NOTICE).
+The endpoint needs a container that declares itself d1; convert the checkpoint with `--set
+decision.type=d1`. d1's prompt text, which radiance carries, is Liquid AI's under the LFM Open
+License v1.0, as the model is (NOTICE).
 
 ```sh
-rad-convert ~/models/LiquidAI/d1-3B -o d1-3b-bf16.rad --set decision.type=d1
+rad-convert /srv/models/LiquidAI/d1-3B -o d1-3b-bf16.rad --set decision.type=d1
 radiance --model d1-3b-bf16.rad --port 8000
 
 curl -s localhost:8000/v1/systemone -H 'Content-Type: application/json' -d '{
@@ -1805,7 +1897,7 @@ curl -s localhost:8000/v1/systemone -H 'Content-Type: application/json' -d '{
                 "criteria": ["Can wait", "Today", "Blocking the customer now"]}}}'
 ```
 
-The answer is an object of the same names, in the same order:
+The answer is an object with the same names, in the same order:
 
 ```
 {"answers": {
@@ -1818,60 +1910,158 @@ The answer is an object of the same names, in the same order:
  "usage": {"input_tokens": N, "output_tokens": 0}}
 ```
 
-- **`state`** is required: a string, any JSON value (rendered as indented JSON, keys in the order
-  sent), or `null` with pictures alone.
-- **`questions`** is an object of named questions, answered in the order sent. A question is
-  `type` (`noul`, `choice` — the default — or `score`), `instructions`, and `criteria`: for a
-  `noul` optionally `{"true": ..., "false": ...}`; for a `choice` the options, name to description;
-  for a `score` 2 to 10 level descriptions, lowest first.
-- **`images`** is an array of `data:` URLs, placed ahead of the state. Each picture is first
-  scaled down to at most 1024 x 1024 pixels' area, as d1's runner does, then cut as LFM2-VL's
-  processor cuts it: whole when it is small, else into 512-pixel tiles plus a thumbnail.
-- **`noul`** is P(yes); a `choice` names its most probable option; a `score` is the expected level.
-  Each answer is a softmax over its options' raw logits, an option scoring its best spelling.
-- **`usage.input_tokens`** counts what the model read as d1 counts it: the shared state once and
-  each question's own tail.
+- `state` is required: a string, any JSON value (rendered as indented JSON, keys in the order sent),
+  or `null` with pictures alone.
+- `questions` is an object of named questions, answered in the order sent. A question is `type`
+  (`noul`, `choice` (the default) or `score`), `instructions`, and `criteria`: for a `noul`
+  optionally `{"true": ..., "false": ...}`; for a `choice` the options, name to description; for a
+  `score` 2 to 10 level descriptions, lowest first.
+- `images` is an array of `data:` URLs, placed ahead of the state. Each picture is first scaled down
+  to at most 1024 x 1024 pixels' area, as d1's runner does, then cut as LFM2-VL's processor cuts it:
+  whole when it is small, else into 512-pixel tiles plus a thumbnail.
+- `noul` is P(yes); a `choice` names its most probable option; a `score` is the expected level. Each
+  answer is a softmax over its options' raw logits, an option scoring its best spelling.
+- `usage.input_tokens` counts what the model read as d1 counts it: the shared state once and each
+  question's own tail.
 
-**Several questions read the state once.** The first runs alone and leaves the state's end in the
-prefix cache — its attention blocks and a checkpoint of LFM2's convolutions there — and the rest
-start from it together, each computing only its own question. A single question is one pass of
-the whole prompt, tokenised as one text, as d1 does.
+Several questions read the state once: the first runs alone and leaves the state in the prefix
+cache (attention blocks and a checkpoint of LFM2's convolutions), and the rest start from it
+together. A single question is one pass of the whole prompt, tokenised as one text, as d1 does.
 
-Against d1's own runner in float32, on eight text cases (one and several questions, JSON and long
-log states): every choice and every `input_tokens` equal, worst probability difference 0.0044.
+Against d1's own runner in float32, on eight text cases (one and several questions, JSON and long log
+states): every choice and every `input_tokens` equal, worst probability difference 0.0044.
 
-## 6. Operate it
+### 5.14 Speech to text
+
+A model whose architecture plugin says how it transcribes -- Qwen3-ASR, served as its checkpoint
+ships -- answers OpenAI's `POST /v1/audio/transcriptions`:
+
+```sh
+radiance --model ~/models/Qwen/Qwen3-ASR-1.7B-hf
+
+curl -s http://localhost:8000/v1/audio/transcriptions \
+  -F file=@meeting.wav -F model=qwen3-asr                    # {"text": "...", "usage": {...}}
+curl -s http://localhost:8000/v1/audio/transcriptions \
+  -F file=@clip.mp3 -F language=en -F response_format=text    # the transcript, as plain text
+curl -sN http://localhost:8000/v1/audio/transcriptions \
+  -F file=@clip.flac -F stream=true                           # transcript.text.delta events
+```
+
+The form is OpenAI's: `file` (wav, mp3, flac, ogg, opus, m4a, aac, webm or aiff), `model`,
+`language`, `prompt`, `response_format` and `stream`.
+
+- **`language`** is an ISO 639-1 code or a name the model knows (`en`, `English`); it forces the
+  language, and without it the model says which it heard -- `verbose_json` reports it. A language
+  the model does not know is a 400 that lists the ones it does.
+- **`prompt`** is context for the recognition -- a name, a domain's words -- read as plain text, so
+  no part of it can be taken for one of the model's control tokens.
+- **`response_format`** is `json` (`text` and token `usage`), `text`, or `verbose_json`, which adds
+  the language, the duration and one segment a clip, each with its start and end in seconds. `srt`
+  and `vtt` are refused, and so are word timestamps.
+- **`stream=true`** sends `transcript.text.delta` events as the transcript is written, then one
+  `transcript.text.done` with the whole text and the usage.
+- **`temperature`** must be 0 or absent: the decode is greedy, as the model's reference is.
+
+**A recording longer than one encoder pass (30 seconds for Qwen3-ASR) is cut into clips,** each
+ending at the quietest 100 ms of the last five seconds before the pass would be full, so the cuts
+land in pauses. The clips run in waves of up to eight (fewer when `--max-queued-requests` admits
+fewer), each wave prepared when it starts, and their transcripts are joined with a space. A
+request holds its wave's admission places from its first wave to its last, so it is refused with a
+429 only before it starts. A request takes up to an hour of audio, in a file within
+`--max-body-mib`.
+
+The same model answers `/v1/chat/completions` with an `input_audio` part through a chat template
+that renders the part's marker where the audio goes (`--override-chat-template`); the checkpoint's
+own template renders audio only for content parts of type `audio`, which this server does not hand
+it.
+
+#### Live: `/v1/realtime`
+
+The same model transcribes speech while it is spoken over a WebSocket at `/v1/realtime`, speaking
+OpenAI's realtime transcription protocol, so a client written for OpenAI's works unchanged. The
+client streams audio in and commits each turn; the server answers with the words as they settle
+and a completed transcript for each turn:
+
+| client sends | server answers |
+|---|---|
+| `session.update` (`session.type: "transcription"`), or the beta's `transcription_session.update` | `session.updated` (`session.created` comes first, unasked) |
+| `input_audio_buffer.append` — base64 of 16-bit little-endian mono PCM; a binary frame of the same bytes also works | `conversation.item.input_audio_transcription.delta` as words settle |
+| `input_audio_buffer.commit` — the turn is over | `input_audio_buffer.committed`, then `...transcription.completed` with the turn's whole transcript and its token usage |
+| `input_audio_buffer.clear` | `input_audio_buffer.cleared` |
+
+The session's settings live under `session.audio.input`:
+
+- **`format`** is `{"type": "audio/pcm", "rate": 24000}` as OpenAI's is; 8, 11.025, 12, 16, 22.05,
+  32, 44.1 and 48 kHz are taken as well, and resampled to the model's 16 kHz.
+- **`transcription`**: `language` (or a one-entry `languages`) forces the language, as `language`
+  does on the upload route; `prompt` and `keywords` are context; `delay` -- `minimal`, `low`,
+  `medium` (the default), `high`, `xhigh` -- trades how soon a word settles for how sure it is.
+- **`turn_detection`** is `null` (the default, as for OpenAI's live models: the client commits
+  each turn) or `{"type": "server_vad", "threshold", "prefix_padding_ms", "silence_duration_ms"}`,
+  which ends a turn at each pause the server hears, with `speech_started` / `speech_stopped`
+  events around it. `semantic_vad` is refused.
+
+**How words settle.** The encoder hears a clip whole, so a turn in progress is heard again from its
+start each time another half second of audio has come in: one short pass, held to the words the
+earlier passes settled and decoding only what follows them. Each pass settles its reply but for the
+last few tokens -- the ones the end of the audio can still change -- and a settled word is never
+taken back: the deltas, joined, are the start of the completed transcript. The words not yet
+settled go out as `radiance.input_audio_transcription.tentative` (`item_id`, `text`), which each
+pass replaces; it is not an OpenAI event, and a client that does not know it ignores it. On
+LibriSpeech streamed at real time, the first word shows half a second into the audio, a word
+settles a median 1.5 s after it first shows (2 s at the 90th percentile), and a turn's completed
+transcript arrives about 0.1 s after its commit -- the same text the upload route gives the same
+audio.
+
+A turn that reaches one encoder pass -- 30 seconds -- is committed at the quietest point of its
+last five seconds, and the rest goes on as the next turn; nothing settles in those five seconds, so
+no word heard after the cut has already gone out as the turn's.
+
+**Limits.** A server holds as many sessions as `--max-num-seqs`. Each runs one pass at a time and
+holds one admission place (`--max-queued-requests`) for its whole life; a session refused either
+way gets an `error` event and a 1013 close. A message is at most 2 MiB; a larger one closes the
+socket unread. A session that falls behind its audio is closed with a `buffer_overflow` error and a
+1008 close: more than 16 MiB of messages it has not taken in, or committed turns waiting for their
+transcript beyond 64 of them or 120 s of audio.
+
+With `--api-key`, a socket carries the key as `Authorization: Bearer`, or -- from a browser, which
+cannot set a header on one -- as the subprotocol `openai-insecure-api-key.<key>` beside `realtime`,
+as OpenAI's browser clients send it. With `--no-cors`, a page from another origin may not open the
+socket.
+
+---
+
+## 6. Operation
 
 ### 6.1 The dashboard
 
-Open `http://<host>:<port>/` in a browser. Three tabs:
+Open `http://<host>:<port>/` in a browser. It has three tabs.
 
-**Dashboard** — the live strip across the top (decode step time, decode and prefill throughput,
+**Dashboard**: the live strip across the top (decode step time, decode and prefill throughput,
 requests in flight, KV cache in VRAM, draft acceptance), then cards for the batch, memory and
 interconnect, and the expert plane.
 
-The **KV cache** meter splits what it is holding into two segments:
+The KV cache meter splits what it holds into two segments:
 
 ```
-KV cache   3.3 GiB / 4.5 GiB · 390.1k tok · 75.5%
+KV cache   3.3 / 4.5 GiB  ·  75.5%
 ▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-20.8k tok in flight · 369.3k held for the next turn
+20.8k tok read by running requests  ·  369.3k kept for reuse
 ```
 
-The full-strength segment is live requests; the ghost segment is **prefix cache** — finished turns
-kept so the next turn need not re-prefill. Held is not a second pool: it gives way the moment a
-live request needs it. A high held figure with a high hit rate is the cache doing its job, not a
-leak. Both segments take their warning colour from the *total* fill, since what causes preemption
-is the pool being full.
+The full-strength segment is context running requests are reading; the dim segment is prefix cache,
+finished turns kept for reuse, which gives way the moment a live request needs it. A large kept
+figure with a high hit rate is the cache working, not a leak. Both segments take their warning colour
+from the total fill, since a full pool causes preemption.
 
-**Sessions** — one row per stored conversation: how many tokens, which tier it is in, and whether
-its linear half is still reachable. Sizes **overlap and cannot be added up**: two sessions sharing
-a system prompt share the blocks for it, which is the whole point of a prefix cache.
+**Sessions**: one row per stored conversation: how many tokens, which tier it is in, and whether its
+linear half is still reachable. Sizes overlap and cannot be added: two sessions sharing a system
+prompt share its blocks.
 
-On a hybrid model, a session with blocks but no reachable snapshot reuses **zero** tokens — the
-scheduler clamps reuse to the last linear checkpoint. That verdict is the headline of the tab.
+On a hybrid model, a session with blocks but no reachable snapshot reuses zero tokens, because the
+scheduler clamps reuse to the last linear checkpoint. That verdict is the tab's headline.
 
-**Model** — the resolved graph: every op, which library serves it, and what did not resolve.
+**Model**: the resolved graph: every op, which library serves it, and what did not resolve.
 
 ### 6.2 The JSON behind it
 
@@ -1883,55 +2073,58 @@ curl -s localhost:8000/server_info | jq    # model, cards, KV, draft depth, wire
 curl -s localhost:8000/diagnostics | jq    # the startup report, hardware read again now (§7.1)
 ```
 
-`/server_info` is the operator's first question asked of a process that is already running: which
-model, on how many cards, with how much KV, drafting how deeply, over which wire. All of it is in
-the startup log too — but a startup log is on a machine, in a file, from a process that may have
-been restarted since.
+`/server_info` reports what a running process serves: the model, the cards, the KV cache, the draft
+depth and the wire, as the startup log does.
 
 Its `request_defaults` object says what a request that leaves a field out is served with: every
-sampler field, `max_tokens`, `reasoning_effort`, `reasoning_effort_map`, `chat_template_kwargs` and
-`reasoning_format`, under the request's own spelling of each. `capabilities.reasoning_efforts`
-lists the efforts the chat template takes, or is `null` when it takes any. `server.default_max_tokens` is `null` for `auto`, and
-`server.max_tokens_cap` is `null` when there is none.
+sampler field, `max_tokens`, `reasoning_effort`, `reasoning_effort_map`, `thinking_token_budget`,
+`chat_template_kwargs` and `reasoning_format`, under the request's own spelling of each.
+`capabilities.reasoning_efforts` lists the efforts the chat template takes, or is `null` when it takes
+any. `server.default_max_tokens` is `null` for `auto`, and `server.max_tokens_cap` is `null` when
+there is none.
 
 ### 6.3 Metrics
 
-`GET /metrics` is Prometheus text. Two families:
+`GET /metrics` is Prometheus text, in two families.
 
-**`vllm:` — the compatibility set**, so existing dashboards work: `num_requests_running`,
+**`vllm:`**, the compatibility set, so existing dashboards work: `num_requests_running`,
 `num_requests_waiting`, `num_preemptions_total`, `gpu_cache_usage_perc`, `kv_cache_usage_perc`,
 `gpu_prefix_cache_hit_rate`, `prompt_tokens_total`, `generation_tokens_total`,
 `time_to_first_token_seconds`, `time_per_output_token_seconds`, `inter_token_latency_seconds`,
 `request_prompt_tokens`, `request_generation_tokens`, `request_success_total`, …
 
-**`radiance:` — what this engine actually has**:
+**`radiance:`**, this engine's own:
 
 | | |
 |---|---|
 | `engine_steps_total`, `_decode_total`, `_prefill_total`, `_mixed_total` | step counts by kind |
-| `engine_step_seconds_total`, `_decode_total` | **the honest step time denominator** |
+| `engine_step_seconds_total`, `_decode_total` | step time, the denominator for per-step figures |
 | `decode_tokens_total`, `prefill_tokens_total` | |
 | `decode_tokens_per_second`, `prefill_tokens_per_second` | |
 | `draft_tokens_total`, `draft_accepted_total`, `draft_acceptance_ratio` | |
 | `draft_position_reached_total`, `draft_position_accepted_total`, `draft_position_acceptance_ratio` | acceptance by position: the two counters over any window, the ratio since start |
 | `draft_refills_total`, `draft_refill_tokens_total` | prefix hits ended a drafter window early, and the tokens recomputed (§4.6) |
-| `decode_rows_unspeculated_total` | rows that never drafted at all |
+| `decode_rows_unspeculated_total` | rows that never drafted |
 | `draft_depth_adaptive`, `draft_verify_depth_total{depth}` | the adaptive window's mean over the running sequences, and verifies by the drafts they carried; only with `--draft-window adaptive` (§4.6) |
+| `engine_prefill_chunks_capped_total` | prefill chunks held back to share a step (§4.5) |
+| `engine_steps_held_total` | decode-only steps `--prefill-interleave` ran between chunks (§4.5) |
 | `attn_cached_tokens_total`, `linear_cached_tokens_total` | prefix reuse, both halves |
 | `linear_checkpoints_written_total`, `linear_prefix_cache_hit_rate` | |
 | `prefix_cache_evictions_total`, `prefix_cache_ckpt_evictions_total` | |
-| `prefix_cache_expired_total`, `prefix_cache_ckpt_expired_total` | what `--prefix-cache-ttl` took (§4.8) |
+| `prefix_cache_ckpt_evictions_by_reason_total{reason}`, `prefix_cache_ckpt_refused_total` | snapshots released by `--checkpoint-policy` (`retention`) or as the least recently used of a full store (`store_full`); checkpoints not written for want of a slot |
+| `prefix_hit_cuts_total{reason}`, `prefix_hit_cut_tokens_total` | admissions whose hit reused nothing (`no_snapshot`, `windowed_group`, `adopt_failed`), and the checkpoint shortfall: cached prompt tokens computed again because the hit resumed at a snapshot below it. `/stats` and `/sessions` carry the same counts; `RADIANCE_LOG=debug` logs each eviction and each cut hit |
+| `prefix_cache_expired_total`, `prefix_cache_ckpt_expired_total` | what `--prefix-cache-ttl` removed (§4.8) |
 | `num_requests_preempted` | |
 | `http_queue_depth`, `http_responses_total`, `http_admission_rejected_total` | |
 | `client_disconnect_total`, `stream_overflow_total` | |
 
-Two traps worth naming:
+Two pitfalls:
 
-- **`draft_acceptance_ratio` is conditional on having drafted.** It reads healthy while
-  tokens-per-step collapses. The quantity that separates the two is blocks per step —
-  `draft_tokens_total / depth` over `engine_steps_decode_total`. `scripts/mcdecl.sh` measures it.
-- **Step time is not wall-clock over steps.** Use `engine_step_seconds_decode_total /
-  engine_steps_decode_total`, which charges only decode. Wall-clock charges idle and prefill to it.
+- `draft_acceptance_ratio` is conditional on having drafted, so it can stay high while tokens per
+  step collapse. Blocks per step (`draft_tokens_total / depth` over `engine_steps_decode_total`)
+  separates the two; `scripts/mcdecl.sh` measures it.
+- Step time is not wall-clock over steps. Use `engine_step_seconds_decode_total /
+  engine_steps_decode_total`, which charges only decode; wall-clock also charges idle and prefill.
 
 `deploy/grafana/radiance.json` charts both families over time, on Prometheus or VictoriaMetrics.
 
@@ -1941,15 +2134,15 @@ Two traps worth naming:
 radiance --model m.rad --live
 ```
 
-Cards, throughput, draft acceptance and the expert plane, redrawn in place. **Redirected it prints
-one greppable `key=value` line instead**, so it is usable from a script:
+Cards, throughput, draft acceptance and the expert plane, redrawn in place. Redirected, it prints one
+greppable `key=value` line instead, for scripts:
 
 ```sh
 radiance --model m.rad --live >> serve.log 2>&1
 ```
 
-The step counter is the field that tells a stalled loop from an idle one: throughput decays toward
-zero on its own, but a step count frozen between two draws means the loop itself stopped.
+The `step` field tells a stalled loop from an idle one: throughput decays towards zero on its own,
+but a step count frozen between two draws means the loop stopped.
 
 ### 6.5 Logging
 
@@ -1961,28 +2154,25 @@ radiance --model m.rad -vv                    # same as trace
 
 ### 6.6 Security
 
-**There is no TLS, and without `--api-key` there is no authentication.** CORS is on, so a page on
-any origin can call the API from a browser; `--no-cors` turns it off.
+There is no TLS, and without `--api-key` there is no authentication. CORS is on, so a page on any
+origin can call the API from a browser; `--no-cors` turns it off.
 
 ```sh
 radiance --model m.rad --api-key "$KEY"
 ```
 
 With a key, every request must carry `Authorization: Bearer KEY` (or Anthropic's `X-Api-Key: KEY`)
-or it is answered 401 — `/tokenize` and `/server_info` included, since they hand out the
-vocabulary, the chat template and the configuration. Three paths are exempt: `/health` (and
-`/v1/health`) and `/ping`, because a load balancer cannot carry a bearer token and an
-authenticated probe is a server that reports itself down, and the dashboard page itself (`/`,
-`/dashboard`), which holds no data — on a 401 it shows a key field, keeps the key in the browser's
-storage and sends it on every fetch of data it makes.
+or it is answered 401, `/tokenize` and `/server_info` included. Exempt are `/health`, `/v1/health` and
+`/ping`, because load balancers cannot send a bearer token, and the dashboard page (`/`,
+`/dashboard`), which holds no data: on a 401 it asks for the key, keeps it in the browser's storage
+and sends it on every data fetch.
 
-Without a key, `/diagnostics` answers only a client on the same machine (a loopback address) and
-every other one 403: it describes the host — kernel, boot parameters, PCI layout, memory limits —
-and not just the model. Read it with `curl localhost:8000/diagnostics` on the machine, or start
-the server with `--api-key` to read it from elsewhere.
+Without a key, `/diagnostics` answers only loopback clients (others get 403), because it describes
+the host: kernel, boot parameters, PCI layout, memory limits. Read it on the machine, or start the
+server with `--api-key`.
 
-The key is checked, not encrypted: on any network you do not control, bind to localhost and put a
-TLS-terminating reverse proxy in front:
+The key is not encrypted in transit. On a network you do not control, bind to localhost behind a
+TLS-terminating reverse proxy:
 
 ```sh
 radiance --model m.rad --host 127.0.0.1 --port 8000 --api-key "$KEY"
@@ -1990,46 +2180,40 @@ radiance --model m.rad --host 127.0.0.1 --port 8000 --api-key "$KEY"
 
 ### 6.7 Restarting and stopping
 
-Nothing here is a daemon; run it under systemd, a supervisor or `nohup`. `scripts/fnstop.sh` stops
-a running server and waits for the process to actually go — which matters, because VRAM is not
-released until it does.
+radiance is not a daemon; run it under systemd, a supervisor or `nohup`. `scripts/fnstop.sh` stops a
+running server and waits for the process to exit, which matters because VRAM is not released until
+it does.
 
 ---
 
-## 7. When something goes wrong
+## 7. Troubleshooting
 
-### 7.1 Start with the startup report
+### 7.1 The startup report
 
-The last thing startup prints before `serving on` is one block, `STARTUP REPORT`, in three parts.
-A startup that stops prints it too, after the error, with what it had resolved by then, and ends
-it with an `E` line that repeats the error, so the tail of the log still shows it. It is the part
-of a log to paste into an issue.
+The last block startup prints before `serving on` is `STARTUP REPORT`. A startup that stops prints
+it too, after the error, with what it had resolved, and ends with an `E` line repeating the error. It
+is the part of a log to paste into an issue. Its sections:
 
-- **CONFIGURATION** lists every option the command line takes, from the same table `--help`
-  prints. Each line shows the value in force and where it came from: `default`, `command line`,
-  an environment variable, or `auto`. An `auto` line carries the reason under it: the drafter's
-  depth, where the embedding and the n-gram table went and why, the VRAM split, the placement
-  strategy, and each sampler default with the file it came from, or the built-in default the
-  file left it at. `--api-key` shows only `set` or `not set`.
-- **ENVIRONMENT** names the `RADIANCE_*` variables that are set (§8). It shows only the names,
-  never the values.
+- **CONFIGURATION**: every option `--help` lists, with the value in force and its source
+  (`default`, `command line`, an environment variable, or `auto`). An `auto` line carries the reason
+  under it: the drafter's depth, where the embedding and n-gram table went, the VRAM split, the
+  placement strategy, each sampler default and the file it came from. `--api-key` shows only `set` or
+  `not set`.
+- **ENVIRONMENT** names the `RADIANCE_*` variables that are set (§8), never their values.
 - **DERIVED** shows what startup worked out that no single option states: the VRAM split with the
-  budget report under it, the weights by tier, the KV cache, and the kernel libraries selection
-  used, with the attention rows by name.
-- **HARDWARE** reads the machine from `/proc` and `/sys`, the same files inside the image. It
-  covers the CPU, RAM, swap, kernel, container, cgroup and memlock limits, transparent huge
-  pages, the IOMMU mode from the cards' own groups, TTM's page limit (`ttm.pages_limit`) and
-  `cwsr_enable`. Each display device gets its gfx target, VRAM and BAR, and its PCIe link **at
-  every hop up to the root port**. A card with a switch on it reports its own link at full speed
-  whatever the slot does, so a root port parked at half speed only shows here. The block also
-  shows the card's PCIe power levels, its power cap against its default and its maximum, any
-  voltage offset, and its runtime power management. The cgroup limit is the tightest one from
-  the process's own cgroup up to the root.
-- **FINDINGS** lists warnings first, then notes. Each says what was seen, what it costs, and the
-  fix. Every warning is also printed as a `W` line of its own.
+  budget report under it, the weights by tier, the KV cache, and the kernel libraries selection used,
+  with the attention rows by name.
+- **HARDWARE** reads the machine from `/proc` and `/sys` (the same files inside the image): CPU, RAM,
+  swap, kernel, container, cgroup (the tightest limit up to the root) and memlock limits, transparent
+  huge pages, the IOMMU mode from the cards' groups, `ttm.pages_limit` and `cwsr_enable`. Each display
+  device gets its gfx target, VRAM and BAR; its PCIe link at every hop up to the root port (a card
+  with an on-board switch reports full speed whatever the slot does); its PCIe power levels; its power
+  cap against default and maximum; any voltage offset; and its runtime power management.
+- **FINDINGS** lists warnings, then notes. Each says what was seen, what it costs, and the fix. Every
+  warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 1.6.0
+I STARTUP REPORT -- radiance 1.7.0
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [command line]
 I   --tp                               2                                           [command line]
@@ -2049,12 +2233,12 @@ I        why: every copy between host memory and the card ... cross this link, s
 I        fix: a link stuck one level down after long uptime has been cleared by a reboot; ...
 ```
 
-A PCIe link at rest parks at its lowest speed, so a link below its maximum is only a finding when
-the card was busy as it was read. At startup the cards are mostly idle. `GET /diagnostics` reads
-the hardware again and runs the same checks, so call it during a long prefill to see the links and
-power levels under load. A reading is reused for a second, and the power-management files (DPM
-levels, power caps, busy percentage) are read only for the cards the server runs on: the driver
-answers them from the card's firmware under a lock, and wakes a sleeping card to do it.
+A PCIe link at rest parks at its lowest speed, so a link below its maximum is a finding only when the
+card was busy as it was read; at startup the cards are mostly idle. `GET /diagnostics` reads the
+hardware again and runs the same checks, so call it during a long prefill. A reading is reused for a
+second, and the power-management files (DPM levels, power caps, busy percentage) are read only for
+the cards the server runs on, because the driver answers them from firmware under a lock and wakes a
+sleeping card to do it.
 
 ```sh
 curl -s -H "Authorization: Bearer $KEY" localhost:8000/diagnostics | jq '.findings'
@@ -2062,22 +2246,22 @@ curl -s -H "Authorization: Bearer $KEY" localhost:8000/diagnostics | jq '.findin
 
 ### 7.2 Messages and what they mean
 
-| What you see | What it means | What to do |
+| Message | Meaning | Action |
 |---|---|---|
-| `N declared op(s) resolve to libref` and the engine exits | No kernel library covers those ops on this card. Serving from the reference implementation would be orders of magnitude slow with nothing to say so | Install a library that covers them, or accept the cost with `--debug-accept-reference-kernels`. The named ops are exactly what a new library must implement |
-| `did not fit` at load, naming a weight class or a KV group | The split left one side too little. A routed expert cannot be served from the file tier, so it has nowhere else to go | If **weights** did not fit: add or raise `--host-pool-mib`, or lower `--max-model-len` or `--max-num-seqs`. If a **KV group** did not fit: `--kv-cache-dtype fp8`, or a larger `--host-pool-mib` (RAM permitting), which takes experts off the card. The plan report names which, by class, with the shortfall |
-| `chat is 501` in the startup line | The container carries no chat template | Re-convert with `--tokenizer`, and check that a `chat_template.jinja` sits beside `tokenizer_config.json` in the checkpoint. Meanwhile use `/v1/completions` |
+| `N declared op(s) resolve only to a reference implementation (libref)` and the engine exits | No kernel library covers those ops on this card (§2) | Install a library that covers them, or accept the cost with `--debug-accept-reference-kernels`. The named ops are what a new library must implement |
+| `DID NOT FIT` in the placement plan, naming a weight class, or `KV group '...': ... did not fit the KV pool` | The split left one side too little. A routed expert cannot be served from the file tier, so it has nowhere else to go | If weights did not fit: add or raise `--host-pool-mib`, or lower `--max-model-len` or `--max-num-seqs`. If a KV group did not fit: `--kv-cache-dtype fp8`, or a larger `--host-pool-mib` (RAM permitting), which takes experts off the card. The plan report names which, by class, with the shortfall |
+| `chat is 501` in the `serving on` line | The container carries no chat template | Re-convert with `--tokenizer`, and check that a `chat_template.jinja` sits beside `tokenizer_config.json` in the checkpoint. Meanwhile use `/v1/completions` |
 | `does not read '<weight>' encoded <encoding>` at startup | No loaded kernel takes that weight's encoding for the op that reads it | Convert with a recipe that writes an encoding a loaded kernel reads, or load the library that reads it |
-| Prefix hit rate 0% and every turn re-prefills | The KV pool cannot hold the live sessions, so the cache evicts what the next turn wanted | The cache already has everything the experts can do without: a larger `--host-pool-mib` (RAM permitting), `--kv-cache-dtype fp8`, or fewer/shorter sessions. See §4.3 |
-| The server dies with no log line, on a request it had been serving fine | A kernel whose code object had never been loaded could not be: the card has no room left. HIP faults inside the launch rather than returning an error, so there is nothing to print | A card left with too little room for a first launch — see §4.3. Set `--gpu-headroom-mib` to the value the startup warning names. `coredumpctl info` names the kernel; `AMD_LOG_LEVEL=1` prints `HSA_STATUS_ERROR_OUT_OF_RESOURCES` just above the fault |
-| KV in VRAM stays high with one session and nothing moves | The idle tiers are **off** — they are sized, and with no size nothing is copied | Pass `--prefix-cache-mib N` |
-| `out of memory` / `the carve reserved N of address space and the card would not back it` | Something else is holding VRAM | Check with `rocm-smi`; stop the other process. The budget is stated before allocation, so the log says what it asked for |
-| `pool allocation refused` with `backing allocation of … refused` on the second card, after the first card's pools succeeded | The VRAM budget is measured before any rank allocates. A card that refuses its weights pool lost that memory to another process in between (the line below the refusal says how much is free now). A refused `host_pool` is pinned memory: **every rank pins its own `--host-pool-mib`**, so `--tp 2` pins it twice, and the amdgpu driver caps what every process together pins at RAM less 1/64 and 1.5 GiB. The pool is locked user memory, which `ttm.pages_limit` does not count | Stop the other process (`rocm-smi --showpids`). For the host pool, keep `--tp` × `--host-pool-mib` under both the cap and the available RAM the refusal names. `amdgpu.no_system_mem_limit=1` lifts the driver's cap, but not the RAM |
-| `host_pool: backing allocation of … refused: rad_dev_alloc(…): locking piece K of N`, and `failed to pin userptr` in `journalctl -k` | The IOMMU would not DMA-map one piece of the pinned host pool. Pinned host memory is locked in pieces of at most 1 GiB because an Intel VT-d host in scalable mode was seen to refuse any single pin above about 2.5 GiB; a piece failing means this machine refuses smaller pins still, or a total its IOMMU will not map | Keep IOMMU translation on: `iommu=pt` lets every pin through but on that host also removed peer access between the cards, which moves every all-reduce onto the slower host-memory path. Report the kernel version, the IOMMU mode and the refusal line |
-| `a synchronisation has waited 5 s` naming a kernel, then `no queue has advanced`, then `HW Exception … GPU Hang` and a reset in `journalctl -k` (`MES failed to respond to msg=REMOVE_QUEUE`, `MODE1 reset`) | The card stopped running the queue. The kernel named is where it stopped, not necessarily why. The driver resets the whole card, VRAM included, and the engine is aborted. The usual cause is compute wave save/restore being off: the driver evicts a process's queues whenever host memory the card maps is moved under memory pressure, and with `cwsr_enable=0` it cannot preempt a running queue, so the eviction waits for a queue a serve never lets drain. A voltage offset or other clock instability is the other cause seen on R9700s. If the stall line says the queues **advanced**, the wait was long rather than stuck, and nothing is wrong | `cat /sys/module/amdgpu/parameters/cwsr_enable` must print `1` (the startup report warns when it is `0`); set `amdgpu.cwsr_enable=1`, rebuild the initramfs and reboot. Remove any `OD_VDDGFX_OFFSET` (`pp_od_clk_voltage`). A reset puts the power cap, fan curve and voltage offset back to firmware defaults, so re-apply them before every start rather than once at boot. Keep the devcoredump under `/sys/class/drm/card*/device/devcoredump/data`; a reboot loses it. `docker inspect` shows exit code 0 for a container Docker has already restarted, which says nothing about how the old process ended |
-| `--draft-model is not implemented` | This engine loads its drafter from the container | `rad-convert --draft-model DIR` at conversion time |
-| `context_length_exceeded` on a request | The **prompt alone** does not fit the context. `max_tokens` is clamped rather than refused, so this fires only when there is no room left to generate at all | Shorten the prompt by the number of tokens the message names, or raise `--max-model-len` if the model allows it |
-| `unknown option '--foo'` and the engine exits | Deliberate. A typo in a budget flag is the difference between the plan you asked for and one the planner invented | Check `radiance --help` |
+| Prefix hit rate 0% and every turn re-prefills | The KV pool cannot hold the live sessions, so the cache evicts what the next turn wanted | The cache already has everything the experts can spare: a larger `--host-pool-mib` (RAM permitting), `--kv-cache-dtype fp8`, or fewer or shorter sessions (§4.3) |
+| The server dies with no log line, on a request it had been serving fine | A kernel's first launch could not load its code object for lack of VRAM; HIP faults inside the launch instead of returning an error | Set `--gpu-headroom-mib` to the value the startup warning names (§4.3). `coredumpctl info` names the kernel; `AMD_LOG_LEVEL=1` prints `HSA_STATUS_ERROR_OUT_OF_RESOURCES` just above the fault |
+| KV in VRAM stays high with one session and nothing moves | The host tier is off: it is sized, and without a size nothing is copied | Pass `--prefix-cache-mib N` |
+| `out of memory` / `the carve reserved N of address space and the card would not back it` | Something else is holding VRAM | Check with `rocm-smi` and stop the other process. The budget is stated before allocation, so the log says what it asked for |
+| `pool allocation refused` with `backing allocation of … refused` on the second card, after the first card's pools succeeded | The VRAM budget is measured before any rank allocates, so a card that refuses its weights pool lost that memory to another process in between (the next line says how much is free now). A refused `host_pool` is pinned memory: every rank pins its own `--host-pool-mib` (twice at `--tp 2`), and the amdgpu driver caps what all processes together pin at RAM less 1/64 and 1.5 GiB. It is locked user memory, which `ttm.pages_limit` does not count | Stop the other process (`rocm-smi --showpids`). For the host pool, keep `--tp` × `--host-pool-mib` under both the cap and the available RAM the refusal names. `amdgpu.no_system_mem_limit=1` lifts the driver's cap, but not the RAM |
+| `host_pool: backing allocation of … refused: rad_dev_alloc(…): locking piece K of N`, and `failed to pin userptr` in `journalctl -k` | The IOMMU would not DMA-map one piece of the pinned host pool. Pinned host memory is locked in pieces of at most 1 GiB because an Intel VT-d host in scalable mode can refuse a single pin above about 2.5 GiB; a failing piece means this machine refuses smaller pins still, or a total its IOMMU will not map | Keep IOMMU translation on: `iommu=pt` lets every pin through, but on such a host it can also remove peer access between the cards, moving every all-reduce onto the slower host-memory path. Report the kernel version, the IOMMU mode and the refusal line |
+| `device: a synchronisation has waited 5 s; the queues:` with the packet each queue is on, then `device: no queue has advanced`, then `HW Exception … GPU Hang` and a reset in `journalctl -k` (`MES failed to respond to msg=REMOVE_QUEUE`, `MODE1 reset`) | The card stopped running the queue; the kernel named is where it stopped, not necessarily why. The driver resets the whole card, VRAM included, and the engine is aborted. The usual cause is compute wave save/restore being off: the driver evicts a process's queues whenever host memory the card maps moves under memory pressure, and with `cwsr_enable=0` it cannot preempt a running queue, so the eviction waits on a queue that never drains. Clock instability (a voltage offset) is the other cause seen on R9700s. If the follow-up line says the queues advanced, the wait was long, not stuck | `cat /sys/module/amdgpu/parameters/cwsr_enable` must print `1` (the startup report warns when it is `0`); set `amdgpu.cwsr_enable=1`, rebuild the initramfs and reboot. Remove any `OD_VDDGFX_OFFSET` (`pp_od_clk_voltage`). A reset restores the power cap, fan curve and voltage offset to firmware defaults; re-apply them before every start. Keep the devcoredump under `/sys/class/drm/card*/device/devcoredump/data`, which a reboot loses. `docker inspect` shows exit code 0 for a container Docker already restarted, whatever ended the old process |
+| `--draft-model is not implemented` | The engine loads its drafter from the container | `rad-convert --draft-model DIR` at conversion time |
+| `context_length_exceeded` on a request | The prompt alone does not fit the context. `max_tokens` is clamped rather than refused, so this fires only when there is no room left to generate | Shorten the prompt by the number of tokens the message names, or raise `--max-model-len` if the model allows it |
+| `unknown option '--foo'` and the engine exits | An unknown flag is an error, so a typo in a budget flag cannot silently change the plan | Check `radiance --help` |
 | Empty `content` and `finish_reason: "length"` on short chat turns | The reasoning spent all of `max_tokens` inside `<think>`; `usage.completion_tokens_details.reasoning_tokens` equals `completion_tokens`. Qwen3.8's default `reasoning_effort` is `xhigh` | `--reasoning-effort medium`, or `"reasoning_effort": "none"` per request; or cap the reasoning with `thinking_token_budget` / `--thinking-token-budget` below `max_tokens` |
 | `401` with `invalid api key` | The server was started with `--api-key` | Send `Authorization: Bearer KEY` (§6.6) |
 
@@ -2086,39 +2270,39 @@ First three things to run when a server will not start:
 ```sh
 rad-info m.rad                            # is the container what you think it is?
 radiance --model m.rad --debug-graph      # does every op resolve?
-rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct at all?
+rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct?
 ```
 
 ---
 
 ## 8. Environment
 
-**Operator-facing**
+**Operation**
 
 | | |
 |---|---|
-| `RADIANCE_HOME` | where `kernels/`, `architectures/` and `quantizers/` live; a `:`-separated search path, the first home winning. Same as `--radiance-home` |
-| `RADIANCE_KERNELS` | default kernel libraries, comma-separated. Same as `--kernels`, read by the engine *and* every tool, so a plugin validated with `rad-kbench` can be served without editing launchers |
-| `RADIANCE_LOG` | `error` \| `warn` \| `info` \| `debug` \| `trace` |
-| `ROCM_PATH` | where ROCm lives, if not `/opt/rocm` |
-| `HF_TOKEN` | for `scripts/hfget.sh`, and `--model <owner/name>`, on a gated or private repo |
+| `RADIANCE_HOME` | where `kernels/`, `architectures/` and `quantizers/` live; a `:`-separated search path, the first home winning. Same as `--radiance-home`; set but empty is unset |
+| `RADIANCE_KERNELS` | default kernel libraries, separated by `,` or `:`. Same as `--kernels`, read by the engine and every tool by one rule, so a plugin validated with `rad-kbench` serves the same way without editing launchers; set but empty is unset |
+| `RADIANCE_LOG` | `error` \| `warn` \| `info` \| `debug` \| `trace` (default `info`) |
+| `ROCM_PATH` | where ROCm lives, if not `/opt/rocm` (build time) |
+| `HF_TOKEN` | for `scripts/hfget.sh` and `--model <owner/name>` on a gated or private repo |
 | `XDG_CACHE_HOME` | where `--model <owner/name>` fetches to without `--download-dir` (`$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf`) |
 
 **Tooling**
 
 | | |
 |---|---|
-| `RADIANCE_TUNE` | pin a kernel's tunable axes instead of reading the tune cache — `op:key=value[,key=value][;op:...]`. For comparing tunings, not for deployment |
+| `RADIANCE_TUNE` | pin a kernel's tunable axes instead of reading the tune cache: `op:key=value[,key=value][;op:...]`. For comparing tunings, not for deployment |
 | `RADIANCE_CALIB_DIR` | where an engine run writes calibration data for a recipe's `gptq calib=DIR` |
 | `RADIANCE_CALIB_TOKENS` | with `RADIANCE_CALIB_DIR`, the tokens the calibration tap accumulates before it writes and switches itself off (default 65536) |
 | `RADIANCE_PROFILE_EVERY` | with `--profile-ops`, dump the per-op table every N steps (default 32) |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
 
-There is also a family of instruments for engine development — `RADIANCE_DEBUG_*` (residual probes,
-idle scrubs, routing and issue dumps), `RADIANCE_OP_ORACLE*` (named ops checked against `libref` on
-the operands the model issued; `scripts/oracle.sh` drives it) and `RADIANCE_OP_REPEAT` (named ops
-run a second time on the same inputs, to ask whether a kernel is a function of them). They are
-instruments, not features; grep `getenv` if you need one, and read the comment beside it first.
+Engine development has its own instruments: `RADIANCE_DEBUG_*` (residual probes, routing and issue
+dumps), `RADIANCE_OP_ORACLE*` (named ops checked against `libref` on the operands the model issued;
+`scripts/oracle.sh` drives it) and `RADIANCE_OP_REPEAT` (named ops run a second time on the same
+inputs, to check that a kernel is a function of them). They are not features; to use one, find its
+name in the source and read the comment beside it.
 
 ---
 
@@ -2126,11 +2310,11 @@ instruments, not features; grep `getenv` if you need one, and read the comment b
 
 | | |
 |---|---|
-| `spec.md` | the design, and it is binding. Start here for *why* |
+| `spec.md` | the design, and it is binding. Start here for why |
 | [TOOLS.md](TOOLS.md) | every flag of every tool, and the shell harnesses |
 | [PLUGIN.md](PLUGIN.md) | writing a kernel plugin: exports, constraints, hooks, out-of-tree build |
-| [OPS.md](OPS.md) | the conventional op vocabulary. Held to the registries by `ctest -R ops_doc` |
-| [ARCHITECTURES.md](ARCHITECTURES.md) | per-architecture geometry, and the traps that stay plausible when they are wrong |
+| [OPS.md](OPS.md) | the conventional op vocabulary, held to the registries by `ctest -R ops_doc` |
+| [ARCHITECTURES.md](ARCHITECTURES.md) | per-architecture geometry, and the mistakes that stay plausible when they are wrong |
 | [IMPLEMENTATION.md](IMPLEMENTATION.md) | layout, build and conventions for working on the engine |
 | [KERNELS.md](KERNELS.md) | what `rad-kbench` last measured |
 | [QSA.md](QSA.md), [MOE-W4.md](MOE-W4.md) | the sparse-attention indexer; the four-bit expert format |

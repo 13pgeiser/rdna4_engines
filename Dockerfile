@@ -1,45 +1,42 @@
 # syntax=docker/dockerfile:1
 #
-# radiance as a container image: the engine, its plugins and its tools compiled inside the ROCm
-# toolchain image, the host test suite run against that build, and a runtime image built FROM
-# SCRATCH that holds the install tree and exactly the shared libraries it loads -- no distribution,
-# no package manager, no shell beyond a static busybox.
+# radiance as a container image: the engine, plugins and tools built in the ROCm toolchain image,
+# the host test suite run against that build, and a FROM scratch runtime image holding the install
+# tree and exactly the shared libraries it loads (no distribution, no package manager, only a
+# static busybox).
 #
 #   docker/build.sh                                       # the usual way (BuildKit / buildx)
 #   docker buildx build -t radiance .                     # the same, by hand
 #   docker buildx build --build-arg GPU_TARGETS="gfx1200;gfx1201" -t radiance .
 #
 # Stages:
-#   ffmpeg   FFmpeg built with only the demuxers core/mm/media.cpp admits and the decoders their
-#            streams need (pictures, video, and audio with swresample), and the three encoders the
-#            images API writes (png, mjpeg, libwebp); the distribution's build brings ~200
-#            packages of encoders, filters and display libraries the engine never calls
-#   llvm     ROCm's libLLVM rebuilt from ROCm's own llvm-project at the commit the image's clang
-#            reports, with docker/llvm-vopd-pairing.patch -- the fix that makes LLVM 24's device
-#            code repeatable from build to build (cmake/RadAddPlugin.cmake, rad_hip_repeatable)
-#   build    ROCm dev image + cmake/ninja/g++-14; configures, builds, installs to /stage, every
-#            device source compiled by ROCm's clang from a shadow of the ROCm tree whose libLLVM
-#            is the llvm stage's
-#   test     docker/llvm-check.sh, then `ctest -LE gpu` on that build -- everything that does not
-#            need a card
-#   rootfs   the install tree stripped, and every library its binaries and plugins load, resolved
-#            by ldd, copied into one directory and checked from inside a chroot
-#   runtime  FROM scratch + rootfs. This is the image that ships
+#   ffmpeg   FFmpeg with only the demuxers core/mm/media.cpp admits, the decoders their streams
+#            need (pictures, video, audio with swresample) and the three encoders the images API
+#            writes (png, mjpeg, libwebp); the distribution's build pulls ~200 unused packages
+#   llvm     ROCm's libLLVM rebuilt from ROCm's llvm-project at the commit the image's clang
+#            reports, with docker/llvm-vopd-pairing.patch, which makes LLVM 24's device code
+#            repeatable across builds (cmake/RadAddPlugin.cmake, rad_hip_repeatable)
+#   build    ROCm dev image + cmake/ninja/g++-14; configures, builds and installs to /stage, with
+#            device code compiled by ROCm's clang from a shadow ROCm tree using the llvm stage's
+#            libLLVM
+#   test     docker/llvm-check.sh, then the host-only ctest suites
+#   rootfs   the stripped install tree plus every library its binaries and plugins load (resolved
+#            by ldd), copied into one directory and checked from inside a chroot
+#   runtime  FROM scratch + rootfs; the shipped image
 #
-# Device code is NOT built with --offload-compress: the engine's AQL backend reads the fat binaries
-# itself and refuses a compressed bundle.
+# Device code is not built with --offload-compress: the AQL backend reads the fat binaries itself
+# and refuses a compressed bundle.
 #
-# GPU_TARGETS must be named. A bare-metal ./build.sh asks the machine which cards it has; a build
-# container has no card to ask, and a build that guessed would emit kernels for hardware nobody
-# chose. They are the targets the shipped KERNEL LIBRARIES are compiled for -- libr4d serves RDNA4
-# only and drops every architecture outside gfx12 on its own. The engine itself runs on every AMD
-# GPU family whatever is named (its own kernels carry the generic family targets), so a kernel
-# library for another card is added to the image by mounting it on the search path:
+# GPU_TARGETS must be named: a build container has no card to detect, unlike a bare-metal
+# ./build.sh. They are the targets of the shipped kernel libraries; libr4d serves RDNA4 only and
+# drops every architecture outside gfx12. The engine's own kernels carry the generic family
+# targets and run on every AMD GPU family, so a kernel library for another card is added by
+# mounting it on the search path:
 #   docker run ... -v /my/plugins:/plugins -e RADIANCE_HOME=/plugins:/opt/radiance/share/radiance
 #
-# The ROCm userspace in the image must be one the host's amdgpu kernel driver supports. It is
-# pinned to the version the serving host runs; move both together. From ROCm 10 on, the dev image
-# is published only as the -full tag.
+# The image's ROCm userspace must be supported by the host's amdgpu kernel driver; it is pinned to
+# the serving host's version, so move both together. From ROCm 10 on, the dev image is published
+# only as the -full tag.
 
 ARG ROCM_VERSION=10.1.0-full
 ARG UBUNTU_VERSION=24.04
@@ -57,12 +54,12 @@ RUN apt-get update \
       libwebp-dev \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /tmp
-# The demuxers are media.cpp's kFormats whitelist, the only containers it opens. The decoders are
-# what those containers carry: still images, H.264 and HEVC (MP4, MOV, HEIF), VP8 and VP9 (WebM,
-# WebP), AV1 through dav1d (WebM, MP4, AVIF), MPEG-1/2/4, Theora and the FLV/H.263 family. JPEG XL
-# is recognised and refused by name: its only decoder is libjxl's. The encoders are an image
-# model's output formats (media.cpp encode_image): png, jpeg as mjpeg, webp through libwebp. No
-# protocols: media.cpp reads from memory through its own I/O context.
+# Demuxers: media.cpp's kFormats whitelist. Decoders: what those containers carry -- still
+# images, H.264 and HEVC (MP4, MOV, HEIF), VP8 and VP9 (WebM, WebP), AV1 through dav1d (WebM, MP4,
+# AVIF), MPEG-1/2/4, Theora and the FLV/H.263 family. JPEG XL is recognised and refused by name
+# (its only decoder is libjxl's). Encoders: the image output formats of media.cpp encode_image
+# (png, jpeg as mjpeg, webp through libwebp). No protocols: media.cpp reads from memory through its
+# own I/O context.
 RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
     curl -fsSL "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" -o ffmpeg.tar.xz \
  && echo "${FFMPEG_SHA256}  ffmpeg.tar.xz" | sha256sum -c - \
@@ -87,15 +84,15 @@ RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
 # ------------------------------------------------------------------------------------------- llvm
 FROM rocm/dev-ubuntu-${UBUNTU_VERSION}:${ROCM_VERSION} AS llvm
 ARG JOBS=
-# THE ONE LIBRARY OF THE HIP COMPILER THAT CHANGES. clang, lld and the offload tools all load
-# lib/llvm/lib/libLLVM.so, so this stage rebuilds that file and nothing else: the source is ROCm's
-# llvm-project at exactly the commit `clang --version` names (a different commit refuses, as does
-# a patch that no longer applies), configured as ROCm's lib/cmake/llvm/LLVMConfig.cmake says it
-# was -- Release without assertions, AMDGPU;SPIRV;X86, every component in the dylib, no RTTI or
-# exceptions, zlib and zstd from rocm_sysdeps -- and compiled by ROCm's own clang and lld. With
-# VOPD pairing off it produces ROCm's code byte for byte; docker/llvm-check.sh holds the build
-# stage to that. A sparse, depth-one fetch: llvm/, the cmake/, libc/ and third-party/ directories
-# its configure reads, and none of its tests or documentation.
+# clang, lld and the offload tools all load lib/llvm/lib/libLLVM.so, so this stage rebuilds only
+# that file: ROCm's llvm-project at exactly the commit `clang --version` names (the stage stops if
+# clang names none or the patch does not apply), configured as ROCm's
+# lib/cmake/llvm/LLVMConfig.cmake records -- Release without assertions, AMDGPU;SPIRV;X86, every
+# component in the dylib, no RTTI or exceptions, zlib and zstd from rocm_sysdeps -- and compiled
+# by ROCm's own clang and lld. With VOPD pairing off it produces
+# ROCm's code byte for byte; docker/llvm-check.sh holds the build stage to that. The fetch is
+# sparse and depth one: llvm/ plus the cmake/, libc/ and third-party/ directories configure reads,
+# without tests or documentation.
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       git cmake ninja-build ca-certificates \
@@ -133,40 +130,38 @@ RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
 # ------------------------------------------------------------------------------------------ build
 FROM rocm/dev-ubuntu-${UBUNTU_VERSION}:${ROCM_VERSION} AS build
 ARG GPU_TARGETS=gfx1201
-# Parallel compile jobs. Empty means one per core; a device-kernel translation unit takes 2-3 GB
-# of RAM under hipcc, so a host that is also serving wants a lower number.
+# Parallel compile jobs; empty means one per core. A device-kernel translation unit takes 2-3 GB
+# of RAM under hipcc, so lower it on a host that is also serving.
 ARG JOBS=
 
-# g++-14 rather than the image's default 13: its libstdc++ is the one hipcc then compiles the
-# device-side translation units against too, and it is the runtime image's libstdc++ as well.
-# gawk because tools/ops_doc_check.sh uses gensub, which Ubuntu's default awk (mawk) lacks.
-# libdav1d7 and libwebp7 are the runtime halves of the AV1 decoder and the WebP encoder the ffmpeg
-# stage linked; busybox-static goes into the runtime image.
+# g++-14 rather than the default 13: hipcc compiles device-side translation units against its
+# libstdc++, which is also the runtime image's. gawk: tools/ops_doc_check.sh uses gensub, which
+# mawk lacks. libdav1d7 and libwebp7 are the runtime libraries of the ffmpeg stage's AV1 decoder
+# and WebP encoder; busybox-static goes into the runtime image.
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       cmake ninja-build pkg-config g++-14 gawk libdav1d7 libwebp7 busybox-static \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ffmpeg /opt/ffmpeg /opt/ffmpeg
-# ROCm's library directory is registered with the loader beside FFmpeg's because the ROCm 10 images
-# register none, and the rootfs stage resolves every library the installed binaries load with ldd.
+# Register ROCm's library directory beside FFmpeg's: the ROCm 10 images register none, and the
+# rootfs stage resolves the installed binaries' libraries with ldd.
 RUN echo /opt/ffmpeg/lib > /etc/ld.so.conf.d/ffmpeg.conf \
  && echo /opt/rocm/lib > /etc/ld.so.conf.d/rocm.conf && ldconfig
 
 ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm CC=gcc-14 CXX=g++-14 \
     PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig
 
-# THE HIP COMPILER: ROCm's clang, loading the llvm stage's libLLVM. ROCm's tools find their
-# libraries through RPATHs relative to themselves -- $ORIGIN/../lib for libLLVM, which
-# LD_LIBRARY_PATH cannot override, and $ORIGIN/../../rocm_sysdeps/lib and $ORIGIN/../../../lib,
-# which leave lib/llvm -- so the compiler lives in a shadow of the whole ROCm tree at the same
-# depth: /opt/rocm-repeatable, every entry a link back into /opt/rocm except lib/llvm/bin, which
-# holds real copies of the executables, and lib/llvm/lib's libLLVM, which is the rebuilt one.
-# Only compiling uses it. The build names /opt/rocm with --rocm-path, so the headers and device
-# libraries are ROCm's and the runtime path clang records in a linked plugin is /opt/rocm/lib;
-# without it clang takes the tree it sits in as ROCm, and a loader that follows that path from
-# the HIP runtime to comgr reaches the rebuilt libLLVM, which lacks the libstdc++ symbols ROCm's
-# GCC-built one re-exports for comgr. The rootfs stage refuses any library resolved through it.
+# The HIP compiler: ROCm's clang loading the llvm stage's libLLVM. ROCm's tools find libraries
+# through RPATHs relative to themselves ($ORIGIN/../lib for libLLVM, which LD_LIBRARY_PATH cannot
+# override, plus $ORIGIN/../../rocm_sysdeps/lib and $ORIGIN/../../../lib), so the compiler runs
+# from /opt/rocm-repeatable, a shadow of the whole ROCm tree at the same depth. Every entry links
+# back into /opt/rocm except lib/llvm/bin (real copies of the executables) and the rebuilt
+# libLLVM. Only compiling uses it. The build passes --rocm-path=/opt/rocm so headers and device
+# libraries are ROCm's and linked plugins record /opt/rocm/lib. Without it clang treats its own
+# tree as ROCm, and the HIP runtime would reach comgr through the rebuilt libLLVM, which lacks the
+# libstdc++ symbols ROCm's GCC-built one re-exports for comgr. The rootfs stage refuses any
+# library resolved through the shadow tree.
 COPY --from=llvm /out/ /tmp/llvm-out/
 RUN set -e; R=/opt/rocm; D=/opt/rocm-repeatable; L=lib/llvm; \
     so=$(basename $(readlink -f $R/$L/lib/libLLVM.so)); \
@@ -186,10 +181,9 @@ RUN set -e; R=/opt/rocm; D=/opt/rocm-repeatable; L=lib/llvm; \
 WORKDIR /src
 COPY . .
 
-# The install prefix is fixed at configure time because the default $RADIANCE_HOME is compiled in
-# as <prefix>/share/radiance; DESTDIR then stages the tree without moving that default.
-# oom_score_adj 1000: on a host that is also serving, the compiler is what the OOM killer takes,
-# not the server.
+# The prefix is fixed at configure time because the default $RADIANCE_HOME is compiled in as
+# <prefix>/share/radiance; DESTDIR stages the tree without moving that default.
+# oom_score_adj 1000: on a host that is also serving, the OOM killer takes the compiler first.
 RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
     cmake -S . -B /build -G Ninja \
       -DCMAKE_INSTALL_PREFIX=/opt/radiance \
@@ -205,41 +199,41 @@ RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
 
 # ------------------------------------------------------------------------------------------- test
 FROM build AS test
-# Host-only: a build container has no /dev/kfd. The `gpu`-labelled suites (mem_test,
+ARG JOBS=
+# Host-only: a build container has no /dev/kfd. The `gpu`-labelled tests (the *_card entries,
 # r4d_selftest, kbench) run against a card from this stage:
 #   docker buildx build --target build -t radiance-build . && docker run --rm \
 #       --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined radiance-build \
 #       ctest --test-dir /build -L gpu --output-on-failure
-# One test at a time: several suites assert that a cost scales linearly, a ratio of two timings
-# that tests running beside them would distort. The build sandbox forbids io_uring, so avx_check
-# reports its file-backed gather case as skipped here. The `oot` suite -- every shipped plugin
-# rebuilt against the installed package, libr4d included -- is the development tree's to run
-# (tests/oot_plugins.sh): it re-does this stage's whole compile.
+# Tests run JOBS at a time (default one per two hardware threads, about one per core on an SMT
+# machine: the per-binary CPU budgets in tests/CMakeLists.txt hold for tests that do not share a
+# core); the `perf` entries, which assert wall-clock costs, run alone (RUN_SERIAL). The build sandbox forbids io_uring, so avx_check skips its
+# file-backed gather case. The `oot` suite (every shipped plugin rebuilt against the installed
+# package) repeats this stage's whole compile, so it runs from the development tree instead
+# (tests/oot_plugins.sh).
 RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
     bash /src/docker/llvm-check.sh /build \
- && ctest --test-dir /build -LE 'gpu|oot' --output-on-failure \
+ && ctest --test-dir /build -LE 'gpu|oot' -j"${JOBS:-$(( ($(nproc) + 1) / 2 ))}" --output-on-failure \
  && touch /build/host-tests-passed
 
 # ----------------------------------------------------------------------------------------- rootfs
 FROM build AS rootfs
-# hfget.sh, which fetches the Hugging Face repo a --model id names, runs curl and jq, and curl needs
-# a CA bundle to reach the hub over TLS. Installed in this stage, not in `build`, so adding them does
-# not recompile the engine.
+# hfget.sh (fetches the Hugging Face repo a --model id names) needs curl, jq and a CA bundle.
+# Installed here rather than in `build` so changing them does not recompile the engine.
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       curl jq ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 # The marker makes this stage, and so the shipped image, depend on the test stage.
 COPY --from=test /build/host-tests-passed /rootfs/opt/radiance/share/radiance/.host-tests-passed
-# Every library the binaries and plugins load, plus comgr, which the HIP runtime opens at run time
-# and cannot initialise a device without, goes into one directory the dynamic loader searches by
-# default: no ld.so.cache, no LD_LIBRARY_PATH. ROCm's own libdrm_amdgpu carries the card name table
-# compiled in, so no amdgpu.ids is copied. A static busybox provides the health check's wget and a
-# shell for `docker exec`; curl, jq and the CA bundle are hfget.sh's, and the bundle is
-# ca-certificates' Mozilla set, which is the directory named for it in the license list.
-# docker/licenses.sh traces each of those files to its package and records its license and source
-# in /usr/share/doc/THIRD-PARTY. Then every ELF file is resolved from inside the tree, so nothing
-# can depend on a library the image lacks.
+# Every library the binaries and plugins load, plus comgr (opened by the HIP runtime at run time
+# and required to initialise a device), goes into one directory the loader searches by default:
+# no ld.so.cache, no LD_LIBRARY_PATH. ROCm's libdrm_amdgpu has the card name table compiled in, so
+# no amdgpu.ids is copied. A static busybox provides the health check's wget and a shell for
+# `docker exec`; curl, jq and the CA bundle are for hfget.sh (the bundle is ca-certificates'
+# Mozilla set, named by that directory in the license list). docker/licenses.sh records each
+# file's package, license and source in /usr/share/doc/THIRD-PARTY. Finally every ELF file is
+# resolved from inside the tree, so none depends on a library the image lacks.
 RUN set -e; R=/rootfs; L=$R/usr/lib/x86_64-linux-gnu; \
     mkdir -p $L $R/lib64 $R/usr/bin $R/bin $R/etc/ssl/certs $R/data $R/tmp; \
     chmod 1777 $R/tmp; \
@@ -283,8 +277,8 @@ LABEL org.opencontainers.image.title="radiance" \
 
 COPY --from=rootfs /rootfs/ /
 
-# A single allocation may take the whole card and the HIP heap may grow to all of VRAM; the
-# runtime's defaults cap both below what the placement plan hands out.
+# Let one allocation take the whole card and the HIP heap grow to all of VRAM; the runtime's
+# defaults cap both below what the placement plan hands out.
 ENV PATH=/opt/radiance/bin:/usr/bin:/bin \
     GPU_MAX_ALLOC_PERCENT=100 \
     GPU_MAX_HEAP_SIZE=100

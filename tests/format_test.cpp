@@ -1,10 +1,9 @@
-/* format_test.cpp -- the .rad container: write one, read it back, and prove the invariants the
+/* format_test.cpp -- the .rad container: write one, read it back, and check the invariants the
  * hot path relies on.
  *
- * The interesting cases here are the refusals. A container is a file somebody was handed, and the
- * engine mmaps it and then addresses into it with arithmetic and no bounds test -- so every claim
- * the arithmetic rests on has to be checked at open, and "checked at open" has to mean RAD_E_FORMAT
- * with a message rather than a SIGSEGV three components later.
+ * The refusals matter most. The engine mmaps an untrusted file and addresses into it with
+ * arithmetic and no bounds test, so every assumption must be checked at open and fail with
+ * RAD_E_FORMAT and a message, not a later SIGSEGV.
  */
 #include "rad_test.h"
 #include "format/radfile.h"
@@ -31,10 +30,17 @@ using namespace rad;
 
 namespace {
 
-std::string tmp_path(const char* stem) {
-    const char* dir = std::getenv("TMPDIR");
-    return std::string(dir && *dir ? dir : "/tmp") + "/radfmt_" +
-           std::to_string((long)::getpid()) + "_" + stem;
+/* Writes `bytes` to radtest::tmp_path(stem); the path, or "" when the file cannot be created. */
+std::string write_tmp(const char* stem, const std::string& bytes) {
+    const std::string p = radtest::tmp_path(stem);
+    FILE* f = std::fopen(p.c_str(), "wb");
+    if (!f) return std::string();
+    std::fwrite(bytes.data(), 1, bytes.size(), f);
+    std::fclose(f);
+    return p;
+}
+std::string write_tmp(const char* stem, const std::vector<uint8_t>& bytes) {
+    return write_tmp(stem, std::string(bytes.begin(), bytes.end()));
 }
 
 std::vector<uint8_t> ramp(int64_t n, uint8_t seed) {
@@ -56,10 +62,9 @@ std::vector<uint8_t> slurp(const std::string& path) {
 
 bool exists(const std::string& path) { return ::access(path.c_str(), F_OK) == 0; }
 
-/* The two encodings the test container is made of: a bf16 weight stored as it is, and int4 codes
- * with an f16 scale a [1 x 32] group. The second has two planes, and over the expert shape below
- * its codes plane ends off a 256-byte boundary, so the scale plane's placement is a real
- * alignment rather than one that falls out of the arithmetic. */
+/* The test container's two encodings: plain bf16, and int4 codes with an f16 scale per [1 x 32]
+ * group. For the expert shape below the int4 codes plane ends off a 256-byte boundary, so the
+ * scale plane's alignment is actually exercised. */
 RadEncoding plain_bf16() { return rad_enc_plain(RAD_BF16); }
 RadEncoding int4_g32() { return rad_enc_affine(RAD_I4, RAD_F16, 1, 32); }
 
@@ -77,8 +82,8 @@ RadWriter::Weight mkw(const char* name, const RadEncoding& enc, int64_t rows, in
     return w;
 }
 
-/* A weight's planes as add_weight(w, planes) takes them: plane k a ramp of its exact
- * rad_enc_plane_bytes(), seeded per plane so two planes of one weight never hold the same bytes. */
+/* A weight's planes as add_weight(w, planes) takes them: plane k is a ramp of exactly
+ * rad_enc_plane_bytes(), seeded per plane so no two planes of a weight match. */
 struct Planes {
     std::vector<std::vector<uint8_t>> bytes;
     std::vector<const void*>          ptr;
@@ -95,26 +100,26 @@ Planes planes_of(const RadWriter::Weight& w, uint8_t seed) {
     return p;
 }
 
-/* The expert shape: [36, 64] of int4 is 1152 bytes of codes, so the 144-byte scale plane starts at
- * 1280. Seeds per weight kind, the same for every expert of every layer -- which is what lets the
- * stride test compare two experts' bytes. */
+/* The expert shape: [36, 64] int4 is 1152 bytes of codes, so the 144-byte scale plane starts at
+ * 1280. Seeds are per weight kind and shared by every expert, so the stride test can compare two
+ * experts' bytes. */
 constexpr int64_t EXP_ROWS = 36, EXP_COLS = 64;
 enum : uint8_t { SEED_EMB = 1, SEED_OUT = 2, SEED_QKV = 3, SEED_GATE = 4, SEED_UP = 5,
                  SEED_DOWN = 6 };
 const char* const kRecipe = "blk.*.ffn_(gate|up).*=rtn:codes=i4,group=32,scale=f16\n";
 const char* const kOptions = "codes=i4,group=32,scale=f16";
 
-/* One small but complete container: two model weights, one layer's dense weight, and two layers
- * of four experts with three slots each -- which is what the fixed-stride addressing is for. The
- * gate is reserved and then written a plane at a time, scale first and codes in two halves, the
- * way a quantiser produces it; everything else goes in whole. */
+/* A small complete container: two model weights, and two layers each with a dense weight and four
+ * experts of three slots, to exercise fixed-stride addressing. The gate is reserved and written a
+ * plane at a time, scale first and codes in two halves, as a quantiser produces it; everything
+ * else goes in whole. */
 struct Built {
     std::string path;
 };
 
 Built write_model(const char* stem) {
     Built b;
-    b.path = tmp_path(stem);
+    b.path = radtest::tmp_path(stem);
 
     RadWriter w;
     CHECK_OK(w.begin(b.path.c_str()));
@@ -135,9 +140,8 @@ Built write_model(const char* stem) {
     whole(mkw("token_embd.weight", plain_bf16(), 128, 64, -1, -1, 0), SEED_EMB);
     whole(mkw("output.weight", plain_bf16(), 128, 64, -1, -1, 0), SEED_OUT);
 
-    /* Two layers, each: one dense weight, then four experts of three slots. The dense weight
-     * comes first so the expert run is contiguous in the directory, which is what
-     * index_experts() requires and what makes the stride derivable. */
+    /* Per layer: the dense weight first, so the expert run is contiguous in the directory as
+     * index_experts() requires to derive the stride. */
     for (int32_t layer = 0; layer < 2; ++layer) {
         const std::string blk = "blk." + std::to_string(layer);
         whole(mkw((blk + ".attn_qkv.weight").c_str(), plain_bf16(), 64, 64, layer, -1, 0),
@@ -189,8 +193,8 @@ bool planes_match(const RadFile& f, const RadFileEntry& e, const RadWriter::Weig
     return true;
 }
 
-/* A copy of `src` with `edit` applied to its bytes, beside it; the copy's path. The edit is handed
- * the header as written so it can find the table it means to damage. */
+/* Writes a copy of `src` beside it with `edit` applied, and returns the copy's path. The edit
+ * gets the header as written so it can locate the table to damage. */
 using Edit = std::function<void(std::vector<uint8_t>&, const RadFileHeader&)>;
 
 std::string patched(const std::string& src, const char* tag, const Edit& edit) {
@@ -214,29 +218,6 @@ template <typename T> T get(const std::vector<uint8_t>& f, uint64_t off) {
 }
 template <typename T> void put(std::vector<uint8_t>& f, uint64_t off, const T& v) {
     std::memcpy(f.data() + off, &v, sizeof v);
-}
-
-/* What `fn` printed to stderr, where the reader logs why it refused a file. */
-std::string stderr_of(const std::function<void()>& fn) {
-    const std::string p = tmp_path("stderr");
-    std::fflush(stderr);
-    const int saved = ::dup(2);
-    const int fd = ::open(p.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (saved < 0 || fd < 0) {
-        if (saved >= 0) ::close(saved);
-        if (fd >= 0) ::close(fd);
-        fn();
-        return std::string();
-    }
-    ::dup2(fd, 2);
-    ::close(fd);
-    fn();
-    std::fflush(stderr);
-    ::dup2(saved, 2);
-    ::close(saved);
-    const std::vector<uint8_t> v = slurp(p);
-    ::unlink(p.c_str());
-    return std::string(v.begin(), v.end());
 }
 
 }  /* namespace */
@@ -280,11 +261,11 @@ TEST(write_and_read_back) {
     CHECK_EQ((int)e->n_planes, 1);
     CHECK_EQ(std::string(f.str(e->quantizer)), std::string());
     CHECK_EQ((int64_t)f.plane(*e, 0).bytes, (int64_t)(128 * 64 * 2));
-    /* The first plane opens the entry, and the bytes came back, not just the directory row. */
+    /* The first plane starts the entry, and the bytes match, not just the directory row. */
     CHECK_EQ((const void*)f.data(f.plane(*e, 0)), (const void*)f.data(*e));
     CHECK(planes_match(f, *e, mkw("", plain, 128, 64, -1, -1, 0), SEED_EMB));
 
-    /* An expert: two planes, and the provenance the quantiser left. */
+    /* An expert: two planes, plus the quantiser's provenance. */
     const RadFileEntry* g = f.find("blk.1.ffn_gate.3");
     REQUIRE(g != nullptr);
     const RadEncoding i4 = int4_g32();
@@ -295,7 +276,7 @@ TEST(write_and_read_back) {
     CHECK_EQ((int)g->layer, 1);
     CHECK_EQ((int)g->expert, 3);
     CHECK_EQ((int)g->slot, 0);
-    /* Written a piece at a time, out of order, and read back whole. */
+    /* Written in pieces out of order, read back whole. */
     CHECK(planes_match(f, *g, mkw("", i4, EXP_ROWS, EXP_COLS, 1, 3, 0), SEED_GATE));
     const RadFileEntry* u = f.find("blk.0.ffn_up.0");
     REQUIRE(u != nullptr);
@@ -303,7 +284,6 @@ TEST(write_and_read_back) {
 
     CHECK(f.find("no.such.weight") == nullptr);
     f.close();
-    ::unlink(b.path.c_str());
 }
 
 /* ------------------------------------------------------------------ the encoding table */
@@ -312,9 +292,8 @@ TEST(an_encoding_is_stored_once_however_many_weights_share_it) {
     RadFile f;
     REQUIRE(f.open(b.path.c_str()) >= 0);
 
-    /* 28 weights, two encodings: a table row per distinct encoding, and every entry naming one.
-     * Equality is byte-for-byte, so the row is the struct the writer was handed and the reader
-     * hands a kernel exactly what the quantiser described. */
+    /* 28 weights, two encodings: one table row per distinct encoding, each entry naming one.
+     * Equality is byte-for-byte, so a kernel receives exactly what the quantiser described. */
     REQUIRE_EQ(f.encoding_count(), (int64_t)2);
     CHECK(!rad_enc_equal(&f.encoding_at(0), &f.encoding_at(1)));
     const RadEncoding plain = plain_bf16(), i4 = int4_g32();
@@ -326,7 +305,6 @@ TEST(an_encoding_is_stored_once_however_many_weights_share_it) {
         CHECK_EQ(e.n_planes, (uint32_t)f.encoding(e).n_planes);
     }
     f.close();
-    ::unlink(b.path.c_str());
 }
 
 /* ------------------------------------------------------------------ alignment */
@@ -335,19 +313,19 @@ TEST(alignment_invariants) {
     RadFile f;
     REQUIRE(f.open(b.path.c_str()) >= 0);
 
-    /* Pool 2 MiB (huge-page mappable), entry 4 KiB (the movement unit), plane 256 B (spec §4.1). */
+    /* Pool 2 MiB (huge-page mappable), entry 4 KiB (the movement unit), plane 256 B (spec §4.2). */
     CHECK_EQ((int64_t)(f.header().data_off % RAD_ALIGN_POOL), (int64_t)0);
 
     for (int64_t i = 0; i < f.entry_count(); ++i) {
         const RadFileEntry& e = f.entry(i);
         CHECK_EQ((int64_t)(e.offset % RAD_ALIGN_UNIT), (int64_t)0);
-        /* Every entry lies inside the data blob, which is what makes data() safe. */
+        /* Every entry lies inside the data blob, which makes data() safe. */
         CHECK(e.offset >= f.header().data_off);
         CHECK(e.offset + e.bytes <= f.header().data_off + f.header().data_bytes);
 
-        /* Its planes: in the encoding's order, each exactly its encoding's size, 256-aligned,
-         * none overlapping the one before, and the entry ending where its last plane does --
-         * so the entry is one span a mover can copy and a plane is a slice by arithmetic. */
+        /* Planes are in encoding order, exactly sized, 256-aligned and non-overlapping, and the
+         * entry ends with its last plane: one span a mover can copy, each plane a slice by
+         * arithmetic. */
         int64_t rows = 0, cols = 0;
         rad_enc_view(e.rank, e.shape, &rows, &cols);
         uint64_t end = e.offset;
@@ -362,23 +340,20 @@ TEST(alignment_invariants) {
         CHECK_EQ(e.offset + e.bytes, end);
     }
 
-    /* The expert's scale plane does not follow its codes directly: 1152 bytes of codes round up
-     * to a plane at 1280. */
+    /* The scale plane does not follow its codes directly: 1152 bytes of codes round up to 1280. */
     const RadFileEntry* g = f.find("blk.0.ffn_gate.0");
     REQUIRE(g != nullptr);
     CHECK_EQ((int64_t)f.plane(*g, 0).bytes, (int64_t)1152);
     CHECK_EQ((int64_t)(f.plane(*g, 1).offset - g->offset), (int64_t)1280);
     CHECK_EQ((int64_t)f.plane(*g, 1).bytes, (int64_t)(EXP_ROWS * 2 * 2));
 
-    /* The string blob is NUL-terminated at its end, which is what lets str() hand back a bare
-     * pointer instead of scanning. */
+    /* The string blob ends in NUL, so str() can return a bare pointer without scanning. */
     CHECK_EQ((int)((const char*)f.base())[f.header().str_off + f.header().str_bytes - 1], 0);
 
     f.close();
-    ::unlink(b.path.c_str());
 }
 
-/* ------------------------------------------------------------------ the whole point */
+/* ------------------------------------------------------------------ fixed-stride experts */
 TEST(fixed_stride_expert_addressing) {
     Built b = write_model("stride");
     RadFile f;
@@ -397,9 +372,8 @@ TEST(fixed_stride_expert_addressing) {
         CHECK(g->stride >= g->unit_bytes);
         CHECK_EQ((int64_t)(g->stride % RAD_ALIGN_UNIT), (int64_t)0);
 
-        /* base + id*stride must land exactly on the directory's own offset for every expert and
-         * every slot. This is the property the mover and the expert kernels use WITHOUT a bounds
-         * test, so it is the one the test exists for. */
+        /* base + id*stride must equal the directory's offset for every expert and slot; the mover
+         * and expert kernels rely on this without a bounds test. */
         for (int32_t e = 0; e < g->n_expert; ++e)
             for (int32_t s = 0; s < g->n_slot; ++s) {
                 const RadFileEntry& row = f.expert_entry(*g, e, s);
@@ -409,38 +383,37 @@ TEST(fixed_stride_expert_addressing) {
                 CHECK_EQ((const void*)f.expert_ptr(*g, e, s), (const void*)f.data(row));
                 CHECK_EQ((int64_t)(row.offset - g->base - (uint64_t)e * g->stride),
                          (int64_t)g->slot_off[s]);
-                /* A plane sits at the same displacement inside every expert's slot, so a scale
-                 * plane is addressed by the same arithmetic as the codes it scales. */
+                /* A plane has the same displacement in every expert's slot, so a scale plane is
+                 * addressed by the same arithmetic as its codes. */
                 const RadFileEntry& row0 = f.expert_entry(*g, 0, s);
                 for (uint32_t k = 0; k < row.n_planes; ++k)
                     CHECK_EQ(f.plane(row, (int)k).offset - row.offset,
                              f.plane(row0, (int)k).offset - row0.offset);
             }
 
-        /* And the bytes really are the same for every expert, since the writer was handed the
-         * same payload -- so a wrong stride would show up here and not only as a wrong pointer. */
+        /* Every expert was written with the same payload, so a wrong stride also shows as
+         * mismatched bytes. */
         const uint8_t* a = f.expert_ptr(*g, 0, 0);
         const uint8_t* c = f.expert_ptr(*g, 3, 0);
         CHECK(std::memcmp(a, c, (size_t)g->slot_bytes[0]) == 0);
     }
 
     f.close();
-    ::unlink(b.path.c_str());
 }
 
-/* --ngram-placement ram: A TABLE COPIED OUT OF THE CONTAINER INTO LOCKED MEMORY is the mapping's
- * bytes, every one of them, at an address no file backs; and a copy read from the wrong file offset
- * is refused by the check against the mapping rather than handed out. Small enough to lock under a
- * default RLIMIT_MEMLOCK, and an odd size so the copy's 2 MiB rounding is exercised. */
+/* --ngram-placement ram: a table copied from the container into locked memory holds exactly the
+ * mapping's bytes at an address no file backs, and a copy read from the wrong file offset fails the
+ * check against the mapping. Small enough for a default RLIMIT_MEMLOCK, and an odd size to
+ * exercise the copy's 2 MiB rounding. */
 TEST(a_table_copied_into_locked_memory_is_the_mapping_byte_for_byte) {
-    const std::string p = tmp_path("tcopy");
+    const std::string p = radtest::tmp_path("tcopy");
     RadWriter w;
     REQUIRE(w.begin(p.c_str()) >= 0);
     w.set_arch("radtest");
     const RadWriter::Weight x = mkw("ngram.weight", plain_bf16(), 1500, 999, -1, -1, 0);
     const Planes want = planes_of(x, 5);
     REQUIRE(w.add_weight(x, want.ptr.data()) >= 0);
-    /* A weight after it, so a read shifted past the table's end is still inside the file. */
+    /* A trailing weight, so a read shifted past the table's end stays inside the file. */
     const RadWriter::Weight y = mkw("tail.weight", plain_bf16(), 64, 64, -1, -1, 0);
     const Planes ywant = planes_of(y, 6);
     REQUIRE(w.add_weight(y, ywant.ptr.data()) >= 0);
@@ -458,32 +431,28 @@ TEST(a_table_copied_into_locked_memory_is_the_mapping_byte_for_byte) {
     TableCopy c;
     std::string why;
     const int rc = table_copy_make(f, src, n, (int64_t)pl.offset, &c, &why);
-    if (rc == RAD_E_NOMEM && why.find("mlock2") != std::string::npos) {
-        std::fprintf(stderr, "  SKIP %s: %s\n", ::radtest::current(), why.c_str());
-    } else {
-        CHECK_OK(rc);
-        CHECK(c.base != nullptr && c.base != (const void*)src);
-        CHECK_EQ(c.bytes % ((size_t)2 << 20), (size_t)0);
-        CHECK(c.bytes >= (size_t)n);
-        if (c.base) CHECK(std::memcmp(c.base, src, (size_t)n) == 0);
-        table_copy_free(&c);
-        CHECK(c.base == nullptr);
+    /* A locked-memory limit below the copy is the machine's setting, not a defect. */
+    if (rc == RAD_E_NOMEM && why.find("mlock2") != std::string::npos) SKIP("%s", why.c_str());
+    CHECK_OK(rc);
+    CHECK(c.base != nullptr && c.base != (const void*)src);
+    CHECK_EQ(c.bytes % ((size_t)2 << 20), (size_t)0);
+    CHECK(c.bytes >= (size_t)n);
+    if (c.base) CHECK(std::memcmp(c.base, src, (size_t)n) == 0);
+    table_copy_free(&c);
+    CHECK(c.base == nullptr);
 
-        /* A sixteen-byte shift in the file offset reads real bytes from the wrong place. */
-        TableCopy bad;
-        std::string bwhy;
-        CHECK_EQ(table_copy_make(f, src, n, (int64_t)pl.offset + 16, &bad, &bwhy), (int)RAD_E_IO);
-        CHECK(bad.base == nullptr);
-        CHECK(bwhy.find("does not match") != std::string::npos);
-    }
-    table_copy_free(&c);                  /* a copy never made, or freed already: a no-op */
+    /* A 16-byte shift in the file offset reads real bytes from the wrong place. */
+    TableCopy bad;
+    std::string bwhy;
+    CHECK_EQ(table_copy_make(f, src, n, (int64_t)pl.offset + 16, &bad, &bwhy), (int)RAD_E_IO);
+    CHECK(bad.base == nullptr);
+    CHECK(bwhy.find("does not match") != std::string::npos);
     f.close();
-    ::unlink(p.c_str());
 }
 
 /* ------------------------------------------------------------------ reserving and writing */
 TEST(a_weight_is_written_in_pieces_in_any_order) {
-    const std::string p = tmp_path("pieces");
+    const std::string p = radtest::tmp_path("pieces");
     RadWriter w;
     REQUIRE(w.begin(p.c_str()) >= 0);
     w.set_arch("radtest");
@@ -497,8 +466,8 @@ TEST(a_weight_is_written_in_pieces_in_any_order) {
     CHECK(w.plane_bytes(idx, 2) < 0);
     CHECK(w.plane_bytes(idx + 1, 0) < 0);
 
-    /* Refused without writing a byte: past the plane, before it, a plane the encoding does not
-     * have, a weight that was never reserved, and data that is not there. */
+    /* Refused without writing: past the plane, before it, a nonexistent plane, an unreserved
+     * weight, and null data. */
     const uint8_t* c = want.bytes[0].data();
     CHECK_EQ(w.write_plane(idx, 0, 1100, c, 100), (int)RAD_E_INVAL);
     CHECK_EQ(w.write_plane(idx, 0, -1, c, 1), (int)RAD_E_INVAL);
@@ -507,8 +476,8 @@ TEST(a_weight_is_written_in_pieces_in_any_order) {
     CHECK_EQ(w.write_plane(-1, 0, 0, c, 1), (int)RAD_E_INVAL);
     CHECK_EQ(w.write_plane(idx, 0, 0, nullptr, 1), (int)RAD_E_INVAL);
 
-    /* The scale first, then the codes a third at a time, last third first -- the order a
-     * producer that emits a block of rows of every plane at once writes them in. */
+    /* Scale first, then codes a third at a time, last third first, as a producer emitting row
+     * blocks of every plane at once would write them. */
     CHECK_OK(w.write_plane(idx, 1, 0, want.bytes[1].data(), 144));
     CHECK_OK(w.write_plane(idx, 0, 768, c + 768, 384));
     CHECK_OK(w.write_plane(idx, 0, 0, c, 384));
@@ -521,13 +490,12 @@ TEST(a_weight_is_written_in_pieces_in_any_order) {
     REQUIRE(e != nullptr);
     CHECK(planes_match(f, *e, x, 9));
     f.close();
-    ::unlink(p.c_str());
 }
 
-/* A SEALED WRITER IS THE SAME FILE. seal() fixes the layout once every table is in, and the planes
- * then go straight to their final offsets -- in any order -- with no spill and no splice; the
- * container has to come out byte for byte the one the spilling writer makes. A table changed after
- * the seal would move the blob, so finish() refuses it, and so does add_weight(). */
+/* A sealed writer produces the same file. seal() fixes the layout once every table is in; planes
+ * then go straight to their final offsets in any order, with no spill or splice, and the result
+ * must match the spilling writer byte for byte. A table changed after the seal would move the
+ * blob, so finish() and add_weight() refuse it. */
 TEST(a_sealed_writer_writes_the_same_file_with_no_spill) {
     struct One { RadWriter::Weight x; uint8_t seed; };
     std::vector<One> ws;
@@ -565,7 +533,7 @@ TEST(a_sealed_writer_writes_the_same_file_with_no_spill) {
         return w.finish();
     };
 
-    const std::string a = tmp_path("seal-spilled"), b = tmp_path("seal-sealed");
+    const std::string a = radtest::tmp_path("seal-spilled"), b = radtest::tmp_path("seal-sealed");
     REQUIRE(build(a, false, false) >= 0);
     REQUIRE(build(b, true, false) >= 0);
     const std::vector<uint8_t> fa = slurp(a), fb = slurp(b);
@@ -581,22 +549,19 @@ TEST(a_sealed_writer_writes_the_same_file_with_no_spill) {
     }
     f.close();
 
-    const std::string c = tmp_path("seal-late");
+    const std::string c = radtest::tmp_path("seal-late");
     CHECK_EQ(build(c, true, true), (int)RAD_E_STATE);
     CHECK(::access(c.c_str(), F_OK) != 0);
-    ::unlink(a.c_str());
-    ::unlink(b.c_str());
 }
 
 TEST(a_plane_left_short_is_refused_at_finish) {
-    /* A hole in a plane is zeros the reader cannot tell from codes: a quantiser that returned
-     * early, a block loop with an off-by-one. The writer refuses the file rather than write it,
-     * and leaves nothing behind -- neither the target nor the spill. */
+    /* An unwritten hole in a plane reads as zero codes (a quantiser that returned early, an
+     * off-by-one block loop). The writer refuses the file and leaves neither target nor spill. */
     const RadWriter::Weight x = mkw("w", int4_g32(), EXP_ROWS, EXP_COLS, -1, -1, 0);
     const Planes want = planes_of(x, 3);
 
     for (int which = 0; which < 2; ++which) {
-        const std::string p = tmp_path(which ? "short_never" : "short_scale");
+        const std::string p = radtest::tmp_path(which ? "short_never" : "short_scale");
         RadWriter w;
         REQUIRE(w.begin(p.c_str()) >= 0);
         w.set_arch("radtest");
@@ -618,7 +583,7 @@ TEST(a_plane_left_short_is_refused_at_finish) {
 }
 
 TEST(a_weight_the_writer_cannot_place_is_refused_and_leaves_no_trace) {
-    const std::string p = tmp_path("refuse");
+    const std::string p = radtest::tmp_path("refuse");
     RadWriter w;
     REQUIRE(w.begin(p.c_str()) >= 0);
     w.set_arch("radtest");
@@ -635,8 +600,8 @@ TEST(a_weight_the_writer_cannot_place_is_refused_and_leaves_no_trace) {
     CHECK(w.add_weight(mkw("d", plain_bf16(), 0, 64, -1, -1, 0)) < 0);
     CHECK(w.add_weight(mkw("", plain_bf16(), 4, 64, -1, -1, 0)) < 0);
 
-    /* The refusals reserved nothing: the one weight that is placed is the file's only entry,
-     * with the only plane, at the start of the blob. */
+    /* The refusals reserved nothing: the one placed weight is the only entry and plane, at the
+     * start of the blob. */
     const RadWriter::Weight ok = mkw("ok", plain_bf16(), 4, 64, -1, -1, 0);
     const Planes okp = planes_of(ok, 2);
     CHECK_EQ(w.add_weight(ok, okp.ptr.data()), (int64_t)0);
@@ -650,14 +615,13 @@ TEST(a_weight_the_writer_cannot_place_is_refused_and_leaves_no_trace) {
     CHECK_EQ(f.entry(0).offset, f.header().data_off);
     CHECK(planes_match(f, f.entry(0), ok, 2));
     f.close();
-    ::unlink(p.c_str());
 }
 
 /* ------------------------------------------------------------------ the vocab section */
 TEST(the_vocab_section_is_rebased_to_where_it_lands) {
-    /* Serialised with section-relative offsets, because the writer alone knows where the section
-     * will sit; finish() adds that position, and the reader then reads it in place. */
-    const std::string p = tmp_path("vocab");
+    /* Serialised with section-relative offsets, since only the writer knows where the section
+     * lands; finish() rebases them and the reader reads in place. */
+    const std::string p = radtest::tmp_path("vocab");
     RadWriter w;
     REQUIRE(w.begin(p.c_str()) >= 0);
     w.set_arch("radtest");
@@ -674,7 +638,7 @@ TEST(the_vocab_section_is_rebased_to_where_it_lands) {
     std::memcpy(blob.data(), &h, sizeof h);
     std::memcpy(blob.data() + sizeof h, text, sizeof text);
 
-    /* Absolute offsets do not fit the section and are refused before anything is placed. */
+    /* Offsets outside the section are refused before anything is placed. */
     RadVocabHeader abs = h;
     abs.tok_text_off = 1u << 20;
     std::vector<uint8_t> bad = blob;
@@ -699,7 +663,6 @@ TEST(the_vocab_section_is_rebased_to_where_it_lands) {
     CHECK(v.tok_score == nullptr);
     CHECK(v.merges == nullptr);
     f.close();
-    ::unlink(p.c_str());
 }
 
 /* ------------------------------------------------------------------ append in place */
@@ -755,10 +718,10 @@ TEST(a_container_extended_in_place_keeps_every_old_weight_where_it_was) {
     RadWriter w;
     REQUIRE((w.begin_append(b.path.c_str(), old)) >= 0);
     carry_over(w, old);
-    /* A carried-over weight's bytes are the old file's, and not the writer's to change. */
+    /* A carried-over weight's bytes belong to the old file and cannot be written. */
     const uint8_t one = 1;
     CHECK_EQ(w.write_plane(0, 0, 0, &one, 1), (int)RAD_E_INVAL);
-    /* One weight in an encoding the container does not have yet, one in one it does. */
+    /* One weight in a new encoding, one in an existing one. */
     const RadWriter::Weight wv = mkw("v.patch.weight", rad_enc_affine(RAD_I8, RAD_BF16, 1, 64),
                                      48, 64, -1, -1, 0);
     const Planes pv = planes_of(wv, 9);
@@ -773,8 +736,8 @@ TEST(a_container_extended_in_place_keeps_every_old_weight_where_it_was) {
     REQUIRE((w.finish()) >= 0);
     old.close();
 
-    /* Nothing between the header and the old end moved: the old tables are dead but intact,
-     * and every old weight's bytes are where they were. */
+    /* Nothing between the header and the old end moved: the old tables are dead but intact, and
+     * every old weight's bytes stay in place. */
     const std::vector<uint8_t> after = slurp(b.path);
     REQUIRE(after.size() > before.size());
     CHECK(std::memcmp(after.data() + sizeof(RadFileHeader), before.data() + sizeof(RadFileHeader),
@@ -801,8 +764,7 @@ TEST(a_container_extended_in_place_keeps_every_old_weight_where_it_was) {
     CHECK_EQ(std::string(f.str(e0->quantizer)), std::string("rtn"));
     CHECK(planes_match(f, *e0, weight_of(f, *e0), SEED_GATE));
 
-    /* The old encodings, carried over, and the one new encoding beside them: the bias shares
-     * the embedding's. */
+    /* The old encodings plus one new one; the bias shares the embedding's. */
     CHECK_EQ(f.encoding_count(), (int64_t)3);
     const RadFileEntry* ev = f.find("v.patch.weight");
     REQUIRE(ev != nullptr);
@@ -823,7 +785,7 @@ TEST(a_container_extended_in_place_keeps_every_old_weight_where_it_was) {
     CHECK_EQ((int64_t)(f.header().data_off % RAD_ALIGN_POOL), (int64_t)0);
     f.close();
 
-    /* The way back: the saved header and length restore the file byte for byte. */
+    /* The saved header and length restore the original file byte for byte. */
     const std::vector<uint8_t> bak = slurp(b.path + ".pre-append");
     REQUIRE_EQ(bak.size(), sizeof(RadFileHeader) + sizeof(int64_t));
     int64_t len = 0;
@@ -835,16 +797,13 @@ TEST(a_container_extended_in_place_keeps_every_old_weight_where_it_was) {
     CHECK_EQ(::ftruncate(fd, (off_t)len), 0);
     ::close(fd);
     CHECK(slurp(b.path) == before);
-
-    ::unlink((b.path + ".pre-append").c_str());
-    ::unlink(b.path.c_str());
 }
 
 TEST(an_in_place_extension_that_fails_leaves_the_container_as_it_was) {
     Built b = write_model("append_fail");
     const std::vector<uint8_t> before = slurp(b.path);
 
-    /* A new expert cannot join its layer from past the end, and the refusal cuts the file back. */
+    /* A new expert cannot join its layer from past the end; the refusal truncates the file back. */
     {
         RadFile old;
         REQUIRE((old.open(b.path.c_str())) >= 0);
@@ -862,7 +821,7 @@ TEST(an_in_place_extension_that_fails_leaves_the_container_as_it_was) {
     }
     CHECK(slurp(b.path) == before);
 
-    /* Another process holding the file: refused before a byte is written. */
+    /* Another process has the file open: refused before writing. */
     int ready[2];
     REQUIRE_EQ(::pipe(ready), 0);
     const pid_t child = ::fork();
@@ -889,7 +848,7 @@ TEST(an_in_place_extension_that_fails_leaves_the_container_as_it_was) {
     ::close(ready[1]);
     CHECK(slurp(b.path) == before);
 
-    /* And with it gone, the same file extends. */
+    /* Once it exits, the same file extends. */
     {
         RadFile old;
         REQUIRE((old.open(b.path.c_str())) >= 0);
@@ -898,15 +857,14 @@ TEST(an_in_place_extension_that_fails_leaves_the_container_as_it_was) {
         w.abort();
     }
     CHECK(slurp(b.path) == before);
-    ::unlink(b.path.c_str());
 }
 
 /* ------------------------------------------------------------------ refusals */
 TEST(truncated_file_is_refused_not_crashed) {
     Built b = write_model("trunc");
 
-    /* Cut the file to a third: the header still claims the full length and every table offset
-     * still points past the end. Nothing may be dereferenced. */
+    /* Truncated copies: the header still claims the full length and table offsets point past the
+     * end. Nothing may be dereferenced. */
     FILE* fp = std::fopen(b.path.c_str(), "rb");
     CHECK(fp != nullptr);
     std::fseek(fp, 0, SEEK_END);
@@ -929,7 +887,6 @@ TEST(truncated_file_is_refused_not_crashed) {
         CHECK_EQ(s, (int)RAD_E_FORMAT);
         CHECK(!f.is_open());
     }
-    ::unlink(cut.c_str());
 
     /* Not a .rad at all. */
     const std::string junk = b.path + ".junk";
@@ -940,18 +897,13 @@ TEST(truncated_file_is_refused_not_crashed) {
     std::fclose(j);
     RadFile f;
     CHECK_EQ(f.open(junk.c_str()), (int)RAD_E_FORMAT);
-    ::unlink(junk.c_str());
 
-    /* A path that is not there is RAD_E_IO, not RAD_E_FORMAT: the two are different problems and
-     * the operator has to be told which. */
+    /* A missing path is RAD_E_IO, distinct from RAD_E_FORMAT. */
     CHECK_EQ(f.open((b.path + ".absent").c_str()), (int)RAD_E_IO);
-
-    ::unlink(b.path.c_str());
 }
 
 TEST(a_container_of_another_version_is_refused_with_the_way_out) {
-    /* One version is read. A file of any other is not a different dialect to be guessed at: it
-     * is refused, and the message names the tool that makes a readable one. */
+    /* Only one version is read. Any other is refused, and the message names rad-convert. */
     Built b = write_model("version");
     for (uint32_t v : { 1u, RAD_FORMAT_VER + 1 }) {
         const std::string bad = patched(b.path, "ver", [&](std::vector<uint8_t>& all,
@@ -966,21 +918,14 @@ TEST(a_container_of_another_version_is_refused_with_the_way_out) {
         CHECK_EQ(s, (int)RAD_E_FORMAT);
         CHECK(!f.is_open());
         CHECK(log.find("rad-convert") != std::string::npos);
-        ::unlink(bad.c_str());
     }
-    ::unlink(b.path.c_str());
 }
 
 TEST(a_table_count_that_overflows_its_span_is_refused) {
-    /* PINS: a table count that cannot be trusted as a byte span is still refused. Checking a table
-     * as `count * sizeof(element)` is a uint64 product of a count the file controls, and every
-     * element type here has an EVEN size, so a count of 2^63 makes the product exactly 2^64 --
-     * zero -- which a span check reads as an empty table and waves through. The loops that follow
-     * iterate the COUNT, not the byte span, so a validate that accepts this walks 2^63 rows off
-     * the end of the mapping, inside the very function whose contract (radfile.h) is that a
-     * corrupt file is RAD_E_FORMAT and not a SIGSEGV three components later. Each table gets its
-     * own copy of the file: one bad count at a time, so a refusal here is attributable to the
-     * field under test. */
+    /* A table count whose byte span overflows is refused. `count * sizeof(element)` is a uint64
+     * product of a file-controlled count; every element size is even, so a count of 2^63 wraps to
+     * zero and looks like an empty table, while later loops iterate the count and walk off the
+     * mapping. Each table is corrupted in its own copy so a refusal is attributable. */
     Built b = write_model("ovf");
     for (int which = 0; which < 5; ++which) {
         const std::string bad = patched(b.path, "ovf", [&](std::vector<uint8_t>& all,
@@ -999,17 +944,14 @@ TEST(a_table_count_that_overflows_its_span_is_refused) {
         RadFile f;
         CHECK_EQ(f.open(bad.c_str()), (int)RAD_E_FORMAT);
         CHECK(!f.is_open());
-        ::unlink(bad.c_str());
     }
-    ::unlink(b.path.c_str());
 }
 
 TEST(an_entry_whose_planes_are_not_its_encodings_is_refused) {
-    /* A reader slices a plane by arithmetic and hands it to a kernel's relayout as exactly what
-     * the encoding says it is. Every way the directory, the plane table and the encoding table can
-     * disagree is refused at open -- each on its own copy of a well-formed file, so the refusal is
-     * the edit's and not some other damage's. Entry 0 is the bf16 embedding (one plane); entry 3
-     * is layer 0's first expert gate (codes at +0, scale at +1280). */
+    /* A reader slices planes by arithmetic and hands them to a kernel's relayout as the encoding
+     * describes. Every disagreement between directory, plane table and encoding table is refused
+     * at open, each on its own copy of a good file. Entry 0 is the bf16 embedding (one plane);
+     * entry 3 is layer 0's first expert gate (codes at +0, scale at +1280). */
     Built b = write_model("planes");
     {
         RadFile ok;
@@ -1057,8 +999,8 @@ TEST(an_entry_whose_planes_are_not_its_encodings_is_refused) {
               p.bytes -= 2;
               put(all, plane_at(h, e.plane_first), p);
           } },
-        /* -16 rather than +16: the scale plane then still ends inside its entry and after the
-         * codes, so the alignment is the only thing wrong with it. */
+        /* -16, not +16, so the scale plane still ends inside its entry after the codes and only
+         * the alignment is wrong. */
         { "a plane off its 256-byte boundary", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
               const RadFileEntry e = entry(all, h, 3);
               RadFilePlane p = get<RadFilePlane>(all, plane_at(h, e.plane_first + 1));
@@ -1079,8 +1021,8 @@ TEST(an_entry_whose_planes_are_not_its_encodings_is_refused) {
               x.plane[0].dtype = RAD_DT_PLUGIN_BASE + 1;
               put(all, h.enc_off, x);
           } },
-        /* A scheme the core does not define is read as a quantiser's own, which rad_enc_valid()
-         * accepts; only the missing terminator is wrong with it. */
+        /* An unknown scheme is a quantiser's own and rad_enc_valid() accepts it; only the
+         * missing terminator is wrong. */
         { "an unterminated scheme", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
               RadEncoding x = get<RadEncoding>(all, h.enc_off);
               std::memset(x.scheme, 'q', sizeof x.scheme);
@@ -1100,26 +1042,21 @@ TEST(an_entry_whose_planes_are_not_its_encodings_is_refused) {
         if (s != RAD_E_FORMAT) std::fprintf(stderr, "    not refused: %s\n", c.what);
         CHECK_EQ(s, (int)RAD_E_FORMAT);
         CHECK(!f.is_open());
-        ::unlink(bad.c_str());
     }
-    ::unlink(b.path.c_str());
 }
 
 TEST(a_layer_with_no_fixed_stride_is_refused) {
-    /* Experts within a layer must share a shape and a format, or `base + id*stride` is a lie and
-     * the hot path -- which does that arithmetic with no bounds test -- reads the wrong bytes.
-     * Both halves refuse it, and they refuse for different reasons worth stating. */
-    const std::string p = tmp_path("nostride");
+    /* Experts within a layer must share shape and format, or the hot path's unchecked
+     * `base + id*stride` reads the wrong bytes. Both writer and reader refuse it. */
+    const std::string p = radtest::tmp_path("nostride");
     const RadWriter::Weight small = mkw("e", plain_bf16(), 32, 64, 0, 0, 0);
     const Planes ps = planes_of(small, 1);
 
-    /* (a) THE WRITER, at the weight that breaks it -- naming the weight, while the operator still
-     * has the checkpoint open and can fix the manifest. Expert 0 defines the shape of a unit and
-     * expert 1 does not match it slot for slot.
+    /* (a) The writer refuses the offending weight by name, while the checkpoint is still at hand.
+     * Expert 0 defines the unit shape and expert 1 does not match it slot for slot.
      *
-     * The size check is not redundant with the offset check above it. An oversized expert still
-     * lands at the right base and displaces only the NEXT one, so an oversized LAST expert passes
-     * every offset test and still leaves a group whose base + id*stride runs off the end. */
+     * The size check is not redundant with the offset check: an oversized last expert lands at the
+     * right base and passes every offset test, yet base + id*stride runs off the end. */
     {
         RadWriter w;
         CHECK_OK(w.begin(p.c_str()));
@@ -1130,7 +1067,7 @@ TEST(a_layer_with_no_fixed_stride_is_refused) {
         w.abort();
     }
 
-    /* (b) Out of order, which no stride addresses at all. Refused on the first weight. */
+    /* (b) Out of order, which no stride can address; refused on the first weight. */
     {
         RadWriter w;
         CHECK_OK(w.begin(p.c_str()));
@@ -1139,23 +1076,20 @@ TEST(a_layer_with_no_fixed_stride_is_refused) {
         w.abort();
     }
 
-    /* (c) THE READER, on a container RadWriter did not produce. The writer's checks bind only
-     * what the writer wrote; a .rad arrives from wherever the operator got it, and the hot path
-     * does `base + id*stride` with no bounds test. So the reader RE-DERIVES the stride at open
-     * from the directory it was handed and refuses a group that has none -- which is why the
-     * check exists on both sides rather than one.
+    /* (c) The reader, on a container RadWriter did not produce: a .rad may come from anywhere,
+     * so the reader re-derives the stride from the directory at open and refuses a group without
+     * one.
      *
-     * Written as a well-formed file whose DIRECTORY is then edited, because that is the shape of
-     * the thing being defended against: bytes that parse, with an entry that lies. Expert 1 and
-     * its plane move one 4 KiB unit along, onto expert 2: every per-entry check still holds --
-     * aligned, inside the file, its plane its encoding's size inside it -- and the three experts
-     * now sit at base, base + 8K and base + 8K, which no single stride describes. */
+     * A well-formed file whose directory is then edited: expert 1 and its plane move one 4 KiB
+     * unit onto expert 2. Every per-entry check still holds, but the experts sit at base,
+     * base + 8K and base + 8K, which no single stride describes. */
     {
         RadWriter w;
         CHECK_OK(w.begin(p.c_str()));
         w.set_arch("radtest");
         for (int e = 0; e < 3; ++e)
-            CHECK(w.add_weight(mkw("e", plain_bf16(), 32, 64, 0, e, 0), ps.ptr.data()) >= 0);
+            CHECK(w.add_weight(mkw(("e" + std::to_string(e)).c_str(), plain_bf16(), 32, 64, 0, e,
+                                   0), ps.ptr.data()) >= 0);
         CHECK_OK(w.finish());
 
         /* It opens as written. */
@@ -1175,15 +1109,263 @@ TEST(a_layer_with_no_fixed_stride_is_refused) {
         RadFile f;
         CHECK_EQ(f.open(bad.c_str()), (int)RAD_E_FORMAT);
         CHECK(!f.is_open());
-        ::unlink(bad.c_str());
     }
-    ::unlink(p.c_str());
+}
+
+/* ------------------------------------------------------------------ the remaining refusals
+ *
+ * Each check validate() and index_experts() make, on its own patched copy of a good file. The
+ * refusal must be RAD_E_FORMAT with the container closed, and its message must be the check's
+ * own, so a case is not passed by some earlier check the edit happens to trip. */
+namespace {
+
+struct Refusal {
+    const char* what;
+    const char* says;      /* a fragment of the intended check's message */
+    Edit        edit;
+};
+
+/* Runs every case on `src` and reports the ones not refused, or refused by another check. */
+void expect_refusals(const std::string& src, const std::vector<Refusal>& cases) {
+    for (const Refusal& c : cases) {
+        const std::string bad = patched(src, "refuse", c.edit);
+        RadFile f;
+        int st = RAD_OK;
+        const std::string log = stderr_of([&] { st = f.open(bad.c_str()); });
+        const bool ok = st == RAD_E_FORMAT && !f.is_open() && has(log, c.says);
+        if (!ok)
+            std::fprintf(stderr, "    %s: status %d, log: %s\n", c.what, st, log.c_str());
+        CHECK(ok);
+    }
+}
+
+RadFileEntry dir_entry(const std::vector<uint8_t>& all, const RadFileHeader& h, uint64_t i) {
+    return get<RadFileEntry>(all, h.dir_off + i * sizeof(RadFileEntry));
+}
+void set_dir_entry(std::vector<uint8_t>& all, const RadFileHeader& h, uint64_t i,
+                   const RadFileEntry& e) {
+    put(all, h.dir_off + i * sizeof(RadFileEntry), e);
+}
+
+/* A container with a vocab section that has every array: three tokens with text and types, one
+ * merge and one step, so each of the section's checks has something to refuse. The section is
+ * laid out header, text, types (padded to 4), merges, then the step at the next multiple of 8. */
+std::string write_vocab_model(const char* stem) {
+    const std::string p = radtest::tmp_path(stem);
+    RadWriter w;
+    CHECK_OK(w.begin(p.c_str()));
+    w.set_arch("radtest");
+    const uint64_t text_off = sizeof(RadVocabHeader);
+    const uint64_t type_off = text_off + 3 * sizeof(rad_stroff);
+    const uint64_t merge_off = type_off + 4;
+    const uint64_t step_off = (merge_off + 8 + 7) / 8 * 8;
+    std::vector<uint8_t> blob(step_off + sizeof(RadVocabStep), 0);
+    RadVocabHeader h{};
+    h.kind = RAD_TOK_BPE;
+    h.n_tokens = 3;
+    h.n_merges = 1;
+    h.n_steps = 1;
+    h.tok_text_off = text_off;
+    h.tok_type_off = type_off;
+    h.merge_off = merge_off;
+    h.step_off = step_off;
+    h.bos = h.eos = h.eot = h.pad_id = h.unk = h.sep = -1;
+    h.chat_template = w.intern_string("{{ messages }}");
+    const rad_stroff text[3] = { w.intern_string("a"), w.intern_string("b"),
+                                 w.intern_string("ab") };
+    const uint8_t types[3] = { RAD_TT_NORMAL, RAD_TT_NORMAL, RAD_TT_NORMAL };
+    const uint32_t merge[2] = { 0, 1 };
+    RadVocabStep st{};
+    st.kind = RAD_PRE_SPLIT;
+    st.arg0 = w.intern_string("\\s+");
+    std::memcpy(blob.data(), &h, sizeof h);
+    std::memcpy(blob.data() + text_off, text, sizeof text);
+    std::memcpy(blob.data() + type_off, types, sizeof types);
+    std::memcpy(blob.data() + merge_off, merge, sizeof merge);
+    std::memcpy(blob.data() + step_off, &st, sizeof st);
+    CHECK_OK(w.set_vocab_section(blob.data(), (int64_t)blob.size()));
+    w.meta_s("note", "a string value");
+    w.add_weight(mkw("w", plain_bf16(), 4, 64, -1, -1, 0), planes_of(mkw("w", plain_bf16(), 4, 64,
+                                                                         -1, -1, 0), 1).ptr.data());
+    CHECK_OK(w.finish());
+    return p;
+}
+
+RadVocabHeader vocab_header(const std::vector<uint8_t>& all, const RadFileHeader& h) {
+    return get<RadVocabHeader>(all, h.vocab_off);
+}
+
+}  /* namespace */
+
+/* The header, the string blob, the metadata and the vocab section: every offset into the string
+ * blob or the section is checked, so str() and the vocab view are plain pointers afterwards. */
+TEST(every_table_and_string_check_refuses_its_own_corruption) {
+    const std::string p = write_vocab_model("tables");
+    {
+        RadFile ok;
+        REQUIRE(ok.open(p.c_str()) == RAD_OK);
+        REQUIRE(bool(ok.vocab()));
+        REQUIRE(ok.vocab().merges != nullptr && ok.vocab().steps != nullptr);
+        REQUIRE(ok.get_s("note") != nullptr);
+    }
+    auto set_header = [](std::vector<uint8_t>& all, const RadFileHeader& h) { put(all, 0, h); };
+    const std::vector<Refusal> cases = {
+        { "an empty string blob", "string blob is empty", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileHeader x = h; x.str_bytes = 0; set_header(all, x); } },
+        { "a string blob that does not end in NUL", "last byte is not NUL", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileHeader x = h; x.str_bytes -= 1; set_header(all, x); } },
+        { "a string blob past the end of the file", "the string blob lies outside", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileHeader x = h; x.str_bytes = all.size(); set_header(all, x); } },
+        { "an architecture name outside the blob", "header string offset", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileHeader x = h; x.arch_id = h.str_bytes; set_header(all, x); } },
+        { "a recipe outside the blob", "header string offset", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileHeader x = h; x.recipe = ~0ull; set_header(all, x); } },
+        { "provenance outside the blob", "header string offset", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileHeader x = h; x.created_by = h.str_bytes + 7; set_header(all, x); } },
+        { "a metadata key outside the blob", "metadata row 0", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileKV kv = get<RadFileKV>(all, h.meta_off); kv.key = h.str_bytes; put(all, h.meta_off, kv); } },
+        { "a metadata string value outside the blob", "metadata row 0", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileKV kv = get<RadFileKV>(all, h.meta_off); kv.v.s = h.str_bytes; put(all, h.meta_off, kv); } },
+        { "a data blob off its 2 MiB boundary", "not 2097152-aligned", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileHeader x = h; x.data_off -= 4096; set_header(all, x); } },
+        { "a vocab section past the end of the file", "the vocab section lies outside", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileHeader x = h; x.vocab_bytes = all.size(); set_header(all, x); } },
+        { "a vocab section shorter than its header", "shorter than its own header", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileHeader x = h; x.vocab_bytes = sizeof(RadVocabHeader) - 8; set_header(all, x); } },
+        { "a vocab section off its alignment", "the vocab section starts at", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileHeader x = h; x.vocab_off += 4; x.vocab_bytes -= 4; set_header(all, x); } },
+        { "token text that runs off the section", "arrays do not fit", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadVocabHeader v = vocab_header(all, h); v.tok_text_off = h.vocab_off + h.vocab_bytes - 8;
+              put(all, h.vocab_off, v); } },
+        { "token types before the section", "arrays do not fit", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadVocabHeader v = vocab_header(all, h); v.tok_type_off = h.vocab_off - 8;
+              put(all, h.vocab_off, v); } },
+        { "merges off their element alignment", "arrays do not fit", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadVocabHeader v = vocab_header(all, h); v.merge_off += 2; put(all, h.vocab_off, v); } },
+        { "a step count past the section", "arrays do not fit", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadVocabHeader v = vocab_header(all, h); v.n_steps = 1000; put(all, h.vocab_off, v); } },
+        { "a merge naming a token past the vocabulary", "merge 0 names token 3", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              const RadVocabHeader v = vocab_header(all, h); put(all, v.merge_off + 4, (uint32_t)3); } },
+        { "token text outside the string blob", "vocab token 1 points outside", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              const RadVocabHeader v = vocab_header(all, h);
+              put(all, v.tok_text_off + sizeof(rad_stroff), (rad_stroff)h.str_bytes); } },
+        { "a step string outside the string blob", "vocab step 0 points outside", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              const RadVocabHeader v = vocab_header(all, h);
+              RadVocabStep st = get<RadVocabStep>(all, v.step_off); st.arg1 = h.str_bytes + 100;
+              put(all, v.step_off, st); } },
+        { "a chat template outside the string blob", "chat template offset", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadVocabHeader v = vocab_header(all, h); v.chat_template = h.str_bytes; put(all, h.vocab_off, v); } },
+    };
+    expect_refusals(p, cases);
+}
+
+/* A directory row: its rank, its extents and its span, each refused at open. */
+TEST(every_directory_row_check_refuses_its_own_corruption) {
+    Built b = write_model("rows");
+    const std::vector<Refusal> cases = {
+        { "rank 0", "has rank 0", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileEntry e = dir_entry(all, h, 0); e.rank = 0; set_dir_entry(all, h, 0, e); } },
+        { "a rank past the ABI's", "the ABI allows", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileEntry e = dir_entry(all, h, 0); e.rank = RAD_MAX_RANK + 1; set_dir_entry(all, h, 0, e); } },
+        { "an extent of zero", "extent 0 in dim 1", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileEntry e = dir_entry(all, h, 1); e.shape[1] = 0; set_dir_entry(all, h, 1, e); } },
+        { "a negative extent", "extent -128 in dim 0", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileEntry e = dir_entry(all, h, 1); e.shape[0] = -128; set_dir_entry(all, h, 1, e); } },
+        { "a span past the end of the file", "-- truncated", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileEntry e = dir_entry(all, h, 2); e.bytes = all.size(); set_dir_entry(all, h, 2, e); } },
+        { "a name outside the string blob", "directory row 2 has a string offset", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileEntry e = dir_entry(all, h, 2); e.options = h.str_bytes; set_dir_entry(all, h, 2, e); } },
+    };
+    expect_refusals(b.path, cases);
+}
+
+/* The expert directory's layout rules, which `base + id * stride` relies on. In write_model's
+ * directory, rows 3..14 are layer 0's four experts of three slots and rows 16..27 layer 1's. */
+TEST(every_expert_layout_check_refuses_its_own_corruption) {
+    Built b = write_model("experts");
+    const std::vector<Refusal> cases = {
+        { "expert 0's slots out of order", "expert 0's slots are 1 at position 0", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileEntry e = dir_entry(all, h, 3); e.slot = 1; set_dir_entry(all, h, 3, e); } },
+        { "an expert 0 slot before the expert's base", "is before the expert's base", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileEntry e = dir_entry(all, h, 4); e.offset = dir_entry(all, h, 3).offset - RAD_ALIGN_UNIT;
+              e.bytes += dir_entry(all, h, 4).offset - e.offset; set_dir_entry(all, h, 4, e); } },
+        { "experts listed out of order", "listed out of order (expected 1, found 2)", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              for (uint64_t i = 6; i < 9; ++i) { RadFileEntry e = dir_entry(all, h, i); e.expert = 2; set_dir_entry(all, h, i, e); } } },
+        { "a later expert without expert 0's slots", "does not have the same 3 slots", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileEntry e = dir_entry(all, h, 8); e.slot = 1; set_dir_entry(all, h, 8, e); } },
+        { "a later expert's slot of another size", "must share a shape and format", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              RadFileEntry e = dir_entry(all, h, 6); e.bytes += RAD_ALIGN_SUB; set_dir_entry(all, h, 6, e); } },
+        { "a layer's experts split by another weight", "not contiguous in the directory", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              for (uint64_t i = 16; i < 28; ++i) { RadFileEntry e = dir_entry(all, h, i); e.layer = 0; set_dir_entry(all, h, i, e); } } },
+        { "more slots than the directory supports", "has 9 slots", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+              /* Expert 0 runs on through experts 1 and 2. */
+              for (uint64_t i = 6; i < 12; ++i) { RadFileEntry e = dir_entry(all, h, i); e.expert = 0; set_dir_entry(all, h, i, e); } } },
+    };
+    expect_refusals(b.path, cases);
+
+    /* The writer refuses a ninth slot while the weight is at hand, rather than write a container
+     * the reader then refuses. */
+    const std::string p = radtest::tmp_path("nineslots");
+    RadWriter w;
+    CHECK_OK(w.begin(p.c_str()));
+    w.set_arch("radtest");
+    for (int32_t s = 0; s < 9; ++s) {
+        const RadWriter::Weight x = mkw(("e0." + std::to_string(s)).c_str(), plain_bf16(), 4, 64,
+                                        0, 0, s);
+        const int64_t idx = w.add_weight(x, planes_of(x, 1).ptr.data());
+        CHECK(s < 8 ? idx >= 0 : idx == RAD_E_INVAL);
+    }
+    w.abort();
+}
+
+/* A weight is looked up by name, so a container holds each name once. The writer refuses a second
+ * weight of a name it holds, from add_weight and from add_existing, and the reader refuses a
+ * directory that lists one twice rather than serving the first and leaving the second dead. */
+TEST(a_container_holds_each_name_once) {
+    const std::string p = radtest::tmp_path("dupname");
+    const RadWriter::Weight a = mkw("blk.0.attn_q.weight", plain_bf16(), 32, 64, 0, -1, 0);
+    const Planes pa = planes_of(a, 1);
+    {
+        RadWriter w;
+        CHECK_OK(w.begin(p.c_str()));
+        w.set_arch("radtest");
+        CHECK(w.add_weight(a, pa.ptr.data()) >= 0);
+        CHECK_EQ(w.add_weight(a, pa.ptr.data()), (int64_t)RAD_E_INVAL);
+        RadWriter::Weight b = a;
+        b.name = "blk.0.attn_k.weight";
+        CHECK(w.add_weight(b, pa.ptr.data()) >= 0);
+        CHECK_OK(w.finish());
+    }
+    {
+        RadFile f;
+        REQUIRE(f.open(p.c_str()) == RAD_OK);
+        CHECK_EQ(f.entry_count(), (int64_t)2);
+        /* Extending in place takes the same name once too. */
+        RadWriter w;
+        REQUIRE(w.begin_append(p.c_str(), f) == RAD_OK);
+        CHECK(w.add_existing(weight_of(f, f.entry(0)), f, f.entry(0)) >= 0);
+        CHECK_EQ(w.add_existing(weight_of(f, f.entry(0)), f, f.entry(0)), (int64_t)RAD_E_INVAL);
+        CHECK_EQ(w.add_weight(a, pa.ptr.data()), (int64_t)RAD_E_INVAL);
+        w.abort();
+    }
+    /* Entry 1's name pointed at entry 0's: every other check holds. */
+    const std::string bad = patched(p, "dup", [&](std::vector<uint8_t>& all, const RadFileHeader& h) {
+        RadFileEntry e0 = get<RadFileEntry>(all, h.dir_off);
+        RadFileEntry e1 = get<RadFileEntry>(all, h.dir_off + sizeof(RadFileEntry));
+        e1.name = e0.name;
+        put(all, h.dir_off + sizeof(RadFileEntry), e1);
+    });
+    RadFile f;
+    int s = RAD_OK;
+    const std::string log = stderr_of([&] { s = f.open(bad.c_str()); });
+    CHECK_EQ(s, (int)RAD_E_FORMAT);
+    CHECK(!f.is_open());
+    CHECK(has(log, "blk.0.attn_q.weight"));
 }
 
 TEST(empty_container_still_opens) {
-    /* A container with no weights is legal -- a vocab-only or metadata-only file -- and must not
-     * be a special case anywhere. Nothing about the layout should depend on there being data. */
-    const std::string p = tmp_path("empty");
+    /* A container with no weights (vocab- or metadata-only) is legal and needs no special case. */
+    const std::string p = radtest::tmp_path("empty");
     RadWriter w;
     CHECK_OK(w.begin(p.c_str()));
     w.set_arch("radtest");
@@ -1201,12 +1383,11 @@ TEST(empty_container_still_opens) {
     CHECK(f.get_i("n_layers", &n));
     CHECK_EQ(n, (int64_t)0);
     f.close();
-    ::unlink(p.c_str());
 }
 
 /* ------------------------------------------------------------------ the tuning cache */
 TEST(tune_cache_round_trip) {
-    const std::string home = tmp_path("home");
+    const std::string home = radtest::tmp_path("home");
     ::mkdir(home.c_str(), 0755);
 
     TuneCache c;
@@ -1218,7 +1399,7 @@ TEST(tune_cache_round_trip) {
     g.set_i("K", 5120);
     g.set_s("dtype", "w4a8");
     const std::string key = TuneCache::canon_geometry(g);
-    /* Sorted by key, so the same shape spells the same however the plugin ordered its params. */
+    /* Sorted by key, so a shape is spelled the same whatever the plugin's parameter order. */
     CHECK_EQ(key, std::string("K=5120 M=64 N=8192 dtype=w4a8"));
 
     Geometry g2;
@@ -1256,24 +1437,20 @@ TEST(tune_cache_round_trip) {
         CHECK_NEAR(got->us, 41.203, 1e-6);
         CHECK_EQ(got->measured, r.measured);
     }
-    /* A row that is not there is absent, not a default. */
+    /* A missing row is absent, not a default. */
     CHECK(back.find("gemm_w4a8_nt_m64", "libr4d", "K=1") == nullptr);
     CHECK(back.find("nope", "libr4d", key) == nullptr);
 
-    /* A missing cache is the normal state of a fresh install, not a failure. */
+    /* A missing cache is normal on a fresh install, not a failure. */
     TuneCache none;
     CHECK_OK(none.load(home, "no-such-machine"));
     CHECK(none.empty());
-
-    ::unlink(TuneCache::path_for(home, "gfx1201-x2-test").c_str());
-    ::rmdir((home + "/tune").c_str());
-    ::rmdir(home.c_str());
 }
 
-/* A hand-edited cache is read at every start, so a line of nothing but blanks -- before the magic
- * line or among the rows -- is a blank line and not a malformed row or a refused file. */
+/* The cache may be hand-edited, so a whitespace-only line, before the magic line or among the
+ * rows, is a blank line, not a malformed row. */
 TEST(a_tune_cache_line_of_blanks_is_a_blank_line) {
-    const std::string home = tmp_path("home_blank");
+    const std::string home = radtest::tmp_path("home_blank");
     ::mkdir(home.c_str(), 0755);
     ::mkdir((home + "/tune").c_str(), 0755);
     const std::string path = TuneCache::path_for(home, "blank-test");
@@ -1302,39 +1479,100 @@ TEST(a_tune_cache_line_of_blanks_is_a_blank_line) {
         CHECK_EQ(c.rows().size(), (size_t)1);
         CHECK(c.find("gemm_x", "libr4d", "K=1 M=1 N=1") != nullptr);
     }
+}
 
-    ::unlink(path.c_str());
-    ::rmdir((home + "/tune").c_str());
-    ::rmdir(home.c_str());
+/* A cache from another machine gives wrong answers, so the key names what changes them. On the
+ * host backend the device is the CPU, named by its model: host kernels tune differently on an AVX2
+ * part and an AVX-512 one, so the CPU must be in the key rather than a fixed "host". */
+TEST(the_machine_key_names_the_card_or_the_cpu) {
+    RadDeviceProps gpu{};
+    std::snprintf(gpu.name, sizeof gpu.name, "AMD Radeon AI PRO R9700");
+    std::snprintf(gpu.arch, sizeof gpu.arch, "gfx1201");
+    CHECK_EQ(rad_machine_key_of(2, &gpu), std::string("gfx1201-x2-AMD_Radeon_AI_PRO_R9700"));
+
+    RadDeviceProps cpu{};
+    std::snprintf(cpu.name, sizeof cpu.name, "AMD Ryzen 9 7950X 16-Core Processor  ");
+    std::snprintf(cpu.arch, sizeof cpu.arch, "host");
+    cpu.is_host_backend = 1;
+    CHECK_EQ(rad_machine_key_of(1, &cpu), std::string("host-x1-AMD_Ryzen_9_7950X_16_Core_Processor"));
+    std::snprintf(cpu.name, sizeof cpu.name, "Intel(R) Xeon(R) Gold 6338");
+    CHECK_EQ(rad_machine_key_of(1, &cpu), std::string("host-x1-Intel_R__Xeon_R__Gold_6338"));
+
+    /* No device at all still names the CPU architecture. */
+    const std::string none = rad_machine_key_of(0, nullptr);
+    CHECK(none.rfind("host-", 0) == 0);
+    CHECK(none != "host-");
+}
+
+/* The cache may be hand-edited and its geometries have no length bound, so a row is read whole
+ * however long it is: a row split at a buffer's length would leave a truncated geometry that never
+ * matches and a tail misread as a row of its own. A timing of nan or inf is a malformed row (every
+ * comparison against it is false or wins), and a measurement date saved as "-" reads back empty,
+ * as an empty choice does. */
+TEST(a_tune_cache_row_is_read_whole_and_a_timing_must_be_finite) {
+    const std::string home = radtest::tmp_path("home_long");
+    ::mkdir(home.c_str(), 0755);
+    ::mkdir((home + "/tune").c_str(), 0755);
+    const std::string path = TuneCache::path_for(home, "long-test");
+    std::string geom;
+    for (int k = 0; geom.size() < 6000; ++k) geom += (k ? " " : "") + fmt("key_%04d=%d", k, k * 7);
+    std::string body = "radtune 2\nmachine long-test\n";
+    body += "gemm_long libr4d mb=2 3.5 2026-01-01T00:00:00Z " + geom + "\n";
+    body += "gemm_nan libr4d - nan - K=1\n";
+    body += "gemm_inf libr4d - inf - K=2\n";
+    body += "gemm_neg libr4d - -inf - K=3\n";
+    body += "gemm_ok libr4d - 2.25 - K=4\n";
+    FILE* f = std::fopen(path.c_str(), "wb");
+    REQUIRE(f != nullptr);
+    std::fputs(body.c_str(), f);
+    std::fclose(f);
+
+    TuneCache c;
+    int st = RAD_OK;
+    const std::string log = stderr_of([&] { st = c.load(home, "long-test"); });
+    CHECK_EQ(st, (int)RAD_OK);
+    CHECK_EQ(c.rows().size(), (size_t)2);
+    const TuneRow* lr = c.find("gemm_long", "libr4d", geom);
+    REQUIRE(lr != nullptr);
+    CHECK_EQ(lr->geom.size(), geom.size());
+    CHECK(c.find("gemm_nan", "libr4d", "K=1") == nullptr);
+    CHECK(c.find("gemm_inf", "libr4d", "K=2") == nullptr);
+    CHECK(c.find("gemm_neg", "libr4d", "K=3") == nullptr);
+    const TuneRow* ok = c.find("gemm_ok", "libr4d", "K=4");
+    REQUIRE(ok != nullptr);
+    CHECK_EQ(ok->measured, std::string());
+    CHECK_EQ(ok->choice, std::string());
+    CHECK(has(log, "3 malformed row(s)"));
+
+    /* An empty date survives a save and a load as empty, not as "-". */
+    CHECK_OK(c.save(home));
+    TuneCache back;
+    CHECK_OK(back.load(home, "long-test"));
+    const TuneRow* again = back.find("gemm_ok", "libr4d", "K=4");
+    REQUIRE(again != nullptr);
+    CHECK_EQ(again->measured, std::string());
+    REQUIRE(back.find("gemm_long", "libr4d", geom) != nullptr);
 }
 
 /* ------------------------------------------------------------------ the safetensors reader */
 
-/* A CHECKPOINT NAME IS MATCHED, NOT DISPLAYED, so how it is decoded decides whether a weight is
- * found at all. JSON cannot write a codepoint above U+FFFF except as a surrogate pair, and a
- * reader that encodes the two halves separately produces CESU-8 -- six bytes that round-trip
- * through itself and compare unequal to the four bytes the same name has everywhere else. The
- * failure is a lookup miss on one tensor, reported as a missing weight.
+/* Tensor names are matched, so their decoding decides whether a weight is found. JSON writes a
+ * codepoint above U+FFFF as a surrogate pair; encoding the halves separately yields CESU-8 (six
+ * bytes) that never equals the standard four-byte UTF-8, and the tensor looks missing.
  *
- * The other three cases are here because they are the boundaries either side of it: the last
- * two-byte codepoint, the first three-byte one, and an unpaired high surrogate, which is malformed
- * input this reader passes through rather than rejecting -- a name is data to be matched. */
+ * The other cases are the boundaries: the last two-byte codepoint, the first three-byte one, and
+ * an unpaired high surrogate, which is passed through rather than rejected since names are only
+ * matched. */
 static std::string st_write(const std::string& header_json) {
-    std::string path = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
-                       "/rad_st_test.safetensors";
-    FILE* f = std::fopen(path.c_str(), "wb");
-    if (!f) return std::string();
-    uint64_t n = header_json.size();
-    std::fwrite(&n, 8, 1, f);
-    std::fwrite(header_json.data(), 1, header_json.size(), f);
-    const char pad[4] = { 0, 0, 0, 0 };            /* one f32 of data section */
-    std::fwrite(pad, 1, 4, f);
-    std::fclose(f);
-    return path;
+    const uint64_t n = header_json.size();
+    std::string bytes((const char*)&n, 8);
+    bytes += header_json;
+    bytes.append(4, '\0');                         /* one f32 of data section */
+    return write_tmp("st.safetensors", bytes);
 }
 
 TEST(safetensors_decodes_a_surrogate_pair_as_one_codepoint) {
-    /* U+1F600, written the only way JSON can write it. */
+    /* U+1F600 as a JSON surrogate pair. */
     const std::string path = st_write(
         "{\"a\\uD83D\\uDE00b\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}");
     CHECK(!path.empty());
@@ -1350,7 +1588,6 @@ TEST(safetensors_decodes_a_surrogate_pair_as_one_codepoint) {
         CHECK(st.find("a\xF0\x9F\x98\x80" "b") != nullptr);
     }
     st.close();
-    ::unlink(path.c_str());
 }
 
 TEST(safetensors_decodes_the_escape_widths_either_side_of_it) {
@@ -1369,11 +1606,10 @@ TEST(safetensors_decodes_the_escape_widths_either_side_of_it) {
     CHECK(st.find("\xE0\xA0\x80") != nullptr);             /* three */
     CHECK(st.find("\xED\xA0\x80" "x") != nullptr);         /* lone surrogate, passed through */
     st.close();
-    ::unlink(path.c_str());
 }
 
-/* Every reader walks a tensor by shape and dtype, so a shape that disagrees with the span its
- * data_offsets give is refused at open. The data section st_write lays down is one f32. */
+/* Readers walk a tensor by shape and dtype, so a shape that disagrees with its data_offsets span
+ * is refused at open. st_write's data section is one f32. */
 TEST(safetensors_refuses_a_shape_that_is_not_its_span) {
     const char* bad[] = {
         /* two f32 claimed over four bytes */
@@ -1391,14 +1627,13 @@ TEST(safetensors_refuses_a_shape_that_is_not_its_span) {
         if (path.empty()) return;
         SafeTensorsFile st;
         CHECK_EQ(st.open(path), RAD_E_FORMAT);
-        ::unlink(path.c_str());
     }
 
     const char* good[] = {
         "{\"t\":{\"dtype\":\"F32\",\"shape\":[],\"data_offsets\":[0,4]}}",        /* a scalar */
         "{\"t\":{\"dtype\":\"BF16\",\"shape\":[2,1],\"data_offsets\":[0,4]}}",
         "{\"t\":{\"dtype\":\"F32\",\"shape\":[0,7],\"data_offsets\":[4,4]}}",     /* empty */
-        /* a dtype this reader cannot size is left to its consumers, which refuse it by name */
+        /* an unsized dtype is left to consumers, which refuse it by name */
         "{\"t\":{\"dtype\":\"F8_E8M0\",\"shape\":[9],\"data_offsets\":[0,4]}}",
     };
     for (const char* h : good) {
@@ -1408,37 +1643,21 @@ TEST(safetensors_refuses_a_shape_that_is_not_its_span) {
         SafeTensorsFile st;
         CHECK_OK(st.open(path));
         CHECK_EQ(st.tensors().size(), (size_t)1);
-        ::unlink(path.c_str());
     }
 }
 
-
 /* ================================================================== the shard index
  *
- * A SHARDED CHECKPOINT'S weight_map IS THE ONLY THING THAT SAYS WHICH FILE A TENSOR IS IN, and
- * rad-convert reads it before it opens anything. The failure it has to avoid is not a crash: an
- * index that parsed to FEWER entries than it holds makes the converter report a tensor as missing
- * from a checkpoint that contains it, which reads as a broken download.
+ * A sharded checkpoint's weight_map is the only record of which file holds each tensor. An index
+ * parsed short makes rad-convert report a present tensor as missing, which looks like a broken
+ * download.
  *
- * Absent is not an error -- a single-file checkpoint has no index and the caller falls back to
- * model.safetensors -- so "not found" and "malformed" have to be different answers.
+ * Absence is not an error (a single-file checkpoint has none and the caller falls back to
+ * model.safetensors), so "not found" and "malformed" are distinct results.
  */
-namespace {
-
-std::string write_index(const char* stem, const std::string& body) {
-    const std::string p = tmp_path(stem);
-    FILE* f = std::fopen(p.c_str(), "wb");
-    if (!f) return std::string();
-    std::fwrite(body.data(), 1, body.size(), f);
-    std::fclose(f);
-    return p;
-}
-
-}  /* namespace */
-
 TEST(the_shard_index_reads_every_entry_of_a_real_weight_map) {
-    /* The shape HuggingFace writes: a metadata block first, then the map. */
-    const std::string p = write_index("index_ok", R"({
+    /* As Hugging Face writes it: a metadata block, then the map. */
+    const std::string p = write_tmp("index_ok", R"({
   "metadata": { "total_size": 123456789 },
   "weight_map": {
     "model.embed_tokens.weight": "model-00001-of-00003.safetensors",
@@ -1454,54 +1673,45 @@ TEST(the_shard_index_reads_every_entry_of_a_real_weight_map) {
     CHECK_EQ(m["model.embed_tokens.weight"], std::string("model-00001-of-00003.safetensors"));
     CHECK_EQ(m["lm_head.weight"], std::string("model-00003-of-00003.safetensors"));
     CHECK_EQ(m.count("model.layers.47.mlp.down_proj.weight"), 1u);
-    std::remove(p.c_str());
 
-    /* The out map is CLEARED first: a second read that failed halfway must not leave the previous
-       checkpoint's shards behind for the converter to open. */
-    const std::string q = write_index("index_one", R"({"weight_map":{"a":"s0.safetensors"}})");
+    /* The out map is cleared first, so a failed second read leaves no stale shards behind. */
+    const std::string q = write_tmp("index_one", R"({"weight_map":{"a":"s0.safetensors"}})");
     CHECK_OK(st_load_index(q, &m));
     CHECK_EQ(m.size(), 1u);
     CHECK_EQ(m.count("lm_head.weight"), 0u);
-    std::remove(q.c_str());
 
-    /* An empty map is a valid index that names nothing, not a parse failure. */
-    const std::string e = write_index("index_empty", R"({"weight_map":{}})");
+    /* An empty map is a valid index, not a parse failure. */
+    const std::string e = write_tmp("index_empty", R"({"weight_map":{}})");
     CHECK_OK(st_load_index(e, &m));
     CHECK_EQ(m.size(), 0u);
-    std::remove(e.c_str());
 }
 
 TEST(a_missing_index_is_not_found_and_a_broken_one_is_a_format_error) {
     std::unordered_map<std::string, std::string> m;
-    /* NOT FOUND IS THE ORDINARY CASE: a single-file checkpoint has no index, and the caller
-       distinguishes it from a corrupt one to decide between falling back and refusing. */
-    CHECK_EQ(st_load_index(tmp_path("does_not_exist"), &m), RAD_E_NOTFOUND);
+    /* Not found is the ordinary single-file case; the caller falls back on it but refuses a
+       corrupt index. */
+    CHECK_EQ(st_load_index(radtest::tmp_path("does_not_exist"), &m), RAD_E_NOTFOUND);
 
-    const std::string a = write_index("index_nomap", R"({"metadata":{"total_size":1}})");
+    const std::string a = write_tmp("index_nomap", R"({"metadata":{"total_size":1}})");
     CHECK_EQ(st_load_index(a, &m), RAD_E_FORMAT);
-    std::remove(a.c_str());
 
-    const std::string b = write_index("index_notobj", R"({"weight_map": "a string"})");
+    const std::string b = write_tmp("index_notobj", R"({"weight_map": "a string"})");
     CHECK_EQ(st_load_index(b, &m), RAD_E_FORMAT);
-    std::remove(b.c_str());
 
-    const std::string c = write_index("index_trunc", R"({"weight_map":{"a":)");
+    const std::string c = write_tmp("index_trunc", R"({"weight_map":{"a":)");
     CHECK_EQ(st_load_index(c, &m), RAD_E_FORMAT);
-    std::remove(c.c_str());
 
-    const std::string d = write_index("index_empty_file", "");
+    const std::string d = write_tmp("index_empty_file", "");
     CHECK_EQ(st_load_index(d, &m), RAD_E_FORMAT);
-    std::remove(d.c_str());
 
-    /* A null out pointer is refused rather than dereferenced. */
-    CHECK_EQ(st_load_index(tmp_path("whatever"), nullptr), RAD_E_INVAL);
+    /* A null out pointer is refused. */
+    CHECK_EQ(st_load_index(radtest::tmp_path("whatever"), nullptr), RAD_E_INVAL);
 }
 
-/* ESCAPES IN A TENSOR NAME ARE RARE AND THE CONVERTER STILL HAS TO GET THEM RIGHT: a name read
- * with its backslashes intact does not match the name the safetensors header carries, and the
- * tensor is reported missing from a file that has it. */
+/* Escapes in index names are decoded; a name with its backslashes intact would not match the
+ * safetensors header and the tensor would look missing. */
 TEST(the_shard_index_decodes_escaped_names) {
-    const std::string p = write_index("index_esc",
+    const std::string p = write_tmp("index_esc",
         "{\"weight_map\":{\"a\\/b.weight\":\"s0.safetensors\","
         "\"q\\\"uote\":\"s1.safetensors\"}}");
     std::unordered_map<std::string, std::string> m;
@@ -1509,26 +1719,20 @@ TEST(the_shard_index_decodes_escaped_names) {
     CHECK_EQ(m.size(), 2u);
     CHECK_EQ(m.count("a/b.weight"), 1u);
     CHECK_EQ(m.count("q\"uote"), 1u);
-    std::remove(p.c_str());
 }
 
 /* ================================================================== the importance matrix
  *
- * AN IMATRIX IS A FILE SOMEBODY ELSE HANDED YOU, and the quantiser that consumes it then runs
- * unattended for an hour. Both readers walk a length-prefixed format out of a mapping, so a
- * malformed one is an out-of-bounds read rather than a wrong answer -- and a misparse that stays
- * in bounds is worse, because the only symptom is slightly worse quantisation quality, which
- * nothing measures per tensor.
+ * An imatrix is an untrusted file feeding a long unattended quantisation. Both readers walk a
+ * length-prefixed format out of a mapping, so a malformed file risks an out-of-bounds read, and an
+ * in-bounds misparse silently degrades quantisation quality.
  *
- * Two formats because llama.cpp has written two, and the per-expert dimension exists in only one
- * of them -- so the join between `<name>.in_sum2` and `<name>.counts` is the part a MoE
- * quantisation depends on and the part a legacy file cannot express.
+ * llama.cpp has written two formats; only the newer has a per-expert dimension, so the join of
+ * `<name>.in_sum2` and `<name>.counts` is what MoE quantisation depends on.
  */
 namespace {
 
-/* A little-endian byte builder. Both formats are length-prefixed binary, so a test that writes
- * one has to write the lengths too -- which is most of the point, since that is what the readers
- * are walking. */
+/* A little-endian byte builder for the length-prefixed formats, lengths included. */
 struct Bin {
     std::vector<uint8_t> b;
     void raw(const void* p, size_t n) {
@@ -1543,17 +1747,6 @@ struct Bin {
     void lstr(const std::string& s) { i32((int32_t)s.size()); raw(s.data(), s.size()); }
     void pad_to(size_t a) { while (b.size() % a) b.push_back(0); }
 };
-
-std::string write_bin(const char* leaf, const std::vector<uint8_t>& bytes) {
-    const char* dir = std::getenv("TMPDIR");
-    const std::string path =
-        std::string(dir && *dir ? dir : "/tmp") + "/radiance_imatrix_test_" + leaf;
-    FILE* f = std::fopen(path.c_str(), "wb");
-    if (!f) return {};
-    if (!bytes.empty()) std::fwrite(bytes.data(), 1, bytes.size(), f);
-    std::fclose(f);
-    return path;
-}
 
 /* One legacy entry: name, ncall, and the raw sums. */
 struct LegacyEntry { std::string name; int32_t ncall; std::vector<float> vals; };
@@ -1570,8 +1763,8 @@ std::vector<uint8_t> legacy_bytes(const std::vector<LegacyEntry>& es) {
     return w.b;
 }
 
-/* One GGUF tensor: its name, its dims (dim 0 fastest) and its payload. Offsets and the data
- * section are computed here so a case only says what it means. */
+/* One GGUF tensor: name, dims (dim 0 fastest) and payload. gguf_bytes computes offsets and the
+ * data section. */
 struct GgufTensor { std::string name; std::vector<uint64_t> dims; std::vector<float> data; };
 
 struct GgufKv { std::string key; uint32_t type; uint32_t u; std::string s; };
@@ -1606,8 +1799,8 @@ std::vector<uint8_t> gguf_bytes(const std::vector<GgufTensor>& ts,
     return w.b;
 }
 
-/* One float of an entry's payload. A GGUF payload is pointed at in the mapping at whatever offset
- * the file's alignment gave it, so it is read the way the reader itself reads it: by memcpy. */
+/* One float of an entry's payload, read by memcpy since a GGUF payload may be unaligned in the
+ * mapping. */
 float f32_at(const float* p, size_t i) {
     float v = 0.0f;
     std::memcpy(&v, (const char*)p + i * sizeof(float), sizeof v);
@@ -1623,7 +1816,7 @@ double mean_of(const std::vector<float>& v) {
 }  /* namespace */
 
 TEST(a_legacy_imatrix_reads_every_entry_it_declares) {
-    const std::string path = write_bin("legacy.imatrix", legacy_bytes({
+    const std::string path = write_tmp("legacy.imatrix", legacy_bytes({
         { "blk.0.attn_q.weight",    10, { 1.0f, 2.0f, 3.0f, 4.0f } },
         { "blk.0.ffn_down.weight",   4, { 8.0f, 8.0f } },
     }));
@@ -1640,22 +1833,20 @@ TEST(a_legacy_imatrix_reads_every_entry_it_declares) {
     if (e) {
         CHECK_EQ(e->cols, (int64_t)4);
         CHECK_EQ(e->ncall, (int64_t)10);
-        /* The legacy format has no per-expert dimension at all, so every tensor is dense and
-         * every expert in a layer is weighted by the layer's aggregate. */
+        /* The legacy format has no per-expert dimension, so every tensor is dense and all
+         * experts in a layer share the layer's aggregate. */
         CHECK_EQ(e->n_expert, (int64_t)1);
         CHECK(e->counts == nullptr);
         CHECK(e->sum2 != nullptr);
         if (e->sum2) CHECK_EQ(f32_at(e->sum2, 2), 3.0f);
     }
     CHECK(im.find("blk.0.ffn_up.weight") == nullptr);
-    std::remove(path.c_str());
 }
 
-/* NORMALISED TO MEAN 1 is the contract, and it is what makes a weighted quantisation error
- * comparable with an unweighted one -- so the quantiser's error report means the same thing with
- * and without an imatrix. */
+/* Importance is normalised to mean 1, so a weighted quantisation error is comparable with an
+ * unweighted one. */
 TEST(importance_is_normalised_to_mean_one) {
-    const std::string path = write_bin("norm.imatrix", legacy_bytes({
+    const std::string path = write_tmp("norm.imatrix", legacy_bytes({
         { "t", 7, { 1.0f, 3.0f, 4.0f, 8.0f } },
     }));
     ImatrixFile im;
@@ -1664,19 +1855,18 @@ TEST(importance_is_normalised_to_mean_one) {
     CHECK(im.importance("t", 0, &w));
     CHECK_EQ(w.size(), (size_t)4);
     CHECK_NEAR(mean_of(w), 1.0, 1e-5);
-    /* The shape of the row survives: column 3 is eight times column 0. */
+    /* The row's shape survives: column 3 is eight times column 0. */
     if (w.size() == 4) CHECK_NEAR(w[3] / w[0], 8.0, 1e-4);
-    std::remove(path.c_str());
 }
 
-/* A UNIFORM SCALE OF THE ROW CANNOT CHANGE THE ANSWER, because mean-1 divides it out. This is
- * the property the per-expert division relies on being harmless, and it is also why an imatrix
- * collected over ten times the calibration set weights a tensor identically. */
+/* A uniform scale of the row does not change the result, since mean-1 divides it out. The
+ * per-expert division relies on this, and it makes the weights independent of calibration-set
+ * size. */
 TEST(importance_is_invariant_to_a_uniform_scale_of_the_row) {
-    const std::string a = write_bin("scale_a.imatrix", legacy_bytes({
+    const std::string a = write_tmp("scale_a.imatrix", legacy_bytes({
         { "t", 1, { 1.0f, 2.0f, 5.0f, 8.0f } },
     }));
-    const std::string b = write_bin("scale_b.imatrix", legacy_bytes({
+    const std::string b = write_tmp("scale_b.imatrix", legacy_bytes({
         { "t", 1000, { 1000.0f, 2000.0f, 5000.0f, 8000.0f } },
     }));
     ImatrixFile ia, ib;
@@ -1687,15 +1877,12 @@ TEST(importance_is_invariant_to_a_uniform_scale_of_the_row) {
     CHECK(ib.importance("t", 0, &wb));
     CHECK_EQ(wa.size(), wb.size());
     for (size_t i = 0; i < wa.size() && i < wb.size(); ++i) CHECK_NEAR(wa[i], wb[i], 1e-4);
-    std::remove(a.c_str());
-    std::remove(b.c_str());
 }
 
-/* A tensor the calibration set never activated has an all-zero row. Weighting by it is a
- * division by zero, so it falls back to uniform -- which is the same thing as quantising that
- * tensor without an imatrix, and is the only answer that is not NaN. */
+/* A tensor the calibration set never activated has an all-zero row, which cannot be normalised,
+ * so it falls back to uniform weights (as if quantised without an imatrix). */
 TEST(a_degenerate_row_falls_back_to_uniform_weights) {
-    const std::string path = write_bin("zero.imatrix", legacy_bytes({
+    const std::string path = write_tmp("zero.imatrix", legacy_bytes({
         { "t", 3, { 0.0f, 0.0f, 0.0f } },
     }));
     ImatrixFile im;
@@ -1704,11 +1891,10 @@ TEST(a_degenerate_row_falls_back_to_uniform_weights) {
     CHECK(im.importance("t", 0, &w));
     CHECK_EQ(w.size(), (size_t)3);
     for (float x : w) CHECK_EQ(x, 1.0f);
-    std::remove(path.c_str());
 }
 
 TEST(importance_declines_a_tensor_or_an_expert_it_does_not_have) {
-    const std::string path = write_bin("absent.imatrix", legacy_bytes({
+    const std::string path = write_tmp("absent.imatrix", legacy_bytes({
         { "t", 1, { 1.0f, 2.0f } },
     }));
     ImatrixFile im;
@@ -1717,18 +1903,16 @@ TEST(importance_declines_a_tensor_or_an_expert_it_does_not_have) {
     CHECK(!im.importance("not_here", 0, &w));
     CHECK(!im.importance("t", 1, &w));      /* the legacy format has one expert */
     CHECK(!im.importance("t", -1, &w));
-    /* And the query with no output buffer answers whether it COULD, for a caller deciding
-     * whether to weight at all. */
+    /* With no output buffer, the query reports whether importance is available. */
     CHECK(im.importance("t", 0, nullptr));
-    std::remove(path.c_str());
 }
 
 /* ------------------------------------------------------------------ gguf */
 
 TEST(a_gguf_imatrix_joins_the_sums_with_the_counts) {
-    const std::string path = write_bin("moe.imatrix", gguf_bytes(
+    const std::string path = write_tmp("moe.imatrix", gguf_bytes(
         {
-            /* Two experts of four columns, expert-major: expert 0 is the first four. */
+            /* Two experts of four columns, expert-major. */
             { "blk.0.ffn_down.in_sum2", { 4, 2 },
               { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f, 3.0f, 4.0f } },
             { "blk.0.ffn_down.counts",  { 1, 2 }, { 100.0f, 7.0f } },
@@ -1754,7 +1938,7 @@ TEST(a_gguf_imatrix_joins_the_sums_with_the_counts) {
         CHECK_EQ(e->n_expert, (int64_t)2);
         CHECK(e->counts != nullptr);
     }
-    /* A dense tensor in the same file is one expert, and the suffix is stripped from both. */
+    /* A dense tensor in the same file is one expert; the suffix is stripped from both names. */
     const ImatrixEntry* q = im.find("blk.0.attn_q");
     CHECK(q != nullptr);
     if (q) {
@@ -1762,14 +1946,12 @@ TEST(a_gguf_imatrix_joins_the_sums_with_the_counts) {
         CHECK_EQ(q->n_expert, (int64_t)1);
         CHECK(q->counts == nullptr);
     }
-    std::remove(path.c_str());
 }
 
-/* EACH EXPERT IS WEIGHTED BY ITS OWN ROW. Reading the layer's aggregate for every expert is what
- * the legacy format forces and what this format exists to stop -- so a per-expert importance that
- * quietly read expert 0 would be indistinguishable from the legacy format's aggregate. */
+/* Each expert is weighted by its own row, not expert 0's and not a layer aggregate as in the
+ * legacy format. */
 TEST(a_per_expert_importance_comes_from_that_experts_own_row) {
-    const std::string path = write_bin("expert.imatrix", gguf_bytes(
+    const std::string path = write_tmp("expert.imatrix", gguf_bytes(
         {
             { "t.in_sum2", { 4, 2 }, { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 2.0f, 3.0f, 4.0f } },
             { "t.counts",  { 1, 2 }, { 100.0f, 7.0f } },
@@ -1783,23 +1965,79 @@ TEST(a_per_expert_importance_comes_from_that_experts_own_row) {
     CHECK(im.importance("t", 1, &w1));
     CHECK_EQ(w0.size(), (size_t)4);
     CHECK_EQ(w1.size(), (size_t)4);
-    /* Expert 0 saw a flat row, so every column is equally important. */
+    /* Expert 0 has a flat row, so every column weighs the same. */
     for (float x : w0) CHECK_NEAR(x, 1.0, 1e-5);
-    /* Expert 1 did not, and the ratios are its own. */
+    /* Expert 1's ratios are its own. */
     CHECK_NEAR(mean_of(w1), 1.0, 1e-5);
     if (w1.size() == 4) {
         CHECK_NEAR(w1[3] / w1[0], 4.0, 1e-4);
         CHECK(w1[0] != w1[3]);
     }
     CHECK(!im.importance("t", 2, &w1));
-    std::remove(path.c_str());
 }
 
-/* THE POPULARITY SIGNAL IS THE RAW COUNT AND MUST STAY RAW. The placement planner warm-starts the
- * expert profile from it, and that is a question about how OFTEN an expert ran -- normalising it
- * the way importance is normalised would make every expert equally popular. */
+/* The converter names weights as container entries; importance_for maps them onto the imatrix's
+ * GGUF names. A wrong mapping hands a quantiser another tensor's importance, or none, with nothing
+ * reported, so each spelling is pinned: a dense weight, an expert slice of a stacked entry, a width
+ * that disagrees, and an expert the calibration never routed to (all-zero sums), which takes
+ * uniform weights rather than zeros that leave a weighted search degenerate. */
+TEST(a_converter_weight_name_finds_its_imatrix_row) {
+    const std::string path = write_tmp("names.imatrix", gguf_bytes(
+        {
+            { "blk.0.attn_q.in_sum2", { 4 }, { 1.0f, 2.0f, 3.0f, 6.0f } },
+            /* Three experts of four columns; expert 1 never routed. */
+            { "blk.5.ffn_down_exps.in_sum2", { 4, 3 },
+              { 1.0f, 1.0f, 1.0f, 1.0f,  0.0f, 0.0f, 0.0f, 0.0f,  8.0f, 4.0f, 2.0f, 2.0f } },
+            { "blk.5.ffn_down_exps.counts", { 1, 3 }, { 10.0f, 0.0f, 3.0f } },
+        },
+        {}));
+    ImatrixFile im;
+    REQUIRE(im.open(path) == RAD_OK);
+    std::vector<float> w;
+
+    REQUIRE(im.importance_for("blk.0.attn_q.weight", 4, &w));
+    REQUIRE_EQ(w.size(), (size_t)4);
+    CHECK_NEAR(w[0], 1.0 / 3.0, 1e-6);             /* mean of the row is 3 */
+    CHECK_NEAR(w[3], 2.0, 1e-6);
+
+    REQUIRE(im.importance_for("blk.5.ffn_down_exps.2.weight", 4, &w));
+    REQUIRE_EQ(w.size(), (size_t)4);
+    CHECK_NEAR(w[0], 2.0, 1e-6);                   /* expert 2's own row, mean 4 */
+    CHECK_NEAR(w[2], 0.5, 1e-6);
+
+    REQUIRE(im.importance_for("blk.5.ffn_down_exps.1.weight", 4, &w));
+    for (float x : w) CHECK_EQ(x, 1.0f);
+
+    CHECK(!im.importance_for("blk.0.attn_q.weight", 5, &w));          /* another width */
+    CHECK(!im.importance_for("blk.5.ffn_down_exps.3.weight", 4, &w)); /* no expert 3 */
+    CHECK(!im.importance_for("blk.5.ffn_down_exps.-1.weight", 4, &w));
+    CHECK(!im.importance_for("blk.5.ffn_down_exps.x.weight", 4, &w));
+    CHECK(!im.importance_for("blk.0.attn_k.weight", 4, &w));
+}
+
+/* With general.alignment 1 every float of a payload may sit at an odd address; the importance is
+ * read by memcpy, so its values are those the file holds. */
+TEST(an_importance_at_an_odd_offset_reads_the_values_the_file_holds) {
+    const std::string path = write_tmp("odd.imatrix", gguf_bytes(
+        { { "a.in_sum2", { 3 }, { 3.0f, 3.0f, 3.0f } },
+          { "b.in_sum2", { 2 }, { 1.0f, 3.0f } } },
+        { { "general.alignment", 4, 1, "" } }, 3, 1));
+    ImatrixFile im;
+    REQUIRE(im.open(path) == RAD_OK);
+    const ImatrixEntry* e = im.find("b");
+    REQUIRE(e != nullptr);
+    CHECK(((uintptr_t)e->sum2 & 3) != 0);           /* the case under test: misaligned */
+    std::vector<float> w;
+    REQUIRE(im.importance_for("b.weight", 2, &w));
+    REQUIRE_EQ(w.size(), (size_t)2);
+    CHECK_NEAR(w[0], 0.5, 1e-6);
+    CHECK_NEAR(w[1], 1.5, 1e-6);
+}
+
+/* The activation count stays raw: the placement planner warm-starts the expert profile from how
+ * often each expert ran, and normalising would make every expert equally popular. */
 TEST(the_activation_count_is_reported_unnormalised) {
-    const std::string path = write_bin("count.imatrix", gguf_bytes(
+    const std::string path = write_tmp("count.imatrix", gguf_bytes(
         {
             { "t.in_sum2", { 2, 3 }, { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f } },
             { "t.counts",  { 1, 3 }, { 900.0f, 30.0f, 1.0f } },
@@ -1812,11 +2050,10 @@ TEST(the_activation_count_is_reported_unnormalised) {
     CHECK_NEAR(im.count("t", 2), 1.0, 1e-6);
     CHECK_EQ(im.count("t", 3), 0.0);
     CHECK_EQ(im.count("absent", 0), 0.0);
-    std::remove(path.c_str());
 }
 
 TEST(a_gguf_entry_with_counts_and_no_sums_is_dropped) {
-    const std::string path = write_bin("orphan.imatrix", gguf_bytes(
+    const std::string path = write_tmp("orphan.imatrix", gguf_bytes(
         {
             { "good.in_sum2", { 2 }, { 1.0f, 3.0f } },
             { "orphan.counts", { 1 }, { 5.0f } },
@@ -1827,14 +2064,13 @@ TEST(a_gguf_entry_with_counts_and_no_sums_is_dropped) {
     CHECK_EQ(im.entries().size(), (size_t)1);
     CHECK(im.find("good") != nullptr);
     CHECK(im.find("orphan") == nullptr);
-    std::remove(path.c_str());
 }
 
-/* general.alignment moves where the data section starts, and reading it from the wrong place is
- * a whole file of plausible-looking wrong numbers rather than an error. */
+/* general.alignment sets where the data section starts; reading from the wrong place would give
+ * plausible wrong numbers, not an error. */
 TEST(the_declared_alignment_places_the_data_section) {
     for (uint64_t a : { (uint64_t)32, (uint64_t)64, (uint64_t)1 }) {
-        const std::string path = write_bin("align.imatrix", gguf_bytes(
+        const std::string path = write_tmp("align.imatrix", gguf_bytes(
             { { "t.in_sum2", { 3 }, { 2.0f, 4.0f, 6.0f } } },
             { { "general.alignment", 4, (uint32_t)a, "" } }, 3, a));
         ImatrixFile im;
@@ -1845,14 +2081,12 @@ TEST(the_declared_alignment_places_the_data_section) {
             CHECK_EQ(f32_at(e->sum2, 0), 2.0f);
             CHECK_EQ(f32_at(e->sum2, 2), 6.0f);
         }
-        std::remove(path.c_str());
     }
 }
 
-/* A KV the walker does not care about still has to be STEPPED OVER correctly, or every tensor
- * info after it is read from the middle of a string. */
+/* An unrelated KV must be stepped over correctly, or every following tensor info is misread. */
 TEST(an_unrelated_kv_is_stepped_over_rather_than_read) {
-    const std::string path = write_bin("kv.imatrix", gguf_bytes(
+    const std::string path = write_tmp("kv.imatrix", gguf_bytes(
         { { "t.in_sum2", { 2 }, { 1.0f, 3.0f } } },
         { { "general.architecture", 8, 0, "llama" },
           { "some.f64",             12, 42, "" },
@@ -1863,13 +2097,12 @@ TEST(an_unrelated_kv_is_stepped_over_rather_than_read) {
     const ImatrixEntry* e = im.find("t");
     CHECK(e != nullptr);
     if (e && e->sum2) CHECK_EQ(f32_at(e->sum2, 1), 3.0f);
-    std::remove(path.c_str());
 }
 
 /* ------------------------------------------------------------------ refusals
  *
- * Each of these is a file a user was handed. The reader walks lengths out of a mapping, so the
- * alternative to refusing is reading past the end of it. */
+ * The reader walks lengths out of a mapping of an untrusted file, so malformed input must be
+ * refused rather than read past the end. */
 
 TEST(a_file_that_is_not_there_is_an_io_error) {
     ImatrixFile im;
@@ -1877,41 +2110,38 @@ TEST(a_file_that_is_not_there_is_an_io_error) {
 }
 
 TEST(a_file_too_short_to_be_an_imatrix_is_refused) {
-    const std::string path = write_bin("short.imatrix", { 1, 2, 3, 4 });
+    const std::string path = write_tmp("short.imatrix", std::vector<uint8_t>{ 1, 2, 3, 4 });
     ImatrixFile im;
     CHECK_EQ(im.open(path), RAD_E_FORMAT);
-    std::remove(path.c_str());
 }
 
 TEST(a_legacy_entry_that_runs_past_the_end_is_refused) {
     std::vector<uint8_t> bytes = legacy_bytes({ { "t", 1, { 1.0f, 2.0f, 3.0f } } });
-    bytes.resize(bytes.size() - 6);          /* half of the last float, and part of the one before */
-    const std::string path = write_bin("trunc.imatrix", bytes);
+    bytes.resize(bytes.size() - 6);          /* cuts into the last two floats */
+    const std::string path = write_tmp("trunc.imatrix", bytes);
     ImatrixFile im;
     CHECK_EQ(im.open(path), RAD_E_FORMAT);
-    std::remove(path.c_str());
 }
 
 TEST(a_legacy_entry_count_that_is_not_one_is_refused) {
     Bin w;
     w.i32(0);
     w.i32(0);
-    const std::string path = write_bin("zeroentries.imatrix", w.b);
+    const std::string path = write_tmp("zeroentries.imatrix", w.b);
     ImatrixFile im;
     CHECK_EQ(im.open(path), RAD_E_FORMAT);
-    std::remove(path.c_str());
 }
 
-/* A GGUF's rotary scaling arrives as the config.json keys the architecture reads, type and all,
- * and never as a bare factor in RadModelMeta::rope_scale. A YaRN modifier config.json has no
- * spelling for is refused. */
+/* A GGUF's rotary scaling becomes the config.json keys the architecture reads, including the
+ * type, never a bare factor in RadModelMeta::rope_scale. A YaRN modifier with no config.json
+ * spelling is refused. */
 TEST(a_gguf_rotary_scaling_becomes_the_config_keys_with_its_type) {
     auto meta = [](const std::vector<GgufKv>& extra, const char* leaf, MetaOwn* out) -> int {
         std::vector<GgufKv> kvs = { { "general.architecture", 8, 0, "llama" },
                                     { "llama.block_count", 4, 2, "" } };
         kvs.insert(kvs.end(), extra.begin(), extra.end());
         GgufFile g;
-        if (g.open(write_bin(leaf, gguf_bytes({}, kvs)).c_str()) != RAD_OK) return RAD_E_IO;
+        if (g.open(write_tmp(leaf, gguf_bytes({}, kvs)).c_str()) != RAD_OK) return RAD_E_IO;
         return meta_from_gguf(g, out);
     };
     {
@@ -1927,14 +2157,14 @@ TEST(a_gguf_rotary_scaling_becomes_the_config_keys_with_its_type) {
         CHECK_EQ(std::string(m.get("rope_scaling.original_max_position_embeddings")),
                  std::string("32768"));
     }
-    {   /* llama.cpp's default type is linear, and the older key names its factor. */
+    {   /* llama.cpp's default type is linear; the older key names its factor. */
         MetaOwn m;
         CHECK_OK(meta({ { "llama.rope.scale_linear", 12, 2, "" } }, "linear.gguf", &m));
         CHECK_EQ(std::string(m.get("rope_scaling.type")), std::string("linear"));
         CHECK_EQ(std::string(m.get("rope_scaling.factor")), std::string("2"));
         CHECK_EQ(m.m.rope_scale, 1.0f);
     }
-    {   /* A type the architecture does not implement is carried by name for it to refuse. */
+    {   /* An unimplemented type is carried by name for the architecture to refuse. */
         MetaOwn m;
         CHECK_OK(meta({ { "llama.rope.scaling.type", 8, 0, "longrope" },
                         { "llama.rope.scaling.factor", 12, 4, "" } }, "longrope.gguf", &m));
@@ -1959,33 +2189,38 @@ TEST(a_gguf_rotary_scaling_becomes_the_config_keys_with_its_type) {
 }
 
 TEST(a_gguf_version_this_reader_does_not_know_is_refused) {
-    const std::string path = write_bin("v2.imatrix", gguf_bytes(
+    const std::string path = write_tmp("v2.imatrix", gguf_bytes(
         { { "t.in_sum2", { 2 }, { 1.0f, 2.0f } } }, {}, /*version=*/2));
     ImatrixFile im;
     CHECK_EQ(im.open(path), RAD_E_FORMAT);
-    std::remove(path.c_str());
 }
 
 TEST(a_gguf_tensor_that_runs_past_the_end_is_refused) {
     std::vector<uint8_t> bytes =
         gguf_bytes({ { "t.in_sum2", { 64 }, { 1.0f, 2.0f } } }, {});
-    const std::string path = write_bin("over.imatrix", bytes);
+    const std::string path = write_tmp("over.imatrix", bytes);
     ImatrixFile im;
     CHECK_EQ(im.open(path), RAD_E_FORMAT);
-    std::remove(path.c_str());
 }
 
-/* 2^62 x 4 floats is 2^64 elements, which wraps to zero: a zero-byte tensor passes any bounds
- * test, and the entry would then claim 2^62 columns to read. */
+/* A second entry under one tensor name could never be looked up, so the file is refused. */
+TEST(a_gguf_that_lists_a_tensor_twice_is_refused) {
+    const std::string path = write_tmp("twice.gguf", gguf_bytes(
+        { { "t.weight", { 2 }, { 1.0f, 2.0f } }, { "t.weight", { 2 }, { 3.0f, 4.0f } } }, {}));
+    GgufFile g;
+    CHECK(g.open(path.c_str()) != RAD_OK);
+}
+
+/* 2^62 x 4 floats wraps to zero elements, which passes any bounds test while the entry claims
+ * 2^62 columns. */
 TEST(a_gguf_tensor_whose_dims_wrap_is_refused) {
-    const std::string path = write_bin("wrap.imatrix", gguf_bytes(
+    const std::string path = write_tmp("wrap.imatrix", gguf_bytes(
         { { "t.in_sum2", { (uint64_t)1 << 62, 4 }, { 1.0f, 2.0f } } }, {}));
     ImatrixFile im;
     CHECK_EQ(im.open(path), RAD_E_FORMAT);
-    std::remove(path.c_str());
 }
 
-/* A tensor count is an allocation size before it is anything else. */
+/* A tensor count sizes an allocation, so one the file cannot hold is refused. */
 TEST(a_gguf_tensor_count_the_file_cannot_hold_is_refused) {
     Bin w;
     w.raw("GGUF", 4);
@@ -1993,16 +2228,15 @@ TEST(a_gguf_tensor_count_the_file_cannot_hold_is_refused) {
     w.u64((uint64_t)1 << 60);   /* tensors */
     w.u64(0);                   /* kvs */
     w.u64(0);
-    const std::string path = write_bin("manytensors.imatrix", w.b);
+    const std::string path = write_tmp("manytensors.imatrix", w.b);
     ImatrixFile im;
     CHECK_EQ(im.open(path), RAD_E_FORMAT);
-    std::remove(path.c_str());
 }
 
-/* count() reads one value per expert of the .in_sum2 dims, so a .counts that holds fewer is not
- * read at all: the importance stands, and the activation count reads as absent. */
+/* count() reads one value per expert of the .in_sum2 dims, so a shorter .counts is ignored: the
+ * importance stands and the activation count reads as absent. */
 TEST(a_gguf_counts_shorter_than_the_expert_count_is_ignored) {
-    const std::string path = write_bin("shortcounts.imatrix", gguf_bytes(
+    const std::string path = write_tmp("shortcounts.imatrix", gguf_bytes(
         { { "t.in_sum2", { 2, 3 }, { 1.f, 1.f, 1.f, 1.f, 2.f, 6.f } },
           { "t.counts",  { 1, 2 }, { 900.0f, 30.0f } } }, {}));
     ImatrixFile im;
@@ -2018,20 +2252,18 @@ TEST(a_gguf_counts_shorter_than_the_expert_count_is_ignored) {
     CHECK(im.importance("t", 2, &imp));
     CHECK_EQ(imp.size(), (size_t)2);
     if (imp.size() == 2) CHECK_NEAR(imp[1] / imp[0], 3.0f, 1e-6);
-    std::remove(path.c_str());
 }
 
-/* The trailing dims of an .in_sum2 can multiply to less than cols x n_expert -- a zero third dim
- * makes the tensor empty -- and every query indexes by cols x n_expert. */
+/* An .in_sum2 whose trailing dims multiply to less than cols x n_expert (e.g. a zero third dim)
+ * is dropped, since every query indexes by cols x n_expert. */
 TEST(a_gguf_sums_smaller_than_their_claimed_extent_are_dropped) {
-    const std::string path = write_bin("emptysums.imatrix", gguf_bytes(
+    const std::string path = write_tmp("emptysums.imatrix", gguf_bytes(
         { { "t.in_sum2", { 4, 2, 0 }, {} },
           { "u.in_sum2", { 2 },       { 1.0f, 3.0f } } }, {}));
     ImatrixFile im;
     CHECK_OK(im.open(path));
     CHECK(im.find("t") == nullptr);
     CHECK(im.find("u") != nullptr);
-    std::remove(path.c_str());
 }
 
 TEST(an_alignment_that_is_not_a_power_of_two_is_refused) {
@@ -2043,17 +2275,16 @@ TEST(an_alignment_that_is_not_a_power_of_two_is_refused) {
     w.gstr("general.alignment");
     w.u32(4);
     w.u32(24);          /* not a power of two */
-    const std::string path = write_bin("badalign.imatrix", w.b);
+    const std::string path = write_tmp("badalign.imatrix", w.b);
     ImatrixFile im;
     CHECK_EQ(im.open(path), RAD_E_FORMAT);
-    std::remove(path.c_str());
 }
 
 TEST(reopening_replaces_everything_the_previous_file_left) {
-    const std::string a = write_bin("first.imatrix", legacy_bytes({
+    const std::string a = write_tmp("first.imatrix", legacy_bytes({
         { "only_in_a", 1, { 1.0f, 2.0f } },
     }));
-    const std::string b = write_bin("second.imatrix", gguf_bytes(
+    const std::string b = write_tmp("second.imatrix", gguf_bytes(
         { { "only_in_b.in_sum2", { 2 }, { 3.0f, 4.0f } } },
         { { "imatrix.chunk_count", 4, 5, "" } }));
     ImatrixFile im;
@@ -2067,8 +2298,6 @@ TEST(reopening_replaces_everything_the_previous_file_left) {
     CHECK(im.is_gguf());
     CHECK_EQ(im.chunk_count(), (int64_t)5);
     CHECK_EQ(im.entries().size(), (size_t)1);
-    std::remove(a.c_str());
-    std::remove(b.c_str());
 }
 
 RAD_TEST_MAIN()

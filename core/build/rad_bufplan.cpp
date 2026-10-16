@@ -1,19 +1,16 @@
 /* rad_bufplan.cpp -- the buffer plan (spec §3.1).
  *
  * Activations are declared, liveness is computed over the declared op list, and non-overlapping
- * lifetimes are packed into one arena sized once. The alternative is an allocator on the hot
- * path, and an allocator on the hot path is the thing this engine exists to remove.
+ * lifetimes are packed into one arena sized once, so the hot path never allocates.
  *
- * Two conservatisms are deliberate and both are stated in the spec: the arena is sized for
- * max_tok, and liveness is computed over the declared list, which is a superset of what any given
- * step issues. A plan that is correct for the worst step is correct for every step.
+ * Two deliberate conservatisms (both in the spec): the arena is sized for max_tok, and liveness
+ * covers the declared list, a superset of what any step issues. A plan correct for the worst step
+ * is correct for every step.
  *
- * The packer is greedy interval colouring, largest first: for each buffer in descending size
- * order, take the lowest aligned offset that collides with no already-placed buffer whose
- * lifetime overlaps. It is O(n^2) in the buffer count at declare, which for a few hundred
- * activations is microseconds, and it is within a few percent of optimal on the shapes that
- * matter -- the one big activation is placed first and everything else fills in around it.
- * Optimal packing here is NP-hard and the difference is not worth a solver.
+ * The packer is greedy interval colouring, largest first: each buffer takes the lowest aligned
+ * offset that collides with no placed buffer whose lifetime overlaps. O(n^2) in the buffer count,
+ * microseconds for a few hundred activations, and within a few percent of optimal on real shapes
+ * (the one big activation goes first). Optimal packing is NP-hard and not worth a solver.
  */
 #include "rad_build.h"
 #include "rad_internal.h"
@@ -23,12 +20,10 @@
 
 namespace rad {
 
-/* Every buffer starts at a 256-byte boundary: the container's sub-block alignment, and wide
- * enough for any vector load an RDNA4 kernel issues (dwordx4 is 16 B). A kernel that needs more
- * than this from its scratch says so through its scratch hook, which is sized separately. */
+/* Every buffer starts at a 256-byte boundary: the container's sub-block alignment, and enough for
+ * any RDNA4 vector load (dwordx4 is 16 B). A kernel needing more alignment for its scratch says so
+ * through its scratch hook, which is sized separately. */
 static constexpr int64_t kBufAlign = (int64_t)RAD_ALIGN_SUB;
-
-#include <cstdlib>
 
 namespace {
 
@@ -41,8 +36,8 @@ struct Item {
 
 bool overlaps(const Item& a, const Item& b) { return a.lo <= b.hi && b.lo <= a.hi; }
 
-/* Lowest aligned offset at or above 0 that fits `need` bytes without colliding with anything in
- * `placed` that is alive at the same time. */
+/* Lowest aligned offset that fits `want` without colliding with anything already placed
+ * (off >= 0) that is alive at the same time. */
 int64_t first_fit(const Item& want, const std::vector<Item>& placed) {
     std::vector<std::pair<int64_t, int64_t>> occ;
     occ.reserve(placed.size());
@@ -56,6 +51,22 @@ int64_t first_fit(const Item& want, const std::vector<Item>& placed) {
         off = std::max(off, align_up(e, kBufAlign));
     }
     return off;
+}
+
+/* Places every item, largest first, ties by lifetime start then index, so the plan is identical
+ * on every rank and every run. Returns the packed extent. */
+int64_t pack(std::vector<Item>& items) {
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
+        if (a.bytes != b.bytes) return a.bytes > b.bytes;
+        if (a.lo != b.lo) return a.lo < b.lo;
+        return a.idx < b.idx;
+    });
+    int64_t end = 0;
+    for (Item& it : items) {
+        it.off = first_fit(it, items);
+        end = std::max(end, it.off + it.bytes);
+    }
+    return end;
 }
 
 }  /* namespace */
@@ -79,50 +90,35 @@ int plan_buffers(Program& p, BufPlanReport* rep) {
 
         Item it{ i, align_up(b.bytes, kBufAlign), b.first_def, b.last_use };
         if (it.lo < 0 || it.hi < it.lo) {
-            /* Live for the whole program: the sound assumption when nothing declared a use. */
+            /* No declared use: live for the whole program. */
             it.lo = 0;
             it.hi = last_op > 0 ? last_op : 0;
             if (b.decl.kind == RAD_BUF_TRANSIENT) ++r.n_unknown_live;
         }
 
-        /* The two domains are coloured SEPARATELY and each offset is relative to its own arena.
-         * A host-site activation cannot index device memory, so interleaving them in one offset
-         * space would leave both arenas sparse -- correct, and paying VRAM for host activations.
+        /* Each domain is coloured separately, with offsets relative to its own arena. One shared
+         * offset space would leave both arenas sparse and spend VRAM on host activations.
          * Program::arena_bytes is the device high-water mark, host_arena_bytes the host one. */
         if (b.decl.domain == RAD_DOMAIN_HOST) host.push_back(it);
         else if (b.decl.kind == RAD_BUF_TRANSIENT) transient.push_back(it);
         else persist.push_back(it);
     }
 
-    /* Largest first, ties broken by lifetime start and then by index, so the plan is the same on
-     * every rank and every run -- a placement that varies between ranks is a debugging nightmare
-     * for a bug that only shows up as a numerical difference. */
-    auto by_size = [](const Item& a, const Item& b) {
-        if (a.bytes != b.bytes) return a.bytes > b.bytes;
-        if (a.lo != b.lo) return a.lo < b.lo;
-        return a.idx < b.idx;
-    };
-    std::sort(transient.begin(), transient.end(), by_size);
-    std::sort(host.begin(), host.end(), by_size);
-
     for (const Item& t : transient) r.sum_bytes += t.bytes;
 
-    /* peak_live is what a perfect packer would reach, so the pair (peak_live, transient_bytes)
-     * brackets the arena and says whether the greedy pass left anything on the table. */
+    /* peak_live: what a perfect packer would reach (see BufPlanReport). */
     for (int32_t t = 0; t <= std::max<int32_t>(last_op, 0); ++t) {
         int64_t live = 0;
         for (const Item& it : transient) if (it.lo <= t && t <= it.hi) live += it.bytes;
         r.peak_live = std::max(r.peak_live, live);
     }
 
-    /* PERSIST survives across steps and DERIVED is written once per step by the core before any
-     * op runs, so neither may share with a transient or with each other: both are live for every
-     * op that could read them.
+    /* PERSIST survives across steps and DERIVED is written by the core before any op runs, so
+     * both are live for every op and share with nothing.
      *
-     * THEY GO AT THE BOTTOM, and the transients above them. A step smaller than the largest packs
-     * its transients smaller (plan_level), and what it does not reach at the TOP of the arena is
-     * lent to the expert slab; the fixed region has to be where no level moves it, because what
-     * it holds outlives the step that wrote it. */
+     * They go at the bottom, transients above. A smaller step packs its transients smaller
+     * (plan_level) and lends the unused top of the arena to the expert slab, so the fixed region
+     * must sit where no level moves it: its contents outlive the step that wrote them. */
     int64_t off = 0;
     for (const Item& it : persist) {
         p.buffers[it.idx].arena_offset = off;
@@ -132,32 +128,17 @@ int plan_buffers(Program& p, BufPlanReport* rep) {
     const int64_t fixed = align_up(off, kBufAlign);
     r.persist_bytes = fixed;
 
-    std::vector<Item> placed;
-    placed.reserve(transient.size());
-    int64_t tr_end = 0;
-    for (Item it : transient) {
-        it.off = first_fit(it, placed);
-        tr_end = std::max(tr_end, it.off + it.bytes);
-        p.buffers[it.idx].arena_offset = fixed + it.off;
-        placed.push_back(it);
-    }
+    const int64_t tr_end = pack(transient);
+    for (const Item& it : transient) p.buffers[it.idx].arena_offset = fixed + it.off;
     r.transient_bytes = tr_end;
 
     p.arena_fixed_bytes = fixed;
     p.arena_bytes = fixed + tr_end;
 
-    /* The host arena is its own address space and its own base pointer. Offsets below are relative
-     * to it, not to Program::arena_bytes. */
-    std::vector<Item> host_placed;
-    int64_t host_end = 0;
-    for (Item it : host) {
-        /* One pass, same packer: a host PERSIST is live for the whole program by construction, so
-         * first_fit already refuses to share it with anything. */
-        it.off = first_fit(it, host_placed);
-        host_end = std::max(host_end, it.off + it.bytes);
-        p.buffers[it.idx].arena_offset = it.off;
-        host_placed.push_back(it);
-    }
+    /* The host arena has its own base pointer; these offsets are relative to it. Same packer in
+     * one pass: a host PERSIST is live for the whole program, so it shares with nothing. */
+    const int64_t host_end = pack(host);
+    for (const Item& it : host) p.buffers[it.idx].arena_offset = it.off;
     r.host_bytes = host_end;
     p.host_arena_bytes = host_end;
 
@@ -192,9 +173,8 @@ int plan_level(const Program& full, const Program& probe, int64_t rows, ArenaLev
             f.dtype != q.dtype || f.rank != q.rank)
             return refuse(fmt("buffer %zu is '%s' in the real declare and '%s' in the sizing one",
                               i, fb.name.c_str(), pb.name.c_str()));
-        /* ONLY THE ROWS MAY SHRINK. Every other extent is a stride some kernel was resolved
-         * against at the real size, and a buffer narrower in any of them would be read at the
-         * wrong pitch. */
+        /* Only the rows may shrink. Every other extent is a stride some kernel was resolved
+         * against at the real size. */
         for (uint32_t d = 1; d < f.rank; ++d)
             if (f.shape[d] != q.shape[d])
                 return refuse(fmt("buffer '%s' changes extent %u (%lld to %lld) with the step size",
@@ -203,36 +183,27 @@ int plan_level(const Program& full, const Program& probe, int64_t rows, ArenaLev
             return refuse(fmt("buffer '%s' is larger for a smaller step (%lld rows to %lld)",
                               fb.name.c_str(), (long long)f.shape[0], (long long)q.shape[0]));
         lv.decl[i] = q;
-        /* THE FIXED REGION AND THE HOST ARENA ARE THE SAME AT EVERY LEVEL. A persistent buffer
-         * holds what an earlier step wrote, so it cannot move -- and it keeps its full size too:
-         * one the plugin sizes by the step (a per-token plane it writes from outside the op order)
-         * is only ever smaller at a smaller step, and the real declare's extent covers it. */
+        /* The fixed region and the host arena are the same at every level. A persistent buffer
+         * holds an earlier step's data, so it cannot move, and it keeps its full size: one sized
+         * by the step (a per-token plane written outside the op order) is only smaller at a
+         * smaller step, and the real extent covers it. */
         if (f.kind != RAD_BUF_TRANSIENT || f.domain == RAD_DOMAIN_HOST) {
             lv.decl[i] = f;
             lv.offset[i] = fb.arena_offset;
             continue;
         }
-        /* The real declare's liveness: the op list is the same, and it is the one the kernels were
-         * issued against. */
+        /* The real declare's liveness: the op list is the same one the kernels were issued
+         * against. */
         Item it{ i, align_up(buffer_bytes(q), kBufAlign), fb.first_def, fb.last_use };
-        if (it.lo < 0 || it.hi < it.lo) { it.lo = 0; it.hi = (int32_t)full.ops.size(); }
+        if (it.lo < 0 || it.hi < it.lo) {
+            it.lo = 0;
+            it.hi = std::max<int32_t>((int32_t)full.ops.size() - 1, 0);
+        }
         transient.push_back(it);
     }
 
-    auto by_size = [](const Item& a, const Item& b) {
-        if (a.bytes != b.bytes) return a.bytes > b.bytes;
-        if (a.lo != b.lo) return a.lo < b.lo;
-        return a.idx < b.idx;
-    };
-    std::sort(transient.begin(), transient.end(), by_size);
-    std::vector<Item> placed;
-    int64_t tr_end = 0;
-    for (Item it : transient) {
-        it.off = first_fit(it, placed);
-        tr_end = std::max(tr_end, it.off + it.bytes);
-        lv.offset[it.idx] = full.arena_fixed_bytes + it.off;
-        placed.push_back(it);
-    }
+    const int64_t tr_end = pack(transient);
+    for (const Item& it : transient) lv.offset[it.idx] = full.arena_fixed_bytes + it.off;
     lv.end = full.arena_fixed_bytes + tr_end;
     if (lv.end > full.arena_bytes)
         return refuse(fmt("packing the smaller buffers took %lld bytes, more than the full plan's "

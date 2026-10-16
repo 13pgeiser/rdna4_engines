@@ -1,17 +1,15 @@
 /* diag_test.cpp -- the startup report (core/diag/diag.h).
  *
- * THE MACHINE IS A DIRECTORY. The collector reads /proc and /sys under a root, so every case here
- * builds the root it wants: two R9700s behind on-card switches, one of them on a root port running
- * at half its speed under load, an integrated GPU beside them, and the host files a real Linux box
- * has. The layout copies what a gfx1201 host's sysfs actually holds (KFD topology location ids,
- * pp_dpm_pcie's table, pp_od_clk_voltage's offset block), so a parser that only works on a
- * simplified fixture fails here.
+ * The collector reads /proc and /sys under a root directory, so each case builds its machine:
+ * two R9700s behind on-card switches, one on a root port running at half speed under load, an
+ * integrated GPU, and the usual Linux host files. The layout copies a real gfx1201 host's sysfs
+ * (KFD topology location ids, pp_dpm_pcie's table, pp_od_clk_voltage's offset block), so a parser
+ * that only handles a simplified fixture fails.
  *
- * What is held down:
- *   COLLECTED   each fact reaches its field, every hop of a card's PCIe path included
- *   CHECKED     each finding fires on the machine that has the problem and stays quiet on one
- *               that does not -- an idle link parked low is not a finding
- *   REPORTED    every option in the command line's table reaches the report, and a secret does not
+ *   Collected   each fact reaches its field, including every hop of a card's PCIe path
+ *   Checked     each finding fires on a machine with the problem and stays quiet otherwise;
+ *               an idle link parked low is not a finding
+ *   Reported    every option in the command-line table reaches the report; secrets do not
  */
 #include "rad_test.h"
 
@@ -33,18 +31,12 @@ namespace fs = std::filesystem;
 
 namespace {
 
+/* A machine of its own: an empty directory under the test's temporary directory. */
 struct Root {
     std::string dir;
     Root() {
-        const char* t = std::getenv("TMPDIR");
-        std::string base = (t && *t) ? t : "/tmp";
-        char tmpl[512];
-        snprintf(tmpl, sizeof tmpl, "%s/diag_test.XXXXXX", base.c_str());
-        dir = mkdtemp(tmpl) ? tmpl : "";
-    }
-    ~Root() {
-        std::error_code ec;
-        if (!dir.empty()) fs::remove_all(dir, ec);
+        std::string tmpl = radtest::tmp_path("root.XXXXXX");
+        dir = mkdtemp(tmpl.data()) ? tmpl : "";
     }
     void put(const std::string& rel, const std::string& text) const {
         const fs::path p = fs::path(dir) / rel.substr(1);
@@ -116,8 +108,8 @@ void r9700(const Root& r, const std::string& rp, const std::string& up, const st
               "\ndomain 0\ngfx_target_version 120001\n");
 }
 
-/* The machine the report was written against: a 16-core desktop part, two R9700s (the second on a
- * root port parked at Gen4 while busy, and with a lower power cap), an integrated GPU. */
+/* A 16-core desktop part, two R9700s (the second on a root port at Gen4 while busy, with a lower
+ * power cap) and an integrated GPU. */
 void machine(const Root& r) {
     std::string cpu;
     for (int i = 0; i < 4; ++i)
@@ -239,8 +231,8 @@ TEST(every_display_device_is_listed_with_its_kfd_target) {
     CHECK_EQ(a->dpm_pcie[1], std::string("1: 16.0GT/s, x8 616Mhz"));
 }
 
-/* THE ROOT PORT IS ON THE PATH. The card's own link reads Gen5 x16 on both cards; only the second
- * card's root port says it runs at 16 GT/s. */
+/* The root port is part of the path: both cards' own links read Gen5 x16, and only the second
+ * card's root port shows 16 GT/s. */
 TEST(the_whole_pcie_path_is_read_root_port_first) {
     Root r;
     machine(r);
@@ -272,8 +264,8 @@ TEST(an_empty_root_is_all_unknown_and_does_not_fail) {
     CHECK(text.find("no display-class PCI device") != std::string::npos);
 }
 
-/* A LIMIT ABOVE THE PROCESS'S OWN CGROUP BINDS IT. The leaf says max; the slice above it holds
- * 8 GiB and the one above that 16 GiB, so the process can have 8. */
+/* A limit on an ancestor cgroup binds the process. The leaf says max, its parent 8 GiB and the
+ * grandparent 16 GiB, so the process gets 8 GiB. */
 TEST(the_tightest_cgroup_limit_on_the_way_up_is_reported) {
     Root r;
     machine(r);
@@ -292,8 +284,8 @@ TEST(the_tightest_cgroup_limit_on_the_way_up_is_reported) {
     CHECK_EQ(diag::collect(r.dir).host.cgroup_mem_limit, (int64_t)4 << 30);
 }
 
-/* unique_id is a full 64-bit hash, which a signed 64-bit read cannot hold. Ahead of the keys the
- * target is read from, it must not stop the read. */
+/* unique_id is a full 64-bit hash that overflows a signed 64-bit read. It precedes the keys the
+ * target is read from and must not stop the read. */
 TEST(a_kfd_value_too_large_for_a_signed_read_does_not_hide_the_rest) {
     Root r;
     machine(r);
@@ -308,8 +300,8 @@ TEST(a_kfd_value_too_large_for_a_signed_read_does_not_hide_the_rest) {
     CHECK_EQ(a->simd, 128);
 }
 
-/* A SERVING PROCESS READS THE SMU-BACKED FILES OF ITS OWN CARDS ONLY. The other cards are still
- * listed, from their PCI and memory files. */
+/* A serving process reads the SMU-backed files of its own cards only. Other cards are still
+ * listed from their PCI and memory files. */
 TEST(only_the_managed_cards_power_files_are_read) {
     Root r;
     machine(r);
@@ -371,8 +363,7 @@ TEST(a_link_below_max_under_load_is_a_warning) {
     CHECK(names_port);
 }
 
-/* AT REST A LINK PARKS LOW, and that is not a finding: the same parked root port on an idle card
- * says nothing. */
+/* A link parks low at rest, so the same parked root port on an idle card is not a finding. */
 TEST(an_idle_card_with_a_parked_link_is_not_a_finding) {
     Root r;
     machine(r);
@@ -398,8 +389,8 @@ TEST(cards_set_up_differently_are_named) {
     CHECK(has(found, "cpu-governor", diag::Finding::Note));
 }
 
-/* THE DEFAULT IS THE YARDSTICK, NOT THE MAXIMUM. Both cards allow 330 W and default to 300 W; the
- * first is at its default and says nothing, the second was lowered to 280 W and is named. */
+/* A power cap is judged against the default, not the maximum. Both cards allow 330 W and default
+ * to 300 W; the first is at its default, the second is lowered to 280 W and is named. */
 TEST(a_power_cap_is_judged_against_the_cards_default) {
     Root r;
     machine(r);
@@ -413,7 +404,7 @@ TEST(a_power_cap_is_judged_against_the_cards_default) {
     auto found = diag::check(f, diag::RunFacts{});
     CHECK(!named(found, "0000:03:00.0"));
     CHECK(named(found, "0000:07:00.0"));
-    /* A card that does not say its default is not judged at all. */
+    /* A card that does not report its default is not judged. */
     for (diag::CardFacts& c : f.cards) c.power_cap_default_uw = -1;
     CHECK(!has(diag::check(f, diag::RunFacts{}), "power-cap-below-default"));
 }
@@ -461,14 +452,14 @@ TEST(host_findings) {
     CHECK(has(found, "iommu-translated", diag::Finding::Note));
     CHECK(has(found, "memory-low", diag::Finding::Warn));
     CHECK(has(found, "swap-in-use", diag::Finding::Note));
-    /* Warnings come before notes, so the first lines of the section are the ones to act on. */
+    /* Warnings come before notes, so the section leads with what to act on. */
     bool seen_note = false, order_ok = true;
     for (const diag::Finding& x : found) {
         if (x.level == diag::Finding::Note) seen_note = true;
         else if (seen_note) order_ok = false;
     }
     CHECK(order_ok);
-    /* Huge pages off on a passthrough IOMMU is a note: the page size has not measured slower. */
+    /* THP off on a passthrough IOMMU is only a note: the page size has not measured slower. */
     for (diag::CardFacts& c : f.cards) c.iommu_type = "identity";
     CHECK(has(diag::check(f, run), "thp-never", diag::Finding::Note));
 }
@@ -491,7 +482,7 @@ TEST(engine_findings) {
     const auto found = diag::check(f, run);
     CHECK(has(found, "tp-wire-lossy", diag::Finding::Note));
     CHECK(has(found, "prefix-cache-off", diag::Finding::Note));
-    /* Passthrough is not advice for peer access: on one Intel VT-d host it removed it. */
+    /* Passthrough is not advised for peer access: on an Intel VT-d host it disabled P2P. */
     for (const diag::Finding& x : found)
         if (x.id == "p2p-off") CHECK(x.fix.find("IOMMU in passthrough") == std::string::npos);
     CHECK(has(found, "experts-from-host", diag::Finding::Note));
@@ -502,21 +493,21 @@ TEST(engine_findings) {
     CHECK(!has(found, "host-backend"));
     run.p2p_forced_off = true;
     CHECK(!has(diag::check(f, run), "p2p-off"));
-    /* The cache the engine turned off itself -- the KL mode, an embedding model -- is not a
-     * setting to undo, and its reason is on the option's line instead. */
+    /* A cache the engine turned off itself (KL mode, an embedding model) is not a setting to
+     * undo; its reason goes on the option's line instead. */
     run.prefix_cache_off_why = "an embedding model: an encoder keeps no KV to reuse";
     CHECK(!has(diag::check(f, run), "prefix-cache-off"));
-    /* #58's shape: a card is in the machine and the engine came up on the host. */
+    /* A card is present but the engine came up on the host backend. */
     for (diag::CardFacts& c : f.cards) { c.rank = -1; }
     run.host_backend = true;
     CHECK(has(diag::check(f, run), "host-backend", diag::Finding::Warn));
-    /* An integrated GPU's few hundred MiB of carve-out is not a card the engine would serve on. */
+    /* An integrated GPU with a few hundred MiB of carve-out is not a card the engine would serve on. */
     for (diag::CardFacts& c : f.cards) c.vram_total = (int64_t)512 << 20;
     CHECK(!has(diag::check(f, run), "host-backend"));
 }
 
-/* THE MODE IS THE CARDS'. An integrated GPU identity-mapped beside a translated discrete card is
- * a machine whose serving card is translated, whatever the other group says. */
+/* The IOMMU mode comes from the serving cards: an identity-mapped integrated GPU beside a
+ * translated discrete card still means the serving card is translated. */
 TEST(the_iommu_mode_is_read_from_the_serving_cards) {
     Root r;
     machine(r);
@@ -526,6 +517,9 @@ TEST(the_iommu_mode_is_read_from_the_serving_cards) {
     diag::Facts f = served_machine(r);
     CHECK_EQ(f.host.iommu, std::string("mixed"));
     CHECK(f.host.iommu_why.find("DMA-FQ for 0000:07:00.0") != std::string::npos);
+    /* The groups beat iommu=pt on the command line, which the platform may not honour. */
+    r.put("/proc/cmdline", "root=PARTUUID=x rw iommu=pt\n");
+    CHECK_EQ(served_machine(r).host.iommu, std::string("mixed"));
     diag::RunFacts run;
     run.host_pool_mib = 12288;
     CHECK(has(diag::check(f, run), "iommu-translated", diag::Finding::Note));
@@ -535,26 +529,12 @@ TEST(the_iommu_mode_is_read_from_the_serving_cards) {
 
 /* ------------------------------------------------------------------ reported */
 
-namespace {
-
-struct Argv {
-    std::vector<std::string> store;
-    std::vector<char*>       argv;
-    explicit Argv(std::initializer_list<const char*> v) {
-        store.emplace_back("radiance");
-        for (const char* s : v) store.emplace_back(s);
-        for (std::string& s : store) argv.push_back(s.data());
-    }
-};
-
-}  /* namespace */
-
-/* EVERY OPTION IN THE TABLE REACHES THE REPORT, with a value shown and not the placeholder an
- * option without a formatter gets. An option added to the table without one fails here by name. */
+/* Every option in the table reaches the report with a value, not the placeholder an option
+ * without a formatter gets. An option added without one fails here by name. */
 TEST(every_option_in_the_table_is_reported) {
     Config c;
     Argv a({ "--model", "/m/x.rad" });
-    CHECK_EQ(config_parse((int)a.argv.size(), a.argv.data(), &c), 0);
+    CHECK_EQ(config_parse(a.argc(), a.argv.data(), &c), 0);
     const std::vector<diag::ConfigRow> rows = diag::config_rows(c);
     const std::vector<std::string> names = diag::config_option_names();
     CHECK_EQ(rows.size(), names.size());
@@ -576,7 +556,7 @@ TEST(sources_and_secrets) {
     Config c;
     Argv a({ "--model", "/m/x.rad", "--tp", "2", "--api-key", "sk-very-secret-value",
              "--gpu-headroom", "128" });
-    CHECK_EQ(config_parse((int)a.argv.size(), a.argv.data(), &c), 0);
+    CHECK_EQ(config_parse(a.argc(), a.argv.data(), &c), 0);
     unsetenv("RADIANCE_KERNELS");
     std::vector<diag::ConfigRow> rows = diag::config_rows(c);
     auto row = [&](const char* f) -> const diag::ConfigRow* {
@@ -592,8 +572,8 @@ TEST(sources_and_secrets) {
           row("--kernels")->value == "libr4d,libref");
     CHECK(row("--api-key") && row("--api-key")->value == "set");
 
-    /* A DECISION SUPPLIES THE VALUE AND THE REASON; a default it resolves becomes `auto`, a given
-     * option keeps its source; a topic no option states is returned as derived. */
+    /* A decision supplies the value and the reason. A default it resolves becomes `auto`, a given
+     * option keeps its source, and a topic with no option is returned as derived. */
     std::vector<diag::Decision> d;
     diag::decide(&d, "--num-speculative-tokens", "2", "the drafter's own depth");
     diag::decide(&d, "--tp", "2", "as given");
@@ -616,12 +596,12 @@ TEST(sources_and_secrets) {
     CHECK(text.find("DERIVED") != std::string::npos);
 }
 
-/* BYTES THAT ARE NOT UTF-8 ARE REPLACED, NOT THROWN ON. A --model path is the operator's bytes,
- * and a strict serialiser would turn every /diagnostics request into a 500. */
+/* Bytes that are not UTF-8 are replaced, not thrown on. A --model path is arbitrary operator
+ * bytes, and a strict serialiser would fail every /diagnostics request with a 500. */
 TEST(a_value_that_is_not_utf8_does_not_break_the_json) {
     Config c;
     Argv a({ "--model", "/m/caf\xe9.rad" });
-    CHECK_EQ(config_parse((int)a.argv.size(), a.argv.data(), &c), 0);
+    CHECK_EQ(config_parse(a.argc(), a.argv.data(), &c), 0);
     c.sample_dry_seq_breakers = std::vector<std::string>{ "\xff\xfe" };
     std::vector<diag::ConfigRow> rows;
     bool threw = false;
@@ -641,13 +621,12 @@ TEST(a_value_that_is_not_utf8_does_not_break_the_json) {
     CHECK(j["configuration"][0]["value"].get<std::string>() == "/m/caf\xef\xbf\xbd.rad");
 }
 
-/* EACH SAMPLER FIELD NAMES ITS OWN SOURCE. A generation_config.json that states a temperature and
- * a top_p and nothing else supplied those two; top_k and min_p are SamplingParams' own values,
- * and a reason that named the file for all four would send a reader to look for them in it. */
+/* Each sampler field names its own source. A generation_config.json stating only temperature and
+ * top_p supplied those two; top_k and min_p are SamplingParams' defaults and must not cite it. */
 TEST(sampler_defaults_carry_a_source_per_field) {
     Config c;
     Argv a({ "--model", "/m/x.rad", "--min-p", "0.05" });
-    CHECK_EQ(config_parse((int)a.argv.size(), a.argv.data(), &c), 0);
+    CHECK_EQ(config_parse(a.argc(), a.argv.data(), &c), 0);
     GenSampling g;
     CHECK(gen_sampling_parse(R"({"temperature": 0.6, "top_p": 0.95})", "test", &g));
     SamplingParams sp = g.onto(SamplingParams{});
@@ -661,19 +640,19 @@ TEST(sampler_defaults_carry_a_source_per_field) {
           find("--temp")->value == "0.6");
     CHECK(find("--top-p") && find("--top-p")->why == "from /m/gen.json");
     CHECK(find("--top-k") && find("--top-k")->why.find("/m/gen.json states no top_k") == 0);
-    /* --min-p was given: its own row says "command line", and nothing here overrides that. */
+    /* --min-p was given: its own row says "command line" and is not overridden here. */
     CHECK(!find("--min-p"));
-    /* No source at all: every field says the model stated nothing. */
+    /* With no source, every field says the model stated nothing. */
     for (const GenFieldSource& x : gen_sampling_sources(GenSampling{}, "", SamplingParams{}, c))
         CHECK(x.why.find("the model states no sampling of its own") == 0);
 }
 
-/* A VALUE THE SERVER RESOLVES IS RECORDED WHERE IT IS RESOLVED, not worked out again by the
- * report: unresolved, the option's line says only how it will be. */
+/* A value the server resolves is recorded where it is resolved, not recomputed by the report.
+ * Until then, the option's line says only how it will be resolved. */
 TEST(auto_server_bounds_are_not_recomputed_by_the_report) {
     Config c;
     Argv a({ "--model", "/m/x.rad" });
-    CHECK_EQ(config_parse((int)a.argv.size(), a.argv.data(), &c), 0);
+    CHECK_EQ(config_parse(a.argc(), a.argv.data(), &c), 0);
     std::vector<diag::ConfigRow> rows = diag::config_rows(c);
     for (const diag::ConfigRow& x : rows)
         if (x.flag == "--http-threads" || x.flag == "--max-n" || x.flag == "--max-queued-requests")
@@ -692,7 +671,7 @@ TEST(the_json_carries_every_section) {
     const auto found = diag::check(f, diag::RunFacts{});
     Config c;
     Argv a({ "--model", "/m/x.rad" });
-    CHECK_EQ(config_parse((int)a.argv.size(), a.argv.data(), &c), 0);
+    CHECK_EQ(config_parse(a.argc(), a.argv.data(), &c), 0);
     const nlohmann::json j = nlohmann::json::parse(
         diag::to_json(diag::config_rows(c), {}, f, diag::RunFacts{}, found), nullptr, false);
     CHECK(!j.is_discarded());

@@ -1,14 +1,14 @@
 /* tokenizer_regex_test.cpp -- the pre-tokeniser pattern compiler, construct by construct.
  *
- * The expected splits are Oniguruma's: each table row was run through HuggingFace tokenizers'
- * Split (behaviour and invert as given) and its pieces recorded, because that is the engine a
- * tokenizer.json pattern is written for and the only definition of what one means. A row per
- * construct the dialect covers -- escapes, classes and their set operations, every shorthand and
- * property, groups, greedy and lazy quantifiers, the flags and their scope, anchors, one-codepoint
- * lookaround, and the iteration rules for empty matches -- so a regression names the construct.
+ * The expected splits are Oniguruma's: each row was run through HuggingFace tokenizers' Split
+ * (behaviour and invert as given) and its pieces recorded, since that is the engine tokenizer.json
+ * patterns are written for and the only definition of what one means. There is a row per
+ * construct the dialect covers (escapes, classes and set operations, every shorthand and
+ * property, groups, greedy and lazy quantifiers, flags and their scope, anchors, one-codepoint
+ * lookaround, iteration over empty matches), so a regression names the construct.
  *
- * Then the refusals: every construct outside the dialect must fail to compile, with a message
- * that names it, since a pattern that does not compile is a vocabulary that does not load.
+ * Every construct outside the dialect must fail to compile with a message naming it, since a
+ * pattern that does not compile is a vocabulary that does not load.
  */
 #include "rad_test.h"
 
@@ -440,8 +440,8 @@ TEST(every_split_behaviour_and_invert_folds_as_huggingface_does) {
     }
 }
 
-/* match_at is the primitive find_iter is built from: the leftmost-FIRST match anchored at a
- * position, which is not the longest one. */
+/* match_at is the primitive find_iter is built on: the leftmost-first match anchored at a
+ * position, which is not necessarily the longest. */
 TEST(match_at_is_leftmost_first_not_longest) {
     auto re = compile("a|ab|abc");
     REQUIRE(re != nullptr);
@@ -461,8 +461,8 @@ TEST(match_at_is_leftmost_first_not_longest) {
     CHECK_EQ(ws->match_at(" x", 0), (int64_t)-1);
 }
 
-/* EVERY CONSTRUCT OUTSIDE THE DIALECT IS REFUSED BY NAME. The phrase checked is the one a reader
- * of the load error needs to find the construct in a 200-character pattern. */
+/* Every construct outside the dialect is refused by name. The checked phrase is what a reader of
+ * the load error needs to find the construct in a 200-character pattern. */
 TEST(constructs_outside_the_dialect_are_refused_by_name) {
     const struct { const char* pattern; const char* says; } refused[] = {
         { "(a)\\1",                 "backreference" },
@@ -521,9 +521,8 @@ TEST(constructs_outside_the_dialect_are_refused_by_name) {
     }
 }
 
-/* THE PATTERNS MODELS SHIP compile, and to small machines: a pre-tokeniser DFA that needed
- * thousands of states would be a sign the construction had gone wrong, not a feature of the
- * pattern. */
+/* Shipped patterns compile to small machines: a pre-tokeniser DFA with thousands of states would
+ * mean the construction had gone wrong, not that the pattern needs it. */
 TEST(shipped_patterns_compile_to_small_dfas) {
     const char* shipped[] = {
         /* Qwen3.5 / 3.6 / 3.8 */

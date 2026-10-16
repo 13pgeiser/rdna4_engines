@@ -1,13 +1,12 @@
-/* tokenizer_fixture.h -- vocabularies and text for the tokenizer tests, made on the spot.
+/* tokenizer_fixture.h -- vocabularies and text for the tokenizer tests, built in memory.
  *
- * The tests need no model file. A byte-level BPE vocabulary is TRAINED here, deterministically,
- * on generated text -- the textbook algorithm: count adjacent pairs over the pre-tokenised words,
- * merge the most frequent, repeat -- so it has the shape of a real one: every byte is a token,
- * common words are single tokens, rare ones take several merges, and some merges produce text
- * other merges build on. The generators draw from every general category, the scripts and
- * sequences that stress a pre-tokeniser (combining marks, ZWJ emoji, CJK, Hangul, RTL), digit runs
- * of every length, every kind of whitespace, contractions in mixed case, and optionally bytes that
- * are not UTF-8.
+ * No model file is needed. A byte-level BPE vocabulary is trained here, deterministically, on
+ * generated text with the textbook algorithm (count adjacent pairs over the pre-tokenised words,
+ * merge the most frequent, repeat), so it has the shape of a real one: every byte is a token,
+ * common words are single tokens, rare ones take several merges. The generators cover every
+ * general category, sequences that stress a pre-tokeniser (combining marks, ZWJ emoji, CJK,
+ * Hangul, RTL), digit runs of every length, every kind of whitespace, mixed-case contractions,
+ * and optionally invalid UTF-8.
  */
 #pragma once
 #include "text/tokenizer.h"
@@ -37,27 +36,6 @@ inline const char* k_llama3 =
 inline const char* k_gpt2 =
     "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+";
 
-/* The GPT-2 byte alphabet: byte -> its mapped character's UTF-8. */
-inline std::string bytelevel_char(uint8_t b) {
-    static std::vector<std::string> map = [] {
-        std::vector<std::string> m(256);
-        bool taken[256] = {};
-        auto utf8 = [](uint32_t c) {
-            std::string s;
-            if (c < 0x80) s += (char)c;
-            else { s += (char)(0xC0 | (c >> 6)); s += (char)(0x80 | (c & 0x3F)); }
-            return s;
-        };
-        for (int c = 0x21; c <= 0x7E; ++c) { m[c] = utf8(c); taken[c] = true; }
-        for (int c = 0xA1; c <= 0xAC; ++c) { m[c] = utf8(c); taken[c] = true; }
-        for (int c = 0xAE; c <= 0xFF; ++c) { m[c] = utf8(c); taken[c] = true; }
-        uint32_t n = 0;
-        for (int c = 0; c < 256; ++c) if (!taken[c]) m[c] = utf8(256 + n++);
-        return m;
-    }();
-    return map[b];
-}
-
 inline std::string cp_utf8(uint32_t c) {
     std::string s;
     if (c < 0x80) { s += (char)c; }
@@ -69,6 +47,21 @@ inline std::string cp_utf8(uint32_t c) {
         s += (char)(0x80 | ((c >> 6) & 0x3F)); s += (char)(0x80 | (c & 0x3F));
     }
     return s;
+}
+
+/* The GPT-2 byte alphabet: byte -> its mapped character's UTF-8. */
+inline std::string bytelevel_char(uint8_t b) {
+    static std::vector<std::string> map = [] {
+        std::vector<std::string> m(256);
+        bool taken[256] = {};
+        for (int c = 0x21; c <= 0x7E; ++c) { m[c] = cp_utf8(c); taken[c] = true; }
+        for (int c = 0xA1; c <= 0xAC; ++c) { m[c] = cp_utf8(c); taken[c] = true; }
+        for (int c = 0xAE; c <= 0xFF; ++c) { m[c] = cp_utf8(c); taken[c] = true; }
+        uint32_t n = 0;
+        for (int c = 0; c < 256; ++c) if (!taken[c]) m[c] = cp_utf8(256 + n++);
+        return m;
+    }();
+    return map[b];
 }
 
 /* The general category of `c` from the compiler's own tables. */

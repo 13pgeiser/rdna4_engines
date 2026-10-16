@@ -1,45 +1,26 @@
-// The ten small bf16 ops the engine issues between the GEMMs, and the reason they are here at all.
+// The small bf16 ops the engine issues between the GEMMs: embedding gathers, norms, elementwise
+// ops, rope, KV stores. Every op in a step needs a device launch, because the engine's buffers
+// live in VRAM and `rad_issue` refuses an op with no launch for its operands' domain.
 //
-// The rest of this library is kernels worth writing: a WMMA GEMM, a paged attention, a chunked
-// scan.  These are not -- they are an embedding gather, a norm, an add, a sigmoid.  They
-// are here because a step is not a set of interesting kernels, it is a CHAIN, and a chain with one
-// host link does not run: the engine's buffers live in VRAM, libref is domain HOST, and
-// `rad_issue` refuses an op with no launch for the domain its operands are on.  Twenty-one ops
-// short of a device implementation is not "slower", it is a server that answers the first request
-// with `no device kernel for this band` and exits.  So: one kernel library, and this is where a
-// kernel with no other home goes -- including the ops nobody would choose to write.
-//
-// THE ARITHMETIC IS libref's, DELIBERATELY.  Ref is the oracle (spec §17) and these are the
-// ops whose disagreements would be invisible -- an RMS norm that accumulates in bf16, a gather that
-// reads a negative id as unsigned, a rotary that pairs the wrong halves.  Each kernel below states
-// which ref function it must equal.  Where ref rounds, this rounds, in the same place:
+// The arithmetic is libref's (the oracle, spec §17); each kernel names the ref function it must
+// equal, rounding in the same places:
 //
 //   * every reduction accumulates in f32 and only the store narrows to bf16;
-//   * `f32_to_bf16` is round-to-nearest-even (r4d_common.h), which is ref's rounder;
-//   * a NEGATIVE index -- token id, gather row, KV slot -- is the PADDING convention and writes a
-//     zero row or skips the store.  It is not an error and it is not clamped to zero, which would
-//     silently duplicate token 0 across every padding position of a ragged batch.
+//   * `f32_to_bf16` is round-to-nearest-even (r4d_common.h), as in ref;
+//   * a negative index (token id, gather row, KV slot) is padding and writes a zero row or skips
+//     the store. It is not clamped to zero, which would duplicate token 0 across padding.
 //
-// ONE DELIBERATE DIVERGENCE FROM REF, and it is about what a kernel can do rather than about the
-// arithmetic.  Ref reads its index arrays on the host and REFUSES the launch when one is out of
-// range -- an id at or above n_vocab, a gather row past the source, a KV slot past the last block.
-// A device kernel cannot: the indices are in VRAM, checking them means a copy and a synchronisation
-// on the step path, and a per-row `return` cannot become a status.  So the bound is an ARGUMENT and
-// an out-of-range index takes the same path as a negative one -- a zero row, or no store.  That is
-// a defined answer to a caller bug; the alternative is a page fault that takes the server down.
+// One divergence from ref: ref checks index arrays on the host and refuses out-of-range values. A
+// kernel cannot without a copy and sync on the step path, so the bound is an argument and an
+// out-of-range index is treated like a negative one (zero row or no store) instead of faulting.
 //
-// AND ONE ON PRECISION: `expf`, `powf` and `sincosf` here are the ACCURATE forms, not the `__`
-// hardware approximations.  A rope angle is position * inv_freq and position reaches 262144, where
-// __sincosf's argument reduction has nothing left; and every one of these ops is an oracle
-// comparison away from libref, which uses the libm forms.  None of them is on a hot path
-// that would notice.
+// `expf`, `powf` and `sincosf` are the accurate forms, not the `__` approximations: rope positions
+// reach 262144, beyond __sincosf's argument reduction, and libref uses libm. None is on a hot path.
 //
-// WHAT IS NOT HERE.  No fusion.  `rmsnorm` and `add` next to each other are the unfused sequence
-// the architecture plugin asked for, and fusing them is a SELECTION the plugin makes by declaring
-// `rmsnorm_add` (spec §2.3), not something a kernel library does behind its back.  When the fused
-// forms are wanted they are new entry points and new rows, not a rewrite of these.
+// No fusion: fused forms such as `rmsnorm_add` are separate entry points the architecture plugin
+// selects (spec §2.3).
 //
-// Every entry point returns a negative code rather than throwing, matching r4d_gemm_fp8a8.hip.
+// Entry points return a negative code rather than throwing, as in r4d_gemm_fp8a8.hip.
 
 #include "r4d.h"
 #include "r4d_args.h"
@@ -57,30 +38,7 @@ constexpr uint32_t kWave    = 32;
 constexpr uint32_t kThreads = 256;
 constexpr uint32_t kWaves   = kThreads / kWave;
 
-__device__ __forceinline__ float bf2f(uint16_t h) {
-    return __builtin_bit_cast(float, (uint32_t)h << 16);
-}
-
-/* An orthonormal Walsh-Hadamard over N values a THREAD owns, in place and its own inverse. Only
- * `kv_store_kernel`'s quality probe uses it, and only there does a sequential butterfly make sense:
- * r4d_fwht.h's is the one to reuse anywhere speed matters, and it wants a WAVE per N-wide block
- * with N/32 values a lane. N must be a power of two, which every scale group the probe accepts is. */
-template <uint32_t N>
-__device__ __forceinline__ void hadamard(float* a) {
-    static_assert(N && (N & (N - 1u)) == 0u, "the Walsh-Hadamard width must be a power of two");
-    for (uint32_t len = 1; len < N; len <<= 1)
-        for (uint32_t i = 0; i < N; i += len << 1)
-            for (uint32_t j = 0; j < len; ++j) {
-                const float u = a[i + j], w = a[i + j + len];
-                a[i + j] = u + w;
-                a[i + j + len] = u - w;
-            }
-    const float s = rsqrtf((float)N);
-    for (uint32_t e = 0; e < N; ++e) a[e] *= s;
-}
-
-// Sum across the block, broadcast to every thread. One LDS round trip after the wave reduction,
-// which is what the norms need and nothing else here does.
+// Sum across the block, broadcast to every thread: one LDS round trip after the wave reduction.
 template <uint32_t NW>
 __device__ __forceinline__ float block_sum(float v, float* lds) {
     v = r4d_wave_sum(v);
@@ -94,15 +52,13 @@ __device__ __forceinline__ float block_sum(float v, float* lds) {
 }
 
 // ---------------------------------------------------------------------------- embed_lookup
-// ref_embed_lookup.  One block a token; a negative id -- or one at or above n_vocab, see the
-// divergence note at the top -- writes a zero row.
+// ref_embed_lookup. One block per token; a negative id, or one at or above n_vocab, writes a zero
+// row.
 //
-// `vocab_off` is the first GLOBAL row this rank's table stands for, which makes the embedding
-// vocab-parallel: ids stay global, a rank subtracts the offset, and a token belonging to another
-// rank takes the same zero-row path the padding id takes.  Summing the ranks then reconstructs x.
-// At vocab_off = 0 this is the plain gather, to the bit.
-// `mult` multiplies every gathered entry, the product rounded once (Gemma's sqrt(hidden)); 1 is the
-// plain copy, to the bit.
+// `vocab_off` is the first global row of this rank's table, making the embedding vocab-parallel:
+// ids stay global, a rank subtracts the offset, and another rank's token takes the zero-row path.
+// Summing the ranks reconstructs x. `mult` scales every entry with one rounding (Gemma's
+// sqrt(hidden)); 1 is a plain copy.
 __global__ __launch_bounds__(kThreads) void embed_lookup_kernel(
     const int32_t* __restrict__ tok, const uint16_t* __restrict__ wte, uint16_t* __restrict__ x,
     uint32_t n_embd, int32_t n_vocab, int32_t vocab_off, uint32_t x_ld, float mult) {
@@ -118,25 +74,22 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_kernel(
         for (uint32_t i = threadIdx.x; i < n_embd; i += kThreads) dst[i] = src[i];
         return;
     }
-    for (uint32_t i = threadIdx.x; i < n_embd; i += kThreads) dst[i] = f32_to_bf16(bf2f(src[i]) * mult);
+    for (uint32_t i = threadIdx.x; i < n_embd; i += kThreads) dst[i] = f32_to_bf16(bf16_to_f32(src[i]) * mult);
 }
 
 // ---------------------------------------------------------------------------- embed_lookup_q
-// ref_embed_lookup_q.  x[m] = bf16(wte[id] * scale), from a table stored as E4M3 codes with ONE
-// scale (Q) or as plain bf16, where an absent scale is one.  This is the n-gram table's gather
-// (arch/common/rad_block_ple.h) wherever --ngram-placement lets a card read the table: in VRAM, or
-// in pinned host memory the card reads in place over the link.
+// ref_embed_lookup_q. x[m] = bf16(wte[id] * scale), from a table of E4M3 codes with one scale (Q)
+// or plain bf16; an absent scale is one. This is the n-gram table's gather
+// (arch/common/rad_block_ple.h) when --ngram-placement lets a card read the table, in VRAM or in
+// pinned host memory over the link.
 //
-// A THREAD A QUAD OF ENTRIES, NOT A BLOCK A ROW.  A row of the n-gram table is 160 entries, so a
-// block a row leaves most of its threads idle and the grid is as deep as the chunk's row count.
-// Flattened, consecutive threads take consecutive quads, and a row's 40 threads read its 160
-// contiguous bytes.  V = 1 is the same walk an entry at a time, for a width or a pitch the quad's
-// 4- and 8-byte accesses would misalign.
+// One thread per quad of entries: an n-gram row is only 160 entries, so a block per row would
+// leave most threads idle. Consecutive threads take consecutive quads. V = 1 walks one entry at a
+// time, for widths or pitches the quad's 4- and 8-byte accesses would misalign.
 //
-// THE VALUE libavx's LOOKUP TABLE HOLDS, to the bit: a code decodes to f32 exactly
-// (v_cvt_pk_f32_fp8, or the software form beside it in r4d_fp8_wmma.h), the product with the
-// scale rounds once in f32, and f32_to_bf16 rounds to nearest even.  An id outside [0, n_vocab)
-// after the offset writes a zero row (the divergence note at the top of this file).
+// Bit-identical to libavx's lookup table: a code decodes to f32 exactly (v_cvt_pk_f32_fp8 or the
+// software form in r4d_fp8_wmma.h), the scale product rounds once in f32, and f32_to_bf16 rounds
+// to nearest even. An id outside [0, n_vocab) after the offset writes a zero row.
 template <uint32_t V, bool Q>
 __global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
     const int32_t* __restrict__ tok, const void* __restrict__ wte, const void* __restrict__ sc,
@@ -179,9 +132,9 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
 }
 
 // ---------------------------------------------------------------------------- gather_rows
-// ref_gather_rows.  Same shape as the embedding gather and the same negative-index rule, but the
-// source row pitch is the caller's rather than n: a gather off a padded activation buffer is what
-// the op exists for (one logits row per sequence out of a whole prefill chunk).
+// ref_gather_rows. Like the embedding gather, with the same negative-index rule, but the source
+// row pitch is the caller's: it gathers from padded activation buffers (one logits row per
+// sequence out of a prefill chunk).
 __global__ __launch_bounds__(kThreads) void gather_rows_kernel(
     const uint16_t* __restrict__ x, const int32_t* __restrict__ idx, uint16_t* __restrict__ y,
     uint32_t n, int32_t src_rows, uint32_t x_ld, uint32_t y_ld) {
@@ -196,20 +149,15 @@ __global__ __launch_bounds__(kThreads) void gather_rows_kernel(
     for (uint32_t i = threadIdx.x; i < n; i += kThreads) dst[i] = src[i];
 }
 
-
 // ---------------------------------------------------------------- byte row gather / scatter
 //
-// ref_gather_rows and ref_scatter_rows at dtype u8.  A SEPARATE PAIR FROM THE bf16 ONES, and not
-// a widened version of them, because these move OPAQUE BYTES: the KV pool's tier traffic is the
-// caller, a row is one layer's fragment of one block, and what is in it is whatever the attention
-// kernel wrote.  Reading that as bf16 would be a lie with teeth -- libref is the oracle for every
-// op here, its bf16 path loads through float, and a bf16 NaN payload is not guaranteed to survive
-// that round trip.  At u8 every value is 0..255 and float carries it exactly, so oracle and kernel
-// agree bit for bit on any payload at all.
+// ref_gather_rows and ref_scatter_rows at dtype u8. Separate from the bf16 pair because these move
+// opaque bytes: the KV pool's tier traffic, where a row is one layer's fragment of one block.
+// libref's bf16 path loads through float, which need not preserve a NaN payload; at u8 every value
+// is exact in float, so oracle and kernel agree on any payload.
 //
-// 16 BYTES A THREAD WHERE THE ROW ALLOWS IT.  A KV fragment is a tensor extent and is aligned; the
-// registry constrains `n` to a multiple of 16 so this is the only path, and a row that did not
-// satisfy it would not have resolved here.
+// One uchar4 per thread step. The registry constrains `n` to a multiple of 16, so there is no
+// ragged path.
 __global__ __launch_bounds__(kThreads) void gather_rows_u8_kernel(
     const uchar4* __restrict__ x, const int32_t* __restrict__ idx, uchar4* __restrict__ y,
     uint32_t n4, int32_t src_rows, uint32_t x_ld4, uint32_t y_ld4) {
@@ -225,9 +173,8 @@ __global__ __launch_bounds__(kThreads) void gather_rows_u8_kernel(
     for (uint32_t i = threadIdx.x; i < n4; i += kThreads) dst[i] = src[i];
 }
 
-// The mirror.  A negative index writes NOTHING -- the destination is a live pool and the rows this
-// call was not asked about belong to somebody else, so the zero-fill the gather does for an absent
-// row would be data loss here rather than padding.
+// The mirror. A negative index writes nothing: the destination is a live pool, so the gather's
+// zero-fill would be data loss here.
 __global__ __launch_bounds__(kThreads) void scatter_rows_u8_kernel(
     const uchar4* __restrict__ v, const int32_t* __restrict__ idx, uchar4* __restrict__ x,
     uint32_t n4, int32_t dst_rows, uint32_t v_ld4, uint32_t x_ld4) {
@@ -242,19 +189,15 @@ __global__ __launch_bounds__(kThreads) void scatter_rows_u8_kernel(
 // ---------------------------------------------------------------------------- rmsnorm
 // ref_rmsnorm: y = x * rsqrt(mean(x^2) + eps) * (w + wadd).
 //
-// THE GAIN IS ADDED IN f32 AFTER THE bf16 LOAD.  `wadd` is GemmaRMSNorm's `1 +` (Qwen3.5,
-// Qwen3-Next, Gemma store a zero-centred gamma); forming `1 + w` in bf16 first loses 0.3% per
-// channel, which is why r4d_rmsnorm_had_quant_i8 takes the same argument and why it is not the
-// caller's job to bake it into the weight.
+// `wadd` is added to the gain in f32 after the load: it is GemmaRMSNorm's `1 +` (Qwen3.5,
+// Qwen3-Next and Gemma store a zero-centred gamma), and forming `1 + w` in bf16 loses 0.3% per
+// channel. r4d_rmsnorm_had_quant_i8 takes the same argument.
 //
-// THE GAIN IS f32 OR bf16 AND THE CALLER SAYS WHICH.  Every norm gain in this project's
-// architecture plugins is declared RAD_F32 -- they are a few thousand elements against gigabytes of
-// weights, and the norm is where a rounded gain shows -- while the activation either side is bf16.
-// A kernel that assumed one width would read the other as two halves of the wrong number, so the
-// width is a template parameter and the shim reads it off the operand.
+// The gain is f32 or bf16 (WF32), read off the operand by the shim. Architecture plugins declare
+// norm gains RAD_F32, since they are small and a rounded gain shows in the norm.
 //
-// Two passes over the row.  n is 256 (a QK-norm head) or 5120 (the hidden state), so the row is in
-// L1 for the second pass and a one-pass Welford would buy nothing but a different rounding.
+// Two passes over the row: n is 256 (a QK-norm head) or 5120 (the hidden state), so the row is in
+// L1 for the second pass, and one-pass Welford would only change the rounding.
 template <bool WF32, uint32_t THR>
 __global__ __launch_bounds__(THR) void rmsnorm_kernel(
     const uint16_t* __restrict__ x, const void* __restrict__ w, uint16_t* __restrict__ y,
@@ -265,23 +208,19 @@ __global__ __launch_bounds__(THR) void rmsnorm_kernel(
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
 
     float ss = 0.0f;
-    for (uint32_t i = threadIdx.x; i < n; i += THR) { const float v = bf2f(xr[i]); ss += v * v; }
+    for (uint32_t i = threadIdx.x; i < n; i += THR) { const float v = bf16_to_f32(xr[i]); ss += v * v; }
     ss = block_sum<THR / kWave>(ss, lds);
     const float s = rsqrtf(ss / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += THR) {
-        const float g = !w ? 1.0f : WF32 ? ((const float*)w)[i] : bf2f(((const uint16_t*)w)[i]);
-        yr[i] = f32_to_bf16(bf2f(xr[i]) * s * (g + wadd) * mult);
+        const float g = !w ? 1.0f : WF32 ? ((const float*)w)[i] : bf16_to_f32(((const uint16_t*)w)[i]);
+        yr[i] = f32_to_bf16(bf16_to_f32(xr[i]) * s * (g + wadd) * mult);
     }
 }
 
 // ---------------------------------------------------------------------------- rmsnorm_p
-// ref_rmsnorm_p: y = x * rsqrt(mean(x^2) + eps) -- the SAME normalisation as rmsnorm with NO gain.
-// It is the weightless value normalisation Gemma's attention uses on V (llama.cpp's
-// ggml_rms_norm(V, eps), no tensor); there is no checkpoint plane to feed a gain through, so an
-// rmsnorm call would need a phantom all-zero weight. Two passes over the row, the sum of squares
-// in f32; the second pass drops the gain multiply rmsnorm has. The mean accumulates in f32 in
-// ascending index order, exactly as rmsnorm does, so the two agree bit-for-bit where rmsnorm's
-// gain happens to be one.
+// ref_rmsnorm_p: y = x * rsqrt(mean(x^2) + eps), rmsnorm with no gain. Gemma's attention applies
+// it to V (llama.cpp's ggml_rms_norm(V, eps)), which has no checkpoint gain. Accumulates exactly as
+// rmsnorm does, so the two agree bit for bit where rmsnorm's gain is one.
 __global__ __launch_bounds__(kThreads) void rmsnorm_p_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
     uint32_t n, float eps, uint32_t x_ld, uint32_t y_ld) {
@@ -290,19 +229,17 @@ __global__ __launch_bounds__(kThreads) void rmsnorm_p_kernel(
     const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
     float ss = 0.0f;
-    for (uint32_t i = threadIdx.x; i < n; i += kThreads) { const float v = bf2f(xr[i]); ss += v * v; }
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads) { const float v = bf16_to_f32(xr[i]); ss += v * v; }
     ss = block_sum<kThreads / kWave>(ss, lds);
     const float s = rsqrtf(ss / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += kThreads)
-        yr[i] = f32_to_bf16(bf2f(xr[i]) * s);
+        yr[i] = f32_to_bf16(bf16_to_f32(xr[i]) * s);
 }
 
 // ---------------------------------------------------------------------------- add / mul
-// ref_add / ref_mul, including THE ONE BROADCAST RULE: an operand carrying exactly n elements
-// against an output of rows*n broadcasts along rows, and nothing else broadcasts at all.  That is
-// what makes a bias add this op instead of a second one, and the narrowness is the point -- silent
-// broadcasting of an arbitrary shape is how a shape bug becomes a plausible number.
-// `b_step` 0 reads one element for the whole row -- with b_ld 0 too, a scalar for the whole op.
+// ref_add / ref_mul with one broadcast rule: an operand of exactly n elements against an output of
+// rows*n broadcasts along rows; nothing else broadcasts, so shape bugs are not hidden.
+// `b_step` 0 reads one element per row; with b_ld 0 too, a scalar for the whole op.
 __global__ __launch_bounds__(kThreads) void binary_kernel(
     const uint16_t* __restrict__ a, const uint16_t* __restrict__ b, uint16_t* __restrict__ y,
     uint32_t n, uint32_t a_ld, uint32_t b_ld, uint32_t y_ld, int mul, uint32_t b_step) {
@@ -311,19 +248,16 @@ __global__ __launch_bounds__(kThreads) void binary_kernel(
     const uint16_t* __restrict__ br = b + (size_t)m * b_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
     for (uint32_t i = threadIdx.x; i < n; i += kThreads) {
-        const float u = bf2f(ar[i]), v = bf2f(br[i * b_step]);
+        const float u = bf16_to_f32(ar[i]), v = bf16_to_f32(br[i * b_step]);
         yr[i] = f32_to_bf16(mul ? u * v : u + v);
     }
 }
 
 // ---------------------------------------------------------------------------- sigmoid
-// ref_sigmoid.  Its own op and not a mode on a unary kernel for the same reason it is its own row:
-// a gated attention output multiplies by sigmoid(gate) and the selector has to be able to name that.
+// ref_sigmoid, its own op so the selector can name a gated attention's sigmoid(gate).
 //
-// ROW-WISE WITH A PITCH, not flat over the extent, because the operand it is issued against is a
-// COLUMN SLICE: the gate is the second half of each head of an interleaved [tokens, heads,
-// 2*head_dim] projection, so its rows are `n` wide inside a stride of 2n and there is no contiguous
-// extent to walk.  A flat kernel would either refuse it or read the query.
+// Row-wise with a pitch because the operand is a column slice: the gate is the second half of each
+// head of an interleaved [tokens, heads, 2*head_dim] projection, `n` wide inside a stride of 2n.
 __global__ __launch_bounds__(kThreads) void sigmoid_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
     uint32_t n, uint32_t x_ld, uint32_t y_ld) {
@@ -331,18 +265,16 @@ __global__ __launch_bounds__(kThreads) void sigmoid_kernel(
     const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
     for (uint32_t i = threadIdx.x; i < n; i += kThreads)
-        yr[i] = f32_to_bf16(1.0f / (1.0f + expf(-bf2f(xr[i]))));
+        yr[i] = f32_to_bf16(1.0f / (1.0f + expf(-bf16_to_f32(xr[i]))));
 }
 
 // ---------------------------------------------------------------------------- logit_softcap
-// ref_logit_softcap: y = cap * tanh(x / cap), the final-logit softcap. THE ROW-WISE-WITH-A-PITCH
-// SHAPE IS COPIED FROM sigmoid on purpose: Gemma's arch issues it against the logits_gemm's output,
-// and the pitch form costs nothing on a contiguous buffer -- it is x_ld == n.
+// ref_logit_softcap: y = cap * tanh(x / cap), the final-logit softcap. Row-wise with a pitch like
+// sigmoid; on a contiguous buffer x_ld == n.
 //
-// A ROW IS SPREAD OVER gridDim.y BLOCKS, because a row is a vocabulary shard: 65536 wide at Gemma
-// 4's tp 4, and the step's rows are a decode's few. One block a row walked 256 elements a thread of
-// tanhf on a handful of CUs -- ~85 us at one row, --profile-ops on an R9700, for 256 KiB of f32.
-// Elementwise, so the spread moves no bits.
+// A row is spread over gridDim.y blocks: it is a vocabulary shard (65536 wide at Gemma 4's tp 4)
+// and decode has few rows, so one block per row leaves most CUs idle (~85 us at one row on an
+// R9700). Elementwise, so the split changes no bits.
 __global__ __launch_bounds__(kThreads) void logit_softcap_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
     uint32_t n, float cap, uint32_t x_ld, uint32_t y_ld) {
@@ -350,12 +282,10 @@ __global__ __launch_bounds__(kThreads) void logit_softcap_kernel(
     const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
     for (uint32_t i = blockIdx.y * kThreads + threadIdx.x; i < n; i += gridDim.y * kThreads)
-        yr[i] = f32_to_bf16(cap * tanhf(bf2f(xr[i]) / cap));
+        yr[i] = f32_to_bf16(cap * tanhf(bf16_to_f32(xr[i]) / cap));
 }
 
-/* The f32 leg: the 1.3.0 sampling chain carries the logits in f32 from the gemm, so the softcap
- * is issued against f32 rows. The same row-with-pitch shape as the bf16 leg, and the math is the
- * op's definition verbatim -- no rounding pass, the buffer already holds the arithmetic dtype. */
+/* The f32 leg, for logits the gemm writes as f32. Same shape as the bf16 leg, with no rounding. */
 __global__ __launch_bounds__(kThreads) void logit_softcap_kernel_f32(
     const float* __restrict__ x, float* __restrict__ y,
     uint32_t n, float cap, uint32_t x_ld, uint32_t y_ld) {
@@ -366,42 +296,34 @@ __global__ __launch_bounds__(kThreads) void logit_softcap_kernel_f32(
         yr[i] = cap * tanhf(xr[i] / cap);
 }
 
-/* The blocks a softcap row is spread over: eight elements a thread, at most 64 blocks a row. */
+/* Blocks per softcap row: eight elements a thread, at most 64 blocks. */
 static uint32_t softcap_blocks_per_row(int n) {
     uint32_t b = (uint32_t)((n + kThreads * 8 - 1) / (kThreads * 8));
     return b < 1 ? 1 : (b > 64 ? 64 : b);
 }
 
 // ---------------------------------------------------------------------------- scale
-// ref_scale: y = x * s, s a [1] weight broadcast over every element. THE ROW-WISE-WITH-A-PITCH
-// SHAPE IS COPIED FROM sigmoid on purpose: Gemma's arch issues it against the residual stream at
-// the end of every layer (the per-layer scalar), and the pitch form costs nothing on a contiguous
-// buffer -- it is x_ld == n. The scalar is read once per block (a single load, cached), not per
-// element: a per-element reload of a [1] tensor is the same value every time and costs a load per
-// element. `s` is f32 or bf16 (the layer_scalar weight is bf16 in the checkpoint); the branch is
-// on its dtype, so the op is dtype-generic in the scalar and the bf16 kernel is the residual
-// stream's, which is what a served Gemma 4 issues it against.
+// ref_scale: y = x * s, s a [1] weight broadcast over every element (Gemma's per-layer scalar on
+// the residual stream). Row-wise with a pitch like sigmoid. The scalar is loaded once per block;
+// it is f32 or bf16 (the checkpoint's layer_scalar is bf16), selected by `s_dt`.
 __global__ __launch_bounds__(kThreads) void scale_kernel(
     const uint16_t* __restrict__ x, const void* __restrict__ s, uint32_t s_dt,
     uint16_t* __restrict__ y, uint32_t n, uint32_t x_ld, uint32_t y_ld) {
     const uint32_t m = blockIdx.x;
-    const float sv = (s_dt == RAD_F32) ? ((const float*)s)[0] : bf2f(((const uint16_t*)s)[0]);
+    const float sv = (s_dt == RAD_F32) ? ((const float*)s)[0] : bf16_to_f32(((const uint16_t*)s)[0]);
     const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
     for (uint32_t i = threadIdx.x; i < n; i += kThreads)
-        yr[i] = f32_to_bf16(bf2f(xr[i]) * sv);
+        yr[i] = f32_to_bf16(bf16_to_f32(xr[i]) * sv);
 }
 
 // ---------------------------------------------------------------------------- silu_mul
-// ref_silu_mul: y[.., i] = silu(gu[.., i]) * gu[.., n + i].  THE GATE IS THE FIRST HALF, which is
-// the order rad-convert fuses gate_proj and up_proj into one weight in; the two conventions cannot
-// drift because both are stated and neither is inferred.
+// ref_silu_mul: y[.., i] = silu(gu[.., i]) * gu[.., n + i]. The gate is the first half, the order in
+// which rad-convert fuses gate_proj and up_proj.
 //
-// A ROW IS SPLIT OVER grid.y, kSiluPer elements a thread. One workgroup a row put a decode step's few
-// rows on as many workgroups, each walking its row a strided element at a time behind an exp and a
-// divide: latency-bound, and the shape of that walk was up to the compiler. Here a thread's
-// elements are independent and their loads unconditional (a column past the row reads its last
-// element and the store drops it), so they are all in flight at once. Same arithmetic an element.
+// A row is split over grid.y, kSiluPer elements per thread, so decode's few rows use more than a
+// few workgroups. A thread's loads are unconditional (a column past the row reads the last element
+// and its store is dropped), so all are in flight at once.
 constexpr uint32_t kSiluPer = 4;
 __global__ __launch_bounds__(kThreads) void silu_mul_kernel(
     const uint16_t* __restrict__ gu, uint16_t* __restrict__ y,
@@ -420,17 +342,15 @@ __global__ __launch_bounds__(kThreads) void silu_mul_kernel(
 #pragma unroll
     for (uint32_t u = 0; u < kSiluPer; ++u) {
         const uint32_t i = i0 + u * kThreads;
-        const float g = bf2f(gv[u]);
-        if (i < n) yr[i] = f32_to_bf16((g / (1.0f + expf(-g))) * bf2f(uv[u]));
+        const float g = bf16_to_f32(gv[u]);
+        if (i < n) yr[i] = f32_to_bf16((g / (1.0f + expf(-g))) * bf16_to_f32(uv[u]));
     }
 }
 
 // ---------------------------------------------------------------------------- gelu_mul
-// ref_gelu_mul: y[.., i] = gelu_tanh(gu[.., i]) * gu[.., n + i]. THE GATE IS THE FIRST HALF, the
-// same order-lock as silu_mul. The tanh-approx GELU (gemma's gelu_pytorch_tanh), NOT the erf one:
-// gated feed-forwards are trained with the tanh form, and the constants are the standard fit the
-// gemm_nt_bias "gelu_tanh" epilogue uses (the identical function, so a GELU-gated FFN and a
-// tanh-gelu epilogue agree to the last bit).
+// ref_gelu_mul: y[.., i] = gelu_tanh(gu[.., i]) * gu[.., n + i], gate first as in silu_mul. The tanh
+// GELU (gemma's gelu_pytorch_tanh), not erf, with the same constants as the gemm_nt_bias
+// "gelu_tanh" epilogue so the two agree bit for bit.
 __global__ __launch_bounds__(kThreads) void gelu_mul_kernel(
     const uint16_t* __restrict__ gu, uint16_t* __restrict__ y,
     uint32_t n, uint32_t gu_ld, uint32_t y_ld) {
@@ -438,35 +358,30 @@ __global__ __launch_bounds__(kThreads) void gelu_mul_kernel(
     const uint16_t* __restrict__ gr = gu + (size_t)m * gu_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
     for (uint32_t i = threadIdx.x; i < n; i += kThreads) {
-        const float g = bf2f(gr[i]);
+        const float g = bf16_to_f32(gr[i]);
         const float k0 = 0.7978845608028654f, k1 = 0.044715f;
         const float gelu = 0.5f * g * (1.0f + tanhf(k0 * (g + k1 * g * g * g)));
-        yr[i] = f32_to_bf16(gelu * bf2f(gr[n + i]));
+        yr[i] = f32_to_bf16(gelu * bf16_to_f32(gr[n + i]));
     }
 }
 
 // ---------------------------------------------------------------------------- rope
-// ref_rope, in place over a fused [n_head + 2*n_head_kv] head row -- the V heads at the end are
-// left alone, which is the whole reason the op takes the fused projection rather than two tensors.
+// ref_rope, in place over a fused [n_head + 2*n_head_kv] head row; the trailing V heads are left
+// alone, which is why the op takes the fused projection.
 //
-// NeoX pairs element i with i + rot/2; GPT-J pairs 2i with 2i+1.  Which one a checkpoint wants is a
-// property of the checkpoint, and getting it wrong produces fluent text with a broken sense of
-// position -- the hardest kind of wrong to notice.  `mrope` is NOT a third case: RadBatch carries
-// one position component per token, and mrope over equal components is bit-identical to neox
-// (rad_block_attn_gated.h says so and says what would have to change first), so the shim maps it.
+// NeoX pairs element i with i + rot/2; GPT-J pairs 2i with 2i+1. The checkpoint decides, and the
+// wrong choice yields fluent text with broken positions. With one position component per token,
+// mrope is bit-identical to neox (rad_block_attn_gated.h), so the shim maps it.
 //
-// PARTIAL ROTARY.  `rot` may be less than head_dim -- 64 of 256 on this target -- and the tail of
-// the head is untouched.  The base ladder's exponent divides by `den`, which `ladder` resolves:
-// `rot` for `rotary` (the rotated prefix, a complete rotary of its own width) and `head_dim` for
-// `head` (the proportional variant, a prefix of the full-width table). `den` = `rot` on the
-// default path, so existing models are bit-for-bit unchanged.
+// Partial rotary: `rot` may be less than head_dim (64 of 256 here) and the tail is untouched. The
+// base ladder's exponent divides by `den`: `rot` for `rotary` (default), `head_dim` for `head`
+// (the proportional variant).
 //
-// One thread a PAIR.  The pair's two loads and two stores are the whole body, so there is no
-// reduction and no LDS; the grid is (M, heads).
+// One thread per pair: two loads and two stores, no reduction, no LDS.
 //
-// THE MULTI-COMPONENT MODES (ref_rope's rope_freqs): `mode` 2 mrope, 3 imrope, 4 axial, with up to
-// three sections, read a position per component out of `plane`-strided rows -- component c of
-// token m at pos[c * plane + m]. `plane` 0 is the one-component form, where every mode is neox.
+// Multi-component modes (ref_rope's rope_freqs): `mode` 2 mrope, 3 imrope, 4 axial, up to three
+// sections, with component c of token m at pos[c * plane + m]. `plane` 0 is the one-component
+// form, where every mode is neox.
 __device__ __forceinline__ int rope_comp(int mode, uint32_t i, const int* sec, int n_sec,
                                          uint32_t* j) {
     *j = i;
@@ -506,9 +421,9 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
                 inv = 1.0f / powf(theta, (float)(2 * j) / (float)(2 * sec[c]));
         }
         inv = yarn.frequency(inv, (int)i);
-        /* THE PROPORTIONAL LADDER rotates the whole head with every frequency past nfreq zero
-         * (HF's _compute_proportional_rope_parameters), so pair i is (i, i + head_dim/2) and the
-         * pairs past nfreq turn by 0: cos 1, sin 0, the value back exactly. */
+        /* The proportional ladder rotates the whole head with every frequency past nfreq zero
+         * (HF's _compute_proportional_rope_parameters): pair i is (i, i + head_dim/2), and pairs
+         * past nfreq turn by 0 (cos 1, sin 0), returning the value exactly. */
         if (i >= nfreq) inv = 0.0f;
         const float ang = p * inv;
         float c, s;
@@ -516,22 +431,20 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
         if (yarn.factor != 0.0f) { c *= yarn.magnitude; s *= yarn.magnitude; }
         const uint32_t i0 = gptj ? 2 * i : i;
         const uint32_t i1 = gptj ? 2 * i + 1 : i + half;
-        const float x0 = bf2f(hd[i0]), x1 = bf2f(hd[i1]);
+        const float x0 = bf16_to_f32(hd[i0]), x1 = bf16_to_f32(hd[i1]);
         hd[i0] = f32_to_bf16(x0 * c - x1 * s);
         hd[i1] = f32_to_bf16(x0 * s + x1 * c);
     }
 }
 
 // ---------------------------------------------------------------------------- kv_store
-// ref_kv_store, and THE PAGED LAYOUT IS THE ONE EVERY KERNEL IN THIS PROJECT SHARES:
+// ref_kv_store. The paged layout every kernel in this project shares:
 //
 //     kv_cache[num_blocks, kv_heads, block_size, 2 * head_dim]
 //
-// K first and V second inside a slot: element d of the key at [..., d] and of the value at
-// [..., head_dim + d].  A flat slot index decomposes as block = slot / block_size and
-// offset = slot % block_size, which is what `slot_mapping` carries.  A NEGATIVE slot is a padding
-// position and stores nothing.
-template <uint32_t QG, uint32_t QF, uint32_t QW, uint32_t QB>
+// K then V inside a slot: key element d at [..., d], value element d at [..., head_dim + d]. A flat
+// slot index (`slot_mapping`) splits into block = slot / block_size, offset = slot % block_size. A
+// negative slot is padding and stores nothing.
 __global__ __launch_bounds__(kThreads) void kv_store_kernel(
     const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
     const int32_t* __restrict__ slot, uint16_t* __restrict__ kv,
@@ -544,101 +457,6 @@ __global__ __launch_bounds__(kThreads) void kv_store_kernel(
     const size_t slot_base = ((size_t)blk * kv_heads * block_size + (size_t)off) * 2 * head_dim;
     const size_t head_step = (size_t)block_size * 2 * head_dim;
 
-    if constexpr (QG) {
-        /* ---- A QUALITY PROBE, NOT A FORMAT. `R4D_KV_QSIM=<g>` round-trips every `g`-element
-         * group of k and of v through a quantiser with its own scale and stores the result as
-         * ordinary bf16. Nothing about the cache's layout, size or bandwidth changes -- the point
-         * is to answer "would this format still write correct code" BEFORE any of that is built,
-         * rather than building a real cache to find out.
-         *
-         * THREE KNOBS, and each one is a question:
-         *   R4D_KV_QSIM=<g>   the scale group. int8 spends its 8 bits on the range the group
-         *                     occupies, so the components that carry the dot product land near
-         *                     bf16 and only the small ones are coarse.
-         *   R4D_KV_QSIMF=1    snap to E4M3 instead of int8. E4M3 keeps 3 mantissa bits at EVERY
-         *                     magnitude -- ~6% relative everywhere -- so a scale cannot change its
-         *                     step, only keep a small head out of the subnormals below 2^-6.
-         *   R4D_KV_QSIMW=1    ROTATE the group by an orthonormal Walsh-Hadamard first. A scale is
-         *                     set by the group's largest element, so one outlier channel costs
-         *                     every other element its resolution; the rotation spreads that
-         *                     outlier over all QG channels. It is why this engine's own WIRE codec
-         *                     is `wht6` and not `u6`.
-         *
-         * THE ROTATION IS FREE TO DEPLOY ON BOTH SIDES, which is what makes it worth measuring.
-         * The transform is orthonormal and its own inverse, so
-         *
-         *     score[t] = q . k[t]      = (R q) . (R k[t])
-         *     out      = sum p[t] v[t] = R^T ( sum p[t] (R v[t]) )
-         *
-         * -- a cache holding R k and R v needs the QUERY rotated once per (token, head) and the
-         * OUTPUT rotated back once per (token, head). Neither is per CACHED token, so the cost
-         * does not grow with context, which is the whole reason a KV cache is expensive. This
-         * probe rotates back itself instead, because it stores bf16: same values, one extra round.
-         *
-         * WHAT THE PROBE SAYS ABOUT EIGHT BITS. Top-1 agreement against a bf16 control is a
-         * Bernoulli trial a prompt, so at p ~ 0.93 its standard error is a couple of points at any
-         * prompt count worth running -- and every 8-bit arm sits inside that band at ~93-94%
-         * agreement. The mean absolute delta, which has thousands of samples rather than hundreds,
-         * separates them by only ~5% end to end: int8 with a per-head scale and a rotated K at
-         * 0.196, int8 with a scale per 32 at 0.199, unscaled fp8 e4m3 at 0.205.
-         *
-         * THE CASE FOR AN INTEGER KV CACHE IS THEREFORE WEAK: fp8 is already built, is DENSER
-         * (50.0% of bf16 against 50.8% for scaled int8), and measures the same. The rotation does
-         * not change that. The rotation MECHANISM is real all the same -- at int4 it is worth
-         * +5.0 points of agreement and takes |delta| from 0.308 to 0.255 -- there is simply little
-         * left for it to fix at eight bits.
-         *
-         * ONE THREAD OWNS A GROUP, and k and v are done in SEPARATE PASSES so the thread holds QG
-         * floats and not 2*QG -- at QG = 256 that is the difference between 1 KiB of scratch a
-         * lane and 2. This runs once per stored token and its speed is irrelevant; a plain
-         * sequential butterfly is used rather than r4d_fwht.h's, which wants a WAVE per block. */
-        const uint32_t ng = kv_heads * head_dim / QG;
-        for (uint32_t g = threadIdx.x; g < ng; g += kThreads) {
-            const uint32_t j0 = g * QG, h = j0 / head_dim, d0 = j0 % head_dim;
-            uint16_t* __restrict__ c = kv + slot_base + (size_t)h * head_step;
-            const uint16_t* const src[2] = { k + (size_t)t * k_ld + j0,
-                                             v + (size_t)t * v_ld + j0 };
-            uint16_t* const dst[2] = { c + d0, c + head_dim + d0 };
-#pragma unroll 1
-            for (uint32_t which = 0; which < 2u; ++which) {
-                /* QW: 0 none, 1 both, 2 K only, 3 V only. The asymmetry is the point -- the
-                 * outlier structure a rotation exists to break up is a KEY phenomenon (channels
-                 * that are consistently large after RoPE), and a value row has no such structure,
-                 * so rotating V may only be mixing its own quantisation noise across channels. */
-                constexpr bool rot_k = (QW == 1u || QW == 2u);
-                constexpr bool rot_v = (QW == 1u || QW == 3u);
-                const bool rot = which == 0u ? rot_k : rot_v;
-                float b[QG];
-                for (uint32_t e = 0; e < QG; ++e) b[e] = bf2f(src[which][e]);
-                if constexpr (rot_k || rot_v) { if (rot) hadamard<QG>(b); }
-                float amax = 0.0f;
-                for (uint32_t e = 0; e < QG; ++e) amax = fmaxf(amax, fabsf(b[e]));
-                /* QB is the integer width: 8 bits is +-127 and 4 is +-7. Four is where a rotation
-                 * has the most to gain, because that is where one outlier really does cost every
-                 * other element in the group its resolution. E4M3 ignores it. */
-                const float lvl = (float)((1u << (QB - 1u)) - 1u);
-                const float sc =
-                    amax > 0.0f ? amax * (QF ? (1.0f / 448.0f) : (1.0f / lvl)) : 1.0f;
-                for (uint32_t e = 0; e < QG; ++e) {
-                    const float q = b[e] / sc;
-                    if constexpr (QF) {
-                        /* The clamp is the fp8 quantiser's own: the builtin answers an
-                         * out-of-range input with a NaN rather than saturating, and amax/scale is
-                         * 448 in exact arithmetic but can land an ulp above it. */
-                        int pk = 0;
-                        pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(q, -448.0f), 448.0f),
-                                                             0.0f, pk, false);
-                        b[e] = r4d_fp8::e4m3((uint32_t)pk & 0xFFu) * sc;
-                    } else {
-                        b[e] = fminf(fmaxf(rintf(q), -lvl), lvl) * sc;
-                    }
-                }
-                if constexpr (rot_k || rot_v) { if (rot) hadamard<QG>(b); }
-                for (uint32_t e = 0; e < QG; ++e) dst[which][e] = f32_to_bf16(b[e]);
-            }
-        }
-        return;
-    }
     for (uint32_t j = threadIdx.x; j < kv_heads * head_dim; j += kThreads) {
         const uint32_t h = j / head_dim, d = j % head_dim;
         uint16_t* __restrict__ c = kv + slot_base + (size_t)h * head_step;
@@ -647,20 +465,15 @@ __global__ __launch_bounds__(kThreads) void kv_store_kernel(
     }
 }
 
-// The same scatter into an E4M3 cache.  It is the write side of the fp8kv attention family and its
-// `k_descale` / `v_descale` operands: without it a cache declared fp8 has no way to be filled.
+// The same scatter into an E4M3 cache: the write side of the fp8kv attention family and its
+// `k_descale` / `v_descale` operands.
 //
-// THE SCALE IS A CALLER CONSTANT AND IT HAS TO BE.  The reader's descale is indexed
-// `[seq * kv_heads + kv_head]` (r4d.h), which is ONE number for a whole sequence -- so it cannot
-// depend on the token being written, because tokens written at different steps share it.  vLLM has
-// the same contract and defaults both scales to 1.0.  This takes them as arguments so a calibrated
-// pair costs nothing later; at 1.0 the store is a plain E4M3 round of the bf16 the attention would
-// otherwise have cached.
+// The scale is a caller constant: the reader's descale is indexed `[seq * kv_heads + kv_head]`
+// (r4d.h), one number per sequence, so it cannot depend on the token written. vLLM has the same
+// contract and defaults both scales to 1.0, where the store is a plain E4M3 round of the bf16.
 //
-// FOUR COLUMNS A THREAD, for the reason quant_act_fp8 takes four: it is exactly the two
-// v_cvt_pk_fp8_f32 that fill one dword, and the store is then a single dword rather than four
-// byte writes.  head_dim is a multiple of 4 on every shape this serves and the entry point refuses
-// anything else, so a head's 4-column group never straddles two heads and there is no ragged tail.
+// Four columns per thread: two v_cvt_pk_fp8_f32 fill one dword, stored at once. The entry point
+// requires head_dim % 4 == 0, so a group never straddles two heads.
 __global__ __launch_bounds__(kThreads) void kv_store_fp8_kernel(
     const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
     const int32_t* __restrict__ slot, uint8_t* __restrict__ kv,
@@ -679,11 +492,11 @@ __global__ __launch_bounds__(kThreads) void kv_store_fp8_kernel(
         float kf[4], vf[4];
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
-            kf[e] = bf2f(k[(size_t)t * k_ld + j + (uint32_t)e]) * k_inv;
-            vf[e] = bf2f(v[(size_t)t * v_ld + j + (uint32_t)e]) * v_inv;
+            kf[e] = bf16_to_f32(k[(size_t)t * k_ld + j + (uint32_t)e]) * k_inv;
+            vf[e] = bf16_to_f32(v[(size_t)t * v_ld + j + (uint32_t)e]) * v_inv;
         }
-        // Clamped because v_cvt_pk_fp8_f32 answers an out-of-range input with NaN, not a
-        // saturate -- the same reason quant_act_fp8 clamps.
+        // Clamped because v_cvt_pk_fp8_f32 returns NaN for out-of-range input instead of
+        // saturating (as in quant_act_fp8).
         int pk = 0, pv = 0;
         pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(kf[0], -448.0f), 448.0f),
                                              fminf(fmaxf(kf[1], -448.0f), 448.0f), pk, false);
@@ -702,20 +515,16 @@ __global__ __launch_bounds__(kThreads) void kv_store_fp8_kernel(
 
 // ================================================================================ entry points
 //
-// Pitches are in ELEMENTS and 0 means "tight".  Every pointer is bf16 except the index arrays,
-// which are i32 -- the core's derived buffers are all i32 (core/sched/batch.cpp refuses anything
-// else), so there is no 64-bit index form to serve.
+// Pitches are in elements; 0 means tight. Pointers are bf16 except the index arrays, which are i32
+// (the core's derived buffers are all i32, core/sched/batch.cpp).
 
-/* THE BODY TAKES A SINK; THE PUBLIC ENTRY IS A WRAPPER. `r4d.h`'s long-stream signature is
- * libr4d's driver API and callers outside this tree use it, so it stays exactly as it was -- but
- * the launch has to be describable, and writing the geometry twice is the one thing ABI v10's
- * contract says not to do. One body, two ways in. */
+/* The plugin entry and r4d.h's long-stream entry share this body. */
 static int embed_lookup_bf16_emit(long tok, long wte, long x, int M, int n_embd, int n_vocab,
-                                  int vocab_off, int x_ld, float mult, const R4dSink& sk) {
+                                  int vocab_off, int x_ld, float mult, RadStream stream) {
     if (!tok || !wte || !x) return -1;
     if (M <= 0 || n_embd <= 0 || n_vocab <= 0 || vocab_off < 0) return -2;
     if (!x_ld) x_ld = n_embd;
-    return R4D_EMIT(sk, embed_lookup_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+    return R4D_EMIT(stream, embed_lookup_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
                     (const int32_t*)tok, (const uint16_t*)wte,
                     (uint16_t*)x, (uint32_t)n_embd, (int32_t)n_vocab, (int32_t)vocab_off,
                     (uint32_t)x_ld, mult) == RAD_OK ? 0 : -4;
@@ -723,21 +532,21 @@ static int embed_lookup_bf16_emit(long tok, long wte, long x, int M, int n_embd,
 
 extern "C" int r4d_embed_lookup_bf16(long tok, long wte, long x, int M, int n_embd, int n_vocab,
                                      int vocab_off, int x_ld, long stream) {
-    R4dSink sk; sk.stream = (RadStream)(uintptr_t)stream;
-    return embed_lookup_bf16_emit(tok, wte, x, M, n_embd, n_vocab, vocab_off, x_ld, 1.0f, sk);
+    return embed_lookup_bf16_emit(tok, wte, x, M, n_embd, n_vocab, vocab_off, x_ld, 1.0f,
+                                  (RadStream)(uintptr_t)stream);
 }
 
-/* The quad walk when the width, the pitch and both bases allow its 4- and 8-byte accesses (a bf16
- * table's quad is 8 bytes), an entry a thread otherwise. */
+/* The quad walk when width, pitch and both bases allow its 4- and 8-byte accesses (a bf16 quad is
+ * 8 bytes); otherwise one entry per thread. */
 static int embed_lookup_q_emit(const int32_t* tok, const void* wte, bool q, const void* sc,
                                bool sc_f32, uint16_t* x, long long M, int n_embd, int n_vocab,
-                               int vocab_off, long long x_ld, const R4dSink& sk) {
+                               int vocab_off, long long x_ld, RadStream stream) {
     const bool quad = n_embd % 4 == 0 && x_ld % 4 == 0 && r4d_aligned(x, 8) &&
                       r4d_aligned(wte, q ? 4 : 8);
     const uint64_t threads = (uint64_t)M * (uint64_t)(quad ? n_embd / 4 : n_embd);
     const dim3 grid((uint32_t)((threads + kThreads - 1) / kThreads));
 #define R4D_ELQ(V, Q)                                                                             \
-    R4D_EMIT(sk, (embed_lookup_q_kernel<V, Q>), grid, dim3(kThreads), 0, tok, wte, sc,          \
+    R4D_EMIT(stream, (embed_lookup_q_kernel<V, Q>), grid, dim3(kThreads), 0, tok, wte, sc,      \
              (uint32_t)(sc_f32 ? 1u : 0u), x, (uint32_t)M, (uint32_t)n_embd, (int32_t)n_vocab,   \
              (int32_t)vocab_off, (uint32_t)x_ld)
     const int rc = quad ? (q ? R4D_ELQ(4, true) : R4D_ELQ(4, false))
@@ -749,17 +558,17 @@ static int embed_lookup_q_emit(const int32_t* tok, const void* wte, bool q, cons
 extern "C" int r4d_embed_lookup_bf16_scaled(long tok, long wte, long x, int M, int n_embd,
                                            int n_vocab, int vocab_off, int x_ld, float scale,
                                            long stream) {
-    R4dSink sk; sk.stream = (RadStream)(uintptr_t)stream;
-    return embed_lookup_bf16_emit(tok, wte, x, M, n_embd, n_vocab, vocab_off, x_ld, scale, sk);
+    return embed_lookup_bf16_emit(tok, wte, x, M, n_embd, n_vocab, vocab_off, x_ld, scale,
+                                  (RadStream)(uintptr_t)stream);
 }
 
 static int gather_rows_bf16_emit(long x, long idx, long y, int M, int n, int src_rows,
-                                 int x_ld, int y_ld, const R4dSink& sk) {
+                                 int x_ld, int y_ld, RadStream stream) {
     if (!x || !idx || !y) return -1;
     if (M <= 0 || n <= 0 || src_rows <= 0) return -2;
     if (!x_ld) x_ld = n;
     if (!y_ld) y_ld = n;
-    return R4D_EMIT(sk, gather_rows_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+    return R4D_EMIT(stream, gather_rows_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
                     (const uint16_t*)x, (const int32_t*)idx,
                     (uint16_t*)y, (uint32_t)n, (int32_t)src_rows,
                     (uint32_t)x_ld, (uint32_t)y_ld) == RAD_OK ? 0 : -4;
@@ -767,22 +576,19 @@ static int gather_rows_bf16_emit(long x, long idx, long y, int M, int n, int src
 
 extern "C" int r4d_gather_rows_bf16(long x, long idx, long y, int M, int n, int src_rows,
                                     int x_ld, int y_ld, long stream) {
-    R4dSink sk; sk.stream = (RadStream)(uintptr_t)stream;
-    return gather_rows_bf16_emit(x, idx, y, M, n, src_rows, x_ld, y_ld, sk);
+    return gather_rows_bf16_emit(x, idx, y, M, n, src_rows, x_ld, y_ld,
+                                 (RadStream)(uintptr_t)stream);
 }
 
-
-/* Byte rows. `n`, `x_ld` and `y_ld` are in BYTES at this boundary and are divided down to uchar4
- * inside, so a caller that thinks in a pool's byte strides never has to convert -- and the one
- * place the /4 happens is the one place it can be wrong. */
+/* Byte rows. `n`, `x_ld` and `y_ld` are in bytes here and divided down to uchar4 inside. */
 static int gather_rows_u8_emit(long x, long idx, long y, int M, int n, int src_rows,
-                               int x_ld, int y_ld, const R4dSink& sk) {
+                               int x_ld, int y_ld, RadStream stream) {
     if (!x || !idx || !y) return -1;
     if (M <= 0 || n <= 0 || src_rows <= 0) return -2;
     if (!x_ld) x_ld = n;
     if (!y_ld) y_ld = n;
     if ((n | x_ld | y_ld) & 3) return -2;        /* the registry constrains n; pitches too */
-    return R4D_EMIT(sk, gather_rows_u8_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+    return R4D_EMIT(stream, gather_rows_u8_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
                     (const uchar4*)x, (const int32_t*)idx, (uchar4*)y,
                     (uint32_t)(n / 4), (int32_t)src_rows,
                     (uint32_t)(x_ld / 4), (uint32_t)(y_ld / 4)) == RAD_OK ? 0 : -4;
@@ -790,18 +596,18 @@ static int gather_rows_u8_emit(long x, long idx, long y, int M, int n, int src_r
 
 extern "C" int r4d_gather_rows_u8(long x, long idx, long y, int M, int n, int src_rows,
                                   int x_ld, int y_ld, long stream) {
-    R4dSink sk; sk.stream = (RadStream)(uintptr_t)stream;
-    return gather_rows_u8_emit(x, idx, y, M, n, src_rows, x_ld, y_ld, sk);
+    return gather_rows_u8_emit(x, idx, y, M, n, src_rows, x_ld, y_ld,
+                               (RadStream)(uintptr_t)stream);
 }
 
 static int scatter_rows_u8_emit(long v, long idx, long x, int M, int n, int dst_rows,
-                                int v_ld, int x_ld, const R4dSink& sk) {
+                                int v_ld, int x_ld, RadStream stream) {
     if (!v || !idx || !x) return -1;
     if (M <= 0 || n <= 0 || dst_rows <= 0) return -2;
     if (!v_ld) v_ld = n;
     if (!x_ld) x_ld = n;
     if ((n | v_ld | x_ld) & 3) return -2;
-    return R4D_EMIT(sk, scatter_rows_u8_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+    return R4D_EMIT(stream, scatter_rows_u8_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
                     (const uchar4*)v, (const int32_t*)idx, (uchar4*)x,
                     (uint32_t)(n / 4), (int32_t)dst_rows,
                     (uint32_t)(v_ld / 4), (uint32_t)(x_ld / 4)) == RAD_OK ? 0 : -4;
@@ -809,24 +615,22 @@ static int scatter_rows_u8_emit(long v, long idx, long x, int M, int n, int dst_
 
 extern "C" int r4d_scatter_rows_u8(long v, long idx, long x, int M, int n, int dst_rows,
                                    int v_ld, int x_ld, long stream) {
-    R4dSink sk; sk.stream = (RadStream)(uintptr_t)stream;
-    return scatter_rows_u8_emit(v, idx, x, M, n, dst_rows, v_ld, x_ld, sk);
+    return scatter_rows_u8_emit(v, idx, x, M, n, dst_rows, v_ld, x_ld,
+                                (RadStream)(uintptr_t)stream);
 }
 
-// `w_f32` says whether the gain is f32 (every norm gain the architecture plugins declare) or bf16;
-// a null `w` is a gain of one. `mult` scales the row before its one rounding (rmsnorm's `mult`).
+// `w_f32` selects an f32 or bf16 gain; a null `w` is a gain of one. `mult` scales the row before
+// its single rounding.
 extern "C" int r4d_rmsnorm_mult_bf16(long x, long w, long y, int M, int n, float eps, float wadd,
                                      float mult, int w_f32, int x_ld, int y_ld, long stream) {
     if (!x || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (!x_ld) x_ld = n;
     if (!y_ld) y_ld = n;
-    // ONE WORKGROUP A ROW, so the grid at a decode batch is a handful of workgroups on a 64-CU
-    // part and the row is latency bound. r4d_act_threads is the measured crossover table the int8
-    // activation kernels already use; r4d_rmsnorm_quant_fp8 calls the SAME function, and it has to,
-    // because the width decides which columns a thread folds into the sum of squares. Two kernels
-    // that disagree about it disagree in the last bits of the norm, and the fused one is required
-    // to be byte-identical to this kernel followed by the quantiser.
+    // One workgroup per row, so decode rows are latency-bound. r4d_act_threads is the measured
+    // width table; r4d_rmsnorm_quant_fp8 must use the same one, because the width decides which
+    // columns a thread folds into the sum of squares and the fused kernel must be byte-identical
+    // to this one followed by the quantiser.
     const int thr = r4d_act_threads(M, n);
 #define R4D_RN_T(wf, T)                                                                         \
     hipLaunchKernelGGL((rmsnorm_kernel<wf, T>), dim3((uint32_t)M), dim3(T), 0,                  \
@@ -843,16 +647,14 @@ extern "C" int r4d_rmsnorm_mult_bf16(long x, long w, long y, int M, int n, float
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
-/* The unscaled form, the entry point every caller before `mult` used: times one is exact. */
+/* The unscaled form (mult = 1 is exact). */
 extern "C" int r4d_rmsnorm_bf16(long x, long w, long y, int M, int n, float eps, float wadd,
                                 int w_f32, int x_ld, int y_ld, long stream) {
     return r4d_rmsnorm_mult_bf16(x, w, y, M, n, eps, wadd, 1.0f, w_f32, x_ld, y_ld, stream);
 }
 
-// The weightless norm: rmsnorm without the gain multiply.  It is not templated on a thread count
-// the way rmsnorm is, because rmsnorm's width is pinned to the fused rmsnorm_quant_fp8 by their
-// shared byte-identical requirement, and rmsnorm_p has no fused quantiser counterpart to match --
-// kThreads is the same choice the other non-templated row kernels (binary, sigmoid, silu_mul) make.
+// The weightless norm. Unlike rmsnorm it is not templated on width: rmsnorm's width is pinned to
+// match the fused rmsnorm_quant_fp8, and rmsnorm_p has no fused counterpart, so it uses kThreads.
 extern "C" int r4d_rmsnorm_p_bf16(long x, long y, int M, int n, float eps,
                                   int x_ld, int y_ld, long stream) {
     if (!x || !y) return -1;
@@ -865,9 +667,8 @@ extern "C" int r4d_rmsnorm_p_bf16(long x, long y, int M, int n, float eps,
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
-// `op` is 0 for a sum and 1 for a product.  `b_ld` of 0 with the same n is the broadcast form: the
-// caller passes a b_ld of zero and every row reads the same n elements.
-// b_ld -1 is a ONE-ELEMENT b, the scalar broadcast; 0 is one row broadcast down the rows.
+// `op` is 0 for a sum, 1 for a product. `b_ld` 0 broadcasts one row of n down the rows; -1 is a
+// one-element b, broadcast as a scalar.
 extern "C" int r4d_binary_bf16(long a, long b, long y, int M, int n, int op,
                                int a_ld, int b_ld, int y_ld, long stream) {
     if (!a || !b || !y) return -1;
@@ -894,16 +695,16 @@ extern "C" int r4d_sigmoid_bf16(long x, long y, int M, int n, int x_ld, int y_ld
 }
 
 // ---------------------------------------------------------------------------- fill
-// y[m, i] = v for every element of an [M, n] extent with a row pitch -- the op a rank issues where
-// it has nothing to compute and a downstream reader (an all-reduce, a residual) still expects a
-// defined buffer. A memset cannot do this: the wire may have a pitch and bf16 is two bytes.
+// y[m, i] = v over an [M, n] extent with a row pitch, for a rank with nothing to compute whose
+// downstream reader (an all-reduce, a residual) still needs a defined buffer. A memset cannot
+// handle the pitch or a two-byte value.
 __global__ __launch_bounds__(kThreads) void fill_kernel(uint16_t* __restrict__ y, uint32_t n,
                                                         uint32_t y_ld, uint16_t v) {
     uint16_t* __restrict__ yr = y + (size_t)blockIdx.x * y_ld;
     for (uint32_t i = threadIdx.x; i < n; i += kThreads) yr[i] = v;
 }
 
-// The host form of r4d_common.h's f32_to_bf16 (which is __device__): the same round-to-nearest-even.
+// Host form of r4d_common.h's f32_to_bf16 (which is __device__), round-to-nearest-even.
 static inline uint16_t f32_to_bf16_host(float f) {
     uint32_t u;
     std::memcpy(&u, &f, sizeof u);
@@ -975,9 +776,8 @@ extern "C" int r4d_silu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
-// GELU-gated product, the gemma FFN activation.  Same shape and order-lock as silu_mul (the gate
-// is the first half of the fused [M, 2n] row); the only difference is the nonlinearity, which is
-// the tanh approximation, not the erf one, to match ref_gelu_mul's act_gelu_tanh.
+// GELU-gated product, the gemma FFN activation. Same shape and gate order as silu_mul; tanh GELU to
+// match ref_gelu_mul's act_gelu_tanh.
 extern "C" int r4d_gelu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream) {
     if (!gu || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
@@ -998,11 +798,9 @@ extern "C" int r4d_rope_bf16(long qkv, long pos, int M, int head_dim, int n_rope
                             row_pitch, 0, nullptr, 0, 0, stream);
 }
 
-// THE ONE LAUNCH OF rope_kernel. `yarn` with factor 0 is the plain rotary: the kernel's YaRN
-// blend returns the frequency it was given and the magnitude is not applied, so the C entry points
-// below and the op without YaRN run the same arithmetic with the same arguments. `den` is the
-// ladder's width (`rot` for `rotary`, `head_dim` for `head`) -- the multi-component form passes
-// the caller's, and the plain entry passes `rot`, as it always has.
+// The single launch of rope_kernel. `yarn` with factor 0 is the plain rotary (the YaRN blend
+// returns the frequency unchanged and no magnitude is applied). `den` is the ladder width (`rot`
+// for `rotary`, `head_dim` for `head`); the plain entry passes `rot`.
 static int rope_launch(long qkv, long pos, int M, int head_dim, int n_rope_heads, int rot, int den,
                        int gptj, float theta, float rscale, int row_pitch, int mode,
                        const int* sec, int n_sec, int plane, RadYarn yarn, long stream,
@@ -1041,14 +839,8 @@ extern "C" int r4d_kv_store_bf16(long k, long v, long slot, long kv, int M, int 
     if (M <= 0 || head_dim <= 0 || kv_heads <= 0 || block_size <= 0 || n_blocks <= 0) return -2;
     if (!k_ld) k_ld = kv_heads * head_dim;
     if (!v_ld) v_ld = kv_heads * head_dim;
-    /* NO QUANTISATION-SIMULATION BRANCH ON THE SERVING PATH. The probe above is compiled only when
-     * its template parameters are set; this launch pins them off. A simulation that stays in the
-     * store path is four branches and a macro tree between every token and its cache, for a
-     * question that is answered once.
-     *
-     * The real fp8 cache is a separate entry point (r4d_kv_store_fp8, below) selected by
-     * --kv-cache-dtype, not a mode of this one. */
-    hipLaunchKernelGGL((kv_store_kernel<0u, 0u, 0u, 8u>), dim3((uint32_t)M), dim3(kThreads), 0,
+    /* The fp8 cache is a separate entry point (r4d_kv_store_fp8), selected by --kv-cache-dtype. */
+    hipLaunchKernelGGL(kv_store_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
                        (hipStream_t)stream,
                        (const uint16_t*)k, (const uint16_t*)v, (const int32_t*)slot,
                        (uint16_t*)kv, (uint32_t)head_dim, (uint32_t)kv_heads,
@@ -1056,22 +848,21 @@ extern "C" int r4d_kv_store_bf16(long k, long v, long slot, long kv, int M, int 
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
-// bf16 k and v in, E4M3 cache out.  `k_scale` and `v_scale` are what the READER will multiply back
-// by -- they are the descale, so this divides -- and 1.0 is the vLLM default and the value the
-// attention kernels assume when their descale pointers are null.
+// bf16 k and v in, E4M3 cache out. `k_scale` and `v_scale` are the reader's descales, so this
+// divides by them; 1.0 is the vLLM default and what the attention kernels assume when their
+// descale pointers are null.
 static int kv_store_fp8_emit(long k, long v, long slot, long kv, int M, int head_dim,
                              int kv_heads, int block_size, int n_blocks,
                              int k_ld, int v_ld, float k_scale, float v_scale,
-                             const R4dSink& sk) {
+                             RadStream stream) {
     if (!k || !v || !slot || !kv) return -1;
     if (M <= 0 || head_dim <= 0 || kv_heads <= 0 || block_size <= 0 || n_blocks <= 0) return -2;
-    // Four columns a thread is the packing, so a head must be a whole number of groups; otherwise
-    // one group would straddle two heads and write the next head's first bytes.
+    // Four columns per thread, so a head must be whole groups or a group would straddle two heads.
     if (head_dim % 4) return -3;
     if (!(k_scale > 0.0f) || !(v_scale > 0.0f)) return -5;
     if (!k_ld) k_ld = kv_heads * head_dim;
     if (!v_ld) v_ld = kv_heads * head_dim;
-    return R4D_EMIT(sk, kv_store_fp8_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+    return R4D_EMIT(stream, kv_store_fp8_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
                     (const uint16_t*)k, (const uint16_t*)v, (const int32_t*)slot,
                     (uint8_t*)kv, (uint32_t)head_dim, (uint32_t)kv_heads,
                     (uint32_t)block_size, (uint32_t)n_blocks, (uint32_t)k_ld, (uint32_t)v_ld,
@@ -1081,29 +872,21 @@ static int kv_store_fp8_emit(long k, long v, long slot, long kv, int M, int head
 extern "C" int r4d_kv_store_fp8(long k, long v, long slot, long kv, int M, int head_dim,
                                 int kv_heads, int block_size, int n_blocks,
                                 int k_ld, int v_ld, float k_scale, float v_scale, long stream) {
-    R4dSink sk; sk.stream = (RadStream)(uintptr_t)stream;
     return kv_store_fp8_emit(k, v, slot, kv, M, head_dim, kv_heads, block_size, n_blocks,
-                             k_ld, v_ld, k_scale, v_scale, sk);
+                             k_ld, v_ld, k_scale, v_scale, (RadStream)(uintptr_t)stream);
 }
 
 // ================================================================================ logits_gemm
 //
-// THE OUTPUT IS f32 AND THAT IS THE WHOLE REASON THIS KERNEL EXISTS.  `logits_gemm` is the same
-// arithmetic as r4d_gemm_bf16_nt_m16 under another parameter spelling, so dispatching it there
-// looks correct -- but that kernel writes `__hip_bfloat16* C`, and the engine declares its logits
-// buffer f32, because a bf16 logit has eight bits of mantissa and a nucleus cut is a comparison of
-// neighbouring probabilities.  The projection would write bf16 pairs into an f32 plane: every
-// logit wrong, the magnitudes roughly right, and fluent nonsense out of the sampler.  rad-kbench
-// catches it as rel_l2 1.2 against the oracle, but only where it has a device domain to run in.
+// The output is f32, which is why this kernel exists: `logits_gemm` is r4d_gemm_bf16_nt_m16's
+// arithmetic, but that kernel writes bf16 and the engine's logits buffer is f32 (eight mantissa
+// bits are too few for nucleus cuts between neighbouring probabilities).
 //
-// One workgroup a vocabulary column, 256 threads striding K.  At n_vocab 248320 and K 5120 that is
-// a 2.5 GiB weight read a step and the read is the cost; the arithmetic is a v_dot2 per pair.  It
-// is not a tuned kernel and does not pretend to be -- there is one variant, it is correct, and the
-// tuning axis is open.
+// One workgroup per vocabulary column, 256 threads striding K. At n_vocab 248320 and K 5120 the
+// 2.5 GiB weight read per step is the cost. Untuned: one correct variant.
 //
-// Rows come in chunks of kLgRows so the accumulators stay in registers whatever M is.  M here is
-// one row per SAMPLED position -- `gather_rows` has already reduced a prefill chunk to one row a
-// sequence -- so a chunk is almost always the whole of it.
+// Rows are processed in chunks of kLgRows so accumulators stay in registers. M is one row per
+// sampled position (`gather_rows` runs first), so one chunk usually covers it.
 
 namespace {
 
@@ -1132,7 +915,7 @@ __global__ __launch_bounds__(kThreads) void logits_gemm_kernel(
                 const uint16_t* __restrict__ ar = a + (size_t)(r0 + i) * a_ld + k;
                 float s = 0.0f;
 #pragma unroll
-                for (uint32_t p = 0; p < kLgVec; ++p) s += bf2f(ar[p]) * bf2f(wv[p]);
+                for (uint32_t p = 0; p < kLgVec; ++p) s += bf16_to_f32(ar[p]) * bf16_to_f32(wv[p]);
                 acc[i] += s;
             }
         }
@@ -1174,24 +957,17 @@ extern "C" int r4d_logits_gemm_bf16(long a, long w, long c, int M, int K, int N,
 
 // ============================================================== the plugin ABI entry points
 //
-// Unpacking RadArgs and re-deriving the row pitches IS this kernel's own business, so it lives
-// here rather than in a translation layer an out-of-tree author cannot write.  See
-// libr4d/r4d_args.h.
+// Unpacking RadArgs and deriving row pitches belongs to the kernel library (libr4d/r4d_args.h).
+// The kernels take raw pointers and one pitch, so anything unpitched must be tight (spec 2.1).
+// Before each launch an op checks:
 //
-// WHAT THESE CHECK, and why here and not deeper in.  The kernels take raw pointers and one
-// pitch, so anything they do not pitch has to be tight -- the "necessary condition only"
-// boundary of spec 2.1.  Every op below therefore establishes, before the launch:
-//
-//   * the dtype.  These kernels are bf16 and read through a uint16_t; an f32 operand would be
-//     read as two bf16 halves and the output would be plausible garbage.  The rows constrain
-//     `dtype`, but a constraint is a NECESSARY condition on the geometry and not a promise
-//     about the tensors, so the operand's own dtype is what is tested.
-//   * the row pitch.  r4d_rows_pitch() gives it in elements, or -1 when an inner axis is
-//     strided, and -1 is RAD_E_STRIDE rather than a silently wrong walk.
-//   * the row count.  It comes from the OPERAND and never from the `M` parameter: M is RANGED,
-//     so the value in the args is the band's upper bound and a loop bounded by it walks off
-//     the arena (libref/ref_ops.h makes the same point at more length).
-/* bf16 is the only activation width these kernels read. Stated once. */
+//   * the dtype, from the operand itself: a row's `dtype` constraint is a necessary condition on
+//     the geometry, not a promise about the tensors, and an f32 operand read as bf16 is garbage.
+//   * the row pitch: r4d_rows_pitch() returns elements, or -1 (RAD_E_STRIDE) for a strided inner
+//     axis.
+//   * the row count, from the operand, never the `M` parameter: M is ranged, so the args hold the
+//     band's upper bound (libref/ref_ops.h).
+/* bf16 is the only activation width these kernels read. */
 static inline int dt_bf16(const RadTensor* t) {
     return (t && t->dtype == RAD_BF16) ? RAD_OK : RAD_E_DTYPE;
 }
@@ -1199,8 +975,7 @@ static inline int dt_i32(const RadTensor* t) {
     return (t && (t->dtype == RAD_I32 || t->dtype == RAD_U32)) ? RAD_OK : RAD_E_DTYPE;
 }
 
-/* Opaque bytes. The tier traffic moves KV fragments whose contents are whatever the attention
- * kernel wrote, so u8 is the dtype that describes them without claiming to interpret them. */
+/* Opaque bytes: KV tier traffic, whose contents are whatever the attention kernel wrote. */
 static inline int dt_u8(const RadTensor* t) {
     return (t && (t->dtype == RAD_U8 || t->dtype == RAD_I8)) ? RAD_OK : RAD_E_DTYPE;
 }
@@ -1211,7 +986,7 @@ static inline int dt_u8(const RadTensor* t) {
 
 enum { EL_TOK = 0, EL_WTE, EL_X };
 
-static int rad_embed_lookup_body(const RadArgs* a, const R4dSink& sk) {
+extern "C" int r4d_rad_embed_lookup(const RadArgs* a, RadStream stream) {
     const RadTensor* tok = r4d_opt(a, EL_TOK);
     const RadTensor* wte = r4d_opt(a, EL_WTE);
     const RadTensor* x   = r4d_opt(a, EL_X);
@@ -1235,18 +1010,16 @@ static int rad_embed_lookup_body(const RadArgs* a, const R4dSink& sk) {
     const float mult = (float)r4d_getf(a, "mult", 1.0);
     return embed_lookup_bf16_emit(r4d_addr(tok), r4d_addr(wte), r4d_addr(x),
                                   (int)M, (int)n_embd, (int)n_vocab, (int)voff, (int)x_ld,
-                                  mult, sk) == 0 ? RAD_OK : RAD_E_DEVICE;
+                                  mult, stream) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
-R4D_ENTRY(r4d_rad_embed_lookup, rad_embed_lookup_body)
 
 /* ------------------------------------------------------------------ embed_lookup_q */
 
-/* Operand 4, `ahead`, is not read. It carries the ids of the prompt after this step for a host
- * reader that fetches table rows from a file before they are wanted; a card reads its table where
- * it already is, so there is nothing to fetch. */
+/* Operand 4, `ahead`, is not read: it carries upcoming prompt ids for a host reader that
+ * prefetches table rows from a file, and a card reads its table in place. */
 enum { ELQ_TOK = 0, ELQ_WTE, ELQ_SCALE, ELQ_X };
 
-static int rad_embed_lookup_q_body(const RadArgs* a, const R4dSink& sk) {
+extern "C" int r4d_rad_embed_lookup_q(const RadArgs* a, RadStream stream) {
     const RadTensor* tok = r4d_opt(a, ELQ_TOK);
     const RadTensor* wte = r4d_opt(a, ELQ_WTE);
     const RadTensor* sc  = r4d_opt(a, ELQ_SCALE);
@@ -1274,16 +1047,15 @@ static int rad_embed_lookup_q_body(const RadArgs* a, const R4dSink& sk) {
     return embed_lookup_q_emit((const int32_t*)r4d_addr(tok), (const void*)r4d_addr(wte), q,
                                sc ? (const void*)r4d_addr(sc) : nullptr,
                                sc && sc->dtype == RAD_F32, (uint16_t*)r4d_addr(x), M,
-                               (int)n_embd, (int)n_vocab, (int)voff, x_ld, sk) == 0
+                               (int)n_embd, (int)n_vocab, (int)voff, x_ld, stream) == 0
                ? RAD_OK : RAD_E_DEVICE;
 }
-R4D_ENTRY(r4d_rad_embed_lookup_q, rad_embed_lookup_q_body)
 
 /* ------------------------------------------------------------------ gather_rows */
 
 enum { GR_X = 0, GR_IDX, GR_Y };
 
-static int rad_gather_rows_body(const RadArgs* a, const R4dSink& sk) {
+extern "C" int r4d_rad_gather_rows(const RadArgs* a, RadStream stream) {
     const RadTensor* x   = r4d_opt(a, GR_X);
     const RadTensor* idx = r4d_opt(a, GR_IDX);
     const RadTensor* y   = r4d_opt(a, GR_Y);
@@ -1303,15 +1075,12 @@ static int rad_gather_rows_body(const RadArgs* a, const R4dSink& sk) {
 
     return gather_rows_bf16_emit(r4d_addr(x), r4d_addr(idx), r4d_addr(y),
                                  (int)M, (int)n, (int)src, (int)x_ld, (int)y_ld,
-                                 sk) == 0 ? RAD_OK : RAD_E_DEVICE;
+                                 stream) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
-R4D_ENTRY(r4d_rad_gather_rows, rad_gather_rows_body)
-
 
 /* ------------------------------------------------------------------ byte rows */
-/* The u8 forms. `n` here is a COUNT OF BYTES, because at dtype u8 an element is a byte -- so the
- * pitches r4d_rows_pitch returns are byte pitches and go straight through. */
-static int rad_gather_rows_u8_body(const RadArgs* a, const R4dSink& sk) {
+/* The u8 forms. `n` is a byte count, so r4d_rows_pitch's pitches are byte pitches. */
+extern "C" int r4d_rad_gather_rows_u8(const RadArgs* a, RadStream stream) {
     const RadTensor* x   = r4d_opt(a, GR_X);
     const RadTensor* idx = r4d_opt(a, GR_IDX);
     const RadTensor* y   = r4d_opt(a, GR_Y);
@@ -1331,15 +1100,13 @@ static int rad_gather_rows_u8_body(const RadArgs* a, const R4dSink& sk) {
 
     return gather_rows_u8_emit(r4d_addr(x), r4d_addr(idx), r4d_addr(y),
                                (int)M, (int)n, (int)src, (int)x_ld, (int)y_ld,
-                               sk) == 0 ? RAD_OK : RAD_E_DEVICE;
+                               stream) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
-R4D_ENTRY(r4d_rad_gather_rows_u8, rad_gather_rows_u8_body)
 
-/* The operand order is (v, idx, x) and x is INOUT: the destination is the pool and the rows this
- * call does not name stay as they were. */
+/* Operands (v, idx, x), x inout: rows the call does not name are left unchanged. */
 enum { SR_V = 0, SR_IDX, SR_X };
 
-static int rad_scatter_rows_u8_body(const RadArgs* a, const R4dSink& sk) {
+extern "C" int r4d_rad_scatter_rows_u8(const RadArgs* a, RadStream stream) {
     const RadTensor* v   = r4d_opt(a, SR_V);
     const RadTensor* idx = r4d_opt(a, SR_IDX);
     const RadTensor* x   = r4d_opt(a, SR_X);
@@ -1359,14 +1126,12 @@ static int rad_scatter_rows_u8_body(const RadArgs* a, const R4dSink& sk) {
 
     return scatter_rows_u8_emit(r4d_addr(v), r4d_addr(idx), r4d_addr(x),
                                 (int)M, (int)n, (int)dst, (int)v_ld, (int)x_ld,
-                                sk) == 0 ? RAD_OK : RAD_E_DEVICE;
+                                stream) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
-R4D_ENTRY(r4d_rad_scatter_rows_u8, rad_scatter_rows_u8_body)
 
-/* THE SAME COPY, for rows a caller declared bf16: the kernel moves bytes, so a bf16 row of n is
- * 2n bytes and nothing else about it changes. An encoder's rows over a language model's
- * embeddings are the case -- both sides are activations, declared bf16. */
-static int rad_scatter_rows_bf16_body(const RadArgs* a, const R4dSink& sk) {
+/* The same copy for rows declared bf16 (e.g. an encoder's rows over a language model's
+ * embeddings): a bf16 row of n is 2n bytes. */
+extern "C" int r4d_rad_scatter_rows_bf16(const RadArgs* a, RadStream stream) {
     const RadTensor* v   = r4d_opt(a, SR_V);
     const RadTensor* idx = r4d_opt(a, SR_IDX);
     const RadTensor* x   = r4d_opt(a, SR_X);
@@ -1386,20 +1151,15 @@ static int rad_scatter_rows_bf16_body(const RadArgs* a, const R4dSink& sk) {
 
     return scatter_rows_u8_emit(r4d_addr(v), r4d_addr(idx), r4d_addr(x),
                                 (int)M, (int)(2 * n), (int)dst, (int)(2 * v_ld), (int)(2 * x_ld),
-                                sk) == 0 ? RAD_OK : RAD_E_DEVICE;
+                                stream) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
-R4D_ENTRY(r4d_rad_scatter_rows_bf16, rad_scatter_rows_bf16_body)
 
 /* ------------------------------------------------------------------ cast (bf16 -> bf16) */
-/* A STRIDED ROW COPY, which is what `cast` degenerates to when the two ends are the same dtype,
- * and the reason there is a device row for it at all: an architecture that conditions a drafter on
- * the trunk's INTERMEDIATE hidden states has to move rows out of the residual stream before the
- * next layer overwrites it, and the only other implementation is ref's -- on the host, which the
- * reference gate refuses in a serve.
- *
- * libr4d's 2D copy takes byte pitches, so a column slice of a wider buffer is expressible and no
- * kernel has to learn about the layout: this is exactly how five taps land side by side in one
- * [T, 5 * n_embd] row. */
+/* A strided row copy, which is what `cast` reduces to when both ends are the same dtype. A
+ * drafter conditioned on the trunk's intermediate hidden states must copy rows out of the residual
+ * stream before the next layer overwrites them, and ref's host implementation is refused in a
+ * serve. libr4d's 2D copy takes byte pitches, so taps can land side by side as column slices of
+ * one [T, 5 * n_embd] row. */
 enum { CS_X = 0, CS_Y };
 
 extern "C" int r4d_rad_cast(const RadArgs* a, RadStream s) {
@@ -1415,9 +1175,8 @@ extern "C" int r4d_rad_cast(const RadArgs* a, RadStream s) {
     const long long y_ld = r4d_rows_pitch(y, n, &M);
     const long long x_ld = r4d_rows_pitch(x, n, &Mx);
     if (y_ld < 0 || x_ld < 0) return R4D_NO(RAD_E_STRIDE);
-    /* The ROW COUNT is the destination's. A tap writes a column slice of a buffer sized for the
-     * step's ceiling while the source is the live rows, so the two extents differ by design; what
-     * must hold is that the source has the rows the destination asks for. */
+    /* The row count is the destination's: a tap's destination is sized for the step's ceiling
+     * while the source holds the live rows, so the source need only have at least as many. */
     if (M <= 0 || Mx < M) return R4D_NO(RAD_E_SHAPE);
 
     return r4d_p2p_copy2d(r4d_addr(y), r4d_addr(x), y_ld * 2, x_ld * 2, n * 2, M,
@@ -1435,8 +1194,8 @@ extern "C" int r4d_rad_rmsnorm(const RadArgs* a, RadStream s) {
     if (!x || !y) return R4D_NO(RAD_E_INVAL);
     R4D_NEED(dt_bf16(x));
     R4D_NEED(dt_bf16(y));
-    /* An ABSENT gain is one: a norm with no scale (Gemma 4's value norm, its multimodal
-     * embedder's pre-projection norm). `wadd` belongs to a gain and is refused without one. */
+    /* An absent gain is one (Gemma 4's value norm, its multimodal embedder's pre-projection norm).
+     * `wadd` without a gain is refused. */
     if (!w) {
         const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
         if (n <= 0) return R4D_NO(RAD_E_SHAPE);
@@ -1452,11 +1211,8 @@ extern "C" int r4d_rad_rmsnorm(const RadArgs* a, RadStream s) {
                                 (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
     }
     if (!r4d_contig(w)) return R4D_NO(RAD_E_STRIDE);
-    /* THE GAIN IS THE ONE OPERAND THAT IS NOT bf16. Every architecture plugin here declares its
-     * norm gains RAD_F32 -- a few thousand elements against gigabytes of weights, and the norm is
-     * where a rounded gain shows -- so the width is read off the operand and handed to the kernel
-     * rather than assumed. Assuming it would read an f32 gain as two bf16 halves of the wrong
-     * number, which is the silent kind of wrong. */
+    /* The gain may be f32 (as plugins declare norm gains) or bf16; its width is read off the
+     * operand rather than assumed. */
     if (w->dtype != RAD_F32 && w->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
     const int w_f32 = w->dtype == RAD_F32;
 
@@ -1520,10 +1276,8 @@ static int binary(const RadArgs* a, int mul, RadStream s) {
     if (y_ld < 0 || a_ld < 0) return R4D_NO(RAD_E_STRIDE);
     if (M <= 0 || Ma < M) return R4D_NO(RAD_E_SHAPE);
 
-    /* THE ONE BROADCAST RULE: an operand carrying exactly n elements against an output of M rows
-     * broadcasts along rows, and nothing else broadcasts at all. A pitch of 0 is how the kernel is
-     * told. Anything in between -- more than n, fewer than M*n -- is a shape bug and is refused
-     * rather than made plausible. */
+    /* The one broadcast rule: exactly n elements against M rows broadcasts along rows (pitch 0).
+     * Anything between n and M*n is a shape bug and is refused. */
     long long b_ld = 0;
     if (r4d_numel(B) == n && M > 1) {
         if (!r4d_contig(B)) return R4D_NO(RAD_E_STRIDE);
@@ -1544,7 +1298,7 @@ extern "C" int r4d_rad_add(const RadArgs* a, RadStream s) { return binary(a, 0, 
 extern "C" int r4d_rad_mul(const RadArgs* a, RadStream s) { return binary(a, 1, s); }
 
 /* mul_weight: y = x * w, `w` a bf16 weight of one element (pitch -1, a scalar) or one row (pitch
- * 0, broadcast down the rows) -- the binary kernel's two broadcast forms. */
+ * 0, broadcast down the rows). */
 extern "C" int r4d_rad_mul_weight(const RadArgs* a, RadStream s) {
     const RadTensor* X = r4d_opt(a, 0);
     const RadTensor* W = r4d_opt(a, 1);
@@ -1578,10 +1332,8 @@ extern "C" int r4d_rad_sigmoid(const RadArgs* a, RadStream s) {
     R4D_NEED(dt_bf16(x));
     R4D_NEED(dt_bf16(y));
 
-    /* ROW-WISE, WITH A PITCH, because the input is usually a COLUMN SLICE. A gated attention block
-     * issues this against the second half of each head of an interleaved [tokens, heads,
-     * 2*head_dim] projection: `n` wide inside a stride of 2n, with no contiguous extent anywhere.
-     * Treating it as a flat elementwise op refused it outright. */
+    /* Row-wise with a pitch: the input is usually a column slice (the gate half of an interleaved
+     * [tokens, heads, 2*head_dim] projection, `n` wide inside a stride of 2n). */
     const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
     if (n <= 0) return R4D_NO(RAD_E_SHAPE);
     long long M = 0, My = 0;
@@ -1617,21 +1369,17 @@ extern "C" int r4d_rad_logit_softcap(const RadArgs* a, RadStream s) {
     const RadTensor* x = r4d_opt(a, 0);
     const RadTensor* y = r4d_opt(a, 1);
     if (!x || !y) return R4D_NO(RAD_E_INVAL);
-    /* Two legs, one op: bf16 (the logits buffer as the gemm writes it on the bf16 chain) and f32
-     * (the 1.3.0 sampling chain, where the gemm hands the sampler f32 rows). The dtype check
-     * moved from the entry to the call below because the legs differ, not the geometry. */
+    /* Two legs: bf16 logits, or f32 logits as the gemm hands the sampler. */
     const bool leg_bf16 = (x->dtype == RAD_BF16) && (y->dtype == RAD_BF16);
     const bool leg_f32  = (x->dtype == RAD_F32)  && (y->dtype == RAD_F32);
     if (!leg_bf16 && !leg_f32) return R4D_NO(RAD_E_DTYPE);
 
-    /* `cap` is where the model lives: Gemma 4 issues it at 30.0. The default exists for the same
-     * reason every other one here does (a direct call with no declare in front), and the `> 0`
-     * test is load-bearing: a zero cap is a division by zero in every lane, not a bad answer. */
+    /* Gemma 4 issues cap 30.0; the default serves direct calls. A zero cap would divide by zero
+     * in every lane. */
     const float cap = (float)r4d_getf(a, "cap", 30.0);
     if (!(cap > 0.0f)) return R4D_NO(RAD_E_INVAL);
 
-    /* ROW-WISE WITH A PITCH, same as sigmoid: issued against a column slice there is no contiguous
-     * extent to walk, and the contiguous case costs nothing. */
+    /* Row-wise with a pitch, as sigmoid. */
     const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
     if (n <= 0) return R4D_NO(RAD_E_SHAPE);
     long long M = 0, My = 0;
@@ -1658,16 +1406,12 @@ extern "C" int r4d_rad_scale(const RadArgs* a, RadStream s) {
     R4D_NEED(dt_bf16(x));
     R4D_NEED(dt_bf16(y));
 
-    /* `s` is a [1] weight, f32 or bf16 (the layer_scalar weight is bf16 in the checkpoint). A
-     * scalar with no element is a shape error, not a broadcast of zero -- a zero scalar would be
-     * a plausible number, which is the thing the oracle rules out. Read on the device (the kernel
-     * reads s[0] once per block) rather than a host copy: a device-to-host copy of one element is
-     * a synchronisation on the step path, and the per-block read is cached. */
+    /* `s` is a [1] weight, f32 or bf16. An empty scalar is a shape error, not a zero. It is read
+     * on the device, once per block, to avoid a device-to-host sync on the step path. */
     if (sc->dtype != RAD_F32 && sc->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
     if (r4d_numel(sc) < 1) return R4D_NO(RAD_E_SHAPE);
 
-    /* ROW-WISE WITH A PITCH, same as sigmoid: issued against the residual stream at the end of a
-     * layer there is no contiguous extent to walk, and the contiguous case costs nothing. */
+    /* Row-wise with a pitch, as sigmoid. */
     const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
     if (n <= 0) return R4D_NO(RAD_E_SHAPE);
     long long M = 0, My = 0;
@@ -1743,25 +1487,22 @@ extern "C" int r4d_rad_rope(const RadArgs* a, RadStream s) {
     if (head_dim <= 0 || n_head <= 0) return R4D_NO(RAD_E_SHAPE);
     if (rot <= 0 || rot > head_dim || (rot & 1)) return R4D_NO(RAD_E_SHAPE);
 
-    /* `ladder`: `rotary` (default) measures the base ladder in `rot`; `head` in `head_dim`, the
-     * proportional variant. head_dim is already validated above, so `den = head_dim` is safe. */
+    /* `ladder`: `rotary` (default) measures the base ladder in `rot`; `head` in `head_dim` (the
+     * proportional variant). */
     const char* lad = r4d_gets(a, "ladder");
     long long den = rot;
     if (lad) {
         if (!std::strcmp(lad, "head")) den = head_dim;
-        else if (std::strcmp(lad, "rotary") && std::strcmp(lad, "head"))
-            return R4D_NO(RAD_E_UNSUPPORTED);
+        else if (std::strcmp(lad, "rotary")) return R4D_NO(RAD_E_UNSUPPORTED);
     }
-    /* `head` is HF's proportional RoPE: the rotation spans the WHOLE head (rotate_half over
-     * head_dim, so pair i is (i, i + head_dim/2)) and only the first rotary_dim/2 frequencies are
-     * non-zero. Rotating the first rotary_dim dims as a rotary of their own pairs (i, i + rot/2)
-     * instead -- Gemma 4's global layers, 128 of 512 -- turns the wrong channels, and long-range
-     * attention degrades with distance. */
+    /* `head` is HF's proportional RoPE: the rotation spans the whole head (pair i is
+     * (i, i + head_dim/2)) and only the first rotary_dim/2 frequencies are non-zero. Pairing
+     * (i, i + rot/2) instead turns the wrong channels (Gemma 4's global layers, 128 of 512) and
+     * degrades long-range attention. */
 
-    /* THE MODE, and with it how many components a position has. With [M] positions -- one
-     * component a token -- mrope and imrope ARE neox: every frequency reads the same position and
-     * the ladder is the same. With [C, M] positions and `sections`, each frequency reads the
-     * component its section names (docs/OPS.md, `rope`). */
+    /* The mode sets how many components a position has. With [M] positions, mrope and imrope are
+     * neox. With [C, M] positions and `sections`, each frequency reads its section's component
+     * (docs/OPS.md, `rope`). */
     const char* mode = r4d_gets(a, "mode");
     int gptj = 0, mc = 0;
     if (mode) {
@@ -1803,10 +1544,9 @@ extern "C" int r4d_rad_rope(const RadArgs* a, RadStream s) {
     const float rscale = (float)r4d_getf(a, "scale", 1.0);
     const RadYarn yarn = rad_yarn_args(a);
     if (!rad_yarn_valid(yarn)) return R4D_NO(RAD_E_INVAL);
-    /* YaRN over the axial vision rotary, or over a linear position divide, is no model's. */
+    /* No model uses YaRN with the axial vision rotary or a linear position divide. */
     if (yarn.factor != 0.0f && (mc == 4 || rscale != 1.0f)) return R4D_NO(RAD_E_UNSUPPORTED);
-    /* The Q heads and the K heads rotate; the V heads that follow them do not, which is the whole
-     * reason this op takes the fused projection rather than two tensors. */
+    /* The Q and K heads rotate; the trailing V heads do not. */
     long long rot_l = rot, nfreq = rot / 2;
     if (den == head_dim && rot < head_dim && !multi && !gptj && mc == 0) rot_l = head_dim;
     return rope_launch(r4d_addr(qkv), r4d_addr(pos), (int)Mp, (int)head_dim,
@@ -1821,9 +1561,8 @@ extern "C" int r4d_rad_rope(const RadArgs* a, RadStream s) {
 
 enum { KS_K = 0, KS_V, KS_SLOT, KS_CACHE };
 
-/* The geometry both stores share. The ONLY difference between them is the cache's dtype and what
- * the kernel does with a value on the way in, so everything up to the launch is one function --
- * two copies of a paged-layout check is how the two drift into disagreeing about the layout. */
+/* Geometry shared by both stores, which differ only in the cache dtype, so the paged-layout check
+ * exists once. */
 struct KvStoreGeom {
     const RadTensor *k, *v, *sm, *kv;
     long long head_dim, block_size, kv_heads, n_blocks, k_ld, v_ld, T;
@@ -1844,9 +1583,8 @@ static int kv_store_geom(const RadArgs* a, KvStoreGeom* g) {
     g->block_size = r4d_geti_or(a, "block_size", 0);
     g->kv_heads   = r4d_geti_or(a, "n_head_kv", g->kv->rank == 4 ? g->kv->shape[1] : 0);
     if (g->head_dim <= 0 || g->block_size <= 0 || g->kv_heads <= 0) return R4D_NO(RAD_E_SHAPE);
-    /* The paged layout is [n_blocks, kv_heads, block_size, 2*head_dim] and every kernel in this
-     * project shares it. A cache that disagrees is refused rather than walked with the parameters'
-     * idea of the shape. */
+    /* The shared paged layout is [n_blocks, kv_heads, block_size, 2*head_dim]; refuse a cache that
+     * disagrees. */
     if (g->kv->rank != 4) return R4D_NO(RAD_E_SHAPE);
     if (g->kv->shape[1] != g->kv_heads || g->kv->shape[2] != g->block_size ||
         g->kv->shape[3] != 2 * g->head_dim) return R4D_NO(RAD_E_SHAPE);
@@ -1874,16 +1612,15 @@ extern "C" int r4d_rad_kv_store(const RadArgs* a, RadStream s) {
                              (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
-/* The E4M3 twin. `k_scale` and `v_scale` are the DESCALES the attention side multiplies back by --
- * one number per (sequence, head) there, so a constant here -- and 1.0 is both vLLM's default and
- * what the fp8kv kernels assume when their descale operands are absent. */
-static int rad_kv_store_fp8_body(const RadArgs* a, const R4dSink& sk) {
+/* The E4M3 store. `k_scale` and `v_scale` are the attention side's descales (one per sequence and
+ * head there, a constant here); 1.0 is vLLM's default and the fp8kv kernels' assumption when the
+ * descale operands are absent. */
+extern "C" int r4d_rad_kv_store_fp8(const RadArgs* a, RadStream stream) {
     KvStoreGeom g{};
     const int rc = kv_store_geom(a, &g);
     if (rc != RAD_OK) return rc;
     if (g.kv->dtype != RAD_F8E4M3) return R4D_NO(RAD_E_DTYPE);
-    /* Four columns a thread is the packing the kernel uses, so a head must be a whole number of
-     * groups; otherwise one group straddles two heads and writes the next head's first bytes. */
+    /* Four columns per thread, so a head must be whole groups. */
     if (g.head_dim % 4) return R4D_NO(RAD_E_SHAPE);
 
     const double ks = r4d_getf(a, "k_scale", 1.0);
@@ -1893,24 +1630,14 @@ static int rad_kv_store_fp8_body(const RadArgs* a, const R4dSink& sk) {
     return kv_store_fp8_emit(r4d_addr(g.k), r4d_addr(g.v), r4d_addr(g.sm), r4d_addr(g.kv),
                              (int)g.T, (int)g.head_dim, (int)g.kv_heads, (int)g.block_size,
                              (int)g.n_blocks, (int)g.k_ld, (int)g.v_ld,
-                             (float)ks, (float)vs, sk) == 0 ? RAD_OK : RAD_E_DEVICE;
+                             (float)ks, (float)vs, stream) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
-R4D_ENTRY(r4d_rad_kv_store_fp8, rad_kv_store_fp8_body)
 
 /* ------------------------------------------------------------------ logits_gemm
  *
- * ITS OWN KERNEL, AND THE OUTPUT DTYPE IS WHY. `logits_gemm` is `gemm_nt`'s arithmetic under the
- * vocabulary edge's parameter spelling -- `n_vocab` and `n_embd` where gemm_nt says N and K -- so
- * the skinny bf16 GEMM looks like the right target for it. That GEMM writes bf16. The engine
- * declares its logits buffer f32, because a bf16 logit has eight bits of mantissa and a nucleus
- * cut is a comparison of neighbouring probabilities, so that dispatch writes bf16 pairs into an
- * f32 plane: every logit wrong, the magnitudes roughly right, fluent nonsense out of the sampler.
- *
- * M is one row per SAMPLED position, not per token: `gather_rows` runs first and reduces a prefill
- * chunk to one row a sequence. At max_tok 8192 against a 248K vocabulary the ungathered logits
- * buffer alone would be 8 GiB, which is what that op is for.
- *
- */
+ * gemm_nt's arithmetic with `n_vocab`/`n_embd` for N/K, but writing f32 (see the kernel above).
+ * M is one row per sampled position: `gather_rows` runs first, since ungathered logits at
+ * max_tok 8192 and a 248K vocabulary would be 8 GiB. */
 
 enum { LG_X = 0, LG_W, LG_Y };
 
@@ -1921,8 +1648,7 @@ extern "C" int r4d_rad_logits_gemm(const RadArgs* a, RadStream s) {
     if (!x || !w || !y) return R4D_NO(RAD_E_INVAL);
     R4D_NEED(dt_bf16(x));
     R4D_NEED(dt_bf16(w));
-    /* f32, and checked rather than assumed: the bf16 GEMM this op resembles writes bf16 into
-     * exactly this buffer. See the note above. */
+    /* f32 output, checked. */
     if (y->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
     if (!r4d_contig(w)) return R4D_NO(RAD_E_STRIDE);
 

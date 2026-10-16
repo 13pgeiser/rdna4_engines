@@ -1,11 +1,11 @@
 /* tokenizer_json.cpp -- reading a vocab in, and writing it into the .rad.
  *
  * Three sources and one sink:
- *   parse_tokenizer_json()  the HuggingFace file, interpreted rather than hashed. This is the
- *                           preferred path and the one spec §12 is about.
- *   vocab_from_gguf()       GGUF metadata, where the chain has already been lost and has to be
- *                           reconstructed from `tokenizer.ggml.pre`, a name llama.cpp derived by
- *                           hashing the original tokenizer.json.
+ *   parse_tokenizer_json()  the HuggingFace file, interpreted rather than hashed; the preferred
+ *                           path (spec §12).
+ *   vocab_from_gguf()       GGUF metadata, where the chain is lost and is reconstructed from
+ *                           `tokenizer.ggml.pre`, a name llama.cpp derived by hashing the
+ *                           original tokenizer.json.
  *   vocab_serialize()       into the .rad's vocab section, and back.
  */
 #include "text/tokenizer.h"
@@ -25,21 +25,61 @@ using json = nlohmann::json;
 
 namespace {
 
-/* HuggingFace's SplitDelimiterBehavior, in the order our iarg encodes. */
+/* HuggingFace's SplitDelimiterBehavior, in the order our iarg encodes; -1 for another name. */
 int behavior_from_name(const std::string& s) {
     if (s == "Removed")            return 0;
     if (s == "Isolated")           return 1;
     if (s == "MergedWithPrevious") return 2;
     if (s == "MergedWithNext")     return 3;
     if (s == "Contiguous")         return 4;
-    return 1;   /* Isolated is the default in every tokenizer.json that omits it */
+    return -1;
 }
 
+/* Metaspace's prepend scheme, in the order our iarg encodes; -1 for another name. */
 int prepend_scheme_from_name(const std::string& s) {
     if (s == "never")  return 0;
     if (s == "first")  return 1;
     if (s == "always") return 2;
-    return 2;
+    return -1;
+}
+
+/* A field value the tokenizer has no encoding for: guessing one would change the token
+ * boundaries, so the vocabulary is refused like an unknown step. */
+int refuse_value(const char* origin, const char* field, const std::string& v) {
+    RAD_ERR("%s: %s '%s' is not supported", origin, field, v.c_str());
+    return RAD_E_UNSUPPORTED;
+}
+
+/* Merges read by token text into ids: a pair naming a text that is not a token is dropped and
+ * counted, since some vocabs ship merges over strings that are not tokens. */
+struct MergeIds {
+    std::unordered_map<std::string, uint32_t> id_of;
+    size_t dropped = 0;
+
+    explicit MergeIds(const std::vector<std::string>& tokens) {
+        id_of.reserve(tokens.size() * 2);
+        for (size_t i = 0; i < tokens.size(); ++i) id_of.emplace(tokens[i], (uint32_t)i);
+    }
+    void add(const std::string& l, const std::string& r, VocabBuild& out) {
+        auto li = id_of.find(l), ri = id_of.find(r);
+        if (li == id_of.end() || ri == id_of.end()) { ++dropped; return; }
+        out.merges.emplace_back(li->second, ri->second);
+    }
+    /* The "a b" spelling, split at the first space. */
+    void add_spaced(const std::string& s, VocabBuild& out) {
+        const size_t sp = s.find(' ');
+        if (sp == std::string::npos) { ++dropped; return; }
+        add(s.substr(0, sp), s.substr(sp + 1), out);
+    }
+};
+
+/* A Metaspace step over U+2581 that always prepends it, as a SentencePiece vocab reads. */
+VocabStep metaspace(uint32_t kind) {
+    VocabStep s;
+    s.kind = kind;
+    s.arg0 = "\xe2\x96\x81";
+    s.iarg = 2;
+    return s;
 }
 
 const json* get(const json& o, const char* k) {
@@ -58,9 +98,9 @@ bool bool_or(const json& o, const char* k, bool dflt) {
     return v && v->is_boolean() ? v->get<bool>() : dflt;
 }
 
-/* A regex a step carries is compiled HERE as well as when the vocab loads, so that rad-convert
- * refuses a pattern outside the compiler's dialect with the construct named, instead of writing a
- * container no engine will load. */
+/* A step's regex is compiled here as well as at vocab load, so rad-convert refuses an
+ * unsupported pattern with the construct named instead of writing a container that cannot
+ * load. */
 int check_regex(const std::string& pat, const char* what, const char* origin) {
     std::unique_ptr<TokRegex> re;
     std::string why;
@@ -84,9 +124,9 @@ bool read_pattern(const json& o, std::string* pat, bool* is_regex) {
     return false;
 }
 
-/* A token id out of the file, which indexes the token table as soon as it is read: a negative
- * one, or one that is not an integer, writes outside it, and a huge one sizes it. `limit` is
- * one past the largest id accepted (see parse_tokenizer_json_buf). */
+/* A token id from the file. It indexes the token table as soon as it is read, so a negative or
+ * non-integer id would write outside it and a huge one would size it. `limit` is one past the
+ * largest id accepted (see parse_tokenizer_json_buf). */
 bool read_id(const json& v, uint64_t limit, int32_t* out) {
     if (!v.is_number_integer()) return false;
     if (!v.is_number_unsigned() && v.get<int64_t>() < 0) return false;
@@ -143,9 +183,8 @@ int read_normalizer(const json& n, std::vector<VocabStep>& out, const char* orig
         out.push_back(s);
         return RAD_OK;
     }
-    /* Everything else is refused BY NAME rather than ignored. An ignored normaliser is a
-     * tokeniser that runs, produces different boundaries, and says nothing -- exactly the
-     * failure this component exists to remove (spec §12). */
+    /* Anything else is refused by name: ignoring a normaliser silently changes token boundaries
+     * (spec §12). */
     RAD_ERR("%s: normalizer '%s' has no RadVocabStep. Refusing rather than approximating it; "
             "add a RAD_NORM_* for it if a model needs it.", origin, t.c_str());
     return RAD_E_UNSUPPORTED;
@@ -176,8 +215,8 @@ int read_pretok(const json& n, std::vector<VocabStep>& out, const char* origin) 
             return RAD_E_FORMAT;
         }
         if (!is_regex) {
-            /* A literal delimiter is a regex with every metacharacter escaped. Doing the escape
-             * at convert time keeps the runtime with one kind of Split instead of two. */
+            /* A literal delimiter becomes a regex with every metacharacter escaped, so the
+             * runtime has one kind of Split. */
             std::string q;
             for (char c : s.arg0) {
                 if (std::strchr("\\^$.|?*+()[]{}", c)) q += '\\';
@@ -187,7 +226,9 @@ int read_pretok(const json& n, std::vector<VocabStep>& out, const char* origin) 
         }
         s.kind  = RAD_PRE_SPLIT;
         s.flags = bool_or(n, "invert", false) ? 1u : 0u;
-        s.iarg  = behavior_from_name(str_or(n, "behavior", "Isolated"));
+        const std::string bh = str_or(n, "behavior", "Isolated");
+        s.iarg  = behavior_from_name(bh);
+        if (s.iarg < 0) return refuse_value(origin, "Split behavior", bh);
         RAD_TRY(check_regex(s.arg0, "Split", origin));
         out.push_back(s);
         return RAD_OK;
@@ -195,7 +236,9 @@ int read_pretok(const json& n, std::vector<VocabStep>& out, const char* origin) 
     if (t == "Metaspace") {
         s.kind  = RAD_PRE_METASPACE;
         s.arg0  = str_or(n, "replacement", "\xe2\x96\x81");
-        s.iarg  = prepend_scheme_from_name(str_or(n, "prepend_scheme", "always"));
+        const std::string ps = str_or(n, "prepend_scheme", "always");
+        s.iarg  = prepend_scheme_from_name(ps);
+        if (s.iarg < 0) return refuse_value(origin, "Metaspace prepend_scheme", ps);
         s.flags = bool_or(n, "split", true) ? 1u : 0u;
         /* The pre-0.14 spelling: add_prefix_space instead of prepend_scheme. */
         if (!get(n, "prepend_scheme")) s.iarg = bool_or(n, "add_prefix_space", true) ? 2 : 0;
@@ -203,13 +246,17 @@ int read_pretok(const json& n, std::vector<VocabStep>& out, const char* origin) 
         return RAD_OK;
     }
     if (t == "Whitespace" || t == "WhitespaceSplit" || t == "BertPreTokenizer") {
-        s.kind = RAD_PRE_WHITESPACE;
+        s.kind  = RAD_PRE_WHITESPACE;
+        s.flags = t == "Whitespace" ? kPreWhitespace
+                : t == "WhitespaceSplit" ? kPreWhitespaceSplit : kPreBert;
         out.push_back(s);
         return RAD_OK;
     }
     if (t == "Punctuation") {
         s.kind = RAD_PRE_PUNCTUATION;
-        s.iarg = behavior_from_name(str_or(n, "behavior", "Isolated"));
+        const std::string bh = str_or(n, "behavior", "Isolated");
+        s.iarg = behavior_from_name(bh);
+        if (s.iarg < 0) return refuse_value(origin, "Punctuation behavior", bh);
         out.push_back(s);
         return RAD_OK;
     }
@@ -219,8 +266,7 @@ int read_pretok(const json& n, std::vector<VocabStep>& out, const char* origin) 
         out.push_back(s);
         return RAD_OK;
     }
-    RAD_ERR("%s: pre_tokenizer '%s' has no RadVocabStep. Refusing rather than falling back to a "
-            "default split -- a default split is llama.cpp's failure mode, not ours.",
+    RAD_ERR("%s: pre_tokenizer '%s' is not supported; no RAD_PRE_* step implements it",
             origin, t.c_str());
     return RAD_E_UNSUPPORTED;
 }
@@ -241,7 +287,9 @@ int read_decoder(const json& n, std::vector<VocabStep>& out, const char* origin)
     if (t == "Metaspace") {
         s.kind = RAD_DEC_METASPACE;
         s.arg0 = str_or(n, "replacement", "\xe2\x96\x81");
-        s.iarg = prepend_scheme_from_name(str_or(n, "prepend_scheme", "always"));
+        const std::string ps = str_or(n, "prepend_scheme", "always");
+        s.iarg = prepend_scheme_from_name(ps);
+        if (s.iarg < 0) return refuse_value(origin, "Metaspace prepend_scheme", ps);
         if (!get(n, "prepend_scheme")) s.iarg = bool_or(n, "add_prefix_space", true) ? 2 : 0;
         out.push_back(s);
         return RAD_OK;
@@ -274,20 +322,22 @@ int read_decoder(const json& n, std::vector<VocabStep>& out, const char* origin)
         return RAD_OK;
     }
     if (t == "WordPiece") {
-        /* WordPiece's decoder is a Replace of the continuation prefix plus a leading strip.
-         * Expressing it as the two steps it is keeps the runtime free of a per-model branch. */
+        /* A Replace of the continuation prefix that also joins words with a space, as
+         * HuggingFace's WordPiece decoder does (kDecWordPiece). `cleanup` defaults to true. */
         VocabStep r;
-        r.kind = RAD_DEC_REPLACE;
-        r.arg0 = str_or(n, "prefix", "##");
-        r.arg1 = "";
+        r.kind  = RAD_DEC_REPLACE;
+        r.arg0  = str_or(n, "prefix", "##");
+        r.flags = kDecWordPiece | (bool_or(n, "cleanup", true) ? kDecWordPieceCleanup : 0u);
         out.push_back(r);
         return RAD_OK;
     }
     if (t == "BPEDecoder") {
+        /* The end-of-word suffix becomes a space, except on the last token (kDecBpeSuffix). */
         VocabStep r;
-        r.kind = RAD_DEC_REPLACE;
-        r.arg0 = str_or(n, "suffix", "</w>");
-        r.arg1 = " ";
+        r.kind  = RAD_DEC_REPLACE;
+        r.arg0  = str_or(n, "suffix", "</w>");
+        r.arg1  = " ";
+        r.flags = kDecBpeSuffix;
         out.push_back(r);
         return RAD_OK;
     }
@@ -305,9 +355,8 @@ int read_model(const json& m, VocabBuild& out, const char* origin, uint64_t id_l
         return RAD_E_FORMAT;
     }
 
-    /* {text: id}, the BPE and WordPiece shape. The ids are dense, but nothing guarantees the
-     * JSON order matches the id order, so each is placed by id -- which is why every one is
-     * checked before the table is sized from them. */
+    /* {text: id}, the BPE and WordPiece shape. JSON order need not match id order, so each
+     * entry is placed by id; every id is checked before the table is sized from them. */
     auto read_text_to_id = [&](const char* kind) -> int {
         if (!vocab->is_object()) {
             RAD_ERR("%s: %s vocab is not an object of {text: id}", origin, kind);
@@ -336,6 +385,14 @@ int read_model(const json& m, VocabBuild& out, const char* origin, uint64_t id_l
     if (type == "BPE") {
         out.kind = RAD_TOK_BPE;
         out.ignore_merges = bool_or(m, "ignore_merges", false);
+        /* Subword affixes change what every merge produces, and dropout makes encoding random;
+         * the encoder implements neither. */
+        for (const char* k : { "continuing_subword_prefix", "end_of_word_suffix" }) {
+            const std::string v = str_or(m, k, "");
+            if (!v.empty()) return refuse_value(origin, (std::string("BPE ") + k).c_str(), v);
+        }
+        if (const json* d = get(m, "dropout"); d && d->is_number() && d->get<double>() > 0.0)
+            return refuse_value(origin, "BPE dropout", d->dump());
         RAD_TRY(read_text_to_id("BPE"));
     } else if (type == "Unigram") {
         out.kind = RAD_TOK_UNIGRAM;
@@ -354,8 +411,7 @@ int read_model(const json& m, VocabBuild& out, const char* origin, uint64_t id_l
             out.scores.push_back(e[1].get<float>());
         }
         out.types.assign(out.tokens.size(), (uint8_t)RAD_TT_NORMAL);
-        /* The encoder emits this id for text no piece covers, so one that names no token would
-         * put an id outside the vocabulary into the output. */
+        /* The encoder emits this id for uncovered text, so it must name a token. */
         const json* u = get(m, "unk_id");
         if (u && !read_id(*u, out.tokens.size(), &out.unk)) {
             RAD_ERR("%s: Unigram unk_id %.64s is not an id in its %zu-token vocab", origin,
@@ -364,6 +420,13 @@ int read_model(const json& m, VocabBuild& out, const char* origin, uint64_t id_l
         }
     } else if (type == "WordPiece") {
         out.kind = RAD_TOK_WORDPIECE;
+        /* The encoder spells continuations "##" and takes words of up to 100 characters,
+         * HuggingFace's defaults. */
+        const std::string prefix = str_or(m, "continuing_subword_prefix", "##");
+        if (prefix != "##") return refuse_value(origin, "WordPiece continuing_subword_prefix", prefix);
+        if (const json* mc = get(m, "max_input_chars_per_word");
+            mc && !(mc->is_number_integer() && mc->get<int64_t>() == 100))
+            return refuse_value(origin, "WordPiece max_input_chars_per_word", mc->dump());
         RAD_TRY(read_text_to_id("WordPiece"));
     } else {
         RAD_ERR("%s: model type '%s' is not implemented (BPE, Unigram and WordPiece are)",
@@ -371,8 +434,8 @@ int read_model(const json& m, VocabBuild& out, const char* origin, uint64_t id_l
         return RAD_E_UNSUPPORTED;
     }
 
-    /* Byte fallback is a property of the MODEL in tokenizer.json and a step for us, because it
-     * changes what the encoder does on a miss and the encoder is where the miss happens. */
+    /* Byte fallback is a model property in tokenizer.json but a step here: it changes what the
+     * encoder does on a miss. */
     if (bool_or(m, "byte_fallback", false)) {
         VocabStep s;
         s.kind = RAD_PRE_BYTE_FALLBACK;
@@ -381,52 +444,42 @@ int read_model(const json& m, VocabBuild& out, const char* origin, uint64_t id_l
 
     if (type != "BPE") return RAD_OK;
 
-    /* Merges. Two spellings in the wild: ["a b", ...] and [["a","b"], ...]. The second exists
-     * because a token can contain a space. */
+    /* Merges come as ["a b", ...] or, since a token can contain a space, [["a","b"], ...]. */
     const json* merges = get(m, "merges");
     if (!merges || !merges->is_array()) return RAD_OK;
 
-    std::unordered_map<std::string, uint32_t> id_of;
-    id_of.reserve(out.tokens.size() * 2);
-    for (size_t i = 0; i < out.tokens.size(); ++i) id_of.emplace(out.tokens[i], (uint32_t)i);
-
-    size_t dropped = 0;
+    MergeIds ids(out.tokens);
     out.merges.reserve(merges->size());
     for (const json& e : *merges) {
-        std::string l, r;
-        if (e.is_array() && e.size() == 2 && e[0].is_string() && e[1].is_string()) {
-            l = e[0].get<std::string>();
-            r = e[1].get<std::string>();
-        } else if (e.is_string()) {
-            const std::string s = e.get<std::string>();
-            const size_t sp = s.find(' ');
-            if (sp == std::string::npos) { ++dropped; continue; }
-            l = s.substr(0, sp);
-            r = s.substr(sp + 1);
-        } else {
-            ++dropped;
-            continue;
-        }
-        auto li = id_of.find(l), ri = id_of.find(r);
-        if (li == id_of.end() || ri == id_of.end()) { ++dropped; continue; }
-        out.merges.emplace_back(li->second, ri->second);
+        if (e.is_array() && e.size() == 2 && e[0].is_string() && e[1].is_string())
+            ids.add(e[0].get<std::string>(), e[1].get<std::string>(), out);
+        else if (e.is_string())
+            ids.add_spaced(e.get<std::string>(), out);
+        else
+            ++ids.dropped;
     }
-    if (dropped) {
-        /* Every dropped merge is a merge the tokeniser will not make, so the boundary moves.
-         * It is a warning rather than an error only because a handful of vocabs genuinely ship
-         * merges over strings they never added as tokens. */
+    /* A dropped merge moves token boundaries; only a warning, as MergeIds says why. */
+    if (ids.dropped)
         RAD_WARN("%s: %zu of %zu merges reference text that is not in the vocab and were "
                  "dropped; token boundaries may differ from the reference tokeniser",
-                 origin, dropped, merges->size());
-    }
+                 origin, ids.dropped, merges->size());
     return RAD_OK;
 }
 
-/* Added tokens override the model vocab and may extend past it. `special` decides whether the
- * pre-splitter treats them as control (isolated even when parse_special is off is NOT the rule --
- * see Tokenizer::encode) or as user-defined. */
-int read_added(const json& arr, VocabBuild& out, const char* origin, uint64_t id_limit) {
+/* Added tokens override the model vocab and may extend past it. `special` makes a token control
+ * (isolated only when parse_special is on; see Tokenizer::encode) rather than user-defined.
+ *
+ * The encoder matches an added token against the raw text, exactly as written. HuggingFace's
+ * AddedToken flags each change that: `single_word` matches only between word boundaries,
+ * `normalized` matches against the normalised text (the same thing when there is no normaliser),
+ * and `lstrip` / `rstrip` take the whitespace beside a match into it. Most files spell out every
+ * flag, so a flag is refused only at a value that changes the result. lstrip and rstrip would
+ * also refuse released models (Phi-3's chat markers carry rstrip), and the container has no field
+ * to carry them, so they are warned about instead. */
+int read_added(const json& arr, VocabBuild& out, const char* origin, uint64_t id_limit,
+               bool has_normalizer) {
     if (!arr.is_array()) return RAD_OK;
+    std::string stripped;
     for (const json& e : arr) {
         const json* idv = get(e, "id");
         const json* cv  = get(e, "content");
@@ -443,17 +496,28 @@ int read_added(const json& arr, VocabBuild& out, const char* origin, uint64_t id
             out.types.resize(id + 1, (uint8_t)RAD_TT_NORMAL);
             if (out.kind == RAD_TOK_UNIGRAM) out.scores.resize(id + 1, 0.0f);
         }
-        out.tokens[id] = cv->get<std::string>();
-        out.types[id]  = bool_or(e, "special", false) ? (uint8_t)RAD_TT_CONTROL
-                                                      : (uint8_t)RAD_TT_USER_DEFINED;
+        const std::string content = cv->get<std::string>();
+        const bool special = bool_or(e, "special", false);
+        if (bool_or(e, "single_word", false))
+            return refuse_value(origin, "added token single_word=true on", content);
+        if (has_normalizer && bool_or(e, "normalized", false))
+            return refuse_value(origin, "added token normalized=true (under a normalizer) on",
+                                content);
+        if (bool_or(e, "lstrip", false) || bool_or(e, "rstrip", false))
+            stripped += (stripped.empty() ? "" : " ") + content;
+        out.tokens[id] = content;
+        out.types[id]  = special ? (uint8_t)RAD_TT_CONTROL : (uint8_t)RAD_TT_USER_DEFINED;
     }
+    if (!stripped.empty())
+        RAD_WARN("%s: added tokens %s take the whitespace beside them in HuggingFace (lstrip / "
+                 "rstrip); this tokenizer keeps it as text, so prompts with whitespace next to "
+                 "them tokenise differently", origin, stripped.c_str());
     return RAD_OK;
 }
 
-/* tokenizer_config.json is where the ids live. tokenizer.json holds the vocab and the chain but
- * not which token is BOS, so a convert that reads only tokenizer.json produces a vocab that
- * cannot start a sequence. Reading the sibling is opportunistic: absent, the ids stay -1 and
- * rad-convert can fill them from elsewhere. */
+/* tokenizer_config.json names the special tokens; tokenizer.json does not say which is BOS.
+ * The sibling is optional: when it is absent the ids stay -1 and rad-convert can fill them from
+ * elsewhere. */
 void read_config_json(const std::string& dir, VocabBuild& out) {
     const std::string path = dir + "tokenizer_config.json";
     std::ifstream f(path);
@@ -493,8 +557,8 @@ void read_config_json(const std::string& dir, VocabBuild& out) {
     const json* ct = get(c, "chat_template");
     if (ct && ct->is_string()) out.chat_template = ct->get<std::string>();
     else if (ct && ct->is_array() && !ct->empty()) {
-        /* The multi-template form: a list of {name, template}. The one named "default" wins,
-         * else the first, which is what every renderer does. */
+        /* The multi-template form, a list of {name, template}: "default" wins, else the first,
+         * as renderers do. */
         for (const json& e : *ct) {
             if (str_or(e, "name", "") == "default") { out.chat_template = str_or(e, "template", ""); break; }
         }
@@ -503,13 +567,9 @@ void read_config_json(const std::string& dir, VocabBuild& out) {
 }
 
 
-/* THE TEMPLATE MAY NOT BE IN tokenizer_config.json AT ALL. Recent transformers versions write it
- * to a standalone chat_template.jinja and omit the key, so a checkpoint saved by one of those
- * converts with NO template at all unless this sibling is read -- and the only symptom is the
- * server answering /v1/chat/completions with 501, a long way from the cause.
- *
- * The file wins where it exists, which is what transformers itself does; in a checkpoint that
- * carries both, the config key is the superseded copy. */
+/* Recent transformers versions write the template to a standalone chat_template.jinja and omit
+ * the config key; without it, /v1/chat/completions answers 501. The file wins over the config
+ * key, as in transformers. */
 void read_chat_template_file(const std::string& dir, VocabBuild& out) {
     const std::string path = dir + "chat_template.jinja";
     std::ifstream f(path);
@@ -544,10 +604,9 @@ int interpret_tokenizer_json(const json& j, uint64_t id_limit, const char* origi
     }
     RAD_TRY(read_model(*model, out, origin, id_limit));
 
-    /* Order matters and it is the file's order: normaliser, then pre-tokeniser, then decoder.
-     * They land in one list because that is what RadVocabHeader holds, and the kind ranges keep
-     * them separable. read_model may already have pushed a ByteFallback step, which belongs
-     * with the pre-tokenisers; it is re-sorted below. */
+    /* One list, as RadVocabHeader holds it: normaliser, pre-tokeniser, then decoder steps, each
+     * in file order; the kind ranges keep them separable. A ByteFallback step pushed by
+     * read_model belongs with the pre-tokenisers and is moved there. */
     std::vector<VocabStep> pre_from_model;
     pre_from_model.swap(out.steps);
 
@@ -562,15 +621,38 @@ int interpret_tokenizer_json(const json& j, uint64_t id_limit, const char* origi
     out.steps.insert(out.steps.end(), pre.begin(),  pre.end());
     out.steps.insert(out.steps.end(), dec.begin(),  dec.end());
 
-    if (const json* a = get(j, "added_tokens")) RAD_TRY(read_added(*a, out, origin, id_limit));
+    if (const json* a = get(j, "added_tokens"))
+        RAD_TRY(read_added(*a, out, origin, id_limit, !norm.empty()));
 
-    /* WHAT `add_special_tokens` ADDS, when the file says it in its post-processor rather than in
-     * tokenizer_config.json. HuggingFace's encode runs the post-processor, so a TemplateProcessing
-     * whose single-sequence template is `<bos> $A <eos>` IS the model's add-BOS-and-EOS rule --
-     * Gemma states it there and nowhere else, and an embedding model fed its input without the
-     * <eos> it was trained to pool over computes a different vector. Only the two shapes that map
-     * onto add_bos / add_eos are read: one special token before the sequence, one after. The
-     * config's own add_bos_token / add_eos_token, read later, win where present. */
+    /* The model's unknown token, by text. The encoder emits it for text no token covers, which
+     * HuggingFace does too; tokenizer_config.json's unk_token, read later, agrees or is absent. */
+    if (out.unk < 0) {
+        const std::string unk = str_or(*model, "unk_token", "");
+        for (size_t i = 0; !unk.empty() && i < out.tokens.size(); ++i)
+            if (out.tokens[i] == unk) { out.unk = (int32_t)i; break; }
+    }
+
+    /* A Strip after Fuse strips the decoded text as a whole. Its start can be stripped as text
+     * streams; its end cannot be taken back once streamed, and two of them would interleave. */
+    {
+        bool fused = false, stripped = false;
+        for (const VocabStep& s : dec) {
+            if (s.kind == RAD_DEC_FUSE) fused = true;
+            if (s.kind != RAD_DEC_STRIP || !fused) continue;
+            if ((s.iarg >> 32) != 0 || stripped) {
+                RAD_ERR("%s: a Strip decoder after Fuse that strips the end of the text, or a "
+                        "second one, is not supported", origin);
+                return RAD_E_UNSUPPORTED;
+            }
+            stripped = true;
+        }
+    }
+
+    /* What `add_special_tokens` adds, when the post-processor says it. HuggingFace's encode runs
+     * the post-processor, so a TemplateProcessing single template `<bos> $A <eos>` is the model's
+     * add-BOS/EOS rule; Gemma states it only there, and an embedding model pools over that <eos>.
+     * Only a special token before and/or after the sequence is read. The config's
+     * add_bos_token / add_eos_token, read later, win where present. */
     if (const json* pp = get(j, "post_processor")) {
         if (str_or(*pp, "type", "") == "TemplateProcessing") {
             const json* single = get(*pp, "single");
@@ -604,15 +686,13 @@ int parse_tokenizer_json_buf(std::string_view text, const char* origin, VocabBui
     out = VocabBuild{};
     out.source = origin;
 
-    /* NO ID PAST THE SIZE OF THE FILE. Ids are dense, so a vocabulary that names one beyond the
-     * number of bytes listing it would leave more ids unused than the file has bytes; bounding
-     * them by it is what bounds the token table they size to a multiple of the input, whatever
-     * the ids claim. */
+    /* No id may exceed the file size in bytes. Ids are dense, so a valid file never needs a
+     * larger one, and the bound keeps the token table proportional to the input. */
     const uint64_t id_limit = text.size();
 
-    /* A value of the wrong JSON type throws out of nlohmann on the first get<>() that meets it.
-     * The reader checks the shapes that decide what is written where; this turns any other one
-     * into the refusal it is rather than into std::terminate in the converter. */
+    /* nlohmann throws on the first get<>() of a value with the wrong JSON type. The reader checks
+     * the shapes that decide where things are written; this turns any other mismatch into a
+     * format error instead of std::terminate. */
     try {
         return interpret_tokenizer_json(j, id_limit, origin, out);
     } catch (const json::exception& e) {
@@ -654,73 +734,71 @@ namespace {
 
 /* `tokenizer.ggml.pre` -> the pre-tokeniser regex list.
  *
- * These are llama.cpp's ADAPTED patterns, copied verbatim from llm_tokenizer_bpe's constructor
- * (06938ac12). Copying rather than deriving is deliberate: the adaptation llama.cpp applied is
- * part of the pattern's identity for a GGUF -- gpt-4o's `((?=[\p{L}])([^a-z]))*` is not o200k's
- * `[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*`, and a GGUF tokenises the way llama.cpp runs it. They
+ * llama.cpp's adapted patterns, copied verbatim from llm_tokenizer_bpe's constructor
+ * (06938ac12). They are copied, not derived, because a GGUF tokenises the way llama.cpp runs
+ * it: gpt-4o's `((?=[\p{L}])([^a-z]))*` is not o200k's `[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*`. They
  * go through the same compiler as a tokenizer.json pattern.
  *
- * The one exception is kimi-k2. llama.cpp spells it `\p{Han}+` and uses that string only as the
- * key of a hand-written splitter approximating Kimi-K2's real pattern; as a regex it would split
- * Han runs and nothing else. The entry is the real pattern, from the model's tokenization_kimi.py,
- * which is what that splitter was written to stand in for.
+ * Exception: kimi-k2. llama.cpp's `\p{Han}+` is only the key of a hand-written splitter that
+ * approximates Kimi-K2's pattern; as a regex it would split only Han runs. The entry here is the
+ * real pattern from the model's tokenization_kimi.py.
  *
- * The list is not exhaustive and does not try to be. A GGUF whose `pre` is not here is REFUSED,
- * with the instruction to convert from tokenizer.json instead -- which is the path that does not
- * depend on this table at all. */
+ * The list is not exhaustive. A GGUF whose `pre` is missing is refused, with the advice to
+ * convert from tokenizer.json. */
 struct PreEntry { const char* name; const char* regex[4]; bool byte_encode; };
 
+/* The patterns several entries share. */
+constexpr const char* kGpt2 =
+    "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)";
+constexpr const char* kLlama3 =
+    "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+constexpr const char* kQwen2 =
+    "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+constexpr const char* kGpt4o =
+    "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))*((?=[\\p{L}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))+((?=[\\p{L}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+constexpr const char* kLines = "[^\\n]+|[\\n]+";
+
 const PreEntry k_pre[] = {
-    { "default", {
-        "[\\p{P}\\$\\+<=>\\^~\\|]+",
-        "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)",
-        "\\p{N}+",
-        "[0-9][0-9][0-9]" }, true },
-    { "llama3", { "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-    { "llama-bpe", { "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-    { "llama-v3",  { "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-    { "falcon3",   { "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-    { "pixtral",   { "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-    { "lfm2",      { "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-    { "dbrx",      { "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-    { "smaug-bpe", { "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-    { "glm4",      { "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-    { "chatglm-bpe", { "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-
-    { "gpt-2", { "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)" }, true },
-    { "phi-2", { "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)" }, true },
-    { "mpt",   { "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)" }, true },
-    { "olmo",  { "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)" }, true },
-    { "jais",  { "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)" }, true },
-    { "trillion", { "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)" }, true },
-    { "granite-docling", { "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)" }, true },
-
-    { "starcoder", { "\\p{N}", "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)" }, true },
-    { "refact",    { "\\p{N}", "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)" }, true },
-    { "command-r", { "\\p{N}", "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)" }, true },
-    { "smollm",    { "\\p{N}", "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)" }, true },
-    { "codeshell", { "\\p{N}", "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)" }, true },
-    { "exaone",    { "\\p{N}", "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)" }, true },
-    { "minerva-7b",{ "\\p{N}", "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)" }, true },
-
-    { "qwen2",            { "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-    { "stablelm2",        { "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-    { "deepseek-r1-qwen", { "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-    { "hunyuan",          { "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-    { "solar-open",       { "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-    { "grok-2",           { "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-
-    { "qwen35",           { "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-
-    { "gpt-4o",     { "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))*((?=[\\p{L}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))+((?=[\\p{L}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-    { "llama4",     { "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))*((?=[\\p{L}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))+((?=[\\p{L}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-    { "tekken",     { "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))*((?=[\\p{L}])([^A-Z]))+|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))+((?=[\\p{L}])([^A-Z]))*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-
+    { "default", { "[\\p{P}\\$\\+<=>\\^~\\|]+", kGpt2, "\\p{N}+", "[0-9][0-9][0-9]" }, true },
+    { "llama3", { kLlama3 }, true },
+    { "llama-bpe", { kLlama3 }, true },
+    { "llama-v3", { kLlama3 }, true },
+    { "falcon3", { kLlama3 }, true },
+    { "pixtral", { kLlama3 }, true },
+    { "lfm2", { kLlama3 }, true },
+    { "dbrx", { kLlama3 }, true },
+    { "smaug-bpe", { kLlama3 }, true },
+    { "glm4", { kLlama3 }, true },
+    { "chatglm-bpe", { kLlama3 }, true },
+    { "gpt-2", { kGpt2 }, true },
+    { "phi-2", { kGpt2 }, true },
+    { "mpt", { kGpt2 }, true },
+    { "olmo", { kGpt2 }, true },
+    { "jais", { kGpt2 }, true },
+    { "trillion", { kGpt2 }, true },
+    { "granite-docling", { kGpt2 }, true },
+    { "starcoder", { "\\p{N}", kGpt2 }, true },
+    { "refact", { "\\p{N}", kGpt2 }, true },
+    { "command-r", { "\\p{N}", kGpt2 }, true },
+    { "smollm", { "\\p{N}", kGpt2 }, true },
+    { "codeshell", { "\\p{N}", kGpt2 }, true },
+    { "exaone", { "\\p{N}", kGpt2 }, true },
+    { "minerva-7b", { "\\p{N}", kGpt2 }, true },
+    { "qwen2", { kQwen2 }, true },
+    { "stablelm2", { kQwen2 }, true },
+    { "deepseek-r1-qwen", { kQwen2 }, true },
+    { "hunyuan", { kQwen2 }, true },
+    { "solar-open", { kQwen2 }, true },
+    { "grok-2", { kQwen2 }, true },
+    { "qwen35", { "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
+    { "gpt-4o", { kGpt4o }, true },
+    { "llama4", { kGpt4o }, true },
+    { "tekken", { "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))*((?=[\\p{L}])([^A-Z]))+|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))+((?=[\\p{L}])([^A-Z]))*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
     { "seed-coder", { "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1}| ?[^\\s\\p{L}\\p{N}\\r\\n]+|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
-    { "kimi-k2",    { "[\\p{Han}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
+    { "kimi-k2", { "[\\p{Han}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" }, true },
     { "whitespace", { "\\S+" }, false },
-    { "gemma4",     { "[^\\n]+|[\\n]+" }, false },
-    { "sarvam-moe", { "[^\\n]+|[\\n]+" }, false },
+    { "gemma4", { kLines }, false },
+    { "sarvam-moe", { kLines }, false },
 };
 
 }  /* namespace */
@@ -772,8 +850,7 @@ int vocab_from_gguf(const GgufFile& g, VocabBuild& out) {
         const PreEntry* e = nullptr;
         for (const PreEntry& p : k_pre) if (pre == p.name) { e = &p; break; }
         if (!e) {
-            /* This is the refusal spec §12 asks for. llama.cpp would fall back to `default` here
-             * and produce plausible text with wrong boundaries; we would rather not run. */
+            /* Refused per spec §12; llama.cpp falls back to `default` and splits wrongly. */
             RAD_ERR("gguf: tokenizer.ggml.pre = '%s' is not in this build's table, and guessing "
                     "would give a silently different split. Convert from the model's "
                     "tokenizer.json instead, which needs no table.", pre.c_str());
@@ -797,85 +874,49 @@ int vocab_from_gguf(const GgufFile& g, VocabBuild& out) {
             out.steps.push_back(d);
         } else {
             /* SPM-shaped BPE: the vocab is raw UTF-8 with U+2581 for space. */
-            VocabStep s;
-            s.kind = RAD_PRE_METASPACE;
-            s.arg0 = "\xe2\x96\x81";
-            s.iarg = 2;
-            out.steps.push_back(s);
-            VocabStep d;
-            d.kind = RAD_DEC_METASPACE;
-            d.arg0 = "\xe2\x96\x81";
-            d.iarg = 2;
-            out.steps.push_back(d);
+            out.steps.push_back(metaspace(RAD_PRE_METASPACE));
+            out.steps.push_back(metaspace(RAD_DEC_METASPACE));
         }
 
         std::vector<std::string> merges;
         g.get_strs("tokenizer.ggml.merges", &merges);
-        std::unordered_map<std::string, uint32_t> id_of;
-        id_of.reserve(out.tokens.size() * 2);
-        for (size_t i = 0; i < out.tokens.size(); ++i) id_of.emplace(out.tokens[i], (uint32_t)i);
-
-        size_t dropped = 0;
+        MergeIds ids(out.tokens);
         out.merges.reserve(merges.size());
-        for (const std::string& m : merges) {
-            const size_t sp = m.find(' ');
-            if (sp == std::string::npos) { ++dropped; continue; }
-            auto l = id_of.find(m.substr(0, sp));
-            auto r = id_of.find(m.substr(sp + 1));
-            if (l == id_of.end() || r == id_of.end()) { ++dropped; continue; }
-            out.merges.emplace_back(l->second, r->second);
-        }
-        if (dropped)
-            RAD_WARN("gguf: %zu of %zu merges dropped (a half is not a token); token boundaries "
-                     "may differ from the reference tokeniser", dropped, merges.size());
+        for (const std::string& m : merges) ids.add_spaced(m, out);
+        if (ids.dropped)
+            RAD_WARN("gguf: %zu of %zu merges dropped (one side of the merge is not a token); "
+                     "token boundaries may differ from the reference tokeniser",
+                     ids.dropped, merges.size());
     } else if (model == "llama") {
         out.kind = RAD_TOK_BPE;
-        /* SPM proper: whitespace escaped to U+2581, byte fallback for the rest. Expressed as
-         * steps so the runtime has no per-model branch. */
-        VocabStep m;
-        m.kind = RAD_PRE_METASPACE;
-        m.arg0 = "\xe2\x96\x81";
-        m.iarg = 2;
-        out.steps.push_back(m);
+        /* SPM: whitespace escaped to U+2581, byte fallback for the rest, expressed as steps so
+         * the runtime has no per-model branch. */
+        out.steps.push_back(metaspace(RAD_PRE_METASPACE));
         VocabStep bf;
         bf.kind = RAD_PRE_BYTE_FALLBACK;
         out.steps.push_back(bf);
-        VocabStep d;
-        d.kind = RAD_DEC_METASPACE;
-        d.arg0 = "\xe2\x96\x81";
-        d.iarg = 2;
-        out.steps.push_back(d);
-        RAD_WARN("gguf: '%s' is a SentencePiece vocab and this build tokenises it as BPE over the "
-                 "same pieces. That is right for the vocabs that ship as GGUF today and it is "
-                 "not the SPM bigram algorithm; convert from tokenizer.json to be sure.",
+        out.steps.push_back(metaspace(RAD_DEC_METASPACE));
+        RAD_WARN("gguf: '%s' is a SentencePiece vocab, tokenised as BPE over its pieces rather "
+                 "than by the SPM bigram algorithm; convert from tokenizer.json for an exact match",
                  model.c_str());
     } else if (model == "t5") {
         out.kind = RAD_TOK_UNIGRAM;
-        VocabStep m;
-        m.kind = RAD_PRE_METASPACE;
-        m.arg0 = "\xe2\x96\x81";
-        m.iarg = 2;
-        out.steps.push_back(m);
-        VocabStep d;
-        d.kind = RAD_DEC_METASPACE;
-        d.arg0 = "\xe2\x96\x81";
-        d.iarg = 2;
-        out.steps.push_back(d);
+        out.steps.push_back(metaspace(RAD_PRE_METASPACE));
+        out.steps.push_back(metaspace(RAD_DEC_METASPACE));
     } else if (model == "bert") {
         out.kind = RAD_TOK_WORDPIECE;
         VocabStep n;
         n.kind = RAD_NORM_LOWERCASE;
         out.steps.push_back(n);
+        /* BertPreTokenizer and the WordPiece decoder, as a BERT tokenizer.json declares them. */
         VocabStep w;
-        w.kind = RAD_PRE_WHITESPACE;
+        w.kind  = RAD_PRE_WHITESPACE;
+        w.flags = kPreBert;
         out.steps.push_back(w);
-        VocabStep p;
-        p.kind = RAD_PRE_PUNCTUATION;
-        p.iarg = 1;
-        out.steps.push_back(p);
         VocabStep d;
-        d.kind = RAD_DEC_REPLACE;
-        d.arg0 = "##";
+        d.kind  = RAD_DEC_REPLACE;
+        d.arg0  = "##";
+        d.flags = kDecWordPiece | kDecWordPieceCleanup;
         out.steps.push_back(d);
     } else {
         RAD_ERR("gguf: tokenizer.ggml.model = '%s' is not implemented", model.c_str());
@@ -906,8 +947,8 @@ int vocab_serialize(const VocabBuild& in, StringSink& strings, uint64_t off,
     if (in.tokens.size() > UINT32_MAX || in.merges.size() > UINT32_MAX ||
         in.steps.size() > UINT32_MAX) return RAD_E_INVAL;
 
-    /* Every string goes into the file's one blob and only its offset is stored here, per
-     * rad_format.h. That is what makes the section fixed-stride and mmap-walkable. */
+    /* Strings go into the file's one blob and only their offsets are stored here (rad_format.h),
+     * so the section is fixed-stride and mmap-walkable. */
     std::vector<rad_stroff> tok_off(in.tokens.size());
     for (size_t i = 0; i < in.tokens.size(); ++i) tok_off[i] = strings.intern(in.tokens[i]);
 
@@ -935,8 +976,9 @@ int vocab_serialize(const VocabBuild& in, StringSink& strings, uint64_t off,
     h.flags = in.ignore_merges ? RAD_VOCAB_IGNORE_MERGES : 0;
     out.resize(sizeof(RadVocabHeader), 0);
 
-    /* Each array is aligned to its own element so a mapped reader can point a typed pointer at
-     * it. RAD_ALIGN_SUB would be enough for the container's rules; 8 is what the types need. */
+    /* Each array is aligned to its element type so a mapped reader can use a typed pointer.
+     * The largest alignment needed is 8; the container's own rule would only require
+     * RAD_ALIGN_SUB. */
     auto place = [&](size_t align, const void* p, size_t bytes) -> uint64_t {
         pad_to(out, (size_t)off, align);
         const uint64_t at = off + out.size();
@@ -972,9 +1014,8 @@ int vocab_deserialize(const void* file_base, uint64_t file_bytes, const RadVocab
     const char* strs = nullptr;
     uint64_t str_bytes = 0;
     {
-        /* The string blob's extent comes from the file header, which sits at offset 0. Reading
-         * it here rather than taking it as an argument keeps the caller from having to keep the
-         * two in sync. */
+        /* The string blob's extent is read from the file header at offset 0 rather than passed
+         * in, so the caller cannot pass a mismatched one. */
         if (file_bytes < sizeof(RadFileHeader)) return RAD_E_FORMAT;
         const RadFileHeader* fh = reinterpret_cast<const RadFileHeader*>(base);
         if (fh->str_off + fh->str_bytes > file_bytes) return RAD_E_FORMAT;

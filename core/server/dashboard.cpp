@@ -1,22 +1,16 @@
 /* core/server/dashboard.cpp -- the web view of a running engine.
  *
- * Two routes: `/` serves a page, `/stats` serves the JSON it polls. Nothing else, and no
- * framework: the page is a string literal in this file, so there is no asset directory to install,
- * no build step that can go stale against the binary, and no network fetch at all. This engine is
- * deployed on machines with no route to a CDN, and a dashboard that renders blank without one is
- * a dashboard that does not exist.
+ * `/` serves the page and `/stats` the JSON it polls (plus `/sessions` and `/graph`). No
+ * framework: the page is a string literal in this file, so there is no asset directory, no build
+ * step that can go stale against the binary, and no network fetch; the engine runs on machines
+ * with no route to a CDN.
  *
- * WHY IT IS NOT JUST /metrics. Prometheus exposition is the right answer for an operator who has
- * a Prometheus, and this server serves it. It is the wrong answer for the question
- * being asked here -- "what is this process doing right now" -- because getting to that answer
- * costs a scrape config, a time-series database and a Grafana dashboard somebody has to build.
- * The engine already has a terminal view for exactly this (liveview.h, spec §16); this is the
- * same snapshot in a browser, which is where it can be looked at from another machine.
+ * /metrics serves Prometheus, but answering "what is this process doing right now" from it needs a
+ * scrape config, a time-series database and a Grafana dashboard. This is the terminal view's
+ * snapshot (liveview.h, spec §16) in a browser, viewable from another machine.
  *
- * THE PER-POSITION DRAFT PANEL IS THE POINT. Everything else here is visible in some other tool.
- * The conditional acceptance at each draft position is not: it is in SchedMetrics and in /metrics
- * as a labelled gauge, and no ordinary reading of either shows that one late position collapsed
- * while the pooled rate stayed plausible. As a bar chart it is the first thing seen.
+ * The per-position draft panel shows what no pooled metric does: one late draft position
+ * collapsing while the pooled acceptance rate stays plausible.
  */
 #include "server.h"
 
@@ -30,22 +24,17 @@ namespace rad {
 namespace server {
 
 /* ================================================================== /stats */
-/* One object, polled. It carries the scheduler's metrics, the per-position draft table and
- * whatever the engine's snapshot function could see -- and it is deliberately NOT a stable
- * public API: /metrics is that, with vLLM's names, and this is free to say whatever the page
- * needs. A client automating against radiance should scrape /metrics.
+/* One polled object: the scheduler's metrics, the per-position draft table and whatever the
+ * engine's snapshot function provides. Not a stable public API; automation should scrape /metrics.
  *
- * DERIVED RATES ARE THE PAGE'S JOB, not this handler's. Tokens a second and milliseconds a step
- * are differences of counters over wall time, and the browser has both endpoints of the interval
- * while this handler has neither -- computing them here would mean holding per-client state for
- * something the client can subtract. */
+ * Derived rates are the page's job: they are counter differences over wall time, and only the
+ * browser holds both ends of its poll interval. Computing them here would need per-client state. */
 
 /* ------------------------------------------------------------------ /sessions
  *
- * ITS OWN ROUTE, not a field in /stats. The dashboard polls /stats every second and a stored
- * session changes on the scale of its idle thresholds -- tens of seconds at the fastest. Folding
- * a table of conversations into the per-second poll would carry the same bytes a hundred times
- * for each change in them, and the view that reads it is not even on screen most of the time. */
+ * A separate route, not a /stats field: /stats is polled every second, while a stored session
+ * changes on the scale of its idle thresholds (tens of seconds at the fastest), and the view that
+ * reads this is usually off screen. */
 HttpResponse Server::handle_sessions(const HttpRequest&) {
     json o;
     std::vector<SessionStat> v;
@@ -67,9 +56,8 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
         e["on_device"] = s.on_device;
         e["on_host"]   = s.on_host;
         e["moving"]    = s.moving;
-        /* THE RECURRENT HALF. On a hybrid model a session's attention blocks are only part of
-         * what it needs back; the rest is its linear-state snapshots, which are a different size
-         * of object in a different store, in host memory. */
+        /* On a hybrid model a session also needs its linear-state snapshots back: a different
+         * object size, kept in a separate store in host memory. */
         e["snapshots"]   = s.snapshots;
         e["snap_bytes"]  = s.snap_bytes;
         e["resume_tokens"] = s.resume_tokens;
@@ -79,19 +67,15 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
         bytes += s.bytes;
     }
     o["sessions"] = std::move(a);
-    /* SAID HERE SO A READER DOES NOT HAVE TO INFER IT. Two sessions sharing a system prompt share
-     * the blocks for it, so these per-session sizes overlap and adding them up over-counts -- on
-     * a server carrying long agent transcripts by more than an order of magnitude. The field
-     * names say so rather than pretending the sums are totals. */
+    /* Sessions sharing a prefix share its blocks, so these sums over-count (by more than an order
+     * of magnitude with long agent transcripts); the field names say so. */
     o["blocks_sum_overlapping"] = { { "device", dev }, { "host", host } };
     o["snapshots_sum_overlapping"] = snaps;
     o["bytes_sum_overlapping"] = bytes;
     const SchedMetrics sm = deps_.sched ? deps_.sched->metrics() : SchedMetrics{};
-    /* AND THE ONE FIGURE THAT IS NOT A SUM, because a view about what the conversations cost has
-     * to be able to say what the card is actually holding. The pool counts a block once however
-     * many sessions name it, which is the number an operator is asking for and the only one the
-     * per-session rows cannot be made to yield. One group's, the binding one -- see
-     * SchedMetrics::kv_tokens_used for why tokens across paged groups are not additive. */
+    /* What the card actually holds: the pool counts a block once however many sessions name it,
+     * which the per-session rows cannot yield. Tokens are the binding group's only; see
+     * SchedMetrics::kv_tokens_used for why paged groups are not additive. */
     o["pool"] = { { "tokens_used",     sm.kv_tokens_used },
                   { "tokens_total",    sm.kv_tokens_total },
                   { "unshared_tokens", sm.kv_tokens_cached },
@@ -101,31 +85,36 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
         deps_.sched ? deps_.sched->tier_counters() : IScheduler::TierCounters{};
     o["moved"] = { { "to_host", c.to_host }, { "dropped", c.dropped },
                    { "promoted", c.promoted }, { "host_drops", c.host_drops },
+                   { "held_back", c.held_back },
                    { "failures", c.failures } };
-    /* THE SNAPSHOT STORE, on a hybrid model: what one snapshot costs and how many the store
-     * holds. `bytes_each` is 0 on a model with no recurrent state. */
+    /* Snapshot store on a hybrid model: bytes per snapshot and slot count. `bytes_each` is 0
+     * on a model with no recurrent state. */
     o["snapshot_store"] = { { "bytes_each", c.ck_bytes }, { "slots", c.ck_slots } };
-    /* WHAT --prefix-cache-ttl TOOK, entries and snapshots, from whichever tier held them. */
+    /* Entries and snapshots removed by --prefix-cache-ttl, from whichever tier held them. */
     o["expired"] = { { "entries", sm.prefix_expired }, { "snapshots", sm.prefix_ckpt_expired } };
-    /* THE STEP THREAD'S TIME ON THE TIERS: every request waits through it. */
+    /* Step-thread time spent on tier moves; every request waits through it. */
     o["stall"] = { { "restores", c.restores }, { "restore_ms", (double)c.restore_ns / 1e6 },
                    { "flushes", c.flushes }, { "flush_ms", (double)c.flush_ns / 1e6 } };
-    /* AND WHETHER ANY OF IT IS BEING READ. Moving a snapshot and restoring it proves the bytes
-     * travelled; this is the number that says a lookup then SERVED one. A hybrid server can move
-     * snapshots all day and still replay from token zero if the checkpoint the restore put back
-     * is not the one a hit can reach. */
+    /* Whether restored snapshots are served. A hybrid server can move snapshots and still replay
+     * from token zero if the restored checkpoint is not one a hit can reach. */
     o["linear"] = { { "hit_rate", sm.linear_hit_rate },
                     { "cached_tokens", sm.linear_cached_tokens },
-                    { "checkpoints_written", sm.checkpoints_written } };
-    /* WHETHER ANYTHING MOVES, which is not whether anything is STORED. A session is recorded
-     * whether or not it can be demoted, so a non-empty table says only that something is held;
-     * these say whether a tier exists that can move it. */
+                    { "checkpoints_written", sm.checkpoints_written },
+                    { "evictions", { { "retention", sm.prefix_ckpt_retired },
+                                     { "store_full", sm.prefix_ckpt_lru } } },
+                    { "refused", sm.prefix_ckpt_refused },
+                    { "hit_cuts", { { "no_snapshot", sm.hit_cut_no_snapshot },
+                                    { "windowed_group", sm.hit_cut_window },
+                                    { "adopt_failed", sm.hit_cut_adopt } } },
+                    { "hit_cut_tokens", sm.hit_cut_tokens } };
+    /* Whether a tier exists to move sessions to. A session is recorded whether or not it can be
+     * demoted, so a non-empty table only says something is held. */
     o["tiers"] = { { "host", c.host_on } };
-    /* WHAT IS OFF THE CARD, counted once -- see SessionOccupancy. */
+    /* Off-card bytes, counted once; see SessionOccupancy. */
     o["occupancy"] = { { "host_bytes", occ.host_bytes },
                        { "host_cap_bytes", occ.host_cap_bytes } };
-    /* THE ATTENTION HIT RATE, for a model with no recurrent state, where it is the whole answer
-     * to how much of the prompt the cache served. On a hybrid model `linear.hit_rate` is. */
+    /* The attention hit rate: the whole answer on a model with no recurrent state. On a hybrid
+     * model, read `linear.hit_rate`. */
     o["prefix_hit_rate"] = sm.prefix_hit_rate;
     o["enabled"] = c.host_on;
     return HttpResponse::json_body(200, json_dump(o));
@@ -148,34 +137,36 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["kv_util"]         = m.kv_util;
         o["kv_tokens_used"]  = m.kv_tokens_used;
         o["kv_tokens_total"] = m.kv_tokens_total;
-        /* AND THE PART OF `used` THAT NO RUNNING REQUEST IS READING. Held is held, so a finished
-         * turn's blocks are in the figure above for exactly as long as the cache keeps them --
-         * and on a server carrying conversations that is most of a full pool. Without the split
-         * a cache doing its job and a pool that never releases draw the same bar. */
+        /* The part of `used` no running request reads: cached blocks of finished turns. Without
+         * the split, a working cache and a pool that never releases look the same. */
         o["kv_tokens_cached"] = m.kv_tokens_cached;
-        /* THE POOL IN BYTES BESIDE THE POOL IN TOKENS, because they answer different questions and
-         * only one of them is about the card. Tokens say how much context fits; bytes say how much
-         * VRAM is being held, which is what a reader comparing the cache against the weights and
-         * against the card's total is asking. The two are not a unit conversion of each other:
-         * tokens are the binding paged group's and bytes are every group's, recurrent included. */
+        /* The pool in bytes beside tokens: tokens say how much context fits, bytes how much VRAM
+         * is held. Not a unit conversion: tokens are the binding paged group's, bytes are every
+         * group's, recurrent included. */
         o["kv_bytes_used"]   = (double)m.kv_bytes_used;
         o["kv_bytes_total"]  = (double)m.kv_bytes_total;
         o["kv_bytes_carved"] = (double)m.kv_bytes_carved;
         o["kv_tokens_max"]   = m.kv_tokens_max;
         o["prefix_hit_rate"] = m.prefix_hit_rate;
-        /* The leading indicator beside the lagging one: past ~75% kv utilisation the cache
-         * begins dropping prefixes the next turn wants, and the hit rate only falls once
-         * that has happened. An agent turn that re-prefills from scratch costs orders of
-         * magnitude more than one that resumes from the cache. */
+        /* Leading indicator beside the lagging hit rate: past ~75% kv utilisation the cache
+         * starts dropping prefixes the next turn wants. */
         o["prefix_evictions"] = (double)m.prefix_evictions;
-        /* THE LINEAR HALF, WHICH THE ATTENTION HIT RATE SAYS NOTHING ABOUT. On a hybrid model a
-         * prompt can be 100% attention-cached and still re-run every recurrent layer over its
-         * whole prefix, because the two hit at different granularities. Without these a
-         * deployment cannot tell whether linear checkpointing is working at all. Zero throughout
-         * on a model with no recurrent state. */
+        /* Linear-state caching, separate from the attention hit rate: a hybrid prompt can be
+         * fully attention-cached and still re-run every recurrent layer over its prefix, since
+         * the two hit at different granularities. Zero on a model with no recurrent state. */
         o["linear_hit_rate"] = m.linear_hit_rate;
         o["linear_cached_tokens"] = (double)m.linear_cached_tokens;
         o["checkpoints_written"] = (double)m.checkpoints_written;
+        /* Why snapshots went and why hits reused nothing: on a hybrid model these say why a
+         * long prompt was prefilled again. `hit_cut_tokens` is the checkpoint shortfall,
+         * prompt tokens the attention cache held and admission computed again. */
+        o["ckpt_evictions"]  = { { "retention", m.prefix_ckpt_retired },
+                                 { "store_full", m.prefix_ckpt_lru } };
+        o["ckpt_refused"]    = m.prefix_ckpt_refused;
+        o["hit_cuts"]        = { { "no_snapshot", m.hit_cut_no_snapshot },
+                                 { "windowed_group", m.hit_cut_window },
+                                 { "adopt_failed", m.hit_cut_adopt } };
+        o["hit_cut_tokens"]  = (double)m.hit_cut_tokens;
         o["prefill_tps"]     = m.prefill_tps;
         o["decode_tps"]      = m.decode_tps;
         o["draft_accept"]    = m.draft_acceptance;
@@ -186,18 +177,15 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["steps_mixed"]     = m.steps_mixed;
         o["prefill_chunks_capped"] = m.prefill_chunks_capped;
         o["steps_decode"]    = m.steps_decode;
-        /* WHAT THE STEPS COST, so the page does not have to divide wall clock by a step count.
-         * That is the derivation this handler's header calls the page's job, and it is the one
-         * derivation the page cannot do: the browser's two endpoints bracket the engine's IDLE
-         * time as well as its work, and an agent client is idle between turns. See
-         * SchedMetrics::step_ns. */
+        o["steps_held"]      = m.steps_held;
+        /* Time inside steps. The one rate the page cannot derive: wall clock between polls also
+         * covers idle time (see SchedMetrics::step_ns). */
         o["step_ns"]         = m.step_ns;
         o["step_ns_decode"]  = m.step_ns_decode;
         o["rows_unspec"]     = m.decode_rows_unspeculated;
 
-        /* THE CONDITIONAL RATE AT EACH POSITION, with the reach count beside it. Both are needed
-         * and neither alone means anything: a position with a rate of 0.0 and a reach of 3 is
-         * noise, and one with a rate of 0.0 and a reach of 40000 is a broken draft round. */
+        /* Conditional rate per position with its reach count: a rate of 0.0 over a reach of 3 is
+         * noise, over a reach of 40000 a broken draft round. */
         json pos = json::array();
         for (int j = 0; j < m.draft_depth_seen && j < SchedMetrics::MAX_DRAFT_POS; ++j) {
             json p;
@@ -209,9 +197,8 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         }
         o["draft_positions"] = std::move(pos);
 
-        /* THE LIVE REQUEST TABLE. Counters and timestamps, not rates the page could not check:
-         * `decode_tps` is this request's own average since its first token, which is the number
-         * that stays meaningful when a request has been running for four minutes. */
+        /* Live request table: counters and timestamps. `decode_tps` is the request's own average
+         * since its first token. */
         std::vector<RequestStat> rq;
         deps_.sched->requests(&rq);
         json reqs = json::array();
@@ -237,9 +224,8 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["requests"] = std::move(reqs);
     }
 
-    /* The engine's half. Absent when nothing supplied a snapshot function, in which case the page
-     * omits the panels rather than drawing zeroes -- an empty VRAM bar reads as "no memory used",
-     * which is a much worse answer than no bar. */
+    /* The engine's snapshot. Absent without a snapshot function, and the page then omits those
+     * panels rather than drawing zeroes (an empty VRAM bar would read as "no memory used"). */
     if (deps_.live) {
         LiveSnapshot s;
         deps_.live(s);
@@ -259,11 +245,8 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         }
         o["cards"] = std::move(cards);
 
-        /* THE EXPERT PANEL'S DATA. The plane is the picture; everything beside it is what the
-         * picture cannot say -- how much of the model is resident in BYTES, whether the residency
-         * is spread across layers or piled into the first ones, and whether the move traffic is
-         * discovery or thrash. Counted in the engine (liveview.h), not here and not in the page:
-         * three tallies of one snapshot is three chances to disagree. */
+        /* Expert panel data (see ExpertPlane in liveview.h). Tallied once in the engine, not here
+         * or in the page, so all views agree. */
         if (s.experts.n_layers > 0 && s.experts.n_experts > 0) {
             json e;
             e["n_layers"]   = s.experts.n_layers;
@@ -273,8 +256,7 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             e["bytes"]      = s.experts.total_bytes;
             e["movable"]    = s.experts.movable;
             e["heat"]       = s.experts.heat_enabled;
-            /* One row per tier, named -- the page must not hold its own copy of the enum's order,
-             * which is the kind of duplication that survives a reordering and then lies. */
+            /* One named row per tier, so the page holds no copy of the enum's order. */
             json tiers = json::array();
             for (int t = 0; t < kTierCount; ++t) {
                 json r;
@@ -309,8 +291,7 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             o["experts"] = std::move(e);
         }
 
-        /* THE LINK. Cumulative byte counters and nothing derived: both ends of the poll interval
-         * are in the browser and neither is here, exactly as for step time above. */
+        /* Link traffic: cumulative byte counters only; the page derives rates. */
         if (s.link.present) {
             json l;
             l["world"]          = s.link.world;
@@ -340,21 +321,17 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         }
     }
 
-    /* No metrics_.observe_http here, and the same reasoning as /health: a page polling twice a
-     * second would make request_success_total a statement about the dashboard. */
+    /* Not counted in metrics_.observe_http, as for /health: a page polling twice a second would
+     * make the request counters describe the dashboard. */
     return HttpResponse::json_body(200, json_dump(o));
 }
 
 
 /* ================================================================== /graph */
-/* THE DECLARED COMPUTE GRAPH: every op, its bucket table, the kernel that resolved each band, the
- * library it came from, the constraints it matched on and the chain it stands in for.
- *
- * `--debug-graph` prints all of this, but printing it is not the same as being able to look at it:
- * the text dump answers the question on a terminal, at startup, on the machine the engine is on.
- * This is the same walk (dump_graph_json shares every helper with the text one) served from the
- * process that is actually running, which is where the question is usually asked. Static after
- * declare, so it is rendered once and handed over. */
+/* The declared compute graph: every op, its bucket table, the kernel that resolved each band, its
+ * library, the constraints it matched and the chain it stands in for. The same walk as
+ * `--debug-graph` (dump_graph_json shares its helpers), served from the running process. Static
+ * after declare, so it is rendered once. */
 HttpResponse Server::handle_graph(const HttpRequest& req) {
     if (!opt_.graph_json)
         return error_response(err_not_implemented(
@@ -367,21 +344,16 @@ HttpResponse Server::handle_graph(const HttpRequest& req) {
 }
 
 /* ================================================================== the page */
-/* One string. It is long, and every alternative is worse: a file on disk is a file that can be
- * missing or stale against the binary, a generated header is a build step, and a framework is a
- * network fetch. It parses no untrusted input -- every value it renders comes from /stats on the
- * same origin and goes in through textContent or a numeric attribute, never innerHTML.
+/* One string, so it cannot go missing or stale against the binary and needs no build step or
+ * network fetch. It parses no untrusted input: every value comes from same-origin /stats and goes
+ * in through textContent or a numeric attribute, never innerHTML.
  *
- * IT IS BUILT ONCE AND UPDATED IN PLACE. A dashboard that rebuilds its DOM twice a second lays
- * the document out twice a second, drops the reader's text selection every time, and flickers --
- * and it does that on the machine the engine is being watched from. Elements are created when
- * their SHAPE changes (a different draft depth, a different card count) and after that only
- * textContent and one style property are written.
+ * Built once and updated in place: elements are created only when a panel's shape changes (draft
+ * depth, card count); after that only textContent and one style property are written. Rebuilding
+ * the DOM every poll would relayout, flicker and drop the reader's text selection.
  *
- * The design rules are the terminal view's (spec §16) in a browser: a number nobody sampled is
- * blank rather than zero, a section with no data is hidden rather than empty, and nothing moves
- * that is not actually changing. Black, one weight, one accent -- the numbers are the content and
- * everything else on the page is there to not compete with them. */
+ * Display rules: an unsampled number is blank, not zero; a section without data is hidden;
+ * nothing moves that is not changing. Black, one weight, one accent. */
 static const char* const kPage = R"HTML(<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -2996,8 +2968,8 @@ HttpResponse Server::handle_dashboard(const HttpRequest&) {
     r.status = 200;
     r.content_type = "text/html; charset=utf-8";
     r.body = kPage;
-    /* No caching: the page and the binary ship together, so a browser holding yesterday's copy
-     * against today's /stats is a shape mismatch with no symptom other than blank panels. */
+    /* No caching: the page must match the binary's /stats shape, and a stale copy shows only
+     * blank panels. */
     r.set_header("Cache-Control", "no-store");
     return r;
 }

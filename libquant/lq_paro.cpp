@@ -1,34 +1,32 @@
 /* lq_paro.cpp -- ParoQuant: pairwise rotation quantisation (Liang, Chen, Han, Liu; ICLR 2026).
  *
- * WHAT IT DOES. An outlier channel stretches the range of every scale group it sits in. ParoQuant
- * transforms each row's input channels before the grid -- a channel-wise scaling, then `stages`
- * rounds of independent Givens rotations, each a set of disjoint channel pairs inside one rotation
- * group of `rot_group` channels -- so the values of a group even out, and LEARNS the angles and the
- * scales against the output error. The reader undoes the transform on the activation side: the
- * encoding's transform is "givens" (abi/rad_encoding.h), T = D . G_1 ... G_S over row vectors, with
- * the scales, the pairs and the angles stored as its tables.
+ * An outlier channel stretches the range of every scale group it sits in. ParoQuant transforms each
+ * row's input channels before the grid (a channel-wise scaling, then `stages` rounds of independent
+ * Givens rotations, each a set of disjoint channel pairs within one group of `rot_group` channels)
+ * so a group's values even out, and learns the angles and scales against the output error. The
+ * reader undoes the transform on the activation side: the encoding's transform is "givens"
+ * (abi/rad_encoding.h), T = D . G_1 ... G_S over row vectors, with scales, pairs and angles stored
+ * as its tables.
  *
- * STAGE ONE fits the transform: Adam at `lr` (cosine-decayed to a twentieth, no weight decay) over
- * `steps` steps, each on the next `sample_rows` rows of the weight, the angles starting at zero and
- * the scales at one, as the paper's. The weight is quantised through the grid at every step and the gradient
- * reaches the transform through the straight-through estimator: w_hat = w + E T^-1, the
- * quantisation error E held, so a step moves T^-1 to send E where the input does not look.
- * STAGE TWO is the paper's fine-tuning of the transformed weight's rounding and scales; here it is
- * AutoRound (lq_autoround.h) on the transformed weight against the transformed Hessian
- * T^-1 H T^-T, for `iters` steps -- 0 leaves the transformed weight rounded to nearest.
+ * Stage one fits the transform with Adam at `lr` (cosine-decayed to lr/20, no weight decay) over
+ * `steps` steps, each on the next `sample_rows` rows; angles start at zero and scales at one, as in
+ * the paper. Each step quantises through the grid and the gradient reaches the transform by the
+ * straight-through estimator: w_hat = w + E T^-1 with the quantisation error E held, so a step
+ * moves T^-1 to send E where the input does not look.
+ * Stage two replaces the paper's fine-tuning of rounding and scales with AutoRound
+ * (lq_autoround.h) on the transformed weight against T^-1 H T^-T, for `iters` steps; 0 rounds the
+ * transformed weight to nearest.
  *
- * THE PAIRS are drawn at random inside each rotation group, a channel paired at most once a stage
- * and a pair, where the group allows, used at most once over all stages -- the paper's diverse
- * independent rotations -- from a generator seeded by the weight's name, so two converts of the
- * same weight draw the same pairs.
+ * Pairs are drawn at random within each rotation group: a channel is paired at most once per stage
+ * and, where the group allows, a pair is used at most once over all stages (the paper's diverse
+ * independent rotations). The generator is seeded by the weight's name, so converts are repeatable.
  *
- * THE OUTPUT ERROR is the Hessian's quadratic form (lq_hess.h) in the weight's own domain -- the
- * layer-local form of the paper's per-layer output loss -- or, with no Hessian for the weight but
- * an imatrix, its diagonal. With neither the transform stays the identity, which is said.
+ * Output error: the Hessian's quadratic form (lq_hess.h) in the weight's own domain, the
+ * layer-local form of the paper's loss; with no Hessian but an imatrix, its diagonal. With neither,
+ * the transform stays the identity (reported on stderr).
  *
- * DETERMINISM: every gradient is summed over rows in row order, whatever the thread count, so the
- * transform -- and with it the stored file -- is a function of the weight and the calibration
- * alone.
+ * Determinism: gradients are summed over rows in row order regardless of thread count, so the
+ * stored file depends only on the weight and the calibration.
  */
 #include "lq_autoround.h"
 #include "lq_hess.h"
@@ -73,10 +71,10 @@ int paro_setup(const RadParam* o, int n_o, const RadQuantWeight* w, Paro* p) {
     if (p->g.fwht) return refuse(w, "paroquant writes its own transform, so it takes no "
                                     "transform=");
     p->stages = (int)rad_param_geti(o, n_o, "stages", 8);
-    if (p->stages < 1 || p->stages > 64) return refuse(w, "stages= is 1 to 64");
+    if (p->stages < 1 || p->stages > 64) return refuse(w, "stages= must be 1 to 64");
     p->gr = rad_param_geti(o, n_o, "rot_group", 0);
     if (p->gr <= 0) p->gr = (p->g.bc > 0 && w->cols % p->g.bc == 0) ? p->g.bc : 128;
-    if (p->gr < 2 || (p->gr & 1)) return refuse(w, "rot_group= is an even channel count");
+    if (p->gr < 2 || (p->gr & 1)) return refuse(w, "rot_group= must be an even channel count");
     if (w->cols % p->gr) {
         char m[160];
         std::snprintf(m, sizeof m, "paroquant: %lld columns are not a whole number of %lld-channel "
@@ -109,7 +107,7 @@ uint64_t splitmix(uint64_t* s) {
     return z ^ (z >> 31);
 }
 
-/* The pairs: [stages x K], stage s pairing columns (pairs[s][2p], pairs[s][2p+1]). */
+/* The pairs, [stages x K]: stage s pairs columns pairs[s][2p] and pairs[s][2p+1]. */
 std::vector<int32_t> draw_pairs(const char* name, int stages, int64_t K, int64_t gr) {
     std::vector<int32_t> pairs((size_t)(stages * K));
     for (int64_t g0 = 0; g0 < K; g0 += gr) {
@@ -127,7 +125,7 @@ std::vector<int32_t> draw_pairs(const char* name, int stages, int64_t K, int64_t
                 const int a = order[(size_t)x];
                 if (paired[(size_t)a]) continue;
                 int b = -1;
-                for (int64_t y = x + 1; y < gr && b < 0; ++y) {          /* a pair not used yet */
+                for (int64_t y = x + 1; y < gr && b < 0; ++y) {          /* an unused pair */
                     const int c = order[(size_t)y];
                     if (!paired[(size_t)c] && !used[(size_t)(a * gr + c)]) b = c;
                 }
@@ -152,7 +150,7 @@ struct Rot {
     std::vector<float> angle;     /* [S x K/2] */
     std::vector<float> scale;     /* [K] */
 
-    /* v = w . D . G_1 ... G_S, in place */
+    /* v = w . D . G_1 ... G_S, in place. */
     void forward(float* x) const {
         for (int64_t k = 0; k < K; ++k) x[k] *= scale[(size_t)k];
         for (int s = 0; s < S; ++s)
@@ -164,8 +162,8 @@ struct Rot {
                 x[b] = xb * c - xa * sn;
             }
     }
-    /* y = e . T^-1, keeping every intermediate: ys[k] after the k-th inverse stage (k = 0 is e);
-     * the result, divided by the scales, into `out`. */
+    /* y = e . T^-1, keeping every intermediate in ys[k] (after the k-th inverse stage; k = 0 is
+     * e). The result, divided by the scales, goes to `out`. */
     void inverse(const float* e, float* ys, float* out) const {
         std::memcpy(ys, e, (size_t)K * sizeof(float));
         for (int k = 1; k <= S; ++k) {
@@ -195,7 +193,7 @@ void err_grad(const float* D, int64_t R, int64_t K, const float* H, const float*
         for (int64_t k = 0; k < K; ++k) G[r * K + k] = D[r * K + k] * diag[k];
 }
 
-/* STAGE ONE. */
+/* Stage one: fit the transform. */
 void fit(const Paro& p, const float* w, int64_t N, int64_t K, const float* H, const float* diag,
          int steps, double lr, int64_t want, Rot* rot) {
     const Grid& g = p.g;
@@ -210,22 +208,12 @@ void fit(const Paro& p, const float* w, int64_t N, int64_t K, const float* H, co
 
     std::vector<float> ws, vs, fake, E, D, G, ys, part;
     for (int t = 0; t < steps; ++t) {
-        /* this step's rows: the next `take` units, wrapping */
+        /* This step's rows: the next `take` row units, wrapping. */
         std::vector<int64_t> us;
         for (int64_t i = 0; i < take; ++i) us.push_back((t * take + i) % nunits);
         std::sort(us.begin(), us.end());
         us.erase(std::unique(us.begin(), us.end()), us.end());
-        int64_t R = 0;
-        for (int64_t u : us) R += std::min(unit, N - u * unit);
-        ws.resize((size_t)(R * K));
-        {
-            int64_t at = 0;
-            for (int64_t u : us) {
-                const int64_t n = std::min(unit, N - u * unit);
-                std::memcpy(&ws[(size_t)(at * K)], w + u * unit * K, (size_t)(n * K) * sizeof(float));
-                at += n;
-            }
-        }
+        const int64_t R = gather_units(w, N, K, unit, us, &ws);
         vs = ws;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -252,8 +240,8 @@ void fit(const Paro& p, const float* w, int64_t N, int64_t K, const float* H, co
         }
         if (t == 0) norm = loss > 0.0 ? loss : 1.0;
 
-        /* THE BACKWARD PASS, a row at a time into the row's own slot of `part`: dL/dD = 2 G; D =
-         * y_S / scale; and each inverse stage (a, b) -> (c a - s b, s a + c b) gives
+        /* Backward pass, one row at a time into the row's own slot of `part`: dL/dD = 2 G,
+         * D = y_S / scale, and each inverse stage (a, b) -> (c a - s b, s a + c b) gives
          * dL/dt = g_a (-y_b) + g_b y_a over its outputs and sends g back by the transpose. */
         part.assign((size_t)(R * P), 0.0f);
 #ifdef _OPENMP
@@ -286,7 +274,7 @@ void fit(const Paro& p, const float* w, int64_t N, int64_t K, const float* H, co
                 }
             }
         }
-        /* the sum over rows, in row order, and the Adam step on it */
+        /* Sum over rows in row order, then take the Adam step. */
         const double lt = lr_min + 0.5 * (lr - lr_min) * (1.0 + std::cos(M_PI * t / steps));
         const double c1 = 1.0 - std::pow(b1, t + 1), c2 = 1.0 - std::pow(b2, t + 1);
 #ifdef _OPENMP
@@ -312,9 +300,9 @@ void fit(const Paro& p, const float* w, int64_t N, int64_t K, const float* H, co
     }
 }
 
-/* T^-1 H T^-T, block by rotation group: T^-1 is block-diagonal over the groups, so its rows for a
- * group are formed once, by sending each unit vector through the inverse, and every block of H is
- * multiplied on both sides by them. */
+/* T^-1 H T^-T by rotation group. T^-1 is block-diagonal over the groups, so its rows are formed
+ * once by sending each unit vector through the inverse, and each block of H is multiplied by them
+ * on both sides. */
 std::vector<float> transformed_hessian(const Rot& rot, const float* H, const float* diag,
                                        int64_t K, int64_t gr) {
     const int64_t ng = K / gr;
@@ -371,8 +359,8 @@ int paro_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* sr
     const int64_t want = std::max<long long>(1, rad_param_geti(o, n_o, "sample_rows", 512));
     const int iters = (int)std::max<long long>(0, rad_param_geti(o, n_o, "iters", 100));
 
-    /* THE MODEL'S OWN DOMAIN: the grid carries no Hadamard (paroquant_info refuses one), and the
-     * rotation this fits is applied to the weight and the Hessian here, after the read. */
+    /* Domain 0: the grid carries no Hadamard (paro_setup refuses one), and the fitted rotation is
+     * applied to the weight and the Hessian here, after the read. */
     const Gram Hg = calib_gram(dir, w->name, K, 0, "paroquant");
     const float* H = Hg ? Hg->data() : nullptr;
     const float* diag = H ? nullptr : w->importance;

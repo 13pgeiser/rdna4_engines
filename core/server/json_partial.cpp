@@ -67,8 +67,8 @@ struct Scanner {
     }
 
     bool value(int depth) {
-        /* A hard depth cap, because the input is model output and a runaway "[[[[[..." would
-         * otherwise recurse until the stack ends. 256 is far past any real tool schema. */
+        /* Depth cap: the input is model output, and a runaway "[[[[..." would otherwise recurse
+         * until the stack overflows. 256 is far past any real tool schema. */
         if (depth > 256) return false;
         ws();
         if (eof()) return false;
@@ -159,9 +159,8 @@ size_t json_stable_prefix(std::string_view s) {
     while (bs < n && s[n - 1 - bs] == '\\') ++bs;
     if (bs % 2 == 1) return n - 1;
 
-    /* Back out of an unfinished "\uXXXX". `k` is how many characters have arrived after the 'u',
-     * so the escape is complete at k == 4 and short before it. Only six bytes ever need looking
-     * at, which is why this is a loop and not a parser. */
+    /* Back out of an unfinished "\uXXXX". `k` counts the characters after the 'u'; the escape is
+     * complete at k == 4. At most six bytes are examined. */
     for (size_t k = 0; k <= 4 && n >= k + 2; ++k) {
         if (s[n - 1 - k] != 'u') continue;
         if (s[n - 2 - k] != '\\') break;
@@ -185,8 +184,8 @@ bool json_quote_append(std::string& out, std::string_view s) {
     while (p < e) {
         const unsigned char c = *p;
         if (c >= 0x80) {
-            /* Length, and the range the SECOND byte is restricted to, which is what rejects
-             * overlong forms, surrogates and anything past U+10FFFF without decoding. */
+            /* Sequence length and the allowed range of the second byte, which rejects overlong
+             * forms, surrogates and code points past U+10FFFF without decoding. */
             size_t len;
             unsigned char lo = 0x80, hi = 0xBF;
             if (c >= 0xC2 && c <= 0xDF)      len = 2;

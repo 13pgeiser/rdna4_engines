@@ -1,9 +1,8 @@
-/* r4d_enc.h -- what libr4d's relayouts check of an encoding before they rearrange it.
+/* r4d_enc.h -- the encoding checks libr4d's relayouts make before rearranging a weight.
  *
- * A container holds encodings; libr4d's kernels each read a few. A relayout that met an encoding
- * its kernel does not read and rearranged it anyway would hand the kernel bytes that decode to
- * other numbers -- the failure the layout hook exists to refuse, by name, at declare. These are the
- * questions it asks. Pure host C++, like the rest of the declaration side.
+ * A relayout that rearranged an encoding its kernel does not read would hand the kernel bytes
+ * that decode to other numbers; the layout hook refuses such a declaration by name instead. Pure
+ * host C++, like the rest of the declaration side.
  */
 #pragma once
 #include "rad_abi.h"
@@ -32,10 +31,10 @@ inline bool affine(const RadEncoding* e, uint32_t codes, uint32_t scale, int64_t
     return true;
 }
 
-/* The same with a SCALAR CODEBOOK: `codes` indexing a `table` plane of `entries` values of dtype
- * `tab`, the `scale` as above, `transform` exactly, and no other plane. What the table HOLDS is not
- * in an encoding -- a declaration has no plane bytes -- so a kernel that decodes one fixed table
- * compares the plane with it when it relayouts. */
+/* The same with a scalar codebook: `codes` indexing a `table` plane of `entries` values of dtype
+ * `tab`, the `scale` as above, `transform` exactly, and no other plane. A declaration carries no
+ * plane bytes, so a kernel that decodes one fixed table compares the plane's contents at
+ * relayout. */
 inline bool affine_table(const RadEncoding* e, uint32_t codes, uint32_t scale, int64_t br,
                          int64_t bc, uint32_t tab, int64_t entries, const char* transform = "") {
     if (!e || !rad_enc_is(e, "affine")) return false;
@@ -50,9 +49,8 @@ inline bool affine_table(const RadEncoding* e, uint32_t codes, uint32_t scale, i
            e->plane[t].extent[0] == 1 && e->plane[t].extent[1] == entries;
 }
 
-/* affine_table's codebook with a SECOND SCALE LEVEL beside the first: `scale.1` of dtype `scale2`,
- * one value for the whole tensor (libquant's block2=*x*). Four planes: codes, scale, scale.1,
- * table. */
+/* affine_table's codebook with a second scale level: `scale.1` of dtype `scale2`, one value for
+ * the whole tensor (libquant's block2=*x*). Four planes: codes, scale, scale.1, table. */
 inline bool affine_table2(const RadEncoding* e, uint32_t codes, uint32_t scale, int64_t br,
                           int64_t bc, uint32_t scale2, uint32_t tab, int64_t entries,
                           const char* transform = "") {

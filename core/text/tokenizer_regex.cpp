@@ -241,8 +241,7 @@ struct Flags { bool i = false, m = false, x = false; };
 
 /* Recursive descent over the pattern's codepoints. Every refusal goes through fail(), which
  * records the first reason and makes every caller unwind; the message names the construct and
- * the byte where it starts, because "unsupported pattern" alone sends the reader to a
- * 200-character regex with no idea where to look. */
+ * the byte where it starts. */
 class Parser {
 public:
     explicit Parser(std::string_view pat) : pat_(pat) {}
@@ -345,8 +344,8 @@ private:
         return add(n);
     }
 
-    /* `(?imx-imx)` with no colon. Oniguruma reads the REST of the enclosing group -- every `|`
-     * after it included -- as one group with the new flags, so `a(?i)b|c` is `a(?i:b|c)` and not
+    /* `(?imx-imx)` with no colon. Oniguruma reads the rest of the enclosing group, every later `|`
+     * included, as one group with the new flags: `a(?i)b|c` is `a(?i:b|c)`, not
      * `a(?i:b)|(?i:c)`. The caller parses that rest as a nested alternation. */
     bool try_inline_flags(const Flags& f, Flags* g) {
         if (peek() != '(' || peek(1) != '?') return false;
@@ -727,7 +726,7 @@ private:
 
     /* `[` already consumed. Oniguruma's classes: a leading `^`, nested classes as union, `&&` as
      * intersection, `-` literal at either end. Under `(?i)` the class is closed over the case
-     * orbits BEFORE it is negated, which is what makes `(?i:[^a-z])` exclude 'A'. */
+     * orbits before it is negated, so `(?i:[^a-z])` excludes 'A'. */
     bool parse_class(const Flags& f, CpSet* out) {
         const size_t at = start_;
         const bool neg = peek() == '^';
@@ -944,7 +943,7 @@ inline uint32_t decode_canon(const uint8_t* p, uint32_t* len) {
 struct TokRegex::Dfa {
     static constexpr uint32_t kMatch = 0x80000000u;
 
-    /* States are named by their ROW OFFSET, state * ncls, so the inner loop indexes the table
+    /* States are named by their row offset, state * ncls, so the inner loop indexes the table
      * with one add. The dead state is row 0. */
     uint32_t ncls = 0;
     std::vector<uint32_t> trans;          /* row + class -> next row | kMatch */
@@ -1107,11 +1106,10 @@ int TokRegex::compile(std::string_view pattern, std::unique_ptr<TokRegex>* out, 
      *
      * A DFA state is the ordered list of NFA states reached by consuming the last codepoint
      * (before their epsilon closure), plus what is remembered of that codepoint. The closure is
-     * taken on the TRANSITION, when the next codepoint's class is known, so a lookahead is
-     * decided exactly. Walking the closure in priority order, reaching MATCH means a match ends
-     * here and every thread after it is dropped: a lower-priority thread can never produce the
-     * match a backtracking engine would report once a higher one has matched. The threads before
-     * it survive, and a later match from one of them replaces this one. */
+     * taken on the transition, when the next codepoint's class is known, so a lookahead is
+     * decided exactly. Walking the closure in priority order, reaching MATCH records a match and
+     * drops every lower-priority thread, which a backtracking engine would never reach. Higher-
+     * priority threads survive, and a later match from one of them replaces this one. */
     std::vector<uint32_t> mark(nfa.size(), 0), mark2(nfa.size(), 0);
     uint32_t stamp = 0, stamp2 = 0;
     std::vector<int> stack, chars, next_kernel;
@@ -1186,12 +1184,13 @@ int TokRegex::compile(std::string_view pattern, std::unique_ptr<TokRegex>* out, 
         d->trans.resize((size_t)kernels.size() * d->ncls, 0);
         d->eoi_match.resize(kernels.size(), 0);
         if (s == 0) continue;
+        /* A copy: intern() may reallocate `kernels`. Row s of `trans` exists from the resize
+         * above, and the states intern() adds get theirs on their own iteration. */
         const std::vector<int> kernel = kernels[s];
         const uint32_t lb = lbs[s];
         for (uint32_t c = 0; c < d->ncls; ++c) {
             const bool m = closure(kernel, lb, (int)c, &next_kernel);
             const uint32_t t = intern(next_kernel, uses_behind ? lb_after[c] : 0);
-            d->trans.resize((size_t)kernels.size() * d->ncls, 0);
             d->trans[(size_t)s * d->ncls + c] = t | (m ? Dfa::kMatch : 0);
         }
         d->eoi_match[s] = closure(kernel, lb, -1, nullptr) ? 1 : 0;
@@ -1234,7 +1233,7 @@ int64_t TokRegex::match_at(std::string_view text, size_t pos) const {
 
 void TokRegex::find_iter(std::string_view text, std::vector<TokSpan>& out) const {
     /* Oniguruma's iteration as the `onig` crate drives it: search from the end of the previous
-     * match for the leftmost position with a match; an EMPTY match exactly at the end of the
+     * match for the leftmost position with a match; an empty match exactly at the end of the
      * previous one is skipped by advancing one codepoint and searching again. */
     const uint8_t* s = (const uint8_t*)text.data();
     const size_t n = text.size();
@@ -1400,8 +1399,8 @@ void utf8_canonicalize(std::string_view str, std::string& out) {
         out += (char)(0x80 | ((c >> 6) & 0x3F));
         out += (char)(0x80 | (c & 0x3F));
     };
-    /* unicode_cpts_from_utf8's rules, the decoder the rest of the chain uses: a lead byte with
-     * the continuations it announces decodes (overlong forms and surrogates included), anything
+    /* unicode_cpts_from_utf8's rules, as used by the rest of the chain: a lead byte followed by
+     * the continuations it announces decodes (overlong forms and surrogates included); anything
      * else is one U+FFFD per byte. */
     for (size_t i = 0; i < n; ) {
         const uint8_t b = p[i];

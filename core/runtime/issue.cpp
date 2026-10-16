@@ -1,17 +1,13 @@
-/* issue.cpp -- THE hot path, and the C surface the architecture plugin actually calls.
+/* issue.cpp -- the hot path, and the C surface the architecture plugin calls.
  *
- * Per rad_issue, in order: index the op's bucket table with `n`, pick the domain from the resolved
- * instance's current execution site, materialise a RadTensor for each operand out of a template
- * built at declare, resolve every weight handle to a pointer (waiting on the mover's event on the
- * STREAM if the weight is in flight), store the operand count into a RadArgs that was already
- * filled in, and launch.
+ * Per rad_issue: index the op's bucket table with `n`, pick the domain from the op's current
+ * execution site, build a RadTensor per operand from its declare-time template, resolve weight
+ * handles (a stream wait on the mover's event if in flight), set the operand count in the
+ * prefilled RadArgs, and launch.
  *
- * NO ALLOCATION. NO HOST SYNCHRONISATION. NO DEVICE ROUND TRIP. Every one of those is a property
- * you lose by accident, so each of them is checkable here: the only writes are into arrays sized
- * at prepare, the only device call besides the launch is rad_event_wait (which orders a stream and
- * does not block the host), and nothing in this file reads a device value back.
- *
- * See ctx.h for the per-issue cost and where it sits against spec §3.2's budget.
+ * No allocation, no host synchronisation, no device read-back: writes go only to arrays sized at
+ * prepare, and the only device call besides the launch is rad_event_wait, which does not block
+ * the host. See ctx.h for the cost budget (spec §3.2).
  */
 #include <algorithm>
 #include <chrono>
@@ -29,28 +25,22 @@
 
 namespace rad {
 
-/* A COLUMN SLICE: `cols` narrows the LAST dimension while every stride is left alone, so the
- * declared width stays the row pitch. That is what makes a fused projection usable without a
- * copy -- q and the attention gate are interleaved per head inside one buffer, and GDN's `a` and
- * `b` are columns of one in-projection. The element offset is what selects the first column, so
- * the two fields compose: offset picks the start, cols picks the width.
+/* Column slice: `cols` narrows the last dimension and leaves every stride alone, so the declared
+ * width stays the row pitch. This reads a fused projection without a copy (q and the attention
+ * gate interleaved per head; GDN's `a` and `b` in one in-projection). The element offset picks the
+ * first column, `cols` the width.
  *
- * Narrowing the last dimension rather than dim 0 is the whole point: shortening the OUTERMOST
- * dimension leaves every stride correct because they are products of the trailing ones, and
- * shortening the INNERMOST one leaves them correct because nothing is a product of it. Any other
- * dimension would need the strides rewritten, so the ABI offers only these two. */
+ * Only the outermost and innermost dimensions can be shortened without rewriting strides, so the
+ * ABI offers only those two. */
 static inline void narrow_cols(const RadOperand& o, RadTensor* t) {
     if (o.cols > 0 && t->rank >= 1) t->shape[t->rank - 1] = o.cols;
 }
 
-/* DOES THE OPERAND FIT THE BUFFER IT NAMES? The span is the largest element index the descriptor
- * can reach, measured from the buffer's base -- `offset` plus the sum of (extent - 1) * stride
- * over every dimension. It is NOT shape[0] against the declared shape[0]: a row count larger than
- * the declared one is legitimate when `cols` is narrower, because a [T, 2560] buffer read at 160
- * columns IS T*16 rows of 160 and the PLE gather does exactly that. The span is the only reading
- * that accepts the legal case and refuses the overrun.
+/* Whether the operand fits the buffer it names. The span is the largest reachable element index,
+ * `offset` + sum((extent - 1) * stride). Comparing shape[0] instead would be wrong: a [T, 2560]
+ * buffer read at 160 columns is legitimately T*16 rows of 160 (the PLE gather does this).
  *
- * An empty extent reaches nothing and is not an error here; the kernel's own bounds decide. */
+ * An empty extent reaches nothing; the kernel's own bounds decide. */
 static inline bool operand_fits(const RadTensor& t, int64_t offset, const RadTensor& decl) {
     if (offset < 0) return false;
     int64_t span = offset;
@@ -61,9 +51,7 @@ static inline bool operand_fits(const RadTensor& t, int64_t offset, const RadTen
     return span < rad_tensor_numel(&decl);
 }
 
-/* Extents and strides, for the message that refuses. oracle.cpp has one of these in an anonymous
- * namespace; duplicating four lines beats exporting a debug formatter across translation units. */
-static inline std::string opd_shape_str(const RadTensor& t) {
+std::string tensor_shape_str(const RadTensor& t) {
     std::string s = "[";
     for (uint32_t d = 0; d < t.rank; ++d)
         s += fmt("%s%lld", d ? "," : "", (long long)t.shape[d]);
@@ -73,10 +61,9 @@ static inline std::string opd_shape_str(const RadTensor& t) {
     return s + "]";
 }
 
-/* Element offset to byte offset. Split out because the sub-byte cases are the interesting ones:
- * a W4 weight has no addressable odd element, and a plugin-private dtype has no size the core
- * knows at all -- both are refused by name rather than silently truncated into a misaligned
- * pointer. Returns false when the offset cannot be expressed. */
+/* Element offset to byte offset. False when it cannot be expressed: a mid-byte offset into a
+ * packed sub-byte weight (e.g. an odd W4 element), or a plugin-private dtype with no core-known
+ * size. */
 static inline bool byte_delta(int bits, int64_t elems, int64_t* out) {
     if (bits >= 8) { *out = elems * (int64_t)(bits >> 3); return true; }
     if (bits <= 0) return false;                      /* plugin-private: the core has no size */
@@ -87,24 +74,21 @@ static inline bool byte_delta(int bits, int64_t elems, int64_t* out) {
 }
 
 void* Ctx::resolve_weight(rad_weight w) {
-    /* The template already carries WeightInfo::ptr, bound at prepare and refreshed between steps
-     * when the mover says it moved something. In the all-in-VRAM case that is the whole answer and
-     * there is no table, no virtual call and no branch beyond this one. */
+    /* The template carries WeightInfo::ptr, refreshed between steps after a move. In the
+     * all-in-VRAM case that is the answer. */
     void* p = w_tmpl_[w].data;
     if (!residency_) return p;
 
     const WeightSlot* s = residency_->lookup(w);       /* never blocks -- residency.h */
     if (s) {
         p = s->ptr;
-        /* Wait once per generation, not once per issue. A stream wait orders everything issued
-         * after it, so repeating it buys nothing and at eight experts a layer across 64 layers it
-         * would be thousands of runtime calls a step. The mover bumps `generation` when it starts
-         * a transfer, which is what makes the memo sound (residency.h). */
+        /* Wait once per generation, not per issue; a stream wait orders everything issued after
+         * it. Sound because the mover bumps `generation` per transfer (residency.h). */
         if (s->ready && waited_gen_[w] != s->generation) {
-            /* Not part of a recording: once issued it orders everything after it, every later
-             * play included, and a move of a weight a pass names directly re-keys the pass. */
+            /* Kept out of a recording: it orders every later play too, and moving a weight a
+             * pass names directly re-keys the pass. */
             if (rec_) tape_pause(true);
-            rad_event_wait(cur_stream(), s->ready);         /* the STREAM waits; the host does not */
+            rad_event_wait(cur_stream(), s->ready);         /* the stream waits, not the host */
             if (rec_) tape_pause(false);
             waited_gen_[w] = s->generation;
             ++n_stream_waits_;
@@ -115,29 +99,15 @@ void* Ctx::resolve_weight(rad_weight w) {
 
 /* ================================================================== weight tables
  *
- * RAD_OPK_WTAB. See the comment on Ctx::WeightTable and the RAD_WTAB macro in rad_runtime.h: this
- * is where a run of declared weights becomes the device pointer array a grouped GEMM walks.
+ * RAD_OPK_WTAB (Ctx::WeightTable, RAD_WTAB in rad_runtime.h): a run of declared weights becomes
+ * the device pointer array a grouped GEMM walks.
  *
- * THE ENTRIES MUST AGREE ABOUT SHAPE AND DTYPE, and the check is not pedantry -- the kernel is
- * given one set of trailing extents for the whole table and strides its way through an entry with
- * them, so a run that mixes two shapes is a run the kernel reads off the end of. A MoE layer
- * declares 256 identical experts, so this holds by construction and a violation is a plugin bug
- * that is worth naming at the first issue rather than debugging from wrong logits. */
-/* THE TABLE'S MEMORY, ALLOCATED ONCE AND NOT ON THE STEP PATH.
- *
- * Allocating it inside resolve_weight_table, which runs at ISSUE, would have the first step of the
- * first request allocate one pinned array and one device array per grouped-GEMM operand -- an
- * allocator on the step path, and spec §3.1 says there is not one. It would also be invisible to
- * the VRAM budget: the pools are sized before a step has ever run, so those bytes would come out
- * of --gpu-headroom-mib without being named in it.
- *
- * Binding every declared table at prepare() avoids both. The run is a property of the DECLARATION
- * (OpInfo::weights with OpInfo::weight_opd naming the operand position), not of the issue, so
- * there is nothing about it that has to wait for a step. resolve_weight_table still handles a
- * miss, because a plugin may legally issue a table the declaration did not describe -- it just
- * does not happen on any model this engine ships.
- *
- * Returns the slot in wtabs_. */
+ * Entries must agree on shape and dtype: the kernel strides every entry with one set of trailing
+ * extents, so a mixed run reads out of bounds. A violation is a plugin bug, named at first issue. */
+/* A table's pinned and device arrays, allocated once. Normally called from prepare
+ * (bind_weight_tables), so no allocation happens on the step path (spec §3.1) and the bytes are
+ * not taken unbudgeted from --gpu-headroom-mib. resolve_weight_table calls it on a miss, which is
+ * legal for a table the declaration did not describe. Returns the slot in wtabs_. */
 int Ctx::ensure_weight_table(uint64_t key, rad_weight first, int64_t n, size_t* slot_out) {
     auto it = wtab_of_.find(key);
     if (it != wtab_of_.end()) { *slot_out = it->second; return RAD_OK; }
@@ -169,11 +139,9 @@ int Ctx::ensure_weight_table(uint64_t key, rad_weight first, int64_t n, size_t* 
     return RAD_OK;
 }
 
-/* Every RAD_OPD_WTAB operand of every declared op, bound before the first step. The run is
- * contiguous by construction -- rad_decl_weight hands out consecutive indices and a declaration
- * loop over experts produces exactly such a run -- so it is the smallest declared handle at that
- * operand position and the count of them. A gap would be a plugin bug, and it is named rather
- * than papered over: a table assembled from a non-contiguous run would read the wrong expert. */
+/* Binds every RAD_OPD_WTAB operand of every declared op before the first step. A run is the
+ * smallest declared handle at that operand position plus the count; rad_decl_weight hands out
+ * consecutive indices, so a gap is a plugin bug and is refused (it would read the wrong expert). */
 int Ctx::bind_weight_tables() {
     const Program& P = *program_;
     int64_t tables = 0, bytes = 0;
@@ -194,7 +162,7 @@ int Ctx::bind_weight_tables() {
             if (cnt <= 0) continue;
             if ((int64_t)(hi - lo) + 1 != cnt) {
                 RAD_ERR("op '%s' operand %d is a weight table of %lld entries whose declared "
-                        "handles run [%u, %u] -- a table must be a CONTIGUOUS run, because the "
+                        "handles run [%u, %u]; a table must be a contiguous run, because the "
                         "kernel is handed one base and strides through it",
                         op.op.c_str(), p, (long long)cnt, lo, hi);
                 return RAD_E_INVAL;
@@ -213,16 +181,14 @@ int Ctx::bind_weight_tables() {
         }
     }
     if (tables > 0)
-        RAD_DEBUG("weight tables: %lld bound at prepare, %s of pointer arrays -- none of it "
-                  "allocated on the step path", (long long)tables, humanb(bytes).c_str());
+        RAD_DEBUG("weight tables: %lld bound at prepare, %s of pointer arrays",
+                  (long long)tables, humanb(bytes).c_str());
     return RAD_OK;
 }
 
 static const bool g_dbg_issue = std::getenv("RADIANCE_DEBUG_ISSUE") != nullptr;
-/* THE WEIGHT-TABLE WALK, charged separately from the rest of `own`. A grouped-GEMM operand names a
- * run of experts; the first issue walks every entry and later ones the entries the mover changed
- * (WeightTable::pend). Two counters -- entries walked, and the wall time of the walks -- so that
- * cost is read directly rather than inferred from the difference between two builds. */
+/* RADIANCE_DEBUG_ISSUE: entries walked and wall time spent in weight-table refreshes, reported
+ * separately from the rest of `own`. */
 static double g_wtab_us = 0.0, g_wtab_us_p = 0.0;
 static long   g_wtab_e  = 0,   g_wtab_e_p  = 0;
 
@@ -232,10 +198,8 @@ int Ctx::resolve_weight_table(rad_op h, int operand, rad_weight first, int64_t n
     size_t slot;
     auto it = wtab_of_.find(key);
     if (it == wtab_of_.end()) {
-        /* A MISS IS NOT THE NORMAL PATH ANY MORE -- bind_weight_tables() bound every table the
-         * declaration describes. Reaching here means a plugin issued a table at an operand
-         * position its declaration did not name as one, which is legal and is served, but it is
-         * an allocation on the step path and the log says so once. */
+        /* A plugin issued a table at an operand position its declaration did not name. Legal, but
+         * it allocates on the step path. */
         RAD_DEBUG("op %u operand %d issued a weight table of %lld entries that the declaration did "
                   "not describe; allocating it now", (unsigned)h, operand, (long long)n);
         const int rc = ensure_weight_table(key, first, n, &slot);
@@ -254,8 +218,8 @@ int Ctx::resolve_weight_table(rad_op h, int operand, rad_weight first, int64_t n
                                       first, (long long)n));
     }
     WeightTable& t = wtabs_[slot];
-    /* In a pass being recorded the refresh is host work: the recording is cut and the table named,
-     * so a play refreshes it here, on this lane, with whatever the mover has changed by then. */
+    /* While recording, the refresh is host work: cut the tape and name the table, so a play
+     * refreshes it on this lane with whatever the mover has changed by then. */
     if (rec_) {
         tape_cut();
         TapeStep st;
@@ -276,7 +240,7 @@ int Ctx::resolve_weight_table(rad_op h, int operand, rad_weight first, int64_t n
 
 int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
     const RadTensor& e0 = w_tmpl_[t.first];
-    const bool wt_time = g_dbg_issue && rank() == 0;   /* same rule: one thread accumulates */
+    const bool wt_time = g_dbg_issue && rank() == 0;   /* one thread accumulates */
     const auto t_wt0 = wt_time ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
     auto resolve = [&](int64_t e, void** out) -> int {
@@ -294,9 +258,8 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
 
     int64_t walked = 0;
     if (!t.checked) {
-        /* THE FIRST ISSUE: agreement, every entry, and the whole array up in one copy. `host` is
-         * never written after this, so the copy reads what was resolved here however late the
-         * card reaches it. */
+        /* First issue: check agreement, resolve every entry, upload the whole array. `host` is
+         * never written again, so the async copy is safe however late it runs. */
         t.cur.assign((size_t)t.n, nullptr);
         for (int64_t e = 0; e < t.n; ++e) {
             const rad_weight w = (rad_weight)(t.first + e);
@@ -327,8 +290,8 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
                                   fmt("operand %d: the weight table could not be uploaded", operand));
         t.checked = true;
     } else {
-        /* THE ENTRIES THAT MAY HAVE MOVED, each resolved -- which is also what orders the stream
-         * behind a transfer still in flight -- and written only if its pointer differs. */
+        /* Entries that may have moved: resolve each (which also orders the stream behind an
+         * in-flight transfer) and patch only those whose pointer differs. */
         WtabPatch pt;
         auto one = [&](int64_t e) -> int {
             void* p = nullptr;
@@ -364,8 +327,8 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
     return RAD_OK;
 }
 
-/* The residency table's changes since the last pass, queued against every table that holds the
- * weight. A weight also resolved straight into an operand moves `dense_epoch_` as well. */
+/* Queues the residency table's changes against every table holding each weight. A weight also
+ * resolved directly into an operand bumps `dense_epoch_`. */
 void Ctx::sync_residency() {
     if (!residency_) return;
     const std::vector<rad_weight>& ch = residency_->changes();
@@ -375,8 +338,7 @@ void Ctx::sync_residency() {
         if ((size_t)w >= wmemb_head_.size()) continue;
         for (int32_t m = wmemb_head_[w]; m >= 0; m = wmemb_[(size_t)m].next) {
             WeightTable& t = wtabs_[(size_t)wmemb_[(size_t)m].slot];
-            /* A table not yet issued resolves every entry at its first issue, and one already
-             * marked resolves every entry at its next. */
+            /* Unissued or already-full tables resolve every entry at their next issue. */
             if (!t.checked || t.full) continue;
             if ((int64_t)t.pend.size() >= t.n) { t.full = true; t.pend.clear(); continue; }
             t.pend.push_back(wmemb_[(size_t)m].entry);
@@ -385,9 +347,8 @@ void Ctx::sync_residency() {
     residency_->clear_changes();
 }
 
-/* The operand a kernel is handed for a table: entry 0's dtype and trailing extents, with the
- * expert axis PREPENDED at stride zero -- the marker that says the axis is not addressable by
- * arithmetic and `data` is a pointer array. */
+/* The operand a kernel sees for a table: entry 0's dtype and extents with the expert axis
+ * prepended at stride 0, which marks `data` as a pointer array. */
 int Ctx::weight_table_tensor(rad_op h, int operand, const WeightTable& t, const RadTensor& e0,
                              RadTensor* out) {
     if (e0.rank + 1 > RAD_MAX_RANK)
@@ -415,98 +376,24 @@ void Ctx::free_weight_tables() {
     wtab_of_.clear();
 }
 
-/* RADIANCE_DEBUG_ISSUE: WHAT THE ISSUE PATH ACTUALLY COSTS, split from the launch it wraps.
+/* RADIANCE_DEBUG_ISSUE: host cost of the issue path, split from the launch it wraps. Kernel
+ * traces and the per-op profiler only see device time.
  *
- * A draft pass costs several microseconds a dispatch where a bare `hipLaunchKernelGGL` costs
- * around one and a half (`isa/graphrate.hip` prices one). The difference has to be here, and
- * nothing else in the tree can see it: an op's host cost is invisible in a kernel trace, and the
- * per-op profiler times the DEVICE.
+ * `own` is everything before the launch (band scan, domain lookup, operand resolution); `launch`
+ * is the plugin shim plus HIP. Costs two clock reads (~50 ns) per issue when enabled.
  *
- * `own` is everything before the launch -- the band scan, the domain lookup, the operand
- * resolution loop. `launch` is the plugin shim plus HIP. Two clock reads an issue, ~50 ns on a
- * path this says is microseconds, and only when the variable is set.
- *
- * REPORTED PER WINDOW AND NOT AS A RUNNING MEAN. Load and the first prefill put seconds into the
- * accumulator over relatively few issues, so a cumulative average decays through a series of
- * individually plausible numbers, every one of them the startup transient and none of them the
- * steady state. A statistic that is still moving after a million samples is measuring the warm-up,
- * and printing it as "us each" invites exactly the wrong conclusion. */
-
-/* RADIANCE_DEBUG_ARGSHA: ARE A DRAFTER PASS'S KERNEL ARGUMENTS THE SAME EVERY STEP?
- *
- * This is the one question that decides what a captured graph would cost to maintain. A draft pass
- * is the same op sequence at the same shapes every step -- the concurrency does not change inside a
- * request -- so if the ARGUMENTS are identical too, a graph can be captured once and replayed. If
- * they move, every replay needs `hipGraphExecKernelNodeSetParams` over ~50 nodes, which is most of
- * the submit cost back.
- *
- * The staging arena is DOUBLE BUFFERED, so the expectation is not one digest but TWO, alternating.
- * That still replays -- two graphs, picked by parity -- and it is worth knowing before anyone
- * builds either.
- *
- * Digests the operand bytes and `n` of every issue of pass 1 into one FNV-1a and prints it a step. */
-static const bool g_dbg_argsha = std::getenv("RADIANCE_DEBUG_ARGSHA") != nullptr;
-
-static int        g_argsha_pass = -99;
-static long       g_argsha_seen = 0;
-/* ONE DIGEST AN ISSUE, not one a pass: the pass-wide digest only says "something moved", and what
- * decides whether a captured graph is maintainable is HOW MANY nodes move. Kept per position in
- * the pass and compared against the previous step's. */
-/* TWO digests, not one, and the op handle beside them. A count of moving nodes is enough to SIZE
- * a graph; it is not enough to DESIGN one. A node whose operand pointer moved can be left alone if
- * the pointer can be made stable -- the same address refilled in place -- and then the captured
- * graph replays untouched. A node whose SHAPE moved cannot: the launch geometry is baked into the
- * node at capture, so that one needs a real update, which needs launch params only the plugin shim
- * has. Which kind the ten are decides whether this is a contained change or an ABI change. */
-struct ArgSha { rad_op h; uint64_t ptr; uint64_t shp; };
-static std::vector<ArgSha> g_argsha_cur, g_argsha_prev;
-static size_t              g_argsha_i = 0;
-static ArgSha argsha_of(rad_op h, int64_t n, const RadTensor* t, int n_opd) {
-    uint64_t v = 1469598103934665603ull, w = 1469598103934665603ull;
-    auto mix = [&](const void* p, size_t k) {
-        const unsigned char* b = (const unsigned char*)p;
-        for (size_t i = 0; i < k; ++i) { v ^= b[i]; v *= 1099511628211ull; }
-    };
-    auto mixw = [&](const void* p, size_t k) {
-        const unsigned char* b = (const unsigned char*)p;
-        for (size_t i = 0; i < k; ++i) { w ^= b[i]; w *= 1099511628211ull; }
-    };
-    mix(&h, sizeof h);
-    mixw(&h, sizeof h);
-    mixw(&n, sizeof n);   /* the row count IS geometry: it is what the grid is derived from */
-    /* ONLY THE LIVE FIELDS. `RadTensor` carries shape[RAD_MAX_RANK] and stride[RAD_MAX_RANK] of
-     * which only `rank` are meaningful, and `tbuf_` is REUSED across issues -- so hashing the
-     * struct whole picks up whatever the last op left in the tail slots and reports very nearly
-     * every issue as having moved, which is the instrument's own scratch and not the model's
-     * arguments. */
-    for (int i = 0; i < n_opd; ++i) {
-        const RadTensor& tt = t[i];
-        mix(&tt.data, sizeof tt.data);                 /* WHERE  -- a node-update-free fix exists */
-        mixw(&tt.dtype, sizeof tt.dtype);              /* WHAT   -- baked into the node at capture */
-        mixw(&tt.rank, sizeof tt.rank);
-        for (uint32_t d = 0; d < tt.rank && d < RAD_MAX_RANK; ++d) {
-            mixw(&tt.shape[d], sizeof tt.shape[d]);
-            mixw(&tt.stride[d], sizeof tt.stride[d]);
-        }
-    }
-    return ArgSha{h, v, w};
-}
-/* PER OP, because the average is the one number that cannot be acted on. Subtracting the price of
- * a bare fifteen-argument hipLaunchKernelGGL (isa/graphrate.hip has one) from `launch` leaves most
- * of a microsecond an issue in the shim's own prologue -- but that is a subtraction across two
- * different kernels, and an average over a step's ~1850 issues hides whether it is a flat tax or
- * three ops doing something silly. This charges host launch time to the op that spent it. */
+ * Reported per window, not as a running mean, so load and the first prefill do not dominate, and
+ * per op, so host launch time is charged to the op that spent it. */
 struct IssOp { double lau = 0.0, own = 0.0; long n = 0; };
 static std::unordered_map<uint32_t, IssOp> g_iss_by_op;
 static double g_iss_own = 0.0, g_iss_lau = 0.0;
 static double g_iss_own_p = 0.0, g_iss_lau_p = 0.0;
 static long   g_iss_n   = 0;
 
-/* THE STAGER'S TWO CALLS, around an op of a pass it armed for. Before the op, because what it
- * stages for this op has to be in the residency table before the op's tables are resolved -- and
- * sync_residency is what carries a table change into the tables that hold the weight, which the
- * pass otherwise does once, at its start. After the op, on the stream the op went to, because that
- * is where "every reader of this weight is behind us" can be recorded. */
+/* Wraps issue_body with the stager's calls on a pass it armed for. before_op runs before the
+ * op's tables are resolved, followed by sync_residency if the stager changed the residency table.
+ * after_op runs on the op's stream, where "every reader of this weight is behind us" can be
+ * recorded. */
 int Ctx::issue(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
     if (!staging_) return issue_body(h, opd, n_opd, n);
     if (step_status_ < 0) return step_status_;
@@ -526,9 +413,8 @@ int Ctx::issue(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
 int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
     const auto t_iss0 = g_dbg_issue ? std::chrono::steady_clock::now()
                                     : std::chrono::steady_clock::time_point{};
-    /* The step is already aborted. rad_arch_step is void and cannot know, so it will keep issuing
-     * the rest of the layer; launching those would burn a step whose output is already wrong and
-     * bury the first error under fifty more. */
+    /* Step already aborted. rad_arch_step is void and keeps issuing; skip the rest so the first
+     * error stays the reported one. */
     if (step_status_ < 0) return step_status_;
 
     if (h == RAD_NULL_HANDLE || (size_t)h >= plans_.size())
@@ -537,13 +423,12 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
 
     OpPlan& p = plans_[h];
 
-    /* RAD_N_BATCH is what almost every op wants: the ranged parameter is the step's token count. */
+    /* RAD_N_BATCH: the ranged parameter is the step's token count. */
     if (n == RAD_N_BATCH) n = batch_ ? batch_->n_tok : 0;
 
-    /* The bucket table. Bands are sorted by their inclusive upper bound and there are two to four
-     * of them -- the union of the LE/GE/EQ values the candidate kernels placed on the ranged
-     * parameter (spec §2.2). A linear scan is one to three predictable compares off one cache
-     * line, which beats any table or division scheme at this size. */
+    /* The bucket table: two to four bands sorted by inclusive upper bound, from the candidate
+     * kernels' LE/GE/EQ constraints on the ranged parameter (spec §2.2). A linear scan is the
+     * fastest option at this size. */
     const int64_t* hi = band_table_.data() + p.band_off;
     int b = 0;
     while (b < p.n_bands && n > hi[b]) ++b;
@@ -558,6 +443,12 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                               ? "has no host kernel for this band, and the placement planner put "
                                 "it on the host anyway"
                               : "has no device kernel for this band");
+    /* The row's DIV on the ranged parameter held at the band's upper bound, maybe not here. */
+    if (ip.ranged_div > 1 && n % ip.ranged_div != 0)
+        return abort_step_msg(h, RAD_E_SHAPE,
+                              fmt("issued at %lld, which kernel %s does not serve: it requires a "
+                                  "multiple of %lld and was selected at the band's upper bound",
+                                  (long long)n, ip.row->info->name, (long long)ip.ranged_div));
 
     if (n_opd < 0 || n_opd > MAX_OPERANDS)
         return abort_step_msg(h, RAD_E_INVAL,
@@ -583,8 +474,8 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                 return abort_step_msg(h, RAD_E_INVAL,
                                       fmt("operand %d names buffer handle %u, which declare never "
                                           "returned", i, bh));
-            /* One struct copy: dtype, rank, shape and packed strides came from the declaration and
-             * the data pointer is already arena_base + BufferInfo::arena_offset. */
+            /* Template: declared dtype, rank, shape and packed strides; data is already
+             * arena_base + BufferInfo::arena_offset. */
             tt = buf_tmpl_[bh];
             touches_host |= buf_host_[bh] != 0;
             if (o.offset) {
@@ -598,50 +489,27 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                               rad_dtype_name(tt.dtype)));
                 tt.data = static_cast<char*>(tt.data) + d;
             }
-            /* rows > 0 narrows dim 0, which is how a prefill chunk of `rows` tokens issues against
-             * a buffer the plan sized at max_tok. The strides do not change and must not: they are
-             * products of the trailing dimensions, so shortening the outermost one leaves every
-             * one of them correct. That is the whole reason the narrowing is dim 0 only. */
+            /* rows > 0 narrows dim 0, so a prefill chunk issues against a buffer sized at
+             * max_tok. Strides stay valid since they are products of the trailing dimensions. */
             if (o.rows > 0) tt.shape[0] = o.rows;
             narrow_cols(o, &tt);
-            /* AND IT HAS TO FIT THE BUFFER IT NAMES. Narrowing dim 0 is how a chunk of `rows`
-             * tokens issues against a plan sized at max_tok, and the arrow points one way only:
-             * an operand may name FEWER rows than the declaration, never more.
-             *
-             * A read past the end is uninitialised memory. A WRITE past the end is another
-             * buffer's bytes, and the arena packs by liveness -- so what it lands on is whatever
-             * the planner put there, which changes with the graph. That is the worst shape of
-             * bug this runtime can have: it is silent, it is not reproducible across a config
-             * change, and the model can stay correct for as long as the victim happens to be
-             * dead. The canonical shape of it is a MoE expert plane declared at max_tok rows while
-             * the gated quantiser writes rows*top_k of them, which nothing notices until some
-             * later op happens to read the buffer the overrun lands on. */
+            /* An operand may name fewer rows than the declaration, never more. A write past the
+             * end lands on whatever buffer the liveness packing placed there, which changes with
+             * the graph, so the corruption is silent and config-dependent (e.g. a MoE expert plane
+             * declared at max_tok rows but written at rows*top_k). */
             if (!operand_fits(tt, o.offset, buf_tmpl_[bh]))
                 return abort_step_msg(h, RAD_E_SHAPE,
                                       fmt("operand %d reaches past buffer '%s': %s at offset "
                                           "%lld, declared %s", i,
                                           program_->buffers[bh].name.c_str(),
-                                          opd_shape_str(tt).c_str(), (long long)o.offset,
-                                          opd_shape_str(buf_tmpl_[bh]).c_str()));
-            /* AND THE OP HAS TO BE INSIDE THE BUFFER'S PLANNED LIFETIME.
-             *
-             * rad_op_reads/rad_op_writes are what the buffer plan is computed from, and they are
-             * OPT-IN per op -- a buffer nothing declared gets the whole program and shares nothing,
-             * which is the sound default. What is NOT sound is an op that touches a buffer other
-             * ops DID declare, outside the range those declarations produced: the arena has laid
-             * something else over those bytes, and what comes back is whatever the planner put
-             * there. It reads as data, so nothing downstream can tell.
-             *
-             * This defect class recurs, and its shape is always the same: an op acquires a read
-             * its declaration never mentioned. `attn_paged` reading the QSA selection is the
-             * pattern -- the block table arrives as a raw batch pointer, so the op's declared read
-             * set is just the query, and a page id fetched out of a reused buffer is an address
-             * outside every mapping. It survives every step until a wider buffer changes the
-             * packing.
-             *
-             * REFUSED RATHER THAN WARNED, because the failure it prevents is silent and is not
-             * reproducible across a graph change -- the victim buffer is whatever the plan chose
-             * this time. */
+                                          tensor_shape_str(tt).c_str(), (long long)o.offset,
+                                          tensor_shape_str(buf_tmpl_[bh]).c_str()));
+            /* The op must lie inside the buffer's planned lifetime. The plan is computed from the
+             * opt-in rad_op_reads/rad_op_writes; a buffer nothing declared lives for the whole
+             * program. An op touching a declared buffer outside [first_def, last_use] may see
+             * bytes the arena reused for another buffer, typically because the op gained a read
+             * its declaration never mentioned. Refused, not warned: the failure is silent and
+             * depends on the plan's packing. */
             {
                 const BufferInfo& bi = program_->buffers[bh];
                 if (bi.first_def >= 0 &&
@@ -684,26 +552,23 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             }
             if (o.rows > 0) tt.shape[0] = o.rows;
             narrow_cols(o, &tt);
-            /* THE SAME FIT A BUFFER OPERAND HAS TO PASS, for the same reason. A slice that reaches
-             * past the declared weight reads whatever the loader or the mover put after it -- the
-             * next weight in the slab, or the end of the allocation -- and a GEMM over it produces
-             * plausible numbers. Only a sliced operand can overrun, so the whole-weight case every
-             * RAD_W issue takes skips the arithmetic. */
+            /* Same fit check as a buffer: an overrunning slice reads the next weight in the slab
+             * and yields plausible numbers. Only a sliced operand can overrun, so whole-weight
+             * issues skip it. */
             if ((o.offset || o.rows > 0 || o.cols > 0) &&
                 !operand_fits(tt, o.offset, w_tmpl_[wh]))
                 return abort_step_msg(h, RAD_E_SHAPE,
                                       fmt("operand %d reaches past weight '%s': %s at offset "
                                           "%lld, declared %s", i,
                                           program_->weights[wh].name.c_str(),
-                                          opd_shape_str(tt).c_str(), (long long)o.offset,
-                                          opd_shape_str(w_tmpl_[wh]).c_str()));
+                                          tensor_shape_str(tt).c_str(), (long long)o.offset,
+                                          tensor_shape_str(w_tmpl_[wh]).c_str()));
             break;
         }
 
         case RAD_OPK_WTAB: {
-            /* A RUN of declared weights, handed over as a device array of pointers. `handle` is
-             * the first and `rows` is the count -- rad_decl_weight gives out consecutive indices,
-             * so a declaration loop over experts produces exactly such a run. */
+            /* A run of declared weights, passed as a device array of pointers. `handle` is the
+             * first, `rows` the count. */
             const uint32_t w0  = o.handle;
             const int64_t  cnt = o.rows;
             if (w0 == RAD_NULL_HANDLE || cnt <= 0 ||
@@ -723,10 +588,9 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         }
 
         case RAD_OPK_RAW:
-            /* A pointer the core did not allocate -- a RadBatch field, almost always. It has no
-             * BufferInfo, so there is no dtype and no shape to derive: the kernel knows both from
-             * the op's schema, which is where that knowledge belongs. The core carries the pointer
-             * and, if the caller gave one, the row count. */
+            /* A pointer the core did not allocate, usually a RadBatch field. No BufferInfo, so
+             * dtype and shape come from the op's schema; the core carries the pointer and the
+             * optional row count. */
             if (o.offset && o.dtype == RAD_DT_INVALID)
                 return abort_step_msg(h, RAD_E_INVAL,
                                       fmt("operand %d is a raw pointer with an element offset of "
@@ -736,13 +600,10 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                           i, (long long)o.offset));
             std::memset(&tt, 0, sizeof tt);
             tt.data  = o.raw;
-            tt.dtype = o.dtype;   /* RAD_DT_INVALID unless the caller said, which is the point of
-                                   * the field: libref reads positions, cu_seqlens and
-                                   * num_accepted through the tensor's dtype and cannot guess. */
-            /* `cols` on a RAW operand is the SECOND EXTENT, not a column slice: there is no
-             * declared width to slice out of. RAD_P_T2 is how a batch field that is genuinely
-             * two-dimensional says so, and the block table is why it exists -- [n_seq, max_blocks]
-             * handed over as rank 1 loses its width, and every kernel that reads it then guesses. */
+            tt.dtype = o.dtype;   /* RAD_DT_INVALID unless given; libref reads positions,
+                                   * cu_seqlens and num_accepted through the tensor's dtype. */
+            /* On a raw operand `cols` is the second extent, not a column slice (RAD_P_T2), e.g.
+             * the [n_seq, max_blocks] block table. */
             if (o.rows > 0 && o.cols > 0) {
                 tt.rank = 2;
                 tt.shape[0] = o.rows;   tt.shape[1] = o.cols;
@@ -753,10 +614,9 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             break;
 
         case RAD_OPK_KV: {
-            /* A KV group's cache for one layer. `handle` is the rad_kvgroup and `offset` is the
-             * ABSOLUTE layer index, which the binding rebases -- a group holds one cache per bound
-             * layer, not one per model layer, and 48 GDN layers interleaved with 16 attention ones
-             * would otherwise index a 64-deep pool that was never allocated. */
+            /* A KV group's cache for one layer. `handle` is the rad_kvgroup, `offset` the absolute
+             * layer index, rebased through the binding because a group holds one cache per bound
+             * layer, not per model layer. */
             const uint32_t g = o.handle;
             if ((size_t)g >= kv_.size() || !kv_[g].base)
                 return abort_step_msg(h, RAD_E_STATE,
@@ -767,10 +627,8 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                           "rad_kv_group_zero and then issued against, which the "
                                           "plugin must not do", i, g));
             const KVPoolBinding& b = kv_[g];
-            /* A POSITION LOOKUP, not `o.offset - first_layer`. The subtraction is right only for a
-             * group whose layers are contiguous, and they need not be: with 15 attention layers
-             * interleaved through 64, absolute layer 19 -- the fifth of them -- subtracts to slot
-             * 16 of a 15-slot pool, which the bounds check below refuses. */
+            /* A lookup, not a subtraction: a group's layers need not be contiguous
+             * (KVPoolBinding::layer_slot). */
             const int64_t layer = (o.offset >= 0 && (size_t)o.offset < b.layer_slot.size())
                                       ? b.layer_slot[(size_t)o.offset]
                                       : -1;
@@ -783,11 +641,8 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             std::memset(&tt, 0, sizeof tt);
             tt.data  = static_cast<char*>(b.base) + off;
             tt.dtype = b.dtype;
-            /* THE OPERAND CARRIES THE LAYER'S SHAPE, not a flat byte span. The binding composed it
-             * at load out of the plugin's declaration and the block manager's decisions, because
-             * neither half alone is enough (core/runtime/ctx.h says which numbers and why). Every
-             * libr4d shim refuses a flat span -- `if (kv->rank != 4) return RAD_E_SHAPE` -- and
-             * refuses correctly: a paged cache walked as one dimension is not a cache. */
+            /* The operand carries the layer's shape, composed at load (see KVPoolBinding in
+             * ctx.h); libr4d shims refuse a flat span. */
             if (b.rank) {
                 tt.rank = b.rank;
                 for (uint32_t d = 0; d < b.rank; ++d) tt.shape[d] = b.shape[d];
@@ -811,112 +666,41 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         }
     }
 
-    /* Everything else in RadArgs -- the geometry view, the scratch pointer and its size, the
-     * instance init() returned, the rank and the world size -- was filled in at prepare and has
-     * not changed. args.t already points at tbuf_. */
+    /* The rest of RadArgs was filled in at prepare; args.t already points at tbuf_. */
     ip.args.n_t = n_opd;
     p.issued    = true;
     ++n_issues_;
 
-    /* RADIANCE_DEBUG_ARGSHA -- see the note by the digest. Pass 1 only, so the sequence compared
-     * step to step is the same sequence. */
-
-    /* RANK 0 ONLY. These accumulators are file-scope statics and `Ctx::issue` runs on EVERY rank
-     * thread, so without this the two ranks interleave into one sequence: the issue COUNT then
-     * varies run to run and every digest differs, which reads exactly like a data-dependent op
-     * sequence and is not one. */
-    if (g_dbg_argsha && batch_ && rank() == 0) {
-        const int dp = batch_->draft_pass;
-        if (dp != g_argsha_pass) {
-            if (g_argsha_pass == 1 && !g_argsha_cur.empty() && g_argsha_seen < 12) {
-                size_t mptr = 0, mshp = 0;
-                const size_t k = g_argsha_cur.size() < g_argsha_prev.size()
-                                     ? g_argsha_cur.size() : g_argsha_prev.size();
-                for (size_t i = 0; i < k; ++i) {
-                    if (g_argsha_cur[i].ptr != g_argsha_prev[i].ptr) ++mptr;
-                    if (g_argsha_cur[i].shp != g_argsha_prev[i].shp) ++mshp;
-                }
-                if (!g_argsha_prev.empty()) {
-                    std::fprintf(stderr,
-                                 "D argsha: draft pass 1 -- %zu issues, %zu moved a POINTER, "
-                                 "%zu moved a SHAPE\n",
-                                 g_argsha_cur.size(), mptr, mshp);
-                    if (g_argsha_seen < 2) {
-                        auto nm = [&](rad_op oh) -> const char* {
-                            return (oh != RAD_NULL_HANDLE && (size_t)oh < plans_.size() &&
-                                    plans_[oh].info)
-                                       ? plans_[oh].info->op.c_str() : "<?>";
-                        };
-                        for (size_t i = 0; i < k; ++i) {
-                            const bool p = g_argsha_cur[i].ptr != g_argsha_prev[i].ptr;
-                            const bool q = g_argsha_cur[i].shp != g_argsha_prev[i].shp;
-                            if (p || q)
-                                std::fprintf(stderr, "D argsha:   %2zu %-24s %s%s\n", i,
-                                             nm(g_argsha_cur[i].h), p ? "ptr " : "",
-                                             q ? "shape" : "");
-                        }
-                    }
-                }
-                ++g_argsha_seen;
-                g_argsha_prev = g_argsha_cur;
-            } else if (g_argsha_pass == 1) {
-                g_argsha_prev = g_argsha_cur;
-            }
-            if (dp == 1) { g_argsha_cur.clear(); g_argsha_i = 0; }
-            g_argsha_pass = dp;
-        }
-        if (dp == 1) { g_argsha_cur.push_back(argsha_of(h, n, t, n_opd)); ++g_argsha_i; }
-    }
-
-    /* THE LINK BILL, charged where the message size is known and nothing has to be guessed: `n`
-     * IS the collective's `numel` (every all_reduce declares it as the ranged parameter) and
-     * operand 0 carries the dtype it is sent in, which is the ACTIVATION's dtype and not the op's
-     * `dtype` key -- that key is the architecture's operand-combination spelling ("w4a8"), which
-     * is not an element width. Two relaxed adds on seventeen issues a step. */
+    /* All-reduce link accounting: `n` is the collective's numel (its ranged parameter) and operand
+     * 0's dtype is the wire element type. The op's `dtype` key ("w4a8") is not an element
+     * width. */
     if (p.billed && n_opd > 0) {
         const int bits = rad_dtype_bits(t[0].dtype);
         ar_calls_.fetch_add(1, std::memory_order_relaxed);
         if (bits > 0) ar_bytes_.fetch_add(n * bits / 8, std::memory_order_relaxed);
     }
 
-    /* The oracle, if this issue is one it was asked about. It snapshots every operand to the host
-     * before the launch so the host kernel can be given the same bytes -- an in-place op would
-     * otherwise be compared against its own output. Null in every run that did not arm it. */
+    /* The oracle snapshots every operand before the launch, so the host kernel sees the same
+     * input bytes even for an in-place op. */
     const IssuePlan* horacle = oracle_ ? oracle_before(h, b, n_opd) : nullptr;
 
-    /* ============================== A HOST LAUNCH IS A JOIN ==============================
+    /* ============================== a host launch is a join ==============================
      *
-     * THE HOST THREAD RUNS AHEAD OF THE DEVICE. Every device launch is asynchronous, so by the
-     * time this function is called for op N the GPU may still be somewhere back at op N-200 --
-     * that gap is the whole reason the issue path is allowed to cost a microsecond. A HOST-SITE op
-     * is the one place it stops being harmless: it runs NOW, on this thread, and reads and writes
-     * the host arena NOW.
+     * The host runs ahead of the device, but a host-site op reads and writes the host arena now,
+     * on this thread. Without a join it reads stale data, e.g. a host PLE gather
+     * (`embed_lookup_q`) reading row ids a device `ngram_ids` has not yet written: valid ids,
+     * wrong rows, fluent wrong output.
      *
-     * A PLE gather on the host is exactly that shape. `ngram_ids` writes the hashed row ids into a
-     * host-domain buffer on the device, and `embed_lookup_q` reads them on the host. With no join
-     * the host reads whatever the arena holds from an earlier step and gathers the rows of the
-     * wrong n-gram -- valid ids, valid rows, every kernel agreeing with its oracle, and fluent text
-     * that is a stable wrong answer rather than an intermittent one.
+     * The join waits on the last device op per lane that touched the host arena (host_touch_ev_),
+     * not the whole stream: every hazard is with such an op, and draining would idle the device
+     * while the host works. An architecture can issue the producer early and keep the device busy
+     * meanwhile. A host op naming an untracked operand (raw pointer, KV cache, device-domain
+     * buffer) drains its stream instead (host_join).
      *
-     * WHAT THE JOIN WAITS FOR is the last device op on each lane that touched the host arena
-     * (host_touch_ev_), not the whole stream. Every hazard a host op has is with such an op -- the
-     * producer of an input, or a device reader of bytes its output reuses -- and on one lane they
-     * all complete no later than the last of them. Draining the stream instead waits for
-     * everything issued before the op, which on a decode step is every layer in front of it, and
-     * then the device runs dry while the host works, because nothing after the host op has been
-     * issued yet. Waiting on the producer alone lets an architecture issue it early and keep the
-     * device busy with the layers issued in between while the host gathers.
-     *
-     * AN OPERAND THE ARENA DOES NOT DESCRIBE IS NOT TRACKED -- a raw batch pointer, a KV cache, a
-     * device-domain buffer -- so a host op that names one drains its stream (host_join).
-     *
-     * AND THE HOST'S WRITES HAVE TO REACH THE DEVICE. Host-arena memory is cached on the device like
-     * any other memory, and with no host wait between the host op and the kernel that reads its
-     * output, nothing would make that kernel look past a stale line: rad_dev_host_wrote, after the
-     * launch below, is what does. */
+     * The device caches host-arena memory, so rad_dev_host_wrote after the launch makes the
+     * host's writes visible to later kernels. */
     if (dom == RAD_DOMAIN_HOST) {
-        /* TIMED APART FROM THE OP, because it is not the op's cost -- it is the cost of the
-         * PIPELINE this op stops. */
+        /* Timed apart from the op: it is the cost of stopping the pipeline. */
         if (profiling_) {
             const auto j0 = std::chrono::steady_clock::now();
             const int js = host_join(opd, n_opd);
@@ -929,22 +713,17 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         }
     }
 
-    /* A SCRATCH REGION IS ONE STREAM'S. The kernels on a lane are handed consecutive slices of it
-     * (scratch_take), and two that could run at once on the lane are kept apart by the slices
-     * being disjoint -- the pass's recording orders any pair whose slices meet (haz_mark). A
-     * scratch user on each lane with no join between them overlaps with nothing recorded to order
-     * it, and the two would overwrite each other's partials with nothing downstream able to tell.
-     * A split-K router GEMM on lane 0 and the shared arm's split-K GEMM on lane 1 meet exactly
-     * like that on every MoE layer.
+    /* A scratch region belongs to one stream. Kernels on a lane get consecutive slices
+     * (scratch_take); a recorded pass orders any pair whose slices meet (haz_mark). Scratch users
+     * on two unjoined lanes would overwrite each other's partials (e.g. split-K router GEMM on
+     * lane 0 and the shared arm's split-K GEMM on lane 1, every MoE layer).
      *
-     * So a program that declares its second lane gets a region per lane, and each launch is
-     * pointed at its own lane's. A lane used WITHOUT that declaration shares region 0, and there
-     * the second of such a pair is ordered behind the first instead -- the overlap is given up for
-     * that launch, never the numbers. That fallback is kept on lane 0 before lane 1 exists as well:
-     * a lane built later starts with nothing ordering it behind what lane 0 already issued. */
+     * A program that declares its second lane gets a region per lane. Otherwise both lanes share
+     * region 0 and the second user is ordered behind the first, giving up the overlap but not
+     * correctness. That also covers lane 0 before lane 1 exists, since a lane built later has
+     * nothing ordering it behind lane 0's earlier work. */
     if (ip.args.scratch_bytes > 0 && dom != RAD_DOMAIN_HOST && arena_.scratch_regions() > 1) {
-        /* Each lane has its own region, so two scratch users on two lanes never share bytes and
-         * nothing has to be ordered. The plan entry serves whichever lane issues it. */
+        /* Per-lane regions: nothing to order. */
         ip.args.scratch = scratch_take(lane_, ip.args.scratch_bytes);
     } else if (ip.args.scratch_bytes > 0 && dom != RAD_DOMAIN_HOST) {
         ip.args.scratch = scratch_take(0, ip.args.scratch_bytes);
@@ -968,9 +747,9 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         scratch_n_[lane_] = n;
     }
 
-    /* A HOST-SITE OP IN A PASS BEING RECORDED is host work a tape cannot hold: the recording is
-     * cut here and the op kept, to be joined and run again on these operands at every play. Its
-     * launch is not recorded either way -- anything it submitted would be submitted twice. */
+    /* A host-site op while recording: cut the tape and keep the op, to be joined and rerun on
+     * these operands at every play. Its launch is not recorded, or anything it submitted would be
+     * submitted twice. */
     if (rec_ && dom == RAD_DOMAIN_HOST) {
         tape_cut();
         TapeHost th;
@@ -991,10 +770,9 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
     if (host_paused) tape_pause(true);
     const int rec0 = rec_ && !host_paused ? tape_mark() : 0;
 
-    /* A COLLECTIVE HAS THE CARD'S LINK TO ITSELF in a pass the stager copies weights through: the
-     * stager's lists yield while the hold is in force (rad_link_hold says why). Taken here, after
-     * every wait this op's operands put on the stream, so the stream waits on nothing between the
-     * hold and its release -- a weight it waited on could be behind a yielding list. */
+    /* In a staged pass a collective holds the card's link; the stager's copy lists yield meanwhile
+     * (see rad_link_hold). Taken after every wait this op's operands put on the stream, so nothing
+     * between hold and release can wait on a weight stuck behind a yielding list. */
     const bool hold = staging_ && p.collective && dom == RAD_DOMAIN_DEVICE;
     const RadArgs* la = &ip.args;
     RadArgs gate_args;
@@ -1012,18 +790,9 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
     int s;
     if (profiling_ && dom == RAD_DOMAIN_HOST) {
 
-        /* A HOST-SITE OP IS TIMED ON THE HOST CLOCK, because device events cannot see it: they
-         * record when the STREAM reaches them and the stream does not stall for a host call, so an
-         * event pair around this launch measures nothing and the op vanishes from the table.
-         *
-         * Without this the most expensive thing in the step vanishes from the table. The PLE
-         * gather reads sixteen 160-byte rows out of a multi-gigabyte mapping per token, so its
-         * layer costs milliseconds a step against tens of microseconds of device kernels -- and a
-         * device-event profile shows only the tens of microseconds. A host kernel's cost is a
-         * STALL in the middle of the step, which is the one thing an operator most needs named.
-         *
-         * Wall clock and not a device event, so it includes whatever the host call waits on:
-         * page faults, the link read of its input, everything. That is the number that matters. */
+        /* A host-site op is timed on the host wall clock; a device event pair around it would
+         * measure nothing. It includes page faults and link reads, which can make a host op (e.g.
+         * the PLE gather) the most expensive thing in the step. */
         const auto t0 = std::chrono::steady_clock::now();
         s = ip.launch(la, cur_stream());
         const auto t1 = std::chrono::steady_clock::now();
@@ -1032,9 +801,8 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         prof_calls_[(size_t)h] += 1;
         if ((size_t)h < prof_host_.size()) prof_host_[(size_t)h] = 1;
     } else if (profiling_) {
-        /* One predictable branch in exchange for §16's per-op timing. The events go on the compute
-         * stream around the launch; the synchronisation that reads them is at the end of the step,
-         * and it is what makes a profiled run incomparable to an unprofiled one. */
+        /* Spec §16 per-op timing: events around the launch, read by a sync at the end of the
+         * step (which is why profiled runs are not comparable). */
         if (prof_n_ < prof_ring_.size()) {
             ProfSlot& ps = prof_ring_[prof_n_++];
             ps.op = (int32_t)h;
@@ -1046,11 +814,8 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             prof_overflowed_ = true;
             s = ip.launch(la, cur_stream());
         }
-    /* RANK 0 ONLY, FOR THE SECOND TIME IN THIS FILE. `Ctx::issue` runs on every rank thread, so a
-     * file-scope accumulator is written by both. Unguarded, the digest above gives wrong NUMBERS
-     * -- two ranks interleaving into one sequence -- and the per-op std::unordered_map here gives
-     * a SEGFAULT within a window. Doubles race benignly enough to mislead, a hash map does not
-     * race at all. Anything this instrument accumulates belongs to one thread. */
+    /* Rank 0 only: these file-scope accumulators (including an unordered_map) are not
+     * thread-safe, and every rank thread runs this. */
     } else if (g_dbg_issue && rank() == 0) {
         const auto ta = std::chrono::steady_clock::now();
         s = ip.launch(la, cur_stream());
@@ -1068,7 +833,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                  "an issue (%.3f total)\n",
                          g_iss_n, (g_iss_own - g_iss_own_p) / w, (g_iss_lau - g_iss_lau_p) / w,
                          (g_iss_own - g_iss_own_p + g_iss_lau - g_iss_lau_p) / w);
-            /* The walk is inside `own`, so this says how much of `own` it IS. */
+            /* The table walk is part of `own`. */
             std::fprintf(stderr, "D issue:   of which weight tables: %.3f us an issue over "
                                  "%.1f entries (%.1f ns an entry)\n",
                          (g_wtab_us - g_wtab_us_p) / w,
@@ -1076,9 +841,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                          (g_wtab_e - g_wtab_e_p) > 0
                              ? (g_wtab_us - g_wtab_us_p) * 1000.0 / (double)(g_wtab_e - g_wtab_e_p)
                              : 0.0);
-            /* Top by TOTAL host launch time, not by the per-issue mean: an op issued 48 times a
-             * step at 2 us costs more than one issued twice at 20. Both columns are printed so a
-             * fat prologue and a fat call count can be told apart. */
+            /* Top ops by total host launch time, with the per-issue mean beside it. */
             std::vector<std::pair<double, uint32_t>> ord;
             ord.reserve(g_iss_by_op.size());
             for (const auto& kv : g_iss_by_op) ord.push_back({kv.second.lau, kv.first});
@@ -1103,8 +866,8 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         s = ip.launch(la, cur_stream());
     }
     if (hold) {
-        /* Released whatever the launch said, by a barrier unless the launch said it ended the hold
-         * itself (RAD_LINK_ENDED): a list waiting on the hold would otherwise never end. */
+        /* Always released, by a barrier unless the launch ended the hold itself
+         * (RAD_LINK_ENDED); otherwise a list waiting on the hold never ends. */
         const int hr = rad_link_hold(cur_stream(), la != &ip.args && s == RAD_LINK_ENDED ? 2 : 0);
         if (hr < 0 && s >= 0) s = hr;
     }
@@ -1191,13 +954,12 @@ void Ctx::haz_note(const OpPlan& p, const IssuePlan& ip, const RadTensor* t, int
     haz_ops_.push_back(o);
 }
 
-/* THE HOST OP'S JOIN; see "A HOST LAUNCH IS A JOIN" in Ctx::issue. */
+/* See "a host launch is a join" in Ctx::issue_body. */
 int Ctx::host_join(const RadOperand* opd, int n_opd) {
     return host_join_wait(host_join_drains(opd, n_opd));
 }
 
-/* Whether an operand is one the arena does not track, which the join can only cover by draining
- * the stream. */
+/* Whether any operand is untracked by the host arena, so the join must drain the stream. */
 bool Ctx::host_join_drains(const RadOperand* opd, int n_opd) const {
     for (int i = 0; i < n_opd; ++i) {
         const RadOperand& o = opd[i];
@@ -1228,9 +990,7 @@ int Ctx::abort_step(rad_op h, int band, int dom, const IssuePlan& ip, int64_t n,
     const Resolved& r     = o.bands[(size_t)band].dom[dom];
     const char*     key   = o.ranged_key.empty() ? "n" : o.ranged_key.c_str();
 
-    /* std::string here, on a path that has already lost the step. The hot path above allocates
-     * nothing; this one is allowed to, because the alternative is a truncated diagnostic on the
-     * one occasion anybody needs a complete one. */
+    /* Allocating is fine here: the step is already lost, and the diagnostic must be complete. */
     step_fail_ = fmt("kernel %s (%s, %s, %s domain) refused op '%s' at %s=%lld "
                      "[band %s<=%lld] geometry {%s}: %s",
                      kname, pname, r.choice.empty() ? "no tunables" : r.choice.c_str(),
@@ -1239,11 +999,10 @@ int Ctx::abort_step(rad_op h, int band, int dom, const IssuePlan& ip, int64_t n,
                      (long long)o.bands[(size_t)band].hi, r.geom.str().c_str(),
                      rad_strerror(status));
 
-    RAD_ERR("%s", step_fail_.c_str());
-    RAD_ERR("a kernel returning negative at issue is a bug in SELECTION, not a runtime condition. "
-            "The step is aborted and the requests in it fail. There is no fallback here, silent "
-            "or otherwise -- a silent fallback is how you ship a slow path nobody knows about "
-            "(spec §17).");
+    /* A kernel refusing at issue is a selection bug, not a runtime condition: the step fails
+     * and there is no fallback (spec §17). */
+    RAD_ERR("%s; the step is aborted (a kernel that refuses at issue was selected wrongly)",
+            step_fail_.c_str());
 
     step_status_ = status;
     return status;
@@ -1296,9 +1055,8 @@ void* Ctx::buf_ptr(rad_buf b) {
 }  /* namespace rad */
 
 /* ================================================================== the C surface */
-/* rad_runtime.h is C, and this is the whole of its implementation. Ctx derives from RadCtx, so
- * every one of these is a static_cast and a forwarded call -- the compiler sees straight through
- * it, which is the point of the empty base rather than a reinterpret_cast. */
+/* rad_runtime.h's implementation. Ctx derives from RadCtx, so each entry is a static_cast and a
+ * forwarded call. */
 extern "C" {
 
 int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd, int64_t n) {
@@ -1308,7 +1066,7 @@ int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd, int64_t n)
 
 int rad_step_fail(RadCtx* c, const char* what) {
     if (!c) rad::fatal("rad_step_fail: null RadCtx");
-    return static_cast<rad::Ctx*>(c)->step_fail(what ? what : "the architecture block refused this batch");
+    return static_cast<rad::Ctx*>(c)->step_fail(what);
 }
 
 const RadBatch* rad_batch(RadCtx* c)      { return c ? static_cast<rad::Ctx*>(c)->batch() : nullptr; }
@@ -1316,12 +1074,10 @@ int             rad_rank(RadCtx* c)       { return c ? static_cast<rad::Ctx*>(c)
 int             rad_world_size(RadCtx* c) { return c ? static_cast<rad::Ctx*>(c)->world_size() : 1; }
 RadStream       rad_stream(RadCtx* c)     { return c ? static_cast<rad::Ctx*>(c)->stream() : nullptr; }
 
-/* The second lane. `rad_lane` says which one subsequent issues launch on; `rad_lane_join` orders
- * one behind the other with an event and blocks neither the host nor either stream. The runtime
- * joins lane 1 back into lane 0 at the end of every step whatever the plugin did, so forgetting
- * the join is a performance bug and not a correctness one. Read Ctx::lane1_ before using this:
- * every collective must ride ONE lane, a second lane may not carry a split-K GEMM, and the buffer
- * planner packs from a single linear order. */
+/* The second lane. `rad_lane` selects the lane subsequent issues launch on; `rad_lane_join`
+ * orders one behind the other with an event, blocking neither the host nor a stream. The runtime
+ * joins lane 1 back into lane 0 at the end of every step, so a missing join costs performance,
+ * not correctness. See Ctx::lane1_ for the constraints before using it. */
 int rad_lane(RadCtx* c, int lane) {
     if (!c) return RAD_E_INVAL;
     return static_cast<rad::Ctx*>(c)->set_lane(lane);

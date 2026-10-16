@@ -1,4 +1,5 @@
 #include "oai.h"
+#include "http.h"
 #include "json_partial.h"
 #include "rad_internal.h"
 #include "mm/processor.h"
@@ -12,6 +13,7 @@
 #include <ctime>
 #include <limits>
 #include <random>
+#include <type_traits>
 
 namespace rad {
 namespace server {
@@ -60,9 +62,8 @@ std::string base64_encode(const void* data, size_t len) {
 }
 
 bool base64_decode(const std::string& in, std::vector<uint8_t>* out) {
-    /* One table lookup a character: 0..63 a digit, -2 padding or whitespace (skipped wherever it
-     * stands), -1 anything else. A media part is megabytes of this, and a branch ladder a
-     * character decoded a 30 s clip at about 120 MB/s. */
+    /* One table lookup per character: 0..63 a digit, -2 padding or whitespace (skipped anywhere),
+     * -1 invalid. Media parts are megabytes, so a per-character branch ladder is too slow. */
     static const auto kVal = [] {
         std::array<int8_t, 256> t{};
         t.fill(-1);
@@ -80,7 +81,7 @@ bool base64_decode(const std::string& in, std::vector<uint8_t>* out) {
     uint32_t acc = 0;
     int bits = 0;
     while (p < end) {
-        /* Four digits at once while they are four digits: the body of any real payload. */
+        /* Fast path: four valid digits at once. */
         if (bits == 0 && end - p >= 4) {
             const int a = kVal[p[0]], b = kVal[p[1]], c = kVal[p[2]], d = kVal[p[3]];
             if ((a | b | c | d) >= 0) {
@@ -105,34 +106,28 @@ bool base64_decode(const std::string& in, std::vector<uint8_t>* out) {
     return true;
 }
 
-/* THE PARSED TREE IS BOUNDED, NOT ONLY THE BODY. A JSON value costs the tree a 16-byte node plus
- * its container's growth slack however few bytes it took on the wire, so `[1,1,1,...]` grows
- * about eightfold in parsing, and a body at the transport's size limit becomes gigabytes before
- * a single field has been read -- let alone a prompt checked against the context. Nothing a
- * request can legitimately carry needs many values per token of context: a token-id prompt is
- * one per token and must fit the context, and everything else (messages, tools, schemas, stop
- * strings) is small beside it. So past a budget scaled from the context the parse stops keeping
- * values, and the request is refused having cost a bounded tree. */
+/* The parsed tree is bounded, not only the body. Each JSON value costs a 16-byte node plus
+ * container slack however short its text, so `[1,1,1,...]` grows about eightfold and a body at
+ * the transport limit could become gigabytes before any field is checked. A legitimate request
+ * needs few values per context token (a token-id prompt is one per token; everything else is
+ * small), so past a budget scaled from the context the parse keeps nothing and is refused. */
 int64_t json_value_budget(int64_t max_ctx) {
     const int64_t kFloor = 1 << 20;        /* what a request needs with no context to scale by */
     const int64_t kPerToken = 16;          /* a batch of up to this many full-context prompts */
     return kFloor + kPerToken * std::max<int64_t>(max_ctx, 0);
 }
 
-/* AND ITS DEPTH IS BOUNDED, because the parser is the only thing here that walks a tree without
- * recursing. Serialising one (`dump`) and destroying a copy made field by field both recurse once
- * a level, and a request's schema is serialised on the way to its grammar -- so a body of a few
- * hundred kilobytes of brackets, well inside the value budget, would overflow the worker's stack.
- * Nothing a request carries nests anywhere near the bound: a schema deep enough to matter is
- * refused by the grammar compiler at half of it. */
+/* Depth is bounded too: the parser does not recurse, but `dump` and destroying a field-by-field
+ * copy recurse once per level, and a request's schema is serialised on the way to its grammar.
+ * A few hundred KB of brackets, well inside the value budget, would overflow the worker's stack.
+ * No legitimate request nests near it; the grammar compiler refuses schemas at half the bound. */
 json parse_json_bounded(const std::string& body, int64_t max_ctx, bool* over, bool* deep) {
     const int64_t budget = json_value_budget(max_ctx);
     int64_t n = 0;
     *over = false;
     *deep = false;
-    /* Every completed value is counted once: a scalar at `value`, a container at its end. Once
-     * over or too deep, every event answers false, which tells the parser to keep nothing
-     * further. */
+    /* Each completed value counts once: a scalar at `value`, a container at its end. Once over
+     * or too deep, every event returns false so the parser keeps nothing more. */
     json::parser_callback_t keep = [&](int depth, json::parse_event_t ev, json&) {
         if (!*deep && depth > kJsonMaxDepth) *deep = true;
         if (!*over && (ev == json::parse_event_t::value ||
@@ -201,27 +196,37 @@ ApiError err_overloaded(const std::string& why) {
     return e;
 }
 
+std::vector<std::string> dry_breakers(const std::vector<std::string>& deployment, bool set) {
+    if (set || !deployment.empty()) return deployment;
+    return { "\n", ":", "\"", "*" };
+}
+
+ApiError err_internal(const std::string& why) {
+    ApiError e;
+    e.status = 500;
+    e.type = "internal_server_error";
+    e.message = why;
+    return e;
+}
+
 /* ================================================================== key vetting
  *
- * FOUR KINDS OF FIELD, and the lists below are the whole policy.
+ * Four kinds of field; the lists below are the whole policy.
  *
- * `kAccepted*` is what this server reads and honours, in OpenAI's, vLLM's and llama.cpp's
- * spellings alike (`repetition_penalty` and `repeat_penalty`, `max_tokens` and `n_predict`).
+ * `kAccepted*`: read and honoured, in OpenAI's, vLLM's and llama.cpp's spellings alike
+ * (`repetition_penalty` and `repeat_penalty`, `max_tokens` and `n_predict`).
  *
- * `kInert` changes nothing about the answer: routing and bookkeeping labels (`user`, `metadata`,
- * OpenRouter's `session_id`), and llama.cpp's knobs for its own speed and slot management
- * (`cache_prompt`, `id_slot`, `speculative.*`, ...) -- this server caches prefixes and speculates
- * on its own terms, and the output is the same either way. Accepted and ignored.
+ * `kInert`: cannot change the answer. Routing and bookkeeping labels (`user`, `metadata`), and
+ * llama.cpp's speed and slot knobs (`cache_prompt`, `id_slot`, `speculative.*`, ...); this server
+ * caches and speculates on its own terms. Accepted and ignored.
  *
- * `kGuarded` is what this server knows and does not implement, where honouring it WOULD change
- * the answer: mirostat, top-n-sigma, dynamic temperature, a logit bias. llama.cpp-built clients
- * send every one of them on every request at its "off" value, so each is accepted at that value
- * and refused by name at any other -- a 200 still means every field that could change the answer
- * was honoured, and a client that turned mirostat on learns that it was not.
+ * `kGuarded`: known, not implemented, and would change the answer (mirostat, top-n-sigma,
+ * dynamic temperature, logit bias). llama.cpp-built clients send them on every request at their
+ * "off" value, so each is accepted at that value and refused by name at any other. A 200 thus
+ * means every answer-changing field was honoured.
  *
- * ANYTHING ELSE IS IGNORED, as llama.cpp and vLLM ignore it. A field this server has never heard
- * of is a client's own extension far more often than a request it has misunderstood, and refusing
- * it breaks the client for nothing (#47). The ignored names are logged at debug.
+ * Anything else is ignored, as llama.cpp and vLLM do: an unknown field is far more often a
+ * client's own extension than a misunderstood request. Ignored names are logged at debug.
  */
 namespace {
 
@@ -246,16 +251,16 @@ const char* kAcceptedChat[] = {
 };
 
 /* `preserved_tokens` is llama-server's: control tokens a raw completion's text keeps. On chat the
- * reply format decides them (the guarded entry below); a raw completion has no format, and a
- * client that renders its own template and parses its own reply -- a tool-call sidecar -- has no
- * other way to see a format built of control tokens. */
+ * reply format decides them (guarded below); a raw completion has no format, and a client that
+ * renders its own template and parses its own reply (e.g. a tool-call sidecar) needs it to see
+ * a format built from control tokens. */
 const char* kAcceptedCompletion[] = { "prompt", "echo", "preserved_tokens" };
 
 const char* kAcceptedEmbedding[] = { "model", "input", "messages", "encoding_format",
                                       "dimensions", "image_tokens", "prompt_name" };
 
-/* Named explicitly so that "we ignore it" is a decision in the source and not an accident of a
- * missing branch -- and so the debug line of ignored names lists only what nobody decided on. */
+/* Listed explicitly so ignoring them is a recorded decision, and the debug line of ignored names
+ * shows only undecided fields. */
 const char* kInert[] = {
     /* OpenAI's and OpenRouter's bookkeeping */
     "user", "metadata", "store", "service_tier", "safety_identifier", "prompt_cache_key",
@@ -280,8 +285,10 @@ struct Guarded {
 bool is_zero(const json& v)      { return v.is_null() || (v.is_number() && v.get<double>() == 0.0); }
 bool non_positive(const json& v) { return v.is_null() || (v.is_number() && v.get<double>() <= 0.0); }
 bool falsy(const json& v)        { return v.is_null() || (v.is_boolean() && !v.get<bool>()); }
+/* json::empty() is false for every string, the empty one included, so a string is tested as one. */
 bool empty_value(const json& v) {
-    return v.is_null() || ((v.is_object() || v.is_array() || v.is_string()) && v.empty());
+    if (v.is_string()) return v.get_ref<const std::string&>().empty();
+    return v.is_null() || ((v.is_object() || v.is_array()) && v.empty());
 }
 bool at_most_one(const json& v)  { return v.is_null() || (v.is_number() && v.get<double>() <= 1.0); }
 bool text_only(const json& v) {
@@ -293,11 +300,11 @@ bool text_only(const json& v) {
 
 const Guarded kGuarded[] = {
     { "logit_bias", empty_value, "an empty object",
-      "the device sampler (spec 13) has no per-token bias stage" },
-    { "mirostat", is_zero, "0", "mirostat is not one of the device samplers (spec 13)" },
-    { "top_n_sigma", non_positive, "-1", "top-n-sigma is not one of the device samplers (spec 13)" },
+      "the device sampler has no per-token bias stage" },
+    { "mirostat", is_zero, "0", "mirostat is not one of the device samplers" },
+    { "top_n_sigma", non_positive, "-1", "top-n-sigma is not one of the device samplers" },
     { "dynatemp_range", non_positive, "0",
-      "dynamic temperature is not one of the device samplers (spec 13)" },
+      "dynamic temperature is not one of the device samplers" },
     { "min_keep", is_zero, "0", "the cut stages keep no minimum candidate count" },
     { "post_sampling_probs", falsy, "false",
       "logprobs are the raw distribution's; the distribution after the sampler's stages is not "
@@ -321,28 +328,26 @@ const Guarded kGuarded[] = {
       "the chat format names the control tokens a reply keeps" },
 };
 
-bool in_list(const char* const* list, size_t n, const std::string& k) {
-    for (size_t i = 0; i < n; ++i) if (k == list[i]) return true;
+template <size_t N>
+bool in_list(const char* const (&list)[N], const std::string& k) {
+    for (const char* s : list) if (k == s) return true;
     return false;
 }
-#define ARRN(a) (sizeof(a) / sizeof((a)[0]))
 
 int vet_keys(const json& body, Endpoint ep, ApiError* err, bool native = false) {
     std::string ignored;
     for (auto it = body.begin(); it != body.end(); ++it) {
         const std::string& k = it.key();
-        if (in_list(kInert, ARRN(kInert), k)) continue;
+        if (in_list(kInert, k)) continue;
         bool prefixed = false;
         for (const char* p : kInertPrefixes) prefixed = prefixed || k.rfind(p, 0) == 0;
         if (prefixed) continue;
         if (ep == Endpoint::Embedding) {
-            if (in_list(kAcceptedEmbedding, ARRN(kAcceptedEmbedding), k)) continue;
+            if (in_list(kAcceptedEmbedding, k)) continue;
         } else {
-            if (in_list(kAcceptedCommon, ARRN(kAcceptedCommon), k)) continue;
-            if (ep == Endpoint::Chat &&
-                in_list(kAcceptedChat, ARRN(kAcceptedChat), k)) continue;
-            if (ep == Endpoint::Completion &&
-                in_list(kAcceptedCompletion, ARRN(kAcceptedCompletion), k)) continue;
+            if (in_list(kAcceptedCommon, k)) continue;
+            if (ep == Endpoint::Chat && in_list(kAcceptedChat, k)) continue;
+            if (ep == Endpoint::Completion && in_list(kAcceptedCompletion, k)) continue;
         }
         /* llama-server's native completion returns the token ids, so the field is served there. */
         if (native && k == "return_tokens") continue;
@@ -362,8 +367,8 @@ int vet_keys(const json& body, Endpoint ep, ApiError* err, bool native = false) 
     return RAD_OK;
 }
 
-/* Typed getters that refuse rather than coerce: OpenAI clients that send "0.7" as a string are
- * sending a bug, and silently accepting it hides it until the day the string is "warm". */
+/* Typed getters that refuse rather than coerce: a client sending "0.7" as a string has a bug,
+ * and accepting it would hide the bug. */
 bool get_num(const json& b, const char* k, double* out, ApiError* err) {
     auto it = b.find(k);
     if (it == b.end() || it->is_null()) return true;
@@ -371,11 +376,9 @@ bool get_num(const json& b, const char* k, double* out, ApiError* err) {
     *out = it->get<double>();
     return true;
 }
-/* EVERY INTEGER FIELD THIS FILE READS IS STORED IN 32 BITS, so a value that does not fit is
- * refused here rather than narrowed at the call site. Narrowing is not a clamp: 2^32 becomes 0
- * and 2^31 becomes negative, and for `max_tokens` both of those read downstream as "no limit".
- * The unsigned branch matters too -- nlohmann keeps a literal above INT64_MAX as unsigned, and
- * reading that as int64 wraps it negative. */
+/* Every integer field read here is stored in 32 bits, so a value that does not fit is refused
+ * rather than narrowed: 2^32 would become 0 and 2^31 negative, both "no limit" for `max_tokens`.
+ * nlohmann keeps a literal above INT64_MAX as unsigned, hence the unsigned branch. */
 bool get_int(const json& b, const char* k, int64_t* out, ApiError* err) {
     auto it = b.find(k);
     if (it == b.end() || it->is_null()) return true;
@@ -404,9 +407,9 @@ bool get_str(const json& b, const char* k, std::string* out, ApiError* err) {
     *out = it->get<std::string>();
     return true;
 }
-/* A MEMBER OF A NESTED OBJECT -- a message, a content block, a tool -- read as a string: absent or
- * null leaves `*out` as it was, any other type is refused, named by `param`. json::value() throws
- * on a type it cannot convert, and a throw out of a handler is a 500 in the library's words. */
+/* A string member of a nested object (a message, a content block, a tool): absent or null leaves
+ * `*out` unchanged, any other type is refused under `param`. Used instead of json::value(),
+ * which throws on a type mismatch and would surface as a 500. */
 bool member_str(const json& o, const char* k, const char* param, std::string* out, ApiError* err) {
     auto it = o.find(k);
     if (it == o.end() || it->is_null()) return true;
@@ -414,16 +417,15 @@ bool member_str(const json& o, const char* k, const char* param, std::string* ou
     *out = it->get<std::string>();
     return true;
 }
-/* The same read where the type is checked later, by the validation the value goes through: here a
- * member that is not a string reads as `def`. */
+/* The same read where later validation checks the type: a non-string member reads as `def`. */
 std::string str_or(const json& o, const char* k, const std::string& def = std::string()) {
     auto it = o.find(k);
     return it != o.end() && it->is_string() ? it->get<std::string>() : def;
 }
 
-/* A conversation's label as /sessions shows it: at most 128 bytes, cut where a character starts,
- * because the label is serialised into JSON that refuses a string split inside one. */
-static std::string session_label_of(const std::string& s) {
+/* A conversation's label for /sessions: at most 128 bytes, cut at a UTF-8 character boundary
+ * because the label is serialised into JSON. */
+std::string session_label_of(const std::string& s) {
     constexpr size_t kMax = 128;
     if (s.size() <= kMax) return s;
     size_t cut = kMax;
@@ -431,37 +433,22 @@ static std::string session_label_of(const std::string& s) {
     return s.substr(0, cut);
 }
 
-/* ONE FIELD, SEVERAL SPELLINGS: OpenAI's, vLLM's and llama.cpp's name for the same thing. Any of
- * them may be sent; two that disagree are refused, because there is no order in which to read
- * them that the caller could have meant. */
-bool get_num_any(const json& b, std::initializer_list<const char*> keys, double* out,
-                 ApiError* err) {
+/* One field under several spellings (OpenAI's, vLLM's, llama.cpp's), read as a number (double)
+ * or a 32-bit integer (int64_t). Any may be sent; two that disagree are refused, since no reading
+ * order could be what the caller meant. */
+template <class T>
+bool get_any(const json& b, std::initializer_list<const char*> keys, T* out, bool* present,
+             ApiError* err) {
     const char* named = nullptr;
-    double v = *out;
+    T v = *out;
     for (const char* k : keys) {
         auto it = b.find(k);
         if (it == b.end() || it->is_null()) continue;
-        double x = 0;
-        if (!get_num(b, k, &x, err)) return false;
-        if (named && x != v) {
-            *err = err_bad(k, std::string("disagrees with ") + named + ", which is the same field");
-            return false;
-        }
-        v = x;
-        named = k;
-    }
-    *out = v;
-    return true;
-}
-bool get_int_any(const json& b, std::initializer_list<const char*> keys, int64_t* out,
-                 bool* present, ApiError* err) {
-    const char* named = nullptr;
-    int64_t v = *out;
-    for (const char* k : keys) {
-        auto it = b.find(k);
-        if (it == b.end() || it->is_null()) continue;
-        int64_t x = 0;
-        if (!get_int(b, k, &x, err)) return false;
+        T x = 0;
+        bool ok;
+        if constexpr (std::is_same_v<T, double>) ok = get_num(b, k, &x, err);
+        else ok = get_int(b, k, &x, err);
+        if (!ok) return false;
         if (named && x != v) {
             *err = err_bad(k, std::string("disagrees with ") + named + ", which is the same field");
             return false;
@@ -475,6 +462,18 @@ bool get_int_any(const json& b, std::initializer_list<const char*> keys, int64_t
 }
 
 }  /* namespace */
+
+KeyPolicy request_key_policy() {
+    KeyPolicy p;
+    p.common.assign(std::begin(kAcceptedCommon), std::end(kAcceptedCommon));
+    p.chat.assign(std::begin(kAcceptedChat), std::end(kAcceptedChat));
+    p.completion.assign(std::begin(kAcceptedCompletion), std::end(kAcceptedCompletion));
+    p.embedding.assign(std::begin(kAcceptedEmbedding), std::end(kAcceptedEmbedding));
+    p.inert.assign(std::begin(kInert), std::end(kInert));
+    p.inert_prefixes.assign(std::begin(kInertPrefixes), std::end(kInertPrefixes));
+    for (const Guarded& g : kGuarded) p.guarded.push_back(g.key);
+    return p;
+}
 
 /* The body of every generation endpoint: one JSON object, parsed into a bounded tree. */
 int parse_request_object(const std::string& body, const OaiLimits& lim, json* b, ApiError* err) {
@@ -505,8 +504,7 @@ int parse_request_object(const std::string& body, const OaiLimits& lim, json* b,
 namespace {
 
 /* One row per bounded sampler field. `lo_open` excludes the lower bound; `hi` of infinity is no
- * upper bound. `why` is the refusal when the range alone does not say it well, and null for a
- * closed interval, whose refusal names the interval and the value. */
+ * upper bound. `why` is the refusal text, or null to print the closed interval and the value. */
 struct SamplerRange {
     const char* field;
     double      lo, hi;
@@ -519,7 +517,8 @@ constexpr double kInf = std::numeric_limits<double>::infinity();
 const SamplerRange kSamplerRanges[] = {
     { "temperature",        0.0,  2.0,  false, nullptr },
     { "top_p",              0.0,  1.0,  true,  "must be in (0, 1]" },
-    { "top_k",              0.0,  kInf, false, "must be >= 0 (0 disables it)" },
+    { "top_k",              0.0,  kInf, false,
+      "must be >= 0 (0 samples from the 1024 most likely tokens, the sampler's candidate width)" },
     { "min_p",              0.0,  1.0,  false, nullptr },
     { "typical_p",          0.0,  1.0,  true,  "must be in (0, 1]" },
     { "presence_penalty",   -2.0, 2.0,  false, nullptr },
@@ -529,13 +528,14 @@ const SamplerRange kSamplerRanges[] = {
     { "xtc_probability",    0.0,  1.0,  false, nullptr },
     { "xtc_threshold",      0.0,  1.0,  false, nullptr },
     { "dry_base",           1.0,  kInf, false, "must be >= 1" },
+    { "dry_allowed_length", 1.0,  kInf, false, "must be >= 1" },
     { "dry_penalty_last_n", -1.0, kInf, false, "must be >= -1" },
 };
 
 }  /* namespace */
 
-/* Written as "inside the range" and negated, so a NaN -- which a flag can parse and JSON cannot
- * carry -- fails every row rather than passing them all. */
+/* Tested as "inside the range" so a NaN (which a flag can parse, though JSON cannot carry one)
+ * fails every row. */
 bool sampler_value_ok(const char* field, double v, std::string* why) {
     for (const SamplerRange& r : kSamplerRanges) {
         if (std::strcmp(r.field, field)) continue;
@@ -557,17 +557,16 @@ bool sampler_value_ok(const char* field, double v, std::string* why) {
 /* ================================================================== the sampler order
  *
  * llama.cpp's `samplers`: which stages run and in what order, as names ("top_k", "temperature",
- * with llama.cpp's aliases) or as one string of its letters ("kypmxt"). A stage the list leaves
- * out does not run, whatever its own field says -- llama.cpp's meaning, and the reason a client
- * sends the list.
+ * with llama.cpp's aliases) or a string of letters ("kypmxt"). A stage the list leaves out does
+ * not run, whatever its own field says (llama.cpp's meaning).
  *
- * THE CHAIN HERE IS FIXED BUT FOR ONE THING (core/sample/sampler.h): penalties, DRY, top-k, then
- * top-p, min-p, typical and XTC, with temperature either before the cuts (vLLM's order, the
- * default) or after them (llama.cpp's). So a list is honoured when the stages it enables appear in
- * that relative order with temperature at either end of the cuts, and refused by name otherwise.
- * Only ENABLED stages are compared: a stage at its identity value is the same wherever it sits,
- * which is what lets llama.cpp's default list -- typ_p before top_p -- through whenever typical
- * is off. top-n-sigma is guarded at its off value (kGuarded), so it is free to appear anywhere. */
+ * The chain here is fixed (core/sample/sampler.h): penalties, DRY, top-k, top-p, min-p, typical,
+ * XTC, with temperature either before the cuts (vLLM's order, the default) or after them
+ * (llama.cpp's). A list is honoured when its enabled stages appear in that relative order with
+ * temperature at either end of the cuts, and refused by name otherwise. Only enabled stages are
+ * compared, since a stage at its identity value commutes with everything; this admits
+ * llama.cpp's default list (typ_p before top_p) whenever typical is off. top-n-sigma is guarded
+ * at its off value (kGuarded), so it may appear anywhere. */
 static int apply_sampler_order(const json& b, SamplingParams* sp, ApiError* err) {
     auto it = b.find("samplers");
     if (it == b.end() || it->is_null()) return RAD_OK;
@@ -596,27 +595,23 @@ static int apply_sampler_order(const json& b, SamplingParams* sp, ApiError* err)
             default:  return -1;
         }
     };
+    auto unknown = [&](const std::string& what) {
+        *err = err_unsupported("samplers", what + " names no sampler this server runs (infill and "
+                                                  "adaptive_p are not served)");
+        return RAD_E_UNSUPPORTED;
+    };
     std::vector<int> list;
     if (it->is_string()) {
         for (char c : it->get<std::string>()) {
             const int st = by_char(c);
-            if (st < 0) {
-                *err = err_unsupported("samplers", std::string("'") + c + "' names no sampler this "
-                                       "server runs (infill and adaptive_p are not served)");
-                return RAD_E_UNSUPPORTED;
-            }
+            if (st < 0) return unknown(std::string("'") + c + "'");
             list.push_back(st);
         }
     } else if (it->is_array()) {
         for (const json& n : *it) {
             if (!n.is_string()) { *err = err_bad("samplers", "expected sampler names"); return RAD_E_INVAL; }
             const int st = by_name(n.get<std::string>());
-            if (st < 0) {
-                *err = err_unsupported("samplers", "\"" + n.get<std::string>() + "\" names no "
-                                       "sampler this server runs (infill and adaptive_p are not "
-                                       "served)");
-                return RAD_E_UNSUPPORTED;
-            }
+            if (st < 0) return unknown("\"" + n.get<std::string>() + "\"");
             list.push_back(st);
         }
     } else {
@@ -625,8 +620,8 @@ static int apply_sampler_order(const json& b, SamplingParams* sp, ApiError* err)
     }
 
     auto listed = [&](int st) { return std::find(list.begin(), list.end(), st) != list.end(); };
-    /* What the list leaves out is off. Greedy stays greedy: temperature 0 is the argmax in either
-     * engine whatever surrounds it. */
+    /* Stages the list leaves out are off. Temperature 0 stays greedy: it is the argmax either
+     * way. */
     if (!listed(PEN))  { sp->rep_penalty = 1.0f; sp->freq_penalty = 0.0f; sp->pres_penalty = 0.0f; }
     if (!listed(DRY))  sp->dry_multiplier = 0.0f;
     if (!listed(TOPK)) sp->top_k = 0;
@@ -672,8 +667,8 @@ static int apply_sampler_order(const json& b, SamplingParams* sp, ApiError* err)
         last_st = st;
     }
     if (!on[TEMP]) return RAD_OK;
-    /* Temperature: after the penalties, and before every enabled cut or after every one. top-k
-     * commutes with it -- a monotone rescale keeps the same k largest -- so it is not a cut here. */
+    /* Temperature: after the penalties, and before all enabled cuts or after all of them. top-k
+     * commutes with it (a monotone rescale keeps the same k largest), so it is not a cut here. */
     const int pt = pos(TEMP);
     for (int st : { PEN, DRY })
         if (on[st] && pos(st) > pt) return refuse(st, TEMP);
@@ -700,11 +695,9 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
         return false;
     };
 
-    /* THE DEPLOYMENT'S DEFAULTS ARE THE SEED, and every field below reads its current value
-     * before looking for one in the body -- so a field the request names overrides, and a field
-     * it omits keeps what the checkpoint asked for. Done here rather than at each call site
-     * because a sampler default that reached one endpoint and not the other would make the same
-     * model answer differently through /v1/completions than through /v1/chat/completions. */
+    /* Start from the deployment's defaults; each field below overrides only when the request
+     * names it. Done here, not per endpoint, so /v1/completions and /v1/chat/completions sample
+     * identically. */
     r->sp = lim.default_sampling;
 
     d = r->sp.temp;
@@ -743,7 +736,8 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
     r->sp.freq_penalty = (float)d;
 
     d = r->sp.rep_penalty;
-    if (!get_num_any(b, { "repetition_penalty", "repeat_penalty" }, &d, err)) return RAD_E_INVAL;
+    if (!get_any(b, { "repetition_penalty", "repeat_penalty" }, &d, nullptr, err))
+        return RAD_E_INVAL;
     if (!ok("repetition_penalty", d)) return RAD_E_INVAL;
     r->sp.rep_penalty = (float)d;
 
@@ -771,20 +765,18 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
     r->sp.dry_base = (float)d;
     i64 = r->sp.dry_allowed_length;
     if (!get_int(b, "dry_allowed_length", &i64, err)) return RAD_E_INVAL;
+    if (!ok("dry_allowed_length", (double)i64)) return RAD_E_INVAL;
     r->sp.dry_allowed_length = (int)i64;
     i64 = r->sp.dry_penalty_last_n;
     if (!get_int(b, "dry_penalty_last_n", &i64, err)) return RAD_E_INVAL;
     if (!ok("dry_penalty_last_n", (double)i64)) return RAD_E_INVAL;
     r->sp.dry_penalty_last_n = (int)i64;
 
-    /* ABSENT MEANS llama.cpp's FOUR, not none. A client that turns DRY on and names no breakers
-     * gets what llama-server gives it -- newline, colon, quote and asterisk end a repeat -- and a
-     * list that is sent replaces them outright, an empty one included. The default costs nothing
-     * with DRY off: the sampler resolves breakers only for a request that runs DRY. */
+    /* Absent means llama.cpp's four breakers (newline, colon, quote, asterisk), not none; a sent
+     * list, even empty, replaces them. The sampler resolves breakers only when DRY runs. */
     auto dsb = b.find("dry_sequence_breakers");
     if (dsb == b.end() || dsb->is_null()) {
-        if (r->sp.dry_seq_breakers.empty() && !lim.default_dry_breakers_set)
-            r->sp.dry_seq_breakers = { "\n", ":", "\"", "*" };
+        r->sp.dry_seq_breakers = dry_breakers(r->sp.dry_seq_breakers, lim.default_dry_breakers_set);
     } else {
         r->sp.dry_seq_breakers.clear();
         if (!dsb->is_array()) {
@@ -800,21 +792,25 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
         }
     }
 
-    /* An unset seed must not mean seed 0, or every request in a deployment that never sets one
-     * would draw the identical sample. Absent means "pick one", which is what OpenAI's contract
-     * says and what makes `seed` meaningful when it IS set. */
+    /* An absent seed is random, per OpenAI's contract; seed 0 would make every unseeded request
+     * draw the same sample. -1 is random too: llama-server's spelling of "no seed", which its
+     * clients send back from /props. */
     auto sit = b.find("seed");
-    if (sit != b.end() && !sit->is_null()) {
-        if (!sit->is_number_integer()) { *err = err_bad("seed", "expected an integer"); return RAD_E_INVAL; }
+    if (sit != b.end() && !sit->is_null() && !sit->is_number_integer()) {
+        *err = err_bad("seed", "expected an integer");
+        return RAD_E_INVAL;
+    }
+    if (sit != b.end() && !sit->is_null() &&
+        !(!sit->is_number_unsigned() && sit->get<int64_t>() == -1)) {
         r->sp.seed = (uint64_t)sit->get<int64_t>();
     } else {
         static thread_local std::mt19937_64 rng{std::random_device{}()};
         r->sp.seed = rng();
     }
 
-    /* n. Implemented by fan-out: n independent requests over the same prompt, which the prefix
-     * cache makes nearly free after the first (spec 7.3). Their seeds are offset from the
-     * request's, because n identical seeds would produce n identical completions. */
+    /* n is served by fan-out: n independent requests over one prompt, nearly free after the first
+     * through the prefix cache (spec 7.3). Their seeds are offset from the request's so the n
+     * completions differ. */
     i64 = 1;
     if (!get_int(b, "n", &i64, err)) return RAD_E_INVAL;
     if (i64 < 1 || i64 > lim.max_n) {
@@ -829,13 +825,12 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
     if (!get_int(b, "priority", &i64, err)) return RAD_E_INVAL;
     r->priority = (int)i64;
 
-    /* max_tokens, with max_completion_tokens as OpenAI's newer spelling and n_predict as
-     * llama.cpp's. A NEGATIVE VALUE IS llama.cpp's "no limit": whatever the context leaves, which
-     * is what 0 resolves to in clamp_max_tokens -- and unlike an absent field it does not take the
-     * deployment's --default-max-tokens. */
+    /* max_tokens, also spelled max_completion_tokens (OpenAI) and n_predict (llama.cpp). A
+     * negative value is llama.cpp's "no limit": stored as 0, which clamp_max_tokens resolves to
+     * what the context leaves; unlike an absent field it ignores --default-max-tokens. */
     int64_t mt = 0;
     bool mt_named = false;
-    if (!get_int_any(b, { "max_tokens", "max_completion_tokens", "n_predict" }, &mt, &mt_named,
+    if (!get_any(b, { "max_tokens", "max_completion_tokens", "n_predict" }, &mt, &mt_named,
                      err))
         return RAD_E_INVAL;
     if (mt_named && mt == 0) { *err = err_bad("max_tokens", "must be >= 1, or -1 for no limit"); return RAD_E_INVAL; }
@@ -844,14 +839,10 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
     /* ignore_eos: generate to max_tokens whatever the model emits. See Request::ignore_eos. */
     if (!get_bool(b, "ignore_eos", &r->ignore_eos, err)) return RAD_E_INVAL;
 
-    /* stop: a string or an array of strings.
-     *
-     * BOUNDED IN COUNT AND LENGTH, because every stop string is searched for in each stretch of
-     * text a choice produces -- by the decoder and again by the server's own scan -- so what one
-     * request costs per token is its number of stop strings times the longest of them. OpenAI
-     * allows four. The bounds here are far past anything a client sends and exist so that no
-     * request can buy that scan without limit. The deployment may move them (--max-stop-strings,
-     * --max-stop-bytes). */
+    /* stop: a string or an array of strings. Bounded in count and length because every stop
+     * string is searched in each piece of generated text (by the decoder and the server's scan),
+     * so per-token cost is count x longest. OpenAI allows four; the bounds are far above that
+     * and configurable (--max-stop-strings, --max-stop-bytes). */
     const size_t max_stops = (size_t)lim.max_stops, max_stop_bytes = (size_t)lim.max_stop_bytes;
     auto st = b.find("stop");
     if (st != b.end() && !st->is_null()) {
@@ -888,14 +879,12 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
     if (!get_bool(b, "stream", &bl, err)) return RAD_E_INVAL;
     r->stream = bl;
 
-    /* llama.cpp's streaming extras: the timings on every chunk rather than the last, and the
-     * prompt's progress as chunks while it is being read. */
+    /* llama.cpp's streaming extras: timings on every chunk, and prompt progress chunks. */
     if (!get_bool(b, "timings_per_token", &r->timings_per_token, err)) return RAD_E_INVAL;
     if (!get_bool(b, "return_progress", &r->return_progress, err)) return RAD_E_INVAL;
 
-    /* OpenRouter's `session_id`: which conversation the request belongs to, as the client names
-     * it. It labels the conversation on /sessions and the dashboard and changes nothing else. A
-     * value that is not a string is not a label and is ignored, as the field is everywhere. */
+    /* OpenRouter's `session_id`: the client's conversation name, used only as a label on
+     * /sessions and the dashboard. A non-string value is ignored. */
     auto sid = b.find("session_id");
     if (sid != b.end() && sid->is_string()) r->session_label = session_label_of(sid->get<std::string>());
 
@@ -914,27 +903,20 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
 
 /* ================================================================== thinking
  *
- * Three spellings reach this server for one question -- does the model reason before it answers.
- * `chat_template_kwargs: {"enable_thinking": false}` is what vLLM's clients send and is the one
- * that matters here; `enable_thinking` at the top level is the shorthand several clients grew;
- * `reasoning_effort` is OpenAI's own, and "none"/"minimal" is the only value of it this server
- * can honour, because the rest ask the model to think HARDER and no chat template exposes a dial
- * for that.
+ * Three spellings ask whether the model reasons before answering:
+ * `chat_template_kwargs: {"enable_thinking": false}` (vLLM's clients), top-level
+ * `enable_thinking` (a common shorthand), and OpenAI's `reasoning_effort`, whose "none" and
+ * "minimal" turn thinking off.
  *
- * THE KWARG ALONE IS NOT ENOUGH, and this is the trap the whole function exists for. The vendored
- * llama.cpp chat layer copies chat_template_kwargs into the template context and THEN overwrites
- * the key `enable_thinking` with its own boolean field (chat-auto-parser-helpers.cpp). So a
- * caller who sends the kwarg and nothing else has it silently overwritten with the default true,
- * and sees the model think anyway -- a 200 that did not honour the request, which is the one
- * outcome this file's header forbids. Lifting the kwarg into the field is what makes it real.
+ * The kwarg alone is not enough: the vendored llama.cpp chat layer copies chat_template_kwargs
+ * into the template context and then overwrites `enable_thinking` with its own boolean field
+ * (chat-auto-parser-helpers.cpp). The kwarg is therefore lifted into that field.
  *
- * THE DEPLOYMENT'S DEFAULTS GO IN FIRST AND THE REQUEST OVERWRITES THEM, key by key -- except that
- * thinking is one setting with three spellings, and a default in one spelling must not survive a
- * request that used another. A request that says anything about thinking (either enable_thinking,
- * or a reasoning effort) drops the deployment's enable_thinking; one that names an effort drops
- * the deployment's effort too. Otherwise `--chat-template-kwargs '{"enable_thinking":false}'`
- * would turn off thinking for a caller who sent `reasoning_effort: "high"`, and
- * `--reasoning-effort none` would do the same to one who sent `enable_thinking: true`.
+ * Deployment defaults go in first and the request overwrites them key by key, but a default in
+ * one spelling must not survive a request using another. A request that says anything about
+ * thinking drops the deployment's enable_thinking; one that names an effort also drops the
+ * deployment's effort. Otherwise `--chat-template-kwargs '{"enable_thinking":false}'` would
+ * disable thinking for a caller sending `reasoning_effort: "high"`.
  */
 RequestThinking request_thinking(const json& b) {
     auto kw = b.find("chat_template_kwargs");
@@ -981,10 +963,8 @@ void map_reasoning_effort(const OaiLimits& lim, ChatRenderOptions* opt) {
 
 ApiError template_refusal(const ChatRenderOptions& opt, const OaiLimits& lim, int rs,
                           const std::string& why) {
-    /* AN EFFORT OUTSIDE THE SET IS THE REASON, when the set is known and the word is not in it:
-     * the render that refused carried no other variable the template was probed for. The
-     * template's own sentence is a traceback through its source, which says nothing a client can
-     * act on that the set does not. */
+    /* With a known set and an effort outside it, the effort is the reason: no other probed
+     * variable was in the render. The set is more actionable than the template's traceback. */
     auto it = opt.template_kwargs.find("reasoning_effort");
     if (it != opt.template_kwargs.end() && !lim.reasoning_efforts.empty()) {
         const json v = json::parse(it->second, nullptr, false);
@@ -1023,8 +1003,8 @@ static int parse_thinking(const json& b, const OaiLimits& lim, ChatRenderOptions
 
     if (has_kw) {
         for (auto it = kw->begin(); it != kw->end(); ++it) {
-            /* dump(), not get<string>(): the template context wants JSON, so a string value has
-             * to arrive still quoted. See ChatRenderOptions. */
+            /* dump(), not get<string>(): the template context takes JSON, so strings stay
+             * quoted. See ChatRenderOptions. */
             opt->template_kwargs[it.key()] = it.value().dump();
             if (it.key() == "enable_thinking") {
                 if (!it.value().is_boolean()) {
@@ -1041,12 +1021,9 @@ static int parse_thinking(const json& b, const OaiLimits& lim, ChatRenderOptions
     if (!get_bool(b, "enable_thinking", &think, err)) return RAD_E_INVAL;
     opt->enable_thinking = think;
 
-    /* `preserve_thinking` AT THE TOP LEVEL is the template variable of that name, the same
-     * shorthand `enable_thinking` is: llama.cpp maps the field into the template, and clients
-     * written against it (oh-my-pi, for every Qwen model) send it there as well as in
-     * chat_template_kwargs. The Qwen3.6 and later templates read it to keep earlier assistant
-     * turns' reasoning in the prompt; a template that does not read it ignores it, as it ignores
-     * any variable it does not name. Like enable_thinking, the top-level spelling wins. */
+    /* Top-level `preserve_thinking` is shorthand for the template variable, as llama.cpp maps it
+     * and as some clients send it. Qwen3.6+ templates read it to keep earlier assistant turns'
+     * reasoning in the prompt; other templates ignore it. The top-level spelling wins. */
     auto pt = b.find("preserve_thinking");
     if (pt != b.end() && !pt->is_null()) {
         if (!pt->is_boolean()) {
@@ -1056,30 +1033,23 @@ static int parse_thinking(const json& b, const OaiLimits& lim, ChatRenderOptions
         opt->template_kwargs["preserve_thinking"] = pt->dump();
     }
 
-    /* REASONING EFFORT IS THE TEMPLATE'S VOCABULARY, NOT OURS, so there is no allow-list here.
-     * One would be wrong in both directions: OpenAI's ladder is none/minimal/low/medium/high,
-     * while a model's template may accept a different set -- Qwen3.8's takes xhigh/medium/low and
-     * raise_exception's on anything else. An allow-list would admit `"high"` only for the template
-     * to refuse it, and refuse `"xhigh"`, which that template would have taken.
+    /* Reasoning effort is the template's vocabulary, so there is no allow-list: OpenAI's ladder is
+     * none/minimal/low/medium/high, while e.g. Qwen3.8's template takes xhigh/medium/low and
+     * raises on anything else.
      *
-     * What this layer actually owns is the one mapping that is a SERVER semantic and not a
-     * template one: "none" and "minimal" mean do not think, which is `enable_thinking = false`
-     * and is honoured whatever the template's dial is called. Everything else is passed through
-     * as template context, and a template that does not read it ignores it -- exactly as the
-     * kwarg path already does. A template that DOES read it and refuses says so in its own words,
-     * because ChatPrompt::error carries the sentence out (core/text/chat.h).
-     *
-     * An explicit chat_template_kwargs entry still wins: emplace does not overwrite. */
+     * The server owns one mapping: "none" and "minimal" mean enable_thinking = false. Every other
+     * word is passed as template context; a template that refuses it says so through
+     * ChatPrompt::error (core/text/chat.h). An explicit chat_template_kwargs entry wins, since
+     * emplace does not overwrite. */
     std::string effort;
     if (!get_str(b, "reasoning_effort", &effort, err)) return RAD_E_INVAL;
     /* --reasoning-effort-map, before "none" and "minimal" are read, so a map can name either. */
     if (auto m = lim.reasoning_effort_map.find(effort);
         !effort.empty() && m != lim.reasoning_effort_map.end())
         effort = m->second;
-    /* The deployment's default, where the request did not say. Last, so every explicit spelling
-     * above it wins; emplace, so a chat_template_kwargs entry that already set the key stands.
-     * "none" and "minimal" are an enable_thinking default, so any word about thinking drops them;
-     * a level is an effort default, dropped by an effort. */
+    /* The deployment's default, where the request is silent. "none" and "minimal" act as an
+     * enable_thinking default, dropped by any word about thinking; a level is an effort default,
+     * dropped by an effort. */
     if (effort.empty()) {
         const std::string& def = lim.default_reasoning_effort;
         const bool off = def == "none" || def == "minimal";
@@ -1094,18 +1064,33 @@ static int parse_thinking(const json& b, const OaiLimits& lim, ChatRenderOptions
 
 /* ================================================================== grammar / response_format */
 
-/* `schema_json`, when non-null, means "hand me the schema instead of compiling it" -- which is
- * what the chat endpoint needs. A chat template BUILDS the grammar itself, from the schema and
- * from its own tool-call syntax together, and it takes the schema as a schema
- * (chat-auto-parser-generator.cpp keys `has_response_format` off `inputs.json_schema`). Handing
- * it a pre-compiled GBNF in the `grammar` slot instead means it sees no response format at all,
- * emits no grammar, and the compiled one is then overwritten by that empty result -- a
- * `response_format` that returns 200 and constrains nothing. /v1/completions has no template, so
- * it passes null and the schema is compiled here. */
+/* A non-null `schema_json` returns the schema instead of compiling it, for the chat endpoint:
+ * the chat layer builds the grammar from the schema and its tool-call syntax together, and keys
+ * `has_response_format` off `inputs.json_schema` (chat-auto-parser-generator.cpp). A precompiled
+ * GBNF would be overwritten by its empty result. /v1/completions has no template, passes null,
+ * and the schema is compiled here. */
 static int parse_output_format(const json& b, const OaiDeps& d, OaiRequest* r, ApiError* err,
                                std::string* schema_json = nullptr) {
     std::string gram;
     if (!get_str(b, "grammar", &gram, err)) return RAD_E_INVAL;
+
+    /* A schema goes back as JSON for the template path, or is compiled into the grammar. */
+    auto use_schema = [&](const json& schema, const char* param) -> int {
+        if (schema_json) { *schema_json = schema.dump(); return RAD_OK; }
+        if (!d.grammar) {
+            *err = err_not_implemented(std::string(param) + " requires the JSON-schema to GBNF "
+                                       "compiler, which this build was wired without");
+            return RAD_E_UNSUPPORTED;
+        }
+        std::string out, why;
+        const int st = d.grammar->from_json_schema(schema, out, why);
+        if (st < 0) {
+            *err = err_bad(param, "the schema could not be compiled to a grammar: " + why);
+            return st;
+        }
+        r->sp.grammar = std::move(out);
+        return RAD_OK;
+    };
 
     auto rf = b.find("response_format");
     const bool has_rf = rf != b.end() && !rf->is_null();
@@ -1122,18 +1107,7 @@ static int parse_output_format(const json& b, const OaiDeps& d, OaiRequest* r, A
             return RAD_E_INVAL;
         }
         if (!js->is_object()) { *err = err_bad("json_schema", "expected a JSON Schema object"); return RAD_E_INVAL; }
-        json schema = *js;
-        if (schema_json) { *schema_json = schema.dump(); return RAD_OK; }
-        if (!d.grammar) {
-            *err = err_not_implemented("json_schema requires the JSON-schema to GBNF compiler "
-                                       "(spec 13), which this build was wired without");
-            return RAD_E_UNSUPPORTED;
-        }
-        std::string out, why;
-        const int st = d.grammar->from_json_schema(schema, out, why);
-        if (st < 0) { *err = err_bad("json_schema", "could not be compiled to a grammar: " + why); return st; }
-        r->sp.grammar = out;
-        return RAD_OK;
+        return use_schema(*js, "json_schema");
     }
     if (!gram.empty()) { r->sp.grammar = gram; return RAD_OK; }
     if (!has_rf) return RAD_OK;
@@ -1165,35 +1139,41 @@ static int parse_output_format(const json& b, const OaiDeps& d, OaiRequest* r, A
                        type + "\"");
         return RAD_E_INVAL;
     }
+    return use_schema(schema, "response_format");
+}
 
-    if (schema_json) { *schema_json = schema.dump(); return RAD_OK; }
-
-    if (!d.grammar) {
-        *err = err_not_implemented(
-            "response_format requires the JSON-schema to GBNF compiler (spec 13), which this "
-            "build was wired without");
-        return RAD_E_UNSUPPORTED;
+/* Appends a token-id array, refused under `param` unless every element is a valid id. */
+static int token_ids(const json& arr, const char* param, std::vector<int32_t>* out,
+                     ApiError* err) {
+    for (const auto& v : arr) {
+        int32_t id = 0;
+        if (!v.is_number_integer()) {
+            *err = err_bad(param, "token arrays must contain integers only");
+            return RAD_E_INVAL;
+        }
+        if (!token_id(v, &id)) {
+            *err = err_bad(param, "a token id must be in [0, 2147483647], got " + v.dump());
+            return RAD_E_INVAL;
+        }
+        out->push_back(id);
     }
-    std::string out, why;
-    int s = d.grammar->from_json_schema(schema, out, why);
-    if (s < 0) {
-        *err = err_bad("response_format", "schema could not be compiled to a grammar: " + why);
-        return s;
-    }
-    r->sp.grammar = out;
     return RAD_OK;
+}
+
+/* Compiles the request's grammar at admission, while failure is still a 400; on the step path
+ * it would fail a request that is already streaming. `param` names the field it came from. */
+static int compile_grammar(const OaiDeps& d, OaiRequest* r, const char* param, ApiError* err) {
+    if (r->sp.grammar.empty() || !d.grammar) return RAD_OK;
+    std::string why;
+    if (d.grammar->compile(r->sp.grammar, &r->sp.grammar_program, why) >= 0) return RAD_OK;
+    *err = err_bad(param, "the grammar this request implies cannot be run: " + why);
+    return RAD_E_INVAL;
 }
 
 /* ================================================================== multimodal content parts */
 
-/* The marker the chat template renders for a media part. Both sides have to agree on it; it is
- * declared here and in iface.h so that neither component owns it privately. */
-static const char* const MEDIA_MARKER = RAD_MEDIA_MARKER;
-
-/* Pull the bytes out of an OpenAI image_url. Only `data:` URLs are accepted: fetching an
- * arbitrary http(s) URL on a caller's behalf turns the inference server into an SSRF proxy with
- * network access to everything the deployment can reach, and no amount of allowlisting makes
- * that a good default. */
+/* Only `data:` URLs are accepted: fetching arbitrary http(s) URLs would make the server an SSRF
+ * proxy into everything the deployment can reach. */
 int decode_media_url(const std::string& url, const std::string& field,
                      std::vector<uint8_t>* out, ApiError* err) {
     if (url.rfind("data:", 0) != 0) {
@@ -1218,8 +1198,8 @@ int decode_media_url(const std::string& url, const std::string& field,
     return RAD_OK;
 }
 
-/* THE DEEPEST NESTING IN A JSON TEXT, counted without parsing it: brackets outside string
- * literals, whether or not the text is valid JSON. */
+/* The deepest bracket nesting in a JSON text, counted without parsing (brackets outside string
+ * literals, valid JSON or not). */
 static int json_text_depth(const std::string& s) {
     int d = 0, most = 0;
     bool in_str = false, esc = false;
@@ -1237,20 +1217,16 @@ static int json_text_depth(const std::string& s) {
     return most;
 }
 
-/* A STRING THAT PARSES INTO A TREE DEEPER THAN THE BOUND. Only valid JSON becomes a tree: text
- * that is not JSON never becomes one (a tool result that does not parse is rendered as the
- * string it is), so its brackets are not nesting, however they count. The count
- * runs first and the validation (json::accept, which builds nothing and does not recurse) only
- * when it is over. */
+/* True when `s` is valid JSON nesting deeper than the bound. Invalid JSON is rendered as a plain
+ * string, so its brackets do not count. The cheap count runs first; json::accept (no tree, no
+ * recursion) only when it is over. */
 static bool json_text_too_deep(const std::string& s) {
     return json_text_depth(s) > kJsonMaxDepth && json::accept(s);
 }
 
-/* STRINGS THE CHAT TEMPLATE PARSES AS JSON are bounded like the body is (parse_json_bounded). An
- * assistant message's tool-call arguments and a tool message's content arrive as strings, one
- * level deep in the request, and the template layer parses them into trees and serialises those
- * again when it renders -- recursively, one call a level. Their nesting is checked here, before
- * that happens, so a string of brackets cannot take the worker's stack. */
+/* Strings the chat template parses as JSON are depth-bounded like the body (parse_json_bounded).
+ * Tool-call arguments and tool-message content arrive as strings; the template layer parses and
+ * re-serialises them recursively, so a string of brackets could overflow the worker's stack. */
 static int check_template_json(const json& msg, const std::string& role, ApiError* err) {
     if (role == "assistant") {
         auto tcs = msg.find("tool_calls");
@@ -1283,23 +1259,35 @@ static int check_template_json(const json& msg, const std::string& role, ApiErro
     return RAD_OK;
 }
 
-/* Rewrite content parts in place: text stays, media becomes the marker and its bytes are handed
- * to the encoder. `media` collects (kind, bytes) in the order they appear, which is the order the
- * markers appear in the rendered prompt. */
-/* ONE MEDIA CONTENT PART, read and decoded: 1 with `*kind` and `*bytes` set when `part` is an
- * image, video or audio part, 0 when it is some other type (the caller's to judge), negative with
- * `*err` set when it is a media part that cannot be served. `field` prefixes the error's field
- * name -- "messages[].content[]" for chat, "input[]" for embeddings.
+/* Read and decode one media content part. Returns 1 with `*kind` and `*bytes` set for an image,
+ * video or audio part, 0 for any other type (the caller decides), negative with `*err` for a
+ * media part that cannot be served. `field` prefixes the error's field name
+ * ("messages[].content[]" for chat, "input[]" for embeddings).
  *
- * IMAGE AND VIDEO PARTS, in the two spellings clients send: OpenAI's
- * {"type":"image_url","image_url":{"url":...}} (and the bare-string form), the Responses API's
- * "input_image", and the video equivalents vLLM's clients use -- {"type":"video_url",
- * "video_url":{"url":...}} and "input_video". AUDIO is OpenAI's {"type":"input_audio",
- * "input_audio":{"data": base64, "format": "wav"|"mp3"}} -- and the other formats the decoder
- * admits by the same spelling -- or vLLM's {"type":"audio_url","audio_url":{"url": data URL}}. */
+ * Image and video: OpenAI's {"type":"image_url","image_url":{"url":...}} (or a bare string), the
+ * Responses API's "input_image", and vLLM's {"type":"video_url","video_url":{"url":...}} and
+ * "input_video". Audio: OpenAI's {"type":"input_audio","input_audio":{"data": base64, "format":
+ * ...}} with any format the decoder admits, or vLLM's {"type":"audio_url","audio_url":{"url":
+ * data URL}}. */
 static int read_media_part(const json& part, const std::string& type, const std::string& field,
                            const OaiDeps& d, const OaiLimits& lim, MediaKind* kind,
                            std::vector<uint8_t>* bytes, ApiError* err) {
+    /* A {"url": ...} object or a bare string under `key`, decoded from its data: URL. */
+    auto from_url = [&](const char* key) -> int {
+        const std::string fld = field + "." + key;
+        auto it = part.find(key);
+        std::string url;
+        if (it != part.end() && it->is_object() && it->contains("url") && it->at("url").is_string())
+            url = it->at("url").get<std::string>();
+        else if (it != part.end() && it->is_string())
+            url = it->get<std::string>();
+        else {
+            *err = err_bad(fld, "expected {\"url\": ...}");
+            return RAD_E_INVAL;
+        }
+        RAD_TRY(decode_media_url(url, fld + ".url", bytes, err));
+        return 1;
+    };
     const bool is_image = type == "image_url" || type == "input_image";
     const bool is_video = type == "video_url" || type == "input_video";
     if (is_image || is_video) {
@@ -1308,52 +1296,21 @@ static int read_media_part(const json& part, const std::string& type, const std:
         const bool allowed = is_image ? lim.allow_image : lim.allow_video;
         if (!allowed || !d.mm || !d.mm->accepts(*kind)) {
             *err = err_not_implemented(
-                std::string(what) + " input requires a vision encoder (spec 11); this "
+                std::string(what) + " input requires a vision encoder; this "
                 "model was loaded without one");
             return RAD_E_UNSUPPORTED;
         }
-        const std::string key = is_image ? "image_url" : "video_url";
-        const std::string fld = field + "." + key;
-        std::string url;
-        auto iu = part.find(key);
-        if (iu == part.end() && type == "input_image") iu = part.find("image_url");
-        if (iu == part.end() && type == "input_video") iu = part.find("video_url");
-        if (iu != part.end() && iu->is_object() && iu->contains("url") &&
-            iu->at("url").is_string())
-            url = iu->at("url").get<std::string>();
-        else if (iu != part.end() && iu->is_string())
-            url = iu->get<std::string>();
-        else {
-            *err = err_bad(fld, "expected {\"url\": ...}");
-            return RAD_E_INVAL;
-        }
-        RAD_TRY(decode_media_url(url, fld + ".url", bytes, err));
-        return 1;
+        return from_url(is_image ? "image_url" : "video_url");
     }
     if (type == "input_audio" || type == "audio_url") {
         *kind = MediaKind::Audio;
         if (!lim.allow_audio || !d.mm || !d.mm->accepts(MediaKind::Audio)) {
             *err = err_not_implemented(
-                "audio input requires an audio encoder (spec 11); this model was loaded "
+                "audio input requires an audio encoder; this model was loaded "
                 "without one");
             return RAD_E_UNSUPPORTED;
         }
-        if (type == "audio_url") {
-            const std::string fld = field + ".audio_url";
-            auto au = part.find("audio_url");
-            std::string url;
-            if (au != part.end() && au->is_object() && au->contains("url") &&
-                au->at("url").is_string())
-                url = au->at("url").get<std::string>();
-            else if (au != part.end() && au->is_string())
-                url = au->get<std::string>();
-            else {
-                *err = err_bad(fld, "expected {\"url\": ...}");
-                return RAD_E_INVAL;
-            }
-            RAD_TRY(decode_media_url(url, fld + ".url", bytes, err));
-            return 1;
-        }
+        if (type == "audio_url") return from_url("audio_url");
         auto ia = part.find("input_audio");
         if (ia == part.end() || !ia->is_object() || !ia->contains("data") ||
             !ia->at("data").is_string()) {
@@ -1363,15 +1320,15 @@ static int read_media_part(const json& part, const std::string& type, const std:
         auto fit = ia->find("format");
         const std::string fmt =
             fit != ia->end() && fit->is_string() ? fit->get<std::string>() : std::string();
-        /* The decoder recognises the container by its bytes; the format is checked against
-         * what it admits so a typo is named here rather than as an undecodable clip. */
+        /* The decoder detects the container from its bytes; the format is checked anyway so a
+         * typo is reported as such rather than as an undecodable clip. */
         static const char* const kAudioFormats[] = { "wav", "mp3", "flac", "ogg", "opus",
                                                      "m4a", "aac", "webm", "aiff" };
-        bool known = false;
-        for (const char* f : kAudioFormats) known = known || fmt == f;
-        if (!known) {
-            *err = err_bad(field + ".input_audio.format",
-                           "must be one of wav, mp3, flac, ogg, opus, m4a, aac, webm, aiff");
+        if (!in_list(kAudioFormats, fmt)) {
+            std::string names;
+            for (const char* f : kAudioFormats)
+                names += (names.empty() ? "" : ", ") + std::string(f);
+            *err = err_bad(field + ".input_audio.format", "must be one of " + names);
             return RAD_E_INVAL;
         }
         if (!base64_decode(ia->at("data").get<std::string>(), bytes)) {
@@ -1383,6 +1340,32 @@ static int read_media_part(const json& part, const std::string& type, const std:
     return 0;
 }
 
+/* Whether any string in `v` (a key or a value, the media parts' own markers aside) contains
+ * RAD_MEDIA_MARKER. Iterative: the tree is up to kJsonMaxDepth deep. */
+static bool spells_media_marker(const json& v) {
+    std::vector<const json*> todo = { &v };
+    while (!todo.empty()) {
+        const json* j = todo.back();
+        todo.pop_back();
+        if (j->is_string()) {
+            if (j->get_ref<const std::string&>().find(RAD_MEDIA_MARKER) != std::string::npos)
+                return true;
+        } else if (j->is_object()) {
+            auto t = j->find("type");
+            if (t != j->end() && *t == "media_marker") continue;
+            for (auto it = j->begin(); it != j->end(); ++it) {
+                if (it.key().find(RAD_MEDIA_MARKER) != std::string::npos) return true;
+                todo.push_back(&it.value());
+            }
+        } else if (j->is_array()) {
+            for (const json& e : *j) todo.push_back(&e);
+        }
+    }
+    return false;
+}
+
+/* Rewrite content parts in place: text stays, media becomes the marker and its bytes go to
+ * `media` as (kind, bytes) in the order the markers appear in the rendered prompt. */
 static int lower_content_parts(json& messages, const OaiDeps& d, const OaiLimits& lim,
                                std::vector<std::pair<MediaKind, std::vector<uint8_t>>>* media,
                                ApiError* err) {
@@ -1435,12 +1418,10 @@ static int lower_content_parts(json& messages, const OaiDeps& d, const OaiLimits
                 }
                 continue;
             }
-            /* IMAGE, VIDEO AND AUDIO PARTS (read_media_part). A MEDIA MARKER, NOT TEXT, takes the
-             * part's place: the chat layer flattens a message's parts into one string and joins
-             * TEXT parts with a newline; it joins a marker to its neighbours with nothing, which
-             * is what the model's own template does with an image part (<|vision_end|> runs
-             * straight into the text after it). Joined as text, every picture would cost one
-             * '\n' token the model's own prompt does not have. */
+            /* Media parts (read_media_part) become a media_marker part, not text: the chat layer
+             * joins text parts with a newline but a marker with nothing, matching the model's own
+             * template (<|vision_end|> runs straight into the following text). As text, each
+             * picture would add a '\n' token the model never saw. */
             {
                 MediaKind kind;
                 std::vector<uint8_t> bytes;
@@ -1454,7 +1435,7 @@ static int lower_content_parts(json& messages, const OaiDeps& d, const OaiLimits
                                : (type == "image_url" || type == "input_image") ? "image_url"
                                                                                 : "video_url");
                     part["type"] = "media_marker";
-                    part["text"] = MEDIA_MARKER;
+                    part["text"] = RAD_MEDIA_MARKER;
                     continue;
                 }
             }
@@ -1463,32 +1444,38 @@ static int lower_content_parts(json& messages, const OaiDeps& d, const OaiLimits
             return RAD_E_INVAL;
         }
     }
+    /* Beside media, text that spells the marker would be taken for a media part's place in the
+     * rendered prompt (tokenize_with_media); refused, as the embeddings endpoint refuses it. With
+     * no media the marker is plain text. */
+    if (!media->empty() && spells_media_marker(messages)) {
+        *err = err_bad("messages", std::string("a message contains \"") + RAD_MEDIA_MARKER +
+                                       "\", which this server reserves for the place of a media "
+                                       "part, in a request that carries media");
+        return RAD_E_INVAL;
+    }
     return RAD_OK;
 }
 
-/* Tokenise a rendered prompt that contains media markers, replacing each marker with the token
- * run its media part became: the processor's placeholders -- the model's own pad ids, which a
- * hashed n-gram embedding reads like any other -- with whatever markers and timestamps the model
- * wants around them. The encoder's rows replace the placeholders' embeddings later (spec §11);
- * here only the ids and their offsets are fixed, and with them the prompt's rotary layout.
+/* Each marker becomes its media part's token run: the processor's placeholders (the model's pad
+ * ids, which a hashed n-gram embedding reads like any other) with the model's surrounding markers
+ * and timestamps. The encoder's rows replace the placeholder embeddings later (spec §11); here
+ * only the ids and offsets, and so the rotary layout, are fixed.
  *
- * Each media part is processed HERE, on the request's own worker, because decoding a video and
- * resizing its frames is the most expensive host work a request can bring: it must not reach the
- * scheduler's thread, where every other request's step would wait on it. */
+ * Media is processed here, on the request's worker, because decoding and resizing video is the
+ * most expensive host work a request brings and must not stall the scheduler thread. */
 int tokenize_with_media(const std::string& rendered, const OaiDeps& d,
                         std::vector<std::pair<MediaKind, std::vector<uint8_t>>>& media,
                         const MediaOpts& opts, PromptInput* out, ApiError* err) {
     out->text = rendered;
     auto pm = std::make_shared<mm::PromptMedia>();
-    const std::string marker = MEDIA_MARKER;
+    const std::string marker = RAD_MEDIA_MARKER;
     size_t pos = 0, mi = 0;
     for (;;) {
         size_t at = rendered.find(marker, pos);
         std::string seg = rendered.substr(pos, at == std::string::npos ? std::string::npos : at - pos);
         if (!seg.empty()) {
-            /* add_special is false for every segment, the first included: the template renders
-             * whatever special tokens the model wants, and an extra BOS would shift every
-             * position after it -- the same reason the text-only path gives. */
+            /* add_special is false for every segment: the template already renders the special
+             * tokens, and an extra BOS would shift every position after it. */
             auto ids = d.tok->encode(seg, false, /*parse_special=*/true);
             out->tokens.insert(out->tokens.end(), ids.begin(), ids.end());
         }
@@ -1531,34 +1518,20 @@ int tokenize_with_media(const std::string& rendered, const OaiDeps& d,
 
 /* ================================================================== the context bound
  *
- * THE CONTEXT CLAMPS max_tokens RATHER THAN REFUSING THE REQUEST.
+ * The context clamps max_tokens instead of refusing the request. max_tokens is an upper bound and
+ * the context is another that holds regardless, so refusing yields no tokens where clamping
+ * yields the same ones. Clients commonly send a fixed large max_tokens and cannot compute the
+ * remaining window without the tokeniser.
  *
- * `max_tokens` is an upper bound -- "stop by here at the latest" -- and the context is a second
- * upper bound that holds whether or not the request acknowledges it: a sequence cannot run past
- * it however many tokens were asked for. So refusing does not produce more tokens than clamping
- * does, it produces none, and the field that caused the refusal could not have been honoured at
- * any value the caller might have sent instead.
+ * A prompt that does not fit on its own is still an error, naming how much to cut.
  *
- * That matters because a fixed `max_tokens` is what clients actually send. A caller whose default
- * is 128k gets a 400 on every prompt long enough to matter -- exactly the requests a long-context
- * server exists for -- and the only fix available to them is to compute the server's remaining
- * window themselves, which they cannot do without knowing the tokeniser.
- *
- * A PROMPT THAT DOES NOT FIT ON ITS OWN IS STILL AN ERROR. There is no window left to generate
- * into, nothing about the request is servable, and the caller has to shorten the prompt -- so that
- * case keeps its refusal and names how much has to go.
- *
- * This is the one deliberate exception to the rule the key vetting above enforces, that a 200
- * means every field of the request was honoured. It is an exception because those keys are
- * SETTINGS -- dropping one serves a different model than the caller asked for -- and this one is a
- * BOUND, whose purpose is to stop generation early and which the context was going to stop earlier
- * anyway. What the caller gets back still says so: the completion ends with finish_reason
- * "length" and `usage` reports the tokens it actually produced.
+ * This is the one exception to "a 200 means every field was honoured": the vetted keys are
+ * settings, this is a bound the context would hit anyway. The reply still says so through
+ * finish_reason "length" and `usage`.
  */
-/* THE DEPLOYMENT'S CAP IS A THIRD BOUND OF THE SAME KIND, clamped for the same reason: a request
- * asking for more than the operator allows is still a request worth serving up to the cap. And a
- * max_tokens of 0 is the `--default-max-tokens auto` default, which is "what the context leaves" --
- * resolved here, against this prompt, so that the scheduler always sees a finite bound. */
+/* The deployment's cap (OaiLimits::max_tokens_cap) clamps the same way. A max_tokens of 0
+ * (the `--default-max-tokens auto` default) means what the context leaves, resolved here
+ * against this prompt so the scheduler always sees a finite bound. */
 static int clamp_max_tokens(size_t n_prompt, const OaiLimits& lim, const char* field,
                             OaiRequest* out, ApiError* err) {
     if (lim.max_tokens_cap > 0 &&
@@ -1569,11 +1542,9 @@ static int clamp_max_tokens(size_t n_prompt, const OaiLimits& lim, const char* f
 
     const int64_t room = lim.max_ctx - (int64_t)n_prompt;
     if (room <= 0) {
-        /* WORDED FOR THE CLIENTS THAT READ IT. An agent compacts its history when a request
-         * overflows, and it recognises the overflow by the error's text: OpenAI's "maximum
-         * context length is N tokens" and llama-server's "exceeds the available context size"
-         * are the two phrases those matchers look for, so the sentence carries both, beside
-         * OpenAI's code and llama-server's two numbers. */
+        /* Agents detect overflow by the message text to compact their history, so the sentence
+         * carries both OpenAI's "maximum context length is N tokens" and llama-server's
+         * "exceeds the available context size", beside OpenAI's code and llama-server's numbers. */
         char msg[384];
         snprintf(msg, sizeof msg,
                  "This model's maximum context length is %lld tokens: the request (%zu tokens) "
@@ -1591,9 +1562,8 @@ static int clamp_max_tokens(size_t n_prompt, const OaiLimits& lim, const char* f
     if (out->max_tokens <= 0) {
         out->max_tokens = (int32_t)std::min<int64_t>(room, INT32_MAX);
     } else if ((int64_t)out->max_tokens > room) {
-        /* Debug rather than Warn: on a long-context deployment whose clients send a constant
-         * max_tokens this fires on every request that is working correctly, and a line printed
-         * per request is how a server's log stops being read at all. */
+        /* Debug, not Warn: clients sending a constant max_tokens trigger this on every normal
+         * request. */
         RAD_DEBUG("max_tokens %d does not fit beside %zu prompt tokens in a %lld token context; "
                   "serving %lld", (int)out->max_tokens, n_prompt, (long long)lim.max_ctx,
                   (long long)room);
@@ -1604,18 +1574,16 @@ static int clamp_max_tokens(size_t n_prompt, const OaiLimits& lim, const char* f
 
 /* ================================================================== chat */
 
-/* THE REASONING BLOCK BY TOKEN ID, and the budget on it.
+/* The reasoning block by token id, and its budget.
  *
- * The render names the block's markers as text; the engine counts and closes it by token, so
- * the markers are encoded here, once per request. A marker that is not one token leaves the span
- * unknown: the reply's reasoning is still split out, but it is not counted and cannot be closed
- * by forcing a token. The opener matters only to a reply that must open its own block.
+ * The render names the markers as text; the engine counts and closes the block by token, so the
+ * markers are encoded here once per request. A marker that is not one token leaves the span
+ * unknown: reasoning is still split out, but not counted and not closable by forcing a token.
+ * The opener matters only when the reply must open its own block.
  *
- * `thinking_token_budget` is vLLM's name for the field and `thinking_budget` Qwen's API's; both
- * are read, as max_tokens and max_completion_tokens are. A budget the span cannot hold is a 400
- * naming why -- accepting it and generating unbounded reasoning is the outcome this file's
- * header forbids. The deployment's default applies only where it can be held: a reply whose
- * block cannot be counted gets none, as it would on a model with no reasoning block at all. */
+ * Budget spellings: vLLM's `thinking_token_budget`, Qwen's `thinking_budget`, and llama.cpp's.
+ * A budget on an unknown span is a 400 naming why, not unbounded reasoning. The deployment's
+ * default applies only where the span is known. */
 static int parse_thinking_budget(const json& b, const OaiDeps& d, const OaiLimits& lim,
                                  const ChatRender& render, SamplingParams* sp, ApiError* err) {
     ReasoningSpan span;
@@ -1626,11 +1594,9 @@ static int parse_thinking_budget(const json& b, const OaiDeps& d, const OaiLimit
         if (!render.think_open.empty()) o = d.tok->encode(render.think_open, false, true);
         n_close = c.size();
         n_open  = o.size();
-        /* AN OPENER THAT IS ONE CONTROL TOKEN AND THEN TEXT -- Gemma 4's `<|channel>thought` --
-         * is found by that first token: it is what a reply opening its own block writes first,
-         * and no text can be. The text after it counts as reasoning, as the markers do. An opener
-         * with a second control token in it (a channel and a message marker) is not read this
-         * way, since its first token may open something other than the reasoning. */
+        /* An opener that is one control token followed by text (Gemma 4's `<|channel>thought`)
+         * is found by that first token; the text after it counts as reasoning. An opener with a
+         * second control token is not, since its first token may open something else. */
         bool open_first = o.size() > 1 && d.tok->reply_bytes(o[0]).empty() &&
                           !d.tok->token_bytes(o[0]).empty();
         for (size_t i = 1; open_first && i < o.size(); ++i)
@@ -1651,8 +1617,8 @@ static int parse_thinking_budget(const json& b, const OaiDeps& d, const OaiLimit
         if (it == b.end() || it->is_null()) continue;
         int64_t v = 0;
         if (!get_int(b, k, &v, err)) return RAD_E_INVAL;
-        /* llama.cpp's spellings take a negative budget for "none": said, it overrides the
-         * deployment's default as a number does. */
+        /* A negative budget means "none" (llama.cpp) and still overrides the deployment's
+         * default. */
         if (v < 0) v = -1;
         if (named && v != budget) {
             *err = err_bad(k, std::string("disagrees with ") + named + ", which is the same field");
@@ -1685,15 +1651,15 @@ static int parse_thinking_budget(const json& b, const OaiDeps& d, const OaiLimit
     return RAD_OK;
 }
 
-/* LOGPROBS, in each endpoint's spelling, into one count.
+/* Logprobs, in each endpoint's spelling, into one count.
  *
  *   chat         `logprobs` true, with `top_logprobs` alternatives (0 when absent, OpenAI's default)
  *   completions  `logprobs` the number of alternatives, OpenAI's legacy integer
  *   any          llama-server's `n_probs`, which wins over both
  *
- * A count of 0 still returns each token's own logprob on chat (OpenAI's meaning) and returns
- * nothing on completions (llama-server's: its `logprobs` 0 and `n_probs` 0 are both "off"). The
- * numbers are the RAW distribution's, as OpenAI and llama-server report them. */
+ * A count of 0 still returns each token's own logprob on chat (OpenAI's meaning) and nothing on
+ * completions (llama-server treats `logprobs` 0 and `n_probs` 0 as off). Values are the raw
+ * distribution's, as OpenAI and llama-server report them. */
 static int parse_logprobs(const json& b, const OaiLimits& lim, Endpoint ep, OaiRequest* out,
                           ApiError* err) {
     bool want = false;
@@ -1766,7 +1732,7 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
 
     if (!d.chat) {
         *err = err_not_implemented(
-            "/v1/chat/completions requires a chat template (spec 12); this model was loaded "
+            "/v1/chat/completions requires a chat template; this model was loaded "
             "without one. Use /v1/completions");
         return RAD_E_UNSUPPORTED;
     }
@@ -1774,9 +1740,8 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
     auto mit = b.find("messages");
     if (mit == b.end()) { *err = err_bad("messages", "is required"); return RAD_E_INVAL; }
     json messages = *mit;
-    /* The deprecated functions API's turns, as the current API spells them: an assistant
-     * message's `function_call` is one tool call, and a `function` message is the result of the
-     * call before it. The call ids pair them; the old API has none. */
+    /* Deprecated functions-API turns in current form: an assistant `function_call` becomes one
+     * tool call and a `function` message its result, paired by synthesised call ids. */
     if (messages.is_array()) {
         std::string call_id;
         int n_calls = 0;
@@ -1800,9 +1765,8 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
             if (!it->is_object() || !it->contains("role") || it->at("role") != "user") continue;
             const auto cit = it->find("content");
             if (cit == it->end()) break;
-            /* At most 160 bytes are kept, so no more than that is copied out of a message that
-             * may be a whole document, and the cut lands on a UTF-8 lead byte: a log line split
-             * inside a character is not valid text. */
+            /* Keep at most 160 bytes, copying no more than that from a possibly huge message,
+             * and cut on a UTF-8 lead byte. */
             constexpr size_t kKeep = 160;
             std::string t;
             auto take = [&t](const std::string& s) {
@@ -1824,10 +1788,10 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
         }
     }
 
-    /* OpenAI's DEPRECATED functions API, which older clients still send: `functions` is `tools`
-     * with each entry unwrapped, and `function_call` is `tool_choice` -- "none", "auto", or
-     * {"name": ...}. Rewritten into the current fields, and refused beside them. The old API
-     * answers one call at most, so the grammar admits one. */
+    /* OpenAI's deprecated functions API: `functions` is `tools` with each entry unwrapped, and
+     * `function_call` is `tool_choice` ("none", "auto" or {"name": ...}). Rewritten into the
+     * current fields and refused alongside them. The old API returns at most one call, so the
+     * grammar admits one. */
     auto fns = b.find("functions");
     if (fns != b.end() && !fns->is_null()) {
         if (b.contains("tools") && !b.at("tools").is_null()) {
@@ -1878,10 +1842,9 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
         out->n_tools = (int)tools.size();
     }
 
-    /* A forced choice -- "required", or an object naming one function -- makes the call grammar
-     * the whole reply instead of a lazy one: the reasoning block, then the calls (one when
-     * `parallel_tool_calls` is false), then nothing, so the reply ends at the last call. A named
-     * function narrows the calls to that one. */
+    /* A forced choice ("required", or an object naming one function) makes the call grammar the
+     * whole reply instead of a lazy one: reasoning, then the calls (one when
+     * `parallel_tool_calls` is false), then the end. A named function narrows the calls to it. */
     std::string tool_choice = "auto", named;
     auto tcit = b.find("tool_choice");
     if (tcit != b.end() && !tcit->is_null()) {
@@ -1927,9 +1890,8 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
         return RAD_E_INVAL;
     }
 
-    /* Honoured by the grammar rather than by a prompt instruction: the auto-parser emits a
-     * repeatable call section only when this is true (chat-auto-parser-generator.cpp), so false
-     * genuinely admits one call and not several. */
+    /* Enforced by the grammar: the auto-parser emits a repeatable call section only when this is
+     * true (chat-auto-parser-generator.cpp). */
     bool parallel = true;
     if (!get_bool(b, "parallel_tool_calls", &parallel, err)) return RAD_E_INVAL;
 
@@ -1955,9 +1917,9 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
     const bool agp_named = b.contains("add_generation_prompt") && !b.at("add_generation_prompt").is_null();
     if (!get_bool(b, "add_generation_prompt", &opt.add_generation_prompt, err)) return RAD_E_INVAL;
 
-    /* llama.cpp's `reasoning_format`. "none" leaves the reasoning in `content` between the
-     * template's own markers; "auto" and "deepseek" move it to `reasoning_content`, which is what
-     * this server does anyway. "deepseek-legacy" -- both at once -- is not served. */
+    /* llama.cpp's `reasoning_format`: "none" leaves reasoning in `content` between the template's
+     * markers; "auto" and "deepseek" move it to `reasoning_content` (the default behaviour).
+     * "deepseek-legacy" (both at once) is not served. */
     std::string rfmt;
     if (!get_str(b, "reasoning_format", &rfmt, err)) return RAD_E_INVAL;
     if (rfmt == "deepseek-legacy") {
@@ -1970,12 +1932,11 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
         return RAD_E_INVAL;
     }
 
-    /* ASSISTANT PREFILL. A conversation that ends in an assistant message is continued, not
-     * answered: the reply picks up where that message stops. llama.cpp's default and the
-     * Anthropic API's meaning; vLLM's `continue_final_message` names it explicitly, true or
-     * llama.cpp's "content" / "reasoning_content". A request that names `add_generation_prompt`
-     * true opens a new turn after it instead, as vLLM does; naming that and
-     * `continue_final_message` both is a contradiction, refused as llama.cpp refuses it. */
+    /* Assistant prefill: a conversation ending in an assistant message is continued, not
+     * answered (llama.cpp's default and Anthropic's meaning). vLLM's `continue_final_message`
+     * requests it explicitly: true, or llama.cpp's "content" / "reasoning_content". Naming
+     * `add_generation_prompt` opens a new turn instead, as in vLLM; naming it true together with
+     * `continue_final_message` is refused, as in llama.cpp. */
     {
         std::string cont;
         auto cf = b.find("continue_final_message");
@@ -2024,16 +1985,14 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
         }
     }
 
-    /* The template's grammar and the caller's are ONE grammar, not two, and the template is the
-     * one that knows how to combine them -- a tool-calling format has to leave room for the call
-     * syntax around whatever the caller constrained. So both halves go IN and the merged result
-     * comes back out: a raw GBNF as `grammar`, a `response_format` as the schema it started as. */
+    /* The caller's constraint goes into the render, which merges it with the format's tool-call
+     * syntax into one grammar: a raw GBNF as `grammar`, a `response_format` as its schema. */
     opt.grammar     = out->sp.grammar;
     opt.json_schema = schema_json;
 
     RAD_TRY(parse_thinking(b, lim, &opt, err));
-    /* The request's reasoning_format over the deployment's (--reasoning-format), which the
-     * template defaults above have just applied. */
+    /* The request's reasoning_format overrides the deployment's (--reasoning-format), applied by
+     * parse_thinking's template defaults. */
     if (!rfmt.empty()) opt.reasoning_format = rfmt;
 
     std::vector<std::pair<MediaKind, std::vector<uint8_t>>> media;
@@ -2051,15 +2010,8 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
         return RAD_E_INVAL;
     }
 
-    /* Everything the render decided that the rest of the request has to carry. The grammar can
-     * come back non-empty when none went in -- that is a tool-calling template constraining its
-     * own call syntax -- and it arrives LAZY, so the reply is free prose until the model starts
-     * writing a call. Dropping `grammar_lazy` here would constrain the whole reply to be a tool
-     * call, which is a model that can no longer answer in words. */
-    /* A REQUEST THAT ASKED TO BE CONSTRAINED AND CAME BACK UNCONSTRAINED IS A REFUSAL, not a 200.
-     * `response_format` and `grammar` are promises about the shape of the answer; a template that
-     * returns no grammar for one has not kept it, and returning the answer anyway would leave the
-     * caller parsing free prose against a schema they were told was enforced. */
+    /* A requested constraint that came back without a grammar is refused, not served
+     * unconstrained. */
     if (render.grammar.empty() && !(opt.grammar.empty() && opt.json_schema.empty())) {
         *err = err_unsupported(opt.json_schema.empty() ? "grammar" : "response_format",
                                "this model's chat template produced no grammar for it, so the "
@@ -2067,6 +2019,9 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
         return RAD_E_UNSUPPORTED;
     }
 
+    /* What the render decided. A tool-calling template may return a grammar when none went in;
+     * it is lazy, so the reply is free prose until a call starts. Dropping `grammar_lazy` would
+     * force every reply to be a tool call. */
     out->sp.grammar          = render.grammar;
     out->sp.grammar_lazy     = render.grammar_lazy;
     out->sp.grammar_triggers = render.grammar_triggers;
@@ -2076,39 +2031,27 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
     out->parse_tools         = out->tools_present && render.parser != nullptr;
     RAD_TRY(parse_thinking_budget(b, d, lim, render, &out->sp, err));
 
-    /* The format's own end-of-turn markers join the caller's stop strings rather than living in a
-     * second list: both end the generation and both report `finish_reason: "stop"` (sink.cpp), so
-     * a separate list would be a distinction with no observable difference. */
+    /* The format's end-of-turn markers join the caller's stop strings; both end generation with
+     * `finish_reason: "stop"` (sink.cpp). n_client_stops records where the caller's end. */
     out->n_client_stops = out->stop.size();
     for (const auto& s : render.additional_stops)
         if (std::find(out->stop.begin(), out->stop.end(), s) == out->stop.end())
             out->stop.push_back(s);
 
-    /* A reply that starts inside the reasoning block: its stop strings are the answer's, so they
-     * apply only after the block's closer (Detokenizer::defer_stops_until). The chat format says
-     * whether the rendered prompt leaves the block open and what closes it. */
+    /* A reply starting inside the reasoning block applies its stop strings only after the
+     * block's closer (Detokenizer::defer_stops_until). */
     if (render.think_starts_open && !render.think_close.empty())
         out->stops_after = render.think_close;
 
-    /* Checked HERE, where the answer is still a 400. The grammar being validated may be the
-     * caller's, or one the template produced for its own tool-call syntax; either way the first
-     * moment it can fail is when the automaton is built, and building it on the step path would
-     * mean failing a request that is already streaming. */
-    if (!out->sp.grammar.empty() && d.grammar) {
-        std::string gerr;
-        if (d.grammar->compile(out->sp.grammar, &out->sp.grammar_program, gerr) < 0) {
-            *err = err_bad(out->tools_present ? "tools" : "grammar",
-                           "the grammar this request implies cannot be run: " + gerr);
-            return RAD_E_INVAL;
-        }
-    }
+    /* The grammar may be the caller's or the template's own. */
+    RAD_TRY(compile_grammar(d, out, out->tools_present ? "tools" : "grammar", err));
 
     const std::string& rendered = render.prompt;
 
     PromptInput p;
     if (media.empty()) {
-        /* add_special is false: a chat template renders whatever special tokens the model wants,
-         * including its BOS. Adding another is a silent off-by-one in every position. */
+        /* add_special is false: the template renders the model's special tokens, BOS included;
+         * another would shift every position. */
         p.tokens = d.tok->encode(rendered, false, /*parse_special=*/true);
         p.text = rendered;
     } else {
@@ -2143,23 +2086,13 @@ int parse_completion_request(const std::string& body, const OaiDeps& d, const Oa
     RAD_TRY(parse_sampling(b, lim, out, err));
     RAD_TRY(parse_output_format(b, d, out, err));
 
-    /* Checked HERE for the same reason as on the chat path: a grammar the machine refuses is a
-     * 400 while the request can still be refused, rather than a compile on the scheduler thread
-     * that cancels a request the client was told had been accepted. */
-    if (!out->sp.grammar.empty() && d.grammar) {
-        std::string gerr;
-        if (d.grammar->compile(out->sp.grammar, &out->sp.grammar_program, gerr) < 0) {
-            *err = err_bad(b.contains("grammar") ? "grammar" : "response_format",
-                           "the grammar this request implies cannot be run: " + gerr);
-            return RAD_E_INVAL;
-        }
-    }
+    RAD_TRY(compile_grammar(d, out, b.contains("grammar") ? "grammar" : "response_format", err));
 
     if (!get_bool(b, "echo", &out->echo, err)) return RAD_E_INVAL;
 
-    /* The control tokens this completion's text keeps (llama-server's field): each string is
-     * tokenised by the decoder and every control token in it is rendered rather than dropped.
-     * Bounded as the stop strings are, since the decoder looks each one up per token. */
+    /* llama-server's `preserved_tokens`: control tokens in these strings are rendered in the
+     * text rather than dropped. Bounded like stop strings, since the decoder checks each per
+     * token. */
     {
         auto pt = b.find("preserved_tokens");
         if (pt != b.end() && !pt->is_null()) {
@@ -2181,8 +2114,7 @@ int parse_completion_request(const std::string& body, const OaiDeps& d, const Oa
     }
 
     RAD_TRY(parse_logprobs(b, lim, Endpoint::Completion, out, err));
-    /* `echo` with logprobs asks for the PROMPT's logprobs too, which are not computed: a prompt
-     * position's distribution never leaves the card. */
+    /* `echo` with logprobs would need the prompt's logprobs, which never leave the card. */
     if (out->echo && out->want_logprobs) {
         *err = err_unsupported("echo", "logprobs for the prompt are not returned; send echo "
                                        "without logprobs, or logprobs without echo");
@@ -2195,38 +2127,25 @@ int parse_completion_request(const std::string& body, const OaiDeps& d, const Oa
         return RAD_E_INVAL;
     }
 
-    /* A raw prompt is the client's whole input: no template wraps it and no role is the server's
-     * to protect, so its control tokens are parsed, as vLLM and llama.cpp parse them. A client
-     * that renders its own chat template sends "<|im_start|>" meaning the token; read as text it
-     * reaches the model as six pieces of punctuation. Token ids could name any control token
-     * already. */
+    /* A raw prompt has no template or roles to protect, so control tokens in it are parsed, as
+     * in vLLM and llama.cpp: a client rendering its own template means "<|im_start|>" as the
+     * token. Token ids can name any control token anyway. */
     auto push_text = [&](const std::string& s) {
         PromptInput p;
         p.text = s;
         p.tokens = d.tok->encode(s, true, /*parse_special=*/true);
         out->prompts.push_back(std::move(p));
     };
-    auto push_ids = [&](const json& arr, ApiError* e) -> bool {
+    auto push_ids = [&](const json& arr) -> int {
         PromptInput p;
-        for (const auto& v : arr) {
-            if (!v.is_number_integer()) {
-                *e = err_bad("prompt", "token arrays must contain integers only");
-                return false;
-            }
-            int32_t id = 0;
-            if (!token_id(v, &id)) {
-                *e = err_bad("prompt", "a token id must be in [0, 2147483647], got " + v.dump());
-                return false;
-            }
-            p.tokens.push_back(id);
-        }
+        RAD_TRY(token_ids(arr, "prompt", &p.tokens, err));
         p.text = d.tok->decode(p.tokens);
         out->prompts.push_back(std::move(p));
-        return true;
+        return RAD_OK;
     };
 
-    /* llama-server's mixed prompt: strings and token ids in one array are ONE prompt, the strings
-     * tokenised in place, only the first of them with the BOS. */
+    /* llama-server's mixed prompt: strings and token ids in one array form one prompt, strings
+     * tokenised in place, BOS only on the first element. */
     bool mixed = false;
     if (native && pit->is_array()) {
         bool s = false, n = false;
@@ -2265,14 +2184,14 @@ int parse_completion_request(const std::string& body, const OaiDeps& d, const Oa
                 push_text(s.get<std::string>());
             }
         } else if (pit->front().is_number_integer()) {
-            if (!push_ids(*pit, err)) return RAD_E_INVAL;
+            RAD_TRY(push_ids(*pit));
         } else if (pit->front().is_array()) {
             for (const auto& a : *pit) {
                 if (!a.is_array()) {
                     *err = err_bad("prompt", "a batch of token arrays must be all arrays");
                     return RAD_E_INVAL;
                 }
-                if (!push_ids(a, err)) return RAD_E_INVAL;
+                RAD_TRY(push_ids(a));
             }
         } else {
             *err = err_bad("prompt", "expected a string, an array of strings, an array of token "
@@ -2284,10 +2203,7 @@ int parse_completion_request(const std::string& body, const OaiDeps& d, const Oa
         return RAD_E_INVAL;
     }
 
-    /* THE LONGEST PROMPT SETS THE CLAMP. This endpoint takes a BATCH of prompts and `max_tokens`
-     * is one field shared by all of them, so clamping against each in turn would leave the last
-     * one's room standing as the answer for every prompt before it -- and a short prompt would be
-     * cut off for a window it was never short of. */
+    /* The batch shares one `max_tokens`, so the longest prompt sets the clamp. */
     size_t longest = 0;
     for (const auto& p : out->prompts) {
         if (p.tokens.empty()) { *err = err_bad("prompt", "tokenised to nothing"); return RAD_E_INVAL; }
@@ -2298,6 +2214,33 @@ int parse_completion_request(const std::string& body, const OaiDeps& d, const Oa
 }
 
 /* ================================================================== embeddings */
+
+/* One embedding input from text and its media, with the tokenizer's special tokens around the
+ * whole. tokenize_with_media adds none, and with no template to place them the tokenizer's own
+ * BOS/EOS rule applies; a BOS shifts the media runs by one. */
+static int embedding_input(const std::string& text,
+                           std::vector<std::pair<MediaKind, std::vector<uint8_t>>>& media,
+                           const OaiDeps& d, int32_t image_tokens, OaiRequest* out,
+                           ApiError* err) {
+    PromptInput p;
+    if (media.empty()) {
+        p.text = text;
+        p.tokens = d.tok->encode(text, true, /*parse_special=*/true);
+    } else {
+        MediaOpts mo;
+        mo.image_tokens = image_tokens;
+        RAD_TRY(tokenize_with_media(text, d, media, mo, &p, err));
+        const ITokenizer::VocabInfo vi = d.tok->vocab_info();
+        if (vi.add_bos && vi.bos >= 0) {
+            p.tokens.insert(p.tokens.begin(), vi.bos);
+            for (auto& pl : p.media->items) pl.tok += 1;
+            p.media->layout();
+        }
+        if (vi.add_eos && vi.eos >= 0) p.tokens.push_back(vi.eos);
+    }
+    out->prompts.push_back(std::move(p));
+    return RAD_OK;
+}
 
 int parse_embeddings_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
                              OaiRequest* out, ApiError* err) {
@@ -2329,8 +2272,8 @@ int parse_embeddings_request(const std::string& body, const OaiDeps& d, const Oa
         /* Bounded by the model's width in the handler, which knows it. */
         out->dimensions = dv.get<int64_t>();
     }
-    /* A soft-token budget for this request's images (Gemma 4's processor); the processor refuses
-     * it on a model that sizes images otherwise. */
+    /* A soft-token budget for this request's images (Gemma 4's processor); other processors
+     * refuse it. */
     if (b.contains("image_tokens") && !b.at("image_tokens").is_null()) {
         const json& iv = b.at("image_tokens");
         const int64_t n = iv.is_number_integer() ? iv.get<int64_t>() : 0;
@@ -2341,15 +2284,14 @@ int parse_embeddings_request(const std::string& body, const OaiDeps& d, const Oa
         out->image_tokens = (int32_t)n;
     }
 
-    /* THE NAMED PROMPT: sentence-transformers' `prompt_name`, the model's own text in front of
-     * each text or content-part input. A model that states a default prompt applies it to a
-     * request that names none, as its reference library does. */
+    /* sentence-transformers' `prompt_name`: the model's own text in front of each text or
+     * content-part input. A model's default prompt applies when none is named, as in its
+     * reference library. */
     std::string prefix;
     const bool prompt_named = b.contains("prompt_name") && !b.at("prompt_name").is_null();
     {
         std::string pname;
-        const bool named = prompt_named;
-        if (named) {
+        if (prompt_named) {
             if (!b.at("prompt_name").is_string()) {
                 *err = err_bad("prompt_name", "expected a string");
                 return RAD_E_INVAL;
@@ -2364,15 +2306,15 @@ int parse_embeddings_request(const std::string& body, const OaiDeps& d, const Oa
         }
     }
 
-    /* THE MESSAGES FORM, vLLM's chat embedding: one input rendered through the model's own chat
-     * template (EmbeddingGemma 2's concatenates the system text and then every message's text and
-     * media placeholders), the tokenizer's special tokens around the whole as for an input. */
+    /* vLLM's chat embedding (`messages`): one input rendered by the model's chat template
+     * (EmbeddingGemma 2's concatenates the system text, then each message's text and media
+     * placeholders), with the tokenizer's special tokens around the whole. */
     if (b.contains("messages") && !b.at("messages").is_null()) {
         if (b.contains("input") && !b.at("input").is_null()) {
             *err = err_bad("messages", "a request takes `input` or `messages`, not both");
             return RAD_E_INVAL;
         }
-        if (b.contains("prompt_name") && !b.at("prompt_name").is_null()) {
+        if (prompt_named) {
             *err = err_bad("prompt_name", "a `messages` input is rendered by the chat template "
                                           "and takes no prompt");
             return RAD_E_INVAL;
@@ -2394,59 +2336,34 @@ int parse_embeddings_request(const std::string& body, const OaiDeps& d, const Oa
                                            (why.empty() ? std::string() : ": " + why));
             return RAD_E_INVAL;
         }
-        PromptInput p;
-        if (media.empty()) {
-            p.text = render.prompt;
-            p.tokens = d.tok->encode(render.prompt, true, /*parse_special=*/true);
-        } else {
-            MediaOpts mo;
-            mo.image_tokens = out->image_tokens;
-            RAD_TRY(tokenize_with_media(render.prompt, d, media, mo, &p, err));
-            const ITokenizer::VocabInfo vi = d.tok->vocab_info();
-            if (vi.add_bos && vi.bos >= 0) {
-                p.tokens.insert(p.tokens.begin(), vi.bos);
-                for (auto& pl : p.media->items) pl.tok += 1;
-                p.media->layout();
-            }
-            if (vi.add_eos && vi.eos >= 0) p.tokens.push_back(vi.eos);
-        }
-        out->prompts.push_back(std::move(p));
-        return RAD_OK;
+        return embedding_input(render.prompt, media, d, out->image_tokens, out, err);
     }
 
     auto it = b.find("input");
     if (it == b.end() || it->is_null()) { *err = err_bad("input", "is required"); return RAD_E_INVAL; }
 
-    auto push_ids = [&](const json& arr, ApiError* e) -> bool {
-        /* A prompt is text; token ids take none, and asking for one by name is refused rather
-         * than dropped. A model's default prompt applies to text inputs only. */
+    auto push_ids = [&](const json& arr) -> int {
+        /* A named prompt cannot precede token ids and is refused; a default prompt applies to
+         * text inputs only. */
         if (prompt_named && !prefix.empty()) {
-            *e = err_bad("prompt_name", "a prompt is text and cannot go in front of token ids");
-            return false;
+            *err = err_bad("prompt_name", "a prompt is text and cannot go in front of token ids");
+            return RAD_E_INVAL;
         }
         PromptInput p;
-        for (const auto& v : arr) {
-            if (!v.is_number_integer()) {
-                *e = err_bad("input", "token arrays must contain integers only");
-                return false;
-            }
-            int32_t id = 0;
-            if (!token_id(v, &id)) {
-                *e = err_bad("input", "a token id must be in [0, 2147483647], got " + v.dump());
-                return false;
-            }
-            p.tokens.push_back(id);
-        }
+        RAD_TRY(token_ids(arr, "input", &p.tokens, err));
         out->prompts.push_back(std::move(p));
-        return true;
+        return RAD_OK;
+    };
+    /* Control tokens are parsed as for a /v1/completions prompt: no template wraps the input. */
+    auto push_text = [&](const std::string& s) {
+        std::vector<std::pair<MediaKind, std::vector<uint8_t>>> none;
+        return embedding_input(prefix + s, none, d, out->image_tokens, out, err);
     };
 
-    /* ONE INPUT OF CONTENT PARTS -- text, images, video, audio, in order -- the same parts a chat
-     * message carries, and one vector for the lot. The parts are joined with nothing between
-     * them and each media part becomes its processor's token run, which is what an embedding
-     * model's own template does (EmbeddingGemma 2's concatenates text and placeholders), and the
-     * tokenizer's own special tokens go around the whole: what HuggingFace's processor feeds the
-     * model. */
+    /* One input of content parts (text, image, video, audio, in order) yields one vector. Parts
+     * are joined with nothing between them, each media part becoming its token run, and the
+     * tokenizer's special tokens go around the whole, matching what HuggingFace's processor feeds
+     * the model (EmbeddingGemma 2's template concatenates text and placeholders). */
     auto push_parts = [&](const json& parts, ApiError* e) -> int {
         std::vector<std::pair<MediaKind, std::vector<uint8_t>>> media;
         std::string rendered = prefix;
@@ -2467,10 +2384,9 @@ int parse_embeddings_request(const std::string& body, const OaiDeps& d, const Oa
                     return RAD_E_INVAL;
                 }
                 const std::string t = part.at("text").get<std::string>();
-                /* The marker is how a media part's position survives into tokenisation, so text
-                 * that spells it would be taken for one. */
-                if (t.find(MEDIA_MARKER) != std::string::npos) {
-                    *e = err_bad("input[].text", std::string("contains \"") + MEDIA_MARKER +
+                /* Text containing the marker would be taken for a media part. */
+                if (t.find(RAD_MEDIA_MARKER) != std::string::npos) {
+                    *e = err_bad("input[].text", std::string("contains \"") + RAD_MEDIA_MARKER +
                                                      "\", which this server reserves for media");
                     return RAD_E_INVAL;
                 }
@@ -2486,57 +2402,29 @@ int parse_embeddings_request(const std::string& body, const OaiDeps& d, const Oa
                 return RAD_E_INVAL;
             }
             media.emplace_back(kind, std::move(bytes));
-            rendered += MEDIA_MARKER;
+            rendered += RAD_MEDIA_MARKER;
         }
-        PromptInput p;
-        if (media.empty()) {
-            p.text = rendered;
-            p.tokens = d.tok->encode(rendered, true, /*parse_special=*/true);
-        } else {
-            MediaOpts mo;
-            mo.image_tokens = out->image_tokens;
-            RAD_TRY(tokenize_with_media(rendered, d, media, mo, &p, e));
-            /* tokenize_with_media adds no special tokens (a chat template renders its own);
-             * this input has no template, so the tokenizer's own rule applies around it. */
-            const ITokenizer::VocabInfo vi = d.tok->vocab_info();
-            if (vi.add_bos && vi.bos >= 0) {
-                p.tokens.insert(p.tokens.begin(), vi.bos);
-                for (auto& pl : p.media->items) pl.tok += 1;
-                p.media->layout();
-            }
-            if (vi.add_eos && vi.eos >= 0) p.tokens.push_back(vi.eos);
-        }
-        out->prompts.push_back(std::move(p));
-        return RAD_OK;
+        return embedding_input(rendered, media, d, out->image_tokens, out, e);
     };
     auto is_parts = [](const json& a) { return a.is_array() && !a.empty() && a.front().is_object(); };
 
-    /* Parsed like a /v1/completions prompt, and for the same reason: the input is the client's
-     * own text with no template around it. */
     if (it->is_string()) {
-        PromptInput p;
-        p.text = prefix + it->get<std::string>();
-        p.tokens = d.tok->encode(p.text, true, /*parse_special=*/true);
-        out->prompts.push_back(std::move(p));
+        RAD_TRY(push_text(it->get<std::string>()));
     } else if (it->is_array()) {
         if (it->empty()) { *err = err_bad("input", "must not be empty"); return RAD_E_INVAL; }
         if (it->front().is_number_integer()) {
-            if (!push_ids(*it, err)) return RAD_E_INVAL;
+            RAD_TRY(push_ids(*it));
         } else if (is_parts(*it)) {
             RAD_TRY(push_parts(*it, err));
         } else {
-            /* A BATCH: each element its own input -- a string, a token array or an array of
-             * content parts. */
+            /* A batch: each element is one input (a string, a token array or content parts). */
             for (const auto& el : *it) {
                 if (el.is_string()) {
-                    PromptInput p;
-                    p.text = prefix + el.get<std::string>();
-                    p.tokens = d.tok->encode(p.text, true, /*parse_special=*/true);
-                    out->prompts.push_back(std::move(p));
+                    RAD_TRY(push_text(el.get<std::string>()));
                 } else if (is_parts(el)) {
                     RAD_TRY(push_parts(el, err));
                 } else if (el.is_array()) {
-                    if (!push_ids(el, err)) return RAD_E_INVAL;
+                    RAD_TRY(push_ids(el));
                 } else {
                     *err = err_bad("input", "expected strings, token arrays or arrays of content "
                                             "parts");
@@ -2549,11 +2437,16 @@ int parse_embeddings_request(const std::string& body, const OaiDeps& d, const Oa
         return RAD_E_INVAL;
     }
 
-    for (const auto& p : out->prompts) {
-        if (p.tokens.empty()) { *err = err_bad("input", "tokenised to nothing"); return RAD_E_INVAL; }
-        if (lim.max_ctx > 0 && (int64_t)p.tokens.size() > lim.max_ctx) {
-            *err = err_bad("input", "exceeds the model context");
+    for (size_t i = 0; i < out->prompts.size(); ++i) {
+        const int64_t n = (int64_t)out->prompts[i].tokens.size();
+        if (n == 0) { *err = err_bad("input", "tokenised to nothing"); return RAD_E_INVAL; }
+        if (lim.max_ctx > 0 && n > lim.max_ctx) {
+            *err = err_bad("input", "input " + std::to_string(i) + " is " + std::to_string(n) +
+                                        " tokens, more than the model context of " +
+                                        std::to_string(lim.max_ctx));
             err->code = "context_length_exceeded";
+            err->n_prompt_tokens = n;
+            err->n_ctx = lim.max_ctx;
             return RAD_E_INVAL;
         }
     }
@@ -2585,9 +2478,8 @@ static json usage_json(const UsageOut& u) {
     o["completion_tokens"] = u.completion;
     o["total_tokens"] = u.prompt + u.completion;
     o["prompt_tokens_details"] = d;
-    /* HOW MUCH OF completion_tokens THE CLIENT NEVER SEES AS CONTENT. Without it a reply cut at
-     * max_tokens inside its reasoning reads as a model that answered nothing; with it the client
-     * can tell the budget went to reasoning. */
+    /* The share of completion_tokens spent reasoning, so a reply cut at max_tokens inside its
+     * reasoning can be told apart from one that answered nothing. */
     if (u.reasoning >= 0) {
         json c;
         c["reasoning_tokens"] = u.reasoning;
@@ -2623,26 +2515,26 @@ json timings_json(const TimingsOut& t) {
     return o;
 }
 
-/* THE USAGE CHUNKS.
- *
- * `stream_options.include_usage` is parsed, validated and accepted on both endpoints, so both
- * streams have to emit it; accepting the field and then not honouring it is the outcome
- * core/server/oai.h's header forbids in its opening paragraph.
- *
- * One contract for both, OpenAI's: an empty choices array, sent after the last content chunk
- * and before [DONE]. Only the `object` differs, because it is a different endpoint's stream. */
-static std::string usage_chunk(const OaiRequest& r, const UsageOut& u, const TimingsOut& t,
-                               const char* object) {
+/* OpenAI's completion object of type `object` around `choices`, as JSON text. */
+static std::string completion_object(const OaiRequest& r, const char* object, json choices,
+                                     const UsageOut& u, const TimingsOut& t) {
     json o;
     o["id"] = r.id;
     o["object"] = object;
     o["created"] = r.created;
     o["model"] = r.model;
     if (!r.system_fingerprint.empty()) o["system_fingerprint"] = r.system_fingerprint;
-    o["choices"] = json::array();
+    o["choices"] = std::move(choices);
     o["usage"] = usage_json(u);
     if (t.valid) o["timings"] = timings_json(t);
-    return sse_event(o.dump());
+    return o.dump();
+}
+
+/* The usage chunk for `stream_options.include_usage`, on both endpoints. OpenAI's contract: an
+ * empty choices array, after the last content chunk and before [DONE]. Only `object` differs. */
+static std::string usage_chunk(const OaiRequest& r, const UsageOut& u, const TimingsOut& t,
+                               const char* object) {
+    return sse_event(completion_object(r, object, json::array(), u, t));
 }
 
 std::string text_usage_chunk(const OaiRequest& r, const UsageOut& u, const TimingsOut& t) {
@@ -2683,9 +2575,9 @@ std::string logprobs_content(const LogprobEntry* e, size_t n) {
     return s;
 }
 
-/* OpenAI's legacy shape: parallel arrays, and the alternatives as one {text: logprob} object a
- * token. Two alternatives with the same text -- distinct ids that decode alike -- collapse to the
- * likelier, which is what that shape can say. */
+/* OpenAI's legacy shape: parallel arrays, and the alternatives as one {text: logprob} object per
+ * token. Alternatives with the same text (distinct ids that decode alike) collapse to the
+ * likelier. */
 static json lp_legacy(const LogprobEntry* e, size_t n, size_t offset) {
     json toks = json::array(), lps = json::array(), tops = json::array(), offs = json::array();
     for (size_t i = 0; i < n; ++i) {
@@ -2695,8 +2587,8 @@ static json lp_legacy(const LogprobEntry* e, size_t n, size_t offset) {
         for (const LogprobAlt& a : e[i].top)
             if (!t.contains(a.text)) t[a.text] = a.logprob;
         tops.push_back(std::move(t));
-        /* Where the token's text starts in the choice's, which is where the one before it ended:
-         * its own `text` can be shorter than what it added (half a character, held back). */
+        /* The token's offset is where the previous one ended: its own `text` can be shorter than
+         * what it added (half a character, held back). */
         offs.push_back(offset);
         offset = e[i].end;
     }
@@ -2739,16 +2631,7 @@ std::string chat_completion_body(const OaiRequest& r, const std::vector<ChoiceOu
                                   ? "function_call" : finish_reason_oai(c.finish);
         arr.push_back(std::move(ch));
     }
-    json o;
-    o["id"] = r.id;
-    o["object"] = "chat.completion";
-    o["created"] = r.created;
-    o["model"] = r.model;
-    if (!r.system_fingerprint.empty()) o["system_fingerprint"] = r.system_fingerprint;
-    o["choices"] = std::move(arr);
-    o["usage"] = usage_json(u);
-    if (t.valid) o["timings"] = timings_json(t);
-    return o.dump();
+    return completion_object(r, "chat.completion", std::move(arr), u, t);
 }
 
 std::string text_completion_body(const OaiRequest& r, const std::vector<ChoiceOut>& choices,
@@ -2766,16 +2649,7 @@ std::string text_completion_body(const OaiRequest& r, const std::vector<ChoiceOu
         ch["finish_reason"] = finish_reason_oai(c.finish);
         arr.push_back(std::move(ch));
     }
-    json o;
-    o["id"] = r.id;
-    o["object"] = "text_completion";
-    o["created"] = r.created;
-    o["model"] = r.model;
-    if (!r.system_fingerprint.empty()) o["system_fingerprint"] = r.system_fingerprint;
-    o["choices"] = std::move(arr);
-    o["usage"] = usage_json(u);
-    if (t.valid) o["timings"] = timings_json(t);
-    return o.dump();
+    return completion_object(r, "text_completion", std::move(arr), u, t);
 }
 
 std::string embeddings_body(const OaiRequest& r, const std::vector<std::vector<float>>& vecs,
@@ -2835,10 +2709,9 @@ std::string sse_event(const std::string& json_text) {
 }
 
 std::string sse_error(const ApiError& e) {
-    /* A failure after the headers have gone out cannot change the status code, so the error has
-     * to travel in the stream. Clients that ignore it still see the stream end; clients that read
-     * it get the reason instead of a truncated answer. */
-    return "data: " + e.dump() + "\n\n";
+    /* After the headers are sent the status cannot change, so the error travels in the
+     * stream. */
+    return sse_event(e.dump());
 }
 
 /* ================================================================== the streaming path */
@@ -2847,9 +2720,8 @@ ReplyStream::ReplyStream(const OaiRequest& r, int index, const IReplyParser* par
     : reader_(parser ? parser->open() : nullptr), id_(r.id), model_(r.model),
       fingerprint_(r.system_fingerprint), created_(r.created), index_(index) {}
 
-/* What one increment adds to the message the stream adds up to, and the id a call is announced
- * with: minted here, because the parser reads the model's text and the model writes none. Returns
- * false for an increment that adds nothing and is not sent. */
+/* Fold one increment into `last_`. Call ids are minted here, since the model writes none.
+ * Returns false for an increment that adds nothing and is not sent. */
 bool ReplyStream::absorb(const ReplyDelta& d) {
     switch (d.kind) {
     case ReplyDelta::Reasoning:
@@ -2881,7 +2753,7 @@ std::string ReplyStream::push(std::string_view appended, bool is_final) {
     if (finished_) return std::string();
     std::string out;
     if (!reader_) {
-        /* Nothing to parse: the text is the answer, as it arrives. */
+        /* No parser: the text is the content as it arrives. */
         if (!appended.empty()) {
             ev_.clear();
             ReplyDelta d;
@@ -2899,8 +2771,7 @@ std::string ReplyStream::push(std::string_view appended, bool is_final) {
     out = emit(ev_);
     if (is_final) {
         finished_ = true;
-        /* The reader's message is the reply by definition; the deltas above add up to it, and
-         * the ids are the ones this stream minted. */
+        /* The reader's message is authoritative; keep the call ids this stream minted. */
         ParsedMessage m = reader_->message();
         for (size_t i = 0; i < m.tool_calls.size() && i < last_.tool_calls.size(); ++i)
             m.tool_calls[i].id = last_.tool_calls[i].id;
@@ -2922,9 +2793,8 @@ bool calls_complete(const ParsedMessage& m) {
 
 Finish ReplyStream::adjusted_finish(Finish f) const {
     if (f != Finish::Stop && f != Finish::StopString) return f;
-    /* Only claim tool_calls if every call closed and its arguments parse. A truncated arguments
-     * object reported as a tool call is a tool invoked with the wrong arguments (json_partial.h).
-     * The deltas of an open call have gone out already; the finish reason says not to run it. */
+    /* Claim tool_calls only if every call closed and its arguments parse (json_partial.h), so a
+     * truncated call is not run. Its deltas have already been sent. */
     return calls_complete(last_) ? Finish::ToolCalls : f;
 }
 
@@ -2952,8 +2822,8 @@ std::string ChatDeltaStream::chunk(json delta, const char* finish_reason, const 
 }
 
 void ChatDeltaStream::delta_open(std::string& out) {
-    /* Built from nlohmann's own serialisation of each field, on first use rather than in the
-     * constructor, so a field nlohmann refuses throws where chunk() would have. */
+    /* Built from nlohmann's serialisation of each field, on first use rather than in the
+     * constructor, so a field nlohmann refuses throws where chunk() would. */
     if (head_.empty())
         head_ = "data: {\"id\":" + json(id_).dump() +
                 ",\"object\":\"chat.completion.chunk\",\"created\":" + json(created_).dump() +
@@ -2989,30 +2859,39 @@ void ChatDeltaStream::set_timings(const TimingsOut& t) {
     if (t.valid) timings_ = "\"timings\":" + timings_json(t).dump();
 }
 
-/* Text that is not well-formed UTF-8 goes to nlohmann, which refuses it with the exception the
- * tree in chunk() raises for it. */
+/* Malformed UTF-8 falls back to nlohmann, which throws the same exception chunk() would. */
 void ReplyStream::quote(std::string& out, std::string_view s) {
     if (!json_quote_append(out, s)) out += json(std::string(s)).dump();
 }
 
-std::string ChatDeltaStream::first_chunk() {
-    json d;
-    d["role"] = "assistant";
-    d["content"] = "";
-    return chunk(std::move(d), nullptr);
+std::string ChatDeltaStream::first_chunk() { return std::string(); }
+
+std::string ChatDeltaStream::started() {
+    std::string out;
+    open_role(out);
+    return out;
 }
 
-/* One SSE chunk per increment, in the order the reader completed them. A call is announced with
- * its id, name and empty arguments before any of its arguments flow -- an entry with no name is
- * an index the client can never resolve. */
+/* The bytes chunk() writes for this delta, without taking the pending logprobs or timings,
+ * which belong to the output chunk that follows. */
+void ChatDeltaStream::open_role(std::string& out) {
+    if (role_sent_) return;
+    role_sent_ = true;
+    delta_open(out);
+    out += "{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n";
+}
+
+/* One SSE chunk per increment, in reader order. A call is announced with its id, name and empty
+ * arguments before its arguments flow, since clients cannot resolve an unnamed entry. */
 std::string ChatDeltaStream::emit(const std::vector<ReplyDelta>& ev) {
     std::string out;
     for (const ReplyDelta& d : ev) {
         if (!absorb(d) || d.kind == ReplyDelta::CallEnd) continue;
-        /* The functions API has one call; a second one past the grammar's one is not sent. */
+        /* The functions API has one call; any further call is not sent. */
         if (legacy_ && (d.kind == ReplyDelta::CallBegin || d.kind == ReplyDelta::CallArgs) &&
             (d.kind == ReplyDelta::CallBegin ? last_.tool_calls.size() - 1 : d.call) > 0)
             continue;
+        open_role(out);
         delta_open(out);
         switch (d.kind) {
         case ReplyDelta::Reasoning:
@@ -3064,9 +2943,9 @@ std::string ChatDeltaStream::emit(const std::vector<ReplyDelta>& ev) {
 }
 
 std::string ChatDeltaStream::final_chunk(Finish f, const TimingsOut& t, const UsageOut&) {
-    /* The generation is over, so whatever the reader was holding is resolved now. A caller that
-     * already said so gets nothing twice. */
+    /* Resolve whatever the reader holds; a no-op if push already saw is_final. */
     std::string out = push(std::string_view(), true);
+    open_role(out);
     const Finish a = adjusted_finish(f);
     out += chunk(json::object(), legacy_ && a == Finish::ToolCalls ? "function_call"
                                                                    : finish_reason_oai(a), &t);
@@ -3077,11 +2956,10 @@ std::string ChatDeltaStream::final_chunk(Finish f, const TimingsOut& t, const Us
 
 namespace {
 
-/* CLAUDE CODE STAMPS EVERY REQUEST'S SYSTEM PROMPT. Its first block opens
- * `x-anthropic-billing-header: cc_version=...; cc_entrypoint=cli; cch=a5145;` and the cch value
- * changes per request, so the very first tokens of the prompt differ every turn and the prefix
- * cache can never reuse a conversation. It is an integrity stamp for Anthropic's billing and
- * means nothing to a model; held constant, as llama-server holds it. */
+/* Claude Code's system prompt opens with
+ * `x-anthropic-billing-header: cc_version=...; cc_entrypoint=cli; cch=a5145;` where cch changes
+ * per request, so the prompt's first tokens differ every turn and defeat the prefix cache. It is
+ * a billing stamp meaningless to the model, held constant as in llama-server. */
 void hold_billing_stamp(std::string& s) {
     static const char kHead[] = "x-anthropic-billing-header:";
     if (s.rfind(kHead, 0) != 0) return;
@@ -3092,9 +2970,8 @@ void hold_billing_stamp(std::string& s) {
     for (size_t i = at + 4; i < end; ++i) s[i] = 'f';
 }
 
-/* An image block's source as the content part the chat path reads. A URL source stays a URL,
- * which the chat path refuses as it refuses every remote fetch (decode_media_url). `at` names the
- * block in a refusal. */
+/* An image block's source as a chat content part. A URL source stays a URL, which the chat path
+ * refuses like every remote fetch (decode_media_url). `at` names the block in a refusal. */
 int anthropic_image(const json& block, const std::string& at, json* out, ApiError* err) {
     auto sit = block.find("source");
     if (sit == block.end() || !sit->is_object()) {
@@ -3117,22 +2994,314 @@ int anthropic_image(const json& block, const std::string& at, json* out, ApiErro
     return RAD_OK;
 }
 
+/* The top-level fields of a Messages request. Anthropic's API refuses a field it does not
+ * define, and its clients send beta fields that change what the request means (a `thread`
+ * continuation sends only the tail of the conversation), so a field outside these lists is
+ * refused by name rather than ignored. The refusal says "Extra inputs are not permitted", as
+ * Anthropic's does; Claude Code matches those words to retry without a beta field it can
+ * drop. */
+const char* kAnthropicFields[] = {
+    "model", "messages", "system", "max_tokens", "temperature", "top_p", "top_k", "stream",
+    "stop_sequences", "tools", "tool_choice", "thinking", "metadata", "output_config",
+    "output_format", "context_management", "thread",
+};
+
+/* Accepted and not acted on: none of them can change the answer here. Capacity and placement
+ * (`service_tier`, `inference_geo`, `speed`), prompt-cache control (`cache_control`,
+ * `diagnostics`; the prefix cache is the server's own), and the inputs of Anthropic's
+ * classifiers and refusal fallbacks (`safeguards`, `fallbacks`, `context_hint`), which do not
+ * run here. */
+const char* kAnthropicInert[] = {
+    "service_tier", "inference_geo", "speed", "cache_control", "diagnostics",
+    "safeguards", "fallbacks", "context_hint",
+};
+
+struct AnthropicRefusal {
+    const char* key;
+    const char* why;
+};
+/* Known, not served, and able to change the answer. */
+const AnthropicRefusal kAnthropicRefused[] = {
+    { "mcp_servers", "remote MCP servers are not connected from here; send their tools in "
+                     "`tools` and their results back as tool_result blocks" },
+    { "container", "code execution containers are not served" },
+};
+
+int vet_anthropic_fields(const json& b, ApiError* err) {
+    for (auto it = b.begin(); it != b.end(); ++it) {
+        const std::string& k = it.key();
+        if (in_list(kAnthropicFields, k) || in_list(kAnthropicInert, k)) continue;
+        for (const AnthropicRefusal& r : kAnthropicRefused) {
+            if (k != r.key) continue;
+            *err = err_unsupported(k, r.why);
+            return RAD_E_UNSUPPORTED;
+        }
+        *err = err_unsupported(k, "Extra inputs are not permitted: this server does not serve "
+                                  "the field, and one it does not know could change the answer");
+        return RAD_E_UNSUPPORTED;
+    }
+    return RAD_OK;
+}
+
+/* Anthropic's effort levels. */
+bool anthropic_effort(const json& v) {
+    if (!v.is_string()) return false;
+    const std::string& s = v.get_ref<const std::string&>();
+    return s == "low" || s == "medium" || s == "high" || s == "xhigh" || s == "max";
+}
+
+/* `output_config` (or the deprecated top-level `output_format`, the same schema): `effort`
+ * becomes the chat request's `reasoning_effort`, which the chat template takes as its own level
+ * names (a level it does not take is refused there, and --reasoning-effort-map renames them);
+ * `format` becomes `response_format`. `task_budget` is a pacing hint the model is shown on
+ * Anthropic's side; nothing here shows it, so it is accepted and not acted on. */
+int anthropic_output_config(const json& b, json* o, ApiError* err) {
+    auto put_format = [o, err](const json& f, const std::string& at) {
+        std::string type;
+        if (!f.is_object() || !member_str(f, "type", (at + ".type").c_str(), &type, err)) {
+            if (!f.is_object()) *err = err_bad(at, "expected an object");
+            return false;
+        }
+        auto s = f.find("schema");
+        if (type != "json_schema" || s == f.end() || !s->is_object()) {
+            *err = err_bad(at, "expected {\"type\":\"json_schema\",\"schema\":{...}}");
+            return false;
+        }
+        (*o)["response_format"] = json{ { "type", "json_schema" },
+                                        { "json_schema", { { "name", "output" },
+                                                           { "schema", *s } } } };
+        return true;
+    };
+    auto of = b.find("output_format");
+    const bool legacy = of != b.end() && !of->is_null();
+    auto oc = b.find("output_config");
+    if (oc == b.end() || oc->is_null()) {
+        if (legacy && !put_format(*of, "output_format")) return RAD_E_INVAL;
+        return RAD_OK;
+    }
+    if (!oc->is_object()) { *err = err_bad("output_config", "expected an object"); return RAD_E_INVAL; }
+    for (auto it = oc->begin(); it != oc->end(); ++it) {
+        const std::string& k = it.key();
+        const json& v = it.value();
+        if (k == "effort") {
+            if (!anthropic_effort(v)) {
+                *err = err_bad("output_config.effort",
+                               "must be \"low\", \"medium\", \"high\", \"xhigh\" or \"max\"");
+                return RAD_E_INVAL;
+            }
+            (*o)["reasoning_effort"] = v;
+        } else if (k == "format") {
+            if (legacy) {
+                *err = err_bad("output_format", "cannot be combined with output_config.format");
+                return RAD_E_INVAL;
+            }
+            if (!put_format(v, "output_config.format")) return RAD_E_INVAL;
+        } else if (k == "task_budget") {
+            if (!v.is_object()) {
+                *err = err_bad("output_config.task_budget", "expected an object");
+                return RAD_E_INVAL;
+            }
+        } else {
+            *err = err_unsupported("output_config." + k, "Extra inputs are not permitted");
+            return RAD_E_UNSUPPORTED;
+        }
+    }
+    if (legacy && !o->contains("response_format") && !put_format(*of, "output_format"))
+        return RAD_E_INVAL;
+    return RAD_OK;
+}
+
+/* `context_management` asks for edits of the conversation's history (clearing old tool uses or
+ * thinking) before the model reads it. The conversation is served as sent, so the request is
+ * taken and its answer reports that no edit was applied (`applied_edits: []`), which is
+ * Anthropic's own report for a request no edit triggered on. */
+int anthropic_context_management(const json& b, bool* sent, ApiError* err) {
+    auto cm = b.find("context_management");
+    if (cm == b.end() || cm->is_null()) return RAD_OK;
+    if (!cm->is_object()) {
+        *err = err_bad("context_management", "expected an object");
+        return RAD_E_INVAL;
+    }
+    auto ed = cm->find("edits");
+    if (ed != cm->end() && !ed->is_null()) {
+        if (!ed->is_array()) {
+            *err = err_bad("context_management.edits", "expected an array");
+            return RAD_E_INVAL;
+        }
+        for (const json& e : *ed)
+            if (!e.is_object() || !e.contains("type") || !e.at("type").is_string()) {
+                *err = err_bad("context_management.edits[]", "expected an object with a `type`");
+                return RAD_E_INVAL;
+            }
+    }
+    if (sent) *sent = true;
+    return RAD_OK;
+}
+
+/* `thread` asks Anthropic to keep the conversation server-side. `create` sends the whole
+ * conversation and is served as any request; `continue` sends only what follows a stored
+ * message, and nothing is stored here. */
+int anthropic_thread(const json& b, ApiError* err) {
+    auto th = b.find("thread");
+    if (th == b.end() || th->is_null()) return RAD_OK;
+    std::string type;
+    if (!th->is_object() || !member_str(*th, "type", "thread.type", &type, err)) {
+        if (!th->is_object()) *err = err_bad("thread", "expected an object");
+        return RAD_E_INVAL;
+    }
+    if (type == "create") return RAD_OK;
+    if (type == "continue") {
+        *err = err_unsupported("thread", "conversations are not stored here, so a thread cannot "
+                               "be continued; send the whole conversation in `messages`");
+        return RAD_E_UNSUPPORTED;
+    }
+    *err = err_bad("thread.type", "must be \"create\" or \"continue\", got \"" + type + "\"");
+    return RAD_E_INVAL;
+}
+
+/* A system message's text: a string or text blocks, joined with newlines. An effort-only
+ * message (no text beside an `output_config`) yields "" and sets `*effort`. */
+int system_message(const json& m, std::string* out, json* effort, ApiError* err) {
+    for (auto it = m.begin(); it != m.end(); ++it)
+        if (it.key() != "role" && it.key() != "content" && it.key() != "clear_at" &&
+            it.key() != "output_config") {
+            *err = err_unsupported("messages[]." + it.key(), "Extra inputs are not permitted "
+                                   "on a system message");
+            return RAD_E_UNSUPPORTED;
+        }
+    auto oc = m.find("output_config");
+    if (oc != m.end() && !oc->is_null()) {
+        if (!oc->is_object() || oc->size() != 1 || !oc->contains("effort") ||
+            !anthropic_effort(oc->at("effort"))) {
+            *err = err_bad("messages[].output_config",
+                           "expected {\"effort\": \"low\"|\"medium\"|\"high\"|\"xhigh\"|\"max\"}");
+            return RAD_E_INVAL;
+        }
+        *effort = oc->at("effort");
+    }
+    auto c = m.find("content");
+    std::string t;
+    if (c == m.end() || c->is_null()) {
+    } else if (c->is_string()) {
+        t = c->get<std::string>();
+    } else if (c->is_array()) {
+        for (const json& blk : *c) {
+            const std::string type = str_or(blk, "type");
+            if (type != "text") {
+                *err = err_unsupported("messages[].content[].type", "a system message carries "
+                                       "text blocks only, not \"" + type + "\"");
+                return RAD_E_UNSUPPORTED;
+            }
+            std::string bt;
+            if (!member_str(blk, "text", "messages[].content[].text", &bt, err)) return RAD_E_INVAL;
+            if (!t.empty()) t += "\n";
+            t += bt;
+        }
+    } else {
+        *err = err_bad("messages[].content", "expected a string or text blocks");
+        return RAD_E_INVAL;
+    }
+    if (t.empty() && effort->is_null()) {
+        *err = err_bad("messages[].content", "must not be empty");
+        return RAD_E_INVAL;
+    }
+    *out = std::move(t);
+    return RAD_OK;
+}
+
+bool user_after(const json& msgs, size_t at) {
+    for (size_t j = at + 1; j < msgs.size(); ++j)
+        if (msgs[j].is_object() && str_or(msgs[j], "role") == "user") return true;
+    return false;
+}
+
+/* A system message as the conversation reads it: its text, "" when there is none to render,
+ * and the effort it sets. `clear_at: "next_user_message"` renders the text until a later user
+ * message (a tool_result-only one included) exists, then never again. An effort applies from
+ * the next user message on, so one after the last user message does not apply to this reply. */
+int system_turn(const json& msgs, size_t at, std::string* text, json* effort, ApiError* err) {
+    json e;
+    RAD_TRY(system_message(msgs[at], text, &e, err));
+    std::string when = "never";
+    if (!member_str(msgs[at], "clear_at", "messages[].clear_at", &when, err)) return RAD_E_INVAL;
+    if (when != "never" && when != "next_user_message") {
+        *err = err_bad("messages[].clear_at",
+                       "must be \"never\" or \"next_user_message\", got \"" + when + "\"");
+        return RAD_E_INVAL;
+    }
+    const bool later = user_after(msgs, at);
+    if (when == "next_user_message" && later) text->clear();
+    if (!e.is_null() && later) *effort = std::move(e);
+    return RAD_OK;
+}
+
+/* Marks, while the conversation is lowered, a user message that holds a system message's text. */
+const char kLowered[] = "rad_lowered_system";
+
+/* Each run of system texts lowered from later system messages joins a neighbouring user message
+ * as text blocks, in order: the user message right after the run, else the one right before
+ * it, else one user message of their own. A user message of its own beside another would be
+ * two user turns in a row, which templates that enforce alternation refuse. A newline sits
+ * between a folded text and the user's own, since some templates join text blocks with
+ * nothing. */
+json fold_lowered_system(json msgs) {
+    json out = json::array();
+    auto blocks = [](json& m) {
+        if (m["content"].is_string())
+            m["content"] = json::array({ json{ { "type", "text" }, { "text", m["content"] } } });
+    };
+    auto text = [](std::string t) { return json{ { "type", "text" }, { "text", std::move(t) } }; };
+    for (size_t k = 0; k < msgs.size();) {
+        if (!msgs[k].contains(kLowered)) {
+            out.push_back(std::move(msgs[k++]));
+            continue;
+        }
+        std::vector<std::string> run;
+        for (; k < msgs.size() && msgs[k].contains(kLowered); ++k)
+            run.push_back(msgs[k]["content"].get<std::string>());
+        if (k < msgs.size() && str_or(msgs[k], "role") == "user") {
+            json& next = msgs[k];
+            blocks(next);
+            json parts = json::array();
+            for (std::string& t : run) parts.push_back(text(std::move(t) + "\n"));
+            for (json& p : next["content"]) parts.push_back(std::move(p));
+            next["content"] = std::move(parts);
+        } else if (!out.empty() && str_or(out.back(), "role") == "user") {
+            blocks(out.back());
+            for (std::string& t : run) out.back()["content"].push_back(text("\n" + t));
+        } else {
+            std::string joined;
+            for (const std::string& t : run) joined += (joined.empty() ? "" : "\n") + t;
+            out.push_back(json{ { "role", "user" }, { "content", joined } });
+        }
+    }
+    return out;
+}
+
 }  /* namespace */
 
 int anthropic_to_chat(const std::string& body, const OaiLimits& lim, std::string* chat,
-                      std::string* label, ApiError* err) {
+                      std::string* label, ApiError* err, bool* context_management) {
     json b;
     RAD_TRY(parse_request_object(body, lim, &b, err));
+    RAD_TRY(vet_anthropic_fields(b, err));
+    RAD_TRY(anthropic_thread(b, err));
+    RAD_TRY(anthropic_context_management(b, context_management, err));
     json o = json::object();
     json msgs = json::array();
 
-    /* The system prompt: a string or text blocks, which become one system message. */
+    /* The system prompt: the `system` field (a string or text blocks) and the system messages
+     * at the head of the conversation, as one system message. The templates read a system
+     * message only where it leads, so the text of a later one joins a user message at its
+     * position (fold_lowered_system). */
+    std::string sys_text;
+    bool has_system = false;
     auto sys = b.find("system");
     if (sys != b.end() && !sys->is_null()) {
-        std::string text;
+        has_system = true;
         if (sys->is_string()) {
-            text = sys->get<std::string>();
-            hold_billing_stamp(text);
+            sys_text = sys->get<std::string>();
+            hold_billing_stamp(sys_text);
         } else if (sys->is_array()) {
             for (const json& blk : *sys) {
                 if (str_or(blk, "type") != "text") {
@@ -3142,14 +3311,13 @@ int anthropic_to_chat(const std::string& body, const OaiLimits& lim, std::string
                 std::string t;
                 if (!member_str(blk, "text", "system[].text", &t, err)) return RAD_E_INVAL;
                 hold_billing_stamp(t);
-                if (!text.empty()) text += "\n";
-                text += t;
+                if (!sys_text.empty()) sys_text += "\n";
+                sys_text += t;
             }
         } else {
             *err = err_bad("system", "expected a string or text blocks");
             return RAD_E_INVAL;
         }
-        msgs.push_back(json{ { "role", "system" }, { "content", text } });
     }
 
     auto mit = b.find("messages");
@@ -3157,12 +3325,37 @@ int anthropic_to_chat(const std::string& body, const OaiLimits& lim, std::string
         *err = err_bad("messages", "is required, as an array");
         return RAD_E_INVAL;
     }
-    for (const json& m : *mit) {
+    /* The effort a system message sets, which overrides the top-level one. */
+    json effort;
+    size_t i = 0;
+    for (; i < mit->size(); ++i) {
+        const json& m = (*mit)[i];
+        if (!m.is_object() || str_or(m, "role") != "system") break;
+        std::string t;
+        RAD_TRY(system_turn(*mit, i, &t, &effort, err));
+        if (t.empty()) continue;
+        hold_billing_stamp(t);
+        if (!sys_text.empty()) sys_text += "\n\n";
+        sys_text += t;
+        has_system = true;
+    }
+    if (has_system) msgs.push_back(json{ { "role", "system" }, { "content", sys_text } });
+
+    for (; i < mit->size(); ++i) {
+        const json& m = (*mit)[i];
         if (!m.is_object()) { *err = err_bad("messages[]", "expected an object"); return RAD_E_INVAL; }
         std::string role;
         if (!member_str(m, "role", "messages[].role", &role, err)) return RAD_E_INVAL;
+        if (role == "system") {
+            std::string t;
+            RAD_TRY(system_turn(*mit, i, &t, &effort, err));
+            if (!t.empty())
+                msgs.push_back(json{ { "role", "user" }, { "content", t }, { kLowered, true } });
+            continue;
+        }
         if (role != "user" && role != "assistant") {
-            *err = err_bad("messages[].role", "must be \"user\" or \"assistant\", got \"" + role + "\"");
+            *err = err_bad("messages[].role",
+                           "must be \"user\", \"assistant\" or \"system\", got \"" + role + "\"");
             return RAD_E_INVAL;
         }
         const json content = m.contains("content") ? m.at("content") : json();
@@ -3174,10 +3367,9 @@ int anthropic_to_chat(const std::string& body, const OaiLimits& lim, std::string
             *err = err_bad("messages[].content", "expected a string or content blocks");
             return RAD_E_INVAL;
         }
-        /* THE TOOL RESULTS GO FIRST. Anthropic carries them in the user turn that follows the
-         * calls, beside whatever the user says next; the chat format wants each one as a tool
-         * message directly after the assistant turn that made the call, and the user's own words
-         * after them. */
+        /* Tool results go first. Anthropic puts them in the user turn after the calls, beside the
+         * user's next words; the chat format wants each as a tool message right after the calling
+         * assistant turn, with the user's words after them. */
         json parts = json::array(), calls = json::array(), results = json::array();
         std::string reasoning;
         for (const json& blk : content) {
@@ -3207,10 +3399,15 @@ int anthropic_to_chat(const std::string& body, const OaiLimits& lim, std::string
                 if (!member_str(blk, "id", "messages[].content[].id", &id, err) ||
                     !member_str(blk, "name", "messages[].content[].name", &name, err))
                     return RAD_E_INVAL;
+                const json input = blk.value("input", json::object());
+                if (!input.is_object()) {
+                    *err = err_bad("messages[].content[].input", "expected an object");
+                    return RAD_E_INVAL;
+                }
                 calls.push_back(json{ { "id", id },
                                       { "type", "function" },
                                       { "function", { { "name", name },
-                                                      { "arguments", blk.value("input", json::object()).dump() } } } });
+                                                      { "arguments", input.dump() } } } });
             } else if (type == "tool_result") {
                 std::string use_id;
                 if (!member_str(blk, "tool_use_id", "messages[].content[].tool_use_id", &use_id, err))
@@ -3256,8 +3453,8 @@ int anthropic_to_chat(const std::string& body, const OaiLimits& lim, std::string
                                         { "tool_call_id", use_id },
                                         { "content", tc } });
             } else {
-                /* A block that would change the answer and that this server cannot serve --
-                 * documents, server tools' results -- is refused by name, not dropped. */
+                /* Unservable blocks that would change the answer (documents, server tool
+                 * results) are refused by name, not dropped. */
                 *err = err_unsupported("messages[].content[].type",
                                        "a content block of type \"" + type + "\" is not served");
                 return RAD_E_UNSUPPORTED;
@@ -3267,7 +3464,7 @@ int anthropic_to_chat(const std::string& body, const OaiLimits& lim, std::string
         if (parts.empty() && calls.empty() && reasoning.empty()) continue;
         json nm = { { "role", role } };
         if (role == "assistant") {
-            /* An assistant turn's text is one string, which is what every template renders. */
+            /* An assistant turn's text is one string, as every template renders it. */
             std::string text;
             for (const json& p : parts)
                 if (p.at("type") == "text") text += p.at("text").get<std::string>();
@@ -3279,11 +3476,15 @@ int anthropic_to_chat(const std::string& body, const OaiLimits& lim, std::string
         if (!reasoning.empty()) nm["reasoning_content"] = reasoning;
         msgs.push_back(std::move(nm));
     }
-    o["messages"] = std::move(msgs);
+    o["messages"] = fold_lowered_system(std::move(msgs));
 
-    /* Client tools are functions. A server tool -- Anthropic's own web search or code
-     * execution, named by `type` -- runs on Anthropic's side and has no counterpart here. */
+    /* Client tools become functions. Server tools (Anthropic's web search, code execution,
+     * named by `type`) run on Anthropic's side and are refused. */
     auto tit = b.find("tools");
+    if (tit != b.end() && !tit->is_null() && !tit->is_array()) {
+        *err = err_bad("tools", "expected an array");
+        return RAD_E_INVAL;
+    }
     if (tit != b.end() && tit->is_array() && !tit->empty()) {
         json tools = json::array();
         for (const json& t : *tit) {
@@ -3304,7 +3505,21 @@ int anthropic_to_chat(const std::string& body, const OaiLimits& lim, std::string
         o["tools"] = std::move(tools);
     }
     auto tc = b.find("tool_choice");
-    if (tc != b.end() && tc->is_object()) {
+    if (tc != b.end() && tc->is_string()) {
+        /* The string form: "auto" and "none" as the chat path takes them, "any" as its
+         * "required". Naming a tool takes the object form. */
+        const std::string v = tc->get<std::string>();
+        if (v == "auto" || v == "none") o["tool_choice"] = v;
+        else if (v == "any") o["tool_choice"] = "required";
+        else {
+            *err = err_bad("tool_choice", "must be \"auto\", \"any\", \"none\" or an object, got "
+                                           "\"" + v + "\"");
+            return RAD_E_INVAL;
+        }
+    } else if (tc != b.end() && !tc->is_null() && !tc->is_object()) {
+        *err = err_bad("tool_choice", "expected a string or an object");
+        return RAD_E_INVAL;
+    } else if (tc != b.end() && tc->is_object()) {
         std::string type = "auto", name;
         if (!member_str(*tc, "type", "tool_choice.type", &type, err) ||
             !member_str(*tc, "name", "tool_choice.name", &name, err))
@@ -3322,29 +3537,49 @@ int anthropic_to_chat(const std::string& body, const OaiLimits& lim, std::string
         if (one) o["parallel_tool_calls"] = false;
     }
 
-    /* `model` too, which the reply names back as Anthropic's does. */
+    /* `model` included, since the reply names it back as Anthropic's does. */
     for (const char* k : { "model", "max_tokens", "temperature", "top_p", "top_k", "stream" })
         if (b.contains(k)) o[k] = b.at(k);
     if (b.contains("stop_sequences")) o["stop"] = b.at("stop_sequences");
 
-    /* Extended thinking: on with a budget, off, or on with the template's own judgement. */
+    /* Extended thinking: on with a budget, off, or on with the template's own judgement;
+     * `between_tools` is how the newest models turn it off. `display` and `block_binding` are
+     * about how Anthropic returns and checks its signed thinking blocks; a local model's
+     * reasoning comes back whole and unsigned, so they change nothing here. */
     auto th = b.find("thinking");
-    if (th != b.end() && th->is_object()) {
+    if (th != b.end() && !th->is_null()) {
+        if (!th->is_object()) { *err = err_bad("thinking", "expected an object"); return RAD_E_INVAL; }
+        for (auto it = th->begin(); it != th->end(); ++it)
+            if (it.key() != "type" && it.key() != "budget_tokens" && it.key() != "display" &&
+                it.key() != "block_binding") {
+                *err = err_unsupported("thinking." + it.key(), "Extra inputs are not permitted");
+                return RAD_E_UNSUPPORTED;
+            }
         std::string type;
         if (!member_str(*th, "type", "thinking.type", &type, err)) return RAD_E_INVAL;
-        if (type == "disabled") {
+        if (type == "disabled" || type == "between_tools") {
             o["enable_thinking"] = false;
         } else if (type == "enabled" || type == "adaptive") {
             o["enable_thinking"] = true;
             if (th->contains("budget_tokens")) o["thinking_token_budget"] = th->at("budget_tokens");
+        } else {
+            *err = err_bad("thinking.type", "must be \"enabled\", \"adaptive\", \"disabled\" or "
+                                            "\"between_tools\", got \"" + type + "\"");
+            return RAD_E_INVAL;
         }
     }
 
-    /* The caller's own name for whoever is asking, which Claude Code fills with its session. */
+    RAD_TRY(anthropic_output_config(b, &o, err));
+    if (!effort.is_null()) o["reasoning_effort"] = effort;
+
+    /* metadata.user_id labels the conversation (Claude Code puts its session there). */
     auto md = b.find("metadata");
-    if (label && md != b.end() && md->is_object() && md->contains("user_id") &&
-        md->at("user_id").is_string())
-        *label = session_label_of(md->at("user_id").get<std::string>());
+    if (md != b.end() && !md->is_null()) {
+        if (!md->is_object()) { *err = err_bad("metadata", "expected an object"); return RAD_E_INVAL; }
+        std::string uid;
+        if (!member_str(*md, "user_id", "metadata.user_id", &uid, err)) return RAD_E_INVAL;
+        if (label && !uid.empty()) *label = session_label_of(uid);
+    }
 
     *chat = o.dump();
     return RAD_OK;
@@ -3355,8 +3590,8 @@ const char* anthropic_stop_reason(const OaiRequest& r, Finish f, const std::stri
         case Finish::ToolCalls: return "tool_use";
         case Finish::Length:    return "max_tokens";
         case Finish::StopString: {
-            /* The client's own stop sequence is stop_sequence; the chat format's end-of-turn marker
-             * is the turn ending, which is end_turn. */
+            /* A client stop sequence is stop_sequence; the format's end-of-turn marker is
+             * end_turn. */
             const auto end = r.stop.begin() + (long)std::min(r.n_client_stops, r.stop.size());
             if (!stop_word.empty() && std::find(r.stop.begin(), end, stop_word) != end)
                 return "stop_sequence";
@@ -3397,20 +3632,15 @@ std::string anthropic_message_body(const OaiRequest& r, const ChoiceOut& c, cons
     o["stop_reason"] = sr;
     o["stop_sequence"] = std::strcmp(sr, "stop_sequence") == 0 ? json(c.stop_word) : json(nullptr);
     o["usage"] = anthropic_usage(u);
+    if (r.context_management)
+        o["context_management"] = json{ { "applied_edits", json::array() } };
     return o.dump();
 }
 
 std::string anthropic_error_body(const ApiError& e) {
-    const char* type = e.status == 401 ? "authentication_error"
-                     : e.status == 403 ? "permission_error"
-                     : e.status == 404 ? "not_found_error"
-                     : e.status == 413 ? "request_too_large"
-                     : e.status == 429 ? "rate_limit_error"
-                     : e.status >= 500 ? "api_error"
-                                       : "invalid_request_error";
     json o;
     o["type"] = "error";
-    o["error"] = json{ { "type", type }, { "message", e.message } };
+    o["error"] = json{ { "type", anthropic_error_type(e.status) }, { "message", e.message } };
     return o.dump();
 }
 
@@ -3427,7 +3657,11 @@ void AnthropicStream::event(std::string& out, const char* type, const json& data
     out += "\n\n";
 }
 
-std::string AnthropicStream::first_chunk() {
+std::string AnthropicStream::first_chunk() { return std::string(); }
+
+std::string AnthropicStream::started() {
+    if (started_) return std::string();
+    started_ = true;
     json m;
     m["id"] = id_;
     m["type"] = "message";
@@ -3445,7 +3679,8 @@ std::string AnthropicStream::first_chunk() {
 void AnthropicStream::open(std::string& out, Block b, const ToolCall* tc) {
     close(out);
     json cb;
-    if (b == Block::Thinking)  cb = { { "type", "thinking" }, { "thinking", "" } };
+    if (b == Block::Thinking)
+        cb = { { "type", "thinking" }, { "thinking", "" }, { "signature", "" } };
     else if (b == Block::Text) cb = { { "type", "text" }, { "text", "" } };
     else cb = { { "type", "tool_use" }, { "id", tc->id }, { "name", tc->name },
                 { "input", json::object() } };
@@ -3457,9 +3692,8 @@ void AnthropicStream::open(std::string& out, Block b, const ToolCall* tc) {
 
 void AnthropicStream::close(std::string& out) {
     if (block_ == Block::None) return;
-    /* A thinking block ends with its signature, which a client hands back with the block on the
-     * next turn. Anthropic's is cryptographic and verified by Anthropic; a local model has none,
-     * and the empty one is what llama-server sends. */
+    /* A thinking block ends with its signature, which clients send back next turn. A local model
+     * has none; the empty one matches llama-server. */
     if (block_ == Block::Thinking)
         event(out, "content_block_delta",
               json{ { "type", "content_block_delta" }, { "index", n_blocks_ - 1 },
@@ -3469,7 +3703,7 @@ void AnthropicStream::close(std::string& out) {
 }
 
 std::string AnthropicStream::emit(const std::vector<ReplyDelta>& ev) {
-    std::string out;
+    std::string out = ev.empty() ? std::string() : started();
     for (const ReplyDelta& d : ev) {
         if (!absorb(d)) continue;
         switch (d.kind) {
@@ -3480,25 +3714,25 @@ std::string AnthropicStream::emit(const std::vector<ReplyDelta>& ev) {
                         { "delta", { { "type", "thinking_delta" }, { "thinking", d.text } } } });
             break;
         case ReplyDelta::Content: {
-            /* The prefill is the caller's own text; Anthropic's API answers what follows it. */
-            std::string_view text = d.text;
+            /* The prefill is the caller's own text; Anthropic's API answers what follows it, and
+             * the buffered body drops it when the reply repeats the whole of it. A start that
+             * matches the prefill so far is held until the reply completes the prefill (dropped)
+             * or departs from it (sent whole). */
+            std::string text = d.text;
             if (!skip_.empty()) {
-                const size_t n = std::min(skip_.size(), text.size());
-                if (skip_.compare(0, n, text.substr(0, n)) == 0) {
-                    skip_.erase(0, n);
-                    text.remove_prefix(n);
-                } else {
-                    skip_.clear();
-                }
+                held_ += text;
+                const size_t n = std::min(held_.size(), skip_.size());
+                const bool same = held_.compare(0, n, skip_, 0, n) == 0;
+                if (same && held_.size() < skip_.size()) break;
+                text = same ? held_.substr(skip_.size()) : held_;
+                held_.clear();
+                skip_.clear();
             }
-            if (text.empty()) break;
-            if (block_ != Block::Text) open(out, Block::Text, nullptr);
-            event(out, "content_block_delta",
-                  json{ { "type", "content_block_delta" }, { "index", n_blocks_ - 1 },
-                        { "delta", { { "type", "text_delta" }, { "text", std::string(text) } } } });
+            text_delta(out, text);
             break;
         }
         case ReplyDelta::CallBegin:
+            release_held(out);
             open(out, Block::Tool, &last_.tool_calls.back());
             break;
         case ReplyDelta::CallArgs:
@@ -3514,21 +3748,43 @@ std::string AnthropicStream::emit(const std::vector<ReplyDelta>& ev) {
     return out;
 }
 
+void AnthropicStream::text_delta(std::string& out, const std::string& text) {
+    if (text.empty()) return;
+    if (block_ != Block::Text) open(out, Block::Text, nullptr);
+    event(out, "content_block_delta",
+          json{ { "type", "content_block_delta" }, { "index", n_blocks_ - 1 },
+                { "delta", { { "type", "text_delta" }, { "text", text } } } });
+}
+
+/* Content held against the prefill is the reply's own text once nothing more can complete the
+ * prefill: the reply ended, or moved on to a call. */
+void AnthropicStream::release_held(std::string& out) {
+    if (held_.empty()) return;
+    std::string text;
+    text.swap(held_);
+    skip_.clear();
+    text_delta(out, text);
+}
+
 std::string AnthropicStream::final_chunk(Finish f, const TimingsOut&, const UsageOut& u) {
-    std::string out = push(std::string_view(), true);
+    std::string out = started();
+    out += push(std::string_view(), true);
+    release_held(out);
     close(out);
     const char* sr = anthropic_stop_reason(*r_, adjusted_finish(f), stop_word_);
     json delta = { { "stop_reason", sr },
                    { "stop_sequence", std::strcmp(sr, "stop_sequence") == 0 ? json(stop_word_)
                                                                              : json(nullptr) } };
-    event(out, "message_delta",
-          json{ { "type", "message_delta" }, { "delta", delta }, { "usage", anthropic_usage(u) } });
+    json md = { { "type", "message_delta" }, { "delta", delta }, { "usage", anthropic_usage(u) } };
+    if (r_->context_management)
+        md["context_management"] = json{ { "applied_edits", json::array() } };
+    event(out, "message_delta", md);
     event(out, "message_stop", json{ { "type", "message_stop" } });
     return out;
 }
 
 std::string AnthropicStream::error_chunk(const ApiError& e, const TimingsOut&, const UsageOut&) {
-    return "event: error\ndata: " + anthropic_error_body(e) + "\n\n";
+    return started() + "event: error\ndata: " + anthropic_error_body(e) + "\n\n";
 }
 
 /* ================================================================== OpenAI's Responses API */
@@ -3622,9 +3878,9 @@ int responses_to_chat(const std::string& body, const OaiLimits& lim, std::string
                                "send the conversation as `input`");
         return RAD_E_UNSUPPORTED;
     }
-    /* WHAT A RESPONSE OBJECT CANNOT CARRY is refused, not computed and dropped: several choices
-     * (a response is one), and logprobs, which the Responses API reports per output_text part --
-     * a split of the reply's tokens this server does not make. */
+    /* Refused rather than computed and dropped: several choices (a response is one reply), and
+     * logprobs, which the Responses API reports per output_text part, a token split this server
+     * does not make. */
     {
         int64_t n = 1;
         if (!get_int(b, "n", &n, err)) return RAD_E_INVAL;
@@ -3648,11 +3904,10 @@ int responses_to_chat(const std::string& body, const OaiLimits& lim, std::string
             return RAD_E_UNSUPPORTED;
         }
     }
-    /* EVERY FIELD THE RESPONSES API DOES NOT DEFINE PASSES THROUGH to the chat request, as
-     * llama-server passes it: a client that adds chat_template_kwargs or top_k to a Responses
-     * request means them. The Responses API's own fields are translated below, and the chat
-     * stream's own extras -- the usage chunk and the prompt progress chunks, which a Responses
-     * stream has no frame for -- are dropped: response.completed carries the usage. */
+    /* Fields the Responses API does not define pass through to the chat request, as in
+     * llama-server (e.g. chat_template_kwargs, top_k). Its own fields are translated below. The
+     * chat stream's usage and progress chunks have no Responses frame and are dropped;
+     * response.completed carries the usage. */
     json o = b;
     for (const char* k : { "input", "instructions", "tools", "tool_choice", "max_output_tokens",
                            "reasoning", "text", "previous_response_id", "store", "metadata",
@@ -3681,8 +3936,8 @@ int responses_to_chat(const std::string& body, const OaiLimits& lim, std::string
                 if (!member_str(item, "role", "input[].role", &role, err)) return RAD_E_INVAL;
                 const json content = item.contains("content") ? item.at("content") : json("");
                 if (role == "assistant") {
-                    /* A turn the model gave earlier: its text, joined to a reasoning item or a
-                     * call of the same turn that came before it. */
+                    /* An earlier model turn: its text joins any preceding reasoning item or call
+                     * of the same turn. */
                     std::string text;
                     if (content.is_string()) {
                         text = content.get<std::string>();
@@ -3749,8 +4004,8 @@ int responses_to_chat(const std::string& body, const OaiLimits& lim, std::string
                 if (!member_str(item, "call_id", "input[].call_id", &id, err)) return RAD_E_INVAL;
                 msgs.push_back(json{ { "role", "tool" }, { "tool_call_id", id }, { "content", content } });
             } else if (type == "reasoning") {
-                /* The reasoning of a turn the model gave earlier, which a template that keeps
-                 * reasoning across turns renders. Its text is the content, else the summary. */
+                /* An earlier turn's reasoning, for templates that keep it across turns: the
+                 * content's text, else the summary's. */
                 std::string text;
                 for (const char* k : { "content", "summary" }) {
                     if (!text.empty() || !item.contains(k) || !item.at(k).is_array()) continue;
@@ -3775,7 +4030,7 @@ int responses_to_chat(const std::string& body, const OaiLimits& lim, std::string
     o["messages"] = std::move(msgs);
 
     /* Function tools only. Built-in tools (web search, file search, computer use) and freeform
-     * custom tools have no chat-completions counterpart; the model is offered what it can call. */
+     * custom tools have no chat-completions counterpart and are left out. */
     json echo_tools = json::array();
     auto tit = b.find("tools");
     if (tit != b.end() && tit->is_array()) {
@@ -3874,9 +4129,7 @@ void ResponsesStream::event(std::string& out, const char* type, json data) {
 
 json ResponsesStream::response(const char* status) const {
     const bool done = std::strcmp(status, "in_progress") != 0;
-    json items = json::array();
-    for (const std::string& it : items_) items.push_back(json::parse(it));
-    return response_object(*r_, status, items, done ? &usage_ : nullptr, incomplete_);
+    return response_object(*r_, status, json(items_), done ? &usage_ : nullptr, incomplete_);
 }
 
 std::string ResponsesStream::first_chunk() {
@@ -3936,13 +4189,17 @@ void ResponsesStream::close(std::string& out) {
                     { "part", text_part(text_) } });
         item = message_item(item_id_, text_, "completed");
     } else {
+        /* A call the reply ended inside was announced but never closed. Its item is
+         * "incomplete", the Responses API's status for an item cut short, so a client acting on
+         * the terminal response does not run it with truncated arguments. */
         const ToolCall& tc = last_.tool_calls[call_];
+        const bool cut = finished_ && last_.open_call && call_ + 1 == last_.tool_calls.size();
         event(out, "response.function_call_arguments.done",
               json{ { "item_id", item_id_ }, { "output_index", at }, { "arguments", tc.arguments } });
-        item = call_item(tc, "completed");
+        item = call_item(tc, cut ? "incomplete" : "completed");
     }
     event(out, "response.output_item.done", json{ { "output_index", at }, { "item", item } });
-    items_.push_back(item.dump());
+    items_.push_back(std::move(item));
     item_ = Item::None;
 }
 
@@ -3950,20 +4207,21 @@ std::string ResponsesStream::emit(const std::vector<ReplyDelta>& ev) {
     std::string out;
     for (const ReplyDelta& d : ev) {
         if (!absorb(d)) continue;
-        const int64_t at = (int64_t)items_.size();
+        /* The open item's index; read after open(), which may close one first. */
+        auto at = [this] { return (int64_t)items_.size(); };
         switch (d.kind) {
         case ReplyDelta::Reasoning:
             if (item_ != Item::Reasoning) open(out, Item::Reasoning, 0);
             text_ += d.text;
             event(out, "response.reasoning_text.delta",
-                  json{ { "item_id", item_id_ }, { "output_index", (int64_t)items_.size() },
+                  json{ { "item_id", item_id_ }, { "output_index", at() },
                         { "content_index", 0 }, { "delta", d.text } });
             break;
         case ReplyDelta::Content:
             if (item_ != Item::Message) open(out, Item::Message, 0);
             text_ += d.text;
             event(out, "response.output_text.delta",
-                  json{ { "item_id", item_id_ }, { "output_index", (int64_t)items_.size() },
+                  json{ { "item_id", item_id_ }, { "output_index", at() },
                         { "content_index", 0 }, { "delta", d.text }, { "logprobs", json::array() } });
             break;
         case ReplyDelta::CallBegin:
@@ -3971,7 +4229,7 @@ std::string ResponsesStream::emit(const std::vector<ReplyDelta>& ev) {
             break;
         case ReplyDelta::CallArgs:
             event(out, "response.function_call_arguments.delta",
-                  json{ { "item_id", item_id_ }, { "output_index", at }, { "delta", d.text } });
+                  json{ { "item_id", item_id_ }, { "output_index", at() }, { "delta", d.text } });
             break;
         case ReplyDelta::CallEnd:
             close(out);

@@ -1,10 +1,9 @@
-/* rad_device.h -- the device layer. Thin on purpose: everything above it is written once, and
- * every backend implements exactly the small set of calls below.
+/* rad_device.h -- the device layer. Deliberately thin: everything above it is written once, and
+ * every backend implements the small set of calls below.
  *
- * The host backend is not a toy. It is what lets the core, the scheduler, the planner, the
- * tokeniser, the server and libref be built and tested on a machine with no accelerator, and it
- * is the same code path RAD_DOMAIN_HOST kernels run on when the planner puts a layer on the CPU
- * (spec §5.1).
+ * The host backend is a full backend. It lets the core, scheduler, planner, tokeniser, server and
+ * libref be built and tested without an accelerator, and RAD_DOMAIN_HOST kernels run on it when the
+ * planner puts a layer on the CPU (spec §5.1).
  */
 #ifndef RAD_DEVICE_H
 #define RAD_DEVICE_H
@@ -19,12 +18,11 @@ typedef void* RadEvent;
 
 enum { RAD_MEM_DEVICE = 0, RAD_MEM_HOST_PINNED = 1, RAD_MEM_HOST = 2, RAD_MEM_HOST_MAPPED = 3 };
 
-/* WHAT THE ENGINE KNOWS ABOUT A DEVICE, AND IT IS ONLY THIS. Nothing above this layer names a
- * vendor, a product or an instruction set: the scheduler, the planner and the budgets are written
- * against these fields and learn the machine from them at run time. A kernel library is where
- * hardware knowledge belongs, and it declares which devices it serves.
+/* Everything the engine knows about a device. Nothing above this layer names a vendor, product or
+ * instruction set: the scheduler, planner and budgets learn the machine from these fields at run
+ * time. Hardware knowledge belongs in kernel libraries, which declare the devices they serve.
  *
- * Every field carries whatever the backend reports, in the backend's own vocabulary. */
+ * Every field carries what the backend reports, in the backend's own vocabulary. */
 typedef struct RadDeviceProps {
     char     name[128];       /* the product name, for logs and for the tuning cache's key */
     char     arch[32];        /* the backend's name for the architecture, with any feature

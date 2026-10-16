@@ -1,22 +1,16 @@
-/* arena.h -- ONE contiguous allocation, sized by the buffer plan at load and never allocated from
+/* arena.h -- one contiguous allocation, sized by the buffer plan at load and never allocated from
  * at runtime.
  *
- * There is deliberately no allocate() on this class. If there were one somebody would eventually
- * call it from inside rad_arch_step, and an allocator on the step path is precisely the class of
- * dynamic behaviour this engine exists to remove (spec §3.1). Offsets come from the buffer plan,
- * which computed liveness over the declared op list and is conservative on purpose: a plan that is
- * correct for the worst step is correct for every step. The arena only owns the block those
- * offsets index into.
+ * There is deliberately no allocate(): an allocator on the step path is the dynamic behaviour this
+ * engine exists to remove (spec §3.1). Offsets come from the buffer plan, which computes liveness
+ * over the declared op list for the worst step; the arena only owns the block they index into.
  *
- * The scratch region sits at the tail and is shared by every op on a stream. That is safe and not
- * merely convenient: launches on one stream execute in order, so no two kernels' scratch lifetimes
- * overlap. A context's second lane is a second stream, where that order does not hold, so a program
- * that declares one gets a second region and each lane's kernels are handed their own
- * (Program::scratch_regions). A lane used without that declaration shares region 0, and there
- * Ctx::issue orders a scratch user behind one on the other lane that nothing has ordered it after
- * yet. Program::scratch_bytes is the largest single kernel's requirement, so a region of that size
- * serves all of them -- and if a kernel asks for more than the plan reserved, prepare refuses by
- * name rather than handing it a short buffer.
+ * Scratch sits at the tail and is shared by every op on a stream, which is safe because launches
+ * on one stream execute in order. A context's second lane is a second stream, so a program that
+ * declares one gets a second region per lane (Program::scratch_regions). A lane used without that
+ * declaration shares region 0, and Ctx::issue orders a scratch user behind an unordered one on the
+ * other lane. Program::scratch_bytes is the largest single kernel's requirement; a kernel asking
+ * for more is refused by name in prepare.
  */
 #pragma once
 #include "../rad_core.h"
@@ -30,9 +24,9 @@ public:
     Arena(const Arena&) = delete;
     Arena& operator=(const Arena&) = delete;
 
-    /* `kind` is a RAD_MEM_* class. The device arena is RAD_MEM_DEVICE; a program with
-     * RAD_DOMAIN_HOST buffers gets a second arena in RAD_MEM_HOST. `regions` scratch regions of
-     * `scratch_bytes` each sit at the tail, one per lane (Program::scratch_regions). */
+    /* `kind` is a RAD_MEM_* class: RAD_MEM_DEVICE for the device arena, RAD_MEM_HOST for the
+     * second arena a program with RAD_DOMAIN_HOST buffers gets. `regions` scratch regions of
+     * `scratch_bytes` each sit at the tail, one per lane. */
     int  init(int64_t plan_bytes, int64_t scratch_bytes, int kind, int regions = 1);
     void release();
 
@@ -58,14 +52,21 @@ private:
 };
 
 
-/* THE ARENA'S SIZE, COMPUTED WITHOUT ALLOCATING IT. Two callers need the same answer at two
- * different times: Ctx::bind_arena, which allocates it at the end of startup, and the VRAM budget
- * resolver, which has to subtract it from the card BEFORE the pools are allocated near the top of
- * startup. Two copies of this walk would agree today and drift the first time the plan grows a
- * domain -- and the failure would be a budget that overcommits the card by exactly the difference.
+/* The arena's size, computed without allocating it. Shared by Ctx::bind_arena (allocates at the
+ * end of startup) and the VRAM budget resolver (subtracts it before the pools are allocated), so
+ * the two cannot drift apart and overcommit the card.
  *
- * `dev_out` is what the device arena's init() will be given as plan_bytes; `total_out` is what it
- * will actually allocate, plan and scratch both padded to RAD_ALIGN_UNIT as Arena::init pads them.
+ * `dev_out` is the plan_bytes the device arena's init() receives; `total_out` is what it
+ * allocates, plan and scratch both padded to RAD_ALIGN_UNIT as Arena::init pads them.
  * Returns the total. */
 int64_t arena_plan_bytes(const Program& P, int64_t* dev_out, int64_t* total_out);
+
+/* The host activation arena's size (the RAD_DOMAIN_HOST buffers), which Ctx::bind_arena pins and
+ * maps at the end of startup; 0 when the program declares none. */
+int64_t arena_host_bytes(const Program& P);
+
+/* The arena level a step of `rows` tokens runs at: the smallest level that holds it, or 0 (the
+ * full plan) when none does. `level_rows[k]` is the largest step level k serves; entry 0 is the
+ * full plan and is never chosen by size. */
+int arena_level_for(const std::vector<int64_t>& level_rows, int64_t rows);
 }  /* namespace rad */

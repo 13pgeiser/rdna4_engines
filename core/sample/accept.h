@@ -1,49 +1,24 @@
-/* accept.h -- speculative acceptance. Verification is a declared op; ACCEPTANCE IS CORE SAMPLER
- * LOGIC (spec §10), which is why it lives here beside the chain that produced the distributions
- * it compares.
+/* accept.h -- speculative acceptance. Verification is a declared op; acceptance is core sampler
+ * logic (spec §10), so it lives beside the chain that produced the distributions it compares.
  *
- * Three rules, and the cheapest one is exact everywhere.
+ * Agreement with the target's own token. A drafted token is accepted when it equals the token the
+ * target produced at that position: the argmax at temperature 0, the target's sampled draw above
+ * it. Both are exact, provided each verified position draws from its own RNG coordinate
+ * (`p.pos = n_out + k` in sampler.cpp): the first emitted token is the target's draw whether the
+ * draft agreed or not, and every later position is conditioned on a prefix accepted only because
+ * it matched. Exact given the same logits; a verify step computes logits at a different M than a
+ * decode step, so text matches a non-speculative run exactly at temperature 0 and mostly above it
+ * (see Engine::collect_step). The cost is acceptance rate, P(y == x) instead of rejection
+ * sampling's min(1, p/q), and no probability planes are needed.
  *
- * AGREEMENT WITH THE TARGET'S OWN TOKEN -- what accept_greedy below actually implements, and what
- * this engine uses. A drafted token is accepted when it equals the token the target produced at
- * that position. At temperature 0 that token is the argmax, which is where the name came from.
- * ABOVE ZERO IT IS THE TARGET'S SAMPLED DRAW, AND ACCEPTING ON IT IS STILL EXACT -- provided each
- * verified position draws from its own RNG coordinate, which core/sample/sampler.cpp guarantees
- * (`p.pos = n_out + k`). Then the target's draw at position k is the one its own distribution
- * specifies there, the first emitted token is that draw whether the draft agreed or not, and every
- * later position is conditioned on a prefix accepted only because it matched. The emitted sequence
- * is a draw from the target, not an approximation of one.
+ * Accepting on argmax at a positive temperature is not exact: it replaces the target's
+ * distribution with its mode. Do not conflate it with the rule above.
  *
- * Exact given the same logits -- which is not the same as byte-identical to a non-speculative run,
- * because a verify step's logits are computed at a different M than a decode step's. The text
- * matches exactly at temperature 0 and mostly above it. See Engine::collect_step.
- *
- * What it costs is acceptance RATE: P(y == x) rather than the optimal min(1, p/q). What it costs
- * in machinery is nothing, which is why the engine computes no probability planes for it.
- *
- * ACCEPTING ON ARGMAX AT A POSITIVE TEMPERATURE is the rule that is NOT exact -- it replaces the
- * target's distribution with its mode. That is a different thing from the above, and the two are
- * easy to conflate.
- *
- * REJECTION SAMPLING. At temperature > 0 the drafted token x is accepted with probability
- * min(1, p(x)/q(x)) where p is the target's filtered distribution and q the drafter's. On
- * rejection the emitted token is drawn from the residual, norm(max(0, p - q)), which is what
- * makes the whole scheme emit exactly the target's distribution. With a GREEDY DRAFTER q is a
- * point mass, so the accept probability collapses to p(x) and the residual is p with x removed
- * and the rest renormalised -- which is the case the fast path is written for.
- *
- * Worth stating plainly because it looks like a regression and is not: acceptance FALLS relative
- * to greedy-against-greedy, because a proposal the target agrees with is still only accepted with
- * probability p(x) rather than always. That is the price of emitting the target's true
- * distribution.
- *
- * WHAT THE ANSWER IS FOR. `n_accepted` is consumed by two components that do different things
- * with it. The scheduler frees paged KV blocks past the accepted position -- a slot-table edit.
- * The linear-attention kernels do NOT recompute: the recurrent state and the conv window have
- * already absorbed the rejected tokens, and libr4d handles that by treating the conv state cache
- * as a rolling window of `conv_width-1 + n_spec` entries and READING AT THE SLOT THE LAST
- * ACCEPTED TOKEN LEFT. A rejection is a change of read offset, not a recompute, and `num_accepted`
- * is a required operand of `gdn_conv_update` and `gdn_recurrent_update` for exactly that reason
+ * Consumers of `n_accepted`: the scheduler frees paged KV blocks past the accepted position. The
+ * linear-attention kernels do not recompute: the recurrent state and conv window have absorbed the
+ * rejected tokens, and libr4d keeps the conv state as a rolling window of `conv_width-1 + n_spec`
+ * entries read at the slot the last accepted token left. A rejection is a read-offset change, which
+ * is why `num_accepted` is an operand of `gdn_conv_update` and `gdn_recurrent_update`
  * (docs/OPS.md, spec §10).
  */
 #pragma once
@@ -53,46 +28,27 @@
 
 namespace rad {
 
-struct SpecAcceptParams {
-    int      n_draft   = 0;      /* draft tokens proposed for this sequence */
-    int64_t  n_vocab   = 0;      /* row stride of the probability planes */
-    uint64_t seed      = 0;      /* the request's seed */
-    uint64_t pos       = 0;      /* output position of draft token 0 */
-    bool     greedy    = false;  /* temperature 0: argmax acceptance instead of rejection */
-};
-
-/* Acceptance by agreement, over precomputed target tokens. `target` is [n_draft+1] -- the token
- * the target model produced at each verified position, including the bonus position past the last
- * draft token, which is why the buffer is one longer than the draft. That token is the argmax at
- * temperature 0 and the target's own sampled draw above it; both are exact, for the reason at the
- * top of this file. The name describes the temperature-0 case; the rule is correct above it too.
+/* Acceptance by agreement over precomputed target tokens. `target` is [n_draft+1]: the token the
+ * target produced at each verified position plus the bonus position past the last draft token.
+ * It is the argmax at temperature 0 and the sampled draw above it; the name describes the
+ * temperature-0 case, but the rule is exact for both (see the file header).
  *
  * Writes n_accepted+1 tokens into `out` (capacity n_draft+1) and sets *n_accepted. Returns
- * RAD_OK. Always emits at least one token: the position after the last accepted one is the
- * target's own answer, which is always correct to emit. */
+ * RAD_OK. Always emits at least one token: the target's own token after the last accepted one. */
 int accept_greedy(const int32_t* draft, int n_draft, const int32_t* target,
                   int32_t* out, int32_t* n_accepted);
 
-/* Rejection sampling. `target_probs` is [(n_draft+1) * n_vocab], each row a NORMALISED
- * distribution as the sampler chain left it -- filtered, renormalised over the survivors, zero
- * elsewhere. `draft_probs` is [n_draft * n_vocab] on the same terms, or null for a greedy drafter
- * (a point mass on the drafted token), which is the common case and the cheap one.
- *
- * Writes n_accepted+1 tokens into `out` and sets *n_accepted. Returns RAD_OK, or RAD_E_INVAL on
- * a malformed argument. A target row that sums to zero -- everything masked out by a grammar --
- * is RAD_E_STATE: there is no token to emit and the request must fail rather than receive one. */
-int accept_stochastic(const SpecAcceptParams& p, const int32_t* draft,
-                      const float* target_probs, const float* draft_probs,
-                      int32_t* out, int32_t* n_accepted);
-
-/* The one a caller reaches for: dispatches on p.greedy. The greedy path needs `target_argmax`
- * (which the `sample_argmax` op already produced) and ignores the probability planes; the
- * stochastic path needs the planes and ignores the argmax. Passing the wrong one for the mode is
- * RAD_E_INVAL rather than a quiet fallback, because a verify step that silently switched
- * acceptance rules would change the output distribution and nothing would say so. */
-int accept_sequence(const SpecAcceptParams& p, const int32_t* draft,
-                    const int32_t* target_argmax,
-                    const float* target_probs, const float* draft_probs,
-                    int32_t* out, int32_t* n_accepted);
+/* Where a verify step's emission ends: at the first end-of-generation token among `out`'s
+ * n_accepted + 1 tokens (accept_greedy's output), which is emitted, or after all of them. Returns
+ * the number of accepted drafts to commit, at most `n_accepted`. A drafter that predicts the stop
+ * token agrees with the target, so without the cut the run would continue into the next turn.
+ * The card's acceptance (sched/advance_impl.h, ADV_ACCEPT) applies the same rule, and the engine
+ * refuses a step where the two disagree. */
+template <class IsEog>
+inline int32_t accept_cut_at_eog(const int32_t* out, int32_t n_accepted, IsEog&& is_eog) {
+    for (int32_t j = 0; j <= n_accepted; ++j)
+        if (is_eog(out[j])) return j;
+    return n_accepted;
+}
 
 }  /* namespace rad */

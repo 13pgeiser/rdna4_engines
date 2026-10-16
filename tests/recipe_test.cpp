@@ -1,13 +1,15 @@
 /* recipe_test.cpp -- the rules rad-convert quantises by (core/format/recipe.h).
  *
- * A recipe decides every weight of a conversion that can take hours, and a rule that silently
- * matched the wrong weights -- or none -- is found only by measuring the container afterwards. So
- * the matching, the order and the two spellings are held here to what spec §4.4 says they are.
+ * A recipe decides every weight of a conversion that can take hours, and a rule that matches the
+ * wrong weights (or none) shows only when the container is measured afterwards. These cases pin
+ * the matching, the order and the two spellings to spec §4.4.
  */
 #include "rad_test.h"
 #include "format/recipe.h"
 
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <string>
 
 using namespace rad;
@@ -74,8 +76,8 @@ TEST(comments_and_blank_lines_are_not_rules_and_a_bad_line_is_named) {
     CHECK_EQ(bad.add_flag("p=:k=v", &why), RAD_E_FORMAT);
 }
 
-/* $NAME is the environment's, so one recipe serves every machine -- and an unset name is refused,
- * because a recipe that quantised against an empty calibration directory did something else. */
+/* $NAME expands from the environment, so one recipe serves every machine. An unset name is
+ * refused: quantising against an empty calibration directory would silently do something else. */
 TEST(a_variable_is_the_environments_and_an_unset_one_is_refused) {
     ::setenv("RAD_RECIPE_TEST_DIR", "/data/calib", 1);
     ::unsetenv("RAD_RECIPE_TEST_UNSET");
@@ -90,8 +92,8 @@ TEST(a_variable_is_the_environments_and_an_unset_one_is_refused) {
     CHECK_EQ(r.add_text("* gptq calib=${RAD_RECIPE_TEST_DIR\n", "v", &why), RAD_E_FORMAT);
 }
 
-/* WHAT A CONTAINER RECORDS: the options in one canonical spelling, so --reuse compares two
- * conversions by what they asked for rather than by how the rule was typed. */
+/* A container records the options in one canonical spelling, so --reuse compares two
+ * conversions by what they asked for, not by how the rule was typed. */
 TEST(the_recorded_options_do_not_depend_on_how_they_were_written) {
     Recipe a, b;
     std::string why;
@@ -115,6 +117,62 @@ TEST(the_recorded_recipe_reads_back_as_the_same_rules) {
         CHECK_EQ(back.rules()[i].quantizer, r.rules()[i].quantizer);
         CHECK(back.rules()[i].options == r.rules()[i].options);
     }
+}
+
+namespace {
+bool has_opt(const RecipeRule* r, const char* k, const char* v) {
+    for (const auto& [kk, vv] : r->options)
+        if (kk == k && vv == v) return true;
+    return false;
+}
+}  /* namespace */
+
+/* The NVFP4 recipe as it ships: it parses, and its patterns decide the 27B architecture's
+ * declared names. The linears (fused MLPs, attention, the delta net's in- and out-projections)
+ * go to MXFP4, the head to block fp8, and the norms, the convolution, the a/b projection and the
+ * embedding keep the checkpoint's form. */
+TEST(the_nvfp4_recipe_decides_the_model_it_was_written_for) {
+    std::string dir = __FILE__;
+    dir = dir.substr(0, dir.find_last_of('/')) + "/../data/recipes";
+    std::ifstream in(dir + "/q38-27b-nvfp4-df2.recipe");
+    REQUIRE(in.good());
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Recipe r;
+    std::string why;
+    REQUIRE_EQ(r.add_text(text, "q38-27b-nvfp4-df2.recipe", &why), RAD_OK);
+    CHECK_EQ(r.rules().size(), (size_t)17);
+
+    /* every linear, across the layer range, by the fused names the builder declares */
+    const char* linears[] = { "blk.47.ffn_gate_up.weight", "blk.47.ffn_down.weight",
+                              "blk.3.ffn_gate_up.weight", "blk.3.attn_qg.weight",
+                              "blk.3.attn_k.weight", "blk.3.attn_v.weight",
+                              "blk.3.attn_output.weight", "blk.47.ssm_inz.weight",
+                              "blk.47.ssm_out.weight" };
+    for (const char* n : linears) {
+        const RecipeRule* m = r.match(n);
+        REQUIRE(m != nullptr);
+        CHECK_EQ(m->quantizer, std::string("rtn"));
+        CHECK(has_opt(m, "codes", "fp4_e2m1"));
+        CHECK(has_opt(m, "group", "32"));
+        CHECK(has_opt(m, "scale", "e8m0"));
+    }
+    /* the head to block fp8 */
+    const RecipeRule* head = r.match("output.weight");
+    REQUIRE(head != nullptr);
+    CHECK(has_opt(head, "codes", "fp8_e4m3"));
+    CHECK(has_opt(head, "block", "128x128"));
+    /* kept as the checkpoint ships them (the a/b projection is bf16 there) */
+    const char* kept[] = { "blk.0.ffn_norm.weight", "blk.0.attn_norm.weight", "blk.47.ssm_conv1d.weight",
+                           "blk.47.ssm_a_log", "blk.47.ssm_ab.weight", "token_embd.weight", "output_norm.weight" };
+    for (const char* n : kept)
+        CHECK(r.match(n) == nullptr);
+    /* the drafter's own linears */
+    const RecipeRule* fc = r.match("dflash.fc.weight");
+    REQUIRE(fc != nullptr);
+    CHECK(has_opt(fc, "codes", "fp4_e2m1"));
+    const RecipeRule* dh = r.match("dflash.draft_head.weight");
+    REQUIRE(dh != nullptr);
+    CHECK(has_opt(dh, "codes", "u2"));
 }
 
 RAD_TEST_MAIN()

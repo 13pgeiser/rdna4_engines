@@ -14,22 +14,20 @@
  *     x += fc2(gelu_tanh(fc1(LN2(x))))
  *   out = fc2'(gelu(fc1'(LN(x) viewed [P/merge^2, merge^2 * width])))   the patch merger
  *
- * which is transformers' Qwen3_5VisionModel. Qwen3-VL's DEEPSTACK taps -- the residual stream
- * after named blocks, each through a merger of its own whose norm is taken AFTER the 2x2 view
- * (over merge^2 * width), into rows added to the language model's hidden state after its first
- * layers -- are declared only for a plugin that asks (declare's `deepstack`); one that does not is
- * refused a tower with taps rather than served without them. Every linear layer is
- * `gemm_nt_bias` with its activation and residual in the epilogue, each rounded where the
- * reference's separate tensors are.
+ * which is transformers' Qwen3_5VisionModel. Qwen3-VL's deepstack taps (the residual stream after
+ * named blocks, each through its own merger whose norm is taken after the 2x2 view, over
+ * merge^2 * width, added to the language model's hidden state after its first layers) are declared
+ * only for a plugin that passes `deepstack`; otherwise a tower with taps is refused. Every linear
+ * is `gemm_nt_bias` with activation and residual in the epilogue, rounded where the reference's
+ * separate tensors are.
  *
- * EVERY RANK RUNS THE WHOLE TOWER. Its weights are replicated rather than sharded: the rows are
- * needed on every rank (each rank embeds every token), and a tower split across ranks would pay a
- * collective per layer to save compute that happens once per picture. The weights are
+ * Every rank runs the whole tower with replicated weights: every rank embeds every token, and
+ * sharding would cost a collective per layer for once-per-picture compute. Weights are
  * RAD_ACCESS_PER_REQUEST, so placement may keep them off the card when VRAM is short.
  *
- * ITS ACTIVATIONS ARE SIZED BY THE PASS, not by a step: RadBuildCtx::max_enc_patches rows. A
- * sizing declare (shape_probe) sizes them by the probe's step instead, which keeps the tower out
- * of the smaller arena levels -- an encoder pass always runs at the full plan (Engine::arena_step).
+ * Activations are sized by the pass (RadBuildCtx::max_enc_patches rows), except in a sizing
+ * declare (shape_probe), which uses the probe's step to keep the tower out of the smaller arena
+ * levels; an encoder pass always runs at the full plan (Engine::arena_step).
  */
 #ifndef RAD_BLOCK_VIT_H
 #define RAD_BLOCK_VIT_H
@@ -65,8 +63,8 @@ struct VisionTower {
     rad_buf b_x = 0, b_h = 0, b_qkv = 0, b_att = 0, b_ff = 0, b_mh = 0, b_mf = 0, b_out = 0;
     char    sec[48] = {};
 
-    /* DEEPSTACK: tap t is the residual stream after block `ds_layer[t]`, merged into `b_ds[t]`
-     * ([P / merge^2, n_embd], one row a merged token, in the order `b_out` holds them). */
+    /* Deepstack: tap t is the residual stream after block `ds_layer[t]`, merged into `b_ds[t]`
+     * ([P / merge^2, n_embd], one row per merged token, in `b_out`'s order). */
     enum { MAX_DS = 4 };
     int        n_ds = 0;
     int        ds_layer[MAX_DS] = {};
@@ -75,8 +73,7 @@ struct VisionTower {
     rad_op     ds_ln[MAX_DS] = {}, ds_1[MAX_DS] = {}, ds_2[MAX_DS] = {};
     rad_buf    b_ds[MAX_DS] = {};
 
-    /* Is there a tower to declare: the container carries one and the deployment asked for media.
-     * `why` is set when the container carries one this block cannot serve. */
+    /* Whether the container carries a vision tower. */
     static bool present(const RadModelMeta* m) {
         return rad_meta_geti(m, "vision_config.depth", 0) > 0;
     }
@@ -112,15 +109,14 @@ inline int VisionTower::declare(RadBuilder* b, const RadModelMeta* m, const RadB
                 (long long)ff, (long long)patch, (long long)merge, (long long)npos);
         return RAD_E_INVAL;
     }
-    /* THE MERGER WRITES ROWS OF THE MODEL'S OWN WIDTH, or its rows could not replace a token's. */
+    /* The merger's rows replace token embeddings, so they must be the model's width. */
     if (n_embd != model_embd) {
         fprintf(stderr, "radiance: the vision tower emits %lld-wide rows and the model embeds "
                         "%lld-wide tokens\n", (long long)n_embd, (long long)model_embd);
         return RAD_E_INVAL;
     }
-    /* DEEPSTACK -- tower layers feeding the language model's early layers directly -- is a second
-     * input path, and a plugin that does not consume it is refused the tower by name rather than
-     * served without it. */
+    /* Deepstack feeds tower layers into the language model's early layers; a plugin that does not
+     * consume it is refused the tower. */
     const char* ds = rad_meta_gets(m, "vision_config.deepstack_visual_indexes", "");
     n_ds = 0;
     for (const char* q = ds; q && *q;) {
@@ -154,13 +150,13 @@ inline int VisionTower::declare(RadBuilder* b, const RadModelMeta* m, const RadB
 
     const int64_t mm = merge * merge;
     P = ctx->max_enc_patches;
-    /* The longest segment attention may see: the REAL pass size in a sizing declare too. It is a
-     * fixed parameter the kernel is chosen by, and the engine runs the real declare's kernel at
-     * every level; only the ranged row counts may follow the probe's step. */
+    /* The longest segment attention may see: the real pass size, even in a sizing declare. It
+     * selects the kernel, and the engine runs the real declare's kernel at every level; only the
+     * ranged row counts may follow the probe's step. */
     const int64_t max_seg = P;
     if (ctx->shape_probe) {
-        /* A sizing declare: the tower's rows follow the probe's step, which keeps its activations
-         * out of the levels a decode step runs at. Rounded to a whole merged row. */
+        /* A sizing declare: rows follow the probe's step (rounded to whole merged rows), keeping
+         * the activations out of the levels a decode step runs at. */
         const int64_t r = std::min<int64_t>(P, ctx->max_tok);
         P = std::max<int64_t>(mm, r / mm * mm);
     }
@@ -168,12 +164,12 @@ inline int VisionTower::declare(RadBuilder* b, const RadModelMeta* m, const RadB
     const int64_t R = P / mm;
     const int ACC = RAD_ACCESS_PER_REQUEST;
 
-    /* ---- weights. Replicated; model-level groups for the stem and the merger, and one group a
-     * block from `first_group` on, past every language layer, so a tower block is its own unit
-     * of movement and never shares one with a text layer. */
+    /* ---- weights, replicated. Model-level groups for the stem and merger; one group per block
+     * from `first_group` on (past every language layer), so a tower block is its own movement
+     * unit. */
     auto bw = [&](const char* dn, const char* src, uint32_t dt, std::initializer_list<int64_t> shp,
                   RadWeightGroup g) -> rad_weight {
-        /* the map first: it is how the checkpoint is asked what the weight is */
+        /* map first: the weight's encoding is looked up through it */
         if (map_copy(b, dn, src) < 0) return 0;
         return decl_w(b, dn, dt, shp, ACC, RAD_SHARD_NONE, g);
     };
@@ -221,9 +217,9 @@ inline int VisionTower::declare(RadBuilder* b, const RadModelMeta* m, const RadB
             return RAD_E_INVAL;
     }
 
-    /* ---- activations. `mh` is the merger's input, declared at the MERGED width: the norm writes
-     * it as P rows of `width` and the first merger layer reads it as P/mm rows of mm * width,
-     * which is the same bytes -- the reference's view(), with no copy. */
+    /* ---- activations. `mh`, the merger's input, is declared at the merged width: the norm writes
+     * P rows of `width` and the first merger layer reads the same bytes as P/mm rows of
+     * mm * width (the reference's view(), no copy). */
     b_x   = decl_b(b, nm.f("v.x"),   RAD_BF16, { P, width });
     b_h   = decl_b(b, nm.f("v.h"),   RAD_BF16, { P, width });
     b_qkv = decl_b(b, nm.f("v.qkv"), RAD_BF16, { P, 3 * width });
@@ -282,11 +278,10 @@ inline int VisionTower::declare(RadBuilder* b, const RadModelMeta* m, const RadB
     op_mln = rw(b, lnorm(P, mn_w, mn_b), { b_x }, { b_mh });
     op_m1  = rw(b, gemm(R, mm * width, mm * width, "gelu", m1_w, m1_b), { b_mh }, { b_mf });
     op_m2  = rw(b, gemm(R, n_embd, mm * width, "none", m2_w, m2_b), { b_mf }, { b_out });
-    /* A deepstack merger normalises AFTER the view, over a merged row: the same bytes as P rows of
-     * `width`, read as R rows of merge^2 * width. Its ops are declared here, after the tower, and
-     * issued between its blocks; their working planes are consumed before the next block runs.
-     * Each tap's OUTPUT is not -- it waits for the language model while the remaining blocks
-     * overwrite the tower's planes -- so it is PERSIST, outside the planner's sharing. */
+    /* A deepstack merger normalises after the view, over R rows of merge^2 * width. Its ops are
+     * declared after the tower and issued between blocks; their working planes are consumed before
+     * the next block. Each tap's output must survive until the language model reads it, so it is
+     * PERSIST. */
     for (int t = 0; t < n_ds; ++t) {
         b_ds[t] = decl_b(b, nm.f("v.ds.%d.out", t), RAD_BF16, { R, n_embd }, RAD_BUF_PERSIST);
         if (!b_ds[t]) return RAD_E_INVAL;
@@ -327,8 +322,8 @@ inline void VisionTower::step(RadCtx* c, const RadBatch* batch) const {
                          "more patches than it was declared for, or not whole merged rows");
         return;
     }
-    /* The patches, their coordinates -- planes 0 and 1 are a dense [2, P] (row, column), all four
-     * a dense [4, P] -- and the segment boundaries, all staged by the core. */
+    /* Patches, coordinates (planes 0-1 a dense [2, P] of (row, column); all four a dense [4, P])
+     * and segment boundaries, staged by the core. */
     const RadOperand pix = praw2(batch->enc_pixels, RAD_BF16, Pn, patch_dim);
     const RadOperand rc  = praw2(batch->enc_coord, RAD_I32, 2, Pn);
     const RadOperand crd = praw2(batch->enc_coord, RAD_I32, 4, Pn);
@@ -362,8 +357,7 @@ inline void VisionTower::step(RadCtx* c, const RadBatch* batch) const {
                         brows(b_ds[t], Rn));
         }
     }
-    /* The merger norm writes P rows of `width` into a buffer declared at the merged width: the
-     * same bytes the next layer reads as P/mm rows. */
+    /* The merger norm writes P rows of `width`; the next layer reads them as P/mm merged rows. */
     RAD_ISSUE_N(c, op_mln, Pn, brows(b_x, Pn), RAD_W(mn_w), RAD_W(mn_b), brows(b_mh, Rn));
     RAD_ISSUE_N(c, op_m1, Rn, brows(b_mh, Rn), RAD_W(m1_w), RAD_W(m1_b), RAD_NONE,
                 brows(b_mf, Rn));
@@ -373,13 +367,12 @@ inline void VisionTower::step(RadCtx* c, const RadBatch* batch) const {
 
 /* ================================================================== the encoder rows
  *
- * THE ROWS AN ENCODER PRODUCED, OVER THE TOKEN EMBEDDINGS THEY REPLACE (RadBatch::mm_rows). One
- * `scatter_rows` over opaque bytes: a row is `n_embd` bf16, the destination the embedding buffer.
+ * Scatters encoder rows over the token embeddings they replace (RadBatch::mm_rows): one
+ * `scatter_rows` of `n_embd` bf16 rows into the embedding buffer.
  *
- * ISSUE IT BEFORE THE EMBEDDING'S REDUCTION. The lookup is vocab-sharded, so each rank's output is
- * a partial sum, and the core hands rank 0 the encoder rows and every other rank zeros: overwritten
- * there, the reduction that follows -- an all_reduce, or the first layer's fused norm -- counts
- * each row once, as it counts a token's embedding once. */
+ * Issue it before the embedding's reduction. The lookup is vocab-sharded, so each rank holds a
+ * partial sum; the core gives rank 0 the encoder rows and other ranks zeros, so the following
+ * reduction (an all_reduce, or the first layer's fused norm) counts each row once. */
 struct MediaRows {
     rad_op  op = 0;
     int64_t n_embd = 0;

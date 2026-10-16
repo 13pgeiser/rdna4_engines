@@ -1,15 +1,12 @@
 /* checks.cpp -- what in the configuration or on the machine costs speed or correctness, and what to
  * do about it.
  *
- * EACH CHECK IS A FUNCTION OF THE FACTS AND NOTHING ELSE: no file is read here and no device is
- * asked, so every one of them is tested by handing it a machine described in a struct. A check
- * says what it saw with the numbers, why that matters, and the change that addresses it -- a
- * warning without a fix is a worry handed to the reader.
+ * Each check is a pure function of the facts (no file or device access), so tests pass a machine
+ * described in a struct. A finding states what was seen with numbers, why it matters, and a fix.
  *
- * WARN is a cost or a risk the operator should act on; NOTE is a setting that is a trade-off or
- * worth knowing when reading a benchmark. A finding that depends on load (a parked link) is only
- * raised when the card was busy when the facts were read: at startup the cards are idle and a
- * PCIe link at rest parks at its lowest speed, which is the power management doing its job.
+ * Warn: a cost or risk to act on. Note: a trade-off, or worth knowing when reading a benchmark.
+ * Load-dependent findings (a parked link) are raised only when the card was busy, since an idle
+ * PCIe link parks at its lowest speed by design.
  */
 #include "diag/diag.h"
 #include "rad_internal.h"
@@ -26,9 +23,6 @@ namespace {
 
 constexpr int64_t kGiB = (int64_t)1 << 30;
 constexpr int64_t kMiB = (int64_t)1 << 20;
-/* A card this busy when its link was read is under load, so a link below its maximum is not the
- * idle parking every PCIe link does. */
-constexpr int kBusyPercent = 30;
 
 void add(std::vector<Finding>* out, Finding::Level lv, const char* id, std::string what,
          std::string why, std::string fix) {
@@ -50,8 +44,8 @@ std::vector<const CardFacts*> served(const Facts& f) {
     return out;
 }
 
-/* WHETHER THE SERVING CARDS' DMA IS TRANSLATED, from their own IOMMU groups where the kernel
- * says, and from the machine's mode where it does not. */
+/* Whether the serving cards' DMA is translated: from their IOMMU groups where known, else the
+ * machine's mode. */
 bool translated(const Facts& f) {
     bool any = false, dma = false;
     for (const CardFacts* c : served(f)) {
@@ -62,8 +56,8 @@ bool translated(const Facts& f) {
     return any ? dma : f.host.iommu == "translated";
 }
 
-/* A GPU the engine could serve on: an amdgpu device with VRAM of its own worth the name. An
- * integrated GPU's carve-out of a few hundred MiB is not one; an APU set up with tens of GiB is. */
+/* An amdgpu device with at least 4 GiB of VRAM. Excludes small iGPU carve-outs, includes an APU
+ * configured with tens of GiB. */
 bool servable_gpu(const CardFacts& c) {
     return c.vendor == "0x1002" && c.driver == "amdgpu" && c.vram_total >= ((int64_t)4 << 30);
 }
@@ -73,19 +67,14 @@ std::string card_name(const CardFacts& c) {
 }
 
 std::string hop_link(const PciHop& h, bool cur) {
-    const std::string& s = cur ? h.cur_speed : h.max_speed;
-    const int w = cur ? h.cur_width : h.max_width;
-    std::string sp = s;
-    const size_t p = sp.find(" PCIe");
-    if (p != std::string::npos) sp.erase(p);
-    return w > 0 ? fmt("%s x%d", sp.c_str(), w) : sp;
+    return cur ? link_text(h.cur_speed, h.cur_width) : link_text(h.max_speed, h.max_width);
 }
 
 /* ---- the link ------------------------------------------------------------------------------ */
 
-/* A HOP BELOW ITS OWN MAXIMUM WHILE THE CARD IS BUSY: the SMU's link power management stuck a
- * level down, or a link that retrained narrower. The card's own endpoint can read full speed
- * while the root port above it runs at half (a card with a switch on it), so every hop is read. */
+/* A hop below its own maximum while the card is busy: link power management stuck a level down,
+ * or a link retrained narrower. Every hop is checked, because the card's endpoint can read full
+ * speed while the root port above an on-card switch runs at half. */
 void check_link_under_load(const Facts& f, std::vector<Finding>* out) {
     for (const CardFacts* c : served(f)) {
         if (c->busy_percent < kBusyPercent) continue;
@@ -120,9 +109,8 @@ void check_link_under_load(const Facts& f, std::vector<Finding>* out) {
     }
 }
 
-/* A LINK THAT CANNOT REACH THE CARD'S SPEED, whatever the load: a hop whose own maximum is below
- * the card's -- a slot one generation older, a riser, a lane split. Not a fault, and often the
- * board's design; worth knowing when two machines measure differently. */
+/* A hop whose maximum is below the card's (older slot, riser, lane split). Often the board's
+ * design, not a fault; a Note. */
 void check_link_capped(const Facts& f, std::vector<Finding>* out) {
     for (const CardFacts* c : served(f)) {
         if (c->chain.size() < 2) continue;
@@ -149,9 +137,8 @@ void check_link_capped(const Facts& f, std::vector<Finding>* out) {
 
 /* ---- the cards against each other ----------------------------------------------------------- */
 
-/* A TENSOR-PARALLEL STEP ENDS WHEN ITS SLOWEST RANK DOES, so cards set up differently serve at
- * the slower one's pace, and a difference in a setting nobody remembers making is the usual
- * reason one card is the slow one. */
+/* A tensor-parallel step ends when its slowest rank does, so differently configured cards serve
+ * at the slower one's pace. */
 void check_cards_differ(const Facts& f, std::vector<Finding>* out) {
     const auto cs = served(f);
     if (cs.size() < 2) return;
@@ -173,7 +160,7 @@ void check_cards_differ(const Facts& f, std::vector<Finding>* out) {
     field("root port link", [](const CardFacts& c) {
               return c.chain.empty() ? std::string() : hop_link(c.chain.front(), false); }, str);
     field("power cap", [](const CardFacts& c) { return c.power_cap_uw; },
-          [](int64_t uw) { return uw < 0 ? std::string("unknown") : fmt("%lld W", (long long)(uw / 1000000)); });
+          watts_text);
     field("voltage offset", [](const CardFacts& c) { return c.vddgfx_offset; }, str);
     field("top PCIe power level", [](const CardFacts& c) {
               return c.dpm_pcie.empty() ? std::string() : c.dpm_pcie.back(); }, str);
@@ -189,10 +176,8 @@ void check_cards_differ(const Facts& f, std::vector<Finding>* out) {
         "/sys/class/drm/cardN/device; set them with the server stopped)");
 }
 
-/* A CAP LOWERED BELOW THE CARD'S OWN DEFAULT. The default, not the maximum, is the yardstick: a
- * stock card ships below the most its board allows (300 W of 330 W on an R9700), and a finding on
- * every stock card is one nobody reads. A cap someone lowered -- or one a reset left at a value a
- * tool set before it -- is the one that changes what the card does under load. */
+/* A power cap below the card's default. Compared to the default, not the maximum: stock cards
+ * ship below the board maximum (300 W of 330 W on an R9700). */
 void check_power_cap(const Facts& f, std::vector<Finding>* out) {
     for (const CardFacts* c : served(f)) {
         if (c->power_cap_uw <= 0 || c->power_cap_default_uw <= 0) continue;
@@ -224,12 +209,9 @@ void check_small_bar(const Facts& f, std::vector<Finding>* out) {
     }
 }
 
-/* AN OVERDRIVE SETTING AND RUNTIME SUSPEND. The driver holds the offset and uploads it again
- * whenever the card resumes from runtime suspend; on RDNA4 that upload has been seen to fail in
- * the kernel log ("Failed to upload customized OD settings") at every resume. Whether the
- * firmware still holds the offset afterwards is not readable here, and a card that lost it runs a
- * lower clock at the same power cap. Keeping the card out of runtime suspend keeps the question
- * from arising. */
+/* Overdrive offset with runtime suspend enabled. The driver re-uploads the offset on every resume,
+ * and on RDNA4 that upload can fail ("Failed to upload customized OD settings"). Whether the
+ * firmware kept it is not readable here; a card that lost it clocks lower at the same cap. */
 void check_od_runtime_pm(const Facts& f, std::vector<Finding>* out) {
     for (const CardFacts* c : served(f)) {
         if (c->vddgfx_offset.empty() || c->vddgfx_offset == "0 mV") continue;
@@ -382,8 +364,7 @@ void check_engine(const Facts& f, const RunFacts& r, std::vector<Finding>* out) 
             "faster prefill, but the model does not compute the exact function; two runs on "
             "different world sizes are not comparable token for token",
             "--tp-wire exact when exactness matters more than prefill speed");
-    /* Only when the operator turned it off: where the engine did (the KL mode, an embedding
-     * model) there is no cache to have, and the configuration line says why. */
+    /* Only when the operator turned it off; an engine-side reason is shown in the configuration. */
     if (!r.prefix_cache && r.prefix_cache_off_why.empty())
         add(out, Finding::Note, "prefix-cache-off", "prefix caching is off (--no-prefix-cache)",
             "every request prefills its whole prompt, including the conversation it shares with "
@@ -432,10 +413,22 @@ std::vector<Finding> check(const Facts& f, const RunFacts& r) {
     check_iommu(f, r, &out);
     check_memlock(f, r, &out);
     check_cpu(f, &out);
-    /* Warnings first, each group in the order above: what to act on before what to know. */
+    /* Warnings first; stable, so each group keeps the order above. */
     std::stable_sort(out.begin(), out.end(),
                      [](const Finding& a, const Finding& b) { return a.level > b.level; });
     return out;
+}
+
+std::string link_text(const std::string& speed, int width) {
+    std::string s = speed;
+    const size_t p = s.find(" PCIe");
+    if (p != std::string::npos) s.erase(p);
+    if (s.empty()) s = "?";
+    return width > 0 ? fmt("%s x%d", s.c_str(), width) : s;
+}
+
+std::string watts_text(int64_t uw) {
+    return uw < 0 ? std::string("unknown") : fmt("%lld W", (long long)(uw / 1000000));
 }
 
 double link_gts(const std::string& speed) {

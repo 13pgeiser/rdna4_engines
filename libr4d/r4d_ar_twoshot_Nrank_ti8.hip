@@ -1,22 +1,20 @@
 // r4d_ar_twoshot_Nrank_ti8.hip: r4d_ar_twoshot_{3,4}rank_ti8 -- reduce-scatter + all-gather with
 // the tiered-int8 wire on both hops, at 3 or 4 ranks. Codec (tiers 1/2/3) from r4d_ar_ti8.h,
-// transport from r4d_ar_twoshot_Nrank_exact.hip. The second hop costs 38/64 of its exact 
-// bytes. Own contribution reads exact from the input at fold time.
+// transport from r4d_ar_twoshot_Nrank_exact.hip. The second hop costs 38/64 of its exact bytes.
+// The own contribution is read exact from the input at fold time.
 //
-// Cross-rank identity: the phase-2 encode input is the deterministic fp32 fold, so the wire 
-// words are identical on every rank by construction, and the owner stores the decode of the
-// words it published -- never the exact fold -- so every rank holds the same bytes for 
-// every shard.
+// Cross-rank identity: the phase-2 encode input is the deterministic fp32 fold, and the owner
+// stores the decode of the words it published, never the exact fold, so every rank holds the same
+// bytes for every shard.
 //
 // Slot: region A = ti8 wire (38*sg bytes, codes | rec | scales), region B at align16(A end)
 // a second wire image of the same layout; the stride must hold both.
 //
-// UNEVEN SHARDS, in whole groups (the exact two-shot's rule one level up): ng = numel/32 groups
-// split ng/ws a shard and the first ng % ws take one more, so shard s starts at group
-// s*base + min(s, rem). Every slot is laid out for the LONGEST shard (sg_max), whichever shard it
-// carries, so a writer and a reader never have to agree on anything but sg_max. At 4 ranks the
-// entry still requires numel to tile 32 x 4 and this is the even split it always was; at 3 a
-// 2048-wide row is 64 groups and 64 * rows divides by 3 one step in three.
+// Uneven shards, in whole groups (the exact two-shot's rule applied to groups): ng = numel/32
+// groups split ng/ws per shard and the first ng % ws take one more, so shard s starts at group
+// s*base + min(s, rem). Every slot is laid out for the longest shard (sg_max), so writer and reader
+// agree on sg_max alone. At 4 ranks the entry requires numel to tile 32 x 4, so the split is even;
+// at 3, a 2048-wide row is 64 groups.
 #include "r4d.h"
 #include "r4d_ar_ti8.h"
 #include "r4d_ar_wide.h"
@@ -28,10 +26,12 @@ __global__ void r4d_ar_twoshot_wide_ti8_kernel(
     const T* __restrict__ in, R4DArWidePeers<char, WS - 1> peers, char* __restrict__ my_base,
     unsigned int* __restrict__ my_flags, T* __restrict__ out,
     unsigned int* __restrict__ seq_ctrs, int n_groups, long slot_stride_bytes,
-    long b_off_bytes, int rank, int drain, int acq, int pub) {
+    long b_off_bytes, int rank, int drain, int acq, int pub,
+    long long* gate, unsigned int* gate_ctr) {
   constexpr int NPEERS = WS - 1;
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
+  const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
   r4d_ar_seq_take(seq_ctrs, R4D_AR_WIDE_MAX_BLOCKS, s_seq, s_slot);  // device-resident, replay-safe
   const unsigned int s = s_seq;
   const int parity = (int)s_slot;
@@ -51,8 +51,8 @@ __global__ void r4d_ar_twoshot_wide_ti8_kernel(
   for (int p = 0; p < NPEERS; ++p)
     pslot[p] = peers.scratch[p] + ((size_t)parity * WS + rank) * (size_t)slot_stride_bytes;
 
-  // ---- phase 1: encode my contribution to each peer-owned shard into its owner's
-  // region A. My own shard's contribution stays exact, read from the input at fold time.
+  // ---- phase 1: encode my contribution to each peer-owned shard into its owner's region A. My
+  // own shard's contribution stays exact, read from the input at fold time.
   for (int p = 0; p < NPEERS; ++p) {
     const T* src = in + R4D_TI8_OFF(peers.rank[p]);
     const int gE = gB < R4D_TI8_LEN(peers.rank[p]) ? gB : R4D_TI8_LEN(peers.rank[p]);
@@ -72,9 +72,9 @@ __global__ void r4d_ar_twoshot_wide_ti8_kernel(
   }
   r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s - 1u, drain, acq, pub);
 
-  // ---- reduce my shard: own contribution exact from the input, peers decoded from
-  // region A, fp32 fold in ascending rank order; the reduced group is re-encoded and its
-  // wire words go to every peer's region B, the owner keeping their decode.
+  // ---- reduce my shard: own contribution exact, peers decoded from region A, fp32 fold in
+  // ascending rank order. The reduced group is re-encoded to every peer's region B and the owner
+  // keeps its decode.
   const T* my_in = in + R4D_TI8_OFF(rank);
   T* my_out = out + R4D_TI8_OFF(rank);
   const int gM = gB < R4D_TI8_LEN(rank) ? gB : R4D_TI8_LEN(rank);
@@ -117,9 +117,12 @@ __global__ void r4d_ar_twoshot_wide_ti8_kernel(
     ti8_store8(my_out + k * TI8_EPL, v2);
   }
   r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s, drain, acq, pub);
+  /* As in the exact two-shot, the hold ends after the second handshake: the reduce above is fused
+   * with the phase-2 wire push. Only the local decode-assemble is left (r4d_ar_seq.h). */
+  r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
 
-  // ---- assemble: decode each peer-owned shard from region B, the mirror of the owner's
-  // roundtrip store.
+  // ---- assemble: decode each peer-owned shard from region B, matching the owner's roundtrip
+  // store.
   for (int p = 0; p < NPEERS; ++p) {
     const int owner = peers.rank[p];
     const char* baseB = my_base +
@@ -147,7 +150,8 @@ static void ar_twoshot_ti8_launch(const long* peer_scratch, const long* peer_fla
                                   long my_scratch, long my_flags, long seq_ctrs,
                                   long slot_stride_bytes, long inp, long out, long n_elem,
                                   long dtype, long rank, long stream_i, long nblocks,
-                                  long nthreads, long drain, long acq, long pub) {
+                                  long nthreads, long drain, long acq, long pub, long gate,
+                                  long gate_ctr) {
   constexpr int NPEERS = WS - 1;
   if (rank < 0 || rank >= WS)
     throw std::runtime_error("ti8 ar: rank " + std::to_string(rank) +
@@ -174,11 +178,10 @@ static void ar_twoshot_ti8_launch(const long* peer_scratch, const long* peer_fla
   int nt = (int)nthreads;
   if (nt < 64) nt = 64;
   if (nt > 1024) nt = 1024;
-  // A wire group is TI8_LPG adjacent lanes and every cross-lane exchange in the codec is a
-  // __shfl_xor masked below TI8_LPG, so the group has to land on lanes 4j..4j+3. The kernel
-  // walks work as k = 4*gA + tid stepping by nt, which keeps k%TI8_LPG == lane%TI8_LPG only
-  // while nt divides by TI8_LPG. A nt that does not would rotate the mapping and give
-  // silently wrong answers with divergent shuffles, so refuse it instead of clamping.
+  // A wire group is TI8_LPG adjacent lanes (codec shuffles use masks below TI8_LPG), so it must
+  // land on lanes 4j..4j+3. The kernel walks k = 4*gA + tid in steps of nt, which keeps
+  // k%TI8_LPG == lane%TI8_LPG only while TI8_LPG divides nt; otherwise the results are silently
+  // wrong, so refuse rather than clamp.
   if (nt % TI8_LPG)
     throw std::runtime_error("ti8 ar: nthreads must be a multiple of " +
                              std::to_string(TI8_LPG) + " (a wire group is that many "
@@ -194,9 +197,8 @@ static void ar_twoshot_ti8_launch(const long* peer_scratch, const long* peer_fla
     peers.rank[i] = (i < (int)rank) ? i : i + 1;
   }
 
-  // scratch must back 2*WS slots of the declared stride, flags one word per (block, source
-  // rank), seq a handshake and a parity word per block of capacity (r4d_ar_seq.h) -- checked
-  // against the allocations, not the arguments.
+  // Checked against the allocations: scratch backs 2*WS slots of the stride, flags one word per
+  // (block, source rank), seq a handshake and a parity word per block of capacity (r4d_ar_seq.h).
   const long slot_bytes = 2L * WS * slot_stride_bytes;
   const long flag_bytes = (long)nb * WS * (long)sizeof(unsigned int);
   r4d_ar_check_extent(my_scratch, slot_bytes, "ti8 ar", "my_scratch");
@@ -213,7 +215,7 @@ static void ar_twoshot_ti8_launch(const long* peer_scratch, const long* peer_fla
   r4d_ar_twoshot_wide_ti8_kernel<T, WS><<<nb, nt, 0, st>>>(                             \
       (const T*)inp, peers, (char*)my_scratch, (unsigned int*)my_flags, (T*)out,        \
       (unsigned int*)seq_ctrs, (int)n_groups, (long)slot_stride_bytes, b_off, (int)rank, \
-      (int)drain, (int)acq, (int)pub)
+      (int)drain, (int)acq, (int)pub, (long long*)gate, (unsigned int*)gate_ctr)
   if (dtype == 0) R4D_AR_TS8_LAUNCH(__hip_bfloat16);
   else R4D_AR_TS8_LAUNCH(__half);
 #undef R4D_AR_TS8_LAUNCH
@@ -226,9 +228,10 @@ void r4d_ar_twoshot_3rank_ti8(long peer_scratch0, long peer_scratch1, long peer_
                               long nthreads, long drain, long acq, long pub) {
   const long ps[2] = {peer_scratch0, peer_scratch1};
   const long pf[2] = {peer_flags0, peer_flags1};
+  /* No link gate at three ranks: the row answers 1, the engine releases by barrier. */
   ar_twoshot_ti8_launch<3>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride_bytes, inp,
                            out, n_elem, dtype, rank, stream, nblocks, nthreads, drain,
-                           acq, pub);
+                           acq, pub, 0L, 0L);
 }
 
 void r4d_ar_twoshot_4rank_ti8(long peer_scratch0, long peer_scratch1, long peer_scratch2,
@@ -236,15 +239,16 @@ void r4d_ar_twoshot_4rank_ti8(long peer_scratch0, long peer_scratch1, long peer_
                               long my_scratch, long my_flags, long seq_ctrs,
                               long slot_stride_bytes, long inp, long out, long n_elem,
                               long dtype, long rank, long stream, long nblocks,
-                              long nthreads, long drain, long acq, long pub) {
+                              long nthreads, long drain, long acq, long pub, long gate,
+                              long gate_ctr) {
   const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
   const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
   ar_twoshot_ti8_launch<4>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride_bytes, inp,
                            out, n_elem, dtype, rank, stream, nblocks, nthreads, drain,
-                           acq, pub);
+                           acq, pub, gate, gate_ctr);
 }
 
-// The tiered-int8 wire format, which the caller needs to size its packed scratch.
+// Tiered-int8 wire format dimensions, for sizing the caller's packed scratch.
 void r4d_ar_ti8_dims(int* group, int* group_bytes) {
   if (group)       *group       = TI8_GROUP;
   if (group_bytes) *group_bytes = TI8_GROUP_BYTES;

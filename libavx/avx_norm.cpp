@@ -1,48 +1,28 @@
-/* avx_norm.cpp -- rmsnorm, rmsnorm_add and layernorm.
+/* avx_norm.cpp -- rmsnorm, rmsnorm_add, layernorm and the vision position-table adds.
  *
- * ============================== ONE PASS OVER THE ROW, TWICE ==============================
+ * Each norm is a reduction followed by a scale, so two passes over the row. The row is converted
+ * to f32 scratch once and both passes read the scratch (libref converts per element, three times
+ * per element in rmsnorm_add).
  *
- * Every norm here is a REDUCTION followed by a SCALE, which means two passes over the row and no
- * way around it: the scale needs a number the whole row contributed to. What can be avoided is
- * paying for the dtype conversion twice, and that is the shape of every kernel below -- convert
- * the row to f32 ONCE into scratch, reduce out of scratch, scale out of scratch. libref converts
- * per element and therefore converts each element three times in rmsnorm_add.
+ * The reduction is `row_sumsq` (avx_support.cpp), a four-accumulator vector tree. It does not sum
+ * in libref's ascending-index order, which is why the bf16 tolerance for a norm is 4e-3, not 0.
  *
- * The reduction itself is `row_sumsq` (avx_support.cpp), which is a four-accumulator vector tree.
- * That does NOT sum in libref's ascending-index order, and it is the whole reason the bf16
- * tolerance for a norm is 4e-3 rather than zero. Stated here because it is the one thing about
- * these kernels that a reader should not have to derive: the arithmetic is the same, the ORDER is
- * not, and the order is what a tolerance is for.
+ * Rounding contracts:
+ *   `wadd` is GemmaRMSNorm's `1 +`, added in f32 after the weight is widened, never to the stored
+ *   bf16 gain (Qwen3.5, Qwen3-Next and Gemma store a zero-centred gain; `1 + w` in bf16 loses 0.3%
+ *   per channel). libr4d's fused norms do the same.
  *
- * ============================== THE TWO ROUNDING CONTRACTS ==============================
- *
- * `wadd` is GemmaRMSNorm's `1 +`, and it is added to the weight in f32 AFTER the weight has been
- * widened -- never to the stored bf16 gain. Qwen3.5, Qwen3-Next and Gemma all store a zero-centred
- * gain, and forming `1 + w` in bf16 first loses 0.3% per channel. libr4d's fused norms say the
- * same thing; this is the third implementation of that sentence and they agree.
- *
- * `rmsnorm_add` takes the variance from the UNROUNDED f32 sum and the multiply from the sum AFTER
- * it has been narrowed into residual_out. That asymmetry is not an accident of libref's loop: it
- * is what vLLM's fused_add_rms_norm does, because the residual has to be stored anyway and
- * re-reading it is free, and every fused kernel in this project will do it. An implementation that
- * kept f32 throughout would be half an ulp better and would fail against every kernel it is meant
- * to certify.
+ *   `rmsnorm_add` takes the variance from the unrounded f32 sum but multiplies the sum after it is
+ *   narrowed into residual_out, as vLLM's fused_add_rms_norm does. Keeping f32 throughout would
+ *   disagree with every fused kernel this is checked against.
  */
 #include "avx_vec.h"
 #include "avx_common.h"
 
 using namespace avx;
 
-/* The gain row, widened once per LAUNCH rather than once per row.
- *
- * WHY THIS IS WORTH ITS OWN BUFFER: `w` is the same n elements for every one of `rows` rows, so
- * converting it inside the row loop converts it `rows` times -- at a 4096-wide bf16 gain and a
- * 2048-token prefill chunk that is 8 M pointless conversions. It cannot go in the thread_local
- * scratch, because every thread needs it and they would each build their own; it is built once
- * into a caller-provided buffer before the parallel region and read by all of them.
- *
- * `wadd` is folded in HERE, which is also where it is cheapest: once per element of the gain,
- * rather than once per element of the output. */
+/* Widen the gain once per launch, not once per row, into a caller buffer built before the
+ * parallel region and shared by all threads. `wadd` is folded in here, once per gain element. */
 static void widen_gain(const RadTensor* w, int64_t n, float wadd, float* out) {
     const int64_t ws = laststride(w);
     if (ws == 1) {
@@ -63,7 +43,7 @@ static void widen_gain(const RadTensor* w, int64_t n, float wadd, float* out) {
 AVX_KERNEL(rmsnorm) {
     if (!a || a->n_t < 3 || !a->t[0].data || !a->t[2].data) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *y = &a->t[2];
-    /* An absent gain is one (libref's reading), and `wadd` belongs to a gain. */
+    /* An absent gain is 1 (as in libref); `wadd` requires a gain. */
     const RadTensor* w = a->t[1].data ? &a->t[1] : nullptr;
     const int64_t n = p_int(a, "n", w && w->rank ? w->shape[w->rank - 1] : 0);
     const float eps  = p_f32(a, "eps", 1e-6f);
@@ -76,7 +56,7 @@ AVX_KERNEL(rmsnorm) {
     float* gain = (float*)scratch_raw((size_t)n * sizeof(float));
     if (w) widen_gain(w, n, wadd, gain);
     else   for (int64_t i = 0; i < n; ++i) gain[i] = 1.0f;
-    /* `mult` folded into the gain: the row is scaled before its one rounding. */
+    /* `mult` is folded into the gain, so the row is scaled before its single rounding. */
     const float mult = p_f32(a, "mult", 1.0f);
     if (mult != 1.0f)
         for (int64_t i = 0; i < n; ++i) gain[i] *= mult;
@@ -99,9 +79,7 @@ AVX_KERNEL(rmsnorm) {
 }
 
 /* ------------------------------------------------------------------ rmsnorm_p */
-/* y = x * rsqrt(mean(x^2) + eps) -- the rmsnorm with no gain. Same one-conversion, two-pass shape
- * and same four-accumulator sum of squares as rmsnorm; the only difference is there is no weight
- * to widen and no gain to multiply in, because the op has no `w` at all. */
+/* y = x * rsqrt(mean(x^2) + eps): rmsnorm without a gain operand. */
 AVX_KERNEL(rmsnorm_p) {
     if (!rad_args_have(a, 2)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *y = &a->t[1];
@@ -167,19 +145,15 @@ AVX_KERNEL(rmsnorm_add) {
         float ss = vf_hsum(vf_add(acc0, acc1));
         for (; i < n; ++i) { float v = xv[i] + rv[i]; sm[i] = v; ss += v * v; }
 
-        /* The residual is written from the UNROUNDED sum... */
+        /* The residual is written from the unrounded sum... */
         out_row(ro, rowoff(ro, r, n), n, sm);
         const float s = 1.0f / std::sqrt(ss / (float)n + eps);
 
-        /* ...and read back NARROWED for the multiply. Done in registers rather than by re-reading
-         * the operand: `row_from_f32` then `row_to_f32` over a hot buffer is the same arithmetic
-         * and does not depend on the store having retired. */
-        /* `sr` is reused as the narrowing buffer and that is not a shortcut, it is the ONLY slot
-         * available: `gain` lives in this thread's scratch_raw arena and calling scratch_raw again
-         * inside the parallel region would grow that arena, free the old block, and leave every
-         * other thread reading a dangling `gain`. `sr` is n floats -- 4n bytes -- which holds any
-         * dtype this operand can be, and `rv` (which may or may not be `sr`, depending on whether
-         * `residual` was already f32) is dead the moment the sum is formed. */
+        /* ...and narrowed for the multiply by a round trip through `sr`, rather than re-reading
+         * the operand. `sr` is the only free buffer: `gain` lives in the launching thread's
+         * scratch_raw arena, and another scratch_raw call inside the parallel region could
+         * reallocate it under the other threads. `sr` holds 4n bytes, enough for any dtype, and
+         * `rv` (possibly `sr`) is dead once the sum is formed. */
         if (ro_dt != RAD_F32) {
             row_from_f32(ro_dt, sm, sr, n);
             row_to_f32(ro_dt, sr, sm, n);
@@ -196,9 +170,8 @@ AVX_KERNEL(rmsnorm_add) {
 }
 
 /* ------------------------------------------------------------------ layernorm */
-/* y = (x - mean) * rsqrt(var + eps) * w + b, BIASED variance (divide by n), which is what every
- * transformer implementation means by layer norm. `b` is optional -- a ViT that dropped its bias
- * passes a null operand rather than a zero tensor. */
+/* y = (x - mean) * rsqrt(var + eps) * w + b, with the biased variance (divide by n). `b` is
+ * optional: a model without a bias passes a null operand. */
 AVX_KERNEL(layernorm) {
     if (a->n_t < 4 || !a->t[0].data || !a->t[1].data || !a->t[3].data) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *w = &a->t[1], *y = &a->t[3];
@@ -210,9 +183,8 @@ AVX_KERNEL(layernorm) {
     if (rows <= 0 || numel(y) < rows * n || numel(w) < n) return RAD_E_SHAPE;
     if (b && numel(b) < n) return RAD_E_SHAPE;
 
-    /* Both the gain and the bias are launch-invariant, so both are widened once, into one
-     * allocation so there is a single scratch_raw call live at a time (avx_common.h: a second call
-     * may reallocate and invalidate the first pointer). */
+    /* Gain and bias are widened once, into one allocation: a second scratch_raw call may
+     * reallocate and invalidate the first pointer. */
     float* gb = (float*)scratch_raw((size_t)(2 * n) * sizeof(float));
     float* gain = gb;
     float* bias = gb + n;
@@ -230,12 +202,9 @@ AVX_KERNEL(layernorm) {
         float* sy = scratch_f32_b((size_t)n);
         const float* v = in_row(x, rowoff(x, r, n), n, sx);
 
-        /* TWO PASSES, NOT THE ONE-PASS (sum, sumsq) FORM. The single-pass variance
-         * E[x^2] - E[x]^2 is one reduction instead of two and is catastrophically worse when the
-         * mean is large relative to the spread -- which is exactly a post-attention residual. What
-         * it costs here is one extra read of a row that is in L1 by then; what it would buy is a
-         * cancellation the tolerance would hide until it did not. libref takes the mean first too,
-         * so this also keeps the two agreeing for the right reason. */
+        /* Two passes (mean, then squared deviations), as in libref. The one-pass E[x^2] - E[x]^2
+         * cancels catastrophically when the mean is large relative to the spread, as in a
+         * post-attention residual; the extra pass reads a row already in L1. */
         const float mean = row_sum(v, n) / (float)n;
         const vf vm = vf_set1(mean);
         vf acc = vf_zero();
@@ -266,10 +235,17 @@ AVX_KERNEL(layernorm) {
 }
 
 /* ------------------------------------------------------------------ grid_embed */
-/* A learned side x side position table resampled bilinearly to each row's grid (corners aligned,
- * edge taps clamped) and added in -- libref's grid_embed, operation for operation: the four taps
- * summed in f32 in the same order, rounded to x's dtype, then added and rounded again. One row a
- * vision-tower patch, off every step path, so it is written for clarity over lanes. */
+/* `v` rounded to an activation dtype (f32, bf16 or f16), as the position term is stored. */
+static inline float round_act(uint32_t dt, float v) {
+    if (dt == RAD_BF16) return rad_bf16_to_f32(rad_f32_to_bf16(v));
+    if (dt == RAD_F16)  return rad_f16_to_f32(rad_f32_to_f16(v));
+    return v;
+}
+
+/* Adds a learned side x side position table, resampled bilinearly to each row's grid (corners
+ * aligned, edge taps clamped). Matches libref's grid_embed operation for operation: four taps
+ * summed in f32 in the same order, rounded to x's dtype, then added and rounded again. One row per
+ * vision-tower patch, off the step path, so it is scalar. */
 AVX_KERNEL(grid_embed) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *tab = &a->t[1], *crd = &a->t[2];
@@ -307,8 +283,7 @@ AVX_KERNEL(grid_embed) {
                 for (int kj = 0; kj < 2; ++kj)
                     acc += ldt(tab, rowoff(tab, th[ki] * side + tw[kj], n) + i * ts) *
                            (wh[ki] * ww[kj]);
-            float pe = acc;
-            if (x->dtype == RAD_BF16) pe = rad_bf16_to_f32(rad_f32_to_bf16(pe));
+            const float pe = round_act(x->dtype, acc);
             stt(x, xb + i * xs, ldt(x, xb + i * xs) + pe);
         }
     }
@@ -316,11 +291,11 @@ AVX_KERNEL(grid_embed) {
 }
 
 /* ------------------------------------------------------------------ grid_embed_aa */
-/* The table resampled as torch's F.interpolate(bilinear, align_corners=False, antialias=True) does
- * it -- SigLIP2's position embedding -- and added in: libref's grid_embed_aa, operation for
- * operation. Per axis a triangle filter on half-pixel centres, widened by the scale when
- * shrinking, its taps inside the table normalised; the rows summed first, f32, rounded once
- * before the add. A coordinate outside its grid is clamped into it. */
+/* Adds the table resampled as torch's F.interpolate(bilinear, align_corners=False,
+ * antialias=True) does (SigLIP2's position embedding); matches libref's grid_embed_aa. Per axis: a
+ * triangle filter on half-pixel centres, widened by the scale when shrinking, with the in-table
+ * taps normalised. Rows are summed first in f32 and rounded once before the add. Out-of-grid
+ * coordinates are clamped. */
 static void aa_taps(int64_t at, int64_t size, int64_t side, float* w, int64_t* lo, int64_t* cnt) {
     if (size < 1) size = 1;
     at = at < 0 ? 0 : (at >= size ? size - 1 : at);
@@ -371,8 +346,7 @@ AVX_KERNEL(grid_embed_aa) {
                     row += ldt(tab, rowoff(tab, (h0 + y) * side + w0 + c, n) + i * ts) * ww[c];
                 acc += row * wh[y];
             }
-            float pe = acc;
-            if (x->dtype == RAD_BF16) pe = rad_bf16_to_f32(rad_f32_to_bf16(pe));
+            const float pe = round_act(x->dtype, acc);
             stt(x, xb + i * xs, ldt(x, xb + i * xs) + pe);
         }
     }

@@ -1,8 +1,11 @@
 /* recipe.cpp -- see recipe.h. */
 #include "recipe.h"
+#include "../plugin/registry.h"
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <cmath>
 #include <cstdlib>
 
 namespace rad {
@@ -34,8 +37,8 @@ bool recipe_glob(const char* p, const char* n) {
 
 namespace {
 
-/* `$NAME` and `${NAME}` from the environment. An unset name is refused: a recipe that silently
- * quantises against an empty calibration directory is a recipe that did something else. */
+/* Expand `$NAME` and `${NAME}` from the environment. An unset name is refused rather than
+ * expanded to empty (e.g. an empty calibration directory). */
 bool expand(const std::string& in, std::string* out, std::string* why) {
     out->clear();
     for (size_t i = 0; i < in.size(); ++i) {
@@ -157,6 +160,66 @@ const RecipeRule* Recipe::match(const std::string& name) const {
     for (const RecipeRule& r : rules_)
         if (recipe_glob(r.pattern.c_str(), name.c_str())) return &r;
     return nullptr;
+}
+
+int CompiledRule::build(const RecipeRule& r, const Registry& reg, std::string* why) {
+    rule = &r;
+    const Registry::QuantRow* row = reg.quantizer(r.quantizer);
+    if (!row || !row->info) {
+        std::string have;
+        for (const auto& qr : reg.quantizers())
+            if (qr.info) have += std::string(have.empty() ? "" : ", ") + qr.info->name;
+        *why = r.origin + ": no quantiser '" + r.quantizer + "' is loaded (" +
+               (have.empty() ? std::string("none are -- is $RADIANCE_HOME/quantizers there?")
+                             : "loaded: " + have) + ")";
+        return RAD_E_NOTFOUND;
+    }
+    q = row->info;
+    keys.reserve(r.options.size());
+    vals.reserve(r.options.size());
+    for (const auto& [k, v] : r.options) {
+        const RadQuantOption* opt = nullptr;
+        for (int i = 0; i < q->n_options; ++i)
+            if (k == q->options[i].key) opt = &q->options[i];
+        if (!opt) {
+            std::string takes;
+            for (int i = 0; i < q->n_options; ++i)
+                takes += std::string(i ? ", " : "") + q->options[i].key;
+            *why = r.origin + ": " + q->name + " takes no option '" + k + "' (it takes " + takes +
+                   ")";
+            return RAD_E_INVAL;
+        }
+        char* end = nullptr;
+        errno = 0;
+        if (opt->type == RAD_P_INT) {
+            const long long x = std::strtoll(v.c_str(), &end, 10);
+            if (v.empty() || !end || *end || errno == ERANGE) {
+                *why = r.origin + ": " + k + "=" + v + " is not a whole number";
+                return RAD_E_INVAL;
+            }
+            keys.push_back(k);
+            vals.push_back(v);
+            params.push_back(RAD_INT(nullptr, x));
+        } else if (opt->type == RAD_P_F64) {
+            const double x = std::strtod(v.c_str(), &end);
+            if (v.empty() || !end || *end || errno == ERANGE || !std::isfinite(x)) {
+                *why = r.origin + ": " + k + "=" + v + " is not a number";
+                return RAD_E_INVAL;
+            }
+            keys.push_back(k);
+            vals.push_back(v);
+            params.push_back(RAD_F64(nullptr, x));
+        } else {
+            keys.push_back(k);
+            vals.push_back(v);
+            params.push_back(RAD_STR(nullptr, nullptr));
+        }
+    }
+    for (size_t i = 0; i < params.size(); ++i) {
+        params[i].key = keys[i].c_str();
+        if (params[i].kind == RAD_P_STR) params[i].sval = vals[i].c_str();
+    }
+    return RAD_OK;
 }
 
 std::string Recipe::text() const {

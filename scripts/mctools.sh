@@ -1,11 +1,10 @@
 #!/bin/sh
-# The four tool-call shapes that are hardest to parse -- an array argument, two calls in one
-# reply, prose before a call, plain chat with tools available -- against a speculating container
-# such as the DSpark one (scripts/mcserve.sh): speculation must not disturb the XML tool grammar.
-# finish_reason tool_calls is the proof the SERVER parsed them; a call that comes back as prose in
-# `content` is a call the parser did not close.
-# The port is an override (P=, default 8100): this harness attaches to a server that is already
-# up rather than starting one.
+# The four hardest tool-call shapes to parse (an array argument, two calls in one reply, prose
+# before a call, plain chat with tools available) against a speculating container such as the
+# DSpark one (scripts/mcserve.sh); speculation must not disturb the XML tool grammar.
+# finish_reason tool_calls shows the server parsed the calls; a call returned as prose in
+# `content` is one the parser did not close.
+# Attaches to a running server on P= (default 8100).
 P=${P:-8100}
 T='[{"type":"function","function":{"name":"edit","description":"edit a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"oldText":{"type":"string"},"newText":{"type":"string"}}}}},"required":["path","edits"]}}},{"type":"function","function":{"name":"bash","description":"run a shell command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}}},{"type":"function","function":{"name":"write","description":"write a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]'
 ask() { # $1 label  $2 user message

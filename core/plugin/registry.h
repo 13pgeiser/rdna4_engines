@@ -1,44 +1,38 @@
 /* registry.h -- the plugin layer: dlopen, the configured hierarchy, the op-schema registry, the
  * constraint selector, bucket tables and the selection table. spec.md §2 and §16.
  *
- * Four rules live here and nowhere else, because every one of them is a rule somebody would
- * otherwise reinvent slightly differently in a second place:
+ * Rules enforced here and nowhere else:
  *
- *   THE HIERARCHY IS ABSOLUTE.  Plugins are queried in configured order and the first plugin with
- *   any matching kernel supplies it. A lower-priority plugin never outbids a higher one no matter
- *   how specialised its kernel -- that is what makes a user override an override (§2.1).
+ *   The hierarchy is absolute. Plugins are queried in configured order and the first plugin with
+ *   any matching kernel supplies it; a lower-ranked plugin never outbids a higher one, however
+ *   specialised its kernel. That is what makes a user override an override (§2.1).
  *
- *   SPECIFICITY IS DECLARED, NOT DERIVED.  Within one plugin the highest `priority` among matching
- *   rows wins, ties broken by declaration order. Counting matched constraints gets it backwards:
- *   {head_dim<=1024, gqa>=1, block%16==0, causal in {0,1}} matches four and {head_dim==256, gqa==6}
- *   matches two, and the second is by far the more specialised.
+ *   Specificity is declared, not derived. Within one plugin the highest `priority` among matching
+ *   rows wins, ties by declaration order. Counting matched constraints gets it backwards:
+ *   {head_dim<=1024, gqa>=1, block%16==0, causal in {0,1}} matches four, {head_dim==256, gqa==6}
+ *   matches two, and the second is more specialised.
  *
- *   SCHEMAS ARE FIXED BY FIRST DECLARATION.  The first plugin in hierarchy order to declare an op
- *   fixes its schema; a later plugin declaring the same op name with a different one is refused at
- *   load with both plugins named. Arguments are positional, so two disagreeing schemas make the
- *   same call mean different things depending on which plugin won selection -- silent numerical
- *   garbage rather than a diagnosable failure (§2.3).
+ *   Schemas are fixed by first declaration. The first plugin in hierarchy order to declare an op
+ *   fixes its schema; a later plugin declaring it differently is refused at load with both named.
+ *   Arguments are positional, so disagreeing schemas would give the same call different meanings
+ *   depending on which plugin won selection (§2.3).
  *
- *   THE BUCKET BOUNDARIES ARE THE CONSTRAINT VALUES THEMSELVES.  The union of the LE, GE and EQ
- *   values candidate kernels place on the ranged parameter, clamped to the declared range. No
- *   policy is chosen by anyone (§2.2).
+ *   Bucket boundaries are the constraint values: the union of the LE, GE and EQ values candidate
+ *   kernels place on the ranged parameter, clamped to the declared range (§2.2).
  *
- *   A REFERENCE LIBRARY IS LAST BY CONSTRUCTION.  A library that declares itself one
- *   (RadPluginReferenceFn) matches every op it declares, so anything ranked behind it would be
- *   unreachable. An unnamed plugin sorts after every named one but still ahead of a reference,
- *   which is what makes dropping in a kernel library for a new card work with no configuration
- *   (§2.1). Naming it in the hierarchy still overrides that. The rule is keyed on the declaration,
- *   never on a name: the libraries that ship with radiance load exactly as a third party's do.
+ *   A reference library is last. A library that declares itself one (RadPluginReferenceFn)
+ *   matches every op it declares, so anything ranked behind it would be unreachable. An unnamed
+ *   plugin sorts after every named one but ahead of a reference, so a kernel library for a new
+ *   card works with no configuration (§18); naming it in the hierarchy overrides that. The rule
+ *   is keyed on the declaration, never on a name, so bundled libraries load like third-party ones.
  *
- * LIFETIME. A Resolved, a Band and a KernelRow all point into a plugin's static tables. They are
- * valid exactly as long as the Registry that loaded them: close() dlcloses, and everything handed
- * out before it dangles after. The core keeps one Registry for the life of the process, so this
- * costs nothing; a tool that loads two kernel sets in turn has to finish with the first.
+ * Lifetime: a Resolved, a Band and a KernelRow point into a plugin's static tables and are valid
+ * only as long as the Registry that loaded them; close() dlcloses. The core keeps one Registry for
+ * the process; a tool that loads two kernel sets in turn must finish with the first.
  *
- * THREADING. Loading is startup, single-threaded, before the rank threads exist. select() and
- * init_instance() are called from every rank thread during declare, so the selection log and the
- * instance list are behind one mutex. It is uncontended at declare and never touched on the step
- * path, which is the only place a lock would cost anything.
+ * Threading: loading is single-threaded, before the rank threads exist. select() and
+ * init_instance() run on every rank thread during declare, so the selection log and instance list
+ * share one mutex. It is never taken on the step path.
  */
 #pragma once
 #include "rad_core.h"
@@ -67,7 +61,7 @@ struct Plugin {
     std::string description;
     std::string build_target;
 
-    uint32_t    kind   = 0;    /* RAD_PLUGIN_KERNEL | RAD_PLUGIN_ARCH */
+    uint32_t    kind   = 0;    /* one of RAD_PLUGIN_KERNEL, _ARCH, _QUANT */
     int         order  = 0;    /* hierarchy position; 0 is highest */
     void*       handle = nullptr;
 
@@ -79,32 +73,30 @@ struct Plugin {
     /* A kernel library that declared itself a reference implementation (RadPluginReferenceFn). */
     bool reference = false;
 
-    /* Architecture plugins are loaded and IDENTIFIED here; the build component drives them. The
-     * core never calls declare or step from the registry -- it only guarantees that no two
-     * plugins claim the same (architecture id, quantisation) PAIR (§2.4). The pair, not the id:
-     * qwen35_bf16 and qwen35_fp8 are the same architecture at two weight formats and both answer
-     * "qwen35", which is the whole reason §2.4 splits on quantisation at all. `arch_quant` is ""
-     * for a plugin that serves an unquantised container, including one that predates the export. */
+    /* Architecture plugins are loaded and identified here; the build component drives them. The
+     * registry only guarantees that no two plugins claim the same (architecture id, quantisation)
+     * pair (§2.4): qwen35_bf16 and qwen35_fp8 both answer "qwen35" at two weight formats.
+     * `arch_quant` is "" for a plugin that serves an unquantised container, including one that
+     * predates the export. */
     std::string arch_id;
     std::string arch_quant;
     int  (*arch_declare)(RadBuilder*, const RadModelMeta*, const RadBuildCtx*) = nullptr;
     void (*arch_step)(RadCtx*, const RadBatch*) = nullptr;
-    /* OPTIONAL (rad_builder.h): null when the plugin exports none, and every question then
-     * answers zero. It is what the core asks BEFORE declare, so that a fact which is an input to
-     * declaration and a property of the model is still read by the plugin and not by us. */
+    /* Optional (rad_builder.h); null means every question answers zero. Asked before declare, so
+     * model facts that are inputs to declaration are still read by the plugin, not the core. */
     int  (*arch_probe)(const RadModelMeta*, RadArchProbe*) = nullptr;
-    /* OPTIONAL (rad_builder.h): null when the plugin exports none, and the reply format is then
-     * derived from the chat template. */
+    /* Optional (rad_builder.h); null means the reply format is derived from the chat template. */
     const RadChatFormat* (*arch_chat_format)(const RadModelMeta*) = nullptr;
+    /* Optional (rad_builder.h); null means the model serves no speech route. */
+    const RadAudioFormat* (*arch_audio_format)(const RadModelMeta*) = nullptr;
 
     RadPluginCloseFn close = nullptr;
 };
 
 /* ------------------------------------------------------------------ one selection question */
-/* What select() did, in enough detail to print §16's table and to answer "why did it not pick the
- * kernel I wrote". `candidates` is every row that was CONSIDERED -- rows of the other domain are
- * not, since they answer a different question, and rows behind a plugin that already supplied a
- * match are not either, because the hierarchy stopped there. */
+/* What select() did, in enough detail to print §16's table and explain why a kernel was not
+ * picked. `candidates` holds every row considered: not rows of the other domain, and not rows
+ * behind a plugin that already supplied a match. */
 struct SelectionTrace {
     struct Candidate {
         std::string plugin;
@@ -123,11 +115,10 @@ struct SelectionTrace {
     int         priority = 0;
     std::string reason;         /* on a miss: the constraint(s) that refused it */
 
-    /* A RAD_DERIVED parameter the CALLER did not supply: its constraints were skipped during
-     * matching, and the winning kernel's RAD_C_EQ value for the key was written into the resolved
-     * geometry afterwards. `known` is false when the winner has no EQ on that key -- ref's
-     * `block_size >= 1` is exactly that case -- and an unset derived key is a condition the
-     * caller has to report, not a zero to be read. */
+    /* A RAD_DERIVED parameter the caller did not supply: its constraints were skipped during
+     * matching and the winner's RAD_C_EQ value for the key was written into the resolved
+     * geometry. `known` is false when the winner has no EQ on the key (e.g. ref's
+     * `block_size >= 1`); the caller must report that, not read a zero. */
     struct DerivedParam {
         std::string key;
         long long   value = 0;
@@ -148,53 +139,44 @@ public:
     Registry& operator=(const Registry&) = delete;
 
     /* ---------------------------------------------------------- loading (§2, §18) */
-    /* Scan a directory of .so files and load them in HIERARCHY ORDER. The hierarchy is configured,
-     * not discovered: `hierarchy` is an ordered list of plugin names (RadPluginInfo::name, or the
-     * file as the operator wrote it -- `libr4d`, `r4d`, `libr4d.so`), so substituting a kernel is
-     * dropping an .so in a directory and naming it ahead of the default. A non-empty list is
-     * EXCLUSIVE: a kernel library it does not name is closed before it registers anything, and an
-     * entry that matches nothing is warned about by name. An empty list loads every kernel library
-     * found, in filename order so the result is reproducible, with a reference library last.
+    /* Scan a directory of .so files and load them in hierarchy order. `hierarchy` is an ordered
+     * list of plugin names (RadPluginInfo::name, or the file as written: `libr4d`, `r4d`,
+     * `libr4d.so`), so substituting a kernel means dropping an .so in and naming it ahead of the
+     * default. A non-empty list is exclusive: a kernel library it does not name is closed before
+     * it registers anything, and an entry that matches nothing is warned about. An empty list
+     * loads every kernel library in filename order (reproducible), a reference library last.
      * Architecture and quantiser plugins are not ranked and always load.
      *
-     * Always completes: every plugin that can be loaded is, every refusal is recorded in
-     * load_errors(), and the FIRST negative status is returned. Reporting the whole list beats
-     * reporting the first failure at the top -- an operator with two stale plugins wants to hear
-     * about both in one run (§3.1). */
+     * Always completes: every loadable plugin is loaded, every refusal goes to load_errors(), and
+     * the first negative status is returned, so one run reports every failure (§3.1). */
     int load_dir(const std::string& dir, const std::vector<std::string>& hierarchy);
-    /* The same over several directories -- a $RADIANCE_HOME search path -- as one set: the
-     * hierarchy orders plugins across all of them, and a file an earlier directory already holds
-     * by the same name is shadowed, not loaded. */
+    /* The same over several directories (a $RADIANCE_HOME search path) as one set: the hierarchy
+     * orders plugins across all of them, and a file name an earlier directory holds shadows later
+     * ones. */
     int load_dirs(const std::vector<std::string>& dirs, const std::vector<std::string>& hierarchy);
 
-    /* One plugin at a known hierarchy position. rad-info and rad-kbench load a single .so; the
-     * engine goes through load_dir. 1, and nothing registered, when the plugin declines this
-     * machine (its rad_plugin_open answers RAD_E_UNSUPPORTED). */
+    /* One plugin at a known hierarchy position (rad-info, rad-kbench); the engine uses load_dir.
+     * Returns 1, with nothing registered, when rad_plugin_open answers RAD_E_UNSUPPORTED. */
     int load_plugin(const std::string& path, int order);
 
-    /* Every registered kernel row's op must have a schema SOMEWHERE in the loaded set -- an
-     * override plugin may legitimately ship kernels for an op whose schema the plugin below it
-     * declared, and that plugin loads later, so the check can only run once the set is complete.
-     * load_dir calls this; a caller assembling a set by hand calls it when it is done. */
+    /* Every kernel row's op must have a schema somewhere in the loaded set. An override plugin
+     * may ship kernels for an op whose schema a later-loading plugin declares, so this runs once
+     * the set is complete: load_dir calls it, a caller assembling a set by hand calls it last. */
     int check_complete();
 
-    /* The device a kernel library's device code is checked against when it loads: the first card
-     * the caller will run on. 0 unless the caller says otherwise -- the engine says so before it
-     * loads anything, once it has chosen its cards. */
+    /* The device a kernel library's device code is checked against at load: the first card the
+     * caller will run on. Default 0; the engine sets it after choosing its cards, before loading. */
     void set_code_device(int device) { code_device_ = device; }
 
-    /* THE ENGINE ABOUT TO SERVE ON THE HOST BACKEND SAYS SO: no card is visible, and no GPU code
-     * object runs in this process at all. A kernel library that brought device code then has its
-     * device rows left out of selection at load, its host rows staying, so every op takes its host
-     * kernel. Only the engine says this. A tool that selects without serving -- rad-convert's
-     * recipe check, rad-kbench's tables, a test of a library's constraints -- sees every row, as
-     * it would on the machine the model is served on. */
+    /* Set by the engine when serving on the host backend, where no GPU code object runs: device
+     * rows are left out at load and every op takes its host kernel. Only the engine sets it; tools
+     * that select without serving (rad-convert's recipe check, rad-kbench, constraint tests) see
+     * every row, as on the serving machine. */
     void set_no_device_code(bool v) { no_device_code_ = v; }
-    /* WHAT THE ENGINE MEASURED ABOUT THE RANKS' DEVICES, for the constraints on "device." keys
-     * (rad_types.h). Set before the first selection, by whoever chose the devices; a registry
-     * nobody told anything has no facts, and a kernel constrained on one is not selected. */
+    /* Measured facts about the ranks' devices, for constraints on "device." keys (rad_types.h).
+     * Set before the first selection by whoever chose the devices; without a fact, a kernel
+     * constrained on it is not selected. */
     void set_device_fact(std::string_view key, long long v) { device_facts_.set_i(key, v); }
-    const Geometry& device_facts() const { return device_facts_; }
 
     void close();                       /* fini instances, close hooks, dlclose, forget everything */
 
@@ -202,9 +184,8 @@ public:
     const Plugin*                   plugin(std::string_view name) const;
     const std::vector<std::string>& load_errors() const { return load_errors_; }
 
-    /* Every quantiser the loaded quantiser plugins offer, in load order. A name is unique across
-     * them -- two plugins naming one quantiser is refused at load -- so the lookup is the answer
-     * and not the first of several. Null when nothing offers it. */
+    /* Every quantiser the loaded quantiser plugins offer, in load order. Names are unique (a
+     * duplicate is refused at load); quantizer() is null when nothing offers the name. */
     struct QuantRow {
         const RadQuantizerInfo* info = nullptr;
         std::string             plugin;
@@ -222,25 +203,19 @@ public:
     const Plugin*      schema_owner(std::string_view op) const;
     std::vector<std::string> op_names() const;      /* sorted; the vocabulary this set implements */
 
-    /* Check a declared parameter set against the op's schema. Without this, a typo and an
-     * unimplemented op are the same diagnostic; with it, a misspelled op fails declare with the
-     * near-miss named. Returns RAD_OK, RAD_E_NOSCHEMA (no such op) or RAD_E_SCHEMA, and fills
-     * `err` with a sentence an architecture-plugin author can act on. */
+    /* Check a declared parameter set against the op's schema; a misspelled op fails with the
+     * near-miss named. Returns RAD_OK, RAD_E_NOSCHEMA (no such op) or RAD_E_SCHEMA, with `err`
+     * written for an architecture-plugin author. */
     int validate(std::string_view op, const RadParam* p, int n_p, std::string* err) const;
 
-    /* The closest known op name to `op` within a small edit distance, or "" if nothing is close.
-     * Public because the builder wants it in its own messages too. */
+    /* The closest known op name within a small edit distance, or "". Also used by the builder. */
     std::string near_miss(std::string_view op) const;
 
     /* ---------------------------------------------------------- the tuning cache (§15) */
-    /* Load $RADIANCE_HOME/tune/<machine>.tune, which rad-tune wrote. resolve() then moves a shape
-     * off each axis's declared default wherever there is a row for it. A missing file is not an
-     * error and leaves every shape on that default, which is what makes an untuned install fast
-     * rather than broken.
-     *
-     * THE CORE OWNS THE CACHE AND THE POLICY, so no plugin has to (tunecache.h; the choice is
-     * applied in select.cpp). Without this call every kernel runs its axis defaults whatever the
-     * file on disk says, which is slow rather than wrong -- but silently so.
+    /* Load $RADIANCE_HOME/tune/<machine>.tune (written by rad-tune). resolve() then moves a shape
+     * off each axis's declared default wherever the file has a row for it. A missing file is not
+     * an error; every shape stays on its default. The core owns the cache and the policy
+     * (tunecache.h, applied in select.cpp). Without this call the file is silently ignored.
      *
      * Returns the number of rows loaded, or a negative status. */
     int  load_tune(const std::string& radiance_home, const std::string& machine = std::string());
@@ -251,67 +226,66 @@ public:
      * plugin the highest declared priority wins, ties on declaration order. Null on a miss, with
      * the refusing constraint in `why->reason`. Every call is recorded in the selection table.
      *
-     * RAD_DERIVED parameters (rad_abi.h) are supplied by the KERNEL, so a constraint on one is
-     * SKIPPED here when the caller did not name it, and the winner's RAD_C_EQ value for the key
-     * comes back in `why->derived` -- resolve() is what writes it into the geometry. Without that
-     * skip, spec §7.2 is circular: the block manager reads the block size off the resolved
-     * attention kernel, but a kernel constrained to block_size == 16 can never be selected by a
-     * query that omits block_size, because a constraint whose key the geometry lacks does not
-     * hold. A caller that supplies the key anyway pins it and matches normally, which is how an
-     * operator forces a block size and gets a refusal by name instead of a substitution. */
-    /* `record` is false for a caller asking the selector a question the ENGINE did not ask -- the
-     * graph dump replays every band to recover the candidate list it threw away. The selection
-     * table is a record of what this deployment resolved, and a reporting tool inflating its
-     * counts would make it a record of itself. */
-    /* `accept`, when given, is asked of every row whose constraints hold, and an answer that is
-     * not empty takes the row out as a candidate with that answer as the reason. It is how a
-     * weight's encoding takes part in selection: a kernel whose layout hook does not read the
-     * encoding a weight operand has (RAD_E_DTYPE) is not a candidate, and the next one is chosen
-     * -- a bf16 lm_head goes to the bf16 GEMM instead of being refused by the fp8 one. */
+     * RAD_DERIVED parameters (rad_abi.h) are supplied by the kernel, so a constraint on one is
+     * skipped when the caller did not name it, and the winner's RAD_C_EQ value comes back in
+     * `why->derived` (resolve() writes it into the geometry). This breaks the §7.2 cycle: the
+     * block manager reads the block size off the resolved attention kernel, and a constraint whose
+     * key the geometry lacks does not hold. A caller that supplies the key pins it and matches
+     * normally, so a forced block size is refused by name rather than substituted.
+     *
+     * `record` is false for questions the engine did not ask (the graph dump replaying bands), so
+     * the selection table records only what this deployment resolved.
+     *
+     * `accept`, when given, is asked of every row whose constraints hold; a non-empty answer drops
+     * the row with that reason. This is how a weight's encoding takes part in selection: a kernel
+     * whose layout hook rejects the operand's encoding (RAD_E_DTYPE) is skipped and the next one
+     * chosen, so a bf16 lm_head goes to the bf16 GEMM rather than being refused by the fp8 one. */
     using RowFilter = std::function<std::string(const KernelRow&, const Geometry&)>;
     const KernelRow* select(std::string_view op, const Geometry& g, int domain,
                             SelectionTrace* why = nullptr, bool record = true,
                             const RowFilter* accept = nullptr);
 
-    /* Selection plus the per-instance bookkeeping: the tuned axes, where they came from, and the frozen
-     * geometry -- the query plus whatever the winning kernel supplied for a derived key, so
-     * rad_kv_block_size() and RadArgs.p both see it. init() is NOT called here -- see
-     * init_instance(). */
+    /* The row select() would choose if `plugin` were the whole hierarchy: the same constraint
+     * match, derived-key skip, device facts and filter, restricted to one plugin and never
+     * recorded. rad-kbench asks each library this way so a replay runs the row the engine would
+     * run with that library alone. `why->derived` carries the winner's derived values. */
+    const KernelRow* select_in(std::string_view plugin, std::string_view op, const Geometry& g,
+                               int domain, const RowFilter* accept = nullptr,
+                               SelectionTrace* why = nullptr) const;
+
+    /* Selection plus per-instance bookkeeping: the tuned axes and their source, and the frozen
+     * geometry (the query plus the winner's derived keys, so rad_kv_block_size() and RadArgs.p
+     * both see them). Does not call init(); see init_instance(). */
     Resolved resolve(std::string_view op, const Geometry& g, int domain, SelectionTrace* why = nullptr,
                      const RowFilter* accept = nullptr);
 
     /* ---------------------------------------------------------- bucket tables (§2.2) */
-    /* Resolve a ranged parameter into a bucket table: one resolution per band, per domain, built
-     * at declare and indexed by the actual value at issue. The boundaries are the constraint
-     * values themselves. Each band is resolved AT ITS UPPER BOUND, which is the worst case in the
-     * band and therefore the only value that is safe to size and select on.
+    /* Resolve a ranged parameter into a bucket table: one resolution per band per domain, built
+     * at declare and indexed by the actual value at issue. Each band is resolved at its upper
+     * bound, the band's worst case and so the only value safe to size and select on.
      *
-     * `ranged_key` empty means the op has no ranged parameter: exactly one band is returned, whose
-     * hi is INT64_MAX so the issue path's band scan always finds it.
+     * An empty `ranged_key` returns one band with hi = INT64_MAX, which the issue path's band scan
+     * always finds.
      *
-     * Both domains are resolved wherever both exist, so the core can change execution site at
-     * runtime without re-resolving. Absence is asymmetric: a band with no DEVICE kernel is fatal
-     * and the caller reports it (this function does not abort -- declare always completes); a band
-     * with no HOST kernel is a warning naming the placement options it just removed. */
+     * Both domains are resolved so the execution site can change at runtime without re-resolving.
+     * A band with no device kernel is fatal; one with no host kernel only removes host-site
+     * execution. Neither aborts here: the caller reports misses once declare completes. */
     std::vector<Band> build_bands(std::string_view op, std::string_view ranged_key,
                                   int64_t lo, int64_t hi, const Geometry& base,
                                   const RowFilter* accept = nullptr);
 
     /* ---------------------------------------------------------- instances (§2.1) */
-    /* init() once per resolved instance -- one op, one band, one domain -- with the frozen
-     * geometry, the rank and the world size. libr4d's all-reduce needs its peer signal buffers and
-     * IPC handles established across ranks before the first call, and a kernel that JITs or loads
-     * a config table wants somewhere to do it that is not the hot path. A negative return aborts
-     * startup and the caller names the kernel. */
+    /* Calls init() once per resolved instance (one op, band and domain) with the frozen geometry,
+     * rank and world size, off the hot path: e.g. libr4d's all-reduce sets up peer signal buffers
+     * and IPC handles here. A negative return aborts startup; the caller names the kernel. */
     int  init_instance(Resolved& r, int rank, int world_size);
     void fini_instances();
     size_t n_instances() const;
 
     /* ---------------------------------------------------------- the selection table (§16) */
-    /* Every DISTINCT question the selector was asked, in the order first asked, with what it
-     * resolved to and, for a miss, the constraint that refused it. Repeats are folded and counted:
-     * a 64-layer model asks the same question 64 times, and "asked 64 times" says how much of the
-     * model resolved to that kernel. This is the record of why a fallback is running. */
+    /* Every distinct question the selector was asked, in first-asked order, with its answer and,
+     * for a miss, the refusing constraint. Repeats are folded into a count, which shows how much
+     * of the model resolved to each kernel. */
     std::string selection_table() const;
     size_t      n_selections() const;
     void        clear_selections();
@@ -334,8 +308,8 @@ private:
 
     struct SelectionRecord {
         std::string op, query, key, kernel, plugin, reason;
-        std::string derived;      /* "block_size:=16", rendered apart from the query because it
-                                   * was NOT part of the question the selector was asked */
+        std::string derived;      /* "block_size:=16", kept apart from the query because it was
+                                   * not part of the question asked */
         int         domain = 0;
         int         priority = 0;
         long long   count = 1;
@@ -362,14 +336,26 @@ private:
 
     mutable std::mutex           mu_;
     std::vector<SelectionRecord> log_;
+    std::unordered_map<std::string, size_t> log_at_;   /* SelectionRecord::key -> index in log_ */
     std::vector<std::pair<const RadKernelInfo*, void*>> instances_;
 };
 
 /* The value a kernel's own constraints place on one key, e.g. the paged block size the resolved
- * attention kernel is compiled for. §7.2: the block manager reads that off the resolved kernel and
- * sizes itself accordingly, because a core that picked its own block size would be a core that has
- * to be edited when a kernel changes. Returns false when the kernel says nothing about that key
- * with that operator -- which is not the same as a default, and the caller has to decide. */
+ * attention kernel is compiled for; the block manager sizes itself from it (§7.2). Returns false
+ * when the kernel has no constraint on that key with that operator; that is not a default, and
+ * the caller decides. */
 bool kernel_constraint(const KernelRow& r, std::string_view key, int c_op, long long* out);
+
+/* "an integer", "a string", ... for a RAD_P_* parameter kind, for diagnostics. */
+const char* param_kind_name(int kind);
+
+/* Why kernel `ki` cannot read weight operand `operand` (named `name`) stored as encoding `enc` with
+ * planes `sel` described by `planes` (dtype and extents; data unused), or "" when it can. A row
+ * whose layout hook answers RAD_E_DTYPE does not read the encoding, and a device row with no hook
+ * reads a single plane as stored. A hookless host row reads canonically. The builder's band
+ * resolution and rad-kbench's replay both ask this, so they choose the same row. */
+std::string weight_refusal(const RadKernelInfo* ki, const Geometry& g, int operand,
+                           const RadEncoding& enc, const int* sel, const RadTensor* planes,
+                           int n_sel, std::string_view name);
 
 }  /* namespace rad */

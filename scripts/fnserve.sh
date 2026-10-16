@@ -1,92 +1,82 @@
 #!/bin/sh
-# Bring up Qwen3.8-Flash-Next as a long-lived server and LEAVE IT RUNNING: start it, wait for
-# /health, print the endpoints and exit with the server still up. The default container is the
-# production one, w4nl64-i8lm.rad, built by data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe
-# (scripts/convfn.sh).
+# Start Qwen3.8-Flash-Next as a long-lived server: wait for /health, print the endpoints and exit
+# with the server still up. The default container is the production w4nl64-i8lm.rad, built by
+# data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe (scripts/convfn.sh).
 #
-# 200K CONTEXT. --max-model-len reserves nothing per request; it sets the WORST CASE the paged
-# pool is sized against. Under expert_tiered the cache lends: the routed experts keep on the card
-# exactly what the host pool cannot hold, and the cache takes the rest of the elastic pool, up to
-# --max-num-seqs x --max-model-len, lending every block no live request holds back to the expert
-# slab. --host-pool-mib is what moves that split: a larger pool takes experts off the card and
-# gives the cache more, in pinned host RAM.
+# Context: --max-model-len reserves nothing per request; it sets the worst case the paged pool is
+# sized against. Under expert_tiered the routed experts keep on the card what the host pool cannot
+# hold, the cache takes the rest of the elastic pool (up to --max-num-seqs x --max-model-len), and
+# blocks no live request holds are lent back to the expert slab. --host-pool-mib moves that split:
+# a larger pool moves experts to pinned host RAM and gives the cache more VRAM.
 #
-# The pool is a CAPACITY, not a per-request cap. A token costs 7.31 KiB across the two paged
+# The pool is a capacity, not a per-request cap. A token costs 7.31 KiB across the two paged
 # groups (kv_attn 26.00 KiB and kv_qsa_bkey 3.25 KiB per 4-token block), so one 200K sequence is
-# 1.43 GiB. A one-shot request needs its own context; a multi-turn one needs more: with prefix
-# caching a finished sequence's blocks stay HELD so the next turn can reuse them, so the demand is
-# the live SESSIONS, and a context of T tokens occupies about 1.8 x T pool tokens. When the pool
-# cannot hold the live sessions, the cache evicts exactly what the next turn asks for, and every
-# turn re-prefills its whole context (0% prefix hit; minutes per turn instead of seconds). Watch
-# kv_util: the hit rate falls off a cliff as the pool fills.
+# 1.43 GiB. With prefix caching a finished sequence's blocks stay held for the next turn, so demand
+# is the live sessions: a context of T tokens occupies about 1.8 x T pool tokens. If the pool
+# cannot hold them, the cache evicts what the next turn needs and every turn re-prefills its whole
+# context (0% prefix hit, minutes per turn). Watch kv_util; the hit rate drops sharply as the pool
+# fills.
 #
 # Defaults are the production shape (gpu-headroom-mib 96, kv-cache-dtype fp8,
 # max-num-batched-tokens 2048, tp 2, speculation depth 3), with the prefix cache on and
-# --checkpoint-slots at its default, because multi-turn chat wants both.
+# --checkpoint-slots at its default, as multi-turn chat needs both.
 #
-# THE CHUNK IS 2048. `--max-num-batched-tokens` is the prefill chunk when checkpoints are off, and
-# it sets how many routed rows the MoE GEMM sees at once. Part of the expert weight is not in
-# VRAM (it is pinned host memory, read over the link inside the kernel), so a smaller chunk
-# re-reads every expert's weight for fewer tokens: 2048 prefills about 55% faster than 512.
-#
-#   - 4096 IS NOT A 4096 CHUNK: plan_chunk splits at --checkpoint-interval (2048) before the
-#     budget applies, so it runs 2048 chunks while the activation arena, which grows with the
-#     BUDGET and is charged before the expert/KV split, takes resident experts for a chunk it never
-#     gets. Startup names which of the two bound the chunk. A real 4096 chunk (with
-#     --checkpoint-interval 4096) is no faster either: the larger arena costs more resident experts
+# Chunk 2048: `--max-num-batched-tokens` is the prefill chunk when checkpoints are off and sets how
+# many routed rows the MoE GEMM sees at once. Part of the expert weight is pinned host memory read
+# over the link inside the kernel, so a smaller chunk re-reads every expert for fewer tokens; 2048
+# prefills about 55% faster than 512.
+#   - 4096 does not give a 4096 chunk: plan_chunk splits at --checkpoint-interval (2048) first,
+#     while the activation arena grows with the budget and is charged before the expert/KV split,
+#     costing resident experts for nothing. Startup names which limit bound the chunk. A real 4096
+#     chunk (--checkpoint-interval 4096) is no faster: the larger arena costs more resident experts
 #     than the amortisation returns.
-#   - It does not cost co-running decoders: queued behind a prefill that finishes sooner, they
-#     finish sooner at 2048 than at 512 (scripts/fnconc.sh measures both halves).
-#   - It does not cost the prefix cache: the KV pool loses about 3% to the larger arena and two
-#     ~180K sessions still hit 99% with no evictions.
-#   - It costs about 0.6% of decode step time at one stream (scripts/cstep2.sh), from the resident
-#     experts the arena takes; at eight streams the difference is below what the harness resolves.
-#   - It changes the text. A different chunk is a different batch shape, so a prefill sums in a
-#     different order and a tie can land on a different token; each chunk size is stable on its
-#     own. Pin the chunk before recording anything to compare against later.
+#   - Co-running decoders queued behind a prefill finish sooner at 2048 than at 512, since the
+#     prefill does (scripts/fnconc.sh).
+#   - The KV pool loses about 3% to the larger arena; two ~180K sessions still hit 99% with no
+#     evictions.
+#   - Decode step time rises about 0.6% at one stream (scripts/cstep2.sh) from the experts the
+#     arena displaces; at eight streams the difference is below the harness's resolution.
+#   - The chunk changes the text: a different batch shape sums prefill in a different order, so a
+#     tie can resolve differently. Each chunk size is stable on its own; pin it before recording a
+#     reference.
 #
-# THE PREFIX CACHE IS TIERED, AND THE ENGINE LEAVES THE HOST TIER OFF BY DEFAULT.
-# --prefix-cache-mib is zero unless asked for, so a server started without it drops a conversation's
-# context the moment the pool needs the blocks. This deployment keeps finished turns in host memory,
-# where they cost the card nothing, for an hour of disuse (--prefix-cache-ttl's default).
-#
-# The ELASTIC half needs no flag and cannot be turned off: the pool holds the blocks it is using
-# plus a buffer derived from the chunk, and the expert slab takes the VRAM it releases. That leans
-# on --gpu-headroom-mib, which is why the 96 above matters -- startup names any shortfall and holds
-# it back on top of the reserve.
+# Prefix cache: the engine's host tier is off by default (--prefix-cache-mib 0), so a conversation
+# is dropped as soon as the pool needs its blocks. This deployment keeps finished turns in host
+# memory for an hour of disuse (--prefix-cache-ttl's default). The elastic VRAM half needs no flag
+# and cannot be turned off: the pool holds the blocks in use plus a buffer derived from the chunk,
+# and the expert slab takes the VRAM it releases. That relies on --gpu-headroom-mib (96 above);
+# startup names any shortfall and holds it back on top of the reserve.
 #
 #   --prefix-cache-mib  finished conversations are copied here at once and their VRAM goes to the
 #                       expert slab; a return restores instead of re-prefilling, and a full tier
-#                       drops its least recently used. It holds attention blocks only: the
-#                       linear-state snapshots are in the --checkpoint-slots store, 113 MiB each on
-#                       this model and counted for the whole server, not per sequence.
+#                       evicts least recently used. It holds attention blocks only: linear-state
+#                       snapshots live in the --checkpoint-slots store (113 MiB each on this model,
+#                       counted for the whole server, not per sequence).
 #
-# THE HOST NUMBER IS DELIBERATELY SMALL BECAUSE OF THE N-GRAM TABLE. The tier's arena is PINNED,
-# and the 47.68 GiB n-gram (PLE) table is read through the container's own mmap, so it lives in
-# the page cache -- and pinned bytes come out of the same host RAM. Taking too much here turns a
-# decode step's minor faults into major ones, a far worse trade than a smaller host tier.
-# Watch /proc/<pid>/stat majflt across a prefill before raising it.
+# The host tier is kept small because of the n-gram table: the tier's arena is pinned, and the
+# 47.68 GiB n-gram (PLE) table is read through the container's mmap, so both draw on the same host
+# RAM. Too large a tier turns a decode step's minor faults into major ones. Watch
+# /proc/<pid>/stat majflt across a prefill before raising it.
 #
-# THE CROSS-RANK WIRE IS THE ROTATED 6-BIT ONE (--tp-wire wht6). An all-reduce at or above
-# --tp-wire-min-kb (128 KiB: every prefill chunk, and decode from seven streams up) carries a
-# Walsh-Hadamard-rotated 6-bit payload instead of bf16 -- 2.6x fewer bytes over PCIe -- inside the
-# gated residual's fused writes. Against the exact wire at a 2048-token chunk it prefills about 6%
-# faster and decodes about 1% faster at eight streams; at one stream nothing changes, because its
-# messages stay under the floor and go exact.
+# --tp-wire wht6: an all-reduce at or above --tp-wire-min-kb (128 KiB: every prefill chunk, and
+# decode from seven streams up) carries a Walsh-Hadamard-rotated 6-bit payload instead of bf16,
+# 2.6x fewer bytes over PCIe, inside the gated residual's fused writes. Against the exact wire at
+# a 2048-token chunk it prefills about 6% faster and decodes about 1% faster at eight streams; one
+# stream stays under the floor and is exact. It is lossy: over greedy continuations of 160 code and
+# prose prompts, wht6 agrees with the exact wire at 91.4% of positions, the same as the E4M3
+# hyper-connection matrices the container already carries versus bf16 (91.3%). WIRE=exact serves
+# the exact wire.
 #
-# IT IS LOSSY, by about as much as a trade this model already makes. Over greedy continuations of
-# 160 code and prose prompts, compared at every position while the two prefixes still agree, wht6
-# agrees with the exact wire at 91.4% of positions -- the same as E4M3 hyper-connection matrices
-# against bf16 ones (91.3%), which the container already carries. WIRE=exact serves the exact wire.
-#
-# Binds 0.0.0.0 so a client on another host can reach it. Stop it with scripts/fnstop.sh.
+# Binds 0.0.0.0 so other hosts can reach it. Stop it with scripts/fnstop.sh.
 P="${P:-8100}"
 M="${M:-$HOME/models/rad/w4nl64-i8lm.rad}"
-cd "$HOME/workspace/radiance/build" || exit 1
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BUILD="${BUILD:-$ROOT/build}"
+cd "$BUILD" || exit 1
 pkill -f "bin/radianc[e]"; while pgrep -f "bin/radianc[e]" >/dev/null; do sleep 1; done; sleep 2
 env GPU_MAX_ALLOC_PERCENT=100 GPU_MAX_HEAP_SIZE=100 $EXTRA_ENV \
 nohup ./bin/radiance --model "$M" \
-    --radiance-home "$HOME/workspace/radiance/build/radiance_home" \
+    --radiance-home radiance_home \
     --host 0.0.0.0 --port "$P" \
     --max-num-seqs ${SEQS:-8} --max-model-len ${MLEN:-200000} \
     --tp ${TP:-2} --placement expert_tiered --host-pool-mib ${HOSTPOOL:-12288} \

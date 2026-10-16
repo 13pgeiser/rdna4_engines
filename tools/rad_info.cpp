@@ -1,14 +1,11 @@
 /* rad-info -- print what a .rad contains.
  *
- * This is the tool you reach for when something is wrong, so it is written for reading: aligned
- * columns, byte counts in human units, and every number that could mislead labelled with what it
- * actually counts. It opens the container read-only and touches nothing else -- no plugins, no
- * declare -- so it works on any container, whatever is installed beside it.
+ * Output is for reading: aligned columns, human byte units, and every count labelled with what it
+ * counts. The container is opened read-only with no plugins and no declare phase, so it works on
+ * any container regardless of what is installed.
  *
- * `--plugins` is the other question an operator asks when something is wrong: what the search path
- * in $RADIANCE_HOME actually offers, and from which file. It loads the plugins exactly as the
- * engine does and prints each one as it registered -- the libraries radiance ships beside any
- * other, because they are found the same way.
+ * `--plugins` instead loads the plugins from $RADIANCE_HOME as the engine does and prints each as
+ * it registered, with the file it came from.
  */
 #include "iface.h"
 #include "format/encoding.h"
@@ -88,8 +85,7 @@ const char* tok_kind(uint32_t k) {
     }
 }
 
-/* Escape a token's text for one line of a report. Byte-level BPE puts U+0120 and friends in
- * there, and a raw newline in a column ruins the table. */
+/* Escape a token's text for one report line (control characters, newlines), truncated at `cap`. */
 std::string vis(const char* s, size_t cap = 40) {
     std::string out;
     for (const char* p = s; *p && out.size() < cap; ++p) {
@@ -189,9 +185,8 @@ void print_tensor_row(const RadFile& f, const RadFileEntry& e, const char* inden
         }
 }
 
-/* The directory, grouped the way the format is organised: by layer, and within a layer by
- * movement unit. The unit is what the mover transfers, so it is the number that matters, and it
- * is printed even when --verbose is off. */
+/* The directory, grouped by layer and then by movement unit (what the mover transfers). Unit sizes
+ * are printed even without --verbose. */
 void print_directory(const RadFile& f, bool verbose) {
     std::printf("\nweight directory (%lld entries, grouped by layer and movement unit)\n",
                 (long long)f.entry_count());
@@ -199,8 +194,7 @@ void print_directory(const RadFile& f, bool verbose) {
 
     int64_t i = 0;
     int64_t total_payload = 0;
-    /* By what the numbers ARE, which is the question a container answers -- and by which
-     * quantiser made them, which is the question a quality regression asks. */
+    /* Totals by encoding and by provenance (which quantiser made the weights). */
     std::map<std::string, std::pair<int64_t, int64_t>> by_enc;   /* entries, bytes */
     std::map<std::string, std::pair<int64_t, int64_t>> by_prov;
 
@@ -234,13 +228,12 @@ void print_directory(const RadFile& f, bool verbose) {
         if (i >= f.entry_count() || f.entry(i).layer != layer || f.entry(i).expert < 0) continue;
 
         const RadFile::ExpertGroup* g = f.group_for_layer(layer);
-        if (!g) { ++i; continue; }   /* validate() guarantees this cannot happen; be quiet if it does */
+        if (!g) { ++i; continue; }   /* validate() rules this out */
 
         std::printf("\n  layer %-14d %3d expert(s) x %d slot(s) %11s   unit: one expert\n",
                     layer, g->n_expert, g->n_slot,
                     humanb((int64_t)g->stride * g->n_expert).c_str());
-        /* base + id*stride is the whole point of the format, so print the two numbers that make
-         * it true rather than making the reader derive them. */
+        /* Experts are addressed as base + id * stride. */
         std::printf("      addressing  base %llu + id * %llu  (payload %s, %s of it padding)\n",
                     (unsigned long long)g->base, (unsigned long long)g->stride,
                     humanb((int64_t)g->unit_bytes).c_str(),
@@ -298,8 +291,7 @@ void print_vocab(const RadFile& f) {
     std::printf("  chat template %s\n", ct[0] ? fmt("%zu bytes", std::strlen(ct)).c_str() : "none");
 
     if (v.h->n_steps) {
-        /* The chain, in declared order. rad-convert interprets tokenizer.json properly instead of
-         * hashing it against a hardcoded enum (spec §12), so this is what it decided. */
+        /* The chain in declared order, as rad-convert interpreted tokenizer.json (spec §12). */
         std::printf("  chain (%u steps, in order)\n", v.h->n_steps);
         for (uint32_t i = 0; i < v.h->n_steps; ++i) {
             const RadVocabStep& s = v.steps[i];
@@ -324,11 +316,8 @@ void print_vocab(const RadFile& f) {
                     (long long)n[RAD_TT_BYTE]);
     }
 
-    /* EVERY CONTROL AND USER-DEFINED TOKEN, WITH ITS ID. Thirty-odd lines, and they are the ones
-     * that decide where a turn ends -- which is a question that otherwise can only be answered by
-     * reading a generation log and guessing. A model that ends its turn on a token the container
-     * did not declare as eos or eot generates straight past it into a hallucinated next turn, and
-     * that failure reads as a rambling model rather than as a mislabelled token. */
+    /* Every control and user-defined token with its id: these decide where a turn ends. A model
+     * that ends its turn on a token not declared eos or eot runs on into a hallucinated next turn. */
     if (v.tok_type && v.tok_text) {
         std::printf("  control/user  (the tokens a turn can end on; eos/eot marked)\n");
         for (uint32_t i = 0; i < v.h->n_tokens; ++i) {
@@ -377,8 +366,8 @@ void print_profile(const RadFile& f, int top) {
         std::printf("  ... %zu more (--profile 0 for all)\n", v.size() - (size_t)n);
 }
 
-/* Every plugin on the search path, one line each, in the order the loader registered it: what kind,
- * what it calls itself, what it declares, and the file it came from. */
+/* Every plugin on the search path in registration order: kind, name, what it declares, and its
+ * file. */
 int print_plugins(const std::string& home) {
     LoadedPlugins lp;
     if (rad_tools_load_plugins(home, rad_hierarchy_from_env(), "", "", &lp) < 0) return 1;
@@ -425,7 +414,8 @@ int main(int argc, char** argv) {
         else if (a == "-v" || a == "--verbose") verbose = true;
         else if (a == "--meta")  only_meta = true;
         else if (a == "--vocab") only_vocab = true;
-        else if (a == "--profile") top = std::atoi(next("--profile"));
+        else if (a == "--profile") top = (int)rad_flag_int("rad-info", "--profile", next("--profile"),
+                                                           0, INT32_MAX);
         else if (a == "--recipe") only_recipe = true;
         else if (a == "--plugins") plugins = true;
         else if (a == "--home") home = next("--home");

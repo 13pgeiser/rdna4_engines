@@ -7,13 +7,13 @@
  *   30 layers, hidden 2816, vocab 262144 (tied to the embedding), rms_norm_eps 1e-6
  *   layer_types: five `sliding_attention` then one `full_attention`, five times over
  *     sliding: 16 heads / 8 KV heads x 256, rope theta 1e4 over the whole head, window 1024
- *     full:    16 heads / 2 KV heads x 512, PROPORTIONAL rope theta 1e6 over a quarter of it,
- *              and K IS V (`attention_k_eq_v`): there is no v_proj, V is the k projection before
+ *     full:    16 heads / 2 KV heads x 512, proportional rope theta 1e6 over a quarter of it,
+ *              and K is V (`attention_k_eq_v`): there is no v_proj, V is the k projection before
  *              its norm and its rotary
  *   attention scale 1.0 -- the q/k norms carry the temperature; q and k RMS-normed per head with a
  *   gain, v with none
  *   Gemma's sandwich norms, plain gains (x_hat * w, not 1 + w)
- *   the feed-forward is TWO ARMS BESIDE EACH OTHER, both reading the same residual:
+ *   the feed-forward is two parallel arms, both reading the same residual:
  *     dense    pre_feedforward_layernorm -> gate|up 2112 (gelu-tanh) -> down
  *              -> post_feedforward_layernorm_1
  *     routed   router over rmsnorm(x) * scale * hidden^-0.5 -> softmax -> top 8 of 128 ->
@@ -22,54 +22,53 @@
  *              post_feedforward_layernorm_2
  *     sum -> post_feedforward_layernorm -> residual add
  *   layer_scalar multiplies the residual stream at the end of every layer
- *   embedding scaled by sqrt(hidden) AS A bf16 (53.0, not 53.066); final norm; tied lm_head;
+ *   embedding scaled by sqrt(hidden) rounded to bf16 (53.0, not 53.066); final norm; tied lm_head;
  *   final_logit_softcapping 30
  *
  * The reference is transformers' modeling_gemma4 (Gemma4TextDecoderLayer, Gemma4TextAttention,
  * Gemma4TextRouter, _compute_proportional_rope_parameters), read at 5.19.
  *
- * ============================== THE READINGS THAT STAY PLAUSIBLE WHEN WRONG ==============================
+ * ============================== EASY TO GET SUBTLY WRONG ==============================
  *
- *   PROPORTIONAL ROPE IS NOT A PARTIAL ROTARY. It rotates the first 64 frequency PAIRS of a
- *   512-wide head at theta^(-2j/512) -- the exponent divides by the HEAD, and pair j is channels
- *   (j, j + 256) -- and leaves the other 192 pairs at frequency zero. `rope` with rotary_dim 128
- *   would pair (j, j + 64) at theta^(-2j/128), which is a different function that still produces
- *   fluent text. It is declared here as a full-width NeoX rotary whose frequencies past pair 63
- *   are divided by 1e30 -- the YaRN blend `rope` already carries, with the ramp a step at 63.5..64
- *   -- which evaluates to exactly the reference's angles below the step and to cos 1, sin ~1e-31
- *   above it. See decl_full_rope().
+ *   Proportional rope is not a partial rotary. It rotates the first 64 frequency pairs of a
+ *   512-wide head at theta^(-2j/512) (the exponent divides by the head width, and pair j is
+ *   channels (j, j + 256)) and leaves the other 192 pairs at frequency zero. `rope` with
+ *   rotary_dim 128 would pair (j, j + 64) at theta^(-2j/128), a different function that still
+ *   produces fluent text. It is declared as a full-width NeoX rotary whose frequencies past pair
+ *   63 are divided by 1e30 (the YaRN blend `rope` already has, with the ramp a step at 63.5..64),
+ *   which gives exactly the reference's angles below the step and cos 1, sin ~1e-31 above it. See
+ *   decl_full_rope().
  *
- *   V ON A FULL LAYER IS THE UN-NORMED, UN-ROTATED K PROJECTION, RMS-normed with a unit gain. So
- *   the value norm reads `k` BEFORE the key norm writes it, which is the issue order below.
+ *   V on a full layer is the un-normed, un-rotated k projection, RMS-normed with a unit gain, so
+ *   the value norm must read `k` before the key norm writes it (the issue order below).
  *
- *   THE ROUTER DOES NOT READ THE FEED-FORWARD'S INPUT. It reads the residual stream through a
- *   GAINLESS norm, times its own `scale` vector, times hidden^-0.5 -- one `rmsnorm` with `scale`
- *   as the gain and `mult` the constant -- while the experts read pre_feedforward_layernorm_2's
- *   output and the dense arm pre_feedforward_layernorm's.
+ *   The router does not read the feed-forward's input. It reads the residual stream through a
+ *   gainless norm, times its own `scale` vector, times hidden^-0.5 (one `rmsnorm` with `scale` as
+ *   the gain and `mult` the constant), while the experts read pre_feedforward_layernorm_2's output
+ *   and the dense arm pre_feedforward_layernorm's.
  *
- *   per_expert_scale MULTIPLIES THE RENORMALISED WEIGHT, after the top-k. It is gathered by expert
+ *   per_expert_scale multiplies the renormalised weight, after the top-k. It is gathered by expert
  *   id with `embed_lookup` (a 128 x 1 table) and multiplied in with `mul`.
  *
- *   THE TWO POST-NORMS OF THE ARMS ARE PER ARM, so under tensor parallel each arm's partial sum is
- *   reduced BEFORE its norm. The two partials sit in one [2T, n_embd] buffer -- dense rows first,
- *   routed rows after -- so one all-reduce carries both.
+ *   The arms' post-norms are per arm, so under tensor parallel each arm's partial sum is reduced
+ *   before its norm. The two partials share one [2T, n_embd] buffer (dense rows first, routed
+ *   after), so one all-reduce carries both.
  *
  * ============================== TENSOR PARALLEL ==============================
  *
  * Heads split by rank, o and down by column with an all-reduce, the vocabulary by row. The full
- * layers' two KV heads are REPLICATED past two ranks -- at four, ranks {0,1} hold KV head 0 and
- * {2,3} KV head 1, each reading its head's row span of k_proj -- the scheme rad_arch.h's geom_from
- * describes. Routed experts are EXPERT-PARALLEL (whole experts, 128/world a rank): a 704-wide
- * expert is 5.5 fp8 blocks and has no block-aligned width split. The router is replicated, so
- * every rank agrees on the routing without a collective and the arm's all-reduce sums the ranks'
- * experts.
+ * layers' two KV heads are replicated past two ranks: at four, ranks {0,1} hold KV head 0 and
+ * {2,3} KV head 1, each reading its head's row span of k_proj (rad_arch.h, geom_from). Routed
+ * experts are expert-parallel (whole experts, 128/world per rank), since a 704-wide expert is 5.5
+ * fp8 blocks and has no block-aligned width split. The router is replicated, so every rank agrees
+ * on the routing without a collective, and the arm's all-reduce sums the ranks' experts.
  *
  * ============================== FP8 EXPERTS ==============================
  *
- * The experts are ~90% of the weight bytes and the decode step reads whichever were routed, so
- * their width is the step's bandwidth. Each projection is served as the container holds it --
- * bf16 by `moe_gemm`, block fp8 (the recipe's `rtn codes=fp8_e4m3 block=128x128 scale=bf16`) by
- * `moe_gemm_q` at fp8a8 over an E4M3 input -- per layer and per projection (expert_format):
+ * The experts are ~90% of the weight bytes and decode reads whichever were routed, so their width
+ * sets the step's bandwidth. Each projection is served as the container holds it, per layer and
+ * per projection (expert_format): bf16 by `moe_gemm`, block fp8 (the recipe's `rtn
+ * codes=fp8_e4m3 block=128x128 scale=bf16`) by `moe_gemm_q` at fp8a8 over an E4M3 input:
  *
  *   gate_up  [2 * 704, 2816]: 1408 rows are whole 64-row tiles and eleven 128-row scale blocks
  *            (one straddles gate and up, which only shares a scale); K is 22 blocks. fp8 at the
@@ -80,13 +79,13 @@
  *            padded columns, which meet zero columns of down, so the function is unchanged, and
  *            then both projections are fp8 (data/recipes/gemma4-26b-a4b-df-pad768.recipe).
  *
- * ============================== WHAT THIS PLUGIN DOES NOT YET DECLARE ==============================
+ * ============================== NOT DECLARED ==============================
  *
- *   the vision tower (Gemma 4's, which arch/embgemma2 already declares for an encoder) -- this
- *   serves text; a container that carries a tower is served with --mm-max-patches 0 and the
- *   server refuses a media part by name;
- *   an fp8 attention or dense arm -- under a tenth of the weight bytes, and the dense arm's 2112
- *   is not whole 128-blocks either.
+ *   the vision tower (arch/embgemma2 declares Gemma 4's for an encoder): this plugin serves text;
+ *   a container carrying a tower is served with --mm-max-patches 0 and media parts are refused by
+ *   name;
+ *   an fp8 attention or dense arm: under a tenth of the weight bytes, and the dense arm's 2112 is
+ *   not whole 128-blocks.
  */
 #include <arch/rad_arch.h>
 #include <arch/rad_fp8.h>
@@ -105,92 +104,22 @@ namespace gemma4 {
 
 using namespace rad::arch;
 
-/* The fused router's two bounds, as rad_block_moe_fp8.h states them: the most routing slots
- * libr4d's sort serves in one workgroup (its kScatterSmall), and the skinny bf16 GEMM's decode
- * band, where the fused op's GEMM is that GEMM's own arithmetic. */
+/* The fused router's two bounds (rad_block_moe_fp8.h): the most routing slots libr4d's sort
+ * serves in one workgroup (kScatterSmall), and the skinny bf16 GEMM's decode band, within which the
+ * fused op's GEMM matches that GEMM's arithmetic. */
 static const int64_t kMoeSortRows = 1024;
 static const int64_t kMoeRouterFusedRows = 64;
 
 /* ============================================================== metadata */
 /* Gemma4ForConditionalGeneration nests the text model's config under `text_config`; a
- * Gemma4ForCausalLM checkpoint does not. rad-convert flattens nested keys with dots, so every key
- * is asked for in both spellings, text_config's first. */
-static long long tc_geti(const RadModelMeta* m, const char* k, long long dflt) {
-    const long long sentinel = -0x7FFFFFFFll;
-    char key[160];
-    std::snprintf(key, sizeof key, "text_config.%s", k);
-    long long v = rad_meta_geti(m, key, sentinel);
-    if (v == sentinel) v = rad_meta_geti(m, k, sentinel);
-    return v == sentinel ? dflt : v;
-}
-static double tc_getf(const RadModelMeta* m, const char* k, double dflt) {
-    char key[160];
-    std::snprintf(key, sizeof key, "text_config.%s", k);
-    if (rad_meta_gets(m, key, nullptr)) return rad_meta_getf(m, key, dflt);
-    return rad_meta_getf(m, k, dflt);
-}
-static const char* tc_gets(const RadModelMeta* m, const char* k, const char* dflt) {
-    char key[160];
-    std::snprintf(key, sizeof key, "text_config.%s", k);
-    const char* v = rad_meta_gets(m, key, nullptr);
-    return v ? v : rad_meta_gets(m, k, dflt);
-}
+ * Gemma4ForCausalLM checkpoint does not, so keys are read with meta_text_get*. */
 /* A JSON boolean reaches the meta as 1/0 or as true/false, depending on the converter's path. */
 static bool tc_getb(const RadModelMeta* m, const char* k, bool dflt) {
-    const char* s = tc_gets(m, k, nullptr);
+    const char* s = meta_text_gets(m, k, nullptr);
     if (!s) return dflt;
     if (!std::strcmp(s, "true") || !std::strcmp(s, "True")) return true;
     if (!std::strcmp(s, "false") || !std::strcmp(s, "False") || !std::strcmp(s, "null")) return false;
     return std::atoll(s) != 0;
-}
-
-/* A value as a bf16 tensor holds it: round to nearest even on the top 16 bits of the f32. The
- * reference's embedding scale is a bf16 buffer, so sqrt(2816) = 53.066 multiplies as 53.0. */
-static double bf16_round(double v) {
-    float f = (float)v;
-    uint32_t u;
-    std::memcpy(&u, &f, 4);
-    u = (u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u;
-    std::memcpy(&f, &u, 4);
-    return (double)f;
-}
-
-/* "1 6 11 17 22 27" -> the trunk layers whose output the drafter reads. Out-of-range entries are
- * dropped (llama_fp8.cpp says why). */
-static int parse_ids(const char* s, int64_t n, int* out, int max) {
-    if (!s) return 0;
-    int k = 0;
-    for (const char* p = s; *p && k < max;) {
-        while (*p == ' ' || *p == ',' || *p == '[' || *p == ']') ++p;
-        if (!*p) break;
-        char* e = nullptr;
-        const long v = std::strtol(p, &e, 10);
-        if (e == p) break;
-        p = e;
-        if (v >= 0 && v < n) out[k++] = (int)v;
-    }
-    return k;
-}
-
-/* "sliding_attention full_attention ..." -> 1 for each full layer. */
-static int parse_types(const char* s, std::vector<int>* full) {
-    full->clear();
-    if (!s) return RAD_E_INVAL;
-    for (const char* p = s; *p;) {
-        while (*p == ' ' || *p == ',' || *p == '[' || *p == ']' || *p == '"') ++p;
-        if (!*p) break;
-        const char* t = p;
-        while (*p && *p != ' ' && *p != ',' && *p != ']' && *p != '"') ++p;
-        const size_t len = (size_t)(p - t);
-        if (len == 14 && !std::strncmp(t, "full_attention", 14))         full->push_back(1);
-        else if (len == 17 && !std::strncmp(t, "sliding_attention", 17)) full->push_back(0);
-        else {
-            fprintf(stderr, "radiance: gemma4: layer_types names '%.*s'; this plugin knows "
-                            "full_attention and sliding_attention\n", (int)len, t);
-            return RAD_E_UNSUPPORTED;
-        }
-    }
-    return RAD_OK;
 }
 
 /* ============================================================== the model */
@@ -199,8 +128,8 @@ static int parse_types(const char* s, std::vector<int>* full) {
  * and window, and in whether V has a projection of its own. */
 struct Kind {
     int64_t hd = 0;          /* head_dim */
-    int64_t nh = 0;          /* query heads, THIS rank */
-    int64_t nkv = 0;         /* KV heads, THIS rank */
+    int64_t nh = 0;          /* query heads, this rank */
+    int64_t nkv = 0;         /* KV heads, this rank */
     int64_t nkv_all = 0;
     bool    kv_repl = false; /* KV heads replicated across ranks (world > nkv_all) */
     int64_t kv_off = 0;      /* this rank's first KV row in the unsharded k/v projection */
@@ -223,10 +152,10 @@ struct Layer {
     /* dense arm */
     rad_weight w_fnorm = 0, w_gu = 0, w_dn = 0, w_fpost1 = 0;
     rad_op op_fnorm = 0, op_gu = 0, op_act = 0, op_dn = 0;
-    /* routed arm. Each projection's experts are plain bf16 or block fp8, whichever the container
-     * holds (expert_format). A bf16 projection's handles are its experts in order, one table; an
-     * fp8 one's are the EVEN local experts then the ODD ones, codes in w_egu/w_edn and the scale
-     * views in w_egus/w_edns, so each parity is one run (see declare). */
+    /* routed arm. Each projection's experts are plain bf16 or block fp8, as the container holds
+     * (expert_format). A bf16 projection's handles are its experts in order, one table; an fp8
+     * one's are the even local experts then the odd ones, codes in w_egu/w_edn and scale views in
+     * w_egus/w_edns, so each parity is one run (see declare). */
     rad_weight w_rscale = 0, w_router = 0, w_escale = 0, w_enorm = 0, w_fpost2 = 0;
     std::vector<rad_weight> w_egu, w_edn, w_egus, w_edns;
     bool gu_fp8 = false, dn_fp8 = false;
@@ -244,17 +173,17 @@ struct Layer {
     rad_weight w_fpost = 0, w_scalar = 0;
     rad_op op_ar_f = 0, op_fpost1 = 0, op_fpost2 = 0, op_fsum = 0, op_fpost = 0, op_add_f = 0;
     rad_op op_scale = 0;
-    /* THE SANDWICH JOINS, FUSED: op_join_a is apost + add_a + fnorm, op_join_f the
-     * routed layer's fpost1 + fpost2 + fsum + fpost + add_f + scale. Zero where not served, and
-     * then the chain above is declared and issued instead. */
+    /* The sandwich joins, fused: op_join_a is apost + add_a + fnorm, op_join_f the routed layer's
+     * fpost1 + fpost2 + fsum + fpost + add_f + scale. Zero where not served; the chain above is
+     * then declared and issued instead. */
     rad_op op_join_a = 0, op_join_f = 0;
     /* op_join_r: op_join_a writing the routed arm's two inputs as well -- the router's norm into
      * b_rn and the experts' fp8 codes into b_hq / b_hqs (norm_add_norm_route) -- where the
      * layer's gate_up is block fp8. op_rnorm and op_enorm are then declared and not issued. */
     rad_op op_join_r = 0;
-    /* op_join_f also writes the NEXT norm -- the following layer's input norm, or the final norm
-     * after the last layer -- into `h`, with that norm's gain `w_next`; the norm it replaces is
-     * then neither declared nor issued. */
+    /* op_join_f also writes the next norm (the following layer's input norm, or the final norm
+     * after the last layer) into `h`, with that norm's gain `w_next`; the replaced norm is then
+     * neither declared nor issued. */
     bool next_norm = false;
     rad_weight w_next = 0;
     /* the drafter's tap, on a layer the drafter reads (see declare) */
@@ -266,7 +195,7 @@ struct Model {
     Geom    g{};             /* the sliding kind's geometry, and everything model-wide */
     Kind    ks{}, kf{};      /* sliding, full */
     int64_t n_layer = 0, E = 0;
-    int64_t n_ff = 0;        /* dense arm, THIS rank */
+    int64_t n_ff = 0;        /* dense arm, this rank */
     bool    moe = false;
     int64_t n_expert = 0, n_local = 0, expert_base = 0, top_k = 0, n_ffe = 0;
     int64_t moe_rows = 0;    /* tokens a routed pass */
@@ -329,9 +258,9 @@ static int split_heads(Kind& k, int64_t nh_all, int world, int rank, const char*
         k.kv_repl = false;
         k.kv_off = rank * k.nkv * k.hd;
     } else {
-        /* REPLICATED: ranks [i*r, (i+1)*r) share KV head i, r = world / nkv_all. A rank's query
-         * heads [rank*nh, (rank+1)*nh) all belong to that head because gqa = nh_all / nkv_all is a
-         * multiple of nh exactly when world is a multiple of nkv_all -- which is checked. */
+        /* Replicated: ranks [i*r, (i+1)*r) share KV head i, r = world / nkv_all. A rank's query
+         * heads [rank*nh, (rank+1)*nh) all belong to that head, because gqa = nh_all / nkv_all is a
+         * multiple of nh exactly when world is a multiple of nkv_all, which is checked. */
         if (world % k.nkv_all) {
             fprintf(stderr, "radiance: gemma4: %d ranks cannot replicate %lld %s KV heads; the "
                             "world must be a multiple of the KV head count\n", world,
@@ -345,8 +274,8 @@ static int split_heads(Kind& k, int64_t nh_all, int world, int rank, const char*
     return RAD_OK;
 }
 
-/* THE FULL LAYERS' ROTARY (see the header). `rope` rotates n_head + n_head_kv heads of its operand,
- * so a q-only tensor is n_head = nh, n_head_kv = 0 and a k-only one n_head = nkv. */
+/* The full layers' rotary (see the file header). `rope` rotates n_head + n_head_kv heads of its
+ * operand, so a q-only tensor is n_head = nh, n_head_kv = 0 and a k-only one n_head = nkv. */
 static rad_op decl_full_rope(RadBuilder* b, const Kind& k, int64_t rows, int64_t heads) {
     const int64_t half = k.hd / 2;
     if (k.rot_pairs >= half)
@@ -375,40 +304,12 @@ static rad_op decl_full_rope(RadBuilder* b, const Kind& k, int64_t rows, int64_t
 static int declare_dflash(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx,
                           Model& m, int base_layer) {
     Names& nm = m.nm;
-    Geom   dg = m.g;
-    dg.n_layer       = rad_meta_geti(meta, "draft.num_hidden_layers", 0);
-    dg.head_dim      = rad_meta_geti(meta, "draft.head_dim", 0);
-    dg.n_head_all    = rad_meta_geti(meta, "draft.num_attention_heads", 0);
-    dg.n_head_kv_all = rad_meta_geti(meta, "draft.num_key_value_heads", 0);
-    dg.n_ff_all      = rad_meta_geti(meta, "draft.intermediate_size", 0);
-    dg.eps           = (float)rad_meta_getf(meta, "draft.rms_norm_eps", 0.0);
-    dg.theta         = (float)rad_meta_getf(meta, "draft.rope_parameters.rope_theta",
-                                            rad_meta_getf(meta, "draft.rope_theta", 0.0));
-    dg.wadd = dg.wadd_qk = 0.0f;
-    if (dg.n_layer <= 0 || dg.head_dim <= 0 || dg.n_head_all <= 0 || dg.n_head_kv_all <= 0 ||
-        dg.n_ff_all <= 0 || !(dg.eps > 0.0f) || !(dg.theta > 0.0f)) {
-        fprintf(stderr, "radiance: gemma4: the container's `draft.` config does not describe a "
-                        "DFlash drafter: layers %lld, heads %lld / kv %lld, head_dim %lld, ffn "
-                        "%lld, rms_eps %g, rope_theta %g\n",
-                (long long)dg.n_layer, (long long)dg.n_head_all, (long long)dg.n_head_kv_all,
-                (long long)dg.head_dim, (long long)dg.n_ff_all, (double)dg.eps, (double)dg.theta);
-        return RAD_E_INVAL;
-    }
+    Geom   dg{};
+    RAD_ARCH_TRY(drafter_geom(dg, m.g, meta, "gemma4 DFlash"));
     if (rad_meta_geti(meta, "draft.hidden_size", dg.n_embd) != dg.n_embd) {
         fprintf(stderr, "radiance: gemma4: the drafter is %lld wide and the target %lld; it reads "
                         "the target's embedding and head, so it is not this target's drafter\n",
                 (long long)rad_meta_geti(meta, "draft.hidden_size", 0), (long long)dg.n_embd);
-        return RAD_E_UNSUPPORTED;
-    }
-    RAD_ARCH_TRY(yarn_from(dg, meta, "draft.", dg.head_dim));
-    int s;
-    if ((s = divide_or_fail(dg.n_head_all,    dg.world, "draft num_attention_heads", &dg.n_head))    < 0) return s;
-    if ((s = divide_or_fail(dg.n_head_kv_all, dg.world, "draft num_key_value_heads", &dg.n_head_kv)) < 0) return s;
-    if ((s = divide_or_fail(dg.n_ff_all,      dg.world, "draft intermediate_size",   &dg.n_ff))      < 0) return s;
-    const long long dvocab = rad_meta_geti(meta, "draft.vocab_size", dg.n_vocab_all);
-    if (dvocab != dg.n_vocab_all) {
-        fprintf(stderr, "radiance: gemma4: the drafter claims a %lld-token vocabulary and the "
-                        "target has %lld\n", dvocab, (long long)dg.n_vocab_all);
         return RAD_E_UNSUPPORTED;
     }
 
@@ -436,7 +337,8 @@ static int declare_dflash(RadBuilder* b, const RadModelMeta* meta, const RadBuil
         std::vector<int> full;
         const char* lt = rad_meta_gets(meta, "draft.layer_types", nullptr);
         if (lt) {
-            RAD_ARCH_TRY(parse_types(lt, &full));
+            RAD_ARCH_TRY(parse_layer_kinds("gemma4", lt, {"full_attention"}, "sliding_attention",
+                                          &full));
             if ((int64_t)full.size() != dg.n_layer) {
                 fprintf(stderr, "radiance: gemma4: the drafter's layer_types names %zu layers and "
                                 "it has %lld\n", full.size(), (long long)dg.n_layer);
@@ -461,19 +363,11 @@ static int declare_dflash(RadBuilder* b, const RadModelMeta* meta, const RadBuil
         }
     }
 
-    /* ONE CACHE FOR ALL FIVE LAYERS, unbounded, because the full layer reads every position. The
-     * sliding layers bound themselves with their attention op's `window`, so the declared drafter
-     * window is 0 and the core stages the whole context. A window group for the four sliding
-     * layers would cap their share at the window; it is the obvious saving once this runs. */
-    RadKVGroupDecl dd{};
-    dd.kind      = RAD_KV_FULL;
-    dd.dtype     = rad_kv_cache_dtype(ctx, RAD_BF16);
-    dd.n_head_kv = dg.n_head_kv;
-    dd.head_dim  = dg.head_dim;
-    m.kv_draft = rad_decl_kv_group(b, nm.f("kv_draft"), &dd);
-    for (int64_t l = 0; l < dg.n_layer; ++l)
-        RAD_ARCH_TRY(rad_bind_layer_kv(b, base_layer + (int)l, m.kv_draft));
-    dg.kv_dtype = rad_dtype_name(dd.dtype);
+    /* One unbounded cache for all the drafter's layers, because its full layer reads every
+     * position. The sliding layers bound themselves with their attention op's `window`, so the
+     * declared drafter window is 0 and the core stages the whole context. A separate window group
+     * for the sliding layers would save memory. */
+    RAD_ARCH_TRY(drafter_kv_group(b, nm, ctx, dg, 0, base_layer, &m.kv_draft));
 
     const int64_t qd  = dg.n_head * dg.head_dim;
     const int64_t kvd = dg.n_head_kv * dg.head_dim;
@@ -522,8 +416,8 @@ static int declare_dflash(RadBuilder* b, const RadModelMeta* meta, const RadBuil
                 (long long)dg.n_vocab_all, dg.world);
         return RAD_E_UNSUPPORTED;
     }
-    /* THE DRAFT, one row a draft position -- [n_seq * steps, 1], which is [n_seq, steps] with a
-     * pitch of `steps` -- and the engine reads it by the declaration below. */
+    /* The draft, one row per draft position: [n_seq * steps, 1], i.e. [n_seq, steps] with pitch
+     * `steps`, read by the engine through the drafter declaration below. */
     dw.tokens = decl_b(b, nm.f("dflash_tokens"), RAD_I32, {sr, 1});
 
     RAD_ARCH_TRY(m.df.declare(b, nm, dg, dc, base_layer, m.kv_draft, m.w_tok, "draft", dw,
@@ -565,11 +459,10 @@ static int declare_dflash(RadBuilder* b, const RadModelMeta* meta, const RadBuil
 
 /* ============================================================== the experts' encoding */
 
-/* WHAT ONE EXPERT PROJECTION IS STORED AS -- the container's entry, or in rad-convert the recipe's
- * plan for it (rad_weight_encoding) -- which picks the GEMM: plain bf16 is `moe_gemm`, block fp8
- * (fp8_e4m3 codes, a bf16 scale a 128x128 block) is `moe_gemm_q` at fp8a8. Anything else is
- * refused by name. A builder with no model behind it answers nothing, and the declared dtype is
- * then what is read: bf16. */
+/* How one expert projection is stored (the container's entry, or in rad-convert the recipe's
+ * plan, rad_weight_encoding), which picks the GEMM: plain bf16 is `moe_gemm`, block fp8 (fp8_e4m3
+ * codes, a bf16 scale per 128x128 block) is `moe_gemm_q` at fp8a8. Anything else is refused by
+ * name. A builder with no model behind it answers nothing, and the declared dtype bf16 is read. */
 enum { EXP_BF16 = 0, EXP_FP8 = 1 };
 static int expert_format(RadBuilder* b, const char* wn, int* fmt) {
     RadEncoding e{};
@@ -588,8 +481,8 @@ static int expert_format(RadBuilder* b, const char* wn, int* fmt) {
     return RAD_E_DTYPE;
 }
 
-/* ONE ENCODING A PROJECTION A LAYER, because one table of experts takes one: the first local
- * expert's decides, and every other has to match it. `what` is "gate_up" or "down". */
+/* One encoding per projection per layer, since one expert table takes one: the first local
+ * expert's decides and every other must match. `what` is "gate_up" or "down". */
 static int layer_expert_format(RadBuilder* b, Names& nm, int64_t l, int64_t base, int64_t n,
                                const char* what, int* fmt) {
     for (int64_t e = 0; e < n; ++e) {
@@ -633,9 +526,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     Names& nm = m.nm;
     Geom&  g  = m.g;
 
-    /* ---- what this plugin is NOT, refused by name. */
-    if (tc_geti(meta, "hidden_size_per_layer_input", 0) > 0 ||
-        tc_geti(meta, "num_kv_shared_layers", 0) > 0 || tc_getb(meta, "use_double_wide_mlp", false) ||
+    /* ---- variants this plugin does not serve, refused by name. */
+    if (meta_text_geti(meta, "hidden_size_per_layer_input", 0) > 0 ||
+        meta_text_geti(meta, "num_kv_shared_layers", 0) > 0 || tc_getb(meta, "use_double_wide_mlp", false) ||
         tc_getb(meta, "attention_bias", false)) {
         fprintf(stderr, "radiance: gemma4: this checkpoint uses per-layer embeddings, shared KV "
                         "layers, a double-wide MLP or attention biases (the E2B/E4B shape); this "
@@ -643,7 +536,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return RAD_E_UNSUPPORTED;
     }
     {
-        const char* act = tc_gets(meta, "hidden_activation", "");
+        const char* act = meta_text_gets(meta, "hidden_activation", "");
         if (!act || std::strcmp(act, "gelu_pytorch_tanh")) {
             fprintf(stderr, "radiance: gemma4: hidden_activation '%s'; this plugin serves "
                             "gelu_pytorch_tanh\n", act ? act : "");
@@ -651,22 +544,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
     }
 
-    /* ---- the geometry. Read, never derived: head_dim is not hidden / heads on this family. */
-    m.n_layer = meta->n_layers > 0 ? meta->n_layers : tc_geti(meta, "num_hidden_layers", 0);
-    m.E       = tc_geti(meta, "hidden_size", meta->n_embd);
-    const int64_t nh_all  = tc_geti(meta, "num_attention_heads", meta->n_head);
-    const int64_t vocab   = tc_geti(meta, "vocab_size", meta->n_vocab);
-    const int64_t ff_all  = tc_geti(meta, "intermediate_size", meta->n_ff);
-    const double  eps     = tc_getf(meta, "rms_norm_eps", meta->rms_eps);
-    m.ks.hd      = tc_geti(meta, "head_dim", meta->head_dim);
-    m.ks.nkv_all = tc_geti(meta, "num_key_value_heads", meta->n_head_kv);
-    m.kf.hd      = tc_geti(meta, "global_head_dim", m.ks.hd);
-    m.kf.nkv_all = tc_geti(meta, "num_global_key_value_heads", m.ks.nkv_all);
+    /* ---- the geometry, read rather than derived: head_dim is not hidden / heads here. */
+    m.n_layer = meta->n_layers > 0 ? meta->n_layers : meta_text_geti(meta, "num_hidden_layers", 0);
+    m.E       = meta_text_geti(meta, "hidden_size", meta->n_embd);
+    const int64_t nh_all  = meta_text_geti(meta, "num_attention_heads", meta->n_head);
+    const int64_t vocab   = meta_text_geti(meta, "vocab_size", meta->n_vocab);
+    const int64_t ff_all  = meta_text_geti(meta, "intermediate_size", meta->n_ff);
+    const double  eps     = meta_text_getf(meta, "rms_norm_eps", meta->rms_eps);
+    m.ks.hd      = meta_text_geti(meta, "head_dim", meta->head_dim);
+    m.ks.nkv_all = meta_text_geti(meta, "num_key_value_heads", meta->n_head_kv);
+    m.kf.hd      = meta_text_geti(meta, "global_head_dim", m.ks.hd);
+    m.kf.nkv_all = meta_text_geti(meta, "num_global_key_value_heads", m.ks.nkv_all);
     m.kf.k_eq_v  = tc_getb(meta, "attention_k_eq_v", false);
-    m.ks.theta   = tc_getf(meta, "rope_parameters.sliding_attention.rope_theta", 0.0);
-    m.kf.theta   = tc_getf(meta, "rope_parameters.full_attention.rope_theta", 0.0);
-    m.ks.window  = tc_geti(meta, "sliding_window", 0);   /* HF: q - k < window, attn_paged's rule */
-    m.softcap    = tc_getf(meta, "final_logit_softcapping", 0.0);
+    m.ks.theta   = meta_text_getf(meta, "rope_parameters.sliding_attention.rope_theta", 0.0);
+    m.kf.theta   = meta_text_getf(meta, "rope_parameters.full_attention.rope_theta", 0.0);
+    m.ks.window  = meta_text_geti(meta, "sliding_window", 0);   /* HF: q - k < window, attn_paged's rule */
+    m.softcap    = meta_text_getf(meta, "final_logit_softcapping", 0.0);
     if (m.n_layer <= 0 || m.E <= 0 || nh_all <= 0 || vocab <= 0 || ff_all <= 0 || !(eps > 0) ||
         m.ks.hd <= 0 || m.ks.nkv_all <= 0 || m.kf.hd <= 0 || m.kf.nkv_all <= 0 ||
         !(m.ks.theta > 0) || !(m.kf.theta > 0) || m.ks.window <= 0) {
@@ -678,13 +571,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 (long long)m.ks.window, (long long)m.kf.hd, (long long)m.kf.nkv_all, m.kf.theta);
         return RAD_E_INVAL;
     }
-    /* The two rotaries. The sliding one is the ordinary full-head NeoX; the full one is read for
-     * its type and its proportion and refused if it is anything this plugin does not compute. */
+    /* The two rotaries. The sliding one is ordinary full-head NeoX; the full one's type and
+     * proportion are read and refused if this plugin does not compute them. */
     {
-        const char* st = tc_gets(meta, "rope_parameters.sliding_attention.rope_type", "default");
-        const char* ft = tc_gets(meta, "rope_parameters.full_attention.rope_type", "default");
-        const double prf = tc_getf(meta, "rope_parameters.full_attention.partial_rotary_factor", 1.0);
-        const double ff  = tc_getf(meta, "rope_parameters.full_attention.factor", 1.0);
+        const char* st = meta_text_gets(meta, "rope_parameters.sliding_attention.rope_type", "default");
+        const char* ft = meta_text_gets(meta, "rope_parameters.full_attention.rope_type", "default");
+        const double prf = meta_text_getf(meta, "rope_parameters.full_attention.partial_rotary_factor", 1.0);
+        const double ff  = meta_text_getf(meta, "rope_parameters.full_attention.factor", 1.0);
         if (std::strcmp(st, "default") || (std::strcmp(ft, "default") && std::strcmp(ft, "proportional")) ||
             ff != 1.0 || !(prf > 0.0) || prf > 1.0) {
             fprintf(stderr, "radiance: gemma4: rotary '%s' (sliding) and '%s' factor %g "
@@ -701,7 +594,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
 
     std::vector<int> full;
-    RAD_ARCH_TRY(parse_types(tc_gets(meta, "layer_types", nullptr), &full));
+    const char* lt = meta_text_gets(meta, "layer_types", nullptr);
+    if (!lt) return RAD_E_INVAL;
+    RAD_ARCH_TRY(parse_layer_kinds("gemma4", lt, {"full_attention"}, "sliding_attention", &full));
     if ((int64_t)full.size() != m.n_layer) {
         fprintf(stderr, "radiance: gemma4: layer_types names %zu layers and the model has %lld\n",
                 full.size(), (long long)m.n_layer);
@@ -748,9 +643,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* ---- the routed arm's geometry. */
     m.moe = tc_getb(meta, "enable_moe_block", false);
     if (m.moe) {
-        m.n_expert = tc_geti(meta, "num_experts", meta->n_expert);
-        m.top_k    = tc_geti(meta, "top_k_experts", meta->n_expert_used);
-        m.n_ffe    = tc_geti(meta, "moe_intermediate_size", 0);
+        m.n_expert = meta_text_geti(meta, "num_experts", meta->n_expert);
+        m.top_k    = meta_text_geti(meta, "top_k_experts", meta->n_expert_used);
+        m.n_ffe    = meta_text_geti(meta, "moe_intermediate_size", 0);
         if (m.n_expert <= 0 || m.top_k <= 0 || m.top_k > m.n_expert || m.n_ffe <= 0) {
             fprintf(stderr, "radiance: gemma4: enable_moe_block with %lld experts, top %lld, of "
                             "%lld\n", (long long)m.n_expert, (long long)m.top_k,
@@ -760,12 +655,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RAD_ARCH_TRY(divide_or_fail(m.n_expert, W, "num_experts", &m.n_local));
         m.expert_base = (int64_t)R * m.n_local;
         /* A pass bounds the [rows * top_k, ...] expert planes; 2048 tokens is one pass at the
-         * default chunk. */
+         * default chunk size. */
         m.moe_rows = T < 2048 ? T : 2048;
     }
 
-    /* ---- the embedding scale and the rotary scaling the converter may have written. */
-    m.escale = bf16_round(std::sqrt((double)E));
+    /* ---- the embedding scale and the rotary scaling the converter may have written. The scale
+     * is rounded to bf16 because the reference holds it in a bf16 buffer: sqrt(2816) = 53.066
+     * multiplies as 53.0. */
+    m.escale = rad_bf16_to_f32(rad_f32_to_bf16((float)std::sqrt((double)E)));
     RAD_ARCH_TRY(yarn_from(g, meta, "", m.ks.hd));
     if (g.yarn.factor != 0.0f || g.rope_scale != 1.0f) {
         fprintf(stderr, "radiance: gemma4: --rope-scaling is not implemented for this family's "
@@ -773,29 +670,23 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return RAD_E_UNSUPPORTED;
     }
 
-    /* ---- the KV groups, one a geometry: the sliding layers' (256-wide heads) and the full
+    /* ---- the KV groups, one per geometry: the sliding layers' (256-wide heads) and the full
      * layers' (512).
      *
-     * THE SLIDING LAYERS' GROUP IS RAD_KV_FULL, NOT RAD_KV_WINDOW, and the window lives on the
-     * attention op (`window` 1024), which reads only the keys inside it. A WINDOW group is not
-     * prefix-cached (core/mem/prefix.cpp: a hit's blocks do not describe a cache whose floor
-     * moves). Before the scheduler knew that, a hit gave the sliding layers a table whose reused
-     * prefix was never written for this request -- recycled blocks of other conversations, and a
-     * reply that answers someone else's question; now a hit on a model with a windowed trunk group
-     * reuses nothing and re-prefills (core/sched). As FULL the group is cached with the others and
-     * a hit is kept, exactly; the drafter's KV gets no hole either. What it costs is the recycling
-     * below the window, which buys nothing here: the planner gives every paged group the same
-     * block count, so the full group bounds the tokens a card holds either way. */
+     * The sliding layers' group is RAD_KV_FULL, not RAD_KV_WINDOW; the window lives on the
+     * attention op (`window` 1024), which reads only keys inside it. A window group is not
+     * prefix-cached (core/mem/prefix.cpp), so a prefix hit on a model with one reuses nothing and
+     * re-prefills (core/sched). As FULL the group is cached with the others and the drafter's KV
+     * has no hole. The only loss is recycling below the window, which gains nothing here: the
+     * planner gives every paged group the same block count, so the full group bounds the tokens a
+     * card holds anyway. */
     {
         RadKVGroupDecl d{};
         d.kind = RAD_KV_FULL;
         d.dtype = rad_kv_cache_dtype(ctx, RAD_BF16);
-        d.window = 0;
         d.n_head_kv = m.ks.nkv;
         d.head_dim = m.ks.hd;
         m.ks.kv = rad_decl_kv_group(b, nm.f("kv_swa"), &d);
-        d.kind = RAD_KV_FULL;
-        d.window = 0;
         d.n_head_kv = m.kf.nkv;
         d.head_dim = m.kf.hd;
         m.kf.kv = rad_decl_kv_group(b, nm.f("kv_full"), &d);
@@ -808,10 +699,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     const char* L = (archs && std::strstr(archs, "Gemma4ForCausalLM")) ? "model"
                                                                        : "model.language_model";
 
-    /* ---- THE EXPERTS' NAME MAPS, AND FROM THEM WHAT EACH LAYER'S EXPERTS ARE, before any buffer:
-     * an fp8 projection reads an E4M3 input that a bf16 one does not, and a plane nothing reads
-     * is still charged by the planner. One stacked tensor a projection a layer, sliced by the
-     * GLOBAL expert index -- this rank declares its window into the checkpoint's experts. */
+    /* ---- the experts' name maps, and from them each layer's expert format, before any buffer:
+     * an fp8 projection reads an E4M3 input a bf16 one does not, and an unread plane would still
+     * be charged by the planner. One stacked tensor per projection per layer, sliced by the global
+     * expert index: this rank declares its window into the checkpoint's experts. */
     m.layers.resize((size_t)m.n_layer);
     if (m.moe) {
         const int64_t NL = m.n_local;
@@ -830,8 +721,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             RAD_ARCH_TRY(layer_expert_format(b, nm, l, m.expert_base, NL, "down", &fdn));
             y.gu_fp8 = fgu == EXP_FP8;
             y.dn_fp8 = fdn == EXP_FP8;
-            /* moe_gemm_q's geometry, refused here by name rather than as a kernel miss. Its
-             * experts are two tables by parity, so a rank holds an even count of them. */
+            /* moe_gemm_q's geometry, refused here by name rather than as a kernel miss. It takes
+             * experts as two tables by parity, so a rank must hold an even count. */
             if ((y.gu_fp8 || y.dn_fp8) && NL % 2) {
                 fprintf(stderr, "radiance: gemma4: block fp8 experts come in pairs on a rank (the "
                                 "fp8 grouped GEMM takes them as two tables by parity); this rank "
@@ -900,8 +791,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     m.b_hout = decl_b(b, nm.f("h_out"), RAD_BF16, {g.max_logit_rows, E});
 
-    /* ---- the drafter's taps: declared when the container carries a DFlash drafter AND this serve
-     * speculates. DFlash2 is refused by name -- its convolutions and selector are another block. */
+    /* ---- the drafter's taps, declared when the container carries a DFlash drafter and this
+     * serve speculates. DFlash2 is refused by name: its convolutions and selector are another
+     * block. */
     if (ctx->max_spec > 0) {
         const char* da = rad_meta_gets(meta, "draft.architectures", "");
         if (da && std::strstr(da, "DFlash2")) {
@@ -912,7 +804,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (da && std::strstr(da, "DFlash")) {
             const char* ids = rad_meta_gets(meta, "draft.dflash_config.target_layer_ids", nullptr);
             if (!ids) ids = rad_meta_gets(meta, "draft.target_layer_ids", nullptr);
-            m.n_taps = parse_ids(ids, m.n_layer, m.tap_layer, Model::MAX_TAPS);
+            m.n_taps = parse_layer_ids(ids, m.n_layer, m.tap_layer, Model::MAX_TAPS);
             if (m.n_taps <= 0) {
                 fprintf(stderr, "radiance: gemma4: the drafter names no trunk layer this model "
                                 "has; it is paired with a different target\n");
@@ -925,9 +817,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_logits = decl_b(b, nm.f("logits"), RAD_F32, {g.max_logit_rows, g.n_vocab});
     RAD_ARCH_TRY(rad_declare_logits(b, m.b_logits));
 
-    /* ---- the vocabulary edges: ONE table, row-sharded with the vocabulary, read as the embedding
-     * by `embed_lookup` and as the head by `logits_gemm` -- Gemma ties them, so storing the head
-     * a second time would be 1.4 GiB for nothing. */
+    /* ---- the vocabulary edges: one table, row-sharded with the vocabulary, read as the embedding
+     * by `embed_lookup` and as the head by `logits_gemm`. Gemma ties them; a second copy would be
+     * 1.4 GiB. */
     m.tok_src = nm.ckpt("%s.embed_tokens.weight", L);
     RAD_ARCH_TRY(map_copy(b, nm.f("token_embd.weight"), m.tok_src));
     RAD_ARCH_TRY(map_copy(b, nm.f("output_norm.weight"), nm.ckpt("%s.norm.weight", L)));
@@ -949,7 +841,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                RAD_NOWEIGHTS),
                            {m.b_x}, {m.b_x});
 
-    /* ---- small declaration helpers, every one rows-banded at the step's height unless told. */
+    /* ---- small declaration helpers, each banded over rows up to the step's height unless
+     * given another bound. */
     auto rmsnorm = [&](int64_t rows, int64_t n, rad_weight w, double mult, rad_buf in, rad_buf out) {
         rad_op h = w ? RAD_OP(b, "rmsnorm",
                               RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
@@ -1013,15 +906,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                   {kb, vb}, {});
     };
 
-    /* THE SANDWICH JOINS, expert_scale AND attn_paged_qrow: asked of the kernel libraries as one
-     * op each and declared as the chain where they do not resolve. Not every library declares them
-     * -- libr4d does, with device rows; libref and libavx do not -- and declaring an op no loaded
-     * library declares is an error, so each is asked about first (rad_op_declared). A deployment
-     * where none is declared -- a CPU-only build, a --kernels list without libr4d -- or where none
-     * resolves -- the host backend -- runs the chain. The fused kernels round where the host chain
-     * rounds (libr4d/r4d_norm_join_bf16.hip); on a card they differ from libr4d's chain by the
-     * order of its reductions. libref has no row for them on purpose, so "nothing serves them"
-     * stays reachable. */
+    /* The sandwich joins, expert_scale and attn_paged_qrow are each requested as one op and
+     * declared as the chain where they do not resolve. Only libr4d declares them (device rows; not
+     * libref or libavx), and declaring an op no loaded library declares is an error, so each is
+     * checked first with rad_op_declared. A CPU-only build, a --kernels list without libr4d, or
+     * the host backend runs the chain. The fused kernels round where the host chain rounds
+     * (libr4d/r4d_norm_join_bf16.hip); on a card they differ from libr4d's chain only in reduction
+     * order. libref deliberately has no row for them, so the chain path stays tested. */
     const bool has_join_a = rad_op_declared(b, "norm_add_norm") != 0;
     const bool has_join_r = rad_op_declared(b, "norm_add_norm_route") != 0;
     const bool has_join_f = rad_op_declared(b, "join_add_scale") != 0;
@@ -1030,9 +921,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     int n_joins = 0, n_route = 0;
 
     const int A = RAD_ACCESS_PER_TOKEN, N = RAD_SHARD_NONE;
-    /* EVERY LAYER'S INPUT NORM GAIN, AHEAD OF THE LAYERS: a feed-forward join writes the next
-     * layer's input norm (join_add_scale's `y`) and so names that layer's gain before the layer
-     * itself is declared. */
+    /* Every layer's input norm gain, declared ahead of the layers: a feed-forward join writes the
+     * next layer's input norm (join_add_scale's `y`), naming that gain before its layer is
+     * declared. */
     for (int64_t l = 0; l < m.n_layer; ++l) {
         const long long ll = (long long)l;
         RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.attn_norm.weight", ll),
@@ -1064,18 +955,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                            RAD_SHARD_COL, gl);
         y.w_apost = decl_w(b, nm.f("blk.%lld.attn_post_norm.weight", ll), RAD_F32, {E}, A, N, gl);
         if (!y.full) {
-            /* ONE PROJECTION, q|k|v, three row parts: every rank takes its slice of each. */
+            /* One projection, q|k|v, three row parts: every rank takes its slice of each. */
             RAD_ARCH_TRY(map_concat(b, nm.f("blk.%lld.attn_qkv.weight", ll),
                                     { src("self_attn.q_proj.weight"), src("self_attn.k_proj.weight"),
                                       src("self_attn.v_proj.weight") }));
-            if (!k.kv_repl) {
-                y.w_qkv = decl_w(b, nm.f("blk.%lld.attn_qkv.weight", ll), RAD_BF16,
-                                 {k.q() + 2 * k.kv_dim(), E}, A, RAD_SHARD_ROW, gl, 0,
-                                 {k.q(), k.kv_dim(), k.kv_dim()});
-            } else {
-                y.w_qkv = decl_w(b, nm.f("blk.%lld.attn_qkv.weight", ll), RAD_BF16,
-                                 {k.q() + 2 * k.kv_dim(), E}, A, RAD_SHARD_ROW, gl, 0,
-                                 {k.q(), k.kv_dim(), k.kv_dim()});
+            y.w_qkv = decl_w(b, nm.f("blk.%lld.attn_qkv.weight", ll), RAD_BF16,
+                             {k.q() + 2 * k.kv_dim(), E}, A, RAD_SHARD_ROW, gl, 0,
+                             {k.q(), k.kv_dim(), k.kv_dim()});
+            if (k.kv_repl) {
                 const int64_t lo[3] = { R * k.q(), k.kv_off, k.kv_off };
                 const int64_t hi[3] = { lo[0] + k.q(), lo[1] + k.kv_dim(), lo[2] + k.kv_dim() };
                 const int64_t tot[3] = { nh_all * k.hd, k.nkv_all * k.hd, k.nkv_all * k.hd };
@@ -1111,22 +998,21 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                            RAD_F64("wadd", 0.0), RAD_INT("v_norm", 1)),
                                 RAD_WEIGHTS(y.w_qn, y.w_kn)),
                             {m.b_qkv}, {m.b_qkv});
-            /* Q IS READ WHERE THE PROJECTION LEFT IT, a column slice of the fused [q|k|v] row, by
-             * `attn_paged_qrow` -- attn_paged with q at its own row pitch, an op of its own so
-             * that no `--kernels` order can hand the slice to a kernel that reads q only dense
-             * (one refuses it with RAD_E_STRIDE, which stops the engine). That saves the
-             * lift: a launch and a [T, q] round trip a sliding layer. Where the op is not declared
-             * or does not resolve, q is lifted into a dense block for attn_paged, which every
-             * attention library takes. Asked once, because every
-             * sliding layer asks the same question; a miss is still the group's first op carrying
-             * a block_size, and answers rad_kv_block_size with the RAD_KV_BLOCK it declares. */
+            /* q is read in place, a column slice of the fused [q|k|v] row, by `attn_paged_qrow`
+             * (attn_paged with q at its own row pitch). It is a separate op so no `--kernels`
+             * order can hand the slice to a kernel that reads q only dense (which would refuse it
+             * with RAD_E_STRIDE and stop the engine). This saves a launch and a [T, q] round trip
+             * per sliding layer. Where the op is not declared or does not resolve, q is copied
+             * into a dense block for attn_paged. Asked once for all sliding layers; even a miss
+             * is the group's first op carrying a block_size, so rad_kv_block_size answers with
+             * its RAD_KV_BLOCK. */
             if (has_qrow && m.qrow != 0) {
                 y.op_attn = attn(k, m.b_qkv, m.b_atts, "attn_paged_qrow");
                 m.qrow = y.op_attn ? 1 : 0;
             }
             if (!y.op_attn) {
-                /* declared here, not with the others: a buffer no op names is live for the whole
-                 * program, and where q is read in place nothing names this one */
+                /* Declared here, not with the others: a buffer no op names is live for the whole
+                 * program, and when q is read in place nothing names this one. */
                 if (!m.b_qs) m.b_qs = decl_b(b, nm.f("q_s"), RAD_BF16, {T, k.q()});
                 y.op_lift = rw(b, RAD_OP(b, "cast",
                                     RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", k.q()),
@@ -1140,7 +1026,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         } else {
             y.op_q     = gemm(T, k.q(), E, y.w_q, m.b_h, m.b_qf);
             y.op_k     = gemm(T, k.kv_dim(), E, y.w_k, m.b_h, m.b_kf);
-            /* V FIRST: the unit-gain norm of the RAW k projection, before the key norm writes k. */
+            /* V first: the unit-gain norm of the raw k projection, before the key norm writes k. */
             y.op_vnorm = rmsnorm(T * k.nkv, k.hd, 0, 1.0, m.b_kf, m.b_vf);
             y.op_qn    = rmsnorm(T * k.nh, k.hd, y.w_qn, 1.0, m.b_qf, m.b_qf);
             y.op_kn    = rmsnorm(T * k.nkv, k.hd, y.w_kn, 1.0, m.b_kf, m.b_kf);
@@ -1151,8 +1037,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             y.op_o     = gemm(T, E, k.q(), y.w_o, m.b_attf, m.b_o);
         }
         if (W > 1) y.op_ar_o = allreduce(T * E, m.b_o);
-        /* The post-norm AFTER the reduction: it is a norm of the whole sum. Declared below, with the
-         * dense arm's pre-norm, as one `norm_add_norm` where a kernel library serves it. */
+        /* The post-norm comes after the reduction, since it normalises the whole sum. Declared
+         * below with the dense arm's pre-norm, as one `norm_add_norm` where a kernel serves it. */
 
         /* ------------------------------------------------ the dense arm */
         RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.ffn_norm.weight", ll), src("pre_feedforward_layernorm.weight")));
@@ -1171,9 +1057,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         /* bf16 and one element: the reference multiplies the bf16 stream by it. */
         y.w_scalar = decl_w(b, nm.f("blk.%lld.layer_scalar", ll), RAD_BF16, {1}, A, N, gl);
 
-        /* The routed arm's two input norms -- the router's gain and the experts' pre-norm -- are
-         * declared here, ahead of the attention join, which writes both inputs where
-         * `norm_add_norm_route` is served and an op names its weights after they are declared. */
+        /* The routed arm's two input norm gains (the router's and the experts' pre-norm) are
+         * declared here, before the attention join, which writes both inputs where
+         * `norm_add_norm_route` is served; an op can only name weights already declared. */
         if (m.moe) {
             RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.ffn_norm_exps.weight", ll),
                                   src("pre_feedforward_layernorm_2.weight")));
@@ -1183,10 +1069,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             y.w_rscale = decl_w(b, nm.f("blk.%lld.ffn_gate_inp.scale", ll), RAD_F32, {E}, A, N, gl);
         }
 
-        /* THE ATTENTION JOIN, and on a layer whose gate_up is block fp8 the routed arm's two
-         * inputs with it: the router's norm (rmsnorm's expression, its mult hidden^-0.5) and the
-         * experts' E4M3 codes (rmsnorm_quant_fp8's) from the norm of x the join already takes --
-         * two launches a layer fewer, and two reads of x. Then norm_add_norm, then the chain. */
+        /* The attention join. On a layer whose gate_up is block fp8 it also writes the routed
+         * arm's two inputs: the router's norm (rmsnorm with mult hidden^-0.5) and the experts'
+         * E4M3 codes (as rmsnorm_quant_fp8), saving two launches and two reads of x per layer.
+         * Otherwise norm_add_norm, else the chain. */
         if (has_join_r && m.moe && y.gu_fp8)
             y.op_join_r = rw(b, RAD_OP(b, "norm_add_norm_route",
                                     RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E),
@@ -1222,19 +1108,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.ffn_exp_scale", ll), src("router.per_expert_scale")));
             y.w_fpost1 = decl_w(b, nm.f("blk.%lld.ffn_post_norm1.weight", ll), RAD_F32, {E}, A, N, gl);
             y.w_fpost2 = decl_w(b, nm.f("blk.%lld.ffn_post_norm2.weight", ll), RAD_F32, {E}, A, N, gl);
-            /* THE ROUTER IS REPLICATED (rad_block_moe_fp8.h argues it): every rank routes every
-             * token the same way from the same residual stream. */
+            /* The router is replicated (rad_block_moe_fp8.h): every rank routes every token the
+             * same way from the same residual stream. */
             y.w_router = decl_w(b, nm.f("blk.%lld.ffn_gate_inp.weight", ll), RAD_BF16,
                                 {m.n_expert, E}, A, N, gl);
             y.w_escale = decl_w(b, nm.f("blk.%lld.ffn_exp_scale", ll), RAD_BF16, {m.n_expert}, A,
                                 N, gl);
-            /* THE EXPERTS: whole experts, this rank's run of them (their name maps and encodings
-             * were settled before the buffers). Each projection's handles are declared as the
-             * runs its GEMM's tables are: bf16, one run in expert order; block fp8, the codes of
-             * the even local experts, then the odd ones', then the scale views in the same two
-             * runs -- `moe_gemm_q` takes a projection's experts as two tables by parity, and a
-             * table is a run of consecutively declared handles. The codes and the scale plane are
-             * two views of one stored weight and one movement unit (slot 0 gate_up, 1 down). */
+            /* The experts: this rank's run of whole experts (name maps and encodings were settled
+             * before the buffers). Each projection's handles are declared in its GEMM's table
+             * order, since a table is a run of consecutively declared handles: bf16 is one run in
+             * expert order; block fp8 is the even local experts' codes, then the odd ones', then
+             * the scale views in the same two runs (`moe_gemm_q` takes two tables by parity). Codes
+             * and scale plane are two views of one stored weight and one movement unit (slot 0
+             * gate_up, 1 down). */
             auto experts = [&](bool fp8, const char* what, int slot, int64_t rows, int64_t cols,
                                std::vector<rad_weight>& wc, std::vector<rad_weight>& ws) {
                 wc.assign((size_t)NL, 0);
@@ -1293,8 +1179,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                   RAD_NOWEIGHTS),
                               {m.b_logit}, {m.b_ids, m.b_ew});
             /* per_expert_scale[expert] times the routing weight: one launch where `expert_scale` is
-             * served, and otherwise the table gathered as [n_expert, 1] by the ids and a
-             * `mul` -- the same bf16 product either way (docs/OPS.md). */
+             * served, otherwise the [n_expert, 1] table gathered by id and a `mul`; the same bf16
+             * product either way (docs/OPS.md). */
             if (has_escale)
                 y.op_expert_scale = rw(b, RAD_OP(b, "expert_scale",
                                            RAD_PARAMS(RAD_RANGE("M", 1, P),
@@ -1310,9 +1196,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                   {m.b_ids}, {m.b_es});
                 y.op_emul   = binop("mul", P, K, m.b_ew, m.b_es, m.b_ew);
             }
-            /* THE EXPERTS' INPUT: pre_feedforward_layernorm_2 of the stream -- for an fp8 gate_up,
-             * normed and quantised in one pass (`rmsnorm_quant_fp8`), with no bf16 copy, since the
-             * fp8 GEMM reads only the codes and their scales. */
+            /* The experts' input, pre_feedforward_layernorm_2 of the stream. For an fp8 gate_up it
+             * is normed and quantised in one pass (`rmsnorm_quant_fp8`) with no bf16 copy, since
+             * the fp8 GEMM reads only codes and scales. */
             if (y.gu_fp8) {
                 y.op_enorm = RAD_OP(b, "rmsnorm_quant_fp8",
                                     RAD_PARAMS(RAD_RANGE("M", 1, P), RAD_INT("n", E),
@@ -1329,18 +1215,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                               RAD_INT("expert_base", m.expert_base)),
                                    RAD_NOWEIGHTS),
                                {m.b_ids}, {m.b_sorted, m.b_eoff, m.b_ecnt});
-            /* THE ROUTER, ITS TOP-K AND THE SORT IN ONE LAUNCH at decode heights. At a decode step
-             * each of the three is one small workgroup's work behind a full dispatch, and libr4d
-             * fuses them: `router_topk_scatter` for the pair, bounded by the sort's single-workgroup
-             * form (kMoeSortRows routing slots), and `router_gemm_topk_scatter` with the router's
-             * GEMM in front, up to the skinny GEMM's decode band -- byte-identical to the launches
-             * they stand in for (docs/OPS.md), so the routing does not move. The per-expert scale
-             * and the experts' input norm sit between them in the issue order and read only the ids
-             * and weights the fused op writes. Declared here, after every buffer they name: a late
+            /* The router, its top-k and the sort in one launch at decode heights, where each is a
+             * small workgroup's work behind a full dispatch. `router_topk_scatter` fuses top-k and
+             * sort, bounded by the sort's single-workgroup form (kMoeSortRows routing slots);
+             * `router_gemm_topk_scatter` adds the router GEMM, up to the skinny GEMM's decode band.
+             * Both are byte-identical to the separate launches (docs/OPS.md). The per-expert scale
+             * and the experts' input norm sit between them in issue order and read only the ids
+             * and weights the fused op writes. Declared after every buffer they name; a late
              * declaration only lengthens a buffer's planned life (rad_block_moe_fp8.h). */
             {
                 const int64_t sort_rows = P * K <= kMoeSortRows ? P : kMoeSortRows / K;
-                if (sort_rows > 0)
+                if (sort_rows > 0 && rad_op_declared(b, "router_topk_scatter"))
                     y.op_topk_scatter = rw(b, RAD_OP(b, "router_topk_scatter",
                                                RAD_PARAMS(RAD_RANGE("M", 1, sort_rows),
                                                           RAD_INT("n_expert", m.n_expert),
@@ -1352,7 +1237,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 if (y.op_topk_scatter) {
                     y.topk_scatter_rows = sort_rows;
                     const int64_t fr = sort_rows < kMoeRouterFusedRows ? sort_rows : kMoeRouterFusedRows;
-                    y.op_router_fused = rw(b, RAD_OP(b, "router_gemm_topk_scatter",
+                    if (rad_op_declared(b, "router_gemm_topk_scatter"))
+                        y.op_router_fused = rw(b, RAD_OP(b, "router_gemm_topk_scatter",
                                                RAD_PARAMS(RAD_RANGE("M", 1, fr), RAD_INT("K", E),
                                                           RAD_INT("n_expert", m.n_expert),
                                                           RAD_INT("n_local", NL), RAD_INT("top_k", K),
@@ -1364,9 +1250,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     if (y.op_router_fused) y.router_fused_rows = fr;
                 }
             }
-            /* THE TWO GROUPED GEMMs DISAGREE ABOUT a_order, and must: gate_up reads the block
-             * input, a row a TOKEN, gathered through sorted_tok; down reads gate_up's product,
-             * already a row a (token, slot) in the scatter's order (rad_block_moe_fp8.h). */
+            /* The two grouped GEMMs use different a_order: gate_up reads the block input, one row
+             * per token, gathered through sorted_tok; down reads gate_up's product, already one row
+             * per (token, slot) in scatter order (rad_block_moe_fp8.h). */
             if (y.gu_fp8) {
                 const std::vector<rad_weight> tab = tables(y.w_egu, y.w_egus);
                 y.op_egu = rw(b, rad_decl_op(b, "moe_gemm_q",
@@ -1428,8 +1314,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             if (W > 1) y.op_ar_f = allreduce(2 * T * E, m.b_ff2);
             if (has_join_f)
             {
-                /* ...and the norm that reads the x it writes: the next layer's input norm, or the
-                 * final norm after the last layer -- one launch and one read of x the less. */
+                /* The join also applies the norm that reads its x (the next layer's input norm, or
+                 * the final norm after the last layer), saving a launch and a read of x. */
                 const rad_weight w_next = l + 1 < m.n_layer ? m.layers[(size_t)l + 1].w_anorm
                                                             : m.w_onorm;
                 y.op_join_f = rw(b, RAD_OP(b, "join_add_scale",
@@ -1461,13 +1347,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         n_joins += (y.op_join_a || y.op_join_r ? 1 : 0) + (y.op_join_f ? 1 : 0);
         n_route += y.op_join_r ? 1 : 0;
 
-        /* THE TAP: a row copy of the layer's output into the column slice a tap owns, DECLARED
-         * HERE, after the layer's last op, because that is where step() issues it. The buffer
-         * planner's liveness is declaration order. One tap op declared after the whole trunk made
-         * `dflash_src` look born at the end of it, so the plan was free to put it on top of
-         * buffers every layer writes -- and at --max-num-seqs 16 it did, under `moe_edn`, the
-         * routed experts' output: every MoE layer after a tap overwrote what the drafter reads,
-         * and on gemma-4-26B-A4B-it it accepted 2% of its drafts with the reply still fluent. */
+        /* The tap: a row copy of the layer's output into its column slice, declared here after
+         * the layer's last op because step() issues it here and declaration order is the
+         * planner's liveness. Declared after the whole trunk instead, `dflash_src` would look
+         * born at the end and could alias buffers every layer writes (e.g. `moe_edn`), corrupting
+         * what the drafter reads while the output stays correct. */
         for (int t = 0; t < m.n_taps; ++t)
             if (m.tap_layer[t] == (int)l && !y.op_tap)
                 y.op_tap = rw(b, RAD_OP(b, "cast",
@@ -1477,24 +1361,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                               {m.b_x}, {m.b_dfsrc});
     }
 
-    /* ---- THE PREFILL OVERLAP (trunk_overlap): where there is a reduction to hide, a routed arm
-     * whose passes a slice can be a whole number of, and every join fused -- the slices issue the
-     * fused forms only. On the exact wire alone: nothing here shows the lossy one gives a slice
-     * the bits it gives the whole. On two R9700s the two slices give the whole chunk's text and
-     * logprobs exactly, at 2048- and 8192-token chunks. The two buffers the second lane reduces in place are taken out of the arena's
-     * sharing, which the runtime asks of every buffer a second lane touches (rad_buf_concurrent);
-     * both live across the whole trunk already, so what that costs is only the sharing with the
-     * drafter's and the head's buffers. */
+    /* ---- the prefill overlap (trunk_overlap). Requires a reduction to hide, a routed arm whose
+     * passes divide a slice, and every join fused (the slices issue only the fused forms). Exact
+     * wire only, since nothing shows the lossy wire gives a slice the same bits as the whole; on
+     * the exact wire the two slices reproduce the whole chunk's text and logprobs exactly. The two
+     * buffers the second lane reduces in place leave the arena's sharing (rad_buf_concurrent);
+     * both already live across the trunk, so this only costs sharing with the drafter's and the
+     * head's buffers. */
     m.overlap = W > 1 && m.moe && g.wire_exact && T >= 2 * m.moe_rows;
     for (const Layer& y : m.layers)
         m.overlap = m.overlap && (y.op_join_a || y.op_join_r) && y.op_join_f && y.next_norm &&
                     y.op_ar_o && y.op_ar_f;
-    /* ---- THE TWO ARMS SIDE BY SIDE (trunk), in a step that runs whole: the dense arm on the
-     * second lane beside the routed arm, which needs nothing of it until the feed-forward join. At a
-     * decode step on 4x R9700 the dense arm is three launches, ~36 us under --profile-ops, behind
-     * the routed arm's ~120 in a layer, and its GEMMs at a few rows are latency-bound -- far from
-     * the bandwidth the experts take. No collective rides it, so the reductions keep lane 0. The
-     * buffers the dense arm touches leave the arena's sharing. */
+    /* ---- the two arms side by side (trunk), in a step that runs whole: the dense arm on the
+     * second lane beside the routed arm, which needs nothing from it until the feed-forward join.
+     * At decode the dense arm is three latency-bound launches (~36 us against the routed arm's
+     * ~120 us per layer on 4x R9700), so it hides behind the experts' bandwidth. No collective
+     * rides it, so the reductions stay on lane 0. Its buffers leave the arena's sharing. */
     m.arms = m.moe;
     if (m.overlap) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_o));
     if (m.overlap || m.arms) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_ff2));
@@ -1514,10 +1396,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                      RAD_STR("dtype", "bf16")),
                           RAD_WEIGHTS(m.w_tok)),
                       {m.b_hout}, {m.b_logits});
-    /* FINAL LOGIT SOFTCAPPING, cap * tanh(x / cap) over the f32 logits: `logit_softcap`, which
-     * libref, libavx and libr4d serve. Where nothing does the model still runs and greedy decoding
-     * is unchanged -- the cap is strictly increasing -- but a sampled distribution is SHARPER than
-     * the model's, so the startup log says so. */
+    /* Final logit softcapping, cap * tanh(x / cap) over the f32 logits (`logit_softcap`, served by
+     * libref, libavx and libr4d). Without it greedy decoding is unchanged (the cap is strictly
+     * increasing) but sampling draws from a sharper distribution, so the startup log warns. */
     if (m.softcap > 0.0) {
         m.op_cap = rw(b, RAD_OP(b, "logit_softcap",
                            RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
@@ -1526,13 +1407,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                            RAD_NOWEIGHTS),
                        {m.b_logits}, {m.b_logits});
         if (!m.op_cap)
-            rad_note(b, "WARNING: nothing serves `logit_softcap` (load libr4d or libavx). "
-                        "The model's logits are %g * tanh(x / %g); without it greedy output is "
-                        "unchanged and SAMPLED output draws from a sharper distribution than the "
-                        "model's", m.softcap, m.softcap);
+            rad_note(b, "warning: no kernel serves `logit_softcap` (load libr4d or libavx), so "
+                        "the logits skip %g * tanh(x / %g): greedy output is unchanged, sampled "
+                        "output draws from a sharper distribution", m.softcap, m.softcap);
     }
 
-    /* THE DRAFTER LAST: declaration order is the buffer planner's liveness (llama_fp8.cpp). */
+    /* The drafter last: declaration order is the buffer planner's liveness. */
     if (m.n_taps > 0)
         RAD_ARCH_TRY(declare_dflash(b, meta, ctx, m, (int)m.n_layer));
 
@@ -1579,8 +1459,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     "beside the routed");
     }
     if (m.kf.rot_pairs < m.kf.hd / 2)
-        rad_note(b, "full layers: PROPORTIONAL rope -- %lld of %lld frequency pairs rotate at "
-                    "theta %g over the whole %lld-wide head, the rest stay at frequency zero",
+        rad_note(b, "full layers: proportional rope, %lld of %lld frequency pairs rotating at "
+                    "theta %g over the whole %lld-wide head and the rest at frequency zero",
                  (long long)m.kf.rot_pairs, (long long)(m.kf.hd / 2), m.kf.theta,
                  (long long)m.kf.hd);
     return RAD_OK;
@@ -1588,9 +1468,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
 /* ============================================================== step */
 
-/* The routed arm over rows [first, first + rows) of a T-token step, in passes of m.moe_rows, its
- * partial into rows [dst, dst + rows) of the join: [T, 2T) for a whole step, and right after the
- * slice's dense rows for a slice of one (trunk_overlap). */
+/* The routed arm over rows [first, first + rows) of a T-token step, in passes of m.moe_rows,
+ * writing its partial into rows [dst, dst + rows) of the join: [T, 2T) for a whole step, or right
+ * after the slice's dense rows for a slice (trunk_overlap). */
 static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T, int64_t first,
                    int64_t rows, int64_t dst) {
     const int64_t E = m.E, K = m.top_k, NL = m.n_local, NE = m.n_expert;
@@ -1602,7 +1482,7 @@ static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T, int64_t
         if (!y.op_join_r)   /* the attention join wrote the router's input otherwise */
             RAD_ISSUE_N(c, y.op_rnorm, n, brow_slice(m.b_x, r0, n, E), RAD_W(y.w_rscale),
                         brow_slice(m.b_rn, r0, n, E));
-        /* One launch, two or three: the router, its top-k and the sort (see declare). */
+        /* The router, its top-k and the sort in one, two or three launches (see declare). */
         const bool rfused = y.op_router_fused && n <= y.router_fused_rows;
         const bool pair = !rfused && y.op_topk_scatter && n <= y.topk_scatter_rows;
         if (rfused) {
@@ -1621,7 +1501,7 @@ static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T, int64_t
                 RAD_ISSUE_N(c, y.op_topk, n, brow_slice(m.b_logit, r0, n, NE),
                             brow_slice(m.b_ids, r0, n, K), brow_slice(m.b_ew, r0, n, K));
         }
-        /* The ids and the gathered scales read as flat [n * K] vectors: the same bytes. */
+        /* The ids and gathered scales are read as flat [n * K] vectors over the same bytes. */
         int32_t* ids = (int32_t*)rad_buf_ptr(c, m.b_ids);
         uint16_t* es = (uint16_t*)rad_buf_ptr(c, m.b_es);
         if (y.op_expert_scale) {
@@ -1633,8 +1513,8 @@ static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T, int64_t
             RAD_ISSUE_N(c, y.op_emul, n, brow_slice(m.b_ew, r0, n, K), brow_slice(m.b_es, r0, n, K),
                         brow_slice(m.b_ew, r0, n, K));
         }
-        /* rmsnorm_quant_fp8's operands: x, residual (absent), w, q, scale, out_bf16 (absent) --
-         * where the attention join did not write the codes already. */
+        /* rmsnorm_quant_fp8's operands: x, residual (absent), w, q, scale, out_bf16 (absent);
+         * issued only where the attention join did not already write the codes. */
         if (y.gu_fp8 && !y.op_join_r)
             RAD_ISSUE_N(c, y.op_enorm, n, brow_slice(m.b_x, r0, n, E), RAD_NONE, RAD_W(y.w_enorm),
                         brow_slice(m.b_hq, r0, n, E), brow_slice(m.b_hqs, r0, n, E / RAD_FP8_BLOCK),
@@ -1755,8 +1635,8 @@ static void trunk(RadCtx* c, const Model& m, const RadBatch* batch) {
             RAD_ISSUE(c, y.op_fnorm, brows(m.b_x, T), RAD_W(y.w_fnorm), brows(m.b_h, T));
         }
 
-        /* dense arm -> rows [0, T) of the join: on lane 1 behind the attention join, where the arms
-         * run side by side, and lane 0 joins it back before the reduction reads them */
+        /* The dense arm into rows [0, T) of the join. With side-by-side arms it runs on lane 1
+         * behind the attention join, and lane 0 joins it back before the reduction. */
         if (m.arms)
             lanes_ok = lanes_ok && rad_lane_join(c, 0, 1) == RAD_OK && rad_lane(c, 1) == RAD_OK;
         RAD_ISSUE(c, y.op_gu, brows(m.b_h, T), RAD_W(y.w_gu), brows(m.b_gu, T));
@@ -1788,8 +1668,8 @@ static void trunk(RadCtx* c, const Model& m, const RadBatch* batch) {
             RAD_ISSUE(c, y.op_scale, brows(m.b_x, T), RAD_W(y.w_scalar), brows(m.b_x, T));
         }
 
-        /* The tap AFTER the scalar: HF's hidden_states[i + 1] is the decoder layer's return value,
-         * which has been multiplied by it. */
+        /* The tap comes after the layer scalar: HF's hidden_states[i + 1] is the decoder layer's
+         * return value, which includes it. */
         for (int t = 0; t < m.n_taps && y.op_tap; ++t) {
             if (m.tap_layer[t] != (int)li) continue;
             RAD_ISSUE(c, y.op_tap, brows(m.b_x, T),
@@ -1802,36 +1682,35 @@ static void trunk(RadCtx* c, const Model& m, const RadBatch* batch) {
 }
 
 /* ============================================================== the prefill overlap */
-/* A PREFILL CHUNK IN TWO SLICES, each slice's all-reduces on the second lane (rad_lane) beside the
- * other slice's compute. On gemma-4-26B-A4B at tp 4 on 4x R9700 the reductions were 47% of a
- * 20K-token prefill under --profile-ops: a layer reduces T x E after attention and both arms' 2T x
- * E after the feed-forward, at ~16.5 GB/s a rank on the link, against ~8 ms of compute a layer at
- * the average chunk. Run whole, the two take turns. Cut in two, a slice's reduction runs while the
- * other slice computes:
+/* A prefill chunk in two slices, each slice's all-reduces on the second lane (rad_lane) beside
+ * the other slice's compute. A layer reduces T x E after attention and 2T x E (both arms) after the
+ * feed-forward; at tp 4 on 4x R9700 the reductions were about half of a long prefill (~16.5 GB/s
+ * per rank on the link against ~8 ms of compute per layer). Run whole, compute and reduction
+ * alternate; cut in two, one slice reduces while the other computes:
  *
  *   lane 0  o(A) o(B) . nan(A) ff(A) . nan(B) ff(B) . jas(A) qkv(A) . jas(B) qkv(B) attn o(A) ..
  *   lane 1       ar_o(A)    ar_o(B)       ar_f(A)         ar_f(B)
  *
- * ATTENTION RUNS WHOLE: it reads every row's keys, and its batch bounds describe the whole step.
- * The rest is a row at a time -- the projections, the joins, both arms -- and so is the reduction,
- * which folds a word in fp32 in ascending rank order whichever message carries it.
+ * Attention runs whole: it reads every row's keys, and its batch bounds describe the whole step.
+ * Everything else (projections, joins, both arms, and the reduction, which folds each word in fp32
+ * in ascending rank order) is row-wise.
  *
- * THE SAME KERNELS, SO THE SAME BITS (core/runtime/ctx.h, the second lane's rule FOUR). A cut is
- * a whole number of routed passes from the step's first row, so the routed arm makes exactly the
- * passes the whole step makes, and both slices are at least one pass (2048 rows): above every row
- * band the projections, the joins, the activation and the reduction have -- the GEMM's at 16 and
- * 64, the reduction's one-shot edge at 524288 elements. None of those kernels' row results
- * depends on the row count, so the step's output is the whole step's.
+ * Same kernels, so same bits (core/runtime/ctx.h, the second lane's fourth rule). The cut is a
+ * whole number of routed passes from the first row, so the routed arm makes the same passes as the
+ * whole step, and both slices are at least one pass (2048 rows), above every row band of the
+ * projections, joins, activation and reduction (the GEMM's at 16 and 64, the reduction's one-shot
+ * edge at 524288 elements). No row result depends on the row count, so the output matches the
+ * whole step's.
  *
- * THE ORDER. Every reduction rides lane 1 behind a join from lane 0, which holds its producer;
- * lane 0 waits for lane 1 before the reduction's consumer. A join orders behind EVERYTHING its
- * lane has issued, so each wait goes in after the lane-0 work that does not need it and before
- * the next reduction is issued -- which is what fixes the issue order below. The embedding's
- * reduction stays on lane 0, ahead of everything lane 1 is first joined behind, so the
- * collectives keep one order on every rank; the runtime joins lane 1 back at the end of a step. */
+ * Ordering: each reduction rides lane 1 behind a join from lane 0, which holds its producer; lane 0
+ * waits for lane 1 before the reduction's consumer. A join orders behind everything its lane has
+ * issued, so each wait goes after the lane-0 work that does not need it and before the next
+ * reduction, which fixes the issue order below. The embedding's reduction stays on lane 0, before
+ * lane 1's first join, so the collectives keep one order on every rank; the runtime joins lane 1
+ * back at the end of the step. */
 
 /* The first row of slice B, or 0 for a step that runs whole: the whole number of routed passes
- * nearest half the step. Both slices are then at least one pass. */
+ * nearest half the step, so both slices are at least one pass. */
 static int64_t split_at(const Model& m, int64_t T) {
     if (!m.overlap || T < 2 * m.moe_rows) return 0;
     const int64_t P = m.moe_rows;
@@ -1858,8 +1737,8 @@ static void out_proj(RadCtx* c, const Model& m, const Layer& y, int64_t r0, int6
 }
 
 /* Rows [r0, r0 + n) from the attention join to the arms' partials, once those rows' attention
- * reduction is in. The slice's partials land in rows [2 r0, 2 r0 + 2n) of the join, dense then
- * routed, so its feed-forward reduction is one run. */
+ * reduction is done. The partials land in rows [2 r0, 2 r0 + 2n) of the join, dense then routed,
+ * so the slice's feed-forward reduction is one run. */
 static void arms(RadCtx* c, const Model& m, const Layer& y, int64_t T, int64_t r0, int64_t n) {
     const int64_t E = m.E, F = m.n_ff;
     if (y.op_join_r)
@@ -1879,8 +1758,8 @@ static void arms(RadCtx* c, const Model& m, const Layer& y, int64_t T, int64_t r
     routed(c, m, y, T, r0, n, 2 * r0 + n);
 }
 
-/* Rows [r0, r0 + n) of layer li's feed-forward join, once their reduction is in -- with the next
- * norm it writes -- and the drafter's taps of those rows. */
+/* Rows [r0, r0 + n) of layer li's feed-forward join (with the next norm it writes), once their
+ * reduction is done, and the drafter's taps of those rows. */
 static void join_ff(RadCtx* c, const Model& m, size_t li, int64_t r0, int64_t n) {
     const Layer& y = m.layers[li];
     const int64_t E = m.E;
@@ -1899,8 +1778,8 @@ static void trunk_overlap(RadCtx* c, const Model& m, const RadBatch* batch, int6
     const int64_t T = batch->n_tok, E = m.E;
     const int64_t a0 = 0, an = cut, b0 = cut, bn = T - cut;
     bool lanes_ok = true;
-    /* An all-reduce in place over `rows` rows of `buf` from `row`, on lane 1 behind everything
-     * lane 0 has issued -- its producer among it. */
+    /* An in-place all-reduce over `rows` rows of `buf` from `row`, on lane 1 behind everything
+     * lane 0 has issued, including its producer. */
     auto reduce = [&](rad_op op, rad_buf buf, int64_t row, int64_t rows) {
         lanes_ok = lanes_ok && rad_lane_join(c, 0, 1) == RAD_OK && rad_lane(c, 1) == RAD_OK;
         RAD_ISSUE_N(c, op, rows * E, brow_slice(buf, row, rows, E), RAD_NONE);
@@ -1985,8 +1864,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
 }
 
 /* ============================================================== probe */
-/* DFlash proposes its whole block in one pass, so its depth is the block it was trained at less
- * the anchor, and nothing else: 15 for z-lab's Gemma 4 drafters (block_size 16). */
+/* DFlash proposes its whole block in one pass, so its depth is fixed at the trained block size
+ * minus the anchor: 15 for z-lab's Gemma 4 drafters (block_size 16). */
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
     out->draft_depth = 0;
@@ -2003,10 +1882,9 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 }
 
 /* ============================================================== the reply format
- * The model's, not this plugin's -- the thought channel, and calls written as a name and one
- * object in Gemma's dialect of JSON -- and shared with gemma4_bf16 (arch/rad_gemma4_chat.h). The
- * container's template is not visible from here (it lives in the vocab section, not the metadata),
- * so this answers for every Gemma 4 container. */
+ * Gemma 4's thought channel and calls written as a name and one object in Gemma's JSON dialect,
+ * shared with gemma4_bf16 (arch/rad_gemma4_chat.h). The container's template lives in the vocab
+ * section, not the metadata, so it is not visible here; this answers for every Gemma 4 container. */
 static const RadChatFormat* chat_format(const RadModelMeta*) { return gemma4_chat_format(); }
 
 }  /* namespace gemma4 */

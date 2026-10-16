@@ -1,32 +1,28 @@
 /* kld.h -- the KL divergence of this model against a recorded reference, at every scored position
  * of a fixed corpus.
  *
- * TWO RUNS, ONE YARDSTICK. `--kld-record DIR` runs the corpus through the model that defines the
- * answer -- the bf16 checkpoint -- and writes its log-probabilities over the whole vocabulary at
- * every scored position, once. `--kld-ref DIR` runs a candidate over the same tokens and compares
- * its own logits against what DIR holds, row by row, so a candidate costs one prefill of the
- * corpus and the reference is never computed again.
+ * `--kld-record DIR` runs the corpus through the reference model (e.g. the bf16 checkpoint) once
+ * and writes its full-vocabulary log-probabilities at every scored position. `--kld-ref DIR` runs a
+ * candidate over the same tokens and compares its logits row by row, so each candidate costs one
+ * prefill of the corpus.
  *
- * WHAT IS REPORTED is the distribution of the per-position KL(P_ref || Q_candidate): its mean,
- * median, 99th, 99.9th and 99.99th percentiles and maximum, the top-1 agreement (the candidate's
- * argmax is the reference's), and both models' perplexity on the corpus's own next tokens. The
- * tail is the point: a quantised model whose mean KL is small can still be confidently wrong at
- * one position in ten thousand, and that is the position a user sees.
+ * Reported: the distribution of per-position KL(P_ref || Q_candidate) (mean, median, 99th, 99.9th,
+ * 99.99th percentile, max), top-1 agreement, and both models' perplexity on the corpus's next
+ * tokens. The tail matters: a small mean KL can hide confidently wrong positions.
  *
- * THE WHOLE VOCABULARY, NOT A TOP-K. A KL over a truncated support is a lower bound that is
- * tightest where it matters least: a peaked distribution keeps its mass in the top few tokens and
- * a flat one -- the high-KL tail -- does not.
+ * The whole vocabulary, not a top-k: a truncated KL is a lower bound, loosest for flat
+ * distributions, which are the high-KL tail.
  *
- * THE REFERENCE FILES (DIR):
+ * Reference files (DIR):
  *   kld.json     the manifest: the model, the corpus, every document's source, token count, first
- *                scored position and first row. Written LAST, so a run that dies leaves a
- *                directory that no --kld-ref will read.
- *   tokens.i32   every document's tokens, concatenated: a candidate is scored on the tokens the
- *                reference saw, not on a re-tokenisation that could differ.
- *   logp.f16     [rows, n_vocab] log-probabilities, f16. Near log p = 0 an f16 has its finest
- *                resolution, and the tail tokens it rounds coarsely carry almost no mass.
- *   top.bin      [rows, kKldTop] {int32 id, f32 log p}: the most likely tokens exactly, which is
- *                where the KL of a confident position lives and where f16 would cost ~1e-4 nats.
+ *                scored position and first row. Written last, so an interrupted run leaves a
+ *                directory no --kld-ref reads.
+ *   tokens.i32   every document's tokens, concatenated, so the candidate scores the reference's
+ *                tokens rather than a re-tokenisation.
+ *   logp.f16     [rows, n_vocab] log-probabilities, f16: finest near log p = 0, coarse only for
+ *                tail tokens with little mass.
+ *   top.bin      [rows, kKldTop] {int32 id, f32 log p}: the most likely tokens exactly, where a
+ *                confident position's KL lives (f16 would cost ~1e-4 nats).
  *   rows.f32     [rows, 2] the reference's own next-token NLL and entropy.
  *
  * Document d scores positions [score_from, n - 1): the logits at p predict token p + 1, and the
@@ -74,9 +70,8 @@ public:
     int open(const Config& cfg, std::shared_ptr<const Vocab> vocab, int64_t n_vocab,
              const std::string& model);
 
-    /* The two halves of open() for documents already tokenised, which is what a test drives:
-     * add_doc() each document, then record_into() creates DIR. score_against() is the ref mode
-     * whole. */
+    /* open() split for already-tokenised documents (tests): add_doc() each, then record_into()
+     * creates DIR; score_against() is the whole ref mode. */
     int add_doc(const std::string& source, const std::vector<int32_t>& ids, int64_t score_from);
     int record_into(const std::string& dir, int64_t n_vocab, const std::string& model);
     int score_against(const std::string& dir, const std::string& out, int64_t n_vocab,
@@ -89,8 +84,8 @@ public:
     int64_t rows_done() const { return done_n_.load(std::memory_order_relaxed); }
 
     /* A step's scored rows. Rows outside a document's scored range are skipped; a row seen twice
-     * -- a document re-prefilled after preemption -- is simply computed again. Blocks until every
-     * row is written (record) or scored (ref): the engine reuses the block at the next step. */
+     * (re-prefill after preemption) is recomputed. Blocks until every row is written or scored,
+     * since the engine reuses the block next step. */
     int score(const std::vector<KldSpan>& spans, const std::vector<KldShard>& shards);
 
     /* Record: checks every row was written and writes the manifest. Ref: the report, printed and,

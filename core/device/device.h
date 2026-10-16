@@ -1,16 +1,12 @@
-/* device.h -- the device layer's internal face.
+/* device.h -- the device layer's internal interface.
  *
- * `abi/rad_device.h` is what the rest of the engine and every plugin calls. This header is
- * the seam between the two implementations of it, plus the two questions the rest of the core
- * actually needs to ask about which one won.
+ * `abi/rad_device.h` is what the engine and plugins call. This header is the seam between its
+ * backend implementations, plus queries for which backend is active.
  *
- * The seam is a vtable rather than an `#ifdef` at every call site. That is a deliberate trade: an
- * indirect call costs a load and a jump, which is unmeasurable against a `hipMemcpyAsync` and
- * unmeasurable against a `memcpy` of anything worth enqueuing, and in exchange there is exactly one
- * definition of each `rad_dev_*` symbol and no way for the two backends to drift into implementing
- * different contracts. Two device layers that have silently diverged is the failure this avoids,
- * and it is the failure that matters, because the host backend is where everything above the
- * kernels is developed (docs/IMPLEMENTATION.md) and the HIP backend is where it has to still work.
+ * The seam is a vtable, not an `#ifdef` per call site. The indirect call is unmeasurable next to
+ * any copy worth enqueuing, and in exchange each `rad_dev_*` symbol has one definition, so the
+ * backends cannot drift into different contracts. That matters because the host backend is where
+ * everything above the kernels is developed (docs/IMPLEMENTATION.md).
  */
 #pragma once
 #include "rad_abi.h"
@@ -21,105 +17,95 @@
 #include <utility>
 #include <vector>
 
-/* AN EVENT THAT ONLY ORDERS WORK ON ONE CARD. Its record makes the recording stream's writes
- * visible to the rest of that card and to nothing else, so it may be waited on by another stream
- * of the same card and queried or synchronised by the host for WHEN, but the host must not read
- * device-written memory on the strength of it, and no other card may wait on it. What that buys
- * is the release: making writes visible to the system waits for every write still in flight to
- * host memory, and with the link busy streaming weights that is most of a microsecond at best and
- * over ten at worst on every record, where the card-wide release costs the packet alone. */
+/* An event that orders work on one card only. Its record makes the stream's writes visible to
+ * that card and nothing else: another stream of the same card may wait on it and the host may
+ * query or sync it for timing, but the host must not read device-written memory on its strength
+ * and no other card may wait on it. The gain is the cheaper release: a system-scope release waits
+ * for every in-flight write to host memory, ~1-10 us per record while the link streams weights. */
 extern "C" int rad_event_create_local(RadEvent* out);
-/* WHAT AN EVENT IS FOR, fixed when it is made. RAD_EVENT_LOCAL is rad_event_create_local's scope.
- * RAD_EVENT_HOST_WAIT is an event the host synchronises on: its records complete with an interrupt
- * the waiting thread blocks on, where the other kind complete silently and can only be waited on by
- * a stream. rad_event_create is RAD_EVENT_HOST_WAIT, rad_event_create_local is RAD_EVENT_LOCAL
- * alone, and rad_event_sync refuses an event made without RAD_EVENT_HOST_WAIT. */
+/* Event purpose, fixed at creation. RAD_EVENT_LOCAL is rad_event_create_local's scope.
+ * RAD_EVENT_HOST_WAIT records complete with an interrupt a host thread can block on; without it
+ * records complete silently and only a stream can wait on them. rad_event_create is
+ * RAD_EVENT_HOST_WAIT, rad_event_create_local is RAD_EVENT_LOCAL alone, and rad_event_sync refuses
+ * an event made without RAD_EVENT_HOST_WAIT. */
 enum : unsigned {
     RAD_EVENT_LOCAL     = 1u,
     RAD_EVENT_HOST_WAIT = 2u,
 };
 extern "C" int rad_event_create_as(RadEvent* out, unsigned flags);
-/* The host has just written memory a kernel issued after this call reads, and no host wait came
- * between: a host-site op's output, read over the link by the device op after it. */
+/* The host has just written memory that a kernel issued after this call reads, with no host wait
+ * in between (e.g. a host-site op's output read over the link by the next device op). */
 extern "C" void rad_dev_host_wrote(void);
 
-/* ONE RANGE OF A RANGED COPY: `bytes` from byte `src` of the source to byte `dst` of the
- * destination, all three multiples of four. */
+/* One range of a ranged copy: `bytes` from source offset `src` to destination offset `dst`, all
+ * three multiples of four. */
 struct RadCopyRange {
     int64_t src;
     int64_t dst;
     int64_t bytes;
 };
-/* A FIXED PREFIX AND A LIST OF RANGES, IN ONE DISPATCH: src[0, prefix) to dst[0, prefix) -- a
- * multiple of sixteen, and it may be zero -- and then every range. The copy reads `ranges` when it
- * runs, so the list lives in memory the device reaches (pinned host memory beside `src`) and stays
- * as written until the stream has passed the copy, like `src` itself. One workgroup copies one
- * range, so a caller cuts a long run into ranges of a few kilobytes. */
+/* Copies src[0, prefix) to dst[0, prefix) (a multiple of 16, possibly zero), then every range,
+ * in one dispatch. The kernel reads `ranges` when it runs, so the list must be device-reachable
+ * (pinned host memory beside `src`) and stay unchanged until the stream passes the copy. One
+ * workgroup copies one range, so callers cut long runs into ranges of a few KB. */
 extern "C" int rad_memcpy_ranges_async(void* dst, const void* src, int64_t prefix,
                                        const RadCopyRange* ranges, int n, RadStream s);
 
-/* ONE COPY OF A LIST: `bytes` from `src` to `dst`, both absolute addresses. */
+/* One copy of a list: `bytes` from `src` to `dst`, both absolute addresses. */
 struct RadCopySeg {
     const void* src;
     void*       dst;
     int64_t     bytes;
 };
-/* MANY UNRELATED COPIES, IN LIST ORDER ON THE STREAM, on the card's DMA engine where the backend
- * has one. The list is read at the call, so it need not outlive it; the bytes it names do, like
- * any copy's. A backend without a DMA engine copies the segments one by one, in order. An empty
- * list puts nothing on the stream, and readies what the backend's first list on that stream's card
- * would otherwise set up, so a caller can take that cost at bring-up.
+/* Many unrelated copies, in list order on the stream, on the card's DMA engine where the backend
+ * has one (otherwise segment by segment). The list itself is read at the call; the bytes it names
+ * must live until the copy runs. An empty list enqueues nothing but performs the card's first-list
+ * setup, so a caller can pay that cost at bring-up.
  *
- * It exists for bulk copies across the link while the card computes -- the prefill stager's,
- * a layer's pooled experts a call. A copy as a kernel holds a compute unit's slot for as long as
- * the link takes, and waits for one to free up at every launch: beside kernels that keep every unit
- * busy, 1.3 MB copies from pinned host memory ran at 2.3 GB/s as kernels and at 28.7 GB/s -- the
- * link -- on the DMA engine, which cost those kernels nothing (aql.cpp, "the DMA lane").
+ * For bulk link copies while the card computes (e.g. a layer's pooled experts in the prefill
+ * stager). A copy kernel holds a CU slot for the link's duration and waits for a free one at
+ * launch: beside busy kernels, 1.3 MB pinned-host copies run at 2.3 GB/s as kernels versus
+ * 28.7 GB/s (link rate) on the DMA engine, at no cost to the kernels (aql.cpp, "the DMA lane").
  *
- * RAD_COPY_YIELD makes the list give way to the card's collectives: it waits, between pieces of
- * about a megabyte, while a stream of that card holds the link (rad_link_hold). */
+ * RAD_COPY_YIELD makes the list yield to the card's collectives: between ~1 MB pieces it waits
+ * while a stream of that card holds the link (rad_link_hold). */
 #define RAD_COPY_YIELD 1u
 extern "C" int rad_memcpy_list_async(const RadCopySeg* segs, int n, unsigned flags, RadStream s);
 
-/* THE CARD'S LINK, HELD BY A STREAM FOR WHAT IT ISSUES BETWEEN TWO CALLS: `on` 1 at the point in
- * `s` where traffic the step waits on starts to cross the card's link -- a collective -- and 0
- * where it ends, or 2 where the work in between ended the hold itself (rad_link_gate). Lists issued
- * RAD_COPY_YIELD for that card stop between pieces while it is held. The holds of one card
- * alternate, on then off, in the order they are issued across all its streams: they never nest or
- * overlap. And the holding stream must not wait, between the two
- * calls, on anything behind a yielding list -- the list would wait for the hold to end, and the
- * hold for the list. A backend without a DMA engine holds nothing.
+/* Holds the card's link for the work `s` issues between two calls. `on` = 1 where step-critical
+ * link traffic (a collective) starts, 0 where it ends, or 2 where the work in between released the
+ * hold itself (rad_link_gate). RAD_COPY_YIELD lists for that card pause between pieces while held.
+ * A card's holds alternate on/off in issue order across all its streams; they never nest or
+ * overlap. Between the two calls the holding stream must not wait on anything behind a yielding
+ * list, or the list and the hold deadlock. A backend without a DMA engine holds nothing.
  *
- * WHY: a card's inbound link carries a collective's peer bytes and the stager's copies alike, and
- * the DMA engine takes its share at the link's full rate. A 4 MB all-reduce message that crosses in
- * 165 us on its own took 301 us beside a layer's copies, and the step waits on every one; the
- * copies have the rest of the layer to finish in. */
+ * Why: collective peer bytes and stager copies share the inbound link, and the DMA engine takes
+ * its share at full rate. A 4 MB all-reduce message takes 165 us alone and 301 us beside a layer's
+ * copies; the step waits on the collective, while the copies have the rest of the layer. */
 extern "C" int rad_link_hold(RadStream s, int on);
 
-/* THE WORD THE HOLD IS KEPT IN, for a launch that ends its own: a 64-bit word in memory every
- * engine and kernel of the card reaches, odd while the link is held. rad_link_hold(s, 2) after a
- * launch that was handed this address records that the launch released the hold itself, by taking
- * one off the word -- once, and only if it found it odd -- as soon as the bytes it waited for had
- * landed. Null where the backend holds nothing. */
+/* The hold word, for a launch that ends its own hold: a 64-bit word reachable by every engine and
+ * kernel of the card, odd while the link is held. A launch handed this address releases the hold
+ * by decrementing the word once, only if odd, as soon as its awaited bytes have landed; follow it
+ * with rad_link_hold(s, 2). Null where the backend holds nothing. */
 extern "C" void* rad_link_gate(RadStream s);
 
-/* THE EXPERT PREFETCH'S DEVICE HALF (core/runtime/xprefetch.cpp). A backend that cannot make a
- * dispatch complete a signal, or has no DMA engine to spare for it, leaves these out:
- * rad_xp_supported is then 0 and the prefetch is off.
+/* Device half of the expert prefetch (core/runtime/xprefetch.cpp). A backend that cannot have a
+ * dispatch complete a signal, or has no spare DMA engine, leaves these out; rad_xp_supported is
+ * then 0 and the prefetch is off.
  *
- * A RIDE is a signal the next dispatch issued on a stream completes -- that dispatch keeps its
- * ordering bit, so the signal stands for everything before it on the stream -- in place of a
- * barrier packet of its own between two kernels. rad_ride_wait puts a barrier on another stream
- * that waits for it and gives the signal back behind that barrier; a ride the DMA engine polls
- * instead goes back with rad_ride_release once nothing can poll it: at once (`after` null) when the
- * list that polled it has finished, else once `after` is `packets` dispatches further on, which is
- * long after the ridden dispatch has completed it.
+ * A ride is a signal completed by the next dispatch on a stream, instead of a separate barrier
+ * packet. That dispatch keeps its ordering bit, so the signal covers everything before it.
+ * rad_ride_wait puts a barrier waiting on it onto another stream and recycles the signal behind
+ * that barrier. A ride polled by the DMA engine is returned with rad_ride_release once nothing can
+ * poll it: immediately (`after` null) when the polling list has finished, else once `after` is
+ * `packets` dispatches further on.
  *
- * rad_xp_list hands the card's prefetch DMA queue a list: wait for `mark` (a ride, or null), copy
- * the `n` ranges, then write `done_val` to `done` (pinned host memory, or null). rad_xp_behind is how
- * many lists the queue has been handed and not yet finished. The prefetch's ring is uncached device
- * memory (rad_dev_alloc_uncached): the engine writes it and kernels read it, and no cache may hold
- * what a slot held before. */
+ * rad_xp_list gives the card's prefetch DMA queue a list: wait for `mark` (a ride, or null), copy
+ * the `n` ranges, then write `done_val` to `done` (pinned host memory, or null). rad_xp_behind
+ * counts lists handed over and not yet finished. The prefetch ring is uncached device memory
+ * (rad_dev_alloc_uncached): the engine writes it and kernels read it, so no cache may hold a
+ * slot's previous contents. */
 extern "C" int     rad_xp_supported(int device);
 extern "C" int     rad_xp_stream_create(RadStream* out);
 extern "C" int     rad_ride(RadStream s, void** token);
@@ -131,35 +117,53 @@ extern "C" int64_t rad_xp_behind(int device);
 extern "C" void*   rad_dev_alloc_uncached(int64_t bytes);
 extern "C" void    rad_dev_free_uncached(void* p);
 
+/* A gate on a stream: the stream stops at the point rad_stream_gate enqueues and goes on once the
+ * host calls rad_gate_open. Everything enqueued behind the gate meanwhile is then ready at once, so
+ * the device runs it back to back however long the host took to submit it. For timing a batch of
+ * launches without the host's submission rate in the measurement (tools/kbench_timer.cpp); the
+ * engine has no use for it.
+ *
+ * Behind a closed gate the queue only fills. A caller enqueues at most rad_gate_room(s) more
+ * submissions, counting each launch's own (a kernel may issue several), and must not wait on the
+ * stream before opening the gate. The backends refuse with RAD_E_STATE, rather than deadlock, a
+ * submission that would wait for room and a rad_stream_sync on a gated stream; an event sync on a
+ * record behind the gate is not caught. Open every gate before destroying its stream.
+ *
+ * The gate itself acquires at system scope, so nothing behind it takes the acquire a first
+ * dispatch after a host wait otherwise takes. rad_gate_room counts the submissions that fit
+ * before the queue is full or before a dispatch would take the periodic system-scope acquire
+ * (an L2 invalidate, see aql.cpp "fences"); on a stream without a closed gate it is the same
+ * count with the device still draining. `gate` is single-use: opening it frees it. Not inside a
+ * tape capture. RAD_E_UNSUPPORTED (and a room of 0) on a backend without gates. */
+extern "C" int     rad_stream_gate(RadStream s, void** gate);
+extern "C" int     rad_gate_open(void* gate);
+extern "C" int64_t rad_gate_room(RadStream s);
+
 namespace rad {
 
 /* A recorded pass, owned by the backend that recorded it. See DeviceBackend::tape_begin. */
 typedef void* RadTape;
 
-/* ------------------------------------------------------------------ who won */
-/* Decided once, at first use, and cached. Callers: the planner (a host backend has no VRAM tier
- * worth planning against, only a budget), the selector (RAD_DOMAIN_HOST is the only domain that
- * can run), and every test that must skip a device-only assertion rather than fail it. */
+/* ------------------------------------------------------------------ active backend */
+/* Decided once at first use and cached. Used by the planner (a host backend has only a budget,
+ * no VRAM tier), the selector (only RAD_DOMAIN_HOST can run) and tests that skip device-only
+ * assertions. */
 bool        device_is_host();
 const char* device_backend_name();      /* "host" or "aql" */
 
 /* ------------------------------------------------------------------ two contract notes
  *
- * These are properties of rad_device.h that the frozen header does not state and that
- * tests/device_test.cpp pins against a real card. Written down here rather than left to be
- * rediscovered:
+ * Properties of rad_device.h that the frozen header does not state; tests/device_test.cpp pins
+ * them against a real card.
  *
- *  1. `rad_memset_async` requires a DEVICE-ACCESSIBLE destination: RAD_MEM_DEVICE,
- *     RAD_MEM_HOST_PINNED or RAD_MEM_HOST_MAPPED. Plain RAD_MEM_HOST is pageable memory the GPU
- *     has never been shown and hipMemsetAsync refuses it. The host backend cannot reproduce that
- *     refusal, so this is the one asymmetry between the two -- see the comment on d_memset_async
- *     in hip.cpp for why it is reported rather than papered over. `rad_memcpy_async` has no such
- *     restriction: hipMemcpyDefault handles pageable memory on both ends.
+ *  1. `rad_memset_async` requires a device-accessible destination: RAD_MEM_DEVICE,
+ *     RAD_MEM_HOST_PINNED or RAD_MEM_HOST_MAPPED. hipMemsetAsync refuses pageable RAD_MEM_HOST.
+ *     The host backend cannot reproduce that refusal, so this is the one asymmetry between the
+ *     two (see d_memset_async in hip.cpp). `rad_memcpy_async` has no such restriction.
  *
- *  2. A null RadStream is refused by BOTH backends. HIP's stream 0 serialises against every other
- *     blocking stream in the process, which is the opposite of spec §5.4's requirement that a
- *     transfer involve no host synchronisation; the engine creates its streams and never uses the
- *     default one, so passing null is a bug and the host backend reports it as one as well.
+ *  2. Both backends refuse a null RadStream. HIP's stream 0 serialises against every blocking
+ *     stream, contrary to spec §5.4 (no host synchronisation in a transfer). The engine never uses
+ *     the default stream, so null is a bug.
  */
 
 /* ------------------------------------------------------------------ the backend vtable */
@@ -190,9 +194,8 @@ struct DeviceBackend {
     int   (*event_sync)(RadEvent e);
     int   (*event_elapsed_ms)(RadEvent a, RadEvent b, float* out);
 
-    /* The host has written memory a kernel issued from here on will read, without a host wait
-     * having come between: whatever makes the device see host writes after a wait has to be done
-     * now as well. */
+    /* The host wrote memory that kernels issued from here on read, with no host wait in between:
+     * do whatever a wait would have done to make host writes visible to the device. */
     void  (*host_wrote)(void);
 
     int   (*memcpy_async)(void* dst, const void* src, int64_t bytes, RadStream s);
@@ -205,73 +208,59 @@ struct DeviceBackend {
     int   (*link_hold)(RadStream s, int on);
     void* (*link_gate)(RadStream s);
 
-    /* ---- recorded passes. A backend with none leaves these null, and the run phase then issues
-     * every pass; see Ctx::run_step for what a tape is for and when one is kept.
+    /* ---- recorded passes. Null on a backend without them; the run phase then issues every
+     * pass. See Ctx::run_step for what a tape is for.
      *
-     * `tape_begin` opens a capture of every submission THIS THREAD makes -- dispatches, event
-     * records and waits -- while `tape_pause` is not in effect (it nests). `tape_mark` is the
-     * number of records so far, which is how the caller cuts a tape into the stretches between
-     * its own host work. `tape_end` closes the capture and returns the tape, or null when `keep`
-     * is 0 or the pass did something a tape cannot reproduce (the reason is in
-     * rad_dev_last_error). `tape_play` submits records [from, to) again, onto the queues they
-     * were recorded on. `tape_destroy` may be called while a play is still queued; the backend
-     * frees the tape once nothing can read it. */
+     * `tape_begin` captures every submission this thread makes (dispatches, event records and
+     * waits) outside `tape_pause` (which nests). `tape_mark` returns the record count, so the
+     * caller can cut the tape at its own host work. `tape_end` returns the tape, or null when
+     * `keep` is 0 or the pass did something a tape cannot reproduce (reason in
+     * rad_dev_last_error). `tape_play` resubmits records [from, to) onto their recorded queues.
+     * `tape_destroy` may be called while a play is queued; the tape is freed once unreachable. */
     int     (*tape_begin)(void);
     int     (*tape_mark)(void);
     void    (*tape_pause)(int on);
     RadTape (*tape_end)(int keep);
     int     (*tape_len)(RadTape t);
     int     (*tape_play)(RadTape t, int from, int to);
-    /* The first record at which two tapes differ, -1 when they agree: the same submissions to the
-     * same queues, the same packets but for where their arguments live, the same argument bytes.
-     * What differs is described into `why`. */
+    /* First record at which two tapes differ, or -1 if they agree (same submissions to the same
+     * queues, same packets apart from argument addresses, same argument bytes). The difference is
+     * described into `why`. */
     int     (*tape_diff)(RadTape a, RadTape b, char* why, int cap);
     void    (*tape_destroy)(RadTape t);
-    /* Record `i` of a tape: what it is (0 a dispatch, 1 an event record or wait) and the queue it
-     * goes to. And the one edit a closed tape takes: whether dispatch `i` is played WITHOUT the
-     * barrier bit, launching while the packets in front of it on its queue are still running.
-     * The caller sets it only where it has shown the dispatch touches nothing those packets write,
-     * and on at most kTapeOverlapRun dispatches in a row; see Ctx::haz_mark. */
+    /* `tape_record`: record `i`'s kind (0 dispatch, 1 event record or wait) and queue.
+     * `tape_set_overlap`, the one edit a closed tape accepts: play dispatch `i` without the barrier
+     * bit, so it launches while earlier packets on its queue still run. The caller sets it only
+     * where the dispatch touches nothing those packets write, and on at most kTapeOverlapRun
+     * consecutive dispatches; see Ctx::haz_mark. */
     int     (*tape_record)(RadTape t, int i, int* kind, uint32_t* queue);
     int     (*tape_set_overlap)(RadTape t, int i, int on);
 
 
-    /* ---- elastic memory: an address range whose SIZE IS FIXED AND WHOSE BACKING IS NOT.
+    /* ---- elastic memory: an address range of fixed size whose backing comes and goes.
      *
-     * A pool allocated whole owns its bytes for the life of the process, which is the right trade
-     * for a pool whose demand is known at startup and the wrong one for two pools that take
-     * turns. The KV cache and the expert slab are that pair: the cache holds what the live
-     * sessions hold and nothing more, and a byte it is not holding is a byte the expert plane
-     * would rather have resident than stream over the link.
+     * Lets two pools that take turns share memory: the KV cache backs only what live sessions
+     * hold, and the expert plane keeps the rest resident instead of streaming it over the link.
      *
-     * WHY THIS IS A PRIMITIVE AND NOT FREE-THEN-REALLOCATE. The KV pool is layer-major
-     * (core/mem/kv.h): layer i lives at `base + i * n_blocks * layer_bytes_per_block`, so the
-     * block count is baked into every layer's base address and the unused blocks are a stripe
-     * inside each layer rather than a tail anyone could hand back. Reserving the address range at
-     * its maximum and backing only part of it leaves every stride where the kernels already
-     * expect it while the physical pages come and go underneath.
+     * Free-then-reallocate does not work: the KV pool is layer-major (core/mem/kv.h), layer i at
+     * `base + i * n_blocks * layer_bytes_per_block`, so unused blocks are a stripe inside each
+     * layer, not a tail. Reserving the maximum range and backing part of it keeps every stride
+     * where the kernels expect it.
      *
-     * A backend without elastic memory leaves these null, and everything above it sizes its pools
-     * once and lives with the split: the absence is a configuration rather than a degradation.
+     * A backend without elastic memory leaves these null and pools are sized once at startup;
+     * that is a supported configuration.
      *
-     * The contract:
-     *
-     *   `vmem_reserve` takes address space and no pages.
-     *
-     *   `vmem_commit` backs ONE GRANULE and `vmem_decommit` unbacks one. A MAPPING IS UNMAPPED
-     *   EXACTLY AS IT WAS MAPPED: a driver handed four granules in one call refuses to unmap the
-     *   second of them on its own. VMem below therefore issues one call per granule and never a
-     *   run, which is what makes the granule the unit a pool can grow and shrink by.
-     *
-     *   `vmem_protect` grants this device read/write access to a range that is already backed. It
-     *   is separate from the commit because the range to name is not the one just mapped: access
-     *   set over a granule adjacent to an already-accessible one is refused where the whole
-     *   contiguous run containing both is accepted, so VMem names the run.
-     *
+     * Contract:
+     *   `vmem_reserve` takes address space, no pages.
+     *   `vmem_commit` backs one granule and `vmem_decommit` unbacks one. The driver unmaps a
+     *   mapping only exactly as it was mapped (four granules mapped in one call cannot be unmapped
+     *   singly), so VMem issues one call per granule.
+     *   `vmem_protect` grants this device read/write access to an already-backed range. It is
+     *   separate from commit because access set on a granule adjacent to an accessible one is
+     *   refused, while the whole contiguous run is accepted; VMem names the run.
      *   `vmem_release` takes a range with nothing committed in it.
      *
-     * The bookkeeping that keeps a commit off a commit lives in VMem below, once, rather than in
-     * each backend. */
+     * Overlap bookkeeping lives once in VMem below, not in each backend. */
     int64_t (*vmem_granularity)(void);                     /* commit quantum; 0 = unsupported */
     void*   (*vmem_reserve)(int64_t bytes, int64_t align);
     void    (*vmem_release)(void* base, int64_t bytes);
@@ -279,47 +268,41 @@ struct DeviceBackend {
     int     (*vmem_decommit)(void* addr, int64_t bytes);
     int     (*vmem_protect)(void* addr, int64_t bytes);
 
-    /* ---- observation. The VRAM in use on a card, every process's, as the driver counts it, read
-     * without entering the device runtime: a dashboard polls it, and a runtime call can wait on
-     * a lock the launch path holds. Available once props() has been read for the device;
-     * RAD_E_UNSUPPORTED before that, and from a backend with no such counter. Last in the table
-     * so that a backend listing its entries in order may leave it out. */
+    /* ---- observation. VRAM in use on a card by all processes, as the driver counts it, read
+     * without entering the device runtime (a dashboard polls it, and a runtime call can block on
+     * a lock the launch path holds). Available once props() has been read for the device;
+     * otherwise, or without such a counter, RAD_E_UNSUPPORTED. */
     int     (*vram_used)(int device, int64_t* out);
 
-    /* ---- plugin device code. A backend that loads device code out of the fat binaries kernel
-     * plugins carry counts each registration; `code_mark` is how many there have been, and
-     * `code_runs` answers whether every one in [from, to) holds a code object `device` runs (1),
-     * not (0, with the reason in `why`), or cannot say (< 0). The plugin loader brackets each
-     * dlopen with marks, so the run is exactly that plugin's. Null on a backend that loads no
-     * device code. */
+    /* ---- plugin device code. `code_mark` counts fat-binary registrations so far; `code_runs`
+     * reports whether every registration in [from, to) has a code object `device` runs (1), not
+     * (0, reason in `why`), or unknown (< 0). The plugin loader brackets each dlopen with marks.
+     * Null on a backend that loads no device code. */
     size_t  (*code_mark)(void);
     int     (*code_runs)(size_t from, size_t to, int device, char* why, int cap);
 
-    /* ---- 1 when the device is integrated graphics: its memory is the host's, so what it reports
-     * as device memory is shared with every process on the machine. Null on a backend with no such
-     * devices, which answers 0. */
+    /* ---- 1 when the device is integrated graphics: its "device memory" is host memory shared
+     * with every process. Null (answers 0) on a backend with no such devices. */
     int     (*integrated)(int device);
 
-    /* ---- 1 when `self` can read and write `peer`'s memory directly, 0 when it cannot, < 0 when
-     * the backend cannot say. Asked, not enabled: rad_dev_enable_peer is the call that maps the
-     * memory. Null on a backend whose devices share one address space, which answers 1. */
+    /* ---- 1 when `self` can access `peer`'s memory directly, 0 when not, < 0 when unknown. A
+     * query only; rad_dev_enable_peer maps the memory. Null (answers 1) on a backend whose devices
+     * share one address space. */
     int     (*peer_access)(int self, int peer);
 
-    /* ---- the card's PCI address, "0000:03:00.0", into `out`; RAD_E_UNSUPPORTED from a backend
-     * whose devices are not PCI devices. It is what joins the runtime's device index to the
-     * kernel's description of the same card -- its link, its power limits, its IOMMU group -- in
-     * the startup report (core/diag/diag.h). */
+    /* ---- the card's PCI address, "0000:03:00.0", into `out`; RAD_E_UNSUPPORTED for non-PCI
+     * devices. The startup report (core/diag/diag.h) uses it to join the runtime's device index to
+     * the kernel's view of the card (link, power limits, IOMMU group). */
     int     (*pci_address)(int device, char* out, int cap);
     /* ---- the device runtime's name and version, "HIP 7.2.25403", into `out`. Null on a backend
-     * with no runtime behind it. */
+     * with no runtime. */
     int     (*runtime_version)(char* out, int cap);
-    /* ---- what carries the engine's copy lists for `device` (rad_memcpy_list_async), into `out`:
-     * the card's DMA engine on a queue of the process's own, or why not. Null on a backend that
-     * copies every list segment by segment. */
+    /* ---- what carries rad_memcpy_list_async for `device`, into `out`: the card's DMA engine on
+     * the process's own queue, or why not. Null on a backend that copies segment by segment. */
     int     (*dma_lane)(int device, char* out, int cap);
 
-    /* ---- the expert prefetch's device half: see rad_xp_supported. Last in the table, so a backend
-     * listing its entries in order leaves them null. */
+    /* ---- expert prefetch device half: see rad_xp_supported. Last in the table, so a backend
+     * listing its entries positionally leaves them null. */
     int     (*xp_supported)(int device);
     int     (*xp_stream_create)(RadStream* out);
     int     (*ride)(RadStream s, void** token);
@@ -330,6 +313,11 @@ struct DeviceBackend {
     int64_t (*xp_behind)(int device);
     void*   (*alloc_uncached)(int64_t bytes);
     void    (*free_uncached)(void* p);
+
+    /* ---- gates: see rad_stream_gate. Null on a backend without them. */
+    int     (*stream_gate)(RadStream s, void** gate);
+    int     (*gate_open)(void* gate);
+    int64_t (*gate_room)(RadStream s);
 };
 
 
@@ -354,8 +342,8 @@ int     dev_peer_access(int self, int peer);
 /* The current backend's DeviceBackend::vram_used. */
 int     dev_vram_used(int device, int64_t* out);
 
-/* The current backend's DeviceBackend::code_mark and code_runs. A backend without them has no
- * device code to check: the mark is 0 and every plugin runs (1). */
+/* The current backend's DeviceBackend::code_mark and code_runs. Without them the mark is 0 and
+ * every plugin runs (1). */
 size_t  dev_code_mark();
 int     dev_code_runs(size_t from, size_t to, int device, std::string* why);
 
@@ -368,41 +356,40 @@ std::string dev_runtime_version();
 /* The current backend's DeviceBackend::dma_lane, "" where it has none. */
 std::string dev_dma_lane(int device);
 
-/* THE LONGEST RUN OF DISPATCHES A PLAYED TAPE LEAVES UNORDERED. Of any kTapeOverlapRun + 1
- * consecutive packets on a queue, one carries the barrier bit, so a packet having been launched
- * still proves that everything more than that many packets before it has completed -- which is
- * what the backend's argument slots and a tape's own lifetime are reclaimed on. */
+/* Longest run of dispatches a played tape leaves unordered. Of any kTapeOverlapRun + 1
+ * consecutive packets on a queue one carries the barrier bit, so a launched packet still proves
+ * that everything more than that many packets earlier has completed. Argument slots and tape
+ * lifetimes are reclaimed on that guarantee. */
 constexpr int kTapeOverlapRun = 6;
 
 /* ------------------------------------------------------------------ the allocation ledger
- * What rad_dev_alloc has handed out, by RAD_MEM_* kind, since the process started. See the
- * comment on the ledger in dispatch.cpp for what it is for and -- more to the point -- what it
- * cannot see: a kernel plugin that calls hipMalloc directly never reaches this file. */
+ * What rad_dev_alloc has handed out since process start, by RAD_MEM_* kind. It does not see a
+ * kernel plugin that calls hipMalloc directly; see the ledger in dispatch.cpp. */
 void rad_dev_alloc_totals(int kind, int64_t* bytes, int64_t* count);
 
 /* Event handles created and not yet destroyed, process-wide. */
 int64_t rad_dev_live_events(void);
+/* Calls to rad_event_sync and rad_stream_sync since process start, from any thread: the host
+ * blocks the ABI makes. */
+int64_t rad_dev_host_blocks(void);
 
 /* ------------------------------------------------------------------ elastic memory
- * One reserved address range and the record of which granules inside it are backed.
+ * One reserved address range and which granules inside it are backed.
  *
- * The interval bookkeeping is here rather than in the backends because the driver refuses a
- * commit that overlaps a commit and a decommit that covers a hole, and two implementations of
- * "which parts of this range are already backed" is two places for that answer to drift. The
- * backends get granule-aligned, disjoint ranges and no decisions.
+ * The interval bookkeeping lives here, not in the backends, because the driver refuses a commit
+ * overlapping a commit and a decommit covering a hole. Backends get granule-aligned, disjoint
+ * ranges and make no decisions.
  *
- * THE TWO ROUNDINGS GO OPPOSITE WAYS, AND IT IS NOT A DETAIL. A commit rounds OUTWARD, so the
- * bytes the caller asked for are certainly backed; a decommit rounds INWARD, so a granule holding
- * one byte the caller still wants is never taken away. The alternative -- one rounding for both --
- * either strands memory or unmaps live data, and the second reads as a kernel fault at an address
- * that was valid a moment ago.
+ * The roundings differ on purpose: commit rounds outward, so every requested byte is backed;
+ * decommit rounds inward, so a granule holding any byte still in use is kept. A shared rounding
+ * would either strand memory or unmap live data (a kernel fault at a valid address).
  *
- * Nothing here is thread-safe. A range is owned by whatever owns the pool it backs, and the
- * commit/decommit path is a policy decision, not a step-path one. */
+ * Not thread-safe. A range is owned by the owner of the pool it backs, and commit/decommit is
+ * policy, not step-path work. */
 class VMem {
 public:
-    /* Whether this process's backend has elastic memory at all. Callers size their pools whole
-     * when it does not: see the DeviceBackend comment for why that is a supported configuration. */
+    /* Whether the backend has elastic memory. Without it callers size pools whole (a supported
+     * configuration; see DeviceBackend). */
     static bool    supported();
     static int64_t granularity();          /* 0 when unsupported */
 
@@ -410,9 +397,8 @@ public:
     ~VMem() { release(); }
     VMem(const VMem&) = delete;
     VMem& operator=(const VMem&) = delete;
-    /* Movable, because an elastic range is owned by whatever structure holds it and those
-     * structures live in vectors. The source is left naming nothing, so the destructor it still
-     * gets does not unmap a range the destination now owns. */
+    /* Movable, since owners live in vectors. The source is left empty so its destructor does not
+     * unmap the range the destination now owns. */
     VMem(VMem&& o) noexcept
         : base_(o.base_), size_(o.size_), committed_(o.committed_), ext_(std::move(o.ext_)) {
         o.base_ = nullptr;
@@ -433,9 +419,8 @@ public:
         return *this;
     }
 
-    /* Address space only: no pages, no VRAM, nothing the card notices. `align` defaults to the
-     * granularity. Reserving large is the point -- the range is the MAXIMUM the pool may ever
-     * reach, because it is the one thing that cannot be changed later without moving addresses. */
+    /* Address space only: no pages, no VRAM. `align` defaults to the granularity. Reserve the
+     * maximum the pool may ever reach; the range cannot grow later without moving addresses. */
     int   reserve(int64_t bytes, int64_t align = 0);
     void  release();                       /* decommits whatever is still backed, then frees the VA */
 
@@ -443,22 +428,22 @@ public:
     int64_t size() const { return size_; }
     int64_t committed() const { return committed_; }   /* bytes actually backed right now */
 
-    /* Both are idempotent and both clamp to the range. commit() backs every granule touching
-     * [off, off+bytes) that is not backed; decommit() unbacks every granule wholly inside it that
-     * is. Either may do nothing and report success. */
+    /* Idempotent and clamped to the range. commit() backs every unbacked granule touching
+     * [off, off+bytes); decommit() unbacks every backed granule wholly inside it. Doing nothing is
+     * success. */
     int  commit(int64_t off, int64_t bytes);
     int  decommit(int64_t off, int64_t bytes);
 
-    /* Is every byte of [off, off+bytes) backed? The question a caller asks before handing the
-     * range to a kernel. */
+    /* Whether every byte of [off, off+bytes) is backed; check before handing a range to a
+     * kernel. */
     bool is_committed(int64_t off, int64_t bytes) const;
 
 private:
     void*   base_ = nullptr;
     int64_t size_ = 0;
     int64_t committed_ = 0;
-    /* Sorted, disjoint and never adjacent: a commit that touches an existing extent merges into
-     * it, so the list length tracks the number of live REGIONS and not the number of calls. */
+    /* Backed extents (offset, bytes): sorted, disjoint and never adjacent, since a touching
+     * commit merges. Length tracks live regions, not calls. */
     std::vector<std::pair<int64_t, int64_t>> ext_;
 
     /* Adds a newly mapped piece and merges it with whatever it touches. */
@@ -466,34 +451,30 @@ private:
     void drop_extent(int64_t off, int64_t bytes);
 };
 
-/* What every VMem in this process has backed, for the receipt Engine::start prints. Device memory
- * committed this way never reaches the rad_dev_alloc ledger -- it is not an allocation -- so
- * without this line the card's own accounting and the engine's disagree by exactly the elastic
- * pools. */
+/* Bytes backed by every VMem in the process, for Engine::start's receipt. VMem commits bypass the
+ * rad_dev_alloc ledger, so without this the engine's accounting would miss the elastic pools. */
 int64_t rad_dev_vmem_committed(void);
 
 #if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
-/* Null when the build has HIP but the machine shows no device. A build that can talk to a GPU and
- * a machine that has one are separate facts, and conflating them is how a CI container that
- * happens to have ROCm headers installed fails at the first hipMalloc instead of running the host
- * backend it was always going to run. The configure decides which kernels are COMPILED; this
- * decides whether there is a card to run them on, and neither answer implies the other. */
+/* Null when the build has HIP but the machine shows no device, so a machine with ROCm installed
+ * but no card runs the host backend instead of failing at the first hipMalloc. Configure decides
+ * which kernels are compiled; this decides whether there is a card to run them. */
 const DeviceBackend* hip_backend_if_present(void);
-/* The HIP backend with its streams, events, copies and fills replaced by AQL packets the engine
- * writes itself (aql.cpp). Aborts, naming why, on a machine it cannot run on. */
+/* The HIP backend with streams, events, copies and fills replaced by AQL packets the engine writes
+ * itself (aql.cpp). Aborts with the reason on a machine it cannot run on. */
 const DeviceBackend* aql_backend_if_present(void);
-/* Bytes copied to or from pageable host memory so far: every such copy is a host wait. */
+/* Bytes copied to or from pageable host memory so far; each such copy is a host wait. */
 int64_t aql_pageable_bytes(void);
-/* The fat binaries registered so far, counted whichever backend runs: the registration hooks are
- * this build's own exported symbols and see every dlopen'ed kernel plugin's device code, card or
- * no card. The host backend's code_mark in a HIP build. */
+/* Fat binaries registered so far, counted whichever backend runs: the registration hooks are this
+ * build's exported symbols and see every dlopen'ed plugin's device code, card or not. Serves as
+ * the host backend's code_mark in a HIP build. */
 size_t  aql_code_registered(void);
 #endif
 
 /* ------------------------------------------------------------------ the error slot */
-/* Both backends write here; rad_dev_last_error() drains it. Thread-local, because spec §1 puts one
- * thread per tensor-parallel rank and the mover on its own: a fault on the mover's thread reported
- * as the compute rank's would send the operator to the wrong half of the engine. */
+/* Both backends write here; rad_dev_last_error() drains it. Thread-local because spec §1 gives each
+ * tensor-parallel rank and the mover their own thread, and an error must be reported on the thread
+ * that caused it. */
 void device_set_error(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
 }  /* namespace rad */

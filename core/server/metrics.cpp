@@ -17,11 +17,16 @@ Histogram::Histogram(std::vector<double> bounds) : bounds_(std::move(bounds)) {
 
 void Histogram::observe(double v) {
     if (!std::isfinite(v)) return;    /* a NaN latency is a bug upstream, not a data point */
-    /* Cumulative: every bucket whose bound is >= v counts this observation. Linear because the
-     * bucket lists are twenty-odd entries and a binary search plus a fixup loop is not faster. */
-    for (size_t i = 0; i < bounds_.size(); ++i)
-        if (v <= bounds_[i]) cnt_[i].fetch_add(1, std::memory_order_relaxed);
-    n_.fetch_add(1, std::memory_order_relaxed);
+    /* Cumulative: every bucket whose bound is >= v counts this observation. A linear scan, since
+     * the lists are twenty-odd entries.
+     *
+     * The count first, then the buckets widest first, each with release. A scrape reads the
+     * buckets narrowest first and the count last, with acquire, so an observation it sees in one
+     * bucket it also sees in every wider one and in the count: the buckets it renders never
+     * decrease and never exceed the count. */
+    n_.fetch_add(1, std::memory_order_release);
+    for (size_t i = bounds_.size(); i-- > 0 && v <= bounds_[i];)
+        cnt_[i].fetch_add(1, std::memory_order_release);
     double cur = sum_.load(std::memory_order_relaxed);
     while (!sum_.compare_exchange_weak(cur, cur + v, std::memory_order_relaxed)) {}
 }
@@ -41,8 +46,8 @@ std::vector<double> buckets_latency() {
             30.0, 40.0, 50.0, 60.0, 120.0, 240.0, 480.0, 960.0, 1920.0, 7680.0};
 }
 
-/* vLLM's build_1_2_5_buckets: mantissas 1, 2, 5 at every decade, stopping at the first value past
- * max_value. A 32K-context model therefore gets 1..20000 and no more. */
+/* vLLM's build_1_2_5_buckets: mantissas 1, 2, 5 at every decade, up to max_value (a 32K-context
+ * model gets 1..20000). */
 std::vector<double> buckets_1_2_5(int64_t max_value) {
     std::vector<double> out;
     if (max_value < 1) max_value = 1;
@@ -106,9 +111,8 @@ void Metrics::observe_request(int64_t n_prompt, int64_t n_generated,
     if (max_tokens > 0) h_params_max_tokens_.observe((double)max_tokens);
 
     if (ttft_s >= 0.0) h_ttft_.observe(ttft_s);
-    /* TPOT is undefined for a one-token generation -- there is no inter-token interval to
-     * measure. Recording a zero there would drag every quantile down, so it is simply not an
-     * observation. */
+    /* TPOT is undefined for a one-token generation; recording a zero would drag every quantile
+     * down. */
     if (tpot_s >= 0.0 && n_generated > 1) h_tpot_.observe(tpot_s);
     if (e2e_s >= 0.0) h_e2e_.observe(e2e_s);
     if (decode_s >= 0.0 && n_generated > 1) h_decode_.observe(decode_s);
@@ -157,37 +161,38 @@ void Metrics::sample(const SchedMetrics& m) {
         draft_vdepth_top_.store(top, std::memory_order_release);
         draft_adapt_on_.store(true, std::memory_order_release);
     }
-    c_preemptions_.inc(std::max(0.0, (double)m.preemptions - c_preemptions_.get()));
-    c_steps_.inc(std::max(0.0, (double)m.steps - c_steps_.get()));
-    c_steps_prefill_.inc(std::max(0.0, (double)m.steps_prefill - c_steps_prefill_.get()));
-    c_steps_mixed_.inc(std::max(0.0, (double)m.steps_mixed - c_steps_mixed_.get()));
-    c_steps_decode_.inc(std::max(0.0, (double)m.steps_decode - c_steps_decode_.get()));
-    c_steps_ahead_.inc(std::max(0.0, (double)m.steps_ahead - c_steps_ahead_.get()));
-    c_prefill_capped_.inc(std::max(0.0, (double)m.prefill_chunks_capped - c_prefill_capped_.get()));
-    c_rows_unspec_.inc(std::max(0.0,
-        (double)m.decode_rows_unspeculated - c_rows_unspec_.get()));
-    c_step_secs_.inc(std::max(0.0, (double)m.step_ns * 1e-9 - c_step_secs_.get()));
-    c_step_secs_decode_.inc(std::max(0.0,
-        (double)m.step_ns_decode * 1e-9 - c_step_secs_decode_.get()));
-    c_prefill_tokens_.inc(std::max(0.0, (double)m.prefill_tokens - c_prefill_tokens_.get()));
-    c_decode_tokens_.inc(std::max(0.0, (double)m.decode_tokens - c_decode_tokens_.get()));
-    c_draft_tokens_.inc(std::max(0.0, (double)m.draft_tokens - c_draft_tokens_.get()));
-    c_draft_accepted_.inc(std::max(0.0, (double)m.draft_accepted - c_draft_accepted_.get()));
-    c_draft_refills_.inc(std::max(0.0, (double)m.draft_refills - c_draft_refills_.get()));
-    c_draft_refill_tokens_.inc(
-        std::max(0.0, (double)m.draft_refill_tokens - c_draft_refill_tokens_.get()));
-    c_attn_cached_.inc(std::max(0.0, (double)m.attn_cached_tokens - c_attn_cached_.get()));
-    c_linear_cached_.inc(std::max(0.0, (double)m.linear_cached_tokens - c_linear_cached_.get()));
-    c_checkpoints_.inc(std::max(0.0, (double)m.checkpoints_written - c_checkpoints_.get()));
-    /* The cache's own cumulative counts, so the delta is taken the same way the others are.
-     * A prefix cache that is evicting under steady load is one that cannot hold the working
-     * set, and the next turn of every session it drops re-prefills from scratch. */
-    c_prefix_evict_.inc(std::max(0.0, (double)m.prefix_evictions - c_prefix_evict_.get()));
-    c_prefix_ckpt_evict_.inc(std::max(0.0,
-        (double)m.prefix_ckpt_evictions - c_prefix_ckpt_evict_.get()));
-    c_prefix_expired_.inc(std::max(0.0, (double)m.prefix_expired - c_prefix_expired_.get()));
-    c_prefix_ckpt_expired_.inc(std::max(0.0,
-        (double)m.prefix_ckpt_expired - c_prefix_ckpt_expired_.get()));
+    c_preemptions_.advance_to(m.preemptions);
+    c_steps_.advance_to(m.steps);
+    c_steps_prefill_.advance_to(m.steps_prefill);
+    c_steps_mixed_.advance_to(m.steps_mixed);
+    c_steps_decode_.advance_to(m.steps_decode);
+    c_steps_ahead_.advance_to(m.steps_ahead);
+    c_prefill_capped_.advance_to(m.prefill_chunks_capped);
+    c_steps_held_.advance_to(m.steps_held);
+    c_rows_unspec_.advance_to(m.decode_rows_unspeculated);
+    c_step_secs_.advance_to((double)m.step_ns * 1e-9);
+    c_step_secs_decode_.advance_to((double)m.step_ns_decode * 1e-9);
+    c_prefill_tokens_.advance_to(m.prefill_tokens);
+    c_decode_tokens_.advance_to(m.decode_tokens);
+    c_draft_tokens_.advance_to(m.draft_tokens);
+    c_draft_accepted_.advance_to(m.draft_accepted);
+    c_draft_refills_.advance_to(m.draft_refills);
+    c_draft_refill_tokens_.advance_to(m.draft_refill_tokens);
+    c_attn_cached_.advance_to(m.attn_cached_tokens);
+    c_linear_cached_.advance_to(m.linear_cached_tokens);
+    c_checkpoints_.advance_to(m.checkpoints_written);
+    /* The cache's own cumulative counts, turned into deltas like the others. */
+    c_prefix_evict_.advance_to(m.prefix_evictions);
+    c_prefix_ckpt_evict_.advance_to(m.prefix_ckpt_evictions);
+    c_prefix_expired_.advance_to(m.prefix_expired);
+    c_prefix_ckpt_expired_.advance_to(m.prefix_ckpt_expired);
+    c_ckpt_retired_.advance_to(m.prefix_ckpt_retired);
+    c_ckpt_lru_.advance_to(m.prefix_ckpt_lru);
+    c_ckpt_refused_.advance_to(m.prefix_ckpt_refused);
+    c_cut_no_snapshot_.advance_to(m.hit_cut_no_snapshot);
+    c_cut_window_.advance_to(m.hit_cut_window);
+    c_cut_adopt_.advance_to(m.hit_cut_adopt);
+    c_cut_tokens_.advance_to(m.hit_cut_tokens);
     g_linear_hit_.set(m.linear_hit_rate);
 }
 
@@ -226,6 +231,8 @@ struct Writer {
         help(name, doc, "counter");
         out += name; out += labels; out += ' '; out += num(v); out += '\n';
     }
+    /* The buckets in ascending order, then the count once for both +Inf and _count, the order
+     * Histogram::observe makes consistent. */
     void hist(const char* name, const char* doc, const std::string& labels, const Histogram& h) {
         help(name, doc, "histogram");
         for (size_t i = 0; i < h.bounds().size(); ++i) {
@@ -234,13 +241,14 @@ struct Writer {
             out += ",le=\""; out += num(h.bounds()[i]); out += "\"} ";
             out += num((double)h.bucket(i)); out += '\n';
         }
+        const double n = (double)h.count();
         out += name; out += "_bucket";
         out += labels.substr(0, labels.size() - 1);
         out += ",le=\"+Inf\"} ";
-        out += num((double)h.count()); out += '\n';
+        out += num(n); out += '\n';
         out += name; out += "_sum"; out += labels; out += ' '; out += num(h.sum()); out += '\n';
         out += name; out += "_count"; out += labels; out += ' ';
-        out += num((double)h.count()); out += '\n';
+        out += num(n); out += '\n';
     }
 };
 
@@ -294,8 +302,7 @@ std::string Metrics::render() const {
            "Histogram of time to first token in seconds.", L, h_ttft_);
     w.hist("vllm:time_per_output_token_seconds",
            "Histogram of time per output token in seconds.", L, h_tpot_);
-    /* The name current vLLM uses for the same measurement. Same data, both spellings, so a
-     * dashboard written against either version works unchanged. */
+    /* Current vLLM's name for the same measurement; both spellings are emitted. */
     w.hist("vllm:inter_token_latency_seconds",
            "Histogram of inter-token latency in seconds.", L, h_tpot_);
     w.hist("vllm:e2e_request_latency_seconds",
@@ -312,8 +319,7 @@ std::string Metrics::render() const {
            "Histogram of the max_tokens request parameter.", L, h_params_max_tokens_);
 
     /* ---------------- radiance-specific ----------------
-     * Under our own prefix, never under vllm:. A dashboard that finds an unfamiliar vllm: name is
-     * a dashboard that has been lied to about which engine it is looking at. */
+     * Under our own prefix, never under vllm:. */
     w.gauge("radiance:prefill_tokens_per_second",
             "Prefill throughput over the scheduler's recent window.", L, g_prefill_tps_.get());
     w.gauge("radiance:decode_tokens_per_second",
@@ -322,10 +328,10 @@ std::string Metrics::render() const {
               "Scheduler steps executed. One forward pass of the model, plus whatever draft "
               "rounds followed it; with speculation a step emits more than one token.",
               L, c_steps_.get());
-    /* STEPS BY SHAPE, and how much of the decode ran unspeculated.
-     * `radiance:decode_rows_unspeculated_total` counts rows that took no draft for ANY reason --
-     * depth 0, a request that may not speculate, a drafter with nothing to propose. Its rate
-     * against engine_steps_total says how much of the decode speculation is not reaching. */
+    /* Steps by shape, and how much of the decode ran unspeculated.
+     * `radiance:decode_rows_unspeculated_total` counts rows that took no draft for any reason
+     * (depth 0, a request that may not speculate, a drafter with nothing to propose); its rate
+     * against engine_steps_total shows how much of the decode speculation misses. */
     w.counter("radiance:engine_steps_prefill_total",
               "Scheduler steps carrying only prefill chunks.", L, c_steps_prefill_.get());
     w.counter("radiance:engine_steps_mixed_total",
@@ -340,24 +346,24 @@ std::string Metrics::render() const {
               "Prefill chunks held back so decode rows and waiting requests got into the step "
               "(--busy-prefill-chunk).",
               L, c_prefill_capped_.get());
+    w.counter("radiance:engine_steps_held_total",
+              "Decode-only steps run after a prefill chunk while other sequences decode "
+              "(--prefill-interleave).", L, c_steps_held_.get());
     w.counter("radiance:decode_rows_unspeculated_total",
               "Decode rows that took no draft, for any reason.",
               L, c_rows_unspec_.get());
-    /* THE STEP TIME, AS A COUNTER AND NOT A RATE. Divide by engine_steps_decode_total for the
-     * milliseconds a decode step costs. Wall clock over a step count answers that only for a
-     * window that was saturated and carried no prefill, and says nothing when it was not. */
+    /* Step time as a counter. Divided by engine_steps_decode_total it gives the cost of a decode
+     * step; wall clock over a step count does so only for a saturated window with no prefill. */
     w.counter("radiance:engine_step_seconds_total",
               "Seconds spent inside a scheduler step, all shapes.", L, c_step_secs_.get());
     w.counter("radiance:engine_step_seconds_decode_total",
               "Seconds spent inside a scheduler step carrying only decode rows.",
               L, c_step_secs_decode_.get());
 
-    /* THE EXACT TOTALS, beside the rate gauges above rather than instead of them. A gauge is what
-     * a dashboard wants; a counter is what a comparison wants, because two runs that settled into
-     * different mixes of prefill and decode have incomparable rates and perfectly comparable
-     * totals. These are the only counters that answer it: vllm:generation_tokens_total is charged
-     * when a request FINISHES, and is therefore identically zero over a window in which nothing
-     * finishes. */
+    /* Exact totals beside the rate gauges. Two runs with different prefill/decode mixes have
+     * incomparable rates but comparable totals. vllm:generation_tokens_total is charged when a
+     * request finishes, so it reads zero over a window in which nothing finishes; these are
+     * charged per step. */
     w.counter("radiance:prefill_tokens_total",
               "Prompt tokens the engine has computed, exact.", L, c_prefill_tokens_.get());
     w.counter("radiance:decode_tokens_total",
@@ -375,11 +381,9 @@ std::string Metrics::render() const {
               "Cached prompt tokens those hits gave back to be recomputed.",
               L, c_draft_refill_tokens_.get());
 
-    /* PREFIX CACHING, DECOUPLED (spec §7.3). vllm:gpu_prefix_cache_hit_rate is the ATTENTION one,
-     * because that is what vLLM's single number has always meant. The linear side hits at a
-     * different granularity -- whole checkpoints, not blocks -- and averaging them would hide the
-     * effect the decoupling exists to expose. Without these a deployment cannot tell whether
-     * linear checkpointing is working at all. */
+    /* Decoupled prefix caching (spec §7.3). vllm:gpu_prefix_cache_hit_rate is the attention hit
+     * rate, as in vLLM. The linear side hits at a different granularity (whole checkpoints, not
+     * blocks), so it is reported separately rather than averaged in. */
     w.gauge("radiance:linear_prefix_cache_hit_rate",
             "Fraction of prompt tokens served from a linear-state checkpoint (spec 7.3).",
             L, g_linear_hit_.get());
@@ -389,10 +393,9 @@ std::string Metrics::render() const {
               "Prompt tokens served from a linear-state checkpoint.", L, c_linear_cached_.get());
     w.counter("radiance:linear_checkpoints_written_total",
               "Linear-state checkpoints written.", L, c_checkpoints_.get());
-    /* THE LEADING INDICATOR FOR A PREFIX-CACHE COLLAPSE. `gpu_prefix_cache_hit_rate` falls
-     * only after a reusable prefix is already gone; this rises as it is dropped. Above ~75%
-     * pool utilisation the cache starts evicting prefixes that the next turn wants, and an
-     * agent's turn-2 latency goes from seconds to minutes. */
+    /* Leading indicator of prefix-cache collapse: the hit rate falls only after a reusable prefix
+     * is gone, while evictions rise as it is dropped. Above ~75% pool utilisation the cache
+     * starts evicting prefixes the next turn wants. */
     w.counter("radiance:prefix_cache_evictions_total",
               "Prefix-cache entries evicted (attention blocks).", L, c_prefix_evict_.get());
     w.counter("radiance:prefix_cache_ckpt_evictions_total",
@@ -403,14 +406,44 @@ std::string Metrics::render() const {
     w.counter("radiance:prefix_cache_ckpt_expired_total",
               "Prefix-cache linear-state checkpoints taken out by --prefix-cache-ttl.", L,
               c_prefix_ckpt_expired_.get());
+    /* Why snapshots went, and why hits were cut: a hybrid server that re-prefills long prompts
+     * shows it here before the linear hit rate says so. */
+    {
+        const std::string base = L.substr(0, L.size() - 1);
+        auto labelled = [&](const char* name, const char* label, const char* value, double v) {
+            w.out += name; w.out += base; w.out += ','; w.out += label; w.out += "=\"";
+            w.out += value; w.out += "\"} "; w.out += num(v); w.out += '\n';
+        };
+        w.help("radiance:prefix_cache_ckpt_evictions_by_reason_total",
+               "Linear-state checkpoints evicted, by reason: released by --checkpoint-policy, or "
+               "the least recently used of a store retention left full.", "counter");
+        labelled("radiance:prefix_cache_ckpt_evictions_by_reason_total", "reason", "retention",
+                 c_ckpt_retired_.get());
+        labelled("radiance:prefix_cache_ckpt_evictions_by_reason_total", "reason", "store_full",
+                 c_ckpt_lru_.get());
+        w.counter("radiance:prefix_cache_ckpt_refused_total",
+                  "Checkpoints not written because every snapshot slot was in use by a restore "
+                  "in the same step.", L, c_ckpt_refused_.get());
+        w.help("radiance:prefix_hit_cuts_total",
+               "Admissions whose prefix hit reused nothing, by reason: no snapshot at or below "
+               "the hit, a windowed group no window snapshot covers, or blocks that could not be "
+               "adopted.", "counter");
+        labelled("radiance:prefix_hit_cuts_total", "reason", "no_snapshot",
+                 c_cut_no_snapshot_.get());
+        labelled("radiance:prefix_hit_cuts_total", "reason", "windowed_group", c_cut_window_.get());
+        labelled("radiance:prefix_hit_cuts_total", "reason", "adopt_failed", c_cut_adopt_.get());
+        w.counter("radiance:prefix_hit_cut_tokens_total",
+                  "Prompt tokens the attention cache held and admission computed again, because "
+                  "the hit resumed at a snapshot below it or reused nothing.", L,
+                  c_cut_tokens_.get());
+    }
     w.gauge("radiance:draft_acceptance_ratio",
-            "Fraction of speculative draft tokens accepted (spec 10).", L, g_draft_accept_.get());
-    /* CONDITIONAL, per draft position: of the verifies that reached position j -- every earlier
-     * one accepted -- the fraction that took j as well. The pooled ratio above cannot tell a
-     * drafter that decays from one whose later rounds are broken; these can, and the companion
-     * `_reached_total` says how much evidence each position carries. `_accepted_total` gives the
-     * same ratio over any window: at a fixed depth the next position's reach would do, but an
-     * adaptive window can end at j with j taken. */
+            "Fraction of speculative draft tokens accepted.", L, g_draft_accept_.get());
+    /* Conditional acceptance per draft position: of the verifies that reached position j (every
+     * earlier one accepted), the fraction that took j too. Unlike the pooled ratio, this tells a
+     * drafter that decays from one whose later rounds are broken. `_reached_total` is the evidence
+     * per position; `_accepted_total` gives the ratio over any window (an adaptive window can end
+     * at j with j taken, so the next position's reach is not enough). */
     const int seen = draft_pos_seen_.load(std::memory_order_acquire);
     if (seen > 0) {
         const std::string base = L.substr(0, L.size() - 1);
@@ -431,9 +464,8 @@ std::string Metrics::render() const {
             w.out += "radiance:draft_position_accepted_total" + base + ",position=\"" +
                      std::to_string(j) + "\"} " + num(g_draft_pos_accepted_[j].get()) + '\n';
     }
-    /* THE ADAPTIVE DRAFT WINDOW, only while --draft-window adaptive is in force: where the policy stands --
-     * at one sequence, that sequence's window -- and where it has been, as verifies by the
-     * number of drafts they carried. */
+    /* Adaptive draft window, only under --draft-window adaptive: the current mean window (at one
+     * sequence, that sequence's window) and its history as verifies by drafts carried. */
     if (draft_adapt_on_.load(std::memory_order_acquire)) {
         w.gauge("radiance:draft_depth_adaptive",
                 "Mean draft window the adaptive policy gives the running sequences.",

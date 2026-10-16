@@ -1,12 +1,12 @@
 // r4d_ar_oneshot_2rank_wht6.hip: translation unit for r4d_ar_oneshot_2rank_wht6, the all-reduce whose wire
-// payload is Walsh-Hadamard rotated and quantised to 6 bits. The device code and the launcher live
-// in r4d_ar_oneshot_2rank_wht6.h so the same source also compiles standalone (no Python, no r4d); this file gives
-// them the library's C ABI and reports the packing constants the caller needs to size its scratch.
-// It also holds the rotated wire's fused forms of ar_hc_write and ar_gather_hc_write, which need
-// the library's gather and hc-write arithmetic (r4d_ar_hc.h) and so live here, not in the header.
+// payload is Walsh-Hadamard rotated and quantised to 6 bits. Device code and launcher live in
+// r4d_ar_oneshot_2rank_wht6.h so they also compile standalone without r4d; this file exports them
+// through the library's C ABI with the packing constants for sizing scratch. It also holds the
+// rotated wire's fused ar_hc_write and ar_gather_hc_write, which need r4d_ar_hc.h.
 #include "r4d.h"
 #include "r4d_ar_hc.h"   // the gather word and the hc write word, shared with the exact wire
 #include "r4d_ar_oneshot_2rank_wht6.h"
+#include <cstring>
 
 void r4d_ar_oneshot_2rank_wht6(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                                long seq_ctrs, long loc_pack, long slot_stride_bytes,
@@ -20,7 +20,7 @@ void r4d_ar_oneshot_2rank_wht6(long peer_scratch, long my_scratch, long peer_fla
 // Block cap of both all-reduce kernels (the flag array is sized from it).
 int r4d_ar_max_blocks(void) { return R4D_AR_MAX_BLOCKS; }
 
-// The rotated-6-bit wire format, which the caller needs to size its packed scratch.
+// Rotated 6-bit wire format dimensions, for sizing the caller's packed scratch.
 void r4d_ar_wht6_dims(int* group, int* bits, int* chunk_elems) {
   if (group)       *group       = GROUP;
   if (bits)        *bits        = BITS;
@@ -28,37 +28,33 @@ void r4d_ar_wht6_dims(int* group, int* bits, int* chunk_elems) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// THE ROTATED WIRE WITH THE GATED RESIDUAL'S WRITE AS ITS EPILOGUE, and with GATHER the MoE gather
-// as its prologue: the 6-bit twins of r4d_ar_hc_write_kernel and r4d_ar_gather_hc_write_kernel
-// (r4d_ar_oneshot_2rank_exact.hip). Each reproduces the unfused chain it replaces to the byte --
-// moe_gather, r4d_ar_oneshot_2rank_wht6, hc_write -- because every stage is the same code: the
-// gather word and the write word are r4d_ar_hc.h's, and the wire is wht6_push_chunk and
-// wht6_reduce_chunk (r4d_ar_oneshot_2rank_wht6.h) at a smaller chunk, which moves bytes between
-// owners and never changes them. The message's words are the chain's words: the gather's are rounded to
-// bf16 as moe_gather stores them, and the reduced sum is rounded to bf16 as the standalone
-// all-reduce stores it, stored into `y`, and read back as that bf16 by the write.
+// The rotated wire with the gated residual write as epilogue and, with GATHER, the MoE gather as
+// prologue: 6-bit counterparts of r4d_ar_hc_write_kernel and r4d_ar_gather_hc_write_kernel
+// (r4d_ar_oneshot_2rank_exact.hip). Each matches the unfused chain (moe_gather,
+// r4d_ar_oneshot_2rank_wht6, hc_write) byte for byte because every stage is the same code: the
+// gather and write words from r4d_ar_hc.h, and wht6_push_chunk / wht6_reduce_chunk at a smaller
+// chunk, which changes byte ownership but not values. Gathered words are rounded to bf16 as
+// moe_gather stores them; the reduced sum is rounded to bf16, stored into `y` and read back as
+// such by the write.
 //
-// A lane's EPL elements are one word, so a word -- and the write behind it -- never straddles a row
-// even where a group or a chunk does: the rotation closes over the flattened message, the write
-// over the row the word sits in.
+// A lane's EPL elements are one word, so a word and its write never straddle a row even where a
+// group or chunk does: the rotation spans the flattened message, the write the word's row.
 //
-// THE GATHER READS ITS SLOTS FROM A TABLE IN LDS, built by the block from the sorted list: the
-// rows a block owns (whole wave-chunks, so tens of rows at a prefill chunk) and every slot of them,
-// found by one pass over the list -- the exact form's decode-sized table, sized here by the launch
-// rather than fixed at R4D_ARG_ROWS. A word's reads of the routed rows then wait on nothing but
-// their own addresses, where the inverse table puts a dependent load of the slot in front of each.
-// The launcher widens the grid until a block's table fits.
+// The gather reads its slots from an LDS table the block builds in one pass over the sorted list,
+// covering every row it owns (whole wave-chunks, so tens of rows at a prefill chunk); unlike the
+// exact form it is sized by the launch, not fixed at R4D_ARG_ROWS. Reads of the routed rows then
+// depend only on their own addresses, where an inverse table adds a dependent slot load before
+// each. The launcher widens the grid until a block's table fits.
 static_assert(EPL == 8, "a lane's share of a group is one 16B word of the message");
 
 // The LDS a block's slot table may take; the handshake's two words sit beside it.
 static constexpr size_t kWht6TableBytes = 60 * 1024;
 
-// THE FUSED FORMS' CHUNK IS 8 GROUPS -- 512 elements, two group-iterations a wave -- where the
-// standalone all-reduce's is 32. A wave walks its chunk's groups one after another and each one
-// waits on its own reads -- the routed rows of the gather, the streams of the write -- so a
-// quarter of the chunk is four times the waves at work on the same message: at a 2048-row chunk
-// the gather form takes 403 us a call, against 500 at the standalone chunk and 416 at 16 groups.
-// The two ranks run the same kernel, so the chunking both push and reduce under is the same.
+// The fused forms use 8-group chunks (512 elements, two group-iterations per wave) instead of the
+// standalone 32. A wave walks its groups serially, each waiting on its own reads (routed rows,
+// streams), so a quarter-size chunk puts four times as many waves on the message: at a 2048-row
+// chunk the gather form takes 403 us against 500 at 32 groups and 416 at 16. Both ranks run the
+// same kernel, so they push and reduce under the same chunking.
 static constexpr int kWht6FusedCG = 8;
 
 // The rows block b's chunks of `ce` elements touch: [row_lo, row_lo + nrow).
@@ -85,7 +81,7 @@ __global__ void r4d_ar_hc_write_wht6_kernel(
   __shared__ unsigned int s_seq, s_slot;
   extern __shared__ int s_tab[];   // slots, weights: [rows_max * top_k]; gates: [rows_max]
   const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
-  r4d_ar_seq_take(seq_ctrs, nbw, s_seq, s_slot);   // device-resident, replay-safe (cudagraph)
+  r4d_ar_seq_take(seq_ctrs, nbw, s_seq, s_slot);   // device-resident, replay-safe
   const unsigned int s = s_seq;
   const Wht6Slot w = wht6_slot(peer_scratch, my_scratch, loc_pack, (int)s_slot,
                                slot_stride_bytes, scale_off_bytes);
@@ -93,8 +89,8 @@ __global__ void r4d_ar_hc_write_wht6_kernel(
   const int cpb = (n_chunks + nb - 1) / nb;                 // block b owns chunks [c0,c1)
   const int c0 = b * cpb; int c1 = c0 + cpb; if (c1 > n_chunks) c1 = n_chunks;
 
-  /* The slot table, as the exact form's: a slot no sorted row claims reads -1, so the clear and
-   * the scan are two phases with a barrier between them. */
+  /* Slot table, as in the exact form: a slot no sorted row claims reads -1, so clear and scan are
+   * separated by a barrier. */
   int* s_i = s_tab;
   float* s_w = reinterpret_cast<float*>(s_tab + rows_max * G.top_k);
   float* s_g = s_w + rows_max * G.top_k;
@@ -172,8 +168,8 @@ int r4d_ar_hc_write_wht6(long peer_scratch, long my_scratch, long peer_flags, lo
   const int n_chunks = (n_groups + kWht6FusedCG - 1) / kWht6FusedCG;
   int nb = clamp_blocks((int)nblocks, n_chunks);
   const int nt = clamp_threads((int)nthreads);
-  /* THE TABLE HAS TO FIT, so the grid widens until it does: a block of cpb chunks touches at most
-   * (cpb * ce - 1) / n + 2 rows. Both ranks compute the same grid from the same M and n, which the
+  /* Widen the grid until the table fits: a block of cpb chunks touches at most
+   * (cpb * ce - 1) / n + 2 rows. Both ranks compute the same grid from the same M and n, as the
    * per-block handshake requires. */
   int rows_max = 0;
   size_t lds = 0;
@@ -187,7 +183,10 @@ int r4d_ar_hc_write_wht6(long peer_scratch, long my_scratch, long peer_flags, lo
     }
     if (lds > kWht6TableBytes || nb > R4D_AR_MAX_BLOCKS) return -3;
   }
-  R4dArGather G{};
+  /* Zeroed including padding, as in r4d_ar_gather_hc_write: the tail padding is part of the
+   * kernel-argument bytes a recorded pass's audit compares. */
+  R4dArGather G;
+  std::memset(&G, 0, sizeof G);
   if (gather) {
     G.ye = (const unsigned short*)ye;
     G.ew = (const unsigned short*)ew;

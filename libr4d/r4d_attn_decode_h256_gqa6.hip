@@ -1,22 +1,21 @@
-// R4D decode. The prefill core (lazy reference-max softmax, f16 operands, folded query scale,
-// contiguous-k fragments, prefetch + scheduling barrier, dot2 row sum) on the split-KV MTP-verify
-// shape, plus two decode-only changes:
+// R4D split-KV decode (also the MTP-verify shape). Same core as the prefill kernel (lazy
+// reference-max softmax, f16 operands, folded query scale, contiguous-k fragments, prefetch +
+// scheduling barrier, dot2 row sum), plus two decode-only options:
 //
-//   KLDS0  reads K straight from the paged cache, including when that cache is fp8. The
-//          widening moves from once-per-workgroup to once-per-warp; it costs VALU on a leg that is
-//          bandwidth-bound and buys back the whole sK allocation, which at TILE 16 is 8.3 KB of
-//          the 14.5 KB that sets resident-CTA count. This is the argmin at every depth.
-//   PF16   split-KV partials as f16 instead of f32. The partial buffer is written once and read
-//          back once, and at 16K context that round trip is ~14 MB against ~17 MB of KV -- i.e.
-//          nearly half the leg's DRAM traffic. Storing O/l rather than O bounds the value by
-//          max|v|, so f16 cannot overflow and its 11-bit mantissa costs ~5e-4 relative.
+//   KLDS0  reads K straight from the paged cache (bf16 or fp8), widening once per warp instead of
+//          once per workgroup. Costs VALU on a bandwidth-bound leg and frees sK, which at TILE 16
+//          is 8.3 KB of the 14.5 KB that limits resident workgroups. Best at every depth.
+//   PF16   split-KV partials stored as f16. At 16K context the partial round trip is ~14 MB
+//          against ~17 MB of KV. Storing O/l instead of O bounds values by max|v|, so f16 cannot
+//          overflow; the 11-bit mantissa costs ~5e-4 relative.
 //
-// This file compiles neither an fp8-P leg nor an alternative to the CONTIG fragment layout; see
-// r4d_attn_prefill_h256_gqa6.hip for the full option set and the reasoning behind each bit.
+// No fp8-P leg and no non-CONTIG alternative here; r4d_attn_prefill_h256_gqa6.hip documents the
+// full option set.
 #include "r4d.h"
 #include "r4d_common.h"
 #include "r4d_dt16.h"
 #include "r4d_q8.h"     // the gate quantiser's 8-bit codes: E4M3, or int8 (GQ == 2)
+#include <algorithm>
 #include <type_traits>
 
 #define O_F16    1
@@ -30,60 +29,29 @@
 #define O_PF8   3072
 #define O_SGB   4096
 #define O_DOT2 16384
-// The tile-staging set, shared with r4d_attn_prefill_h256_gqa6.hip -- see the comments there.
-//   BTS   block table entries for the tile in SGPRs, loaded a tile ahead. On this leg it also
-//         removes a dependent global load from INSIDE the m-tile loop: with KLDS0 the K address
-//         comes from bt[kk/BS] on every m-tile.
+// Tile-staging options, shared with r4d_attn_prefill_h256_gqa6.hip:
+//   BTS   the tile's block-table entries in SGPRs, loaded a tile ahead. With KLDS0 this also takes
+//         the dependent bt[kk/BS] load out of the m-tile loop.
 //   GPREV tile ti+1's V fetched into registers before the m-tile loop.
-//   LDSB  an LDS-scoped barrier, so __syncthreads() stops invalidating the vector cache.
+//   LDSB  an LDS-scoped barrier, so the barrier does not invalidate the vector cache.
 #define O_BTS   262144
 #define O_GPREV 1048576
 #define O_LDSB  2097152
-// O_KNT: a non-temporal hint on the K global load.  The KV a decode step reads is 134 MB a layer
-// streamed once and never re-read, and it walks the whole last level on the way past -- so what the
-// hint would protect is not this kernel but the GEMMs either side of it, whose activation is small
-// enough to live in cache if something stops evicting it.  V cannot take the hint at all: it is
-// loaded through `global_load_tr_b128` and that intrinsic has no non-temporal form.
-//
-// OFF BY DEFAULT.  The hint changes no bytes and costs nothing, and it also gains nothing: on this
-// part the KV stream is not what evicts the neighbouring GEMMs' activation, so neither this kernel
-// nor they move when it is set.  The bit costs one template parameter and is kept so the option
-// stays available for a deployment where the cache pressure is different.
-#define O_KNT   4194304
-// O_V8: an fp8 cache's V tile staged in LDS as its codes, converted when a fragment is read.
-//
-// The f16 tile is 12 KiB a workgroup and a one-wave workgroup has nothing else in LDS, so it is
-// what caps residency: ten workgroups a WGP, two and a half waves a SIMD, for a leg whose tile
-// loop is a chain of global latencies. The codes are 6 KiB. At one wave a workgroup the number of
-// conversions is the same either way -- each V element is read once by the one wave -- and the
-// conversion is exact, so the fragments, and every byte after them, match the f16 tile's. With more
-// waves a workgroup each would convert the whole tile, so the launcher sets it at one.
+// Bit 4194304 is free: a non-temporal hint on the K load gained nothing on the target GPU (the KV
+// stream does not evict the neighbouring GEMMs' activations).
+// O_V8: an fp8 cache's V tile staged in LDS as codes (6 KiB instead of 12 KiB of f16), converted
+// when a fragment is read. For a one-wave workgroup the f16 tile is what caps residency (ten
+// workgroups per WGP). At one wave the conversion count is unchanged and the conversion is exact,
+// so results are identical; with more waves each would convert the whole tile, so the launcher
+// uses it only at one wave.
 #define O_V8    8388608
-// O_KRAW: with K read straight from the paged cache (KLDS0, CONTIG), an m-tile's K is loaded in ONE
-// round -- all HEAD_DIM/16 fragment loads, issued as soon as the row address is known -- and each
-// fragment is converted from its registers just before its WMMA.
-//
-// The prefetch depth (PF) and the scheduling barrier between a group's loads and its WMMAs say
-// what may overlap, and a compiler is free to honour them literally: LLVM 24 does, and with PF 2 a
-// tile's K then arrives in HEAD_DIM/32 round trips, one after another, which cost the head_dim-128
-// drafter leg 16-19% on a bf16 cache. LLVM 22 lifted the loads over the barriers and issued them in
-// one round. This bit asks for that round explicitly. What is held is the cache's own bytes -- 8 a
-// fragment from fp8, 16 from bf16 -- not the converted fragment, so a full round costs 2 or 4 x
-// HEAD_DIM/16 VGPRs; PF = HEAD_DIM/16 would hold every converted fragment at once and cost the
-// waves a SIMD. The fragments, and every byte after them, are unchanged.
+// O_KRAW: with K read from the paged cache (KLDS0, CONTIG), issue all HEAD_DIM/16 fragment loads
+// of an m-tile in one round and convert each fragment just before its WMMA. LLVM 24 honours the PF
+// groups and scheduling barriers literally, so with PF 2 K arrives in HEAD_DIM/32 serial round
+// trips (16-19% on the head_dim-128 drafter leg, bf16 cache). Raw cache bytes are held (8 per
+// fragment for fp8, 16 for bf16), costing 2 or 4 x HEAD_DIM/16 VGPRs; PF = HEAD_DIM/16 would hold
+// converted fragments and cost occupancy. Results are unchanged.
 #define O_KRAW  16777216
-// `__builtin_nontemporal_load` will not take `uint4`/`uint2` -- they are HIP_vector_type class
-// templates, not native vectors -- so the hinted loads go through these and bit-cast the WHOLE
-// value back (never a subscript of it, which miscompiles).
-typedef unsigned r4d_ntu4 __attribute__((ext_vector_type(4)));
-typedef unsigned r4d_ntu2 __attribute__((ext_vector_type(2)));
-
-template <int NT, typename T, typename V>
-__device__ __forceinline__ T r4d_kload(const T* p) {
-  if (!NT) return *p;
-  return __builtin_bit_cast(T, __builtin_nontemporal_load((const V*)p));
-}
-
 __host__ __device__ __forceinline__ int r4d_attn_tiles(int ctx, int tile) { return (ctx + tile - 1) / tile; }
 __host__ __device__ __forceinline__ int r4d_attn_tps(int ctx, int tile, int splits) {
     int t = r4d_attn_tiles(ctx, tile); return (t + splits - 1) / splits;
@@ -99,9 +67,8 @@ __host__ __device__ __forceinline__ int r4d_attn_used(int ctx, int tile, int spl
     int t = r4d_attn_tiles(ctx, tile), tps = r4d_attn_tps(ctx, tile, splits); return (t + tps - 1) / tps;
 }
 
-// WIN turns on a sliding window (a.window positions, ending at each row's causal
-// limit). It is a TEMPLATE parameter and defaults to 0, so a full-attention geometry
-// compiles with no bound, no clamp and no extra mask term.
+// WIN enables a sliding window (a.window positions ending at each row's causal limit). As a
+// template parameter defaulting to 0, full attention compiles with no window code.
 template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT,
          int WIN = 0>
 __global__ __launch_bounds__(NWARPS * 32)
@@ -118,7 +85,6 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     constexpr int DOT2  = ((OPT & O_DOT2) && (OPT & O_F16)) ? 1 : 0;
     constexpr int BTS   = (OPT & O_BTS)  ? 1 : 0;
     constexpr int LDSB  = (OPT & O_LDSB) ? 1 : 0;
-    constexpr int KNT   = (OPT & O_KNT)  ? 1 : 0;
     constexpr int V8    = ((OPT & O_V8) && !KVP) ? 1 : 0;
     static_assert(!V8 || (OPT & O_CONTIG), "the code tile is read in the contiguous layout");
     constexpr int KRAW  = ((OPT & O_KRAW) && !KLDS) ? 1 : 0;
@@ -134,27 +100,18 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     constexpr int NB    = TILE / BS;
     constexpr int NTR   = (TILE / 8) * (HEAD_DIM / (KVP ? 32 : 64));
     constexpr int VREGS = (NTR + NWARPS - 1) / NWARPS;
-    // A V prefetch costs VREGS x 4 VGPRs and this leg already carries a 128-VGPR accumulator and a
-    // 64-VGPR query. At two uint4 (fp8 KV, TILE 16) it is worth 6-8% at depth; at four (fp8
-    // TILE 32, or bf16 TILE 16, whose V is twice the bytes) it spills and LOSES 10%. So the
-    // geometry decides, not the flag.
-    // THREE is reachable only because the K prefetch needs just two: the three-uint4 form is what
-    // the 48-row shape (q_len 8, gqa 6, so NWARPS 3 over NTR 8) needs, it stays inside 255 VGPRs
-    // with no spill, and it is worth a further 2-15% on top -- most at the depths where the K
-    // stream has the least other work to hide behind. At NWARPS 1 or 2, and for a bf16 cache whose
-    // V is twice the bytes, VREGS is 4 or more and the prefetch stays off.
-#ifndef R4D_GPREV_VREGS
-#define R4D_GPREV_VREGS 3
-#endif
-    constexpr int GPREV = ((OPT & O_GPREV) && VREGS <= R4D_GPREV_VREGS) ? 1 : 0;
+    // A V prefetch costs VREGS x 4 VGPRs on top of a 128-VGPR accumulator and a 64-VGPR query.
+    // Up to three uint4 it fits in 255 VGPRs without spilling (two: +6-8% at depth; three, the
+    // 48-row shape q_len 8 x gqa 6 at NWARPS 3: a further 2-15%). At four or more (NWARPS 1-2, or a
+    // bf16 cache) it spills and loses ~10%, so the geometry gates it, not just the flag.
+    constexpr int GPREV = ((OPT & O_GPREV) && VREGS <= 3) ? 1 : 0;
     constexpr float PSHIFT = D::SHIFT;
     constexpr float PGROW  = D::GROW;
 
     __shared__ uint16_t sK[KLDS ? TILE * KSTR : 1];
     __shared__ uint16_t sV16[V8 ? 1 : HEAD_DIM * VSTR];
-    /* A row of the code tile is 16 keys and 8 of padding: 24 bytes is six dwords, so the sixteen
-     * lanes of a fragment read land on distinct banks, and a lane's eight codes are one aligned
-     * 8-byte load. */
+    /* A code-tile row is 16 keys + 8 padding = 24 bytes (six dwords): the sixteen lanes of a
+     * fragment read hit distinct banks, and a lane's eight codes are one aligned 8-byte load. */
     constexpr int VSTR8 = TILE + 8;
     __shared__ uint8_t sV8[V8 ? HEAD_DIM * VSTR8 : 1];
 
@@ -165,19 +122,16 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     const int ctx = a.seqused_k[seq];
     if (ctx <= 0) return;
 
-    // Ragged batches (r4d.h, R4DArgs::cu_q): the rows of q and out this sequence owns, and its
-    // own query length. `a.q_len` is the batch maximum when cu_q is set, and it is what the
-    // launcher sized the wave count from, so rows past `qlen` are simply not live.
+    // Ragged batches (r4d.h, R4DArgs::cu_q): this sequence's q/out rows and query length. With
+    // cu_q, a.q_len is the batch maximum that sized the wave count; rows past qlen are not live.
     const int qoff = r4d_q_off(a.cu_q, seq, a.q_len);
     const int qlen = r4d_q_len(a.cu_q, seq, a.q_len);
     if (qlen <= 0) return;                 // a slot carrying no query rows this step
 
     const int ntl  = r4d_attn_tiles(ctx, TILE);
-    // A sliding-window layer reads only the last `window` positions. The blocks below
-    // that are not merely useless: the engine has freed them and may already have handed
-    // them to another sequence, so reading one is wrong rather than wasteful. The walk
-    // starts at the tile holding the window's first token -- taken at query row 0,
-    // whose window reaches furthest back -- and the splits divide THAT range.
+    // A sliding-window layer must not read below the window: those blocks may already be freed
+    // and reassigned to another sequence. The walk starts at the tile holding row 0's first
+    // window token (row 0 reaches furthest back), and the splits divide that range.
     const int wlo0 = WIN ? r4d_attn_wlo(ctx, qlen, 0, a.window) : 0;
     const int tb   = WIN ? wlo0 / TILE : 0;
     const int neff = ntl - tb;
@@ -211,9 +165,9 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
         }
     }
 
-    // The row's absolute position. Causal masking bounds the key by it; non-causal
-    // masking bounds the key by the sequence and lets the window bound it on BOTH
-    // sides, which is what a block-diffusion drafter's own block needs.
+    // The row's absolute position. Causal masking bounds the key by it; non-causal masking
+    // bounds it by the sequence, with the window applied on both sides (a block-diffusion
+    // drafter's own block).
     const int pos = ctx - qlen + qrow;
     const int cz  = a.causal_seq ? (int)((const unsigned char*)a.causal_seq)[seq] : a.causal;
     const int klimit = cz ? pos
@@ -287,12 +241,10 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
         }
     };
 
-    // A tile's NB entries are read whole, and when a tile spans several blocks the last one can run
-    // past the sequence's last block -- past the end of its row, and on the last row past the end
-    // of the table. Every key is clamped to ctx - 1 before it picks an entry, so no entry past
-    // `lastb` is ever used and clamping the index there changes no value that is. Only a window
-    // that reaches past `lastb` takes the clamped form, so every other tile keeps its one wide
-    // scalar load; at one block a tile no window can reach past it and the test folds away.
+    // A tile's NB entries are read whole, and a multi-block tile can run past the sequence's last
+    // block (on the last row, past the end of the table). Keys are clamped to ctx - 1, so entries
+    // past lastb are never used; only tiles reaching past lastb take the clamped load, and the
+    // rest keep one wide scalar load. With NB == 1 the test folds away.
     const int lastb = (ctx - 1) / BS;
     auto load_bt = [&](int t0, int* out) {
         if (NB > 1 && t0 + NB - 1 > lastb) {
@@ -327,13 +279,11 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
                 uint16_t* kd = &sK[key * KSTR];
                 uint32_t w4[4];
                 if (KVP) {
-                    const uint4 r = r4d_kload<KNT, uint4, r4d_ntu4>(
-                        (const uint4*)((const uint16_t*)a.kv + o + ch * 8));
+                    const uint4 r = *(const uint4*)((const uint16_t*)a.kv + o + ch * 8);
                     w4[0] = D::from_bf16w(r.x); w4[1] = D::from_bf16w(r.y);
                     w4[2] = D::from_bf16w(r.z); w4[3] = D::from_bf16w(r.w);
                 } else {
-                    fp8x8_to_16x4w<D>(r4d_kload<KNT, uint2, r4d_ntu2>(
-                        (const uint2*)((const uint8_t*)a.kv + o + ch * 8)), w4);
+                    fp8x8_to_16x4w<D>(*(const uint2*)((const uint8_t*)a.kv + o + ch * 8), w4);
                 }
                 *(uint2*)(kd + ch * 8)     = make_uint2(w4[0], w4[1]);
                 *(uint2*)(kd + ch * 8 + 4) = make_uint2(w4[2], w4[3]);
@@ -355,7 +305,7 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
                      + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * (2 * HEAD_DIM))
                      * (KVP ? 2 : 1);
             }
-            // A fragment's K bytes: 8 elements at 1 byte (fp8) or 2 (bf16), as the branches below read.
+            // A fragment's raw K: 8 elements of 1 byte (fp8) or 2 (bf16).
             typedef typename std::conditional<KVP != 0, uint4, uint2>::type kraw_t;
             kraw_t kraw[KRAW ? NKS : 1];
             if constexpr (KRAW) {
@@ -373,8 +323,7 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
                     if (KLDS) {
                         const uint16_t* kp = &sK[(mt * 16 + c) * KSTR + 16 * t];
                         if (CTG) {
-                            const uint4 u = r4d_kload<KNT, uint4, r4d_ntu4>(
-                                (const uint4*)(kp + 8 * h));
+                            const uint4 u = *(const uint4*)(kp + 8 * h);
                             kb[j] = D::mk(make_uint2(u.x, u.y), make_uint2(u.z, u.w));
                         } else {
                             kb[j] = D::mk(*(const uint2*)(kp + 4 * h), *(const uint2*)(kp + 8 + 4 * h));
@@ -395,7 +344,7 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
                     } else {
                         const uint8_t* kp = grow + 16 * t;
                         uint32_t w4[4];
-                        // CONTIG makes this ONE 8-byte load where the split map needs two 4-byte.
+                        // CONTIG: one 8-byte load; the split map needs two 4-byte loads.
                         uint2 raw;
                         if constexpr (KRAW && KVP == 0) raw = kraw[t];
                         else raw = CTG ? *(const uint2*)(kp + 8 * h)
@@ -528,29 +477,17 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     }
 }
 
-// Vectorised merge, and the one the h256 launcher takes whenever the split count fits a wave.
-// The arithmetic is identical to r4d_attn_splitkv_combine_kernel below, bit for bit; what changes
-// is the thread map. One WAVE owns one output row and each lane owns EIGHT of that row's 256
-// dims, so a segment is one 16-byte load per lane instead of eight 2-byte loads -- the same 512
-// bytes per instruction across the wave, at an eighth of the instructions -- and one block
-// carries JPB rows. There is no barrier and no LDS anywhere in it, which is also what lets the
-// rows sharing a block have different contexts, and so different segment counts.
-// ---- THE OUTPUT GATE AND THE fp8 QUANTISER AS THE MERGE'S EPILOGUE (attn_paged_gate_quant) ----
+// ---- Output gate and fp8 quantiser as the merge's epilogue (attn_paged_gate_quant) ----
 //
-// A gated attention's output goes from here straight into `gate_quant_fp8`: bf16(sigmoid(gate)),
-// times the merged row, rounded to bf16, and E4M3 codes with one scale per 128 columns taken over
-// that product. A merge row is one (token, head) pair and 128 columns are one scale group, so the
-// row that is merged here is exactly the rows the quantiser would read back -- and it is still in
-// registers. The `_gq` forms below finish it in place, with no dispatch between the two.
+// A gated attention's merged row feeds gate_quant_fp8: bf16(sigmoid(gate)) times the row, rounded
+// to bf16, then E4M3 codes with one scale per 128 columns. A merge row is one (token, head) pair
+// and a scale group is 128 columns, so the `_gq` forms finish the row in registers instead of in a
+// second dispatch.
 //
-// BYTE-FOR-BYTE `gate_quant_fp8`'s arithmetic, which r4d_fused_quant_fp8.hip states: the gate
-// rounded to bf16 before the multiply, the product rounded, the group's absmax (a max, so the
-// order it is taken in cannot matter), scale = amax / 448 or 1 at zero, codes over product / scale
-// clamped to +-448 -- and the bf16 product is what lands in `out`, as the in-place pair leaves it.
-// A padded slot merges to zeros and then takes the same epilogue, as the pair would give it.
-//
-// GQ == 2 IS THE SAME EPILOGUE AT INT8 CODES, for an int8 out projection: scale amax / 127 and the
-// value over it rounded to nearest-even (r4d_q8.h) -- gate_quant_fp8's int8 form, byte for byte.
+// Byte-identical to gate_quant_fp8 (r4d_fused_quant_fp8.hip): gate rounded to bf16 before the
+// multiply, product rounded, scale = group absmax / 448 (1 at zero), codes clamped to +-448, and
+// the bf16 product stored to `out`. A padded slot merges to zeros and takes the same epilogue.
+// GQ == 2 is the int8 form (scale amax / 127, round to nearest-even, r4d_q8.h).
 struct R4DGateQuant {
     const uint16_t* g;          // gate, row `job` at g + job * g_ld
     uint8_t*        q;          // E4M3 (or int8, `i8`) codes, row `job` at q + job * q_ld
@@ -567,6 +504,10 @@ __device__ __forceinline__ uint16_t r4d_gq_gate(uint16_t gb, uint16_t xb) {
 }
 __device__ __forceinline__ float r4d_gq_clamp(float v) { return fminf(fmaxf(v, -448.0f), 448.0f); }
 
+// Vectorised merge, used by the h256 launcher whenever the split count fits a wave. Bit-identical
+// to splitkv_combine_body below; only the thread map differs. One wave owns one output row and
+// each lane HEAD_DIM/32 dims, so a segment is one 16-byte load per lane; a block carries JPB rows.
+// No barrier and no LDS, so rows in one block may have different contexts and segment counts.
 template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN, int GQ>
 __device__ __forceinline__
 void splitkv_combine_vec_body(const R4DArgs& a, int splits, int tile, const R4DGateQuant& gq)
@@ -580,9 +521,8 @@ void splitkv_combine_vec_body(const R4DArgs& a, int splits, int tile, const R4DG
     const int ctx = a.seqused_k[seq];
     uint16_t* outp = (uint16_t*)a.out + (size_t)job * HEAD_DIM + lane * DPL;
 
-    /* The row's bf16 values, then either the plain store or the gated, quantised one. A lane's
-     * DPL columns sit inside one 128-column group, and the group is the 128 / DPL lanes around it,
-     * so its absmax is a butterfly over those lanes and nothing wider. */
+    /* Plain store, or gated + quantised. A lane's DPL columns lie in one 128-column group of
+     * 128 / DPL lanes, so the group absmax is a butterfly over those lanes only. */
     auto finish = [&](const uint16_t (&ob)[DPL]) {
         if constexpr (!GQ) {
             union { uint4 u4; uint2 u2; uint16_t w[DPL]; } o_;
@@ -643,9 +583,9 @@ void splitkv_combine_vec_body(const R4DArgs& a, int splits, int tile, const R4DG
     else      { const float* so = (const float*)a.scratch;
                 sm = so + nrow * HEAD_DIM; sl = sm + nrow; }
 
-    // max is exact in any order, and taken sequentially it is wave-uniform, so this is a scalar
-    // walk. The sum keeps the LDS tree association: the stride-32 pre-accumulation is that tree
-    // off=32 round, and the xor butterfly 16..1 is the rest of it, leaving the value in every lane.
+    // max is order-independent and wave-uniform, so it is a scalar walk. The sum reproduces the
+    // LDS tree's association (stride-32 pre-accumulation, then xor butterfly 16..1) so results
+    // match the non-vector merge bit for bit.
     float gmax = -INFINITY;
     for (int s = 0; s < u; ++s) gmax = fmaxf(gmax, sm[base + s]);
     float tot = 0.0f;
@@ -671,7 +611,7 @@ void splitkv_combine_vec_body(const R4DArgs& a, int splits, int tile, const R4DG
     int s = 0;
     if (PF16) {
         const uint16_t* op = (const uint16_t*)a.scratch + base * HEAD_DIM + lane * DPL;
-        // One aligned access a lane a segment: 16 bytes at head_dim 256, 8 at 128.
+        // One aligned access per lane per segment: 16 bytes at head_dim 256, 8 at 128.
         union { uint4 u4; uint2 u2; __fp16 h[DPL]; } r;
         auto rd = [&](int sx) {
             if (DPL == 8) r.u4 = *(const uint4*)(op + (size_t)sx * HEAD_DIM);
@@ -719,8 +659,7 @@ void splitkv_combine_vec_body(const R4DArgs& a, int splits, int tile, const R4DG
         float av = 0.0f;
         #pragma unroll
         for (int i = 0; i < CHAINS; ++i) av += ch[i][j];
-        // (av * vd) / tot, in that order: folding vd/tot into one reciprocal first is a different
-        // rounding and shows up as a whole bf16 ULP on the merged output.
+        // (av * vd) / tot in this order; folding vd/tot first rounds differently (one bf16 ULP).
         ob[j] = f32_to_bf16(tot > 0.0f ? av * vd / tot : 0.0f);
     }
     finish(ob);
@@ -741,9 +680,9 @@ void r4d_attn_splitkv_combine_vec_gq_kernel(const R4DArgs a, int splits, int til
     splitkv_combine_vec_body<HEAD_DIM, CHAINS, PF16, JPB, WIN, GQ>(a, splits, tile, gq);
 }
 
-// Merge. PF16=1 reads normalised f16 partials and folds l into the weight; PF16=0 is the plain
-// path (unnormalised f32 partials, l summed separately). Both walk the segments in FIXED INDEX
-// ORDER so a request's rounding never depends on CTA scheduling.
+// Merge. PF16=1 reads normalised f16 partials and folds l into the weight; PF16=0 reads
+// unnormalised f32 partials with l summed separately. Both walk segments in fixed index order so
+// rounding never depends on workgroup scheduling.
 template<int HEAD_DIM, int CHAINS, int PF16, int WIN, int GQ>
 __device__ __forceinline__
 void splitkv_combine_body(const R4DArgs& a, int splits, int tile, const R4DGateQuant& gq)
@@ -755,9 +694,9 @@ void splitkv_combine_body(const R4DArgs& a, int splits, int tile, const R4DGateQ
     const int seq = r4d_q_seq(a.cu_q, a.num_seqs, a.q_len, tok);
     const int ctx = a.seqused_k[seq];
 
-    /* One thread a column, so a 128-column scale group is four waves: each takes its own absmax
-     * and the group's is the max over its four, through `red` -- whose last read, the total's,
-     * is behind a barrier before the merge loop, and which a padded slot never used. */
+    /* One thread per column, so a 128-column scale group is four waves, combined through `red`.
+     * Reusing `red` is safe: its last read (the total) is behind a barrier before the merge loop,
+     * and a padded slot never used it. */
     auto finish = [&](uint16_t ob) {
         uint16_t* op = (uint16_t*)a.out + (size_t)job * HEAD_DIM + d;
         if constexpr (!GQ) {
@@ -787,12 +726,11 @@ void splitkv_combine_body(const R4DArgs& a, int splits, int tile, const R4DGateQ
         }
     };
 
-    // A padded batch slot has no context at all. Its output is discarded by the caller, but the
-    // segment count below would divide by zero, so leave zeros and stop. `ctx` is block-uniform,
-    // so every thread takes this branch together and the barriers further down stay matched.
+    // A padded slot (ctx 0) would divide by zero below; write zeros and stop. ctx is
+    // block-uniform, so the barriers below stay matched.
     if (ctx <= 0) { finish(0); return; }
-    // Segment count, derived the same way the decode kernel derived it -- including the
-    // window's tile floor, or the merge would read partials no segment ever wrote.
+    // Segment count, derived exactly as in the decode kernel, including the window's tile floor;
+    // otherwise the merge would read partials no segment wrote.
     const int nef = r4d_attn_tiles(ctx, tile)
                   - (WIN ? r4d_attn_wlo(ctx, r4d_q_len(a.cu_q, seq, a.q_len), 0, a.window) / tile : 0);
     const int tp_ = (nef + splits - 1) / splits;
@@ -873,4 +811,95 @@ void r4d_attn_splitkv_combine_gq_kernel(const R4DArgs a, int splits, int tile,
                                         const R4DGateQuant gq)
 {
     splitkv_combine_body<HEAD_DIM, CHAINS, PF16, WIN, GQ>(a, splits, tile, gq);
+}
+
+// ---- host helpers shared by the paged decode dispatches -----------------------------------------
+
+// Split law of the full-attention legs (h256/gqa6 and the gqa8 family): as many workgroups as fit
+// under 128 (grid = splits * kv_heads * num_seqs), at least two tiles per segment. It does not
+// depend on gqa or head_dim.
+//
+// floor(128 / units), not a power of two: a power of two leaves 96-112 workgroups at 3, 5, 6 and
+// 7 requests, and floor is 2-20% faster there. Staying under a multiple of 64 matters (at five
+// requests, 13 splits = 130 workgroups is three rounds of 64 and slower than 12).
+//
+// Fewer splits mainly save partial-buffer traffic (seqs x q_len x q_heads x splits rows of
+// head_dim f16, written once and read once): at eight requests 12.8 MB at splits 32 vs 3.2 MB at
+// 8, 19% of a 16K step's KV but 1.2% at 128K. The effect fades with depth, never enough to need a
+// context term.
+static inline int r4d_decode_splits(const R4DArgs* a, int tile) {
+    if (a->splits > 0) return a->splits;
+    const int tiles = (a->max_ctx + tile - 1) / tile;
+    const int units = std::max(1, a->kv_heads * a->num_seqs);
+    int s = 128 / units;
+    const int cap = tiles / 2;
+    if (s > cap) s = cap;
+    if (s > tiles) s = tiles;
+    if (s < 1) s = 1;
+    return s;
+}
+
+// Split law of the windowed legs (the DFlash2 drafter at h128/gqa4, Gemma 4 at h256/gqa2): target
+// 192 workgroups, round down to a power of two (min 16), keep at least two tiles per segment, then
+// step up off splits * units == 256, a slow spot for these geometries. The tile count comes from
+// the window when one is set, since that is the span the kernel walks.
+static inline int r4d_decode_splits_win(const R4DArgs* a, int tile) {
+    if (a->splits > 0) return a->splits;
+    const int span  = (a->window > 0 && a->window + a->q_len < a->max_ctx)
+                    ? a->window + a->q_len : a->max_ctx;
+    const int tiles = (span + tile - 1) / tile;
+    const int units = std::max(1, a->kv_heads * a->num_seqs);
+    const int raw   = 192 / units;
+    int s = 128;
+    while (s > 16 && s > raw) s >>= 1;
+    const int cap = tiles / 2;
+    while (s > 16 && s > cap) s >>= 1;
+    if (s > tiles) s = tiles;
+    if (s < 1) s = 1;
+    if (s * units == 256 && s * 2 <= tiles) s <<= 1;
+    return s;
+}
+
+// Bytes of split-KV partials one decode launch needs, the same for both cache dtypes: f16 O/l plus
+// m and l under O_PF16, else f32 O plus m and l.
+static inline long r4d_decode_scratch(const R4DArgs* a, int splits, int opt) {
+    const long rows = (long)r4d_q_total(*a) * a->q_heads;
+    return (opt & O_PF16) ? rows * splits * (long)(a->head_dim * 2 + 8)
+                          : rows * splits * (long)(a->head_dim + 2) * 4L;
+}
+
+// The windowed legs' decode (WIN = 1): the attention kernel at the gqa-aligned height, then the
+// merge, one wave per row when there are enough rows and the segment count fits a wave, else the
+// LDS-tree form; both give identical bytes. Tile 16, paged block 16, at most 64 query rows, and
+// the full-attention legs' merge constants (two rows a block, the wave form from 256 rows).
+// Returns 0, a negative code for a shape it does not serve, or -100 - hipError_t.
+template <int HEAD_DIM, int GQA, int OPT, int KVP>
+static int r4d_decode_launch_win(const R4DArgs* a, hipStream_t s) {
+    constexpr int TILE = 16, BS = 16, JPB = 2, VECMIN = 256, PF16 = (OPT & O_PF16) ? 1 : 0;
+    if (a->head_dim != HEAD_DIM || a->block_size != BS) return -1;
+    if (a->q_heads / a->kv_heads != GQA) return -2;
+    const int rows = a->q_len * GQA;
+    if (rows > 64) return -4;
+    const int nw = (rows + 15) / 16;
+    const int splits = r4d_decode_splits_win(a, TILE);
+#define R4D_WIN_LAUNCH(NW)                                                                     \
+    hipLaunchKernelGGL((r4d_attn_decode_kernel<NW, TILE, HEAD_DIM, GQA, BS, KVP, OPT, 1>),      \
+                       dim3(splits, a->kv_heads, a->num_seqs), dim3(NW * 32), 0, s, *a, splits)
+    if      (nw == 1) R4D_WIN_LAUNCH(1);
+    else if (nw == 2) R4D_WIN_LAUNCH(2);
+    else if (nw == 3) R4D_WIN_LAUNCH(3);
+    else              R4D_WIN_LAUNCH(4);
+#undef R4D_WIN_LAUNCH
+    hipError_t e = hipGetLastError();
+    if (e != hipSuccess) return -100 - (int)e;
+
+    const int jobs3 = r4d_q_total(*a) * a->q_heads;
+    if (splits <= 64 && jobs3 >= VECMIN)
+        hipLaunchKernelGGL((r4d_attn_splitkv_combine_vec_kernel<HEAD_DIM, 4, PF16, JPB, 1>),
+                           dim3((jobs3 + JPB - 1) / JPB), dim3(32 * JPB), 0, s, *a, splits, TILE);
+    else
+        hipLaunchKernelGGL((r4d_attn_splitkv_combine_kernel<HEAD_DIM, 4, PF16, 1>), dim3(jobs3),
+                           dim3(HEAD_DIM), splits * sizeof(float), s, *a, splits, TILE);
+    e = hipGetLastError();
+    return e == hipSuccess ? 0 : -100 - (int)e;
 }

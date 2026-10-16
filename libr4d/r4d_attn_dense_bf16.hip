@@ -2,25 +2,26 @@
 // with an optional two-sided window |i - j| < window. bf16 in and out, f16 operands, f32
 // accumulate. Head widths 64, 256 and 512 are compiled; each (head_dim, gqa) pair is a row.
 //
-// The core is the vision kernel's (r4d_attn_vit_h72_bf16.hip): S^T = K.Q^T, so the wave32
-// column-distributed accumulator gives each lane one query row, the softmax state is lane-private,
-// and the C fragment of S^T is already the B fragment the PV matmul wants -- P never goes through
-// LDS. What this file adds:
+// Core from the vision kernel (r4d_attn_vit_h72_bf16.hip): S^T = K.Q^T, so the wave32
+// column-distributed accumulator gives each lane one query row, softmax state is lane-private, and
+// the C fragment of S^T is already the B fragment of P.V, so P never goes through LDS. Additions:
 //
-//   GQA IN THE WORKGROUP. A workgroup owns one KV head and every query head that reads it, so a
-//   staged K/V tile is consumed by GQA times as many WMMAs as one head would give it. The grid is
-//   (query blocks, kv heads, segments).
+//   GQA in the workgroup: a workgroup owns one KV head and all query heads reading it, so each
+//   staged K/V tile feeds GQA times as many WMMAs. Grid is (query blocks, kv heads, segments).
 //
-//   A WINDOW. A workgroup's key range is cut to the keys any of its queries can see, and the
-//   per-element test runs only on tiles that straddle a window edge or the segment's end; an
-//   interior tile pays nothing. Sliding layers at |i - j| <= 512 then cost O(T * window), not
-//   O(T^2).
+//   Window: the key range is cut to keys any of the workgroup's queries can see, and the
+//   per-element mask runs only on tiles straddling a window edge or the segment end. Sliding
+//   layers cost O(T * window), not O(T^2).
 //
-//   A HEAD SPLIT ACROSS WAVES (DSPLIT). One lane's output is head_dim / 2 floats, so head_dim 512
-//   would need 256 accumulator VGPRs before the query fragments -- more than a lane has. At
-//   DSPLIT 2 two waves own the same 16 queries and half the head each: each contracts its half
-//   of q.k, the two partial scores are summed through LDS, both run the same softmax (a + b ==
-//   b + a, so the two copies agree to the bit), and each accumulates its half of P.V.
+//   Blocks: `block` cuts a segment into blocks of that many rows from its start, each attending
+//   only within itself (a chunked audio encoder's windows). The key range is cut to the blocks
+//   the workgroup's queries are in, and the per-element test runs only where a workgroup or a
+//   tile straddles a block edge. `cu_div` reads cu_seqlens in units that many rows apart.
+//
+//   Head split across waves (DSPLIT): a lane's output is head_dim / 2 floats, so head_dim 512
+//   would need 256 accumulator VGPRs. At DSPLIT 2 two waves share 16 queries and each owns half
+//   the head: partial q.k scores are summed through LDS, both run the same softmax (a + b == b + a,
+//   so both copies agree bit for bit), and each accumulates its half of P.V.
 //
 // Every operand is read at its own token pitch, so q, k and v may be column slices of one fused
 // projection; pitches and head offsets must be multiples of 8 elements for the 16-byte fetches.
@@ -35,8 +36,8 @@ template<int HD, int GQA, int NQB, int DSPLIT, int TILE>
 __global__ __launch_bounds__(NQB * GQA * DSPLIT * 32)
 void r4d_attn_dense_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restrict__ gk,
                            const uint16_t* __restrict__ gv, uint16_t* __restrict__ go,
-                           const int* __restrict__ cu, float scale, int window,
-                           int q_ld, int k_ld, int v_ld, int o_ld)
+                           const int* __restrict__ cu, float scale, int window, int block,
+                           int cdiv, int q_ld, int k_ld, int v_ld, int o_ld)
 {
     typedef DT16<1> D;
     typedef D::frag frag16;
@@ -73,7 +74,7 @@ void r4d_attn_dense_kernel(const uint16_t* __restrict__ gq, const uint16_t* __re
     const int kvh = blockIdx.y, seq = blockIdx.z;
     const int hq  = kvh * GQA + g;
 
-    const int s0 = cu[seq], slen = cu[seq + 1] - s0;
+    const int s0 = cu[seq] / cdiv, slen = cu[seq + 1] / cdiv - s0;
     const int q0 = blockIdx.x * BQ;
     if (slen <= 0 || q0 >= slen) return;
     const int qlast = min(q0 + BQ, slen) - 1;
@@ -84,6 +85,13 @@ void r4d_attn_dense_kernel(const uint16_t* __restrict__ gq, const uint16_t* __re
         kb = max(0, q0 - (window - 1));
         ke = min(slen, qlast + window);
     }
+    const bool blocks = block > 0;
+    if (blocks) {
+        kb = max(kb, q0 / block * block);
+        ke = min(ke, (qlast / block + 1) * block);
+    }
+    // A workgroup whose queries are all in one block masks only the tiles crossing its edges.
+    const bool q_straddle = blocks && q0 / block != qlast / block;
 
     const float mul = scale * 1.44269504089f;
     const int  qpos = q0 + qbi * 16 + c;
@@ -117,11 +125,13 @@ void r4d_attn_dense_kernel(const uint16_t* __restrict__ gq, const uint16_t* __re
     const int ntiles = (ke - kb + TILE - 1) / TILE;
     for (int ti = 0; ti < ntiles; ++ti) {
         const int k0 = kb + ti * TILE;
-        // Whether any (query, key) pair of this tile is outside the window or past the keys:
-        // uniform over the workgroup, so the interior tiles skip the test entirely.
+        // Whether any (query, key) pair of this tile is outside the window or past the keys.
+        // Workgroup-uniform, so interior tiles skip the test.
         const bool mask = (k0 + TILE > ke) ||
                           (window > 0 && (k0 < qlast - (window - 1) ||
-                                          k0 + TILE - 1 > q0 + (window - 1)));
+                                          k0 + TILE - 1 > q0 + (window - 1))) ||
+                          (blocks && (q_straddle || k0 / block != (k0 + TILE - 1) / block ||
+                                      k0 / block != q0 / block));
 
         uint4 kr[KP], vr[VP];
         #pragma unroll
@@ -133,8 +143,8 @@ void r4d_attn_dense_kernel(const uint16_t* __restrict__ gq, const uint16_t* __re
                 kr[p] = *(const uint4*)(kbase + (long)(s0 + kk) * k_ld + gg * 8);
             }
         }
-        // V transposed on the way in: the eight lanes of a group name eight key rows at the same
-        // eight dims, and global_load_tr_b128 hands lane j dim d0+j across all eight.
+        // V transposed on load: a group's eight lanes name eight key rows at the same eight dims,
+        // and global_load_tr_b128 gives lane j dim d0+j across all eight.
         #pragma unroll
         for (int r = 0; r < VP; ++r) {
             const int u = lgi + r * LGRP;
@@ -213,13 +223,14 @@ void r4d_attn_dense_kernel(const uint16_t* __restrict__ gq, const uint16_t* __re
                 for (int e = 0; e < 8; ++e) {
                     const int key = kq + e;
                     const int d = qpos - key;
-                    const bool ok = key < ke && (window <= 0 || (d < window && -d < window));
+                    const bool ok = key < ke && (window <= 0 || (d < window && -d < window)) &&
+                                    (!blocks || key / block == qpos / block);
                     sc[e] = ok ? sc[e] : -INFINITY;
                 }
             }
 
-            // The softmax against a reference max, rescaled only when the row max outgrows what
-            // the f16 P can hold (r4d_dt16.h).
+            // Softmax against a reference max, rescaled only when the row max outgrows the f16
+            // P range (r4d_dt16.h).
             float smax = sc[0];
             #pragma unroll
             for (int e = 1; e < 8; ++e) smax = fmaxf(smax, sc[e]);
@@ -240,7 +251,7 @@ void r4d_attn_dense_kernel(const uint16_t* __restrict__ gq, const uint16_t* __re
             #pragma unroll
             for (int e = 0; e < 8; e += 2)
                 pw[e >> 1] = D::pk(ex2(sc[e] + soff), ex2(sc[e + 1] + soff));
-            // The row sum off the packed P, so the denominator is the values P.V used.
+            // Row sum from the packed P, so the denominator matches the values P.V used.
             const v2hf one = {(__fp16)1.0f, (__fp16)1.0f};
             #pragma unroll
             for (int e = 0; e < 4; ++e)
@@ -290,46 +301,47 @@ void r4d_attn_dense_kernel(const uint16_t* __restrict__ gq, const uint16_t* __re
 template<int HD, int GQA, int NQB, int DSPLIT, int TILE>
 static int r4d_attn_dense_launch(const void* q, const void* k, const void* v, void* o,
                                  const void* cu, int num_seqs, int max_seqlen, int n_head_kv,
-                                 float scale, int window, int q_ld, int k_ld, int v_ld, int o_ld,
-                                 hipStream_t s)
+                                 float scale, int window, int block, int cdiv, int q_ld, int k_ld,
+                                 int v_ld, int o_ld, hipStream_t s)
 {
     constexpr int BQ = NQB * 16;
     dim3 grid((max_seqlen + BQ - 1) / BQ, n_head_kv, num_seqs);
     hipLaunchKernelGGL((r4d_attn_dense_kernel<HD, GQA, NQB, DSPLIT, TILE>), grid,
                        dim3(NQB * GQA * DSPLIT * 32), 0, s, (const uint16_t*)q, (const uint16_t*)k,
-                       (const uint16_t*)v, (uint16_t*)o, (const int*)cu, scale, window, q_ld,
-                       k_ld, v_ld, o_ld);
+                       (const uint16_t*)v, (uint16_t*)o, (const int*)cu, scale, window, block,
+                       cdiv, q_ld, k_ld, v_ld, o_ld);
     const hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -100 - (int)e;
 }
 
 // q, o: [tokens, n_head * head_dim]; k, v: [tokens, n_head_kv * head_dim], each at its own token
 // pitch in elements. cu_seqlens is [num_seqs + 1] int32 on the device; max_seqlen is a host-side
-// bound on the segment lengths and sizes the grid. window 0 is the whole segment.
+// bound on the segment lengths, in rows, and sizes the grid. window 0 is the whole segment, block
+// 0 no blocks; cu_seqlens counts in units cdiv rows apart.
 extern "C" int r4d_attn_dense_bf16(const void* q, const void* k, const void* v, void* o,
                                    const void* cu_seqlens, int num_seqs, int max_seqlen,
                                    int n_head, int n_head_kv, int head_dim, float scale,
-                                   int window, int q_ld, int k_ld, int v_ld, int o_ld,
-                                   void* stream)
+                                   int window, int block, int cdiv, int q_ld, int k_ld, int v_ld,
+                                   int o_ld, void* stream)
 {
     if (n_head <= 0 || n_head_kv <= 0 || n_head % n_head_kv) return -2;
     if ((q_ld | k_ld | v_ld | o_ld) & 7) return -3;
-    if (window < 0) return -4;
+    if (window < 0 || block < 0 || cdiv <= 0) return -4;
     if (num_seqs <= 0 || max_seqlen <= 0) return 0;
     const int gqa = n_head / n_head_kv;
     hipStream_t s = (hipStream_t)stream;
     if (head_dim == 64 && gqa == 1)
         return r4d_attn_dense_launch<64, 1, 8, 1, 64>(q, k, v, o, cu_seqlens, num_seqs, max_seqlen,
-                                                      n_head_kv, scale, window, q_ld, k_ld, v_ld,
-                                                      o_ld, s);
+                                                      n_head_kv, scale, window, block, cdiv, q_ld,
+                                                      k_ld, v_ld, o_ld, s);
     if (head_dim == 256 && gqa == 2)
         return r4d_attn_dense_launch<256, 2, 8, 1, 32>(q, k, v, o, cu_seqlens, num_seqs,
-                                                       max_seqlen, n_head_kv, scale, window, q_ld,
-                                                       k_ld, v_ld, o_ld, s);
+                                                       max_seqlen, n_head_kv, scale, window, block,
+                                                       cdiv, q_ld, k_ld, v_ld, o_ld, s);
     if (head_dim == 512 && gqa == 4)
         return r4d_attn_dense_launch<512, 4, 2, 2, 16>(q, k, v, o, cu_seqlens, num_seqs,
-                                                       max_seqlen, n_head_kv, scale, window, q_ld,
-                                                       k_ld, v_ld, o_ld, s);
+                                                       max_seqlen, n_head_kv, scale, window, block,
+                                                       cdiv, q_ld, k_ld, v_ld, o_ld, s);
     return -1;
 }
 
@@ -351,34 +363,31 @@ extern "C" int r4d_rad_attn_dense(const RadArgs* a, RadStream s) {
     const long long gqa      = r4d_geti_or(a, "gqa", 1);
     if (head_dim <= 0 || gqa <= 0) return R4D_NO(RAD_E_SHAPE);
     /* [tokens, heads * head_dim] (or [tokens, heads, head_dim]) at the operand's own row pitch. */
-    auto rows = [&](const RadTensor* t, long long* n_tok, long long* n_head, long long* ld) {
-        long long width = 1;
-        for (uint32_t i = 1; i < t->rank; ++i) width *= t->shape[i];
-        if (t->rank < 2 || width % head_dim) return false;
-        *n_head = width / head_dim;
-        *ld = r4d_rows_pitch(t, width, n_tok);
-        return *ld >= 0;
-    };
     long long total = 0, nh = 0, q_ld = 0;
     long long tk = 0, hk = 0, k_ld = 0, tv = 0, hv = 0, v_ld = 0, to = 0, ho = 0, o_ld = 0;
-    if (!rows(q, &total, &nh, &q_ld) || !rows(k, &tk, &hk, &k_ld) ||
-        !rows(v, &tv, &hv, &v_ld) || !rows(o, &to, &ho, &o_ld))
+    if (!r4d_head_rows(q, head_dim, &total, &nh, &q_ld) ||
+        !r4d_head_rows(k, head_dim, &tk, &hk, &k_ld) ||
+        !r4d_head_rows(v, head_dim, &tv, &hv, &v_ld) ||
+        !r4d_head_rows(o, head_dim, &to, &ho, &o_ld))
         return R4D_NO(RAD_E_STRIDE);
     if (hk != hv || ho != nh || hk * gqa != nh) return R4D_NO(RAD_E_SHAPE);
     if (tk < total || tv < total || to < total) return R4D_NO(RAD_E_SHAPE);
     if (cu->rank != 1 || cu->shape[0] < 2) return R4D_NO(RAD_E_SHAPE);
     const int num_seqs = (int)(cu->shape[0] - 1);
 
-    /* max_seqlen sizes the grid and is a bound, not a length: the kernel reads the device-side
-     * cu_seqlens. Absent, the total token count is a valid bound. */
+    /* max_seqlen is a grid-sizing bound (the kernel reads device-side cu_seqlens); defaults to
+     * the total token count. */
     long long msl = r4d_geti_or(a, "max_seqlen", 0);
     if (msl <= 0 || msl > total) msl = total;
     const float scale = (float)r4d_getf(a, "scale", 1.0 / std::sqrt((double)head_dim));
     const long long window = r4d_geti_or(a, "window", 0);
+    const long long block  = r4d_geti_or(a, "block", 0);
+    const long long cdiv   = r4d_geti_or(a, "cu_div", 1);
 
     const int e = r4d_attn_dense_bf16(q->data, k->data, v->data, o->data, cu->data, num_seqs,
                                       (int)msl, (int)nh, (int)hk, (int)head_dim, scale,
-                                      (int)window, (int)q_ld, (int)k_ld, (int)v_ld, (int)o_ld, s);
-    if (e == -1) return R4D_NO(RAD_E_SHAPE);
-    return e == 0 ? RAD_OK : R4D_NO(e == -3 ? RAD_E_STRIDE : RAD_E_DEVICE);
+                                      (int)window, (int)block, (int)cdiv, (int)q_ld, (int)k_ld,
+                                      (int)v_ld, (int)o_ld, s);
+    if (e == 0) return RAD_OK;
+    return R4D_NO(e == -3 ? RAD_E_STRIDE : e <= -100 ? RAD_E_DEVICE : RAD_E_SHAPE);
 }

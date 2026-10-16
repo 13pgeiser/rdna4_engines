@@ -10,11 +10,9 @@ namespace rad {
 
 TierExec::~TierExec() { close(); }
 
-/* The two ops are resolved ONCE, at configure, and at the width they will actually be called at.
- * `n` is the fragment in bytes and it is a per-group constant, so nothing here re-resolves on the
- * maintenance path -- a selector call between steps would be affordable and is still the wrong
- * shape: the kernel that serves a transfer must not be able to change underneath a half-finished
- * batch. */
+/* gather_rows and scatter_rows are resolved once here, at the width they are called at (`n` is the
+ * per-group fragment in bytes). Nothing re-resolves on the maintenance path, so the kernel serving
+ * a transfer cannot change in the middle of a batch. */
 int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers,
                         const std::vector<int32_t>& groups, int max_batch, int64_t max_copy,
                         int64_t max_chain, bool leader, int device, int64_t slot_off,
@@ -47,9 +45,8 @@ int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers,
             gi_.push_back(gi);
             continue;
         }
-        /* THE FRAGMENT WIDTH IS THE CONSTRAINT THE KERNEL IS PICKED ON. libr4d's byte-row pair
-         * takes n as a multiple of 4; a geometry that does not satisfy it resolves to nothing
-         * here rather than failing at launch inside a batch. */
+        /* The kernel is picked on the fragment width (libr4d's byte-row pair needs n % 4 == 0).
+         * An unsupported width fails here rather than at launch inside a batch. */
         Geometry q;
         q.set_s("dtype", "u8");
         q.set_i("n", gi.frag);
@@ -67,9 +64,8 @@ int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers,
         gi_.push_back(gi);
     }
     if (gi_.empty()) return RAD_E_UNSUPPORTED;
-    /* EVERY CACHED GROUP ZERO ON THIS RANK: it would hold nothing of any entry, and an empty
-     * entry is a zero-width copy on every path below. Said, and the tiers are off -- one rank
-     * that cannot take part takes them off for all. */
+    /* Every cached group is zero on this rank, so its entry would be empty. One rank that cannot
+     * take part turns the tiers off for all. */
     if (off == 0) {
         RAD_WARN("kv tiers: this rank keeps no cache for any group the prefix cache holds "
                  "(rad_kv_group_zero), so it has no part of an entry to move. The tiers are off.");
@@ -78,10 +74,7 @@ int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers,
     }
     entry_bytes_ = off;
 
-    /* NOTHING IS BUILT ON THE DEVICE HERE -- see device_init(). A tier that is configured but has
-     * no job to run must cost the step nothing, and on this engine that is not a figure of speech:
-     * building the staging buffer and the stream at bringup costs 13.3 ms of a 20.5 ms decode step
-     * on a two-card R9700 Flash-Next server, whether or not a single byte ever moves. */
+    /* Nothing is built on the device here; see device_init(). */
     verify_ = leader && std::getenv("RADIANCE_DEBUG_TIER_VERIFY") != nullptr;
 
     char buf[320];
@@ -97,9 +90,8 @@ int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers,
 TierExec::Sizes TierExec::sizes(int64_t entry_bytes, int64_t max_ctx, int64_t block_size) {
     Sizes s;
     if (entry_bytes <= 0) return s;
-    /* 16 MiB of staging a rank, as entries, between 64 and 4096 of them: the reasons are at the
-     * call in bringup. A copy out is four batches, and a restore is a whole chain, as long as the
-     * longest context the server takes. */
+    /* 16 MiB of staging per rank, clamped to 64..4096 entries (rationale at the bringup call site).
+     * A copy out is four batches; a restore is a whole chain as long as the longest context. */
     s.max_batch = (int)std::min<int64_t>(4096, std::max<int64_t>(64, (16ll << 20) / entry_bytes));
     s.max_copy  = 4ll * s.max_batch;
     const int64_t bs = std::max<int64_t>(1, block_size);
@@ -107,8 +99,7 @@ TierExec::Sizes TierExec::sizes(int64_t entry_bytes, int64_t max_ctx, int64_t bl
     return s;
 }
 
-/* What device_init() allocates, each allocation rounded to the pool granule the card hands VRAM
- * out in. */
+/* What device_init() allocates, each allocation rounded to the VRAM pool granule. */
 int64_t TierExec::device_bytes(int64_t entry_bytes, int n_groups, const Sizes& s) {
     if (entry_bytes <= 0 || n_groups <= 0 || s.max_batch <= 0) return 0;
     const int64_t idx_n = (int64_t)n_groups * (s.max_copy + (int64_t)kRing * s.max_chain);
@@ -117,21 +108,11 @@ int64_t TierExec::device_bytes(int64_t entry_bytes, int n_groups, const Sizes& s
 }
 
 void TierExec::close() {
-    /* Nothing may still be reading the buffers about to be freed. */
+    /* Drain before freeing buffers the stream may still read. */
     if (stream_) (void)rad_stream_sync(stream_);
     if (stream_ && own_stream_) rad_stream_destroy(stream_);
     stream_ = nullptr; shared_ = nullptr; own_stream_ = false;
-    if (stage_)    { rad_dev_free(stage_, RAD_MEM_DEVICE); stage_ = nullptr; }
-    if (idx_dev_)  { rad_dev_free(idx_dev_, RAD_MEM_DEVICE); idx_dev_ = nullptr; }
-    if (idx_host_) { rad_dev_free(idx_host_, RAD_MEM_HOST_PINNED); idx_host_ = nullptr; }
-    for (int i = 0; i < kRing; ++i) {
-        if (ring_ev_[i]) rad_event_destroy(ring_ev_[i]);
-        ring_ev_[i] = nullptr;
-        ring_used_[i] = false;
-    }
-    if (ev_compute_) { rad_event_destroy(ev_compute_); ev_compute_ = nullptr; }
-    if (ev_copy_)    { rad_event_destroy(ev_copy_);    ev_copy_ = nullptr; }
-    if (ev_restore_) { rad_event_destroy(ev_restore_); ev_restore_ = nullptr; }
+    release_device();
     copy_out_ = false;
     gi_.clear();
     order_.clear();
@@ -143,26 +124,25 @@ void TierExec::close() {
     report_.clear();
 }
 
-/* THE DEVICE SIDE, BUILT ON FIRST USE AND NOT BEFORE.
- *
- * Ctx::lane_init() makes the same argument for the second compute lane: a stream is cheap
- * enough that its cost hides inside the run-to-run spread of a warming part, so the only honest
- * way to claim the lane costs nothing when unused is to not build it. The tiers follow the same
- * rule, and here the cost is not small enough to hide in anything. Decode step time with the
- * device side built at bringup, on a two-card R9700 Flash-Next server at 200K context:
- *
- *   no tiers                                             20.54 ms/step   collect 14.66
- *   tiers on, 512 MiB host arena                         33.94 ms/step   collect 26.78
- *   tiers on, idle threshold a day -- NOTHING EVER MOVED 33.88 ms/step   collect 26.66
- *
- * In the third line not one byte crosses the link, and the step is still 65% longer. The cost is
- * in `collect` -- device time -- and a configured tier that has nothing to do pays it on every
- * step. It is not the transfers, not the pinned host arena (512 MiB costs exactly what 12 GiB
- * does) and not the VRAM the staging takes (with no tiers and --gpu-headroom-mib lowered to leave
- * the same 17 MiB free, the step runs at full speed).
- *
- * So the device side is built when the first job needs it, and a server whose conversations never
- * finish pays nothing for the tiers. */
+void TierExec::release_device() {
+    if (stage_)    { rad_dev_free(stage_, RAD_MEM_DEVICE); stage_ = nullptr; }
+    if (idx_dev_)  { rad_dev_free(idx_dev_, RAD_MEM_DEVICE); idx_dev_ = nullptr; }
+    if (idx_host_) { rad_dev_free(idx_host_, RAD_MEM_HOST_PINNED); idx_host_ = nullptr; }
+    for (int i = 0; i < kRing; ++i) {
+        if (ring_ev_[i]) rad_event_destroy(ring_ev_[i]);
+        ring_ev_[i] = nullptr;
+        ring_used_[i] = false;
+    }
+    if (ev_compute_) { rad_event_destroy(ev_compute_); ev_compute_ = nullptr; }
+    if (ev_copy_)    { rad_event_destroy(ev_copy_);    ev_copy_ = nullptr; }
+    if (ev_restore_) { rad_event_destroy(ev_restore_); ev_restore_ = nullptr; }
+}
+
+/* Builds the device side on first use, never at bringup (same rule as Ctx::lane_init()). Built
+ * eagerly, it makes every decode step 65% longer even when nothing ever moves: on two R9700s with
+ * Flash-Next at 200K context, 20.5 -> 33.9 ms/step, all of it device time. The cost is not the
+ * transfers, the pinned arena size or the staging VRAM; it is the extra hardware queue (see
+ * stream_ in tierexec.h). */
 int TierExec::device_init() {
     if (stream_) return RAD_OK;
     RAD_TRY(rad_dev_set(device_));
@@ -176,21 +156,10 @@ int TierExec::device_init() {
     bool ev = rad_event_create(&ev_compute_) == RAD_OK && rad_event_create(&ev_copy_) == RAD_OK &&
               rad_event_create(&ev_restore_) == RAD_OK;
     for (int i = 0; i < kRing && ev; ++i) ev = rad_event_create(&ring_ev_[i]) == RAD_OK;
-    auto undo = [&] {
-        if (stage_)    { rad_dev_free(stage_, RAD_MEM_DEVICE); stage_ = nullptr; }
-        if (idx_dev_)  { rad_dev_free(idx_dev_, RAD_MEM_DEVICE); idx_dev_ = nullptr; }
-        if (idx_host_) { rad_dev_free(idx_host_, RAD_MEM_HOST_PINNED); idx_host_ = nullptr; }
-        for (int i = 0; i < kRing; ++i) { if (ring_ev_[i]) rad_event_destroy(ring_ev_[i]); ring_ev_[i] = nullptr; }
-        if (ev_compute_) { rad_event_destroy(ev_compute_); ev_compute_ = nullptr; }
-        if (ev_copy_)    { rad_event_destroy(ev_copy_);    ev_copy_ = nullptr; }
-        if (ev_restore_) { rad_event_destroy(ev_restore_); ev_restore_ = nullptr; }
-    };
-    if (!stage_ || !idx_dev_ || !idx_host_ || !ev) { undo(); return RAD_E_NOMEM; }
-    /* THE MOVER'S STREAM IF THERE IS ONE, AND A NEW ONE ONLY IF THERE IS NOT. Both move bytes
-     * nobody is waiting for, so one maintenance stream a rank serves both -- and the fourth
-     * hardware queue a second one would claim costs about 13 ms a decode step (see
-     * device_init). Never the step's own stream: a copy out would then be a dependency of the
-     * next token. */
+    if (!stage_ || !idx_dev_ || !idx_host_ || !ev) { release_device(); return RAD_E_NOMEM; }
+    /* Borrow the mover's maintenance stream if there is one; both move bytes nobody waits for,
+     * and a fourth hardware queue costs about 13 ms per decode step. Never the step's own
+     * stream, or a copy out would become a dependency of the next token. */
     if (shared_) {
         stream_ = shared_;
         own_stream_ = false;
@@ -198,24 +167,14 @@ int TierExec::device_init() {
         own_stream_ = true;
     } else {
         stream_ = nullptr;
-        undo();
+        release_device();
         return RAD_E_DEVICE;
     }
     return RAD_OK;
 }
 
-int64_t tier_entry_bytes(const KVManager& kv, const std::vector<int32_t>& groups) {
-    int64_t n = 0;
-    for (int32_t g : groups) {
-        const KVGroupPlan* p = kv.plan(g);
-        if (p && p->paged()) n += p->bytes_per_block;
-    }
-    return n;
-}
-
-/* One (group, layer) launch. `stage_base` is the first entry's staging slot; the rows this call
- * writes (or reads) are at a stride of entry_bytes_ from it, which is what puts each entry's
- * fragment inside its own contiguous staging entry. */
+/* One (group, layer) launch. Staging rows are at stride entry_bytes_ from `stage_base` (the first
+ * entry's slot), so each fragment lands inside its own contiguous staging entry. */
 int TierExec::run_rows(const Resolved& r, bool scatter, const GroupInfo& gi, int64_t layer,
                        void* stage_base, const int32_t* d_idx, int64_t n_jobs) {
     RadTensor pool{};
@@ -234,7 +193,7 @@ int TierExec::run_rows(const Resolved& r, bool scatter, const GroupInfo& gi, int
     pack.dtype = RAD_U8;
     pack.rank = 2;
     pack.shape[0] = n_jobs;      pack.shape[1] = gi.frag;
-    pack.stride[0] = entry_bytes_;   /* <-- the whole trick: one entry's stride, not one row's */
+    pack.stride[0] = entry_bytes_;   /* one entry's stride, not one row's */
     pack.stride[1] = 1;
     pack.data = (char*)stage_base + gi.off + layer * gi.frag;
 
@@ -242,10 +201,8 @@ int TierExec::run_rows(const Resolved& r, bool scatter, const GroupInfo& gi, int
     if (scatter) { t3[0] = pack; t3[1] = idx; t3[2] = pool; }
     else         { t3[0] = pool; t3[1] = idx; t3[2] = pack; }
 
-    /* THE RESOLVED GEOMETRY, not a hand-built one. It carries whatever the winning kernel
-     * supplied for a derived key as well as the query, and M in it is the band's upper bound --
-     * which is correct and is the convention: both implementations take the row count from the
-     * OPERAND extent, because M is ranged and the value in the args is the worst case. */
+    /* Pass the resolved geometry, which carries the winning kernel's derived keys. Its M is the
+     * band's upper bound; kernels take the row count from the operand extent. */
     RadArgs a{};
     a.t = t3; a.n_t = 3;
     a.p = r.geom.params(); a.n_p = r.geom.n_params();
@@ -273,17 +230,15 @@ void TierExec::verify_check(const BlockHash& key, const void* p, int64_t n) {
     if (it == out_sum_.end()) return;               /* never went out through this process */
     const uint64_t back = tier_fnv(p, n);
     if (back == it->second) return;
-    RAD_ERR("kv tiers: the attention blocks for %s came back DIFFERENT (%016llx out, %016llx in). "
-            "The tier is moving the wrong bytes, not the engine choosing differently downstream.",
+    RAD_ERR("kv tiers: the attention blocks for %s came back different (%016llx out, %016llx in); "
+            "the tier moved the wrong bytes",
             key.str().c_str(), (unsigned long long)it->second, (unsigned long long)back);
 }
 
 /* ------------------------------------------------------------------ helpers */
 
-/* WHY THIS IS NOT RAD_TRY. A tier that fails is invisible: the entry stays where it was, the pool
- * keeps its blocks, and everything still works -- just slower, forever, with a counter nobody is
- * looking at. The first failure names the call it came from, because "5824 failures" and nothing
- * else is a day of bisecting. */
+/* Like RAD_TRY, but the first failure is logged with the call it came from. A failing tier is
+ * otherwise invisible: entries stay put and the server only gets slower. */
 #define TIER_TRY(call, what)                                                                  \
     do { const int _s = (call);                                                               \
          if (_s != RAD_OK) { warn_once(what, _s); return _s; } } while (0)
@@ -339,9 +294,8 @@ int TierExec::issue_copy(std::vector<TierJob>& jobs, RadStream compute) {
     TIER_TRY(rad_dev_set(device_), "selecting the rank device");
     TIER_TRY(device_init(), "building the transfer staging");
     const int st = enqueue_copy(jobs, compute);
-    /* A COPY THAT FAILED PART OF THE WAY IN IS DRAINED BEFORE ITS SLOTS GO BACK. The report frees
-     * every host slot the batch was handed, and a transfer already queued into one would land on
-     * whatever the arena gives that slot to next. */
+    /* Drain a partly enqueued copy before its host slots are freed by the report, or a queued
+     * transfer would land on the slot's next owner. */
     if (st != RAD_OK) (void)rad_stream_sync(stream_);
     return st;
 }
@@ -351,13 +305,11 @@ int TierExec::enqueue_copy(std::vector<TierJob>& jobs, RadStream compute) {
     for (TierJob& j : jobs) if (!j.blocks.empty()) order_.push_back(&j);
     const int64_t n = (int64_t)order_.size();
     if (n > copy_idx_) return RAD_E_INVAL;
-    /* EVERY ID FIRST, BEFORE ANY OF THEM IS LAUNCHED AGAINST. A gather over an unbacked id faults
-     * the whole card rather than failing the transfer. */
+    /* Check every id before any launch: a gather over an unbacked id faults the whole card. */
     for (TierJob* j : order_)
         if (!blocks_backed(j->blocks, "copy to host")) return RAD_E_STATE;
 
-    /* AFTER EVERYTHING THE COMPUTE STREAM HAS BEEN GIVEN, which includes the step that wrote these
-     * blocks. A stream wait, not a host wait. */
+    /* Stream-ordered after everything given to compute, including the step that wrote these. */
     TIER_TRY(rad_event_record(ev_compute_, compute), "ordering the copy after the step");
     TIER_TRY(rad_event_wait(stream_, ev_compute_), "ordering the copy after the step");
 
@@ -435,15 +387,13 @@ int TierExec::issue_restore(std::vector<TierJob>& jobs, RadStream compute,
     TIER_TRY(device_init(), "building the transfer staging");
     const size_t ng = gi_.size();
 
-    /* WHO CHOOSES THE BLOCKS, AND WHO KEEPS THE BOOKS. Ids are shared across ranks -- one block
-     * table indexes every rank's shard -- so exactly one rank may choose, and that same rank is
-     * the only one whose allocator means anything: the prefix cache holds the KV references and
-     * the prefix cache is rank 0's. A follower writes into the ids it is handed and reserves
-     * nothing.
+    /* Block ids are shared across ranks (one block table indexes every shard), so only the leader
+     * chooses and reserves them; its allocator is the one the prefix cache (rank 0's) references.
+     * Followers write into the ids they are handed.
      *
-     * THE WHOLE CHAIN IS RESERVED BEFORE ANY OF IT MOVES, one recall of the loan for all of it.
-     * Where the pool runs short the chain is cut at that point and the rest stay unstarted: a hit
-     * needs a contiguous prefix, so an entry past a gap would be restored for nothing. */
+     * The whole chain is reserved before anything moves, with one loan recall. If the pool runs
+     * short the chain is cut there: a hit needs a contiguous prefix, so entries past a gap are
+     * useless. */
     if (leader_) {
         const int64_t n = (int64_t)jobs.size();
         std::vector<std::vector<int32_t>> ids(ng);
@@ -463,15 +413,13 @@ int TierExec::issue_restore(std::vector<TierJob>& jobs, RadStream compute,
     }
     size_t m = 0;
     while (m < jobs.size() && jobs[m].blocks.size() == ng) ++m;
-    /* AND WHETHER THIS RANK CAN ADDRESS WHAT IT WAS HANDED. The leader chose these ids against its
-     * own live mark and the recall moved every follower's with it; this is the check that it did. */
+    /* The leader chose ids against its own live mark and the recall should have moved every
+     * follower's with it; verify that here. */
     for (size_t i = 0; i < m; ++i)
         if (!blocks_backed(jobs[i].blocks, "restore")) { m = i; break; }
 
-    /* THE CUT IS WHAT THE FOLLOWERS READ. They find their chain by which jobs carry block ids,
-     * so every job past the point the leader stopped gives its ids back and carries none. A
-     * follower handed ids for an entry the leader could not address would copy into blocks that
-     * are not the cache's. */
+    /* Followers find the chain by which jobs carry block ids, so every job past the cut releases
+     * its ids and carries none; otherwise a follower would copy into blocks the cache does not own. */
     if (leader_) {
         for (size_t i = m; i < jobs.size(); ++i) {
             for (size_t k = 0; k < ng && k < jobs[i].blocks.size(); ++k)
@@ -487,11 +435,10 @@ int TierExec::issue_restore(std::vector<TierJob>& jobs, RadStream compute,
         verify_check(jobs[i].key, (char*)tiers_->arena().at(jobs[i].host_slot) + slot_off_,
                      entry_bytes_);
 
-    /* FROM HERE ON A FAILURE LEAVES A MIXTURE, so every job about to be written is marked started
-     * first -- report() drops a started job that failed rather than trusting its host copy to
-     * describe blocks some layers of which were overwritten. And the compute stream is made to
-     * wait on whatever was enqueued, success or not: a failed job's blocks go back to the pool,
-     * and nothing may be written into them before the transfers already queued against them. */
+    /* From here a failure leaves blocks partly overwritten. Mark jobs started first, so report()
+     * drops a failed started job instead of trusting its host copy. The compute stream waits on
+     * whatever was enqueued, success or not, because a failed job's blocks return to the pool and
+     * must not be reused before the queued transfers into them. */
     for (size_t i = 0; i < m; ++i) jobs[i].started = true;
     const int ri = ring_next_;
     ring_next_ = (ring_next_ + 1) % kRing;
@@ -522,8 +469,8 @@ int TierExec::issue_restore(std::vector<TierJob>& jobs, RadStream compute,
     for (size_t i = 0; i < done; ++i) (*ok)[i] = 1;
     st_.bytes_in += (int64_t)done * entry_bytes_;
 
-    /* THE STEP THAT READS THESE WAITS FOR THEM, on the device. If even the marker cannot be
-     * enqueued the only ordering left is the host's. */
+    /* The reading step waits on the device; if the event cannot be enqueued, fall back to a host
+     * wait. */
     if (rad_event_record(ev_restore_, stream_) != RAD_OK ||
         rad_event_wait(compute, ev_restore_) != RAD_OK) {
         (void)rad_stream_sync(stream_);
@@ -542,9 +489,8 @@ void TierExec::report_pass(std::vector<TierJob>& jobs, const std::vector<char>& 
     for (size_t i = 0; i < jobs.size(); ++i) {
         TierJob& j = jobs[i];
         const bool good = i < ok.size() && ok[i];
-        /* A PROMOTION THAT FAILED AS A WHOLE gives back the blocks the leader took for it, once
-         * nothing queued against them can still land: report() drops or keeps the record, and
-         * nothing will ever name these blocks again. */
+        /* A failed promotion releases the leader's blocks once nothing queued against them can
+         * still land; after report() nothing names them again. */
         if (j.kind == TierJob::Kind::ToDevice && !good) {
             if (!quiet) { quiesce(); quiet = true; }
             for (size_t k = 0; k < gi_.size() && k < j.blocks.size(); ++k)

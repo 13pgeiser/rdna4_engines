@@ -1,6 +1,6 @@
 /* siglip2.h -- LFM2-VL's image encoder: the SigLIP2 NaFlex tower and the projector after it.
  *
- * WHAT IT COMPUTES, per encoder pass (RadBatch::enc):
+ * Per encoder pass (RadBatch::enc):
  *
  *   x  = patches @ Wp^T + bp                     the patch embedding, a linear layer over a patch
  *                                                row (y, x, channel)
@@ -13,18 +13,18 @@
  *   y  = post_LN(x)
  *   out = l2(gelu(l1([LN](y viewed [P/merge^2, merge^2 * width]))))   the projector
  *
- * which is transformers' Siglip2VisionModel (no pooling head) followed by Lfm2VlMultiModalProjector.
- * The projector's pixel unshuffle is a VIEW here: the processor stores each segment's patches in
+ * i.e. transformers' Siglip2VisionModel (no pooling head) then Lfm2VlMultiModalProjector. The
+ * projector's pixel unshuffle is a view: the processor stores each segment's patches in
  * merge-block order (core/mm/processor.cpp, image_lfm2), so a block's merge^2 patches are
- * consecutive rows, dy then dx -- the order the unshuffle concatenates them in. The tower itself
- * does not care about the order: attention within a segment is permutation-equivariant and every
- * other layer is per patch, and the position table is resampled at each patch's own (row, column).
+ * consecutive rows, dy then dx, the order the unshuffle concatenates them. The tower is
+ * order-independent: attention within a segment is permutation-equivariant, every other layer is
+ * per patch, and the position table is resampled at each patch's own (row, column).
  *
  * q, k and v are one fused weight, concatenated at convert (map_concat), so a layer is one QKV
  * GEMM; the attention reads the three as column slices.
  *
- * Replicated, per-request weights and pass-sized activations, as arch/common/rad_block_vit.h's
- * tower: see the notes there.
+ * Replicated, per-request weights and pass-sized activations, as in arch/common/rad_block_vit.h's
+ * tower.
  */
 #ifndef LFM2_SIGLIP2_H
 #define LFM2_SIGLIP2_H
@@ -64,11 +64,6 @@ struct Siglip2 {
         return !std::strcmp(rad_meta_gets(m, "vision_config.model_type", ""), "siglip2_vision_model") &&
                rad_meta_geti(m, "vision_config.num_hidden_layers", 0) > 0;
     }
-    /* Input patches an output row: the projector's unshuffle. */
-    static int64_t merge_of(const RadModelMeta* m) {
-        const int64_t d = rad_meta_geti(m, "downsample_factor", 0);
-        return d * d;
-    }
 
     int declare(RadBuilder* b, const RadModelMeta* m, const RadBuildCtx* ctx, Names& nm,
                 int64_t model_embd, int first_group);
@@ -102,8 +97,8 @@ inline int Siglip2::declare(RadBuilder* b, const RadModelMeta* m, const RadBuild
                 (long long)proj_hidden);
         return RAD_E_INVAL;
     }
-    /* The pooling head is SigLIP2's contrastive readout; LFM2-VL reads the patch rows, and a
-     * checkpoint that ships a head would load weights nothing runs. Refused by name. */
+    /* The pooling head is SigLIP2's contrastive readout; LFM2-VL reads the patch rows, so a
+     * checkpoint that ships a head is refused by name rather than loading unused weights. */
     if (rad_meta_geti(m, "vision_config.vision_use_head", 0) != 0 ||
         !std::strcmp(rad_meta_gets(m, "vision_config.vision_use_head", ""), "true")) {
         fprintf(stderr, "radiance: lfm2: this SigLIP2 tower has a pooling head, which LFM2-VL does "
@@ -131,8 +126,8 @@ inline int Siglip2::declare(RadBuilder* b, const RadModelMeta* m, const RadBuild
     const int64_t mm = merge * merge, mw = mm * width;
     P = ctx->max_enc_patches;
     /* The longest segment attention sees: a tile or the largest thumbnail, which the processor
-     * keeps within max_num_patches. A bound that picks the attention kernel's block height, so it
-     * is the real one in a sizing declare too. */
+     * keeps within max_num_patches. It selects the attention kernel's block height, so a sizing
+     * declare uses the real value too. */
     const int64_t seg = rad_meta_geti(m, "processor.image_processor.max_num_patches",
                                       rad_meta_geti(m, "max_num_patches", P));
     const int64_t max_seg = std::min<int64_t>(P, seg);
@@ -166,7 +161,7 @@ inline int Siglip2::declare(RadBuilder* b, const RadModelMeta* m, const RadBuild
         l.n1b = bw(nm.f("v.blk.%d.norm1.bias", li),   nm.ckpt(e, tw, li, "layer_norm1.bias"),   { width }, g);
         l.n2w = bw(nm.f("v.blk.%d.norm2.weight", li), nm.ckpt(e, tw, li, "layer_norm2.weight"), { width }, g);
         l.n2b = bw(nm.f("v.blk.%d.norm2.bias", li),   nm.ckpt(e, tw, li, "layer_norm2.bias"),   { width }, g);
-        /* q, k, v fused at convert: one GEMM a layer. */
+        /* q, k, v fused at convert: one GEMM per layer. */
         const char* qw = nm.f("v.blk.%d.qkv.weight", li);
         const char* qb = nm.f("v.blk.%d.qkv.bias", li);
         if (map_concat(b, qw, { nm.ckpt(e, tw, li, "self_attn.q_proj.weight"),
@@ -203,8 +198,9 @@ inline int Siglip2::declare(RadBuilder* b, const RadModelMeta* m, const RadBuild
     if (!w_patch || !b_patch || !w_pos || !pn_w || !pn_b || !m1_w || !m1_b || !m2_w || !m2_b)
         return RAD_E_INVAL;
 
-    /* ---- activations. `mh` is the post-norm's output declared at the MERGED width: the norm
-     * writes P rows of `width` and the projector reads P/mm rows of mm * width, the same bytes. */
+    /* ---- activations. `mh` is the post-norm's output declared at the merged width: the norm
+     * writes P rows of `width` and the projector reads the same bytes as P/mm rows of
+     * mm * width. */
     b_x   = decl_b(b, nm.f("v.x"),   RAD_BF16, { P, width });
     b_h   = decl_b(b, nm.f("v.h"),   RAD_BF16, { P, width });
     b_qkv = decl_b(b, nm.f("v.qkv"), RAD_BF16, { P, 3 * width });
@@ -290,8 +286,8 @@ inline void Siglip2::step(RadCtx* c, const RadBatch* batch) const {
                          "merged rows");
         return;
     }
-    /* The patches, their coordinates -- a dense [4, P] of row, column, segment height and width,
-     * which is what the position resample reads -- and the segment boundaries. */
+    /* The patches, their coordinates (a dense [4, P] of row, column, segment height and width,
+     * read by the position resample) and the segment boundaries. */
     const RadOperand pix = praw2(batch->enc_pixels, RAD_BF16, Pn, patch_dim);
     const RadOperand crd = praw2(batch->enc_coord, RAD_I32, 4, Pn);
     const RadOperand cu  = praw(batch->enc_cu, RAD_I32, S + 1);
@@ -313,8 +309,8 @@ inline void Siglip2::step(RadCtx* c, const RadBatch* batch) const {
         RAD_ISSUE_N(c, l.down, Pn, brows(b_ff, Pn), RAD_W(l.down_w), RAD_W(l.down_b),
                     brows(b_x, Pn), brows(b_x, Pn));
     }
-    /* The post-norm writes Pn rows of `width` into a buffer declared at the merged width: the
-     * same bytes the projector reads as Pn/mm rows -- the pixel unshuffle. */
+    /* The post-norm writes Pn rows of `width` into the merged-width buffer, which the projector
+     * reads as Pn/mm rows: the pixel unshuffle. */
     RAD_ISSUE_N(c, op_post, Pn, brows(b_x, Pn), RAD_W(pn_w), RAD_W(pn_b), brows(b_mh, Rn));
     if (proj_norm)
         RAD_ISSUE_N(c, op_mln, Rn, brows(b_mh, Rn), RAD_W(mn_w), RAD_W(mn_b), brows(b_mn, Rn));

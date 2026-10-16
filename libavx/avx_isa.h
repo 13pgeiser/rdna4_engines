@@ -1,49 +1,34 @@
-/* avx_isa.h -- what this machine can execute, and the one list of ops the whole plugin is built
- * around.
+/* avx_isa.h -- CPU feature detection, and the single list of ops the plugin is built around.
  *
- * ============================== WHY A DISPATCH AT ALL ==============================
+ * Why dispatch. The plugin is a shared object the engine dlopens (spec.md §2) and runs on machines
+ * it was not built on, so -march=native is out: an AVX-512 build SIGILLs on older CPUs. A baseline
+ * build gives up most of the machine (an AVX-512 rmsnorm moves 64 bytes a cycle, SSE2 16). So the
+ * kernels are compiled once per ISA level into separate objects with their own -m flags, and one
+ * baseline translation unit (avx_dispatch.cpp) picks between them at load. Nothing outside the
+ * per-level objects may contain an instruction above the baseline: the dispatcher, registry and
+ * schemas are built without -m flags, since a stray intrinsic there would fault before dispatch.
  *
- * A kernel plugin is a shared object the engine dlopens (spec.md §2). It is shipped, copied,
- * copied and run on machines nobody compiled it on, so `-march=native` is not an option here even
- * though it is the obvious one: a binary built with it on an AVX-512 part SIGILLs on the first
- * vmovdqu64 anywhere older, and the failure is a signal rather than a diagnostic. The
- * alternative -- compile everything baseline -- gives up most of the machine: an AVX-512 rmsnorm
- * moves 64 bytes a cycle where the SSE2 one moves 16.
- *
- * So: the kernels are compiled ONCE PER ISA LEVEL into separate objects, each with its own
- * -m flags, and ONE baseline-compiled translation unit (avx_dispatch.cpp) picks between them at
- * load. Nothing outside those per-level objects may contain an instruction above the baseline,
- * which is why the dispatcher, the registry and the schemas are all in files with no -m flags on
- * them: a single stray intrinsic in the registry would fault before the dispatch ever ran.
- *
- * ============================== THE FOUR LEVELS ==============================
- *
- *   AVX_LEVEL_SCALAR (0)  x86-64 baseline. SSE2 exists on every x86-64 and the compiler uses it
- *                         for scalar float, but nothing here is hand-vectorised. ALWAYS CORRECT,
- *                         always selectable, and the answer every other level is checked against.
- *   AVX_LEVEL_AVX    (1)  AVX. 256-bit FLOAT only -- Sandy/Ivy Bridge have no 256-bit integer
- *                         ALU and no FMA, so the bf16<->f32 conversions in avx_vec.h split into
- *                         two 128-bit halves and every a*b+c is a separate mul and add.
+ * Levels:
+ *   AVX_LEVEL_SCALAR (0)  x86-64 baseline. The compiler uses SSE2 for scalar float, but nothing is
+ *                         hand-vectorised. Always selectable; every other level is checked
+ *                         against it.
+ *   AVX_LEVEL_AVX    (1)  AVX. 256-bit float only: Sandy/Ivy Bridge have no 256-bit integer ALU
+ *                         and no FMA, so the bf16<->f32 conversions in avx_vec.h split into two
+ *                         128-bit halves and every a*b+c is a separate mul and add.
  *   AVX_LEVEL_AVX2   (2)  AVX2 + FMA + F16C. 256-bit integer, vpermd/vpgatherdd, hardware f16.
- *                         This is the level almost every x86 machine made since 2013 runs.
- *   AVX_LEVEL_AVX512 (3)  AVX-512 F/BW/DQ/VL. 512-bit, and -- what actually matters more than the
- *                         width -- 32 architectural vector registers instead of 16, which is what
- *                         lets the GEMM microkernel hold a 12x2 accumulator block in registers,
- *                         and write masks, which remove the scalar tail loop from every op.
+ *                         Nearly every x86 machine since 2013.
+ *   AVX_LEVEL_AVX512 (3)  AVX-512 F/BW/DQ/VL. Besides the width: 32 vector registers instead of 16
+ *                         (room for the GEMM microkernel's 12x2 accumulator block) and write
+ *                         masks, which remove the scalar tail loops.
  *
- * AVX-512 IS NOT ONE FEATURE and the check has to be the conjunction: a Knights Landing has F but
- * not BW/DQ/VL, and a kernel that tested `avx512f` alone and then used a byte shuffle would fault
- * on it. __builtin_cpu_supports is used rather than raw CPUID because it also consults XGETBV --
- * a CPU may enumerate AVX-512 while the OS has not enabled the ZMM state, and using it then
- * faults. Missing that check is the single most common way a hand-rolled CPUID dispatch is wrong.
+ * AVX-512 is checked as the conjunction F && BW && DQ && VL: Knights Landing has F without the
+ * others. __builtin_cpu_supports is used instead of raw CPUID because it also checks XGETBV; a CPU
+ * may enumerate AVX-512 while the OS has not enabled ZMM state, and using it then faults.
  *
- * ============================== THE OP LIST IS A MACRO ==============================
- *
- * AVX_OP_LIST below is the only place the op set is written down. It generates the dispatch table
- * struct, the four extern table declarations, the baseline thunks the registry rows point at, and
- * the harness's op enumeration. Adding an op means adding one line here and one definition per
- * level; forgetting either is a link error rather than a row that silently resolves to null.
- * libref uses the same technique for its shape hooks (`fn ## _shape`, libref/ref_ops.h).
+ * AVX_OP_LIST is the only place the op set is written. It generates the table struct, the four
+ * table declarations, the registry's baseline thunks and the harness's op enumeration. An op
+ * missing a definition at any level is a link error, never a null table entry. (libref uses the
+ * same technique for its shape hooks, libref/ref_ops.h.)
  */
 #ifndef RAD_AVX_ISA_H
 #define RAD_AVX_ISA_H
@@ -68,16 +53,16 @@ int         avx_isa_detect(void);
 int         avx_isa_level(void);
 const char* avx_isa_name(int level);
 
-/* FORCE A LEVEL, FOR THE CHECKER AND FOR NOTHING ELSE.
- *
- * It is an exported C symbol rather than an environment variable on purpose: this project's rule
- * is that an env switch that changes what a kernel computes is exactly the defect that makes "what
- * actually ran" unanswerable, and the engine must never be able to reach this. A symbol the test
- * binary dlsym's cannot be set by accident in a deployment and does not appear in a shell
- * history. Returns the level actually selected, which is
- * min(requested, detected) -- asking for a level the machine cannot execute is clamped rather than
- * honoured, because honouring it means SIGILL. */
+/* Force a level; for the checker only. An exported symbol rather than an environment variable, so
+ * a deployment cannot change what a kernel computes by accident and the engine never reaches it.
+ * Returns the level selected, min(requested, detected): a level the CPU cannot execute would
+ * SIGILL. */
 int         avx_isa_force(int level);
+
+/* Run every parallel region with `threads` team threads whatever its work threshold, or restore
+ * the thresholds with 0; for the checker only, like avx_isa_force. Returns the team size now
+ * forced, 0 when the plugin was built without OpenMP. */
+int         avx_par_force(int threads);
 
 /* ================================================================== the op list
  * X(name) -- `name` is both the op name in the conventional vocabulary (docs/OPS.md) and the
@@ -94,9 +79,11 @@ int         avx_isa_force(int level);
     X(scale_rows)           X(scale)                X(fill)                 X(act_mul)            \
     X(seg_mean)             X(mul_weight)           X(pool_rows)            X(relu)               \
     X(clamp)                X(conv2d)               X(conv1d_dw)            X(rel_sinusoid)       \
+    X(seg_sinusoid)         X(conv2d_unfold)                                                      \
     /* ---- quantisation and rotation */                                                          \
-    X(quant_act_i8)         X(had_quant_act_i8)     X(quant_act_fp8)        X(had_quant_act_fp8)  \
-    X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8)   X(dequant)            \
+    X(quant_act_i8)         X(quant_act_i8g)        X(had_quant_act_i8)     X(quant_act_fp8)      \
+    X(had_quant_act_fp8)    X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8) \
+    X(dequant)                                                                                    \
     X(rmsnorm_quant_fp8)    X(gated_quant_fp8)      X(givens_rotate)        X(givens_dense_quant) \
     /* ---- gemm and the vocabulary edges */                                                      \
     X(gemm_nt)              X(gemm_nt_bias)         X(gemm_nt_q)            X(gemm_nt_q_bias)     \
@@ -104,6 +91,7 @@ int         avx_isa_force(int level);
     /* ---- attention */                                                                          \
     X(attn_paged)           X(attn_dense)           X(kv_store)             X(rope)               \
     X(rope_table)           X(qk_norm_rope)         X(qsa_block_key)        X(attn_local_rel)     \
+    X(qsa_score)            X(qsa_select)           X(qsa_tail_store)       X(qsa_work)           \
     /* ---- mixture of experts */                                                                 \
     X(router_topk)          X(moe_scatter)          X(moe_gemm)             X(moe_gemm_q)         \
     X(moe_gather)           X(row_topk)             X(row_topk_merge)       X(logit_rerank)     \
@@ -113,14 +101,20 @@ int         avx_isa_force(int level);
     X(gdn_recurrent_update) X(gdn_conv_recurrent_update)                X(gdn_gated_rmsnorm)  \
     /* ---- collectives */                                                                        \
     X(all_reduce)           X(all_gather)                                                         \
+    /* ---- image generation */                                                                   \
+    X(ln_mod)               X(gate_add)             X(ln_mod_quant_fp8)     X(timestep_embed)     \
+    X(gather_rows2)         X(lane_gather)          X(lane_store)           X(randn_lanes)        \
+    X(flow_euler)           X(chan_affine)          X(conv2d_nhwc)          X(l2norm_chan)        \
+    X(d2s_add)              X(s2d_avg_add)          X(to_rgba8)             X(gelu_tanh)          \
+    X(scatter_add_rows)     X(attn_prefix_self)                                                   \
     /* ---- sampling, and the drafter's token walk */                                             \
     X(sample_penalties)     X(sample_dry)           X(sample_temp)          X(sample_topk)        \
     X(sample_topp)          X(sample_minp)          X(sample_typical)       X(sample_xtc)         \
     X(sample_merge_topk)    X(sample_mask)          X(sample_pick)          X(sample_argmax)      \
-    X(sample_logprobs)      X(dflash_select)
+    X(sample_logprobs)      X(dflash_select)        X(dflash_conv)
 
-/* The table one ISA level fills. One member per op, same order as AVX_OP_LIST. A missing
- * definition is a link error against the level's own table definition in avx_table.cpp. */
+/* One ISA level's table: one member per op, in AVX_OP_LIST order. A missing definition is a link
+ * error from that level's avx_table.cpp object. */
 typedef struct AvxKernelTable {
 #define AVX_DECL_MEMBER(nm) int (*nm)(const RadArgs*, RadStream);
     AVX_OP_LIST(AVX_DECL_MEMBER)
@@ -135,7 +129,7 @@ extern const AvxKernelTable avx_table_v3;
 
 /* The table for a level, or the scalar table if that level was not built. */
 const AvxKernelTable* avx_table_for(int level);
-/* The live table -- what the thunks call. Repointed by avx_isa_force. */
+/* The live table the thunks call. Repointed by avx_isa_force. */
 const AvxKernelTable* avx_table_live(void);
 
 #ifdef __cplusplus

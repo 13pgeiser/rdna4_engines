@@ -8,17 +8,15 @@ namespace {
 
 __device__ __forceinline__ float xp_bf(uint32_t x) { return __uint_as_float(x << 16); }
 
-/* logits[r, e] = h[r, :] . w[e, :], h and w bf16. A block takes 16 experts, two a 32-lane group. Every
- * lane issues all of its weight loads first -- n_embd / 256 sixteen-byte loads an expert, kept in
- * registers -- so the kernel waits on memory once rather than once a K chunk; the rows are staged in
- * LDS in as few chunks as 40 KiB allows (one at sixteen rows of 2560 needs two). fp32 accumulation.
- * Requires n_embd % 256 == 0 and n_embd <= 4096 (rad_xp_logits_launch checks). WIDE ON PURPOSE: the
- * router input is read in place and the block overwrites it once its GEMMs are done, so a narrower
- * grid that waits longer for CUs beside the compute stream reads it too late and predicts badly. */
+/* logits[r, e] = h[r, :] . w[e, :], bf16 in, fp32 accumulation. A block takes 16 experts, two per
+ * 32-lane group. Each lane issues all its weight loads first (n_embd / 256 16-byte loads per expert,
+ * held in registers) so the kernel waits on memory once; rows are staged in LDS in as few 40 KiB
+ * chunks as fit (16 rows of 2560 need two). Requires n_embd % 256 == 0 and n_embd <= 4096 (the
+ * launcher checks). The grid is wide on purpose: the router input is read in place and overwritten
+ * once the block's GEMMs finish, so a narrower grid waiting for CUs reads it too late. */
 constexpr uint32_t kLgE = 16, kLgJ = 16, kLgLds = 40u << 10;
-/* For gfx9-4-generic, one of rad_core's portable targets, LLVM leaves the row loop inside the
- * unrolled K loop a loop and warns once a copy; every other target unrolls it. The warning is
- * silenced for this kernel only, which changes no code. */
+/* On gfx9-4-generic LLVM does not unroll the row loop inside the unrolled K loop and warns per
+ * copy; other targets unroll it. Silenced for this kernel only. */
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 __global__ __launch_bounds__(256) void xp_logits(const uint16_t* __restrict__ h,
@@ -80,7 +78,7 @@ __global__ __launch_bounds__(256) void xp_logits(const uint16_t* __restrict__ h,
 #pragma unroll
     for (int a = 0; a < 2; ++a) {
         const uint32_t e = e0 + (uint32_t)a;
-        /* No unroll pragma: the exit at `rows` keeps this a loop, and the compiler refuses one. */
+        /* No unroll pragma: the early exit at `rows` makes the compiler refuse it. */
         for (int r = 0; r < rad::kXpMaxRows; ++r) {
             if ((uint32_t)r >= rows) break;
             float v = acc[a][r];
@@ -91,11 +89,11 @@ __global__ __launch_bounds__(256) void xp_logits(const uint16_t* __restrict__ h,
 }
 #pragma clang diagnostic pop
 
-/* One block. Count what the group's previous records came to (whether the step routed them), take each
- * row's top-k with its softmax probability, keep the distinct experts whose entries all sit in one
- * pinned pool slot, score each by its highest probability -- half as much again where the previous
- * pass routed it at this layer -- and write the kXpSlots best into the ring's group as jobs, then the
- * mailbox's number. The previous records' entries are back already: xp_step puts them back. */
+/* One block. Counts whether the step routed the group's previous records, takes each row's top-k
+ * with softmax probabilities, keeps distinct experts whose entries all sit in one pinned pool slot,
+ * scores each by its highest probability (x1.5 if the previous pass routed it at this layer), and
+ * writes the kXpSlots best as jobs, then the mailbox number. xp_step has already restored the
+ * previous records' entries. */
 constexpr float kXpPrevBoost = 0.5f;
 __global__ __launch_bounds__(256) void xp_plan(const float* __restrict__ lg, uint32_t rows, uint32_t ne,
                                                uint32_t k, void** const* __restrict__ map,
@@ -176,8 +174,8 @@ __global__ __launch_bounds__(256) void xp_plan(const float* __restrict__ lg, uin
                 int pi = -1;
                 for (int i = 0; i < pools.n; ++i)
                     if (p >= pools.lo[i] && p < pools.hi[i]) { pi = i; break; }
-                /* Every entry of the unit in the same pool slot: the mover patches a layer's tables
-                 * one at a time, and a unit caught between two of its patches is left alone. */
+                /* All entries of the unit must sit in one pool slot: the mover patches tables one
+                 * at a time, so skip a unit caught between two of its patches. */
                 if (pi >= 0) {
                     const uint64_t lo = pools.lo[pi], st = pools.stride[pi];
                     const uint64_t base = lo + ((p - lo) / st) * st;
@@ -203,8 +201,7 @@ __global__ __launch_bounds__(256) void xp_plan(const float* __restrict__ lg, uin
                 if (u < o) first = false;
                 best = fmaxf(best, s_pr[u]);
             }
-        /* The previous pass routed it here: the counts row still holds that pass until this layer's
-         * router runs. */
+        /* The counts row holds the previous pass until this layer's router runs. */
         if (first && cnt && place && e >= 0 && (uint32_t)e < ne) {
             const int pl = place[e];
             if (pl >= 0 && cnt[pl] > 0) best *= 1.f + kXpPrevBoost;
@@ -231,9 +228,9 @@ __global__ __launch_bounds__(256) void xp_plan(const float* __restrict__ lg, uin
         const uint64_t base = lo + ((s_p[o] - lo) / st) * st;
         const uint64_t dst = ring + (uint64_t)j * rs;
         if (q == 0) {
-            /* System-scope stores write through to host memory themselves, so the tag needs only their
-             * completion, not a writeback of the whole L2 -- which would take the compute stream's dirty
-             * lines with it, every layer. */
+            /* System-scope stores write through to host memory, so the tag needs only their
+             * completion, not a full L2 writeback (which would flush the compute stream's dirty
+             * lines every layer). */
             __hip_atomic_store(&box->jobs[j].src, base, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
             __hip_atomic_store(&box->jobs[j].dst, dst, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
             __hip_atomic_store(&box->jobs[j].bytes, st, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -247,7 +244,7 @@ __global__ __launch_bounds__(256) void xp_plan(const float* __restrict__ lg, uin
             rec[j].oldv[q] = (void*)old;
             rec[j].newv[q] = (void*)(dst + (old - base));
         }
-        /* The tag after the job's own stores have completed: a tag the host sees vouches for them. */
+        /* Tag after the job's stores complete, so a visible tag implies a complete job. */
         if (q == 0) {
             __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
             __hip_atomic_store(&box->jobs[j].tag, (uint64_t)seq, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -263,10 +260,10 @@ __global__ __launch_bounds__(256) void xp_plan(const float* __restrict__ lg, uin
     }
 }
 
-/* On the compute stream ahead of a layer's routed GEMMs. The previous layer's patches go back -- its
- * GEMMs are behind this in the stream -- then this layer's units point at the ring, only where an entry
- * still holds what the plan read (a heat-engine move since wins) and only if the copies have landed:
- * the list's last write before its number puts the request's number in `done`. */
+/* Compute stream, before a layer's routed GEMMs. Restores the previous layer's patches (its GEMMs
+ * are earlier in the stream), then points this layer's units at the ring, only where an entry still
+ * holds what the plan read (a later heat-engine move wins) and only if `done` holds the request
+ * number, which the DMA list writes after its copies. */
 __global__ __launch_bounds__(128) void xp_step(const rad::XpRec* __restrict__ rrec, const int32_t* __restrict__ rn,
                                                const rad::XpRec* __restrict__ prec, const int32_t* __restrict__ pn,
                                                const uint32_t* done, uint32_t seq) {

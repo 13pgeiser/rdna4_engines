@@ -1,44 +1,30 @@
-// r4d_ar_ln_had_quant_i8.hip -- r4d_ar_ln_had_quant_i8: the tensor-parallel all-reduce and the
-// residual add, RMS norm, block Hadamard and int8 quantiser that always follow it, in ONE kernel.
+// r4d_ar_ln_had_quant_i8.hip -- r4d_ar_ln_had_quant_i8: the tensor-parallel all-reduce plus the
+// residual add, RMS norm, block Hadamard and int8 quantiser that always follow it, in one kernel.
 //
-// WHY.  Every row-parallel linear in the model is followed by an all-reduce, and every one of those
-// all-reduces is followed by a norm -- 128 of each on a 64-layer decode step, always adjacent and
-// always in that order:
+// Every row-parallel linear is followed by an all-reduce and then a norm (128 of each on a
+// 64-layer decode step):
 //
 //     out_proj / o_proj / down_proj  ->  all_reduce  ->  (residual add, RMS norm, rotate, quantise)
 //
-// and the norm's output is the next quantised linear's A.  A decode step is launch-bound: over a
-// thousand dispatches with ~2.3 us of unavoidable gap between each is several milliseconds of pure
-// gap, and the standalone norm is itself latency- rather than bandwidth-bound (4.1 us for an
-// 80 KiB row set, against a ~2.6 us launch floor).  Merging the pair removes 128 dispatches AND
-// nearly all of the norm's fixed cost, because the norm's work is bolted onto a kernel that has
-// already paid it.
+// and the norm's output is the next quantised linear's A. Decode is launch-bound (~2.3 us gap per
+// dispatch), and the standalone norm is latency-bound (4.1 us for an 80 KiB row set against a
+// ~2.6 us launch floor). Fusing removes 128 dispatches and most of the norm's fixed cost. The
+// all-reduce output is never materialised: the peer's contribution is a second operand on the
+// norm's load, `t = mine + peer + residual`.
 //
-// The all-reduce OUTPUT never exists.  In the unfused pair it is a bf16 [M, K] tensor written by
-// the all-reduce and read straight back by the norm; here the peer's contribution is simply a
-// second operand on the norm's load -- `t = mine + peer + residual` -- so the round trip is gone
-// as well.
+// Partition by row. r4d_ar_oneshot_2rank_exact gives each block a chunk of 16B words and an
+// independent flag with no grid barrier. A norm needs whole rows for its sum of squares, but rows
+// are contiguous, so giving block b a contiguous row range makes its words exactly those rows'
+// bytes. Both ranks derive the range from (M, gridDim.x), so the handshake stays per-block with no
+// grid barrier. This caps nb at M, which costs nothing here: the standalone all-reduce uses 4
+// blocks on an 80 KiB decode message and M is 8 or more.
 //
-// WHY THE PARTITION IS BY ROW.  r4d_ar_oneshot_2rank_exact gives block b a contiguous chunk of 16B
-// WORDS and an independent flag, with no grid barrier anywhere: b pushes its chunk to the peer,
-// releases peer_flags[b], spins on my_flags[b], then reduces its own chunk.  A norm cannot use that
-// partition -- a sum of squares closes only over a whole row -- but it does not need a grid barrier
-// either, because rows are contiguous: give block b a contiguous range of ROWS and its chunk of
-// words is exactly the bytes of those rows.  Both ranks compute the same range from (M, gridDim.x),
-// so the handshake stays per-block and the kernel keeps the no-grid-barrier structure.
-//
-// The block count therefore has a ceiling the standalone all-reduce does not have (nb <= M), which
-// costs nothing at the sizes this runs at: the standalone all-reduce asks for 4 blocks on an 80 KiB
-// decode message and the row count is 8 or more.  The number of threads actually pushing is n16
-// either way.
-//
-// Everything below the handshake is r4d_rmsnorm_had_quant_i8 unchanged -- the same one-pass
-// argument (the FWHT is linear and inv_rms is a per-row scalar, so the rotation runs before the
-// norm closes and the scale absorbs it), the same register staging rather than an LDS round trip,
-// the same `wadd` added inside the fp32 arithmetic for GemmaRMSNorm's `x_hat * (1 + w)`, and the
-// same optional unrotated bf16 output for a GDN block's bf16 in_proj_ba.  The only change is that
-// the row is loaded from two places and that LDS is re-used across the rows a block owns, which
-// needs one more barrier per row.
+// Below the handshake this is r4d_rmsnorm_had_quant_i8: one pass (the FWHT is linear and inv_rms
+// is a per-row scalar, so the rotation runs before the norm closes and the scale absorbs it),
+// register staging, `wadd` inside the fp32 arithmetic for GemmaRMSNorm's `x_hat * (1 + w)`, and an
+// optional unrotated bf16 output for a GDN block's bf16 in_proj_ba. The differences: the row is
+// loaded from two places, and LDS is reused across a block's rows, which costs one more barrier
+// per row.
 #include "r4d.h"
 #include "r4d_ar_seq.h"
 #include "r4d_common.h"
@@ -47,14 +33,7 @@
 #include <cstdint>
 #include <cmath>
 #include <stdexcept>
-
-// The compressed all-reduce this fuses stores its fp32 sum to a bf16 tensor and the norm reads
-// that back, so the fused kernel rounds the sum to bf16 too and reproduces the unfused pair's
-// output exactly.  Build with -DARN_W6_MATCH=0 to keep the fp32 sum, which is strictly more
-// accurate and NOT token-exact against the pair.
-#ifndef ARN_W6_MATCH
-#define ARN_W6_MATCH 1
-#endif
+#include <string>
 
 #define R4D_ARN_SPIN_MAX 4000000000ULL
 #define R4D_ARN_MAXVALS 72
@@ -67,46 +46,38 @@ __device__ __forceinline__ unsigned int arn_load_acq(const unsigned int* p) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// THE ROTATED 6-BIT WIRE.  Same format and the same arithmetic as r4d_ar_oneshot_2rank_wht6 --
-// orthonormal Walsh-Hadamard over a group of 64, amax-scaled, 6 uniform bits plus a bf16 scale --
-// but packed at a CHUNK of 1024 elements instead of 2048, so that a chunk never straddles a row.
-// That is what lets the norm keep its row partition: block b owns rows [r0, r1), and because K is
-// a whole number of chunks its element range is a whole number of chunks too.
+// Rotated 6-bit wire: same format and arithmetic as r4d_ar_oneshot_2rank_wht6 (orthonormal
+// Walsh-Hadamard over groups of 64, amax-scaled, 6 uniform bits plus a bf16 scale), but packed in
+// chunks of ARN_CE elements instead of 2048 so a chunk never straddles a row. K is a whole number
+// of chunks, so a block's rows [r0, r1) are too, and the row partition holds.
 //
-// The wire is why this exists.  Above ~200 KiB the message is bandwidth-bound and the compressed
-// payload is 2.6x smaller, which is worth far more than the launch the fusion saves.  Carrying the
-// payload in here lets the two wins compose: a message large enough to want the compressed wire
-// still avoids a second dispatch and a bf16 round trip through memory.
+// Above ~200 KiB the message is bandwidth-bound and the compressed payload is 2.6x smaller, which
+// outweighs the saved launch; carrying it here gets both savings.
 //
-// The helpers are duplicated rather than included from r4d_ar_oneshot_2rank_wht6.h on purpose:
-// that header also carries the standalone kernel and its launcher, so including it would
-// instantiate a second copy of a shipped kernel in this translation unit.
+// The helpers are duplicated from r4d_ar_oneshot_2rank_wht6.h on purpose: that header also holds
+// the standalone kernel and launcher, which would be instantiated again in this unit.
 #define ARN_GROUP 64
 #define ARN_BITS 6
 #define ARN_EPL 8
 #define ARN_LPG (ARN_GROUP / ARN_EPL)                   // 8 lanes span one group
 #define ARN_WV 32
 #define ARN_GPW (ARN_WV * ARN_EPL / ARN_GROUP)          // 4 groups per wave-iteration
-// GROUPS PER CHUNK, and the only real tuning knob on the wire.  8 here, against the standalone
-// kernel's 32: a wave owns a whole chunk, so the chunk size is what decides how many waves have
-// work.  A 5120-group message is 160 chunks at 32 and 640 at 8, and the block count cannot make up
-// the difference, because every block pays its own flag round trip over the fabric -- raising the
-// count from 24 to 32 costs ~3%, to 64 ~4%, and to 160 ~24%.  Shrinking the chunk buys the same
-// parallelism for nothing, and the wire's cost falls monotonically from 32 groups to 8.
-#ifndef ARN_CG
+// Groups per chunk, the wire's one tuning knob: 8 here against the standalone kernel's 32. A wave
+// owns a whole chunk, so chunk size sets how many waves have work (a 5120-group message is 160
+// chunks at 32, 640 at 8). More blocks cannot substitute, since each pays its own flag round trip
+// (24 -> 32 blocks costs ~3%, 64 ~4%, 160 ~24%). The wire's cost falls monotonically from 32 groups
+// to 8.
 #define ARN_CG 8
-#endif
-                                                        // groups per chunk
-#define ARN_CE (ARN_CG * ARN_GROUP)                     // 1024 elements per chunk
-#define ARN_ITERS (ARN_CE / (ARN_WV * ARN_EPL))         // 4 iterations to cover a chunk
-#define ARN_NWORD (ARN_ITERS * ARN_EPL * ARN_BITS / 32) // 6 dwords a lane holds for a chunk
-#define ARN_CBYTES (ARN_CE * ARN_BITS / 8)              // 768 wire bytes a chunk
+#define ARN_CE (ARN_CG * ARN_GROUP)                     // elements per chunk (512 at ARN_CG 8)
+#define ARN_ITERS (ARN_CE / (ARN_WV * ARN_EPL))         // wave-iterations per chunk
+#define ARN_NWORD (ARN_ITERS * ARN_EPL * ARN_BITS / 32) // dwords a lane holds per chunk
+#define ARN_CBYTES (ARN_CE * ARN_BITS / 8)              // wire bytes per chunk
 #define ARN_QMAX ((1 << (ARN_BITS - 1)) - 1)
 #define ARN_QMIN (-(1 << (ARN_BITS - 1)))
 #define ARN_MASK ((1u << ARN_BITS) - 1u)
 
-// RTNE to bf16 and back: the scale ships as its top 16 bits, so the sender's own copy has to be
-// exactly what the receiver reconstructs.
+// RTNE to bf16 and back: the scale ships as its top 16 bits, and the sender's own copy must equal
+// what the receiver reconstructs.
 __device__ __forceinline__ float arn_bf16_round(float v) {
   unsigned u = __float_as_uint(v);
   const unsigned lsb = (u >> 16) & 1u;
@@ -115,10 +86,9 @@ __device__ __forceinline__ float arn_bf16_round(float v) {
 }
 
 
-// `lo ? (v + o) : (o - v)` written as `o + (lo ? v : -v)`.  The sign flip is one XOR against a
-// mask that is uniform over the whole stage, so the select disappears: two instructions an element
-// (xor, then the DPP-sourced add) instead of an add, a subtract and a v_cndmask.  Bit-identical --
-// IEEE negation is exact and addition commutes.
+// `lo ? (v + o) : (o - v)` written as `o + (lo ? v : -v)`. The sign flip is one XOR with a mask
+// uniform over the stage: two instructions per element (xor, DPP-sourced add) instead of add,
+// subtract and v_cndmask. Bit-identical, since IEEE negation is exact and addition commutes.
 template <int M>
 __device__ __forceinline__ void arn_xstage(float* v, int lig) {
   const unsigned int sm = (lig & M) ? 0x80000000u : 0u;
@@ -159,11 +129,9 @@ __global__ __launch_bounds__(THR) void r4d_ar_ln_had_quant_i8_kernel(
   constexpr int VPL = HAD / 32, NW = THR / 32;
   constexpr int MAXB = R4D_ARN_MAXVALS / VPL;
   extern __shared__ float lds[];
-  // One staging slice per row the block owns.  The exact wire needs only one (the norm reads the
-  // row straight from memory), but the compressed wire has to REDUCE first, and a per-row reduce
-  // would put cpr chunks -- five at K = 5120 -- in front of NW waves behind a barrier, three times
-  // over.  With the whole block's rows staged, the reduce is one pass over every chunk the block
-  // owns and there is one barrier, not one per row.
+  // One staging slice per owned row on the compressed wire (the exact wire needs one, since the
+  // norm reads rows from memory). The compressed wire must reduce first; staging all rows makes
+  // the reduce one pass over the block's chunks behind one barrier instead of one per row.
   const int r0_ = (int)(((long)blockIdx.x * M) / gridDim.x);
   const int nrows = (int)(((long)(blockIdx.x + 1) * M) / gridDim.x) - r0_;
   float* red = lds + (size_t)(WIRE ? nrows : 1) * K;
@@ -179,10 +147,9 @@ __global__ __launch_bounds__(THR) void r4d_ar_ln_had_quant_i8_kernel(
   int4* ps = peer_base + (size_t)s_slot * slot_stride16;
   const int4* ms = my_base + (size_t)s_slot * slot_stride16;
 
-  // WIRE == 6 only.  The slot is split exactly as the standalone compressed all-reduce splits it:
-  // packed symbols from the base, bf16 group scales from half way up.  Chunk indices are GLOBAL
-  // over the whole [M, K] message, so both ranks address the same bytes without exchanging
-  // anything; a block simply owns the chunks its rows cover.
+  // WIRE == 6 only. The slot is split as in the standalone compressed all-reduce: packed symbols
+  // from the base, bf16 group scales from halfway. Chunk indices are global over the [M, K]
+  // message, so both ranks address the same bytes; a block owns the chunks its rows cover.
   const int cpr = K / ARN_CE;                    // chunks a row spans (K % ARN_CE == 0, checked)
   const int c00 = r0 * cpr, cpb = (r1 - r0) * cpr;
   char* p_pay = (char*)ps;
@@ -190,16 +157,15 @@ __global__ __launch_bounds__(THR) void r4d_ar_ln_had_quant_i8_kernel(
   unsigned short* p_sc = (unsigned short*)((char*)ps + (size_t)(slot_stride16 >> 1) * 16);
   const unsigned short* m_sc =
       (const unsigned short*)((const char*)ms + (size_t)(slot_stride16 >> 1) * 16);
-  // This rank's own packed half, kept in LDS so the reduce folds exactly the bytes it sent
-  // without a global round trip -- the standalone kernel needs a side buffer for this because it
-  // has no LDS to spare; here the norm's staging array is already the reason there is a barrier.
+  // This rank's own packed half, kept in LDS so the reduce folds exactly the bytes it sent without
+  // a global round trip (the standalone kernel uses a side buffer instead).
   unsigned int* Lpk = (unsigned int*)(red + 2 * NW);
   float* Lsc = (float*)(Lpk + (size_t)cpb * ARN_WV * ARN_NWORD);
   const int lig = lane & (ARN_LPG - 1), gw = lane / ARN_LPG;
 
   if constexpr (WIRE == 0) {
-    // push my rows -> peer slot.  K bf16 is K/8 16B words, and rows are contiguous, so a row range
-    // is a word range.
+    // Push my rows to the peer slot. A row is K/8 16B words and rows are contiguous, so a row
+    // range is a word range.
     const int wpr = K >> 3;
     const int wstart = r0 * wpr, wend = r1 * wpr;
     const int4* in4 = (const int4*)X;
@@ -210,9 +176,9 @@ __global__ __launch_bounds__(THR) void r4d_ar_ln_had_quant_i8_kernel(
     }
     for (; k < wend; k += THR) ps[k] = in4[k];
   } else {
-    // rotate, amax, quantise and pack straight into the peer's slot, keeping the same words in
-    // LDS.  A wave owns whole chunks, so every lane emits exactly ARN_NWORD dwords per chunk and
-    // the flush is lane-uniform: one 512B uint4 store and one 256B uint2 store a wave a chunk.
+    // Rotate, amax, quantise and pack straight into the peer's slot, keeping the same words in
+    // LDS. A wave owns whole chunks, so every lane emits exactly ARN_NWORD dwords per chunk and the
+    // flush is lane-uniform.
     for (int ci = wave; ci < cpb; ci += NW) {
       const int c = c00 + ci;
       unsigned int acc[ARN_NWORD];
@@ -249,7 +215,7 @@ __global__ __launch_bounds__(THR) void r4d_ar_ln_had_quant_i8_kernel(
         }
       }
       // Flush lane-contiguously region by region, widest first, so each region is one coalesced
-      // store of ARN_WV x width bytes.  ARN_NWORD is 6 at ARN_CG 16 and 3 at 8.
+      // store of ARN_WV x width bytes (ARN_NWORD is 3).
       char* pb = p_pay + (size_t)c * ARN_CBYTES;
 #pragma unroll
       for (int w4 = 0; w4 + 4 <= ARN_NWORD; w4 += 4)
@@ -272,8 +238,7 @@ __global__ __launch_bounds__(THR) void r4d_ar_ln_had_quant_i8_kernel(
     if (drain == 2) __threadfence_system();
     arn_store_rel(&peer_flags[b], sq);
     unsigned long long z = 0;
-    // A handshake that cannot complete is a lockstep violation: norming a slot the peer never
-    // filled would hand stale bytes on as a sum, so it traps instead.
+    // A handshake that cannot complete is a lockstep violation; trap rather than use stale bytes.
     while (r4d_ar_seq_behind(arn_load_acq(&my_flags[b]), sq)) {
       if (++z > R4D_ARN_SPIN_MAX) __builtin_trap();
     }
@@ -281,14 +246,14 @@ __global__ __launch_bounds__(THR) void r4d_ar_ln_had_quant_i8_kernel(
   __syncthreads();
   if (acq) __threadfence_system();
 
-  // The peer's rows are now in MY scratch, in the same [M, K] layout as X.
+  // The peer's rows are now in my scratch, in the same [M, K] layout as X.
   const __hip_bfloat16* P = (const __hip_bfloat16*)ms;
 
   if constexpr (WIRE == 6) {
-    // REDUCE: unpack both halves of every chunk this block owns, add in fp32, inverse-rotate and
-    // leave the reduced value in the norm's own staging slice.  The norm then reads it exactly
-    // where it would have read `x + p`, and overwrites the same slot with its rotated result --
-    // one lane owns a slot in both passes, so the aliasing needs no second array.
+    // Reduce: unpack both halves of every owned chunk, add in fp32, inverse-rotate, and leave the
+    // result in the norm's staging slice. The norm reads it where it would read `x + p` and
+    // overwrites it with its rotated result; one lane owns a slot in both passes, so the aliasing
+    // is safe.
     for (int ci = wave; ci < cpb; ci += NW) {
       const int c = c00 + ci;
       const char* pb = m_pay + (size_t)c * ARN_CBYTES;
@@ -321,22 +286,20 @@ __global__ __launch_bounds__(THR) void r4d_ar_ln_had_quant_i8_kernel(
             psy |= pac[wi + 1] << (32 - bo);
             lsy |= lac[wi + 1] << (32 - bo);
           }
-          // The two ranks fold the identical pair in OPPOSITE order; fp32 add commutes exactly, so
-          // they stay bit-identical as long as neither product is contracted into an FMA.
-          // libr4d/CMakeLists.txt passes -ffp-contract=off for exactly this.
+          // The ranks fold the same pair in opposite order; fp32 add commutes, so they stay
+          // bit-identical as long as neither product becomes an FMA (libr4d/CMakeLists.txt passes
+          // -ffp-contract=off).
           v[i] = (float)((int)(psy & ARN_MASK) + ARN_QMIN) * psc
                + (float)((int)(lsy & ARN_MASK) + ARN_QMIN) * lsc;
         }
         arn_wht(v, lig);
         const int e0 = (int)((long)(c * ARN_CG + gl) * ARN_GROUP + (long)lig * ARN_EPL
                              - (long)r0 * K);
+        // Rounded to bf16, as the unfused compressed all-reduce stores its sum and the norm reads
+        // it back, so this matches the pair exactly.
 #pragma unroll
         for (int i = 0; i < ARN_EPL; ++i)
-#if ARN_W6_MATCH
           lds[e0 + i] = __bfloat162float(__float2bfloat16(v[i]));
-#else
-          lds[e0 + i] = v[i];
-#endif
       }
     }
     __syncthreads();
@@ -356,15 +319,11 @@ __global__ __launch_bounds__(THR) void r4d_ar_ln_had_quant_i8_kernel(
       float v[VPL];
 #pragma unroll
       for (int j = 0; j < VPL; j++) {
-        // WIRE == 0: ROUNDED TO bf16 ON PURPOSE.  The standalone all-reduce accumulates in fp32
-        // and STORES bf16, and the norm then reads that back -- so folding the reduce into the
-        // norm's load would otherwise drop a rounding step and change the token stream.  It would
-        // change it for the better, but keeping the fused form bit-identical to the pair it
-        // replaces is worth more than the accuracy.  The price is one software RTNE per element
-        // (gfx1201 has no bf16 convert instruction) on a kernel that is launch-bound rather than
-        // ALU-bound.  WIRE == 6 has no such pair to match: the compressed all-reduce it
-        // replaces stores the fp32 sum straight to bf16 and the norm reads that, so here the sum
-        // is taken from LDS in fp32 and the bf16 round trip is simply gone.
+        // WIRE == 0 rounds to bf16 on purpose: the standalone all-reduce stores its fp32 sum as
+        // bf16 and the norm reads that, so skipping the rounding would change the token stream.
+        // Bit-identity with the unfused pair is preferred over the extra accuracy; the software
+        // RTNE (gfx1201 has no bf16 convert) is cheap on this launch-bound kernel. WIRE == 6 reads
+        // the reduced value from LDS, already rounded.
         float t;
         if constexpr (WIRE == 0) {
           t = __bfloat162float(__float2bfloat16(
@@ -416,31 +375,27 @@ __global__ __launch_bounds__(THR) void r4d_ar_ln_had_quant_i8_kernel(
       const int t = __float2int_rn(rl[sr] * inv);
       q[i] = (signed char)(t < -128 ? -128 : (t > 127 ? 127 : t));
     }
-    // lds and red are re-used by the next row this block owns.
+    // lds and red are reused by the block's next row.
     __syncthreads();
   }
 }
 
-// What the compressed wire costs in LDS, so the caller can pick its block count instead of
-// guessing.  A block owns whole rows and holds, per row, a staging slice at `stage_bits` bits an
-// element plus the packed half of its own chunks; getting this wrong is not a slow launch but a
-// refused one.
+// LDS cost of the compressed wire, so the caller can choose a block count. A block owns whole
+// rows and holds, per row, a staging slice at `stage_bits` bits per element plus the packed half
+// of its own chunks; a block count that does not fit is refused.
 void r4d_ar_ln_wire_dims(int* stage_bits, int* chunk_elems, int* chunk_bytes, int* scale_bytes) {
-  // 32: the reduced values are staged as fp32 IN THE NORM'S OWN ARRAY -- the norm reads a slot
-  // and overwrites it with its rotated result, so the staging is not extra LDS at all.  Staging
-  // at bf16 instead would fit half again as many rows per block, but all that buys is a LOWER
-  // block count and this kernel wants a higher one; at the row counts it actually runs, the two
-  // occupy the same LDS and bf16 only adds conversions.
+  // 32: reduced values are staged as fp32 in the norm's own array, so staging costs no extra LDS.
+  // bf16 staging would fit more rows per block, but only lowers the block count, which this
+  // kernel does not want; at the row counts it runs, the LDS is the same.
   if (stage_bits)  *stage_bits  = 32;
   if (chunk_elems) *chunk_elems = ARN_CE;
   if (chunk_bytes) *chunk_bytes = ARN_WV * ARN_NWORD * (int)sizeof(unsigned int);
   if (scale_bytes) *scale_bytes = ARN_CG * (int)sizeof(float);
 }
 
-// The LDS one launch asks for: the norm's fp32 staging -- one row on the exact wire, every row the
-// block owns on the compressed one -- the two reduction planes, and on the compressed wire this
-// rank's packed half of every chunk the block owns. One formula for the launcher and for
-// r4d_ar_ln_blocks_min, so the block count a caller is told fits is the one the launcher accepts.
+// LDS per launch: the norm's fp32 staging (one row on the exact wire, every owned row on the
+// compressed one), the two reduction planes, and on the compressed wire this rank's packed half of
+// every owned chunk. Shared by the launcher and r4d_ar_ln_blocks_min so they agree.
 static size_t ar_ln_lds_bytes(int rows_max, int K, int thr, int wire) {
   size_t b = (size_t)(wire ? rows_max : 1) * K * sizeof(float) + 2 * (thr / 32) * sizeof(float);
   if (wire) {
@@ -449,14 +404,13 @@ static size_t ar_ln_lds_bytes(int rows_max, int K, int thr, int wire) {
   }
   return b;
 }
-// The ceiling on that dynamic allocation: a workgroup's 64 KiB less the kernel's own static words
-// (the sequence and the slot), which the runtime places in front of it.
+// Dynamic LDS ceiling: a workgroup's 64 KiB less the kernel's static words (seq and slot), which
+// the runtime places in front of it.
 static constexpr size_t kArnLdsCap = 65536 - 16;
 
-// The fewest blocks at which this shape fits: every block owns ceil(M / nb) rows, and on the
-// compressed wire each of them costs a staging slice and its chunks' packed half. -1 when no
-// block count serves it -- a row too wide to stage even alone, or too wide for the register
-// staging at this width -- which is the case the launcher would otherwise throw on.
+// Fewest blocks at which this shape fits: each block owns ceil(M / nb) rows, and on the compressed
+// wire each row costs a staging slice and its chunks' packed half. -1 when no block count fits (a
+// row too wide to stage alone, or for the register staging), where the launcher would throw.
 int r4d_ar_ln_blocks_min(int M, int K, int had, int nthreads, int wire) {
   if (M < 1 || K < 1 || had < 32 || K % had) return -1;
   if (wire != 0 && wire != 6) return -1;
@@ -478,7 +432,6 @@ void r4d_ar_ln_had_quant_i8(long peer_scratch, long my_scratch, long peer_flags,
                             int M, int K, int had, float eps, float wadd,
                             long stream, int nblocks, int nthreads, int drain, int acq, int wire) {
   if (K % 16) throw std::runtime_error("r4d ar_ln_had_quant_i8: K must be a multiple of 16");
-  if (K % 8) throw std::runtime_error("r4d ar_ln_had_quant_i8: K*2 must be 16B-aligned");
   if (M < 1) throw std::runtime_error("r4d ar_ln_had_quant_i8: M must be positive");
   if (had < 2 || (had & (had - 1))) throw std::runtime_error(
       "r4d ar_ln_had_quant_i8: had must be a power of two");
@@ -496,10 +449,10 @@ void r4d_ar_ln_had_quant_i8(long peer_scratch, long my_scratch, long peer_flags,
   const int rows_max = (M + nb - 1) / nb;
   if (wire) {
     if (wire != 6) throw std::runtime_error("r4d ar_ln_had_quant_i8: wire must be 0 or 6");
-    // A chunk may not straddle a row, or a block's rows would not be a whole number of chunks
-    // and the two ranks would disagree about who owns which bytes.
+    // A chunk may not straddle a row, or the ranks would disagree on byte ownership.
     if (K % ARN_CE) throw std::runtime_error(
-        "r4d ar_ln_had_quant_i8: the 6-bit wire needs K to be a multiple of 1024");
+        "r4d ar_ln_had_quant_i8: the 6-bit wire needs K to be a multiple of " +
+        std::to_string(ARN_CE));
   }
   const size_t shmem = ar_ln_lds_bytes(rows_max, K, thr, wire);
   if (shmem > kArnLdsCap) throw std::runtime_error(

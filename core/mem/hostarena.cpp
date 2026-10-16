@@ -11,11 +11,8 @@ int HostArena::open(int64_t slot_bytes, int64_t cap_bytes) {
     close();
     if (slot_bytes <= 0 || cap_bytes < slot_bytes) return RAD_E_INVAL;
     const int64_t n = cap_bytes / slot_bytes;
-    /* PINNED, and the allocation is refused rather than downgraded. A pageable host buffer on
-     * this path does not fail, it just collapses -- an async copy to pageable memory serialises
-     * against the stream and the whole point of moving instead of dropping is gone. Better to
-     * start without the store and say so than to run it at a tenth of the rate it was budgeted
-     * at. */
+    /* Pinned or nothing: an async copy to pageable memory serialises against the stream, so a
+     * pageable fallback would run the store at a fraction of its budgeted rate. */
     base_ = rad_dev_alloc(n * slot_bytes, RAD_MEM_HOST_PINNED);
     if (!base_) return RAD_E_NOMEM;
     slot_bytes_ = slot_bytes;
@@ -36,15 +33,9 @@ void HostArena::close() {
     bits_.clear();
 }
 
-int32_t HostArena::alloc() {
-    int32_t got = 0;
-    return alloc_run(1, &got);
-}
-
-/* THE FIRST FREE RUN AT OR AFTER THE CURSOR, wrapping once. A whole word of used slots is skipped
- * in one compare, so a nearly full arena costs a scan of its bitmap -- a few thousand words at the
- * sizes an operator gives this -- and an arena with room costs nothing. The cursor makes
- * consecutive calls hand out consecutive slots, which is what lets a batch be one copy a run. */
+/* First free run at or after the cursor, wrapping once. A fully used word is skipped in one
+ * compare, so a nearly full arena costs one bitmap scan. The cursor makes consecutive calls hand
+ * out consecutive slots, so a batch transfers as one copy per run. */
 int32_t HostArena::alloc_run(int32_t want, int32_t* got) {
     *got = 0;
     if (want <= 0 || !base_ || full()) return -1;
@@ -73,8 +64,8 @@ int32_t HostArena::alloc_run(int32_t want, int32_t* got) {
 
 void HostArena::free(int32_t slot) {
     if (slot < 0 || slot >= cap_slots_) return;
-    /* A slot that is already free is refused rather than counted twice: the used count is what the
-     * sessions view reports and what `full` answers, and a negative one hides the next leak. */
+    /* A double free is ignored so the used count, which `full` and the sessions view read, stays
+     * correct. */
     if (!is_used(slot)) return;
     bits_[(size_t)(slot >> 6)] &= ~(1ull << (slot & 63));
     --used_;

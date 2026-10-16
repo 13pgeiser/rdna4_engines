@@ -1,13 +1,14 @@
-/* engine_kld.cpp -- the KL mode's two halves on the Engine: the driver that runs in place of the
- * HTTP server, and the copy of a step's scored rows off the cards. The arithmetic and the files
- * are core/kld.h's. */
+/* engine_kld.cpp -- the KL mode on the Engine: the driver that replaces the HTTP server, and the
+ * copy of a step's scored rows off the cards. The arithmetic and files are core/kld.h's. */
 #include "engine_priv.h"
 #include "kld.h"
 
 #include "device/device.h"
 #include "server/sink.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -15,9 +16,9 @@
 namespace rad {
 
 int Engine::run_kld() {
-    /* THE LOGITS BUFFER AS EACH RANK DECLARED IT. It has to hold a step's tokens after the
-     * sampler's rows (RadBuildCtx::max_out_rows); a plugin that sized it by its own rule alone
-     * did not read the field, and is refused here rather than overrun at the first step. */
+    /* Each rank's logits buffer must hold a step's tokens after the sampler's rows
+     * (RadBuildCtx::max_out_rows); a plugin that ignored the field is refused here rather than
+     * overrun. */
     const int64_t need = cfg_.max_tok + cfg_.max_seqs;
     const int64_t nv = meta_.n_vocab;
     kld_vocab0_.clear();
@@ -36,8 +37,8 @@ int Engine::run_kld() {
                     d.dtype == RAD_F32 ? "f32" : "another dtype", (long long)need);
             return RAD_E_UNSUPPORTED;
         }
-        /* The columns a rank owns, by the rule declare_sampler checked at startup: a contiguous
-         * equal split, or the whole vocabulary on every rank -- read from rank 0 alone then. */
+        /* The columns a rank owns: the sampler's split, which declare_sampler checked, or the
+         * whole vocabulary on every rank (then read from rank 0 only). */
         const int64_t w = d.shape[1];
         if (w >= nv) {
             if (!kld_width_.empty()) continue;
@@ -45,8 +46,7 @@ int Engine::run_kld() {
             kld_width_.push_back(nv);
             continue;
         }
-        const int64_t per = (nv + cfg_.tp - 1) / cfg_.tp;
-        kld_vocab0_.push_back(per * rk->index);
+        kld_vocab0_.push_back(rk->sampler.config().vocab_off);
         kld_width_.push_back(w);
     }
     int64_t cover = 0;
@@ -69,13 +69,36 @@ int Engine::run_kld() {
 
     auto kld = std::make_unique<Kld>();
     RAD_TRY(kld->open(cfg_, vocab_, nv, cfg_.model));
-    /* Published before add_all takes the scheduler's lock, and read by the step loop only on a
-     * step that carries a scored row -- one planned under that lock, after it. */
+    /* Published before add_all takes the scheduler's lock; the step loop reads it only on steps
+     * planned under that lock afterwards. */
     kld_ = std::move(kld);
 
-    /* EVERY DOCUMENT AT ONCE, under one hold of the queue: the steps they are packed into are
-     * then a function of the corpus and the flags alone, so a rerun batches them identically. */
     const size_t n = kld_->n_docs();
+    /* A document the KV pool cannot hold even alone would wait at the head of the queue forever:
+     * admission takes only a chunk the pool can hold, and nothing ever frees enough. Refused up
+     * front, naming every such document. The pool is the least that a full paged group holds. */
+    {
+        const KVManager& kv = ranks_[0]->kv;
+        int64_t pool = INT64_MAX;
+        for (int32_t g = 0; g < kv.n_groups(); ++g) {
+            const KVGroupPlan* p = kv.plan(g);
+            if (p && p->paged() && p->window_blocks == 0)
+                pool = std::min<int64_t>(pool, p->n_blocks * p->block_size);
+        }
+        int too_long = 0;
+        for (size_t d = 0; d < n; ++d) {
+            const int64_t len = (int64_t)kld_->tokens(d).size();
+            if (kv.can_ever_fit(len)) continue;
+            RAD_ERR("kld: document %zu is %lld tokens and the KV pool holds %lld, so it can never "
+                    "be scored; give the cache more room or shorten the document", d,
+                    (long long)len, (long long)pool);
+            ++too_long;
+        }
+        if (too_long) return RAD_E_FULL;
+    }
+
+    /* Submit every document under one hold of the queue, so batching depends only on the corpus
+     * and the flags and a rerun batches identically. */
     std::vector<std::unique_ptr<server::Sink>> sinks(n);
     std::vector<std::unique_ptr<Request>> reqs(n);
     for (size_t d = 0; d < n; ++d) {
@@ -126,16 +149,16 @@ int Engine::run_kld() {
         sched_.reap(sinks[d]->id);
     }
     if (bad) return RAD_E_STATE;
-    RAD_INFO("kld: %zu documents in %.0f s", n,
-             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    RAD_INFO("kld: %zu documents in %.0f s, %lld preemption(s)", n,
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+             (long long)sched_.metrics().preemptions);
     return kld_->finish();
 }
 
-/* A STEP'S SCORED ROWS, OFF THE CARDS. They follow the sampler's rows in the logits buffer, in
- * the entry order the batch builder wrote them (core/sched/batch.cpp, "THE SCORED ROWS"), so the
- * walk below is that loop again and the count is checked against what the batch named. Every
- * rank's piece on its own stream, behind the step; the next step is not issued until they are
- * read, because the KL mode does not pipeline. */
+/* Copy a step's scored rows off the cards. They follow the sampler's rows in the logits buffer in
+ * the batch builder's entry order (core/sched/batch.cpp), so the walk below repeats that loop and
+ * checks the count. Each rank copies on its own stream behind the step; KL mode does not
+ * pipeline, so the next step waits for this. */
 int Engine::score_rows(const RadBatch* b, const StepOut& so) {
     const int64_t n = b->n_out - so.n_rows;
     if (n <= 0) return RAD_OK;

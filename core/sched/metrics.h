@@ -1,9 +1,7 @@
-/* metrics.h -- the scheduler's snapshot, for the server's /metrics endpoint (spec §14).
+/* metrics.h -- the scheduler's snapshot for the server's /metrics endpoint (spec §14).
  *
- * A plain struct of numbers with no strings built and nothing formatted. Formatting belongs to
- * whoever is exporting -- Prometheus wants vLLM-compatible names, the live view wants a terminal
- * line, and a scheduler that rendered either would have to be edited to add the other. Fixed
- * arrays, so a scrape allocates nothing and cannot contend with the step path for the allocator.
+ * Plain numbers only; each exporter (Prometheus, the live view) does its own formatting. Fixed
+ * arrays, so a scrape allocates nothing and never contends with the step path for the allocator.
  */
 #pragma once
 #include "rad_core.h"
@@ -28,45 +26,28 @@ struct SchedMetrics {
     int64_t preemptions = 0;
     int64_t steps = 0;
 
-    /* STEPS BY SHAPE, AND WHAT SPECULATION DID NOT REACH. `steps_mixed` over `steps` says how
-     * often the load produces a step carrying both a prefill chunk and decode rows; an agentic
-     * load produces them often enough to be worth measuring.
-     *
-     * `decode_rows_unspeculated` counts every decode row that took no draft, whatever the reason
-     * -- depth 0, a request that may not speculate, a drafter with nothing to propose. Counting
-     * ROWS rather than any one reason keeps it the answer to "how much of my decode is running
-     * unspeculated" as the set of reasons changes. Without it the loss is invisible: throughput
-     * falls and every explanation fits. */
+    /* Steps by shape. `steps_mixed` counts steps carrying both a prefill chunk and decode rows.
+     * `decode_rows_unspeculated` counts every decode row that took no draft, for any reason
+     * (depth 0, a request that may not speculate, a drafter with nothing to propose). */
     int64_t steps_prefill = 0;
     int64_t steps_mixed = 0;
     int64_t steps_decode = 0;
+    /* --prefill-interleave: decode-only steps the hold inserted, issued ahead or not; each kept a
+     * ready chunk out. */
+    int64_t steps_held = 0;
     int64_t decode_rows_unspeculated = 0;
-    /* STEPS ISSUED AHEAD: a step whose forward pass went onto the card behind the step before it,
-     * before that step committed (Scheduler::step_next). Every other step waits for the host's
-     * commit and staging with the card idle, so steps_ahead against steps is how much of the run
-     * kept the card fed through the host's part of it. */
+    /* Steps whose forward pass was enqueued behind the previous step before it committed
+     * (Scheduler::step_next). Every other step leaves the card idle during the host's commit and
+     * staging. */
     int64_t steps_ahead = 0;
-    /* PREFILL CHUNKS HELD BACK for other work in the same step (--busy-prefill-chunk): each is a
-     * chunk that would have taken more of the step and left decode rows behind it, or a request
-     * waiting to be admitted, with nothing. Zero under `off`, and on a load that never overlaps a
-     * prefill with anything else. */
+    /* Prefill chunks capped to leave room for decode rows or a waiting admission in the same
+     * step (--busy-prefill-chunk). Zero under `off`. */
     int64_t prefill_chunks_capped = 0;
 
-    /* HOW LONG THE ENGINE SPENT INSIDE A STEP, cumulative nanoseconds, and the decode half of it
-     * separately. Neither is a derived rate -- they are counters, and that is the point.
-     *
-     * A STEP TIME IS NOT WALL TIME OVER A STEP COUNT, and a gauge that computes it that way is
-     * wrong in two directions at once. An engine that idles between requests -- which is every
-     * agent, every chat client, every tool loop -- charges the idle gap to the steps around it,
-     * inflating the step time by however long nothing was running. And a prefill chunk costs an
-     * order of magnitude more than a decode step, so a load that mixes them averages two
-     * populations and calls the result the step time. Both faults are invisible without an
-     * instrument: the number is plausible, it moves with load, and nothing contradicts it.
-     *
-     * With these, `step_ns_decode / steps_decode` is a decode step time that needs no window, no
-     * saturation assumption and no second endpoint. Charged from the scheduler's own
-     * `step_start_`, which is the same clock `decode_tps` already uses -- so this adds no
-     * synchronisation and no timing mode (spec §16). */
+    /* Cumulative nanoseconds spent inside steps, total and for decode steps only. Wall time over
+     * a step count is not a step time: it charges idle gaps between requests to steps and mixes
+     * prefill with decode. `step_ns_decode / steps_decode` is the decode step time. Measured from
+     * `step_start_`, the clock `decode_tps` uses, so no extra synchronisation (spec §16). */
     int64_t step_ns = 0;
     int64_t step_ns_decode = 0;
 
@@ -77,44 +58,44 @@ struct SchedMetrics {
         int64_t blocks_total = 0;
         int64_t blocks_free = 0;
         float   utilisation = 0.0f;   /* 1 - free/total */
-        /* Tokens one block covers, 0 for a stateful group. A pool measured in blocks cannot be
-         * compared with a request measured in tokens, and every reader wants that comparison. */
+        /* Tokens one block covers, 0 for a stateful group. */
         int64_t block_tokens = 0;
-        /* A WINDOWED GROUP recycles its blocks below the window, so its carve says how far back a
-         * sequence keeps context and nothing about how much context fits. */
+        /* A windowed group recycles blocks below the window, so its size bounds how far back a
+         * sequence sees, not how much context fits. */
         bool    window = false;
-        /* AND THE SAME GROUP IN BYTES, which is the measure that survives being added to the next
-         * group's. Neither blocks nor tokens does: a stateful group has no token axis, and two
-         * paged groups share one, so a token of context takes a slot in both and summing them
-         * reports a pool the card does not have. */
+        /* The group in bytes, the only unit that sums across groups: a stateful group has no
+         * token axis, and paged groups share one, so summed tokens overcount. */
         int64_t bytes_total = 0;
         int64_t bytes_used = 0;
-        /* WHAT IT WAS CARVED TO ADDRESS, as against bytes_total, which is what the card is
-         * actually holding for it. The two differ by what the elastic pool has released: the
-         * cache releases the VRAM behind blocks nothing holds, and the difference between these
-         * two numbers is exactly what it gave back. Equal otherwise. */
+        /* Bytes the group was carved to address. bytes_total is what the card holds now; the
+         * difference is the VRAM the elastic pool released behind unheld blocks. */
         int64_t bytes_carved = 0;
     } kv[RAD_SCHED_MAX_KV_GROUPS];
 
     /* Prefix caching (§7.3). Attention and linear are reported separately because they hit at
-     * different granularities and a single number would hide exactly the effect the decoupling
-     * was for. */
+     * different granularities. */
     int64_t prompt_tokens = 0;
     int64_t attn_cached_tokens = 0;
     int64_t linear_cached_tokens = 0;
     float   attn_hit_rate = 0.0f;
-    /* Cumulative, from the prefix cache itself. Rising evictions under a steady workload
-     * mean the pool cannot hold the working set and turn-2 latency is about to collapse. */
+    /* Cumulative, from the prefix cache. Rising evictions under a steady workload mean the pool
+     * cannot hold the working set. */
     int64_t prefix_evictions = 0;
     int64_t prefix_ckpt_evictions = 0;
+    /* prefix_ckpt_evictions by reason (retention policy, least recently used of a full store),
+     * and reservations that went without a snapshot. */
+    int64_t prefix_ckpt_retired = 0, prefix_ckpt_lru = 0, prefix_ckpt_refused = 0;
     int64_t prefix_expired = 0, prefix_ckpt_expired = 0;   /* --prefix-cache-ttl */
-    /* WHAT THE CACHE IS HOLDING ON ITS OWN NOW, in tokens of context: the part of the pool that
-     * an eviction would actually free, because no live sequence is reading it. The pool figure
-     * above counts a held block whoever holds it, and on a server serving conversations most of
-     * it is this rather than the running requests -- so without it a working cache and a leak are
-     * the same picture. Blocks shared with a running sequence are NOT in it; counting them would
-     * make one long request read as a cache that would not release its context. Same token axis
-     * as the paged groups, so it is comparable with kv_tokens_used. */
+    /* Admissions whose attention hit was cut to nothing: no snapshot at or below it (recurrent
+     * state or a window snapshot), a windowed trunk group no window snapshot covers, or blocks
+     * that could not be adopted. `hit_cut_tokens` is the checkpoint shortfall: prompt tokens the
+     * attention cache held and the admission computed again, because the hit resumed at a
+     * snapshot below it or was cut to nothing. */
+    int64_t hit_cut_no_snapshot = 0, hit_cut_window = 0, hit_cut_adopt = 0;
+    int64_t hit_cut_tokens = 0;
+    /* Tokens of context held only by the cache, i.e. what eviction would free. Excludes blocks
+     * shared with a running sequence. Same token axis as the paged groups, so comparable with
+     * kv_tokens_used. */
     int64_t prefix_held_tokens = 0;
     float   linear_hit_rate = 0.0f;
     int64_t checkpoints_written = 0;
@@ -135,18 +116,16 @@ struct SchedMetrics {
     int64_t draft_refill_tokens = 0;
     float   draft_acceptance = 0.0f;
     int     draft_depth = 0;          /* what the controller would choose right now */
-    /* Per draft POSITION, so a cliff can be told from a decay: `reached` is how often every
-     * earlier position was accepted and this one was therefore evaluated, `accepted` how often it
-     * was then taken. Their ratio is the conditional hazard, which is the number that says what a
-     * deeper draft would actually buy. `draft_depth_seen` bounds how much of the arrays is real. */
+    /* Per draft position: `reached` counts verifies where every earlier position was accepted,
+     * `accepted` how often this one was then taken. Their ratio is the conditional acceptance,
+     * which says what a deeper draft would buy. `draft_depth_seen` bounds the valid entries. */
     enum { RAD_METRICS_MAX_SPEC = 64 };
     int     draft_depth_seen = 0;
     int64_t draft_pos_reached [RAD_METRICS_MAX_SPEC] = {};
     int64_t draft_pos_accepted[RAD_METRICS_MAX_SPEC] = {};
-    /* THE ADAPTIVE WINDOW (--draft-window adaptive, draft.h), all zero while it is off. The mean
-     * window it gives the sequences running now -- at one sequence, that sequence's window -- and
-     * the verifies by the window they carried, index = drafts verified, cumulative: the gauge says
-     * where the policy stands, the histogram where it has been. */
+    /* Adaptive window (--draft-window adaptive, draft.h); all zero while off. The gauge is the
+     * mean window over running sequences; the cumulative histogram counts verifies by window,
+     * index = drafts verified. */
     bool    draft_adaptive = false;
     float   draft_depth_adaptive = 0.0f;
     int64_t draft_verify_depth[RAD_METRICS_MAX_SPEC + 1] = {};

@@ -1,10 +1,8 @@
 /* sysinfo.cpp -- the machine, as /proc and /sys describe it.
  *
- * EVERY READ IS A FILE UNDER A ROOT. No tool is run and no library beyond the C++ runtime is
- * asked: the production image is built FROM scratch and has no shell, no lspci and no rocm-smi,
- * and a test hands the collector a directory tree of its own to stand for a machine with two cards
- * behind a switch, a parked link, or an IOMMU that translates. What a file does not say is left
- * unknown, never guessed.
+ * Every read is a file under a root; no tool or library is used. The production image is built
+ * FROM scratch (no shell, lspci or rocm-smi), and tests pass a directory tree describing the
+ * machine. What a file does not say is left unknown, never guessed.
  */
 #include "diag/diag.h"
 #include "rad_internal.h"
@@ -130,34 +128,27 @@ void read_card(const std::string& root, const std::string& bdf, bool pm, CardFac
     for (const std::string& d : list(dev + "/drm"))
         if (d.rfind("card", 0) == 0 && d.size() > 4 && std::isdigit((unsigned char)d[4])) c->drm = d;
 
-    /* THE WHOLE PATH TO THE ROOT PORT, not the card's own link alone. A card with a switch on it
-     * reports its own endpoint link at full speed whatever the slot does upstream: a root port
-     * parked one speed down shows only at the root port (and in the card's DPM table). */
+    /* Every hop up to the root port, not just the card's link: a card with an on-board switch
+     * reports its endpoint at full speed regardless of the slot, so a parked root port shows only
+     * at the root port (and in the card's DPM table). */
+    auto hop = [&](const std::string& at, const std::string& hop_bdf) {
+        PciHop h;
+        h.bdf       = hop_bdf;
+        h.cur_speed = line(at + "/current_link_speed");
+        h.max_speed = line(at + "/max_link_speed");
+        h.cur_width = (int)num(at + "/current_link_width", -1);
+        h.max_width = (int)num(at + "/max_link_width", -1);
+        c->chain.push_back(h);
+    };
     std::error_code ec;
     const fs::path real = fs::canonical(dev, ec);
     if (!ec) {
         for (const fs::path& part : real) {
             const std::string p = part.string();
-            if (!is_bdf(p)) continue;
-            const std::string hd = root + "/sys/bus/pci/devices/" + p;
-            PciHop h;
-            h.bdf       = p;
-            h.cur_speed = line(hd + "/current_link_speed");
-            h.max_speed = line(hd + "/max_link_speed");
-            h.cur_width = (int)num(hd + "/current_link_width", -1);
-            h.max_width = (int)num(hd + "/max_link_width", -1);
-            c->chain.push_back(h);
+            if (is_bdf(p)) hop(root + "/sys/bus/pci/devices/" + p, p);
         }
     }
-    if (c->chain.empty()) {
-        PciHop h;
-        h.bdf       = bdf;
-        h.cur_speed = line(dev + "/current_link_speed");
-        h.max_speed = line(dev + "/max_link_speed");
-        h.cur_width = (int)num(dev + "/current_link_width", -1);
-        h.max_width = (int)num(dev + "/max_link_width", -1);
-        c->chain.push_back(h);
-    }
+    if (c->chain.empty()) hop(dev, bdf);
 
     c->vram_total   = num(dev + "/mem_info_vram_total", -1);
     c->vram_visible = num(dev + "/mem_info_vis_vram_total", -1);
@@ -185,8 +176,8 @@ void read_card(const std::string& root, const std::string& bdf, bool pm, CardFac
         break;
     }
     {
-        /* "OD_VDDGFX_OFFSET:\n-75mV": the offset the driver holds for the card, which is the one
-         * it uploads; whether the firmware took it is not in this file. */
+        /* "OD_VDDGFX_OFFSET:\n-75mV": the offset the driver holds and uploads; whether the
+         * firmware applied it is not in this file. */
         const std::string od = slurp(dev + "/pp_od_clk_voltage");
         const size_t at = od.find("OD_VDDGFX_OFFSET:");
         if (at != std::string::npos) {
@@ -198,14 +189,13 @@ void read_card(const std::string& root, const std::string& bdf, bool pm, CardFac
     }
 }
 
-/* The KFD topology knows what the PCI files do not: each GPU node's target and SIMD count, keyed
- * by its PCI location -- `location_id` is (bus << 8) | (device << 3) | function. */
+/* Each KFD topology GPU node's target and SIMD count, keyed by PCI location:
+ * `location_id` is (bus << 8) | (device << 3) | function. */
 void read_kfd(const std::string& root, std::vector<CardFacts>* cards) {
     const std::string nodes = root + "/sys/class/kfd/kfd/topology/nodes";
     for (const std::string& n : list(nodes)) {
-        /* A LINE AT A TIME, and only the four keys this needs parsed: the file holds values no
-         * signed 64-bit integer takes (unique_id is a full 64-bit hash), and a stream extraction
-         * that meets one fails and stops reading every key after it. */
+        /* Line by line, parsing only the needed keys: some values (unique_id, a 64-bit hash)
+         * overflow int64, and a failed stream extraction would stop reading all later keys. */
         std::istringstream in(slurp(nodes + "/" + n + "/properties"));
         std::string l;
         long long loc = -1, dom = 0, gfx = 0, simd = -1;
@@ -236,19 +226,18 @@ void read_kfd(const std::string& root, std::vector<CardFacts>* cards) {
     }
 }
 
-/* Of two memory limits in HostFacts' encoding (bytes, -2 unlimited, -1 unknown), the one that
- * binds: the smaller number, else unlimited over unknown. */
+/* The binding one of two limits in HostFacts' encoding (bytes, -2 unlimited, -1 unknown): the
+ * smaller number, else unlimited over unknown. */
 int64_t tighter(int64_t a, int64_t b) {
     if (a >= 0 && b >= 0) return std::min(a, b);
     if (a >= 0 || b >= 0) return std::max(a, b);
     return a == -2 || b == -2 ? -2 : -1;
 }
 
-/* THE TIGHTEST MEMORY LIMIT FROM A CGROUP UP TO THE MOUNT'S ROOT. A limit binds every cgroup
- * below it, so the process's own group can say "max" while the systemd slice or the container's
- * group above it holds the limit that counts. `rel` is the path /proc/self/cgroup names, under
- * `mount`; every level on the way up is read, the mount's root included -- inside a container's
- * cgroup namespace that root is the container's own group. */
+/* The tightest memory limit from a cgroup up to the mount's root. A limit binds every cgroup
+ * below it, so the process's group may say "max" while a parent slice holds the real limit.
+ * `rel` is the /proc/self/cgroup path under `mount`; every level is read, the root included
+ * (inside a cgroup namespace that is the container's own group). */
 int64_t cgroup_limit(const std::string& mount, std::string rel, const char* file) {
     int64_t lim = -1;
     while (!rel.empty() && rel.back() == '/') rel.pop_back();
@@ -323,9 +312,9 @@ void read_host(const std::string& root, HostFacts* h) {
         else if (cg.find("containerd") != std::string::npos) h->container = "containerd";
     }
     {
-        /* THE PROCESS'S OWN CGROUP, which inside a container is "/" under its namespace, and
-         * every one above it: cgroup_limit says why. Version 2 is the "0::" line; version 1's
-         * memory controller is the ":memory:" one, where "unlimited" is a number near 2^63. */
+        /* The process's cgroup ("/" inside a container's namespace) and its ancestors. v2 is
+         * the "0::" line; v1's memory controller is ":memory:", where unlimited is a number
+         * near 2^63. */
         std::istringstream in(slurp(root + "/proc/self/cgroup"));
         std::string l;
         int64_t lim = -1;
@@ -355,9 +344,9 @@ void read_host(const std::string& root, HostFacts* h) {
                 if (t.rfind(k, 0) == 0) { h->cmdline += (h->cmdline.empty() ? "" : " ") + t; break; }
     }
     {
-        /* PASSTHROUGH OR TRANSLATED, from what decides it for the cards: their IOMMU groups' type
-         * (identity is passthrough) is the kernel's own answer; the boot parameters and the
-         * presence of an IOMMU are what is left when a card has no group. */
+        /* Passthrough or translated. The cards' IOMMU group type (identity = passthrough) is the
+         * kernel's own answer; IOMMU presence and boot parameters are the fallback for a card
+         * with no group. */
         const bool any_iommu = !list(root + "/sys/class/iommu").empty();
         const bool groups = !list(root + "/sys/kernel/iommu_groups").empty();
         const std::string cl = " " + h->cmdline + " ";
@@ -379,7 +368,7 @@ void read_host(const std::string& root, HostFacts* h) {
     }
     {
         int64_t lim = num(root + "/sys/module/ttm/parameters/pages_limit", -1);
-        /* 0 IS THE DRIVER'S DEFAULT, which is half of RAM. */
+        /* 0 means the driver default, half of RAM. */
         if (lim == 0 && h->mem_total > 0) lim = h->mem_total / 2 / h->page_size;
         h->ttm_pages_limit = lim;
     }
@@ -404,8 +393,7 @@ Facts collect(const std::string& root, const std::vector<std::string>* managed) 
         if (ps > 0) f.host.page_size = ps;
     }
     read_host(root, &f.host);
-    /* EVERY DISPLAY-CLASS DEVICE, the engine's or not: an integrated GPU beside the cards, or a
-     * card the engine was told not to use, is part of the answer to "what is in this machine". */
+    /* Every display-class device, used by the engine or not (an iGPU, an excluded card). */
     for (const std::string& d : list(root + "/sys/bus/pci/devices")) {
         const std::string cls = line(root + "/sys/bus/pci/devices/" + d + "/class");
         if (cls.rfind("0x03", 0) != 0) continue;
@@ -416,23 +404,21 @@ Facts collect(const std::string& root, const std::vector<std::string>* managed) 
         f.cards.push_back(std::move(c));
     }
     read_kfd(root, &f.cards);
-    /* THE IOMMU'S MODE AS THE CARDS SEE IT, which beats the command line where both exist: each
-     * card's group says identity (passthrough) or DMA / DMA-FQ (translated), and a machine can
-     * hold both -- an integrated GPU left identity-mapped beside a translated discrete card. */
-    if (f.host.iommu == "unknown") {
-        std::map<std::string, std::string> by;
-        for (const CardFacts& c : f.cards)
-            if (!c.iommu_type.empty()) by[c.iommu_type] += (by[c.iommu_type].empty() ? "" : ", ") + c.bdf;
-        if (by.size() == 1) {
-            const bool id = by.begin()->first == "identity";
-            f.host.iommu = id ? "passthrough" : "translated";
-            f.host.iommu_why = "the display devices' IOMMU groups are of type " + by.begin()->first;
-        } else if (by.size() > 1) {
-            f.host.iommu = "mixed";
-            f.host.iommu_why.clear();
-            for (const auto& [t, bdfs] : by)
-                f.host.iommu_why += (f.host.iommu_why.empty() ? "" : "; ") + t + " for " + bdfs;
-        }
+    /* The IOMMU mode as the cards see it, which beats the command line where both exist:
+     * identity is passthrough, DMA / DMA-FQ translated. A machine can mix both (an
+     * identity-mapped iGPU beside a translated discrete card). */
+    std::map<std::string, std::string> by;
+    for (const CardFacts& c : f.cards)
+        if (!c.iommu_type.empty()) by[c.iommu_type] += (by[c.iommu_type].empty() ? "" : ", ") + c.bdf;
+    if (by.size() == 1) {
+        const bool id = by.begin()->first == "identity";
+        f.host.iommu = id ? "passthrough" : "translated";
+        f.host.iommu_why = "the display devices' IOMMU groups are of type " + by.begin()->first;
+    } else if (by.size() > 1) {
+        f.host.iommu = "mixed";
+        f.host.iommu_why.clear();
+        for (const auto& [t, bdfs] : by)
+            f.host.iommu_why += (f.host.iommu_why.empty() ? "" : "; ") + t + " for " + bdfs;
     }
     return f;
 }
@@ -442,8 +428,8 @@ void probe_process(HostFacts* h) {
     if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0)
         h->memlock_soft = rl.rlim_cur == RLIM_INFINITY ? -2 : (int64_t)rl.rlim_cur;
 #ifdef SYS_io_uring_setup
-    /* ASKED, NOT INFERRED: a seccomp profile (Docker's default) refuses the call whatever the
-     * sysctl says, and the answer is the error the call returns. One entry, closed at once. */
+    /* Try the call: a seccomp profile (Docker's default) refuses it whatever the sysctl says.
+     * One entry, closed at once. */
     struct { uint32_t sq_entries, cq_entries, flags, sq_thread_cpu, sq_thread_idle, features,
              wq_fd, resv[3]; uint64_t sq_off[5]; uint64_t cq_off[5]; } p{};
     static_assert(sizeof(p) == 120, "io_uring_params is 120 bytes");

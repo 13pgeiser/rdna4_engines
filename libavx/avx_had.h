@@ -1,27 +1,24 @@
-/* avx_had.h -- the Hadamard rotation, the fp8 group quantiser and the epilogue the fp8 fusions
- * share, for the kernels that emit a rotated or block-scaled fp8 row: had_quant_act_fp8, the fused
- * quantisers (avx_quant.cpp), gemm_nt_q_gated (avx_gemm.cpp) and hc_read's rotated twin
- * (avx_hc.cpp). Compiled per level with the file that includes it; include it after avx_vec.h and
- * avx_common.h, with `using namespace avx` in effect. */
+/* avx_had.h -- Hadamard rotation, fp8 group quantiser and the shared fp8-fusion epilogue, for the
+ * kernels that emit a rotated or block-scaled fp8 row: had_quant_act_fp8, the fused quantisers
+ * (avx_quant.cpp), gemm_nt_q_gated (avx_gemm.cpp) and hc_read (avx_hc.cpp).
+ * Compiled per level with its includer; include after avx_vec.h and avx_common.h, with
+ * `using namespace avx` in effect. */
 #ifndef RAD_AVX_HAD_H
 #define RAD_AVX_HAD_H
 
 static inline bool pow2(int64_t v) { return v > 0 && (v & (v - 1)) == 0; }
 
-/* The widest rotation this plugin performs. libr4d caps `had` at 512 -- a power of two dividing
- * the per-rank K, and 8704 admits no more -- so 4096 is four doublings of headroom, and it is
- * libref's cap too so the two agree about what they refuse. A wider request returns
- * RAD_E_UNSUPPORTED BY NAME rather than silently rotating a narrower block: a half-applied
- * rotation is numerically plausible and completely wrong. */
+/* Widest rotation supported. libr4d caps `had` at 512 (the largest power of two dividing a
+ * per-rank K of 8704); 4096 matches libref's cap so both refuse the same requests. A wider request
+ * returns RAD_E_UNSUPPORTED rather than rotating a narrower block, whose output would look
+ * plausible but be wrong. */
 enum { AVX_HAD_MAX = 4096 };
 
 /* ================================================================== the butterfly
- * One stride of the transform over a g-element block. `h` is the stride; the caller runs it
- * ascending from 1. */
+ * One stride `h` of the transform over a g-element block; strides run ascending from 1. */
 #if AVX_LEVEL >= 1
-/* The partner of each lane under a swap at stride `h`, for h < VF_N, and the mask of lanes that
- * take the SUM (the ones with (i & h) == 0; the others take partner - self, which is the
- * subtraction with the operands the right way round). */
+/* In-register stride for h < VF_N: permute each lane with its partner at stride h, then lanes with
+ * (i & h) == 0 take self + partner and the others partner - self. */
 static inline void fwht_small(float* v, int64_t g, int64_t h) {
     for (int64_t b = 0; b < g; b += VF_N) {
         vf x = vf_loadu(v + b);
@@ -34,7 +31,6 @@ static inline void fwht_small(float* v, int64_t g, int64_t h) {
             case 4: p = _mm512_shuffle_f32x4(x, x, 0xB1);      m = 0x0F0F; break;
             default:p = _mm512_shuffle_f32x4(x, x, 0x4E);      m = 0x00FF; break;  /* h == 8 */
         }
-        /* sum where (i & h) == 0, partner - self elsewhere. One blend, no branch per lane. */
         vf_storeu(v + b, _mm512_mask_blend_ps(m, _mm512_sub_ps(p, x), _mm512_add_ps(x, p)));
 #else
         switch (h) {
@@ -84,39 +80,38 @@ static inline void fwht_row(float* v, int64_t n, int64_t g) {
 }
 
 /* ================================================================== the fp8 group
- * out[k0, k1) = v[k0, k1) / scale, clamped to E4M3's finite range, with scale = amax / 448 (1 for an
- * all-zero group). */
-static inline void fp8_group(const float* v, float* out, int64_t k0, int64_t k1, float* scale_out) {
+ * out[k0, k1) = v[k0, k1) / scale, clamped to +-top, with scale = amax / top (1 for an all-zero
+ * group): `top` 448 is E4M3's finite range, 127 int8's. */
+static inline void fp8_group(const float* v, float* out, int64_t k0, int64_t k1, float* scale_out,
+                             float top = 448.0f) {
     const float amax = row_amax(v + k0, k1 - k0);
-    const float sc = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
+    const float sc = amax > 0.0f ? amax * (1.0f / top) : 1.0f;
     const float inv = 1.0f / sc;
-    const vf vi = vf_set1(inv), hi = vf_set1(448.0f), lo = vf_set1(-448.0f);
+    const vf vi = vf_set1(inv), hi = vf_set1(top), lo = vf_set1(-top);
     int64_t i = k0;
     for (; i + VF_N <= k1; i += VF_N)
         vf_storeu(out + i, vf_min(vf_max(vf_mul(vf_loadu(v + i), vi), lo), hi));
     for (; i < k1; ++i) {
         float t = v[i] * inv;
-        out[i] = t > 448.0f ? 448.0f : (t < -448.0f ? -448.0f : t);
+        out[i] = t > top ? top : (t < -top ? -top : t);
     }
     *scale_out = sc;
 }
 
 /* ================================================================== the fp8 fusions' epilogue
  *
- * A fused fp8 op stands in for a pair whose first half writes a bf16 tensor and whose second half
- * quantises the bytes it reads back. So the codes are taken over the bf16-NARROWED value whatever
- * the activation dtype, and `out_bf16` holds exactly that value -- libref's contract for all three
- * (ref_quant.cpp), and the reason the helpers below narrow before they quantise. */
+ * A fused fp8 op replaces a pair that writes a bf16 tensor and then quantises it. So the codes are
+ * taken over the bf16-narrowed value whatever the activation dtype, and `out_bf16` holds that
+ * value (libref's contract, ref_quant.cpp). The helpers below therefore narrow before quantising. */
 
-/* v[0, n) narrowed to bf16 and read back, in place. `tmp` holds n floats, which is room for the n
- * bf16 in between. */
+/* Round v[0, n) through bf16 in place. `tmp` holds n floats (room for the n bf16). */
 static inline void narrow_bf16(float* v, int64_t n, float* tmp) {
     row_from_f32(RAD_BF16, v, tmp, n);
     row_to_f32(RAD_BF16, tmp, v, n);
 }
 
-/* out = act(gate) * up, narrowed to bf16: act 0 is silu (down_proj's input), 1 sigmoid (a gated
- * attention o_proj's). `tmp` holds n floats. */
+/* out = act(gate) * up, narrowed to bf16. act 0 is silu (down_proj's input), 1 is sigmoid (a
+ * gated attention's o_proj input). `tmp` holds n floats. */
 static inline void gate_bf16(const float* gv, const float* uv, float* out, int64_t n, int act,
                              float* tmp) {
     int64_t i = 0;
@@ -131,16 +126,18 @@ static inline void gate_bf16(const float* gv, const float* uv, float* out, int64
     narrow_bf16(out, n, tmp);
 }
 
-/* Row r of the codes `q` and their group scales `s` over v[0, n), in groups of `g` with a ragged
- * last one; and v itself into `ob` when a caller asked for it. `codes` holds n floats. */
+/* Writes row r of the codes `q` and group scales `s` over v[0, n), in groups of `g` (the last may
+ * be short), and v itself into `ob` when given. `codes` holds n floats. An int8 `q` takes
+ * quant_act_i8g's codes (libref/ref_quant.cpp: fp8_row). */
 static inline void fp8_emit(const float* v, float* codes, int64_t n, int64_t g, const RadTensor* q,
                             const RadTensor* s, const RadTensor* ob, int64_t r) {
     if (ob) out_row(ob, rowoff(ob, r, n), n, v);
     const int64_t ngrp = (n + g - 1) / g;
+    const float top = q->dtype == RAD_I8 ? 127.0f : 448.0f;
     for (int64_t gi = 0; gi < ngrp; ++gi) {
         const int64_t k0 = gi * g, k1 = (k0 + g < n) ? k0 + g : n;
         float sc;
-        fp8_group(v, codes, k0, k1, &sc);
+        fp8_group(v, codes, k0, k1, &sc, top);
         stt(s, rowoff(s, r, ngrp) + gi * laststride(s), sc);
     }
     out_row(q, rowoff(q, r, n), n, codes);

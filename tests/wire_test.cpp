@@ -1,17 +1,15 @@
 /* wire_test.cpp -- the pieces of the HTTP and OpenAI surface that are not a route.
  *
- * server_test drives the server end to end and is where a handler's behaviour belongs. What it
- * cannot reach is the half-dozen small functions underneath: a target splitter, a percent
- * decoder, a base64 pair, the UTF-8 back-off that keeps a streamed delta from cutting a code
- * point in half, the bucket ladders every Prometheus quantile is computed against, and the body
- * builders. Each of them is reachable from exactly one route, so a fault in one shows up as one
- * endpoint being subtly wrong -- a query parameter that silently does not arrive, a stream a
- * client cannot decode, a histogram whose quantiles moved across a version boundary.
+ * server_test drives handlers end to end. This file covers the small functions underneath that
+ * it cannot reach directly: the target splitter, percent decoder, base64 pair, the UTF-8 back-off
+ * that keeps a streamed delta from splitting a code point, the bucket ladders Prometheus
+ * quantiles are computed against, and the body builders. Each is reachable from one route, so a
+ * fault shows up as one endpoint being subtly wrong (a query parameter that does not arrive, an
+ * undecodable stream, histogram quantiles that move between versions).
  *
- * WHAT MAKES THESE WORTH A TEST RATHER THAN A READING. Every one of them has a case that is not
- * the obvious one: base64 has two padding lengths, the decoder has to reject a character rather
- * than skip it, `+` means two different things in the two halves of a target, and `utf8_trunc`
- * exists precisely because the easy implementation is wrong.
+ * Each has a non-obvious case: base64 has two padding lengths, the decoder must reject a bad
+ * character rather than skip it, `+` means different things in the two halves of a target, and
+ * the easy implementation of `utf8_trunc` is wrong.
  */
 #include "rad_test.h"
 
@@ -23,10 +21,12 @@
 #include "server/oai.h"
 #include "server/sink.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace rad;
@@ -49,8 +49,8 @@ TEST(a_target_splits_into_a_path_and_decoded_query_parameters) {
     CHECK_EQ(path, std::string("/health"));
     CHECK_EQ(none.size(), 0u);
 
-    /* A key with no value is present and empty -- "?stream" is a flag, and a caller asking
-     * whether the key is there must be able to tell it from a key that was never sent. */
+    /* A key with no value is present and empty: "?stream" is a flag, and a caller must be able
+     * to tell it from a key that was never sent. */
     std::map<std::string, std::string> flag;
     parse_target("/x?stream", &path, &flag);
     CHECK_EQ(flag.size(), 1u);
@@ -77,8 +77,8 @@ TEST(query_values_are_percent_decoded_and_survive_an_embedded_equals) {
     std::map<std::string, std::string> q;
     parse_target("/x?name=a%20b&eq=1%3D2&plus=a+b", &path, &q);
     CHECK_EQ(q["name"], std::string("a b"));
-    /* Split on the FIRST '=' only, or a base64 value -- which ends in '=' padding -- loses its
-     * tail every time. */
+    /* Split on the first '=' only, or a base64 value (which ends in '=' padding) loses its
+     * tail. */
     CHECK_EQ(q["eq"], std::string("1=2"));
     CHECK_EQ(q["plus"], std::string("a b"));
 
@@ -87,9 +87,8 @@ TEST(query_values_are_percent_decoded_and_survive_an_embedded_equals) {
     CHECK_EQ(raw["v"], std::string("a=b=c"));
 }
 
-/* `+` IS A SPACE IN A QUERY STRING AND A PLUS SIGN IN A PATH. The form encoding that gives it the
- * second meaning applies to form data, which is what a query string is and a path is not --
- * so /v1/models/gpt+4 must not become a request for "gpt 4". */
+/* `+` is a space in a query string and a plus sign in a path. Form encoding applies to the query
+ * string, not the path, so /v1/models/gpt+4 must not become a request for "gpt 4". */
 TEST(a_plus_in_the_path_stays_a_plus) {
     std::string path;
     std::map<std::string, std::string> q;
@@ -109,8 +108,8 @@ TEST(url_decode_leaves_a_truncated_or_invalid_escape_alone) {
     CHECK_EQ(url_decode("%41%42"), std::string("AB"));
     CHECK_EQ(url_decode("%4a"), std::string("J"));        /* lower-case hex */
     CHECK_EQ(url_decode("%4A"), std::string("J"));
-    /* A DECODER THAT CONSUMED A BAD ESCAPE WOULD EAT THE BYTES AFTER IT. Leaving it verbatim
-     * makes the mistake visible in the value rather than shortening the string silently. */
+    /* A bad escape is left verbatim; consuming it would eat the bytes after it and silently
+     * shorten the value. */
     CHECK_EQ(url_decode("%zz"), std::string("%zz"));
     CHECK_EQ(url_decode("%4"), std::string("%4"));
     CHECK_EQ(url_decode("%"), std::string("%"));
@@ -122,8 +121,8 @@ TEST(url_decode_leaves_a_truncated_or_invalid_escape_alone) {
 /* ================================================================== base64 */
 
 TEST(base64_round_trips_at_every_padding_length) {
-    /* The three residues are the whole of the encoder's branching, and they are what the padding
-     * length encodes: a decoder that got the two-byte tail wrong would return a trailing zero. */
+    /* The three residues are all of the encoder's branching and what the padding length encodes;
+     * a decoder that got the two-byte tail wrong would return a trailing zero. */
     const char* cases[] = { "", "f", "fo", "foo", "foob", "fooba", "foobar" };
     const char* want[]  = { "", "Zg==", "Zm8=", "Zm9v", "Zm9vYg==", "Zm9vYmE=", "Zm9vYmFy" };
     for (int i = 0; i < 7; ++i) {
@@ -148,18 +147,17 @@ TEST(base64_carries_every_byte_value_including_zero) {
     CHECK_EQ(back.size(), (size_t)256);
     for (int i = 0; i < 256; ++i) CHECK_EQ((int)back[(size_t)i], i);
 
-    /* The alphabet is the standard one and not the URL-safe variant: a decoder on the other end
-     * chooses by which characters it sees, and '+' and '/' are what it must see here. */
+    /* The standard alphabet, not the URL-safe one: a decoder chooses by the characters it sees,
+     * and '+' and '/' are what it must see. */
     bool plus = false, slash = false;
     for (char c : enc) { if (c == '+') plus = true; if (c == '/') slash = true; }
     CHECK(plus);
     CHECK(slash);
 }
 
-/* AN EMBEDDING ARRIVES AS BASE64 FROM A CLIENT, so the decoder is parsing untrusted input: a
- * character outside the alphabet has to be an error and not a byte skipped, or a corrupted
- * payload decodes to a shorter vector that the shape check then accepts or rejects for the
- * wrong reason. */
+/* Embeddings arrive as base64 from clients, so the decoder parses untrusted input: a character
+ * outside the alphabet must be an error, not skipped, or a corrupted payload decodes to a shorter
+ * vector that the shape check then judges for the wrong reason. */
 TEST(base64_decode_rejects_a_character_outside_the_alphabet) {
     std::vector<uint8_t> out;
     CHECK(!base64_decode("Zm9v!", &out));
@@ -167,7 +165,7 @@ TEST(base64_decode_rejects_a_character_outside_the_alphabet) {
     CHECK(!base64_decode("Zm-9v", &out));        /* the URL-safe alphabet is not accepted */
     CHECK(!base64_decode("Zm_9v", &out));
 
-    /* Whitespace and padding are skipped, because a wrapped MIME payload is still the value. */
+    /* Whitespace and padding are skipped, since a wrapped MIME payload is still the value. */
     CHECK(base64_decode("Zm9v\nYmFy", &out));
     CHECK_EQ(std::string(out.begin(), out.end()), std::string("foobar"));
     CHECK(base64_decode("Zm9v YmFy\t\r\n", &out));
@@ -175,16 +173,15 @@ TEST(base64_decode_rejects_a_character_outside_the_alphabet) {
     CHECK(base64_decode("", &out));
     CHECK_EQ(out.size(), 0u);
 
-    /* The output is cleared first: a failed decode after a successful one must not leave the
-     * previous payload behind for the caller to read as this one's. */
+    /* The output is cleared first, so a failed decode never leaves a previous payload behind. */
     CHECK(base64_decode("Zm9v", &out));
     CHECK_EQ(out.size(), 3u);
     CHECK(!base64_decode("!", &out));
     CHECK_EQ(out.size(), 0u);
 }
 
-/* Every length mod 3 round-trips; padding and whitespace are skipped wherever they stand, which
- * splits the four-digit blocks the decoder takes at once; anything else is refused. */
+/* Every length mod 3 round-trips; padding and whitespace are skipped wherever they stand, even
+ * inside a four-digit block; anything else is refused. */
 TEST(base64_round_trips_and_refuses_stray_bytes) {
     std::vector<uint8_t> bytes(1000);
     for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = (uint8_t)((i * 2654435761u) >> 13);
@@ -215,7 +212,7 @@ TEST(a_random_id_carries_its_prefix_and_does_not_repeat) {
 
     const std::string c = random_id("cmpl-");
     CHECK(c.rfind("cmpl-", 0) == 0);
-    /* The body is drawn from a printable set -- an id lands in a URL and in a log line. */
+    /* The body is printable: an id lands in URLs and log lines. */
     for (size_t i = std::string("cmpl-").size(); i < c.size(); ++i)
         CHECK(c[i] > 0x20 && c[i] < 0x7f);
 }
@@ -225,8 +222,8 @@ TEST(the_error_envelope_is_the_shape_a_client_parses) {
     CHECK_EQ(bad.status, 400);
     CHECK_EQ(bad.param, std::string("temperature"));
     const std::string d = bad.dump();
-    /* OpenAI's envelope is {"error":{"message":...}} and a client reads message and param by
-     * name; anything flatter is an error body a library reports as "unknown". */
+    /* OpenAI's envelope is {"error":{"message":...}} and clients read message and param by name;
+     * anything flatter is reported by client libraries as "unknown". */
     CHECK(d.find("\"error\"") != std::string::npos);
     CHECK(d.find("\"message\"") != std::string::npos);
     CHECK(d.find("temperature") != std::string::npos);
@@ -238,15 +235,15 @@ TEST(the_error_envelope_is_the_shape_a_client_parses) {
     CHECK_EQ(uns.param, std::string("logprobs"));
     CHECK(json_complete(uns.dump()));
 
-    /* A CAPABILITY THIS BUILD DOES NOT HAVE IS 501 AND NOT 400, because 400 tells the caller to
-     * fix their request and there is nothing in it to fix. */
+    /* A capability this build lacks is 501, not 400: 400 tells the caller to fix a request that
+     * has nothing to fix. */
     const ApiError ni = err_not_implemented("embeddings");
     CHECK_EQ(ni.status, 501);
     CHECK(ni.dump().find("embeddings") != std::string::npos);
 
-    /* And a full queue is 429, which is what carries a Retry-After: the request is fine and the
-     * server is momentarily not, so backing off and resending is the correct client behaviour.
-     * 503 would say the service is down, which a client is entitled to treat as fatal. */
+    /* A full queue is 429, which carries Retry-After: the request is fine and the server is
+     * momentarily busy, so the client should back off and resend. 503 would say the service is
+     * down, which a client may treat as fatal. */
     const ApiError ov = err_overloaded("admission queue is full");
     CHECK_EQ(ov.status, 429);
     CHECK(json_complete(ov.dump()));
@@ -260,8 +257,8 @@ TEST(the_error_envelope_is_the_shape_a_client_parses) {
 TEST(an_sse_event_is_one_data_line_and_a_blank_line) {
     const std::string e = sse_event("{\"a\":1}");
     CHECK_EQ(e, std::string("data: {\"a\":1}\n\n"));
-    /* THE BLANK LINE IS THE FRAME DELIMITER. Without it a client buffers the event forever and
-     * the stream looks hung rather than broken. */
+    /* The blank line is the frame delimiter; without it a client buffers the event forever and
+     * the stream looks hung. */
     CHECK(e.size() >= 2 && e.compare(e.size() - 2, 2, "\n\n") == 0);
 
     CHECK_EQ(std::string(SSE_DONE), std::string("data: [DONE]\n\n"));
@@ -271,8 +268,8 @@ TEST(an_sse_event_is_one_data_line_and_a_blank_line) {
     CHECK(err.find("\"error\"") != std::string::npos);
     CHECK(err.find("too large") != std::string::npos);
     CHECK(err.compare(err.size() - 2, 2, "\n\n") == 0);
-    /* The payload between the prefix and the delimiter is one complete JSON value, which is what
-     * a client's per-event parse requires. */
+    /* Between the prefix and the delimiter is one complete JSON value, as a client's per-event
+     * parse requires. */
     CHECK(json_complete(err.substr(6, err.size() - 8)));
 }
 
@@ -282,11 +279,10 @@ TEST(the_finish_reason_matches_vllms_spelling) {
     CHECK_EQ(std::string(finish_reason_oai(Finish::Stop)), std::string("stop"));
     CHECK_EQ(std::string(finish_reason_oai(Finish::Length)), std::string("length"));
     CHECK_EQ(std::string(finish_reason_oai(Finish::ToolCalls)), std::string("tool_calls"));
-    /* CANCELLED HAS NO OPENAI SPELLING and vLLM reports "abort". Dashboards key off that string,
-     * so inventing a better one here would make this server's traffic invisible in them. */
+    /* Cancelled has no OpenAI spelling; vLLM reports "abort" and dashboards key off it. */
     CHECK_EQ(std::string(finish_reason_oai(Finish::Cancelled)), std::string("abort"));
-    /* Every reason resolves to something non-empty: a missing finish_reason is a null in the
-     * choice object, which clients treat as "still streaming". */
+    /* Every reason is non-empty: a missing finish_reason is null in the choice object, which
+     * clients read as "still streaming". */
     for (Finish f : { Finish::Stop, Finish::Length, Finish::ToolCalls, Finish::Cancelled,
                       Finish::Error })
         CHECK(finish_reason_oai(f) && *finish_reason_oai(f));
@@ -295,36 +291,34 @@ TEST(the_finish_reason_matches_vllms_spelling) {
 /* ================================================================== the UTF-8 back-off */
 
 TEST(utf8_trunc_backs_out_of_a_split_code_point_and_nothing_else) {
-    /* Complete input is returned whole -- the common case, and the one a per-delta call takes. */
+    /* Complete input is returned whole: the common case, taken on every delta. */
     CHECK_EQ(utf8_trunc("hello"), (size_t)5);
     CHECK_EQ(utf8_trunc(""), (size_t)0);
     CHECK_EQ(utf8_trunc("\xC3\xA9"), (size_t)2);              /* e-acute, complete */
     CHECK_EQ(utf8_trunc("\xE2\x82\xAC"), (size_t)3);          /* euro sign, complete */
     CHECK_EQ(utf8_trunc("\xF0\x9F\x98\x80"), (size_t)4);      /* an emoji, complete */
 
-    /* A TRAILING PARTIAL SEQUENCE IS CUT. A delta ending mid-code-point is not decodable, and a
-     * client that concatenates deltas before decoding sees a replacement character that never
-     * goes away. */
+    /* A trailing partial sequence is cut. A delta ending mid-code-point is not decodable, and a
+     * client that concatenates deltas before decoding would show a permanent replacement
+     * character. */
     CHECK_EQ(utf8_trunc("ab\xC3"), (size_t)2);
     CHECK_EQ(utf8_trunc("ab\xE2\x82"), (size_t)2);
     CHECK_EQ(utf8_trunc("ab\xE2"), (size_t)2);
     CHECK_EQ(utf8_trunc("ab\xF0\x9F\x98"), (size_t)2);
     CHECK_EQ(utf8_trunc("\xF0"), (size_t)0);
 
-    /* A COMPLETE SEQUENCE FOLLOWED BY A PARTIAL ONE keeps the complete one. */
+    /* A complete sequence followed by a partial one keeps the complete one. */
     CHECK_EQ(utf8_trunc("\xE2\x82\xAC\xC3"), (size_t)3);
-    /* AND A PARTIAL SEQUENCE IN THE MIDDLE IS NOT THIS FUNCTION'S BUSINESS. It backs out of a
-     * truncation rather than validating, so a lone lead byte followed by ASCII is left where it
-     * is: only the tail is reconsidered, and the tail here is complete. */
+    /* A partial sequence in the middle is left alone: this backs out of a truncation, it does not
+     * validate, so only the tail is reconsidered. */
     CHECK_EQ(utf8_trunc("\xC3 ok"), (size_t)4);
     CHECK_EQ(utf8_trunc("\xC3 ok\xE2\x82"), (size_t)4);   /* ... and the real tail still cuts */
 }
 
 /* ================================================================== histogram ladders */
 
-/* vLLM'S LAYOUTS, VERBATIM. A dashboard computes quantiles by interpolating between bucket
- * bounds, so changing one of these silently moves every historical quantile across a version
- * boundary -- the graph does not break, it just stops meaning what it meant. */
+/* vLLM's layouts, verbatim. Dashboards compute quantiles by interpolating between bucket bounds,
+ * so changing a bound silently shifts every historical quantile across a version boundary. */
 TEST(the_bucket_ladders_are_sorted_positive_and_the_ones_vllm_publishes) {
     struct { const char* name; std::vector<double> b; size_t n; double first, last; } cases[] = {
         { "ttft",    buckets_ttft(),    22, 0.001, 2560.0 },
@@ -337,8 +331,8 @@ TEST(the_bucket_ladders_are_sorted_positive_and_the_ones_vllm_publishes) {
         CHECK_NEAR(c.b.back(), c.last, 1e-9);
         for (size_t i = 0; i < c.b.size(); ++i) {
             CHECK(c.b[i] > 0.0);
-            /* STRICTLY INCREASING. A repeated bound gives a bucket of zero width, which every
-             * quantile interpolation divides by. */
+            /* Strictly increasing: a repeated bound gives a zero-width bucket, which quantile
+             * interpolation divides by. */
             if (i) CHECK(c.b[i] > c.b[i - 1]);
         }
     }
@@ -358,31 +352,83 @@ TEST(the_token_ladder_is_mantissas_1_2_5_stopping_past_the_context) {
         while (m >= 10.0) m /= 10.0;
         CHECK(std::fabs(m - 1.0) < 1e-9 || std::fabs(m - 2.0) < 1e-9 || std::fabs(m - 5.0) < 1e-9);
     }
-    /* It stops at the first value PAST the bound rather than including it: nothing above the
-     * context can be observed, so a bucket there would never be reached. */
+    /* It stops before the first value past the bound: nothing above the context can be
+     * observed, so a bucket there would never be reached. */
     for (double v : b) CHECK(v <= 32768.0);
 
     const std::vector<double> big = buckets_1_2_5(200000);
     CHECK(big.size() > b.size());
-    CHECK_NEAR(big.back(), 200000.0, 1e-9);        /* the bound itself is legal when it is on the
-                                                    * ladder, because it can be observed */
+    CHECK_NEAR(big.back(), 200000.0, 1e-9);        /* the bound itself is kept when it is on the
+                                                    * ladder, since it can be observed */
 
-    /* A DEGENERATE BOUND STILL GIVES A USABLE HISTOGRAM. Zero or negative is clamped to one
-     * rather than producing an empty ladder, which would make every observation fall in the
-     * overflow bucket and the metric say nothing. */
+    /* A degenerate bound still gives a usable histogram: zero or negative is clamped to one, not
+     * an empty ladder that would put every observation in the overflow bucket. */
     CHECK_EQ(buckets_1_2_5(1).size(), 1u);
     CHECK_EQ(buckets_1_2_5(0).size(), 1u);
     CHECK_EQ(buckets_1_2_5(-5).size(), 1u);
 }
 
+namespace {
+
+/* Every histogram in a Prometheus body, checked as a scraper reads it: within a family the
+ * buckets never decrease, and the +Inf bucket equals `_count`. Returns the violations. */
+int histogram_violations(const std::string& body) {
+    int bad = 0;
+    std::string family;
+    double last = -1.0, inf = -1.0;
+    size_t at = 0;
+    while (at < body.size()) {
+        size_t nl = body.find('\n', at);
+        if (nl == std::string::npos) nl = body.size();
+        const std::string line = body.substr(at, nl - at);
+        at = nl + 1;
+        const size_t b = line.find("_bucket{");
+        const size_t sp = line.rfind(' ');
+        if (line.empty() || line[0] == '#' || sp == std::string::npos) continue;
+        const double v = std::stod(line.substr(sp + 1));
+        if (b != std::string::npos) {
+            const std::string fam = line.substr(0, b);
+            if (fam != family) { family = fam; last = -1.0; }
+            if (v < last) ++bad;
+            last = v;
+            if (line.find("le=\"+Inf\"") != std::string::npos) inf = v;
+        } else if (!family.empty() && line.rfind(family + "_count{", 0) == 0) {
+            if (v != inf) ++bad;
+        }
+    }
+    return bad;
+}
+
+}  /* namespace */
+
+/* A scrape that races observations still renders histograms a scraper accepts: buckets that never
+ * decrease and a +Inf bucket equal to `_count`. An observation counted in one bucket and not yet
+ * in a higher one, or in a bucket and not yet in the count, makes the quantile interpolation
+ * divide a negative difference. Four threads observe during five hundred scrapes. */
+TEST(a_histogram_scraped_during_observations_stays_cumulative) {
+    Metrics m("m", 1024);
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> obs;
+    for (int t = 0; t < 4; ++t)
+        obs.emplace_back([&m, &stop, t] {
+            const double v = 0.0001 * (t + 1);   /* below every bucket's bound */
+            while (!stop.load(std::memory_order_relaxed))
+                m.observe_request(1, 2, v, v, v, v, 1, 8, SuccessReason::Stop);
+        });
+    int bad = 0;
+    for (int i = 0; i < 500 && bad == 0; ++i) bad += histogram_violations(m.render());
+    stop.store(true);
+    for (auto& t : obs) t.join();
+    CHECK_EQ(bad, 0);
+    CHECK_EQ(histogram_violations(m.render()), 0);
+}
 
 /* ================================================================== the response bodies
  *
- * WHAT THESE HAVE TO GET RIGHT is not the content, which the routes already cover end to end, but
- * the SHAPE: a client library deserialises into generated types, and a field of the wrong type --
- * a null where a string was declared, a missing usage block, a number where an array belongs --
- * is a hard parse failure rather than a degraded answer. They are also the only place `usage` is
- * assembled, and usage is what a caller bills against.
+ * The routes cover content end to end; these cases check shape. Client libraries deserialise into
+ * generated types, so a field of the wrong type (a null where a string was declared, a missing
+ * usage block, a number for an array) is a hard parse failure. These builders are also the only
+ * place `usage` is assembled, which callers bill against.
  */
 
 namespace {
@@ -395,22 +441,21 @@ OaiRequest a_request(const char* id, const char* model) {
     return r;
 }
 
-/* nlohmann is already a dependency of this translation unit, so the assertions read the body as
- * a client would rather than searching it for substrings. */
+/* Assertions parse the body as a client would rather than searching it for substrings. */
 json parsed(const std::string& body) {
     CHECK(json_complete(body));
     return json::parse(body, nullptr, false);
 }
 
-}  /* namespace */
-
-static ModelCard card(const char* id, int64_t created, int64_t max_model_len = 0) {
+ModelCard card(const char* id, int64_t created, int64_t max_model_len = 0) {
     ModelCard c;
     c.id = id;
     c.created = created;
     c.max_model_len = max_model_len;
     return c;
 }
+
+}  /* namespace */
 
 TEST(the_model_list_is_a_list_of_one_with_the_fields_clients_read) {
     const json o = parsed(models_body(card("q38-flashnext", 1700000000)));
@@ -422,8 +467,7 @@ TEST(the_model_list_is_a_list_of_one_with_the_fields_clients_read) {
     CHECK_EQ(o["data"][0].value("created", (int64_t)0), (int64_t)1700000000);
     /* `owned_by` is in the schema and generated clients deserialise it. */
     CHECK(o["data"][0].contains("owned_by"));
-    /* No length known, none reported: a client falls back to its own default rather than
-     * trusting a made-up one. */
+    /* No length known, none reported: a client falls back to its own default. */
     CHECK(!o["data"][0].contains("max_model_len"));
     CHECK(!o["data"][0].contains("root"));
     CHECK(!o["data"][0].contains("capabilities"));
@@ -481,23 +525,22 @@ TEST(a_chat_body_carries_usage_and_one_choice_per_completion) {
     CHECK_EQ(o["choices"][1].value("finish_reason", std::string()), std::string("length"));
     CHECK_EQ(o["choices"][1].value("index", -1), 1);
 
-    /* TOTAL IS THE SUM AND NOT A THIRD COUNTER. A caller reconciling a bill against the two
-     * halves has to get the same answer both ways. */
+    /* total is the sum, not a third counter, so a bill reconciles against the two halves. */
     CHECK_EQ(o["usage"].value("prompt_tokens", (int64_t)0), (int64_t)10);
     CHECK_EQ(o["usage"].value("completion_tokens", (int64_t)0), (int64_t)4);
     CHECK_EQ(o["usage"].value("total_tokens", (int64_t)0), (int64_t)14);
-    /* The cached count sits where vLLM puts it and not at the top level. */
+    /* The cached count sits where vLLM puts it, not at the top level. */
     CHECK_EQ(o["usage"]["prompt_tokens_details"].value("cached_tokens", (int64_t)0), (int64_t)6);
 
-    /* logprobs is PRESENT AND NULL rather than absent, because a generated client deserialising
-     * into an optional field distinguishes "not asked for" from "the key does not exist". */
+    /* logprobs is present and null rather than absent: a generated client distinguishes "not
+     * asked for" from "the key does not exist". */
     CHECK(o["choices"][0].contains("logprobs"));
     CHECK(o["choices"][0]["logprobs"].is_null());
 }
 
-/* A TOOL CALL MAKES CONTENT NULL RATHER THAN EMPTY. The schema says a message with tool_calls has
- * no content, and a client branching on `content == null` -- which several do -- reads an empty
- * string as an ordinary text reply and never looks at the calls. */
+/* A tool call makes content null, not empty. The schema says a message with tool_calls has no
+ * content, and clients that branch on `content == null` read an empty string as an ordinary text
+ * reply and ignore the calls. */
 TEST(a_chat_body_with_a_tool_call_sends_a_null_content) {
     ChoiceOut c;
     c.msg.tool_calls.push_back(ToolCall{ "call_1", "get_weather", "{\"city\":\"Berlin\"}" });
@@ -516,8 +559,7 @@ TEST(a_chat_body_with_a_tool_call_sends_a_null_content) {
     const json p = parsed(chat_completion_body(a_request("chatcmpl-3", "m"), { both }, UsageOut{}));
     CHECK_EQ(p["choices"][0]["message"].value("content", std::string()), std::string("checking"));
 
-    /* Reasoning is carried under the key vLLM publishes, and only when there is some: an empty
-     * reasoning_content on every reply is noise in a transcript. */
+    /* Reasoning goes under vLLM's key, and only when non-empty. */
     CHECK(!p["choices"][0]["message"].contains("reasoning_content"));
     ChoiceOut think;
     think.msg.reasoning = "the user wants weather";
@@ -537,16 +579,16 @@ TEST(a_text_completion_body_is_the_other_shape_entirely) {
 
     const json o = parsed(text_completion_body(a_request("cmpl-1", "m"), { c }, u));
     CHECK_EQ(o.value("object", std::string()), std::string("text_completion"));
-    /* A completion choice carries `text` and no `message`; mixing the two is what makes one
-     * endpoint's response undeserialisable by the other endpoint's client. */
+    /* A completion choice carries `text` and no `message`; mixing them makes one endpoint's
+     * response undeserialisable by the other's client. */
     CHECK_EQ(o["choices"][0].value("text", std::string()), std::string("once upon a time"));
     CHECK(!o["choices"][0].contains("message"));
     CHECK_EQ(o["usage"].value("total_tokens", (int64_t)0), (int64_t)7);
 }
 
-/* THE LOGPROB SHAPES DIFFER BETWEEN THE TWO ENDPOINTS and both are fixed by the schema: chat
- * nests an array of per-token objects under `content`, completions carries four parallel arrays.
- * text_offset is where each token's text starts in `text`: where the token before it ended. */
+/* The logprob shapes differ by endpoint, both fixed by the schema: chat nests an array of
+ * per-token objects under `content`, completions carries four parallel arrays. text_offset is
+ * where each token's text starts in `text`, i.e. where the previous token ended. */
 TEST(logprobs_take_each_endpoints_own_shape) {
     ChoiceOut c;
     c.text = "abcd";
@@ -580,9 +622,8 @@ TEST(logprobs_take_each_endpoints_own_shape) {
     CHECK_EQ(tl["text_offset"][1].get<int64_t>(), (int64_t)2);
 }
 
-/* AN SSE EVENT WITH NO CHOICES AND ONLY USAGE, which is what stream_options.include_usage asks
- * for. Accepting the field and not emitting it leaves a client waiting for a chunk that never
- * arrives, so the empty choices array has to be present rather than omitted. */
+/* stream_options.include_usage asks for a final SSE event with only usage. The empty choices
+ * array must be present, not omitted, or a client waits for a chunk that never arrives. */
 TEST(the_completion_usage_chunk_is_an_event_with_an_empty_choices_array) {
     UsageOut u;
     u.prompt = 5;
@@ -600,9 +641,9 @@ TEST(the_completion_usage_chunk_is_an_event_with_an_empty_choices_array) {
     CHECK_EQ(o.value("id", std::string()), std::string("cmpl-9"));
 }
 
-/* THE BASE64 ENCODING IS PER-REQUEST AND IT IS THE RAW FLOAT BUFFER, which is what every client
- * that asks for it unpacks. Sending the JSON array under that flag, or the base64 of a formatted
- * array, both deserialise to nonsense rather than failing. */
+/* Base64 encoding is per request and is the raw float buffer, which every client that asks for it
+ * unpacks. Sending the JSON array under that flag, or base64 of a formatted array, would
+ * deserialise to nonsense instead of failing. */
 TEST(an_embeddings_body_honours_the_encoding_the_request_asked_for) {
     const std::vector<std::vector<float>> vecs = { { 1.0f, 2.0f }, { -0.5f, 0.25f } };
     UsageOut u;
@@ -633,8 +674,7 @@ TEST(an_embeddings_body_honours_the_encoding_the_request_asked_for) {
     CHECK_NEAR(back[0], 1.0f, 1e-6);
     CHECK_NEAR(back[1], 2.0f, 1e-6);
 
-    /* No inputs is an empty list rather than a null or an error: a caller that sent no strings
-     * gets no vectors, and the envelope is still the one its client deserialises. */
+    /* No inputs gives an empty list, not null or an error, in the envelope the client expects. */
     const json z = parsed(embeddings_body(plain, {}, UsageOut{}));
     CHECK(z["data"].is_array());
     CHECK_EQ(z["data"].size(), 0u);

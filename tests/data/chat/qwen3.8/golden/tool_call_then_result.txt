@@ -1,0 +1,58 @@
+<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.
+
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"type": "function", "function": {"name": "read", "description": "Read a file.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path"}, "limit": {"type": "integer"}}, "required": ["path"]}}}
+{"type": "function", "function": {"name": "edit", "description": "Apply edits — exact text, «quoted» & <tagged>, 日本語.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "edits": {"type": "array", "items": {"type": "object", "properties": {"oldText": {"type": "string"}, "newText": {"type": "string"}}, "required": ["oldText", "newText"]}}, "dry_run": {"type": "boolean"}, "mode": {"type": "string", "enum": ["fast", "safe"]}}, "required": ["path", "edits"]}}}
+{"type": "function", "function": {"name": "ping", "description": "Takes no arguments.", "parameters": {"type": "object", "properties": {}}}}
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT><|im_end|>
+<|im_start|>user
+Fix /work/a.py.<|im_end|>
+<|im_start|>assistant
+<think>
+Read it first.
+</think>
+
+<tool_call>
+<function=read>
+<parameter=path>
+/work/a.py
+</parameter>
+<parameter=limit>
+40
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+print(1)
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>

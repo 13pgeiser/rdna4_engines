@@ -19,9 +19,9 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  *
  * ggml/src/ggml-common.h at 06938ac12, the GGML_COMMON_IMPL_C tables, verbatim. These are the
- * tables llama.cpp's DEquantisers read: an I-quant's grid index means the entry here, which is
- * what the `ggml` quantiser copies into an encoding's grid and table planes. The searches build
- * their own lattices from the kgrid tables in lq_ggml_port.cpp, in the same index order.
+ * tables llama.cpp's dequantisers read; the `ggml` quantiser copies them into an encoding's grid
+ * and table planes. The searches build their own lattices from the kgrid tables in
+ * lq_ggml_port.cpp, in the same index order.
  */
 #include "lq_ggml_port.h"
 

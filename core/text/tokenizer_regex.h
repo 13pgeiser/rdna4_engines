@@ -2,27 +2,26 @@
  *
  * A tokenizer.json `Split` carries a regex in Oniguruma's Ruby syntax, and HuggingFace tokenizers
  * runs it through Oniguruma's backtracking matcher. This compiles the same pattern into a DFA over
- * codepoint classes and reproduces what that matcher reports, match for match:
+ * codepoint classes that reports the same matches:
  *
  *   - Unicode properties are Oniguruma's own (tokenizer_ucd.h), so `\p{L}`, `\s`, `\w` and the
- *     `(?i)` orbits mean exactly what they mean there.
- *   - Alternation is leftmost-FIRST, not leftmost-longest: the DFA carries its NFA threads in
- *     priority order and a match cuts every thread below it, which is the backtracking order
- *     without the backtracking (the construction RE2 and regex-automata use). Greedy and lazy
- *     quantifiers are the same priority order read the other way.
- *   - Lookaround of ONE codepoint (`\s+(?!\S)`, `(?=[\p{L}])`, `(?<=x)`), `^`, `$`, `\A`, `\z`,
- *     `\b` and `\B` are assertions on the neighbouring codepoints. The DFA carries what it needs
- *     of the previous codepoint in its state and decides a lookahead on the transition that reads
- *     the next one, so a match is reported one transition late, when that codepoint is known.
- *   - find_iter reproduces Oniguruma's iteration exactly, empty matches included: a match is
- *     reported at the leftmost position where one exists, and an empty match at the end of the
- *     previous match is skipped by one codepoint, as the `onig` crate does.
+ *     `(?i)` orbits mean what they mean there.
+ *   - Alternation is leftmost-first, not leftmost-longest: the DFA carries its NFA threads in
+ *     priority order and a match cuts every lower thread, giving backtracking order without
+ *     backtracking (the RE2 / regex-automata construction). Lazy quantifiers reverse the priority.
+ *   - One-codepoint lookaround (`\s+(?!\S)`, `(?=[\p{L}])`, `(?<=x)`), `^`, `$`, `\A`, `\z`, `\b`
+ *     and `\B` are assertions on the neighbouring codepoints. The state carries what it needs of
+ *     the previous codepoint, and a lookahead is decided on the transition that reads the next
+ *     one, so a match is reported one transition late.
+ *   - find_iter follows Oniguruma's iteration, empty matches included: each match is the leftmost
+ *     one, and an empty match at the end of the previous match is skipped by one codepoint, as
+ *     the `onig` crate does.
  *
- * Anything else is REFUSED at compile time with the construct named: backreferences, atomic
+ * Anything else is refused at compile time with the construct named: backreferences, atomic
  * groups and possessive quantifiers, lookaround wider than one codepoint, unbounded repetition of
- * something that can match empty, `(?i)` over a character that folds to several (U+00DF against
- * "ss"), and properties the tables do not carry. There is no second matcher to fall back to; a
- * pattern either compiles to this or the vocabulary does not load.
+ * something that can match empty, `(?i)` over a character that folds to several (U+00DF vs "ss"),
+ * and properties the tables do not carry. There is no fallback matcher; a pattern that does not
+ * compile fails the vocabulary load.
  */
 #pragma once
 #include <cstddef>
@@ -69,8 +68,7 @@ enum TokSplitBehavior {
 };
 
 /* NormalizedString::split: the non-empty pieces of `text` that `behavior` keeps, appended to
- * `out` as spans of `text`. `scratch` is reused between calls to keep the hot path free of
- * allocation. */
+ * `out` as spans of `text`. `scratch` is reused between calls to avoid allocation. */
 void tok_split(const TokRegex& re, std::string_view text, int behavior, bool invert,
                std::vector<TokSpan>& out, std::vector<TokSpan>& scratch);
 
@@ -83,9 +81,9 @@ void tok_replace(const TokRegex& re, std::string_view text, std::string_view con
 bool utf8_is_canonical(std::string_view s);
 
 /* Append that round trip of `s` to `out`: each byte that does not start a decodable sequence
- * becomes U+FFFD, an overlong form becomes its shortest one. These are the rules of
- * unicode_cpts_from_utf8, the decoder the normalisers and the other pre-tokenisers use, so a
- * Split sees the same text they do. */
+ * becomes U+FFFD, and an overlong form becomes its shortest one. These are the rules of
+ * unicode_cpts_from_utf8, the decoder the normalisers and other pre-tokenisers use, so a Split
+ * sees the same text they do. */
 void utf8_canonicalize(std::string_view s, std::string& out);
 
 }  /* namespace rad */

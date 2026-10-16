@@ -1,8 +1,8 @@
-# One static library. The engine is monolithic on purpose (spec §head): the plugin boundary is
-# where substitution happens, and inside it there is nothing to gain from .so seams.
+# One static library. The engine is monolithic on purpose (spec §head): substitution happens at the
+# plugin boundary, so .so seams inside it buy nothing.
 #
-# Sources are globbed per subdirectory with CONFIGURE_DEPENDS so that adding a file to a component
-# does not mean editing a file another component owns. Re-run cmake if a new file does not appear.
+# Sources are globbed per subdirectory with CONFIGURE_DEPENDS. Re-run cmake if a new file does not
+# appear.
 set(RAD_CORE_DIRS util device plugin build runtime mem sched place sample text server format mm diag gen)
 
 set(RAD_CORE_SRC "")
@@ -12,10 +12,9 @@ foreach(d ${RAD_CORE_DIRS})
        ${CMAKE_CURRENT_SOURCE_DIR}/${d}/*.c)
   list(APPEND RAD_CORE_SRC ${_s})
 endforeach()
-# The top level, MINUS main.cpp. main() belongs to the `radiance` executable and not to the
-# library: with the archive linked whole -- which every host of an architecture plugin must do, see
-# tools/CMakeLists.txt -- a main() inside it collides with each tool's own. A plain archive link
-# hides this, because the tools reference nothing in main.cpp.o and the linker skips it.
+# The top level minus main.cpp, which belongs to the `radiance` executable. Every architecture plugin
+# host links the archive whole (tools/CMakeLists.txt), so a main() inside it would collide with each
+# tool's own.
 file(GLOB _top CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
 list(REMOVE_ITEM _top ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
 list(APPEND RAD_CORE_SRC ${_top})
@@ -40,43 +39,36 @@ endif()
 if(RAD_HIP_FOUND)
   target_compile_definitions(rad_core PUBLIC RAD_HAVE_HIP=1)
   target_link_libraries(rad_core PUBLIC ${RAD_HIP_RUNTIME} ${RAD_HSA_RUNTIME})
-  # AN EXECUTABLE RUNS THE ROCm IT WAS BUILT AGAINST. The runtime is linked by its full path, but the
-  # HIP driver reports that directory among its implicit link directories, so CMake writes no RPATH
-  # for it: the engine, the tools and the tests loaded whichever libamdhip64.so.7 the system's loader
-  # cache names, and a tree built against a second ROCm beside /opt/rocm ran /opt/rocm's runtime
-  # under its own kernels. A linker flag and not CMake's RPATH, because install rewrites CMake's, and
-  # rewriting it beside the entry ROCm 10's clang gives a shared library left an empty element -- the
-  # current directory -- in the installed plugin.
+  # Run the ROCm the tree was built against. The HIP driver reports the runtime's directory as an
+  # implicit link directory, so CMake writes no RPATH for it and the loader cache would pick the
+  # system's libamdhip64.so.7. A linker flag instead of CMake's RPATH, because install rewrites the
+  # latter and, next to ROCm 10 clang's entry, leaves an empty element (the current directory).
   get_filename_component(RAD_HIP_LIBDIR "${RAD_HIP_RUNTIME}" DIRECTORY)
   target_link_options(rad_core INTERFACE "LINKER:-rpath,${RAD_HIP_LIBDIR}")
-  # THE AQL BACKEND'S OWN KERNELS: the copies and fills it dispatches for rad_memcpy_async and
-  # rad_memset_async.
+  # AQL backend kernels: the copies and fills behind rad_memcpy_async and rad_memset_async.
   target_sources(rad_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/device/aql_blit.hip)
   set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/device/aql_blit.hip PROPERTIES LANGUAGE HIP)
-  # THE STEP'S OWN BOOKKEEPING ON THE CARD: acceptance and the next pass's positions (sched/advance.h).
+  # Step bookkeeping on the card: acceptance and the next pass's positions (sched/advance.h).
   target_sources(rad_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/sched/advance.hip)
   set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/sched/advance.hip PROPERTIES LANGUAGE HIP)
-  # WEIGHT-TABLE ENTRIES WRITTEN IN STREAM ORDER, their values carried in the arguments (runtime/wtab.h).
+  # Weight-table entries written in stream order, values passed as arguments (runtime/wtab.h).
   target_sources(rad_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/runtime/wtab.hip)
   set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/runtime/wtab.hip PROPERTIES LANGUAGE HIP)
-  # THE NEXT-LAYER EXPERT PREFETCH's prediction, plan and table patches (runtime/xprefetch.h).
+  # Next-layer expert prefetch: prediction, plan and table patches (runtime/xprefetch.h).
   target_sources(rad_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/runtime/xprefetch.hip)
   set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/runtime/xprefetch.hip PROPERTIES LANGUAGE HIP)
-  # THE CORE'S OWN KERNELS ARE BUILT FOR EVERY AMD GPU FAMILY, not only for the cards this build
-  # targets. They are what every copy and fill on a card runs, so an engine without a code object
-  # for a card cannot start on it -- whatever kernel plugin is installed for that card, and a plugin
-  # for a card the build machine does not have is exactly what a third party ships. The generic
-  # targets cost three small files a family; the loader prefers the exact chip where both exist
-  # (core/device/aql_code.cpp), so a targeted card still runs code built for it.
+  # Core kernels are built for every AMD GPU family, not only RAD_GPU_TARGETS: every copy and fill
+  # runs them, so without a code object the engine cannot start on a card even when a third-party
+  # kernel plugin supports it. The loader prefers the exact chip when both exist
+  # (core/device/aql_code.cpp).
   set(RAD_CORE_GPU_TARGETS ${RAD_GPU_TARGETS}
       gfx9-generic gfx9-4-generic gfx10-1-generic gfx10-3-generic gfx11-generic gfx12-generic)
   list(REMOVE_DUPLICATES RAD_CORE_GPU_TARGETS)
   set_target_properties(rad_core PROPERTIES HIP_ARCHITECTURES "${RAD_CORE_GPU_TARGETS}")
   rad_hip_repeatable(rad_core)
-  # EVERY EXECUTABLE THAT LINKS THE CORE EXPORTS THE HIP ENTRY POINTS THE BACKEND DEFINES. A kernel
-  # plugin is dlopen'ed and its hipLaunchKernel binds to the first definition in the global scope,
-  # which is the executable's only if the executable exports it. Without this a plugin would launch
-  # through HIP onto a queue HIP does not own; aql.cpp checks at startup and refuses to run.
+  # Executables linking the core export the HIP entry points the backend defines, so a dlopen'ed
+  # kernel plugin binds to them instead of real HIP (which does not own the queues). aql.cpp checks
+  # this at startup and refuses to run without it.
   foreach(sym hipLaunchKernel hipMemcpy2DAsync hipMemcpyAsync hipMemsetAsync hipMemset hipStreamSynchronize
               hipEventRecord hipStreamWaitEvent hipGetLastError hipPeekAtLastError
               __hipRegisterFatBinary __hipRegisterFunction __hipUnregisterFatBinary)
@@ -89,28 +81,18 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
   add_executable(radiance main.cpp)
   target_link_libraries(radiance PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,rad_core>")
   # ENABLE_EXPORTS: the architecture plugin binds the declare-phase C ABI back to this binary at
-  # dlopen. See the same note in tools/CMakeLists.txt.
+  # dlopen (tools/CMakeLists.txt).
   set_target_properties(radiance PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     ENABLE_EXPORTS ON)
-  # Installed beside the tools, so a prefix that holds rad-convert and rad-kbench also holds the
-  # binary they exist to feed. RUNTIME and not a bare DESTINATION so that ENABLE_EXPORTS -- which
-  # is what lets an architecture plugin bind the declare-phase C ABI back to this binary at
-  # dlopen, see the note above -- is carried by the same rule that carries the executable.
+  # Installed beside the tools. RUNTIME rather than a bare DESTINATION, so the rule that carries
+  # the executable also carries ENABLE_EXPORTS.
   install(TARGETS radiance RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
-# The plugin layer's test plugins. They are .so files rather than part of rad_core, so they need a
-# CMakeLists of their own -- and it needs to be reached. (Owned by core/plugin/.)
+# The plugin layer's test plugins (.so files, so they need their own CMakeLists).
 #
-# RAD_PLUGIN_INSTALL=OFF for that whole subtree, and this is the one place in the build that turns
-# it off. rad_add_plugin installs what it builds, because a plugin that is built and not installed
-# leaves $RADIANCE_HOME working only when it points at a build directory. But the .so files under
-# core/plugin/testplugin exist only for tests -- to be refused, to conflict with each other, to
-# report a stale ABI, or to stand in for a card in one test -- and none is a kernel a real run may
-# select. Shipping those into a real prefix is the same mistake testplugin/CMakeLists.txt already
-# refuses to make in the build tree -- "a test plugin that a real run could select is a fallback
-# nobody knows about" -- so the opt-out is set here, where the subtree is reached, rather than in a
-# file that component owns.
+# RAD_PLUGIN_INSTALL=OFF for this subtree only. rad_add_plugin normally installs what it builds,
+# but these plugins exist only for tests and must never be selectable from a real prefix.
 set(RAD_PLUGIN_INSTALL OFF)
 add_subdirectory(plugin)

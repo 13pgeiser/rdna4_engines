@@ -1,86 +1,67 @@
-/* r4d_shapes.cpp -- how big is operand i of this op at this geometry, and what may be in it.
+/* r4d_shapes.cpp -- the extent and content domain of each operand of an op at a geometry.
  *
- * THE COMPONENT THAT KNOWS AN OPERAND'S EXTENT IS THE ONE THAT READS IT, which is what the
- * `RadShapeFn` hook is for. A tool's other source is the hand-written table in `tools/`, and that
- * table cannot reach the ops that exist only here -- every fp8 fusion, both all-reduce folds, both
- * DFlash2 ops, `attn_dense` and all twelve sampler stages -- so without this hook those are
- * SKIPPED AND COUNTED for want of a recipe. This file is libr4d's side of the hook.
+ * This is libr4d's side of the `RadShapeFn` hook: the component that reads an operand is the one
+ * that knows its extent. The hand-written table in `tools/` cannot reach ops that exist only here
+ * (every fp8 fusion, both all-reduce folds, both DFlash2 ops, `attn_dense`, the sampler stages), so
+ * without this hook a tool skips them.
  *
- * THE AUTHORITY FOR EVERY EXTENT BELOW IS THE SHIM, not the prose and not the row table. Each
- * `rad_*` entry point in the libr4d shims unpacks `RadArgs.t[i]` and hands libr4d the
- * extents and pitches; where a shim reads `x->shape[1]` and passes it as `K`, that is what the
- * operand is. A comment naming the shim is on every group, so a reader can check one against
- * the other -- and when a shim's contract changes, that is the file whose neighbour has to move.
+ * The authority for every extent is the shim, not the prose or the row table. Each `rad_*` entry
+ * point unpacks `RadArgs.t[i]` into extents and pitches; if a shim passes `x->shape[1]` as `K`,
+ * that is what the operand is. Each group names its shim, and a change to a shim's contract must
+ * be mirrored here.
  *
- * WHAT IS IN AN OPERAND MATTERS AS MUCH AS HOW BIG IT IS. A token id gathers a row of a codebook,
- * a KV slot indexes n_blocks * block_size positions, a block-table entry indexes n_blocks, and a
- * uniform is in [0, 1); draw any of them from the wrong range and the case tests the kernel's
- * out-of-range handling while the report calls it correctness. `RAD_FILL_INDEX` with an explicit
- * `idx_max` is how each of those is said here, and `RAD_OPD_F_IDX_UNIQUE` marks the one scatter
- * (kv_store's slot mapping) whose duplicates would make the store a race and the comparison a
- * measurement of the scheduler.
+ * Content matters as much as size. A token id gathers a row of a codebook, a KV slot indexes
+ * n_blocks * block_size positions, a block-table entry indexes n_blocks, a uniform is in [0, 1).
+ * Drawn from the wrong range, such an operand tests the kernel's out-of-range handling instead of
+ * its arithmetic. `RAD_FILL_INDEX` with an explicit `idx_max` states each range, and
+ * `RAD_OPD_F_IDX_UNIQUE` marks scatters whose duplicate indices would make the store a race.
  *
- * WHAT THIS FILE DOES NOT DESCRIBE, AND WHY. A decline is a real answer: the caller skips the case
- * and counts it, which is correct, where an invented extent produces a PASS that means nothing.
- * The rows below carry a null `opd_shape` deliberately.
+ * ============================================================ rows with no description
+ *
+ * A decline is a real answer: the caller skips and counts the case, where an invented extent
+ * yields a meaningless pass. These rows carry a null `opd_shape`:
  *
  *   gdn_conv_prep, gdn_conv_update, gdn_kkt_solve, gdn_chunk_scan, gdn_recurrent_update
- *       THE HEAD COUNTS ARE NOT IN THE GEOMETRY. `head_k` and `head_v` are head WIDTHS (128 each);
- *       the number of key heads and value heads is read off the operands by the kernels and named
- *       by no parameter of any of these ops, so `conv_dim = 2*Hk*hk + Hv*hv` -- the leading extent
- *       of nearly every operand -- is not derivable from `p`. tools/opshapes.h reaches them only
- *       because rad-kbench hands it the container's metadata through `ShapeCtx`, which this hook's
- *       signature does not carry. A GDN case run at an invented head ratio is a check of a model
- *       nobody is running. (`gdn_gated_rmsnorm` and `gdn_gated_norm_had_quant_i8` ARE described:
- *       their rows are (token, head) pairs and their widths are parameters.)
+ *       The head counts are not in the geometry. `head_k` and `head_v` are head widths (128); the
+ *       kernels read the number of key and value heads off the operands, so
+ *       `conv_dim = 2*Hk*hk + Hv*hv`, the leading extent of nearly every operand, is not derivable
+ *       from `p`. tools/opshapes.h reaches them only through the container metadata rad-kbench
+ *       passes in `ShapeCtx`, which this hook does not receive. (`gdn_gated_rmsnorm` and
+ *       `gdn_gated_norm_had_quant_i8` are described: their rows are (token, head) pairs and their
+ *       widths are parameters.)
  *
  *   attn_dense
- *       No head count either. Its parameters are M, head_dim, gqa, causal and dtype; the vision
- *       kernel reads the head count off `q->shape[1]` and gqa is constrained to 1, so nothing in
- *       the geometry says how many heads a token carries. Picking one would be picking a model.
- *       ref describes it -- it chooses `gqa` query heads against one KV head, which at this row's
- *       gqa == 1 is a single head -- and ref's is the description a correctness check uses anyway,
- *       so the gap this leaves is a benchmark of the vision kernel at a head count nobody runs.
+ *       No head count either: the parameters are M, head_dim, gqa, causal and dtype, the vision
+ *       kernel reads the head count off `q->shape[1]`, and gqa is constrained to 1. ref describes
+ *       it with a single head (`gqa` query heads against one KV head), and correctness checks use
+ *       ref's description anyway.
  *
  *   sample_merge_topk
- *       The extents are known and a description would still be a lie. `gathered` is
- *       world_size * n_cand (u32 global id, f32 logit) pairs packed into one WORD-TYPED buffer, so
- *       the value lane is read by BIT PATTERN and no fill domain puts a sensible float there: an
- *       integer draw makes every logit a denormal, and a device that flushes denormals against a
- *       host that does not orders the candidates differently -- which is the failure r4d_selftest's
- *       two-rank all-gather row exists to catch. `world_size` is not in the parameter list either.
- *       ref declines it for the same two reasons, and the two files agreeing on a decline is the
- *       point: a description here would supply the bytes ref refused to. The full argument is at
- *       the gap this leaves in the sampler section below.
+ *       `gathered` packs (u32 global id, f32 logit) pairs into one word-typed buffer, so no fill
+ *       domain puts a sensible float in the value lane, and `world_size` is not a parameter. ref
+ *       declines it too. Details at the sampler section below.
  *
  *   gemm_nt_q at every grid but fp8
  *       The weight is a plugin-private fragment stream (R4D_DT_W4_FRAG and friends) whose byte
- *       count comes from `RadLayout::bytes`, and RadOpdDesc has only a dtype and a shape -- so a
- *       description here would be a SECOND source for a number r4d_layout.cpp already owns, and
- *       the two would drift silently the first time a packing changed. The scale planes are worse:
- *       R4D_DT_W4_SZ is a (f16 scale, f16 -(1024+zero)) dword whose meaning no public dtype
- *       carries. The fp8 family is different and IS described -- its weight is the checkpoint's
- *       own E4M3 [N][K] bytes against a bf16 [ceil(N/128)][ceil(K/128)] plane, and the fragment
- *       reordering is a permutation of the same count (r4d_fp8_frag.h: `frag_bytes(N,K) == N*K`).
+ *       count comes from `RadLayout::bytes`; RadOpdDesc has only a dtype and a shape, so a
+ *       description would be a second source for a number r4d_layout.cpp owns. R4D_DT_W4_SZ, a
+ *       (f16 scale, f16 -(1024+zero)) dword, has no public dtype either. The fp8 family is
+ *       described: its weight is the checkpoint's E4M3 [N][K] against a bf16
+ *       [ceil(N/128)][ceil(K/128)] plane, and fragment order is a permutation of the same count
+ *       (r4d_fp8_frag.h: `frag_bytes(N,K) == N*K`).
  *
  *   logits_gemm at fp8
- *       THE DECLARED SHAPE AND THE STORED PLANE DIFFER, and only the container knows. The weight
- *       arrives declared [n_vocab][n_embd] E4M3 while the kernel strides it by
- *       r4d_fp8::lm_row_bytes(n_embd) --
- *       the row's own bf16 scales ride in its tail (r4d_fp8_layout.cpp says why: lm_head is ROW
- *       sharded and a shard has to stay a plain byte range). A tool that allocated the declared
- *       shape would hand the kernel a buffer it reads 1.6% past the end of, on every row. The
- *       bf16 row of the same op is described; this one cannot be, until RadOpdDesc can say
- *       "declared this, stored that".
+ *       The declared shape and the stored plane differ. The weight is declared [n_vocab][n_embd]
+ *       E4M3 but the kernel strides it by r4d_fp8::lm_row_bytes(n_embd), since each row carries
+ *       its bf16 scales in its tail (r4d_fp8_layout.cpp). A buffer of the declared shape would be
+ *       read 1.6% past its end. Describable once RadOpdDesc can say "declared this, stored that".
  *
- * NO TUNED AXIS IS READ HERE, and none needs to be. Every axis this plugin declares -- tile
- * shapes, split counts, wave counts, all-reduce launch geometry -- says how a kernel WALKS its
- * operands, not what it is HANDED. An axis that did change an extent would be read from `p`
- * like any other parameter, because the core appends the chosen point to the same list.
+ * No tuned axis is read here: this plugin's axes (tile shapes, split counts, wave counts,
+ * all-reduce launch geometry) change how a kernel walks its operands, not their extents. An axis
+ * that did would be read from `p`, where the core appends the chosen point.
  *
- * Pure host code: no r4d.h, no HIP. It is in the CMake `SOURCES` list beside r4d_rows.cpp and
- * r4d_layout.cpp for the reason that split exists -- the tables a transcription error hides in
- * should compile and be readable on a box with no ROCm.
+ * Pure host code (no r4d.h, no HIP), like r4d_rows.cpp and r4d_layout.cpp, so the tables compile
+ * and can be read without ROCm.
  */
 
 #include <cstdlib>
@@ -93,34 +74,28 @@ namespace {
 
 /* ==================================================================== building a description
  *
- * Each op below builds its whole operand list, in schema order, and then hands out the one the
- * caller asked for. Building the list rather than switching on the index is what makes the COUNT
- * checkable by eye against the schema in r4d_rows.cpp -- the tool cross-checks it against
- * `RadOpSchema::n_operands` as well, and a hook that has drifted from its schema is caught there,
- * but a list a reader can count is the half that stops the drift happening.
+ * Each op builds its whole operand list in schema order and hands out the one asked for, so the
+ * count can be checked by eye against the schema in r4d_rows.cpp (the tool also checks it against
+ * `RadOpSchema::n_operands`).
  */
 
-/* A plain operand of up to four extents. A trailing 0 means "this rank is not present": zero is
- * never a legal extent -- `pick` refuses one below -- so it cannot be confused with a real one,
- * and it lets a two-dimensional and a four-dimensional operand be written the same way. */
+/* A plain operand of up to four extents. A trailing 0 ends the shape; zero is never a legal
+ * extent (`pick` refuses one), so it cannot be mistaken for a real one. */
 RadOpdDesc opd(uint32_t dt, int64_t d0, int64_t d1 = 0, int64_t d2 = 0, int64_t d3 = 0) {
     RadOpdDesc d{};
     d.dtype     = dt;
     d.fill      = RAD_FILL_NORMAL;
-    /* Explicit, though the caller pre-initialises it: -1 is "draw", and a description that meant
-     * "every element is zero" and got it by leaving a field alone is one edit away from being a
-     * description that means nothing. */
+    /* -1 is "draw"; set explicitly though the caller pre-initialises it. */
     d.idx_const = -1;
     const int64_t e[4] = { d0, d1, d2, d3 };
     for (int i = 0; i < 4 && e[i] != 0; ++i) d.shape[d.rank++] = e[i];
     return d;
 }
 
-/* An INDEX operand. `idx_max` is the EXCLUSIVE upper bound of the draw and 0 means "the leading
- * extent of the previous operand", which is the ABI's default and is right for a gather whose
- * source is the operand before it. `konst >= 0` makes every element that value instead of a draw.
- * i32 throughout: every index libr4d reads is a signed 32-bit one, and the two u32 spellings the
- * sampler accepts (`dt_i32` takes either) are the same bytes. */
+/* An index operand. `idx_max` is the exclusive upper bound of the draw; 0 means the previous
+ * operand's leading extent (the ABI default, right for a gather from the operand before it).
+ * `konst >= 0` fills every element with that value. Always i32: every index libr4d reads is signed
+ * 32-bit, and the sampler's u32 spellings (`dt_i32` accepts either) are the same bytes. */
 RadOpdDesc opd_idx(int64_t d0, int64_t d1, int64_t idx_max, int64_t konst = -1,
                    uint32_t flags = 0) {
     RadOpdDesc d = opd((uint32_t)RAD_I32, d0, d1);
@@ -131,9 +106,8 @@ RadOpdDesc opd_idx(int64_t d0, int64_t d1, int64_t idx_max, int64_t konst = -1,
     return d;
 }
 
-/* An OPTIONAL operand this description deliberately does not pass. One entry per schema operand
- * is still emitted -- that count is what catches a hook that has drifted -- so absence needs a
- * spelling, and a null RadTensor is what the ABI already means by it. */
+/* An optional operand this description does not pass. One entry per schema operand is still
+ * emitted, so absence needs a spelling; to the ABI it means a null RadTensor. */
 RadOpdDesc opd_none() {
     RadOpdDesc d{};
     d.idx_const = -1;
@@ -141,19 +115,14 @@ RadOpdDesc opd_none() {
     return d;
 }
 
-/* A domain the fill has to land in. `RAD_FILL_SIGMOID` is the ABI's only (0, 1) draw. */
+/* Restricts the fill to (0, 1); `RAD_FILL_SIGMOID` is the ABI's only such draw. */
 RadOpdDesc in_unit(RadOpdDesc d) { d.fill = RAD_FILL_SIGMOID; return d; }
 
-/* Hand out operand `operand` of a list, having checked the WHOLE list first.
- *
- * The whole list, because a geometry missing one parameter would otherwise describe its first few
- * operands and decline the rest, and a caller that allocated the first few is a caller that has
- * done work for a case it is about to skip. A non-positive extent means a parameter this
- * description needed was absent or zero, which is RAD_E_UNSUPPORTED -- the geometry does not carry
- * what the description needs -- and not RAD_E_SHAPE, which would read as a bug in the tool.
- *
- * An operand index outside the list IS a bug, in this file or in the schema it was written
- * against, and says so with a different code. */
+/* Hands out operand `operand` of a list after checking the whole list, so a geometry missing a
+ * parameter declines every operand rather than describing a few and declining the rest. A
+ * non-positive extent means a needed parameter was absent or zero: RAD_E_UNSUPPORTED, not
+ * RAD_E_SHAPE, which would read as a tool bug. An index outside the list is a bug here or in the
+ * schema, reported as RAD_E_SHAPE. */
 int pick(RadOpdDesc* out, int operand, const RadOpdDesc* list, int n) {
     if (!out || !list || n <= 0) return RAD_E_INVAL;
     for (int i = 0; i < n; ++i) {
@@ -171,50 +140,32 @@ int pick(RadOpdDesc* out, int operand, const RadOpdDesc* list, int n) {
 
 /* ==================================================================== parameters
  *
- * `p` is the RESOLVED geometry, which is to say the geometry with its RANGES COLLAPSED: `M` here
- * is the band's bound, not the row count of any particular step (the same reading every shim in
- * this plugin takes, and the trap r4d_gdn.cpp's dflash_select shim spells out). That is the right
- * value for a description -- the buffers a tool allocates have to hold the band the kernel was
- * selected for -- and it is why nothing below tries to be cleverer about it.
+ * `M` and other ranged parameters read as the band's bound, not any one step's row count (as in
+ * every shim here; see the dflash_select shim in r4d_dflash_select_bf16.hip). Buffers must hold the whole band
+ * the kernel was selected for.
  */
-/* NOT r4d_pgeti_or(), and the difference is load-bearing: that reader takes RAD_P_INT only, which
- * is right for a LAUNCH -- by then the core has collapsed every range to the band's value -- and
- * wrong here, because this hook can be called with a geometry whose ranges are still ranges. A
- * RAD_P_RANGE reads as its HIGH bound: the buffers a tool allocates have to hold the whole band the
- * kernel was selected for, and the low end of a band fits inside them.
- *
- * That reading is rad_param_getdim's, in the ABI, and is shared by both plugins: a shape hook
- * cannot be written without it.
- *
- * A string spelling of an integer parameter is deliberately NOT accepted, where ref's reader takes
- * one: this plugin's shims read integers with r4d_geti_or, which is RAD_P_INT only, so describing a
- * geometry the launch would then refuse would turn a skip into a failure. rad_param_getdim takes
- * the strict reading for exactly that reason; ref layers its leniency on top. */
+/* Not r4d_pgeti_or(): that reads RAD_P_INT only, which suits a launch (every range has collapsed),
+ * but this hook can see ranges still open. rad_param_getdim (ABI, shared by both plugins) reads a
+ * RAD_P_RANGE as its high bound. Unlike ref's reader it rejects a string spelling of an integer,
+ * because this plugin's shims read RAD_P_INT only and describing a geometry the launch refuses
+ * would turn a skip into a failure. */
 int64_t pi(const RadParam* p, int n_p, const char* k, int64_t dflt = 0) {
     return (int64_t)rad_param_getdim(p, n_p, k, (long long)dflt);
 }
 
-/* THE ABI's PARSER, and not an if-ladder of this file's own. rad_dtype_parse is static inline in
- * rad_types.h, which rad_abi.h includes, which this plugin compiles against, so it is reachable
- * from a plugin.
- *
- * Using it is what keeps the accepted spellings identical to libref's. A local subset -- one
- * missing u8, i16, i64, u32, bool, w4, w2 or mxfp4, say -- refuses here what libref accepts, and
- * rad-kbench reads that divergence as a libr4d hole rather than as a parser gap. rad_dtype_parse
- * also carries the `all_reduce` synonyms (the arch blocks declare `bf16`/`fp32` and
- * core/sample/sampler.cpp declares `f32`). */
+/* The ABI's parser (static inline in rad_types.h), so the accepted spellings match libref's; a
+ * local subset would refuse what libref accepts and show up as a libr4d gap. It also carries the
+ * `all_reduce` synonyms (arch blocks declare `bf16`/`fp32`, core/sample/sampler.cpp `f32`). */
 uint32_t dt_of(const char* s) { return rad_dtype_parse(s); }
 
 uint32_t dt_par(const RadParam* p, int n_p, const char* key) {
     return dt_of(r4d_pgets(p, n_p, key));
 }
 
-/* THE ACTIVATION WIDTH, with the fallback that matters. A `dtype` this table does not know is
- * usually a quantisation SCHEME rather than an element width -- "fp8a8", "w4a8" -- and bf16 is
- * what every activation in this project is when nothing says otherwise. Falling back to an invalid
- * dtype instead would size a zero-byte buffer and the case would be skipped for a reason that
- * looks like an allocation failure. `cast` uses the raw reader above, because there a dtype it
- * does not know is a pair this row genuinely cannot serve. */
+/* The activation element type. An unknown `dtype` is usually a quantisation scheme ("fp8a8",
+ * "w4a8") rather than an element width, and activations are bf16 unless stated, so that is the
+ * fallback; an invalid dtype would size a zero-byte buffer. `cast` uses dt_par instead, because
+ * there an unknown dtype is a pair the row cannot serve. */
 uint32_t dt_act(const RadParam* p, int n_p, const char* key) {
     const uint32_t dt = dt_par(p, n_p, key);
     return dt == (uint32_t)RAD_DT_INVALID ? (uint32_t)RAD_BF16 : dt;
@@ -222,41 +173,31 @@ uint32_t dt_act(const RadParam* p, int n_p, const char* key) {
 
 /* ==================================================================== the sampler's params row
  *
- * `params` is an ARRAY OF RadSampleParams viewed through a 32-bit dtype -- one row per sampled
- * position, uploaded once a step (abi/rad_sample.h). Its EXTENT is exact: 96 bytes a row,
- * which is what r4d_sample.cpp's `params_ok` checks in words. Its CONTENT is a struct, and the
- * ABI's fill domains describe a buffer -- normals, a sigmoid, a gate cumsum, a triangular mask, an
- * index draw -- so there is no spelling for "fill this like a request".
+ * `params` is an array of RadSampleParams viewed through a 32-bit dtype, one row per sampled
+ * position (abi/rad_sample.h). The extent is exact: 96 bytes per row, as r4d_sample_stages_f32.hip's
+ * `params_ok` checks. The content is a struct, and no ABI fill domain describes "a plausible
+ * request".
  *
- * DESCRIBED AS f32, WHICH IS A CHOICE ABOUT CONTENT AND NOT ABOUT SIZE, and it is the same choice
- * ref_shapes.cpp makes for the same operand -- the two files have to agree here, because whichever
- * of them a tool asks, BOTH implementations are then handed those bytes. The struct is eleven
- * floats and nine int32s. Drawn as f32 normals every float field -- temp, top_p, min_p,
- * typical_p, the penalties, the two XTC values -- lands in a plausible range, so a third to a half
- * of the rows fall inside the interval that makes their stage do work and the rest are the
- * identity: which is the mix a real batch has.
+ * It is described as f32, matching ref_shapes.cpp (both implementations receive the same bytes,
+ * so the two files must agree). The struct is eleven floats and nine int32s. As f32 normals the
+ * float fields (temp, top_p, min_p, typical_p, the penalties, the XTC values) land in plausible
+ * ranges, so some rows make their stage do work and the rest are the identity, as in a real batch.
  *
- * WHAT IT CANNOT REACH, said plainly rather than left for someone to discover from a PASS. The
- * INTEGER fields come out as the bit patterns of those same normals, so `hist_off`, `hist_len` and
- * `mask_row` are enormous -- and every stage clamps them, which is why this is safe on a device
- * and also why it is weak:
+ * Limits: the integer fields are bit patterns of normals, so `hist_off`, `hist_len` and `mask_row`
+ * are huge. Every stage clamps them, which keeps this safe but weak:
  *
  *     sample_penalties   ho is clamped to hmax, hl to hmax - ho, and `hl <= 0` returns
  *     sample_dry         the same clamp, then `hl <= allowed` returns
  *     sample_mask        `mask_row >= mask_rows` returns before a word of the plane is read
  *
- * `flags` is a bit pattern too, so roughly half the rows carry RAD_SP_GREEDY, and every candidate
- * stage -- top-k, the narrowing stages, the merge, the pick -- treats those as having no
- * candidates. Both implementations do, so the comparison holds; it covers the other half.
+ * So a pass on those three checks the plumbing, not the arithmetic. `flags` is a bit pattern too,
+ * so about half the rows carry RAD_SP_GREEDY, which every candidate stage treats as having no
+ * candidates; the comparison covers the other half. A word-typed or all-zero draw would be worse:
+ * denormal or NaN floats with `1 / temp` infinite, or every stage the identity.
  *
- * A pass on those three says the plumbing agrees, not that the arithmetic does. The alternative --
- * a word-typed draw, or the all-zero row -- is worse in both directions: it makes every float
- * field a denormal or a NaN and `1 / temp` an infinity, or it makes every stage the identity.
- *
- * u32 IS NEVER USED for this or any other word-typed operand here, and that is not taste:
- * tools/opshapes.cpp's `rad_widen` and `rad_narrow` have no RAD_U32 case, so a u32 operand is
- * FILLED as zeroes and COMPARED as zeroes -- a vacuous pass, which is worse than a skip. i32 is
- * the same four bytes and is read. */
+ * Word-typed operands here are never u32: tools/opshapes.cpp's `rad_widen` and `rad_narrow` have
+ * no RAD_U32 case, so a u32 operand is filled and compared as zeroes, a vacuous pass. i32 is the
+ * same four bytes. */
 RadOpdDesc opd_sample_params(int64_t M) {
     return opd((uint32_t)RAD_F32, M, (int64_t)(sizeof(RadSampleParams) / 4));
 }
@@ -264,13 +205,12 @@ RadOpdDesc opd_sample_params(int64_t M) {
 }  /* namespace */
 
 /* ==========================================================================================
- * The small model ops (shims in r4d_model.cpp).
+ * The small model ops (shims in r4d_model_bf16.hip and its neighbours).
  *
- * Every one of these takes `n` as the row width and reads its row COUNT off the operand, so the
- * band's `M` is what a description has to size for. The gain of a norm is the one operand that is
- * not bf16: every architecture plugin in this tree declares its norm gains RAD_F32 -- a few
- * thousand elements against gigabytes of weights, and a norm is where a rounded gain shows -- and
- * the shim reads the width off the operand rather than assuming it.
+ * Each takes `n` as the row width and reads its row count off the operand, so descriptions size
+ * for the band's `M`. A norm's gain is the one operand that is not bf16: every architecture plugin
+ * declares norm gains RAD_F32 (a few thousand elements, and a norm is where a rounded gain shows),
+ * and the shim reads the width off the operand.
  * ========================================================================================= */
 
 extern "C" int r4d_shape_embed_lookup(const RadParam* p, int n_p, int operand,
@@ -282,13 +222,10 @@ extern "C" int r4d_shape_embed_lookup(const RadParam* p, int n_p, int operand,
     const int64_t vo = pi(p, n_p, "vocab_offset", 0);
     const uint32_t D = dt_act(p, n_p, "dtype");
     const RadOpdDesc l[] = {
-        /* A TOKEN ID INDEXES THE TABLE, and the table is the operand AFTER it, so the ABI's
-         * default -- the previous operand's leading extent -- is the wrong one here and n_vocab is
-         * said outright. A draw from anywhere else tests the row's negative-id path and calls it
-         * an embedding.
-         *
-         * Under a vocab shard the bound is vo + nv, because ids are GLOBAL: drawing only within
-         * the slice never exercises the zero-row path the following all_reduce depends on. */
+        /* A token id indexes the table, which is the next operand, so the ABI default (the
+         * previous operand's extent) is wrong and the bound is stated. Under a vocab shard ids
+         * are global, so the bound is vo + nv; drawing only within the slice would never exercise
+         * the zero-row path the following all_reduce depends on. */
         opd_idx(M, 0, vo + nv),
         opd(D, nv, ne),
         opd(D, M, ne),
@@ -296,9 +233,9 @@ extern "C" int r4d_shape_embed_lookup(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
-/* The quantised gather: libref's description (ref_embed_lookup_q_shape), an E4M3 table and a
- * one-element scale in the activation dtype. `ahead` is not passed: it is ids for a reader that
- * fetches rows from a file, and the kernel does not read it. */
+/* The quantised gather, as libref describes it (ref_embed_lookup_q_shape): an E4M3 table and a
+ * one-element scale in the activation dtype. `ahead` is not passed: it holds ids for a reader that
+ * fetches rows from a file, and the kernel ignores it. */
 extern "C" int r4d_shape_embed_lookup_q(const RadParam* p, int n_p, int operand,
                                         RadOpdDesc* out) {
     const int64_t M  = pi(p, n_p, "M");
@@ -323,9 +260,8 @@ extern "C" int r4d_shape_gather_rows(const RadParam* p, int n_p, int operand,
     const int64_t n = pi(p, n_p, "n");
     const uint32_t D = dt_act(p, n_p, "dtype");
     const RadOpdDesc l[] = {
-        /* FOUR TIMES THE ROWS THE GATHER PRODUCES, so the gather is not the identity: a source
-         * exactly M rows tall makes idx[i] == i a plausible answer, and the identity is the one
-         * case that passes while the kernel is broken. */
+        /* Four times the output rows, so the gather is not the identity (with an M-row source,
+         * idx[i] == i is plausible and passes a broken kernel). */
         opd(D, 4 * M, n),
         opd_idx(M, 0, 4 * M),
         opd(D, M, n),
@@ -333,9 +269,8 @@ extern "C" int r4d_shape_gather_rows(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
-/* The byte-row pair. `n` is a count of BYTES here, and the registry constrains it to a multiple
- * of 4 so the vectorised copy is the only path -- a description that drew an odd `n` would be
- * describing a case the kernel correctly refuses. */
+/* The byte-row pair. `n` counts bytes, constrained by the registry to a multiple of 4 so the
+ * vectorised copy is the only path. */
 extern "C" int r4d_shape_gather_rows_u8(const RadParam* p, int n_p, int operand,
                                         RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M");
@@ -348,10 +283,9 @@ extern "C" int r4d_shape_gather_rows_u8(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
-/* And the mirror. The destination is four times the height for the same reason, plus one of its
- * own: a scatter onto exactly M rows under M DISTINCT indices is a permutation, so a kernel that
- * ignored `idx` would still touch every row and could still pass. Wider than the write, and the
- * rows nobody names have to come back unchanged. */
+/* The mirror. The destination is four times taller: a scatter of M distinct indices onto M rows
+ * is a permutation, so a kernel ignoring `idx` would still touch every row. With a taller
+ * destination, unnamed rows must come back unchanged. */
 extern "C" int r4d_shape_scatter_rows_u8(const RadParam* p, int n_p, int operand,
                                          RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M");
@@ -381,10 +315,8 @@ extern "C" int r4d_shape_cast(const RadParam* p, int n_p, int operand,
 
     const int64_t M = pi(p, n_p, "M");
     const int64_t n = pi(p, n_p, "n");
-    /* `from` and `to` are separate keys because the whole point of the op is that the two ends
-     * differ. Two rows serve it -- bf16 -> bf16 (a strided row copy) and bf16 -> f32 (the
-     * widening) -- and the shims refuse anything else on dtype, so a geometry that names another
-     * pair is declined here rather than described into a refusal. */
+    /* Two rows serve the op, bf16 -> bf16 (a strided row copy) and bf16 -> f32, and the shims
+     * refuse any other pair, so another pair is declined here. */
     const uint32_t f = dt_par(p, n_p, "from"), t = dt_par(p, n_p, "to");
     if (f != (uint32_t)RAD_BF16 || (t != (uint32_t)RAD_BF16 && t != (uint32_t)RAD_F32))
         return RAD_E_UNSUPPORTED;
@@ -406,9 +338,8 @@ extern "C" int r4d_shape_rmsnorm(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
-/* ---- the vision tower's (r4d_vit_bf16.hip). Every optional operand is PASSED: the bias of the
- * norm and the residual of the GEMM are the same code with a branch taken, so describing them
- * covers both forms. */
+/* ---- the vision tower's (r4d_vit_bf16.hip). Every optional operand is passed: the norm's bias and
+ * the GEMM's residual are the same code with a branch taken, so this covers both forms. */
 extern "C" int r4d_shape_layernorm(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
     const uint32_t D = dt_act(p, n_p, "dtype");
@@ -419,8 +350,8 @@ extern "C" int r4d_shape_layernorm(const RadParam* p, int n_p, int operand, RadO
 extern "C" int r4d_shape_grid_embed(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), side = pi(p, n_p, "side");
     const uint32_t D = dt_act(p, n_p, "dtype");
-    /* Coordinates drawn over the table's side: some rows sit past their grid's last row and take
-     * the clamped taps as well as the interior ones. */
+    /* Coordinates drawn over the table's side, so some rows fall past their grid's last row and
+     * exercise the clamped taps as well as the interior ones. */
     const RadOpdDesc l[] = { opd(D, M, n), opd(D, side * side, n), opd_idx(4, M, side) };
     R4D_PICK(l);
 }
@@ -432,9 +363,9 @@ extern "C" int r4d_shape_gemm_nt_bias(const RadParam* p, int n_p, int operand, R
     R4D_PICK(l);
 }
 
-/* ---- the gated residual (r4d_hc_bf16.hip's three shims). `inject` and `group` DEFAULT ON, so a
+/* ---- the gated residual (r4d_hc_bf16.hip's three shims). `inject` and `group` default on, so a
  * query naming neither describes what every trunk connection runs; 0 for either describes one of
- * the two exceptions -- the final mixer, and a read whose consumer wants bf16. */
+ * the two exceptions: the final mixer, and a read whose consumer wants bf16. */
 extern "C" int r4d_shape_hc_enter(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
     const uint32_t D = dt_act(p, n_p, "dtype");
@@ -442,8 +373,8 @@ extern "C" int r4d_shape_hc_enter(const RadParam* p, int n_p, int operand, RadOp
     R4D_PICK(l);
 }
 
-/* The MTP head's entry. Both gains are F32, as hc_read's is, and the two fc matrices are the
- * activation dtype -- the checkpoint's `mtp.fc_hidden` / `mtp.fc_embedding`, square and bf16. */
+/* The MTP head's entry. Both gains are F32, as hc_read's is; the two fc matrices are the
+ * checkpoint's `mtp.fc_hidden` / `mtp.fc_embedding`, square, in the activation dtype. */
 extern "C" int r4d_shape_mtp_enter(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
     const uint32_t D = dt_act(p, n_p, "dtype");
@@ -456,18 +387,15 @@ extern "C" int r4d_shape_mtp_enter(const RadParam* p, int n_p, int operand, RadO
 extern "C" int r4d_shape_hc_write(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
     const uint32_t D = dt_act(p, n_p, "dtype");
-    /* `inj` is a gain in (0, 2) -- twice a sigmoid -- and a normal draw would make hc_write a
-     * different test: the point of the op is that the four gains are small and data-dependent. */
+    /* `inj` is a gain in (0, 2), twice a sigmoid, so it is drawn in (0, 1) rather than as a
+     * normal: the op's gains are small and data-dependent. */
     const RadOpdDesc l[] = { opd(D, M, n), in_unit(opd(D, M, hc)), opd(D, M, hc * n) };
     R4D_PICK(l);
 }
 
-/* hc_write's operands with the all-reduce in front: the same three, `y` now the message as well. */
+/* hc_write's operands with the all-reduce in front; `y` is also the message. */
 extern "C" int r4d_shape_ar_hc_write(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
-    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
-    const uint32_t D = dt_act(p, n_p, "dtype");
-    const RadOpdDesc l[] = { opd(D, M, n), in_unit(opd(D, M, hc)), opd(D, M, hc * n) };
-    R4D_PICK(l);
+    return r4d_shape_hc_write(p, n_p, operand, out);
 }
 
 /* moe_gather's five and ar_hc_write's three, in that order; the gather's `y` and the reduction's are
@@ -515,10 +443,8 @@ extern "C" int r4d_shape_hc_read(const RadParam* p, int n_p, int operand, RadOpd
     R4D_PICK(l);
 }
 
-/* add and mul share an operand list. THE BROADCAST FORM IS NOT DESCRIBED: `b` carrying exactly n
- * elements against an output of M rows broadcasts along rows, and that is a second geometry of the
- * same op -- one description can only be one of them, and the elementwise form is the one every
- * caller in this tree issues. */
+/* add and mul share an operand list. Only the elementwise form is described, the one every caller
+ * issues; the broadcast form (`b` of exactly n elements against M rows) is a second geometry. */
 extern "C" int r4d_shape_binary(const RadParam* p, int n_p, int operand,
                                 RadOpdDesc* out) {
 
@@ -564,8 +490,8 @@ extern "C" int r4d_shape_silu_mul(const RadParam* p, int n_p, int operand,
     const int64_t M = pi(p, n_p, "M");
     const int64_t n = pi(p, n_p, "n");
     const uint32_t D = dt_act(p, n_p, "dtype");
-    /* The gate is the FIRST half of a [M, 2n] row, which is the order rad-convert fuses gate_proj
-     * and up_proj in. */
+    /* The gate is the first half of a [M, 2n] row, the order rad-convert fuses gate_proj and
+     * up_proj in. */
     const RadOpdDesc l[] = { opd(D, M, 2 * n), opd(D, M, n) };
     R4D_PICK(l);
 }
@@ -577,14 +503,12 @@ extern "C" int r4d_shape_rope(const RadParam* p, int n_p, int operand,
     const int64_t hd  = pi(p, n_p, "head_dim");
     const int64_t nq  = pi(p, n_p, "n_head");
     const int64_t nkv = pi(p, n_p, "n_head_kv");
-    /* The fused projection row: n_head queries, then n_head_kv each of k and v. The V heads are
-     * untouched, which is the whole reason this op takes the fused row rather than two tensors --
-     * and why the row width is not just (n_head + n_head_kv) * head_dim. `n_head_kv` 0 is the
-     * legal "q only" form the gated attention block issues, so it is not required to be positive
-     * and the width is what has to be. */
+    /* The fused projection row: n_head queries, then n_head_kv each of k and v (v untouched), so
+     * the width includes the V heads. `n_head_kv` 0 is the legal q-only form the gated attention
+     * block issues, so only the width must be positive. */
     const int64_t row = (nq + 2 * nkv) * hd;
-    /* A multi-component mode with its sections takes a position per component, component-major:
-     * three for the interleaved form, one a section otherwise. */
+    /* A multi-component mode with sections takes one position per component, component-major:
+     * three for the interleaved form, one per section otherwise. */
     const char* mode = rad_param_gets(p, n_p, "mode", "neox");
     const char* sec = rad_param_gets(p, n_p, "sections", nullptr);
     int64_t nc = 0;
@@ -600,22 +524,19 @@ extern "C" int r4d_shape_rope(const RadParam* p, int n_p, int operand,
     if (multi && !std::strcmp(mode, "imrope")) nc = 3;
     const RadOpdDesc l[] = {
         opd((uint32_t)RAD_BF16, M, row),
-        /* A POSITION IS NOT A LOOKUP HERE: this kernel computes sincos from the value, so any
-         * non-negative integer is legal and none of them is out of range. M keeps the draw in the
-         * range a step actually presents. */
+        /* Not a lookup: the kernel computes sincos from the value, so any non-negative integer is
+         * legal. M keeps the draw in the range a step presents. */
         multi ? opd_idx(nc, M, M) : opd_idx(M, 0, M),
     };
     R4D_PICK(l);
 }
 
-/* kv_store, both rows. The cache dtype is the one difference between them and it is a PARAMETER,
- * so one description serves both: `kv_dtype` is what the constraint table selects on.
+/* kv_store, both rows: they differ only in the cache dtype, the `kv_dtype` parameter.
  *
- * The paged layout is stated once for the whole project in libref/ref_ops.h and checked by
- * this plugin's shim:  kv_cache[n_blocks, kv_heads, block_size, 2 * head_dim], K at [.., d] and V
- * at [.., head_dim + d]. The block COUNT is not a parameter of anything -- it is a property of the
- * deployment's cache -- so it is this description's to choose, and any cache big enough for the
- * slots to land in will do. */
+ * The paged layout (libref/ref_ops.h, checked by the shim) is
+ * kv_cache[n_blocks, kv_heads, block_size, 2 * head_dim], K at [.., d] and V at [.., head_dim + d].
+ * The block count belongs to the deployment's cache, not to any parameter, so any count large
+ * enough for the slots will do. */
 extern "C" int r4d_shape_kv_store(const RadParam* p, int n_p, int operand,
                                   RadOpdDesc* out) {
 
@@ -625,27 +546,23 @@ extern "C" int r4d_shape_kv_store(const RadParam* p, int n_p, int operand,
     const int64_t bs  = pi(p, n_p, "block_size");
     const uint32_t KV = dt_act(p, n_p, "kv_dtype");
     if (M <= 0 || bs <= 0) return RAD_E_UNSUPPORTED;
-    /* Two blocks of slack, so the slot mapping is not a dense prefix: a scatter that only ever
-     * writes block 0 agrees with anything at all about the block index. */
+    /* Two blocks of slack, so the slot mapping is not a dense prefix and the block index is
+     * actually tested. */
     const int64_t nb = (M + bs - 1) / bs + 2;
     const RadOpdDesc l[] = {
-        /* Spelled [tokens, kv_heads, head_dim]: the shim folds every trailing extent into one row
-         * pitch, so the flattened [M, kv_heads * head_dim] an architecture may declare is the same
-         * bytes and the same pitch -- and this is the spelling ref's description of the op uses,
-         * which is the one that has to match when the two are compared against each other. */
+        /* [tokens, kv_heads, head_dim], as ref spells it. The shim folds trailing extents into
+         * one row pitch, so a flattened [M, kv_heads * head_dim] is the same bytes and pitch. */
         opd((uint32_t)RAD_BF16, M, kvh, hd),
         opd((uint32_t)RAD_BF16, M, kvh, hd),
-        /* A SCATTER DESTINATION, so no slot may repeat -- two tokens on one slot make the store a
-         * race and the two implementations resolve it differently. It indexes POSITIONS, which is
-         * n_blocks * block_size and is no operand's leading extent. */
+        /* A scatter destination, so no slot may repeat (two tokens on one slot race). It indexes
+         * positions, n_blocks * block_size, which is no operand's leading extent. */
         opd_idx(M, 0, nb * bs, -1, RAD_OPD_F_IDX_UNIQUE),
         opd(KV, nb, kvh, bs, 2 * hd),
     };
     R4D_PICK(l);
 }
 
-/* logits_gemm at bf16. The fp8 row of the same op is deliberately not described; see the file
- * header on why its declared shape and its stored plane differ. */
+/* logits_gemm at bf16. The fp8 row is not described; see the file header. */
 extern "C" int r4d_shape_logits_gemm(const RadParam* p, int n_p, int operand,
                                      RadOpdDesc* out) {
 
@@ -655,22 +572,17 @@ extern "C" int r4d_shape_logits_gemm(const RadParam* p, int n_p, int operand,
     const RadOpdDesc l[] = {
         opd((uint32_t)RAD_BF16, M, ne),
         opd((uint32_t)RAD_BF16, nv, ne),
-        /* F32 LOGITS OUT, and checked by the shim rather than assumed: dispatching this op to the
-         * bf16 GEMM instead writes bf16 pairs into an f32 plane -- every logit wrong, the
-         * magnitudes roughly right, fluent nonsense out of the sampler. */
+        /* F32 logits, checked by the shim: the bf16 GEMM would write bf16 pairs into the f32
+         * plane, giving plausible magnitudes and wrong logits. */
         opd((uint32_t)RAD_F32, M, nv),
     };
     R4D_PICK(l);
 }
 
 /* ==========================================================================================
- * The decomposed sampler chain (shims in r4d_sample.cpp). Eleven of the twelve; `sample_merge_topk`
- * is declined and the argument is with the others in the file header.
- *
- * Read the `opd_sample_params` note above before trusting a PASS from any of these: the row's float
- * fields are real and its INTEGER fields are the bit patterns of the same normals, so
- * `sample_penalties`, `sample_dry` and `sample_mask` take their "nothing to do" branch and a pass
- * on those three says the plumbing agrees rather than the arithmetic.
+ * The decomposed sampler chain (shims in r4d_sample_stages_f32.hip). `sample_merge_topk` is declined (below).
+ * See opd_sample_params on the limits: `sample_penalties`, `sample_dry` and `sample_mask` take
+ * their early-out branch, so a pass on those three checks the plumbing only.
  * ========================================================================================= */
 
 /* logits + params, and one auxiliary plane that differs per stage. */
@@ -679,24 +591,22 @@ extern "C" int r4d_shape_sample_penalties(const RadParam* p, int n_p, int operan
 
     const int64_t M  = pi(p, n_p, "M");
     const int64_t nv = pi(p, n_p, "n_vocab");
-    /* THE HISTORY WINDOW IS THIS DESCRIPTION'S CHOICE. `history` is [M, max_hist] and the shim
-     * takes max_hist from the buffer (numel / M); no parameter names it, because a deployment's
-     * history plane is sized by its longest live sequence. 64 is a plausible window, and the
-     * kernel clamps `hist_off` and `hist_len` to it before reading a word -- which is what makes
-     * the params row above safe and this stage's comparison weak. */
+    /* `history` is [M, max_hist], and the shim takes max_hist from the buffer (numel / M); no
+     * parameter names it, since a deployment sizes it by its longest live sequence. 64 is a
+     * plausible window; the kernel clamps `hist_off` and `hist_len` to it. */
     const int64_t hist = 64;
     const RadOpdDesc l[] = {
         opd((uint32_t)RAD_F32, M, nv),
         opd_sample_params(M),
-        /* Token ids, so they are drawn from the vocabulary and not from the plane's own extent. */
+        /* Token ids, drawn from the vocabulary. */
         opd_idx(M, hist, nv),
     };
     R4D_PICK(l);
 }
 
-/* sample_dry: the penalties' three operands and the optional breaker plane, which is not passed --
- * absent means no token is exempt, and the params row above reaches the row's early out before a
- * word of either plane is read. The same reading as ref's description of this op. */
+/* sample_dry: the penalties' three operands, and the optional breaker plane, not passed (absent
+ * means no token is exempt; the params row takes the early out before either plane is read). As
+ * ref describes it. */
 extern "C" int r4d_shape_sample_dry(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
 
     const int64_t M  = pi(p, n_p, "M");
@@ -726,18 +636,15 @@ extern "C" int r4d_shape_sample_mask(const RadParam* p, int n_p, int operand,
     const int64_t M  = pi(p, n_p, "M");
     const int64_t nv = pi(p, n_p, "n_vocab");
     if (nv <= 0) return RAD_E_UNSUPPORTED;
-    /* The plane is [rows, ceil(n_vocab/32)] and is SHORTER than M in a real batch -- a constrained
-     * sequence and an unconstrained one share it and `mask_row` is -1 for the second. One row per
-     * position is the fully-constrained case and the only one a description can pick. */
+    /* The plane is [rows, ceil(n_vocab/32)], shorter than M in a real batch (unconstrained
+     * sequences have `mask_row` -1). One row per position is the fully constrained case. */
     const int64_t words = (nv + 31) / 32;
     const RadOpdDesc l[] = {
         opd((uint32_t)RAD_F32, M, nv),
         opd_sample_params(M),
-        /* A SET BIT MEANS ALLOWED: word w bit b covers token 32w + b, and a cleared bit sets
-         * -infinity. i32 and not u32 for the reason opd_sample_params gives -- a u32 operand is
-         * filled and compared as zeroes -- and a normal draw narrowed to i32 is a sparse mask
-         * rather than a plane that forbids everything. The kernel does not reach it at this params
-         * row anyway: `mask_row` is enormous and the row returns first. */
+        /* A set bit means allowed: word w bit b covers token 32w + b; a cleared bit sets
+         * -infinity. i32, not u32 (see opd_sample_params). Unreached with this params row, whose
+         * `mask_row` is out of range. */
         opd((uint32_t)RAD_I32, M, words),
     };
     R4D_PICK(l);
@@ -748,21 +655,18 @@ extern "C" int r4d_shape_sample_topk(const RadParam* p, int n_p, int operand,
 
     const int64_t M  = pi(p, n_p, "M");
     const int64_t nv = pi(p, n_p, "n_vocab");
-    /* THE CANDIDATE WIDTH IS THE BUFFER'S, not the request's: it is the deployment bound the arena
-     * was sized for and every later stage reads it. No parameter carries it on this op -- `n_cand`
-     * is the narrowing stages' key -- so 64 is chosen here, well inside the 4096 the LDS bitonic
-     * sort covers. */
+    /* The candidate width is the buffer's, the deployment bound every later stage reads. No
+     * parameter carries it on this op (`n_cand` is the narrowing stages' key), so 64 is used,
+     * well inside the 4096 the LDS bitonic sort covers. */
     const int64_t n_cand = 64;
     const RadOpdDesc l[] = {
         opd((uint32_t)RAD_F32, M, nv),
         opd_sample_params(M),
         opd((uint32_t)RAD_I32, M, n_cand),
-        opd((uint32_t)RAD_F32, M, n_cand),   /* cand_val -- LOGITS, not probabilities */
-        /* `pairs` is the VOCAB-PARALLEL path, and it is described rather than skipped because it is
-         * an OUTPUT: nothing has to fill it, comparing it is what checks the packing -- (u32 global
-         * id, f32 logit) with a hole marker for a slot the row could not fill -- and `vocab_off` is
-         * zero on a single-rank graph, which makes the ids the local ones and the check exactly as
-         * strict. Same reading as ref's description of this operand. */
+        opd((uint32_t)RAD_F32, M, n_cand),   /* cand_val: logits, not probabilities */
+        /* `pairs`, the vocab-parallel output: (u32 global id, f32 logit) with a hole marker for an
+         * unfilled slot. As an output it needs no fill, and comparing it checks the packing; with
+         * `vocab_off` zero on one rank the ids are local. As ref describes it. */
         opd((uint32_t)RAD_I32, M, 2 * n_cand),
     };
     R4D_PICK(l);
@@ -802,12 +706,10 @@ extern "C" int r4d_shape_sample_narrow(const RadParam* p, int n_p, int operand,
     const int64_t M  = pi(p, n_p, "M");
     const int64_t nc = pi(p, n_p, "n_cand");
     const RadOpdDesc l[] = {
-        /* EVERY DRAWN ID IS >= 0, so every candidate arrives LIVE -- a stage that dropped nothing
-         * because the set was already empty is the vacuous case. The range is the candidate width
-         * and not the vocabulary: nothing DEREFERENCES an id here, these kernels only reorder and
-         * drop, and `n_vocab` is not a parameter of a narrowing stage anyway. Stated rather than
-         * left at the ABI's default, which for operand ZERO has no previous operand to take a
-         * leading extent from. */
+        /* Every drawn id is >= 0, so every candidate arrives live (an empty set would be
+         * vacuous). The range is the candidate width: these kernels only reorder and drop ids,
+         * and `n_vocab` is not a parameter here. Stated explicitly because operand 0 has no
+         * previous operand for the ABI default. */
         opd_idx(M, nc, nc),
         opd((uint32_t)RAD_F32, M, nc),
         opd_sample_params(M),
@@ -829,25 +731,18 @@ extern "C" int r4d_shape_sample_pick(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
-/* `sample_merge_topk` IS DECLINED, and ref declines it too -- deliberately the same answer, because
- * a description here would supply the very bytes ref refused to.
+/* `sample_merge_topk` is declined, as in ref. `gathered` is world_size * n_cand (u32 global token
+ * id, f32 logit) pairs in one word-typed buffer (i32 or u32 in both plugins: one buffer, one
+ * dtype). The logit lane is read by bit pattern, and an integer draw makes every logit a denormal;
+ * a device that flushes denormals then orders candidates differently from a host that does not.
+ * r4d_selftest's two-rank all-gather row checks exactly that. `world_size` is not a parameter
+ * either, so the gathered width is unknown.
  *
- * `gathered` is world_size * n_cand (u32 GLOBAL token id, f32 logit) pairs packed into ONE
- * WORD-TYPED buffer: both plugins require i32 or u32 for it, because the two halves have different
- * types and a buffer has one dtype. The value lane is therefore read by BIT PATTERN, and no fill
- * domain in this ABI puts a sensible float there -- an integer draw makes every logit a DENORMAL,
- * and a device that flushes denormals against a host reference that does not then order the
- * candidates differently. That is not hypothetical: it is the failure r4d_selftest's two-rank
- * all-gather row exists to catch ("a token id is a small integer, and its bit pattern read as f32
- * is a denormal"). And `world_size` is not in this op's parameter list, so the gathered width would
- * have to be invented on top of that. Either reason is sufficient.
- *
- * `row_topk_merge` is the same shape of operand and is NOT declined, because its plane is f32:
- * there the value lane is a real float and the ID is the bit pattern, which is the way round that
- * works. */
+ * `row_topk_merge` has the same shape and is described, because its plane is f32: the value is a
+ * real float and the id is the bit pattern. */
 
-/* The FUSED sampler, which is a different op from the eleven above and not their composition
- * (r4d_fp8.cpp). Its three outputs are what a rejection-sampling verify needs from one pass. */
+/* The fused sampler (r4d_sample_chain_f32.hip): a separate op, not a composition of the stages above. Its
+ * three outputs are what a rejection-sampling verify needs from one pass. */
 extern "C" int r4d_shape_sample_chain(const RadParam* p, int n_p, int operand,
                                       RadOpdDesc* out) {
 
@@ -855,37 +750,30 @@ extern "C" int r4d_shape_sample_chain(const RadParam* p, int n_p, int operand,
     const int64_t nv = pi(p, n_p, "n_vocab");
     const RadOpdDesc l[] = {
         opd((uint32_t)RAD_F32, M, nv),
-        /* The drafted token per position. Passed rather than left absent: `p_query` -- the accept
-         * probability -- is the output this op exists for, and with `query` absent the kernel
-         * computes two of its three answers. A token id, so it is drawn from the vocabulary. */
+        /* The drafted token per position, drawn from the vocabulary. Passed because without it
+         * the kernel skips `p_query`, the accept probability. */
         opd_idx(M, 0, nv),
-        /* TWO UNIFORMS A POSITION, one for the draw and one for the exclusive draw, and they have
-         * to be IN [0, 1): the inverse-CDF walk falls through to its last live candidate for
-         * anything above the mass, so a normal draw would make every position take the fallback
-         * and the case would check the fallback. RAD_FILL_SIGMOID is the ABI's (0, 1) domain. */
+        /* Two uniforms per position (draw and exclusive draw), in (0, 1): the inverse-CDF walk
+         * falls through to its last live candidate above the mass, so normals would only test
+         * that fallback. */
         in_unit(opd((uint32_t)RAD_F32, 2 * M)),
-        /* [M] x R4DSpecDraw = {u32 tok, u32 tok_excl, f32 p_query}: THREE dwords a position. The
-         * shim only checks numel >= M, which is the count of STRUCTS and not of words, so a
-         * description that said [M] would leave the kernel writing two thirds of its output past
-         * the end of the buffer. i32 rather than u32, for the reason opd_sample_params gives: a u32
-         * operand is compared as zeroes and every case would pass vacuously. */
+        /* [M] x R4DSpecDraw = {u32 tok, u32 tok_excl, f32 p_query}: three dwords per position.
+         * The shim checks only numel >= M (structs, not words), so [M] would let the kernel write
+         * past the buffer. i32, not u32 (see opd_sample_params). */
         opd((uint32_t)RAD_I32, M, 3),
     };
     R4D_PICK(l);
 }
 
 /* ==========================================================================================
- * Attention (shims in r4d_attn.cpp).
+ * Attention (shims in the r4d_attn_*.hip units).
  * ========================================================================================= */
 
-/* attn_paged, all six rows. `q_len` is the ranged parameter -- one query row at decode, thousands
- * in a prefill chunk -- and the KV cache's dtype comes from `kv_dtype`, which is what separates the
- * fp8kv rows from the bf16kv ones, so one description serves the family.
+/* attn_paged, all six rows. `q_len` is the ranged parameter (one row at decode, thousands in a
+ * prefill chunk), and `kv_dtype` separates the fp8kv rows from the bf16kv ones.
  *
- * ONE SEQUENCE WHOSE CONTEXT IS EXACTLY ITS QUERY: a causal attention over its own prefix, which is
- * what a prefill chunk runs and what a decode step's last row is. The block count follows from
- * that, and the alternative -- a context longer than the query -- would need a number no parameter
- * carries. */
+ * One sequence attending causally over its own prefix, as a prefill chunk does; the context
+ * defaults to the query length (see `ctx` below) and the block count follows from it. */
 extern "C" int r4d_shape_attn_paged(const RadParam* p, int n_p, int operand,
                                     RadOpdDesc* out) {
 
@@ -893,18 +781,15 @@ extern "C" int r4d_shape_attn_paged(const RadParam* p, int n_p, int operand,
     const int64_t hd    = pi(p, n_p, "head_dim");
     const int64_t gqa   = pi(p, n_p, "gqa");
     const int64_t bs    = pi(p, n_p, "block_size");
-    /* n_head is OPTIONAL on this op -- it is there because the split-KV scratch hook needs it at
-     * declare -- and without it there is no head count. tools/opshapes.h falls back to `gqa`,
-     * which makes one kv head; that is a different model and this declines instead. */
+    /* n_head is optional on this op (the split-KV scratch hook needs it at declare). Without it
+     * there is no head count, so this declines; tools/opshapes.h falls back to one kv head. */
     const int64_t nh    = pi(p, n_p, "n_head");
     if (q_len <= 0 || hd <= 0 || gqa <= 0 || bs <= 0 || nh <= 0 || nh % gqa)
         return RAD_E_UNSUPPORTED;
     const int64_t kvh = nh / gqa;
-    /* THE CONTEXT DEPTH. Defaults to the query length -- one sequence attending its own prefix,
-     * which is the prefill chunk -- and `ctx` overrides it. No op declares `ctx`: the kernel
-     * reads its context off `seqused` and the block table, so only a DESCRIPTION of the operands
-     * needs to be told, and a harness sweeping depth is the only thing that ever sets it. Must be
-     * at least q_len or the causal mask reads a prefix that is not there. */
+    /* The context depth: the query length unless `ctx` overrides it. No op declares `ctx` (the
+     * kernel reads the context off `seqused` and the block table); it lets a caller sweep depth.
+     * It must be at least q_len, or the causal mask reads a missing prefix. */
     int64_t ctx = pi(p, n_p, "ctx", 0);
     if (ctx < q_len) ctx = q_len;
     const int64_t nblk = (ctx + bs - 1) / bs;
@@ -913,27 +798,24 @@ extern "C" int r4d_shape_attn_paged(const RadParam* p, int n_p, int operand,
     const RadOpdDesc l[] = {
         opd(Q, q_len, nh, hd),
         opd(KV, nblk, kvh, bs, 2 * hd),
-        /* A block-table entry indexes n_blocks and is a READ-side index, so it may repeat. */
+        /* A block-table entry indexes n_blocks; it is read-side, so it may repeat. */
         opd_idx(1, nblk, nblk),
-        /* NOT A DRAW. A context shorter than the query makes a causal attention read a prefix that
-         * does not exist, and both implementations would agree about the garbage while neither
-         * computed what the model asks for. */
+        /* Fixed at ctx, not drawn: a shorter context would make causal attention read a missing
+         * prefix. */
         opd_idx(1, 0, 0, ctx),
-        /* The descales are absent and that means 1.0, which is what vLLM defaults them to and what
-         * the fp8kv kernels assume: they are ONE number per (sequence, head) on the read side and
-         * cannot be derived from the tokens being written. */
+        /* Absent descales mean 1.0, vLLM's default and what the fp8kv kernels assume. They are
+         * one number per (sequence, head) and cannot be derived from the tokens. */
         opd_none(),
         opd_none(),
-        /* cu_seqlens absent = one q_len for the whole batch, which is exact at one sequence. */
+        /* Absent cu_seqlens: one q_len for the whole batch, exact for one sequence. */
         opd_none(),
         opd(Q, q_len, nh, hd),
     };
     R4D_PICK(l);
 }
 
-/* attn_paged_gate_quant -- attn_paged's operands, then gate_quant_fp8's gate, codes and scales
- * over its (token, head) rows: the gate described flat as gate_quant_fp8 describes it, one row a
- * (token, head) pair of `head_dim` columns. */
+/* attn_paged_gate_quant -- attn_paged's operands, then gate_quant_fp8's gate, codes and scales,
+ * flat as gate_quant_fp8 describes them: one row per (token, head) pair, `head_dim` columns. */
 extern "C" int r4d_shape_attn_paged_gate_quant(const RadParam* p, int n_p, int operand,
                                                RadOpdDesc* out) {
     if (operand < 8) return r4d_shape_attn_paged(p, n_p, operand, out);
@@ -954,11 +836,11 @@ extern "C" int r4d_shape_attn_paged_gate_quant(const RadParam* p, int n_p, int o
     R4D_PICK(l);
 }
 
-/* qk_norm_rope_gate -- the gated-attention QKV preamble (shim in r4d_quant.cpp).
+/* qk_norm_rope_gate -- the gated-attention QKV preamble (shim in r4d_qk_norm_rope_gate.hip).
  *
- * NOT docs/OPS.md's `qk_norm_rope`: it splits a [q|gate] projection per head, writes q, k and the
- * gate to three destinations, and takes a PRECOMPUTED cos/sin table rather than a theta. The table
- * is why `rope_table` exists at all. */
+ * Not docs/OPS.md's `qk_norm_rope`: it splits a [q|gate] projection per head, writes q, k and the
+ * gate to three destinations, and takes a precomputed cos/sin table (from `rope_table`) instead of
+ * a theta. */
 extern "C" int r4d_shape_qk_norm_rope_gate(const RadParam* p, int n_p, int operand,
                                            RadOpdDesc* out) {
 
@@ -968,35 +850,28 @@ extern "C" int r4d_shape_qk_norm_rope_gate(const RadParam* p, int n_p, int opera
     const int64_t nkv = pi(p, n_p, "n_head_kv");
     const int64_t rot = pi(p, n_p, "rot");
     const uint32_t Q  = dt_act(p, n_p, "q_dtype");
-    /* The two widths the kernel reads off the operands rather than off a parameter: a cos/sin
-     * table built in f32 and a positions vector in int64 are what the tensors SAY they are. The
-     * optional `cs_f32` / `pos_i64` keys are the caller's declaration of the same thing, so they
-     * decide what to allocate here. The arch that issues this passes cs_f32 = 1. */
+    /* The kernel reads the cos/sin and position widths off the operands; the optional `cs_f32` /
+     * `pos_i64` keys declare the same, so they decide what is allocated here. The issuing arch
+     * passes cs_f32 = 1. */
     const uint32_t CS = pi(p, n_p, "cs_f32", 0) ? (uint32_t)RAD_F32 : (uint32_t)RAD_BF16;
     const RadOpdDesc l[] = {
-        /* THE PROJECTION WHOLE, q and gate interleaved per head -- the kernel splits it itself,
-         * which is what the fusion replaces. Declared flat: the shim folds every trailing extent
-         * into one row pitch, so [M, n_head * 2 * head_dim] and [M, n_head, 2 * head_dim] are the
-         * same bytes and the same pitch. */
-        /* ABSENT IN THE K-ONLY FORM (`n_head` 0), where there is no gate to split and every head
-         * the op serves is read off `k`. A zero-width operand would be a different statement --
-         * "a tensor of no columns" rather than "no tensor" -- and the shim checks for the second. */
+        /* The whole projection, q and gate interleaved per head; the kernel splits it. Flat: the
+         * shim folds trailing extents into one row pitch. Absent in the k-only form (`n_head` 0);
+         * the shim checks for no tensor, not a zero-width one. */
         nq ? opd(Q, M, nq * 2 * hd) : opd_none(),
         opd(Q, M, nkv * hd),
-        /* The [max_ctx, rot] plane, at one row per position of this band. A position indexes a ROW
-         * of it, so the table's row count is the draw's bound -- and unlike `rope`, this one is a
-         * LOOKUP: a position past the end reads another layer's angles or nothing at all. */
+        /* The [max_ctx, rot] plane, one row per position of this band. Unlike `rope`, a position
+         * is a lookup into it, so the table's row count bounds the draw. */
         opd(CS, M, rot),
         opd_idx(M, 0, M),
-        /* The QK norm gains, one per head channel. f32 in every architecture plugin here where
-         * vLLM's are bf16, and the shim requires the two to agree because one flag serves both. */
+        /* The QK norm gains, one per head channel: f32 in every architecture plugin here (vLLM's
+         * are bf16). The shim requires both to agree, since one flag serves both. */
         nq ? opd((uint32_t)RAD_F32, hd) : opd_none(),
         opd((uint32_t)RAD_F32, hd),
         nq ? opd(Q, M, nq * hd) : opd_none(),
         opd(Q, M, nkv * hd),
-        /* `gate_out` absent, which is what the fp8 gated attention block passes: `gate_quant_fp8`
-         * reads the gate at its column offset inside the projection, so a contiguous copy would be
-         * q_dim of bf16 a layer written for nothing. */
+        /* `gate_out` absent, as the fp8 gated attention block passes it: `gate_quant_fp8` reads
+         * the gate in place inside the projection. */
         opd_none(),
     };
     R4D_PICK(l);
@@ -1024,7 +899,7 @@ extern "C" int r4d_shape_qk_norm_rope_gate_kv_store(const RadParam* p, int n_p, 
     R4D_PICK(l);
 }
 
-/* rope_table -- the cos/sin plane the fused prologue reads (shim in r4d_quant.cpp). */
+/* rope_table -- the cos/sin plane the fused prologue reads (shim in r4d_qk_norm_rope_gate.hip). */
 extern "C" int r4d_shape_rope_table(const RadParam* p, int n_p, int operand,
                                     RadOpdDesc* out) {
 
@@ -1032,10 +907,9 @@ extern "C" int r4d_shape_rope_table(const RadParam* p, int n_p, int operand,
     const int64_t rot = pi(p, n_p, "rot");
     const uint32_t D  = dt_act(p, n_p, "dtype");
     const RadOpdDesc l[] = {
-        /* ONLY THE ROWS `positions` NAMES ARE WRITTEN, at each position's OWN row of the plane, so
-         * the draw's bound is the plane's row count and a position outside it would scribble past
-         * the table. The real table is [max_ctx, rot]; M rows is the smallest one that holds every
-         * row this band can name. */
+        /* Only the rows `positions` names are written, each at its own row, so the plane's row
+         * count bounds the draw. The real table is [max_ctx, rot]; M rows holds every row this
+         * band can name. */
         opd_idx(M, 0, M),
         opd(D, M, rot),
     };
@@ -1043,16 +917,14 @@ extern "C" int r4d_shape_rope_table(const RadParam* p, int n_p, int operand,
 }
 
 /* ==========================================================================================
- * Gated delta net -- the one row of the family whose widths are all parameters. The other five are
- * declined; see the file header on the head counts. (`gdn_gated_norm_had_quant_i8` is describable
- * for the same reason and is with the fusions below, where its siblings are.)
+ * Gated delta net -- the one row of the family whose widths are all parameters; the other five are
+ * declined (file header). `gdn_gated_norm_had_quant_i8` is with the fusions below.
  * ========================================================================================= */
 
 extern "C" int r4d_shape_gdn_gated_rmsnorm(const RadParam* p, int n_p, int operand,
                                            RadOpdDesc* out) {
 
-    /* ONE ROW IS ONE (token, head): `M` is already tokens x heads and `channels` is head_v, which
-     * is what makes this op describable where the rest of the family is not. */
+    /* One row per (token, head): `M` is tokens x heads and `channels` is head_v. */
     const int64_t M  = pi(p, n_p, "M");
     const int64_t ch = pi(p, n_p, "channels");
     const RadOpdDesc l[] = {
@@ -1065,25 +937,23 @@ extern "C" int r4d_shape_gdn_gated_rmsnorm(const RadParam* p, int n_p, int opera
 }
 
 /* ==========================================================================================
- * Collectives (shims in r4d_ar.cpp).
+ * Collectives (shims in r4d_ar_entry.hip).
  *
- * These need a real peer over IPC, so a single-process tool gets RAD_E_STATE from init long before
- * it gets to the buffers. Described anyway: the description is not what decides that, and a
- * two-process harness needs it the moment one exists.
+ * These need a real peer over IPC, so a single-process tool gets RAD_E_STATE from init. They are
+ * described for a two-process caller.
  * ========================================================================================= */
 
 extern "C" int r4d_shape_all_reduce(const RadParam* p, int n_p, int operand,
                                     RadOpdDesc* out) {
 
-    /* `numel` is the LARGEST message this instance will ever carry -- init sizes the peer scratch
-     * from it once and the launch reads the real count off the tensor -- so it is exactly the
-     * extent a buffer has to have. */
+    /* `numel` is the largest message the instance carries (init sizes the peer scratch from it;
+     * the launch reads the real count off the tensor), so it is the buffer extent. */
     const int64_t numel = pi(p, n_p, "numel");
     const uint32_t D = dt_act(p, n_p, "dtype");
     const RadOpdDesc l[] = {
         opd(D, numel),
-        /* The optional SECOND DESTINATION. Absent means in place, which every row of the op
-         * serves; described so a caller that passes one is checked against the same extent. */
+        /* The optional second destination; absent means in place. Described so a caller that
+         * passes one is checked against the same extent. */
         opd(D, numel),
     };
     R4D_PICK(l);
@@ -1095,16 +965,14 @@ extern "C" int r4d_shape_all_gather(const RadParam* p, int n_p, int operand,
     const int64_t numel = pi(p, n_p, "numel");
     const int64_t world = pi(p, n_p, "world_size");
     const uint32_t D = dt_act(p, n_p, "dtype");
-    /* `row` absent means the whole message is one row and `y` is the plain concatenation, rank r's
-     * slice at r * numel. The row-INTERLEAVED form is the same extent at a different placement, so
-     * this description covers both. */
+    /* `row` absent: the message is one row and `y` the plain concatenation, rank r's slice at
+     * r * numel. The row-interleaved form has the same extent, so this covers both. */
     const RadOpdDesc l[] = { opd(D, numel), opd(D, world * numel) };
     R4D_PICK(l);
 }
 
-/* The two fused all-reduce + norm folds. Same operands in the same order as the standalone norms
- * they replace, which is the property that makes them substitutable -- so these two descriptions
- * are the standalone ones with `x` reread as the message. */
+/* The two fused all-reduce + norm folds. Their operands match the standalone norms they replace,
+ * in order, with `x` also the message. */
 
 extern "C" int r4d_shape_ar_ln_had_quant_i8(const RadParam* p, int n_p, int operand,
                                             RadOpdDesc* out) {
@@ -1114,14 +982,13 @@ extern "C" int r4d_shape_ar_ln_had_quant_i8(const RadParam* p, int n_p, int oper
     const RadOpdDesc l[] = {
         opd((uint32_t)RAD_BF16, M, n),
         opd((uint32_t)RAD_BF16, M, n),      /* residual: the fused_add_rms_norm form */
-        /* THE GAIN IS BF16 ON THE INT8 SIDE, unlike the fp8 twin below whose shim reads the width
-         * off the operand: r4d_ar_ln_had_quant_i8 takes `wgain` as __hip_bfloat16 and has no flag
-         * for anything else. An f32 gain here would be read as two bf16 halves of the wrong
-         * number, which is the silent kind of wrong. */
+        /* The gain is bf16 on the int8 side: r4d_ar_ln_had_quant_i8 takes `wgain` as
+         * __hip_bfloat16 with no flag (the fp8 twin below reads the width off the operand). An f32
+         * gain would silently be read as two wrong bf16 values. */
         opd((uint32_t)RAD_BF16, n),
         opd((uint32_t)RAD_I8, M, n),
-        /* ONE SCALE PER ROW -- the rotation is what makes that viable, and it carries the
-         * 1/sqrt(had) normalisation as well. Not a per-group plane: this family has no group. */
+        /* One scale per row, viable because of the rotation; it also carries the 1/sqrt(had)
+         * normalisation. This family has no scale group. */
         opd((uint32_t)RAD_F32, M, 1),
         opd((uint32_t)RAD_BF16, M, n),      /* out_bf16, for a bf16 consumer of the post-norm row */
     };
@@ -1134,12 +1001,10 @@ extern "C" int r4d_shape_ar_rmsnorm_quant_fp8(const RadParam* p, int n_p, int op
     const int64_t M = pi(p, n_p, "M");
     const int64_t n = pi(p, n_p, "n");
     const int64_t g = pi(p, n_p, "group", R4D_FP8_BLOCK);
-    /* The block is a property of the checkpoint's scale grid and not a knob: a geometry that
-     * declares a different one is asking for a format the GEMM's fold does not read, and the shim
-     * refuses it by name rather than substituting 128. */
+    /* The block is the checkpoint's scale grid, not a knob; the shim refuses any other. */
     if (g != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
-        opd((uint32_t)RAD_BF16, M, n),      /* INOUT: the message AND the input */
+        opd((uint32_t)RAD_BF16, M, n),      /* inout: the message and the input */
         opd((uint32_t)RAD_BF16, M, n),
         opd((uint32_t)RAD_F32,  n),         /* f32 or bf16; the shim reads the operand's own */
         opd((uint32_t)RAD_F8E4M3, M, n),
@@ -1150,7 +1015,8 @@ extern "C" int r4d_shape_ar_rmsnorm_quant_fp8(const RadParam* p, int n_p, int op
 }
 
 /* ==========================================================================================
- * GEMM, dequant and the row top-R (shims in r4d_gemm.cpp and r4d_fp8.cpp).
+ * GEMM, dequant and the row top-R (shims in the r4d_gemm_*.hip units, r4d_dequant_w4_bf16.hip and
+ * r4d_rowtopk_bf16.hip).
  * ========================================================================================= */
 
 extern "C" int r4d_shape_gemm_nt(const RadParam* p, int n_p, int operand,
@@ -1164,13 +1030,10 @@ extern "C" int r4d_shape_gemm_nt(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
-/* gemm_nt_q, THE BLOCK-SCALED FP8 FAMILY ONLY. The other five grids are declined; the file header
- * says why, and it is the same argument tools/opshapes.h makes from the other side.
- *
- * The grid here is stated by the CHECKPOINT -- E4M3 [N][K] against a bf16
- * [ceil(N/128)][ceil(K/128)] plane, with `group` carrying the 128 -- so there is nothing left to
- * guess. The fragment-ordered arrangement the narrow and tiled rows read is a permutation of the
- * same bytes (frag_bytes(N, K) == N * K), so one description sizes every row of the family. */
+/* gemm_nt_q, the block-scaled fp8 family only; the other five grids are declined (file header).
+ * The checkpoint fixes the grid: E4M3 [N][K] against a bf16 [ceil(N/128)][ceil(K/128)] plane,
+ * `group` carrying the 128. The fragment order the narrow and tiled rows read is a permutation of
+ * the same bytes (frag_bytes(N, K) == N * K), so one description sizes every row. */
 extern "C" int r4d_shape_gemm_nt_q(const RadParam* p, int n_p, int operand,
                                    RadOpdDesc* out) {
 
@@ -1184,25 +1047,22 @@ extern "C" int r4d_shape_gemm_nt_q(const RadParam* p, int n_p, int operand,
     if ((!a8 && !a16) || g != R4D_FP8_BLOCK || K <= 0 || N <= 0) return RAD_E_UNSUPPORTED;
     const int64_t kb = (K + g - 1) / g, nb = (N + g - 1) / g;
     const RadOpdDesc l[] = {
-        /* a, a_scale. The matvec reads the bf16 activation DIRECTLY -- there is no quantise launch
-         * in front of it -- and its shim refuses an activation scale outright, because running
-         * anyway would silently drop a scale the caller believes was applied. */
+        /* a, a_scale. The matvec reads the bf16 activation directly, and its shim refuses an
+         * activation scale rather than silently ignoring it. */
         a8 ? opd((uint32_t)RAD_F8E4M3, M, K) : opd((uint32_t)RAD_BF16, M, K),
         a8 ? opd((uint32_t)RAD_F32, M, kb)   : opd_none(),
         opd((uint32_t)RAD_F8E4M3, N, K),     /* the checkpoint's own bytes */
         opd((uint32_t)RAD_BF16, nb, kb),     /* weight_scale_inv, one per 128x128 tile */
         opd((uint32_t)RAD_BF16, M, N),
-        /* `a_sum` belongs to the asymmetric integer grids and `b_ref` to mxfp4. An fp8 grid is
-         * symmetric by construction and has neither. */
+        /* `a_sum` belongs to the asymmetric integer grids and `b_ref` to mxfp4; fp8 has neither. */
         opd_none(),
         opd_none(),
     };
     R4D_PICK(l);
 }
 
-/* The same GEMM with the SwiGLU and the quantiser folded into its epilogue. `N` is the WEIGHT's
- * rows -- twice the fused width, gate then up -- so the quantiser's outputs are N/2 wide, and that
- * factor is the whole reason this op has a schema of its own rather than a flag on gemm_nt_q. */
+/* The same GEMM with the SwiGLU and the quantiser in its epilogue. `N` is the weight's rows, gate
+ * then up, so the quantiser's outputs are N/2 wide (hence a schema of its own). */
 extern "C" int r4d_shape_gemm_nt_q_gated(const RadParam* p, int n_p, int operand,
                                          RadOpdDesc* out) {
 
@@ -1227,18 +1087,15 @@ extern "C" int r4d_shape_gemm_nt_q_gated(const RadParam* p, int n_p, int operand
     R4D_PICK(l);
 }
 
-/* dequant_w4 -- the packed 4-bit weight back to row-major bf16 (shim in r4d_gemm.cpp).
+/* dequant_w4 -- the packed 4-bit weight back to row-major bf16 (shim in r4d_dequant_w4_bf16.hip).
  *
- * The one weight in this plugin whose packed stream a PUBLIC dtype sizes exactly: RAD_I4 is four
- * bits an element, so [N, K] is the N*K/2 bytes r4d_rad_layout_w4 declares. The scale plane is one
- * (f16 scale, f16 -(1024+zero)) dword per (row, group), stored tile-major as [N/16][K/group][16] --
- * which is N * (K/group) dwords however it is grouped, and the kernel reads it at
+ * The one packed weight a public dtype sizes exactly: RAD_I4 is four bits per element, so [N, K]
+ * is the N*K/2 bytes r4d_rad_layout_w4 declares. The scale plane is one (f16 scale,
+ * f16 -(1024+zero)) dword per (row, group), tile-major [N/16][K/group][16], read at
  * [(t * ng + k/group) * 16 + r].
  *
- * NEITHER STREAM'S CONTENT IS EXPRESSIBLE and that is worth knowing before reading a result: a
- * packed nibble plane and a scale dword are bit layouts, not numbers, so the caller's fill leaves
- * them zeroed or filled with small integers. The extents are exact, which is what a timing harness
- * needs; a correctness comparison would be comparing two dequantisations of the same nonsense. */
+ * Neither stream's content is expressible (bit layouts, not numbers), so the extents are exact for
+ * timing but a correctness comparison here means nothing. */
 extern "C" int r4d_shape_dequant_w4(const RadParam* p, int n_p, int operand,
                                     RadOpdDesc* out) {
 
@@ -1248,7 +1105,8 @@ extern "C" int r4d_shape_dequant_w4(const RadParam* p, int n_p, int operand,
     if (N <= 0 || K <= 0 || g <= 0 || N % R4D_NTILE || K % g) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
         opd((uint32_t)RAD_I4, N, K),
-        opd((uint32_t)RAD_U32, N / R4D_NTILE, (K / g) * R4D_NTILE),
+        /* i32, not u32: a u32 operand is filled with zeroes (see opd_sample_params). */
+        opd((uint32_t)RAD_I32, N / R4D_NTILE, (K / g) * R4D_NTILE),
         opd((uint32_t)RAD_BF16, N, K),
     };
     R4D_PICK(l);
@@ -1256,14 +1114,11 @@ extern "C" int r4d_shape_dequant_w4(const RadParam* p, int n_p, int operand,
 
 /* ---- the routed mixture of experts (shims in r4d_moe.hip) --------------------------------------
  *
- * `expert_offset` IS NOT A FREE DRAW and no fill domain in the ABI says so: it is moe_scatter's
- * output, a non-decreasing prefix array ending at the live row count, and the expert that owns a
- * sorted row is found by searching it. Drawn at random it is a malformed histogram, so two
- * implementations that search it differently can pick different experts and disagree without
- * either being wrong. The EXTENTS are exactly right, which is what a benchmark needs; a
- * correctness comparison over an op that reads it proves less than it looks like. libref's
- * description of the same operand says the same thing, which is the point -- the two plugins have
- * to agree about what a case means before they can be compared. */
+ * `expert_offset` is moe_scatter's output, a non-decreasing prefix array ending at the live row
+ * count, searched to find a sorted row's expert. No ABI fill domain produces that, so a random draw
+ * is a malformed histogram and two implementations may search it differently without either being
+ * wrong. The extents are right for a benchmark; a correctness comparison over an op that reads it
+ * proves little. libref describes the operand the same way. */
 extern "C" int r4d_shape_scale_rows(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
     if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
@@ -1272,9 +1127,8 @@ extern "C" int r4d_shape_scale_rows(const RadParam* p, int n_p, int operand, Rad
     R4D_PICK(l);
 }
 
-/* The per-tensor scalar: one [1] weight broadcast over the whole [M, n] extent. `s` is the middle
- * operand; its extent is 1, not M (that would be scale_rows) and not M*n (that would be a
- * per-element mask). The scalar's dtype is the stream's, so a bf16 or f32 `s` both read. */
+/* The per-tensor scalar: one [1] weight `s` (the middle operand) broadcast over [M, n]. Its dtype
+ * is the stream's, bf16 or f32. */
 extern "C" int r4d_shape_scale(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
     if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
@@ -1297,18 +1151,17 @@ extern "C" int r4d_shape_router_topk(const RadParam* p, int n_p, int operand, Ra
     R4D_PICK(l);
 }
 
-/* The two shape functions concatenated, with `expert_ids` named ONCE -- it is an output here, not
- * an input, which is the only difference between this list and the pair's two. */
+/* router_topk's and moe_scatter's lists concatenated, with `expert_ids` named once (here an
+ * output). */
 extern "C" int r4d_shape_router_topk_scatter(const RadParam* p, int n_p, int operand,
                                              RadOpdDesc* out) {
     const int64_t M  = pi(p, n_p, "M");
     const int64_t ne = pi(p, n_p, "n_expert");
     const int64_t k  = pi(p, n_p, "top_k");
     if (ne <= 0 || ne > 256 || k <= 0 || k > ne) return RAD_E_UNSUPPORTED;
-    /* The sort's single-workgroup bound, stated here too so the workbench never draws a shape the
-     * shim will refuse. 1024 is `kScatterSmall`. */
+    /* The sort's single-workgroup bound (`kScatterSmall`), which the shim enforces. */
     if (M * k > 1024) return RAD_E_UNSUPPORTED;
-    /* The sort's three outputs are sized by THIS RANK'S SLICE, not by the router. */
+    /* The sort's three outputs are sized by this rank's slice of experts, not by the router. */
     const int64_t nl = pi(p, n_p, "n_local", ne);
     if (nl <= 0 || nl > ne) return RAD_E_UNSUPPORTED;
     const uint32_t D = dt_act(p, n_p, "dtype");
@@ -1322,16 +1175,16 @@ extern "C" int r4d_shape_router_topk_scatter(const RadParam* p, int n_p, int ope
     };
     R4D_PICK(l);
 }
-/* The router's gemm_nt in front of router_topk_scatter, and the shared gate's gemm_nt at N = 1
- * beside it: the three lists, with `logits` named once as the GEMM's output. */
+/* The router's gemm_nt before router_topk_scatter, plus the shared gate's gemm_nt at N = 1: the
+ * three lists, with `logits` named once as the GEMM's output. */
 extern "C" int r4d_shape_router_gemm_topk_scatter(const RadParam* p, int n_p, int operand,
                                                   RadOpdDesc* out) {
     const int64_t M  = pi(p, n_p, "M");
     const int64_t K  = pi(p, n_p, "K");
     const int64_t ne = pi(p, n_p, "n_expert");
     const int64_t k  = pi(p, n_p, "top_k");
-    /* 512 experts: the selection keeps sixteen logits a lane (kMaxExpert in r4d_moe.hip), which
-     * is the shim's bound and the row's constraint. */
+    /* At most 512 experts: the selection keeps sixteen logits per lane (kMaxExpert in
+     * r4d_moe.hip), the shim's bound and the row's constraint. */
     if (ne <= 0 || ne > 512 || k <= 0 || k > ne || K <= 0) return RAD_E_UNSUPPORTED;
     if (M > 64 || M * k > 1024) return RAD_E_UNSUPPORTED;
     const int64_t nl = pi(p, n_p, "n_local", ne);
@@ -1357,7 +1210,7 @@ extern "C" int r4d_shape_moe_scatter(const RadParam* p, int n_p, int operand, Ra
     const int64_t k  = pi(p, n_p, "top_k");
     if (ne <= 0 || ne > 256 || k <= 0) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
-        /* Expert ids index EXPERTS, which is no operand's dim 0, so the range is stated. */
+        /* Expert ids index experts, no operand's dim 0, so the range is stated. */
         opd_idx(M, k, ne, -1),
         opd((uint32_t)RAD_I32, M * k),
         opd((uint32_t)RAD_I32, ne + 1),
@@ -1379,25 +1232,23 @@ extern "C" int r4d_shape_moe_gemm_q(const RadParam* p, int n_p, int operand, Rad
     const int64_t N = N0 > N1 ? N0 : N1, K = K0 > K1 ? K0 : K1;
     const int64_t ne0 = (ne + 1) / 2, ne1 = ne / 2;
     const uint32_t D = dt_act(p, n_p, "dtype");
-    /* `a_order` decides the activation's row count: one per token, or one per (token, slot)
-     * already in the scatter's order. A description that took the wrong reading would build the
-     * operand at the other extent, and nothing about the case would look like a shape error. */
+    /* `a_order` sets the activation's row count: one per token, or one per (token, slot) already
+     * in scatter order ("sorted"). */
     const char* ord = rad_param_gets(p, n_p, "a_order", nullptr);
     const int64_t AR = (ord && !std::strcmp(ord, "sorted")) ? M * k : M;
     const RadOpdDesc l[] = {
         opd((uint32_t)RAD_F8E4M3, AR, K),                 /* a -- see `a_order` */
         opd((uint32_t)RAD_F32, AR, (K + g - 1) / g),      /* a_scale */
-        /* THE WEIGHT OPERANDS ARE TABLES at issue and are described here as the STACKED plane they
-         * would be if they were one tensor. A fixture has nowhere to put a pointer array, and the
-         * kernel reads both forms (r4d_moe.hip, wtab_at) precisely so that a described case runs
-         * against the same bytes the engine would hand it. */
+        /* The weight operands are tables when issued, described here as one stacked plane; a
+         * fixture cannot hold a pointer array, and the kernel reads both forms (r4d_moe.hip,
+         * wtab_at). */
         opd((uint32_t)RAD_F8E4M3, ne0, N0, K0),           /* w -- the even experts */
         opd((uint32_t)RAD_BF16, ne0, (N0 + g - 1) / g, (K0 + g - 1) / g),   /* w_scale */
         opd_idx(M * k, 0, M * k, -1),                     /* sorted_tok */
         opd_idx(ne + 1, 0, M * k + 1, -1),                /* expert_offset -- see the note above */
         opd((uint32_t)RAD_F8E4M3, ne1, N1, K1),           /* w_odd -- the odd experts */
         opd((uint32_t)RAD_BF16, ne1, (N1 + g - 1) / g, (K1 + g - 1) / g),   /* w_odd_scale */
-        opd(D, M * k, N),                                 /* y -- in SORTED order */
+        opd(D, M * k, N),                                 /* y, in sorted order */
     };
     R4D_PICK(l);
 }
@@ -1453,12 +1304,10 @@ extern "C" int r4d_shape_moe_gather(const RadParam* p, int n_p, int operand, Rad
     const RadOpdDesc l[] = {
         opd(D, M * k, n),
         opd(D, M, k),
-        /* DISTINCT, and it has to be: gather rebuilds the INVERSE permutation of sorted_tok, so a
-         * repeated entry makes two sorted rows claim one (token, slot) and the last writer wins --
-         * by whichever workgroup lands last, which is a measurement of the scheduler. */
+        /* Distinct: gather rebuilds the inverse permutation of sorted_tok, and a repeated entry
+         * would let two sorted rows race for one (token, slot). */
         opd_idx(M * k, 0, M * k, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE),
-        /* shared and shared_gate -- optional, described anyway so a cold caller allocates them
-         * and exercises the folded form. */
+        /* shared and shared_gate: optional, described so a caller exercises the folded form. */
         opd(D, M, n),
         opd(D, M),
         opd(D, M, n),
@@ -1466,11 +1315,8 @@ extern "C" int r4d_shape_moe_gather(const RadParam* p, int n_p, int operand, Rad
     R4D_PICK(l);
 }
 
-/* row_topk -- exact per-row top-R of a wide bf16 matrix (shim in r4d_gemm.cpp).
- *
- * R is capped at 32 by the entry point (stage 2's PT, "a real limit, not a tuning choice") even
- * though libr4d's own row says 1024; the constraint is transcribed as written and the shim refuses
- * above 32, so a band naming a wider R is declined here rather than described into a refusal. */
+/* row_topk -- exact per-row top-R of a wide bf16 matrix (shim in r4d_rowtopk_bf16.hip). R is at
+ * most 32, stage 2's PT. */
 extern "C" int r4d_shape_row_topk(const RadParam* p, int n_p, int operand,
                                   RadOpdDesc* out) {
 
@@ -1483,13 +1329,10 @@ extern "C" int r4d_shape_row_topk(const RadParam* p, int n_p, int operand,
         opd(D, M, N),
         opd((uint32_t)RAD_I32, M, R),
         opd((uint32_t)RAD_F32, M, R),
-        /* `pairs` is the VOCAB-PARALLEL form and both halves of it are optional -- absent, with
-         * `vocab_off` zero, is the single-rank launch bit for bit. It is described anyway, and for
-         * the reason ref's description of the same operand gives: it is an OUTPUT, so nothing has
-         * to fill it, and comparing it is what checks the packing convention -- an int32 id
-         * memcpy'd into the first float slot beside its value, with id -1 for a slot the row could
-         * not fill. f32 for exactly that reason: the ID is carried by BIT PATTERN, and a
-         * word-typed plane could not hold the value. */
+        /* `pairs`, the vocab-parallel output (optional; absent with `vocab_off` zero is the
+         * single-rank launch). Described, as in ref, because comparing it checks the packing: an
+         * int32 id memcpy'd into the first float slot beside its value, id -1 for an unfilled
+         * slot. f32 because the id travels as a bit pattern while the value must be a float. */
         opd((uint32_t)RAD_F32, M, R, 2),
     };
     R4D_PICK(l);
@@ -1503,15 +1346,12 @@ extern "C" int r4d_shape_row_topk_merge(const RadParam* p, int n_p, int operand,
     const int64_t W = pi(p, n_p, "world_size");
     if (R > 32) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
-        /* [M, world_size * R, 2] f32 pairs with rank r's at [r*R, (r+1)*R), an int32 id in the
-         * first slot of each. THE PLANE IS f32 AND THAT IS WHY THIS ONE IS DESCRIBABLE where
-         * `sample_merge_topk`'s is not: a normal fill puts a REAL float in the value lane, which is
-         * the lane the merge orders on, and the id lane is that same float's bit pattern read as an
-         * int32. A negative float is then a negative id, which the kernel drops as a pad
-         * (`if (id < 0) continue`), and a positive one is a large but perfectly legal id that is
-         * only ever compared against the others and copied out. So about half the candidates are
-         * pads and the rest are ordered exactly -- ties are impossible between distinct normals --
-         * which exercises the pad rule and the ordering in one case. */
+        /* [M, world_size * R, 2] f32 pairs, rank r's at [r*R, (r+1)*R), an int32 id in the first
+         * slot of each. Describable, unlike `sample_merge_topk`, because the plane is f32: a normal
+         * fill puts a real float in the value lane the merge orders on, and the id lane reads the
+         * same bits as an int32. A negative id is a pad the kernel drops, a positive one a large
+         * legal id, so about half the candidates are pads and the rest are ordered without ties,
+         * exercising both rules. */
         opd((uint32_t)RAD_F32, M, W * R, 2),
         opd((uint32_t)RAD_I32, M, R),
         opd((uint32_t)RAD_F32, M, R),
@@ -1519,10 +1359,8 @@ extern "C" int r4d_shape_row_topk_merge(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
-/* pair_argmax (r4d_pair_argmax_f32.hip): row_topk_merge at R = 1 over `n` gathered pairs, so the
- * same f32 plane and the same reading of it -- the value lane draws proper floats, the id lane
- * their bit patterns, a negative one a pad and a positive one a legal id -- and one id and one
- * value a row out. */
+/* pair_argmax (r4d_pair_argmax_f32.hip): row_topk_merge at R = 1 over `n` gathered pairs, with
+ * the same f32 plane and fill reading, and one id and one value out per row. */
 extern "C" int r4d_shape_pair_argmax(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
     if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
@@ -1535,14 +1373,12 @@ extern "C" int r4d_shape_pair_argmax(const RadParam* p, int n_p, int operand, Ra
 }
 
 /* ==========================================================================================
- * Quantisation, the norms and the fusions (shims in r4d_quant.cpp and r4d_fp8.cpp).
+ * Quantisation, the norms and the fusions (shims beside their kernels).
  *
- * TWO FAMILIES, AND THE SCALE IS WHAT SEPARATES THEM. The int8 side is ROTATED and carries ONE f32
- * scale per row -- the block Walsh-Hadamard is what makes a single scale per row viable at all --
- * and its `group` parameter is the ROTATION WIDTH, not a scale grid.
- * The fp8 side has no rotation and carries an f32 scale per (row, 128 columns), because 128
- * is the block the CHECKPOINT's weight scales are taken over. A description that swapped the two
- * would be off by a factor of n/128 on the scale plane and would still look plausible.
+ * Two families, separated by the scale. The int8 side carries one f32 scale per row; its `group`
+ * is the rotation width of the rotated forms (the block Walsh-Hadamard makes one scale viable) and
+ * the width of quant_act_i8's code sums, never a scale grid. The fp8 side is not rotated and
+ * carries an f32 scale per (row, 128 columns), the block the checkpoint's weight scales use.
  * ========================================================================================= */
 
 extern "C" int r4d_shape_quant_act_i8(const RadParam* p, int n_p, int operand,
@@ -1550,26 +1386,15 @@ extern "C" int r4d_shape_quant_act_i8(const RadParam* p, int n_p, int operand,
 
     const int64_t M = pi(p, n_p, "M");
     const int64_t n = pi(p, n_p, "n");
+    const int64_t g = pi(p, n_p, "group");
     const uint32_t D = dt_act(p, n_p, "dtype");
     const RadOpdDesc l[] = {
         opd(D, M, n),
         opd((uint32_t)RAD_I8, M, n),
-        /* ONE SCALE PER ROW, AND THIS IS WHERE THE TWO PLUGINS DISAGREE ABOUT `group`.
-         * r4d_quant_act_i8 takes no group argument at all: its kernel writes `S[row] = amax/127`
-         * and nothing else, whatever `group` says -- the key reaches this op only to size the
-         * `_asum` form's per-group sums. ref's `quant_act_i8` reads `group` as the number of
-         * elements sharing one scale and writes ceil(n/group) of them a row, so at the
-         * declaration the MTP block makes (n = n_embd, group = 128) the two produce different
-         * planes and only libr4d's is what the w2a8 GEMM consumes. This description says what THIS
-         * kernel writes; the disagreement is real and is reported rather than papered over by
-         * describing a plane libr4d never fills. */
         opd((uint32_t)RAD_F32, M, 1),
-        /* THE THIRD OUTPUT SELECTS THE `_asum` FORM, whose [K/group][ceil(M/16)*16] group-major
-         * sums the ASYMMETRIC weight grids subtract. Absent here: it is the form the engine
-         * issues, and libref implements no asymmetric grid, so passing the buffer would
-         * compare a zeroed reference against a real one and report a gap in the ORACLE as a fault
-         * in the kernel. */
-        opd_none(),
+        /* The `_asum` form's group-major sums: whole 16-row tiles, as the asymmetric GEMMs read
+         * them. */
+        g > 0 && n % g == 0 ? opd((uint32_t)RAD_F32, n / g, (M + 15) / 16 * 16) : opd_none(),
     };
     R4D_PICK(l);
 }
@@ -1599,8 +1424,8 @@ extern "C" int r4d_shape_rmsnorm_had_quant_i8(const RadParam* p, int n_p, int op
         opd(D, M, n),                       /* residual, the fused_add_rms_norm form */
         opd((uint32_t)RAD_BF16, n),         /* bf16 gain; see r4d_shape_ar_ln_had_quant_i8 */
         opd((uint32_t)RAD_I8, M, n),
-        opd((uint32_t)RAD_F32, M, 1),       /* one scale per ROW */
-        opd(D, M, n),                       /* out_bf16, UNROTATED, for a bf16 consumer */
+        opd((uint32_t)RAD_F32, M, 1),       /* one scale per row */
+        opd(D, M, n),                       /* out_bf16, unrotated, for a bf16 consumer */
     };
     R4D_PICK(l);
 }
@@ -1612,13 +1437,12 @@ extern "C" int r4d_shape_gated_had_quant_i8(const RadParam* p, int n_p, int oper
     const int64_t n = pi(p, n_p, "n");
     const uint32_t D = dt_act(p, n_p, "dtype");
     const RadOpdDesc l[] = {
-        /* THE PACKED gate_up FORM: `b` absent means the two halves are one [M, 2n] tensor and `b`
-         * is `a + n`, which is vLLM's layout and the one the MLP actually produces. The two-buffer
-         * form is the same op at a different pitch, and only one of the two can be described. */
+        /* The packed gate_up form: `b` absent means one [M, 2n] tensor with `b` at `a + n`, vLLM's
+         * layout and what the MLP produces. The two-buffer form differs only in pitch. */
         opd(D, M, 2 * n),
         opd_none(),
         opd((uint32_t)RAD_I8, M, n),
-        opd((uint32_t)RAD_F32, M, 1),       /* one scale per ROW */
+        opd((uint32_t)RAD_F32, M, 1),       /* one scale per row */
     };
     R4D_PICK(l);
 }
@@ -1630,26 +1454,24 @@ extern "C" int r4d_shape_gdn_gated_norm_had_quant_i8(const RadParam* p, int n_p,
     const int64_t n  = pi(p, n_p, "n");
     const int64_t hd = pi(p, n_p, "head_dim");
     const uint32_t D = dt_act(p, n_p, "dtype");
-    /* The RMS is per HEAD while the rotation and the int8 scale are per TOKEN, which is why this
-     * fusion has no unfused equivalent in the vocabulary -- and why the gain is head_dim floats
-     * and not n of them. The shim checks exactly that (`wgain is 128 floats, not K`).
+    /* The RMS is per head while the rotation and the int8 scale are per token (so no unfused
+     * equivalent exists), and the gain is head_dim floats, not n; the shim checks this.
      *
-     * `zgrp` / `zblk` describe an INTERLEAVED qkvz projection, where element i of the flattened
-     * row sits at (i / zblk) * zgrp + (i % zblk). Absent means a contiguous gate, which is the
-     * shape this describes; the interleaved one is a column view of a wider plane whose width no
-     * parameter of this op carries. */
+     * `zgrp` / `zblk` describe an interleaved qkvz projection, element i of the flattened row at
+     * (i / zblk) * zgrp + (i % zblk). Only the contiguous gate is described; the interleaved one
+     * is a column view of a plane whose width no parameter carries. */
     if (pi(p, n_p, "zgrp", 0) != 0) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
         opd(D, M, n),
         opd(D, M, n),
         opd((uint32_t)RAD_F32, hd),
         opd((uint32_t)RAD_I8, M, n),
-        opd((uint32_t)RAD_F32, M, 1),       /* one scale per ROW */
+        opd((uint32_t)RAD_F32, M, 1),       /* one scale per row */
     };
     R4D_PICK(l);
 }
 
-/* ---- the fp8 side. `group` is the SCALE GRID here and is 128 by the checkpoint. ---- */
+/* ---- the fp8 side. `group` is the scale grid here, 128 from the checkpoint. ---- */
 
 extern "C" int r4d_shape_quant_act_fp8(const RadParam* p, int n_p, int operand,
                                        RadOpdDesc* out) {
@@ -1657,7 +1479,7 @@ extern "C" int r4d_shape_quant_act_fp8(const RadParam* p, int n_p, int operand,
     const int64_t M = pi(p, n_p, "M");
     const int64_t n = pi(p, n_p, "n");
     const int64_t g = pi(p, n_p, "group", R4D_FP8_BLOCK);
-    const uint32_t D = dt_act(p, n_p, "dtype");   /* the INPUT's width; the output is E4M3 */
+    const uint32_t D = dt_act(p, n_p, "dtype");   /* the input's width; the output is E4M3 */
     if (g != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
         opd(D, M, n),
@@ -1667,19 +1489,8 @@ extern "C" int r4d_shape_quant_act_fp8(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
-/* H += X^T X. `n` is K on BOTH axes of the accumulator, which is what makes this op's shape hook
- * worth reading: a caller that passed a [M][n] `h` by analogy with every other op here would be
- * refused by name rather than silently accumulating a row block. */
-/* The QSA compressed key. `M` is BLOCKS and the key operand is `ratio` times taller, which is the
- * one thing a caller sizing buffers off this hook has to read rather than assume. */
-/* The QSA block score. `pages` is the block-key store's height and is NOT derivable from this
- * op's parameters -- it is however many pages the KV pool has, which the runtime decides -- so the
- * hook reports the widest thing a table entry can address and a caller sizing a store off it is
- * getting a bound, not the plan. `bt` entries are PAGE IDS. */
-/* The QSA selection. `sel` is `topk + 1` wide and the extra slot is the PARTIAL PAGE, not spare:
- * sized at `topk` it would drop the newest tokens on three queries in four. */
-/* The work list. `M` is the TOKEN count and `work` the block bound, and they are different
- * numbers with different meanings -- one op, two extents, which is why both are parameters. */
+/* The QSA work list. `M` is the token count and `work` the block bound: two different extents,
+ * hence two parameters. */
 extern "C" int r4d_shape_qsa_work(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
 
     const int64_t M = pi(p, n_p, "M");
@@ -1693,13 +1504,13 @@ extern "C" int r4d_shape_qsa_work(const RadParam* p, int n_p, int operand, RadOp
     const RadOpdDesc l[] = {
         opd(D, M, n),
         opd_idx(M, 1, M * r),          /* positions */
-        opd_idx(s + 1, 1, M + 1),      /* cu_seqlens; a drawn one is not ascending -- see below */
-        /* THE TAIL STATE, SHAPED AS THE GROUP BINDS IT: [slots, heads, ring, n] with heads 1.
-         * One slot a sequence is the narrowest case that still makes `sidx` mean something. */
+        opd_idx(s + 1, 1, M + 1),      /* cu_seqlens; a drawn one is not ascending, see below */
+        /* The tail state as the group binds it: [slots, heads, ring, n], heads 1. One slot per
+         * sequence, the narrowest case in which `sidx` means something. */
         opd(D, s, 1, g, n),
         opd_idx(s, 1, s),              /* the state row; one column, values inside the pool */
         opd_idx(s, W, W),              /* the block-key block table */
-        opd_none(),                    /* rope: the one-component form, which is every text model */
+        opd_none(),                    /* rope: the one-component form (every text model) */
         opd(D, W * r, n),
         opd((uint32_t)RAD_I32, W),
         opd((uint32_t)RAD_I32, W),
@@ -1708,8 +1519,8 @@ extern "C" int r4d_shape_qsa_work(const RadParam* p, int n_p, int operand, RadOp
     R4D_PICK(l);
 }
 
-/* The tail. `seqs` is a parameter AND `cu` is `seqs + 1` long; the shim takes the count from the
- * operand at run time, and this hook only has to size a buffer. */
+/* The QSA tail store. `cu` is `seqs + 1` long; the shim takes the count from the operand at run
+ * time, so `seqs` here only sizes the buffer. */
 extern "C" int r4d_shape_qsa_tail_store(const RadParam* p, int n_p, int operand,
                                         RadOpdDesc* out) {
 
@@ -1723,14 +1534,16 @@ extern "C" int r4d_shape_qsa_tail_store(const RadParam* p, int n_p, int operand,
     const RadOpdDesc l[] = {
         opd(D, M, n),
         opd_idx(M, 1, M * r),          /* positions; bounded by what the tail can index */
-        opd_idx(s + 1, 1, M + 1),      /* cu_seqlens, ASCENDING -- a drawn one is not, and a
-                                        * synthesised case here tests the scan and not the copy */
+        opd_idx(s + 1, 1, M + 1),      /* cu_seqlens should ascend; a drawn one does not, so a
+                                        * synthesised case tests the scan, not the copy */
         opd(D, s, 1, g, n),            /* the tail state: [slots, heads, ring, n], heads 1 */
         opd_idx(s, 1, s),              /* the state row; one column, values inside the pool */
     };
     R4D_PICK(l);
 }
 
+/* The QSA selection. `sel` is `topk + 1` wide: the extra slot is the partial page, without which
+ * the newest tokens would be dropped. */
 extern "C" int r4d_shape_qsa_select(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
 
     const int64_t M  = pi(p, n_p, "M");
@@ -1743,7 +1556,7 @@ extern "C" int r4d_shape_qsa_select(const RadParam* p, int n_p, int operand, Rad
     const RadOpdDesc l[] = {
         opd((uint32_t)RAD_F32, M, nb),
         opd_idx(s, nb, nb),                   /* page ids, and they index nothing wider */
-        opd_idx(s, 1, nb + 1),                /* complete blocks a SEQUENCE, so at most nb */
+        opd_idx(s, 1, nb + 1),                /* complete blocks per sequence, at most nb */
         opd_idx(M, 1, nb * r),                /* the query's own position */
         opd_idx(s + 1, 1, M + 1, -1, RAD_OPD_F_IDX_CU),
         opd((uint32_t)RAD_I32, M, k + 1),
@@ -1753,6 +1566,9 @@ extern "C" int r4d_shape_qsa_select(const RadParam* p, int n_p, int operand, Rad
     R4D_PICK(l);
 }
 
+/* The QSA block score. The block-key store's height is the KV pool's page count, which the
+ * runtime decides, so `blocks` gives the widest a table entry can address: a bound, not the plan.
+ * Table entries are page ids. */
 extern "C" int r4d_shape_qsa_score(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
 
     const int64_t M  = pi(p, n_p, "M");
@@ -1765,16 +1581,16 @@ extern "C" int r4d_shape_qsa_score(const RadParam* p, int n_p, int operand, RadO
     const RadOpdDesc l[] = {
         opd(D, M, h * n),
         opd(D, nb, n),                 /* the store, bounded by the blocks one query can address */
-        /* The table holds PAGE IDS, so a synthesised one must index the store and nothing wider.
-         * Drawn from the operand before it by the ABI's default, which is exactly right here. */
+        /* Page ids, which must index the store: the ABI default (the previous operand) fits. */
         opd_idx(s, nb, 0),
         opd_idx(s + 1, 1, M + 1, -1, RAD_OPD_F_IDX_CU),
-        opd_idx(s, 1, nb + 1),         /* complete blocks a sequence, so at most nb */
+        opd_idx(s, 1, nb + 1),         /* complete blocks per sequence, at most nb */
         opd((uint32_t)RAD_F32, M, nb),
     };
     R4D_PICK(l);
 }
 
+/* The QSA compressed key. `M` counts blocks, and the key input is `ratio` times taller. */
 extern "C" int r4d_shape_qsa_block_key(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
 
     const int64_t M = pi(p, n_p, "M");
@@ -1792,6 +1608,8 @@ extern "C" int r4d_shape_qsa_block_key(const RadParam* p, int n_p, int operand, 
     R4D_PICK(l);
 }
 
+/* H += X^T X. The accumulator is [n][n] (K on both axes), not [M][n] as elsewhere; a row-shaped
+ * `h` is refused. */
 extern "C" int r4d_shape_gram_accum(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
 
     const int64_t M = pi(p, n_p, "M");
@@ -1827,13 +1645,12 @@ extern "C" int r4d_shape_rmsnorm_quant_fp8(const RadParam* p, int n_p, int opera
     if (g != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
         opd(D, M, n),
-        /* THE RESIDUAL IS SECOND, where `rmsnorm_had_quant_i8` puts it, so the two ops differ by
-         * the rotation and nothing else. Passed: it is what turns `add` + `rmsnorm` into one
-         * launch and it is what every caller in this tree issues. It may ALIAS out_bf16 in the
-         * engine; a tool allocating two buffers is the safe case of that. */
+        /* The residual is second, as in `rmsnorm_had_quant_i8`, so the two ops differ only by
+         * the rotation. Passed, as every caller issues it. The engine may alias it with
+         * out_bf16; separate buffers are the safe case. */
         opd(D, M, n),
-        /* f32 or bf16 -- the shim reads the operand's own width and hands the kernel a flag.
-         * Every architecture plugin here declares its norm gains f32. */
+        /* f32 or bf16: the shim reads the operand's width and passes the kernel a flag. Every
+         * architecture plugin declares norm gains f32. */
         opd((uint32_t)RAD_F32, n),
         opd((uint32_t)RAD_F8E4M3, M, n),
         opd((uint32_t)RAD_F32, M, (n + g - 1) / g),
@@ -1851,7 +1668,7 @@ extern "C" int r4d_shape_gated_quant_fp8(const RadParam* p, int n_p, int operand
     const uint32_t D = dt_act(p, n_p, "dtype");
     if (g != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
-        opd(D, M, 2 * n),                   /* gate then up in one buffer; splitting is a copy */
+        opd(D, M, 2 * n),                   /* gate then up in one buffer */
         opd((uint32_t)RAD_F8E4M3, M, n),
         opd((uint32_t)RAD_F32, M, (n + g - 1) / g),
         opd(D, M, n),
@@ -1867,10 +1684,9 @@ extern "C" int r4d_shape_gate_quant_fp8(const RadParam* p, int n_p, int operand,
     const int64_t g = pi(p, n_p, "group", R4D_FP8_BLOCK);
     const uint32_t D = dt_act(p, n_p, "dtype");
     if (g != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
-    /* THE ROW IS A (token, head) PAIR here, not a token: `M` is tokens * n_head and `n` is
-     * head_dim, which is what makes the gate a fixed stride inside the [q|gate] projection and
-     * leaves the scale plane byte-for-byte where the out projection reads it. The gate is a COLUMN
-     * SLICE in the engine; described flat, because a slice is a pitch and the extents are these. */
+    /* A row is a (token, head) pair: `M` is tokens * n_head and `n` is head_dim, so the gate is a
+     * fixed stride inside the [q|gate] projection and the scale plane lands where the out
+     * projection reads it. In the engine the gate is a column slice; described flat. */
     const RadOpdDesc l[] = {
         opd(D, M, n),
         opd(D, M, n),
@@ -1882,8 +1698,7 @@ extern "C" int r4d_shape_gate_quant_fp8(const RadParam* p, int n_p, int operand,
 }
 
 /* ==========================================================================================
- * DFlash2 (shims in r4d_gdn.cpp). Neither op has an unfused equivalent in the vocabulary and
- * neither has a ref implementation, so a tool's only description of them is this one.
+ * DFlash2 (shims in r4d_dflash_conv_t2_g16_bf16.hip and r4d_dflash_select_bf16.hip). Neither op has an unfused equivalent or a ref implementation.
  * ========================================================================================= */
 
 extern "C" int r4d_shape_dflash_conv(const RadParam* p, int n_p, int operand,
@@ -1895,19 +1710,17 @@ extern "C" int r4d_shape_dflash_conv(const RadParam* p, int n_p, int operand,
     const int64_t NG   = pi(p, n_p, "NG");
     const int64_t grp  = pi(p, n_p, "group_size");
     const uint32_t D   = dt_act(p, n_p, "dtype");
-    /* The entry point's own conditions: NG is H/group and a thread owns eight channels. Checked
-     * here so a geometry that cannot be served declines rather than being described into -1. */
+    /* The entry point's conditions: NG is H/group and a thread owns eight channels. */
     if (H <= 0 || grp <= 0 || NG <= 0 || taps <= 0) return RAD_E_UNSUPPORTED;
     if (H % (grp * 8) || NG != H / grp) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
         opd(D, T, H),
-        /* delta IS A SLICE of the [T, 2, taps, NG] kernel projection and its row pitch is
-         * 2*taps*NG, not taps*NG -- passing the packed pitch silently reads the other side's
-         * coefficients and is not a shape error. Declared with the projection's own rank so the
-         * pitch falls out of the shape rather than being asserted. */
+        /* delta is a slice of the [T, 2, taps, NG] kernel projection, row pitch 2*taps*NG; a
+         * packed pitch would silently read the other side's coefficients. Declared at the
+         * projection's rank so the shape carries the pitch. */
         opd(D, T, 2, taps, NG),
-        opd(D, taps, H),                    /* base_kernel: a WEIGHT, contiguous [taps, H] */
-        opd(D, T, H),                       /* out -- must not alias x, which two buffers are */
+        opd(D, taps, H),                    /* base_kernel: a weight, contiguous [taps, H] */
+        opd(D, T, H),                       /* out; must not alias x */
     };
     R4D_PICK(l);
 }
@@ -1923,22 +1736,19 @@ extern "C" int r4d_shape_dflash_select(const RadParam* p, int n_p, int operand,
     const int64_t astr  = pi(p, n_p, "anchor_stride", 1);
     const uint32_t D    = dt_act(p, n_p, "dtype");
     if (M <= 0 || astr < 1) return RAD_E_UNSUPPORTED;
-    /* The three input planes are read at row s*steps+l, so between them they must hold M*steps
-     * rows -- a short one is a walk that reads another sequence's candidates and proposes a
-     * perfectly plausible draft belonging to the wrong request. */
+    /* The three input planes are read at row s*steps+l, so each holds M*steps rows; a short one
+     * would read another sequence's candidates. */
     const int64_t rows = M * steps;
     const RadOpdDesc l[] = {
-        /* CANDIDATE TOKEN IDS, AND THEY ARE GATHER ROWS: the walk scores an edge by reading
-         * pred[id] and succ[id] out of two [n_vocab, rank] codebooks, so a candidate outside the
-         * vocabulary reads off the end of a 1.2 GiB weight. The codebooks are the operands four
-         * and five, not the one before this, so the ABI's default range is the wrong one and
-         * n_vocab is said outright. */
+        /* Candidate token ids, used as gather rows: the walk reads pred[id] and succ[id] from two
+         * [n_vocab, rank] codebooks (operands 4 and 5), so the range is n_vocab, not the ABI
+         * default. */
         opd_idx(rows, K, V),
         opd((uint32_t)RAD_F32, rows, K),
         opd(D, rows, R),
-        /* `anchor` is usually the step's own token_ids, which carries `block` ids a sequence with
-         * the anchor first -- hence the stride. It is gathered from the codebooks exactly as the
-         * candidates are, so it has the same range. The buffer has to hold (M-1)*stride + 1. */
+        /* `anchor` is usually the step's token_ids, `block` ids per sequence with the anchor
+         * first, hence the stride. Gathered like the candidates, so the same range. The buffer
+         * holds (M-1)*stride + 1. */
         opd_idx((M - 1) * astr + 1, 0, V),
         opd(D, V, R),
         opd(D, V, R),

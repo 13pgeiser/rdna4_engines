@@ -1,22 +1,23 @@
-/* rad_qsa.h -- Qwen4-Exp's QSA indexer: the part of a full-attention layer that decides WHICH
- * blocks of key history that layer's attention reads.
+/* rad_qsa.h -- Qwen4-Exp's QSA indexer: decides which blocks of key history a full-attention
+ * layer's attention reads.
  *
- * docs/QSA.md is the decomposition and the argument; this is the declaration side of it. The
- * kernels are libr4d's `qsa_block_key`, `qsa_score` and `qsa_select`, and the sparse attention is
- * the ORDINARY `attn_paged` issued with the selection in place of the sequence's own block table
- * -- both of those are plain operands, so nothing in core/ learns what QSA is.
+ * docs/QSA.md has the design; this is the declaration side. The kernels are libr4d's
+ * `qsa_block_key`, `qsa_score` and `qsa_select`; the sparse attention is the ordinary `attn_paged`
+ * issued with the selection in place of the sequence's block table (both plain operands, so core/
+ * knows nothing of QSA).
  *
- * WHAT IS HERE is the whole indexer: the projection and the query path, the block-key path with
- * its two states, and the score and selection the sparse attention is issued with. Below
- * `budget + ratio - 1` tokens of context the selection is EVERY visible block, so the sparse path
- * must reproduce the dense path's text byte for byte -- which is the oracle any change to this
- * file is checked against.
+ * Contents: the projection and query path, the block-key path with its two states, and the score
+ * and selection. Below `budget + ratio - 1` tokens of context every visible block is selected, so
+ * the sparse path must reproduce the dense path's text byte for byte; that is the test for any
+ * change here.
  */
 #ifndef RAD_QSA_H
 #define RAD_QSA_H
 
 #include "rad_arch.h"
 #include "rad_fp8.h"
+
+#include <atomic>
 
 namespace rad {
 namespace arch {
@@ -27,105 +28,75 @@ struct QsaIndexer {
         int64_t     head_dim = 0;   /* indexer_head_dim     -- 128 */
         int64_t     ratio    = 0;   /* indexer_compress_ratio -- 4 tokens a block */
         int64_t     budget   = 0;   /* indexer_budget       -- 2048 tokens, so 512 blocks */
-        int64_t     rot      = 0;   /* the LAYER's rotary width, which the indexer shares */
+        int64_t     rot      = 0;   /* the layer's rotary width, shared by the indexer */
         const char* mode     = "neox";
         /* Checkpoint names. Absent means this layer has no indexer and declare() is a no-op. */
         const char* qk_proj  = nullptr;
         const char* q_norm   = nullptr;
         const char* k_norm   = nullptr;
-        /* Derived, and all four are the caller's because they size things it declares. */
+        /* Derived; set by the caller because they size buffers it declares. */
         int64_t     topk       = 0;   /* budget / ratio -- blocks the selection keeps */
         int64_t     max_blocks = 0;   /* max_ctx / ratio -- the widest block table */
         int64_t     max_work   = 0;   /* ceil(max_tok / ratio) + max_seqs */
-        /* THE TAIL'S RING LENGTH, `ratio + max_spec`, and the `max_spec` is the whole of it.
-         *
-         * A tail of exactly `ratio` rows indexed by `pos % ratio` is right when a step's tokens
-         * are the tokens that happened. Under speculation they are not: a verify step runs
-         * 1 + n_spec positions and the next step RESTARTS at the first rejected one, so positions
-         * the tail has already overwritten are needed again. Concretely at ratio 4, depth 3,
-         * positions 9..12 -- the store writes slots 1,2,3,0 and position 12 lands on the slot
-         * position 8 is still owed to. Accept one and the next step rebuilds block 2 (tokens
-         * 8..11) out of a slot holding token 12. That block key is then wrong in the cache for
-         * the rest of the sequence, and it happens on any step that straddles a block boundary
-         * and does not accept everything -- which is most of them.
-         *
-         * The deepest rollback is to the first draft, so the widest window a step can still owe
-         * is [p0 - ratio + 1, p0 + n_spec]: ratio + n_spec positions, each needing its own
-         * residue. Under `ratio + max_spec` a slot is only ever overwritten by a position that
-         * far ahead, which is past the end of the step that could ask for it. */
+        /* The tail's ring length, `ratio + max_spec`. A ring of `ratio` indexed by `pos % ratio`
+         * fails under speculation: the next step restarts at the first rejected position, so
+         * overwritten slots are needed again (at ratio 4, depth 3, positions 9..12 write slots
+         * 1,2,3,0 and 12 overwrites the slot of 8; accepting one then rebuilds block 2 from token
+         * 12, corrupting that block key permanently). A step can still owe positions
+         * [p0 - ratio + 1, p0 + n_spec], so `ratio + max_spec` slots keep every owed position. */
         int64_t     ring       = 0;   /* ratio + max_spec */
-        /* THE ATTENTION GROUP, because the SELECTION's output is what the attention reads and so
-         * it is that group's page ids that come out. The block-key group is this block's own and
-         * is declared on first use -- see declare(). */
+        /* The attention group, whose page ids the selection outputs. The block-key group is
+         * declared on first use (see declare()). */
         rad_kvgroup kv_attn    = 0;
-        /* THE TAIL'S GROUP: one RAD_KV_LINEAR state a sequence a layer, `ring` rows of
-         * `head_dim`. It is a KV group and not a buffer because a buffer has no way to name a
-         * SEQUENCE -- see the note on Wire. */
+        /* The tail's group: one RAD_KV_LINEAR state per sequence per layer, `ring` rows of
+         * `head_dim` (a KV group because it is per-sequence state; see Wire). */
         rad_kvgroup kv_tail    = 0;
-        /* DOES ANYTHING READ THE SELECTION? False on the DENSE path, where the attention is
-         * issued with the sequence's own block table and `sel` is written for nobody. The block-key
-         * half still runs -- it is STATEFUL, and a history built without it is a history the sparse
-         * path could not later read -- but the score and the selection are then dead work, and on
-         * this model they are the largest op in the indexer. Declared either way, so the graph and
-         * the buffer plan do not depend on it. */
+        /* Whether anything reads the selection. False on the dense path; the stateful block-key
+         * half still runs so the sparse path can later read the history, but score and select (the
+         * indexer's largest ops) are skipped. Declared either way, so the graph and buffer plan do
+         * not depend on it. */
         bool        emit_sel   = true;
+        /* The rows the score plane was declared with, 0 for max_tok. Fewer only where a step
+         * wider than them is one sequence (RadBuildCtx::max_mixed_tok); such a step scores and
+         * selects in windows of this many rows (step()). */
+        int64_t     plane_rows = 0;
     };
 
-    /* The two planes the front half produces. `qk` is the projection whole -- `heads` query heads
-     * then ONE raw key head -- and `q` is the query heads normed and rotated, contiguous.
+    /* `qk` is the whole projection (`heads` query heads, then one raw key head); `q` is the query
+     * heads normed and rotated, contiguous.
      *
-     * THE RAW KEY IS NEVER NORMED OR ROTATED HERE. It is pooled over `ratio` tokens FIRST and the
-     * norm and the rotation happen to the pooled result, at the position of the block's first
-     * token (`qsa_block_key`). Reading the reference quickly gives the opposite impression,
-     * because the q path right above it does both. */
+     * The raw key is not normed or rotated here: it is pooled over `ratio` tokens first, and the
+     * pooled result is normed and rotated at the block's first token's position (`qsa_block_key`),
+     * unlike the q path. */
     struct Wire {
         rad_buf qk = 0;   /* [max_tok, (heads + 1) * head_dim] */
         rad_buf q  = 0;   /* [max_tok, heads * head_dim] */
-        /* THE TAIL IS NOT IN THIS WIRE AND CANNOT BE. Every other buffer here is within-step
-         * scratch, which is why one set serves the whole model; the tail carries an unfinished
-         * block's RAW INDEX KEYS ACROSS STEPS, and that makes it state with two axes a buffer
-         * cannot express.
-         *
-         *   THE LAYER. The keys are `index_qk_proj`'s output and that weight is PER LAYER, so a
-         *   shared tail has layer L pooling layer L-1's keys -- at decode three of every four
-         *   keys in a completing block come from the wrong layer. Every layer needs its own,
-         *   including the MTP head's.
-         *
-         *   THE SEQUENCE. A per-layer buffer indexed by the BATCH ROW is no better across
-         *   requests: the row is step-local -- the scheduler builds the step from `running_` in
-         *   priority order and then stable-sorts decode first -- so a sequence that outlives an
-         *   earlier one shifts down a row and inherits its keys. A buffer has no per-sequence
-         *   axis to index instead; a KV group does, and that is the one the engine keeps stable
-         *   for the life of a sequence, zeroes when it hands a slot out, and checkpoints with
-         *   the rest of the linear state when the prefix cache saves one.
-         *
-         * So the tail is `Config::kv_tail`, a RAD_KV_LINEAR group, and declare() binds this
-         * layer to it. Nothing about it belongs to a wire shared by every layer. */
+        /* These buffers are within-step scratch shared by every layer. The tail is not here: it
+         * carries an unfinished block's raw index keys across steps, per layer (each layer has its
+         * own `index_qk_proj`, the MTP head included) and per sequence (batch rows are step-local
+         * and shift between steps). A KV group has a stable per-sequence slot, zeroed on hand-out
+         * and checkpointed with the linear state by the prefix cache, so the tail is
+         * `Config::kv_tail` (RAD_KV_LINEAR), bound to this layer in declare(). */
         rad_buf stage = 0;   /* [max_work * ratio, head_dim] */
         rad_buf page  = 0;   /* [max_work]      i32 */
         rad_buf bpos  = 0;   /* [max_work] i32, or [max_work, 3] under M-RoPE */
         rad_buf nc    = 0;   /* [max_seqs]      i32 */
-        /* The selection, ONE ROW A QUERY and not one a sequence. At decode the two are the same
-         * thing; at prefill a chunk's queries share one history and each picks its own set out of
-         * it, which is the whole of Stage B (docs/QSA.md). `sel` and `seqused` are what the sparse
-         * attention is issued with in place of the sequence's own block table and length.
+        /* The selection, one row per query, not per sequence (the same at decode; at prefill each
+         * query of a chunk selects from the shared history, docs/QSA.md, "Per-query selection"). `sel` and
+         * `seqused` replace the sequence's block table and length for the sparse attention.
          *
-         * `score` IS THE BIG ONE: max_tok * max_ctx/ratio floats, 134 MB at a 2048-token chunk and
-         * 64K of context. It is one buffer for the whole model rather than one a layer, and
-         * declare() refuses a geometry whose product is unreasonable rather than discovering it as
-         * an allocation failure. Tiling the query axis would cap it, and the reason it is not done
-         * is that `cu` is absolute over the batch: a tile would need its rows rebased, which means
-         * a per-token sequence id operand -- qsa_work is where it would come from. */
+         * `score` is the largest: max_tok * max_ctx/ratio floats, 134 MB at a 2048-token chunk
+         * and 64K context, one buffer for the whole model. A step of one sequence is tiled on the
+         * query axis when it is wider than the plane (Config::plane_rows): a window of it is a
+         * sequence of its own rows. A step of several is not: that would need a per-token
+         * sequence id operand (from qsa_work), since `cu` is absolute over the batch. */
         rad_buf score = 0;   /* [max_tok, max_blocks] f32 */
         rad_buf sel   = 0;   /* [max_tok, topk + 1]   i32 */
         rad_buf nsel  = 0;   /* [max_tok]             i32 */
         rad_buf sequ  = 0;   /* [max_tok]             i32 */
-        /* THE MODEL'S cos/sin PLANE, [rope_table_rows, rot], or 0 if it builds none. It is the
-         * attention block's -- `rope_table` fills it once a step for every layer -- and the
-         * indexer's own rotation is at the same `rot`, `theta` and `scale`, so the rows are
-         * already there. A block handed no table asks for no fusion and runs the per-head norms
-         * below, which is what keeps a plugin that does not build the table on the unfused
-         * path. */
+        /* The model's cos/sin plane, [rope_table_rows, rot], or 0 if it builds none. Filled once a
+         * step by `rope_table` for the attention block; the indexer rotates at the same `rot`,
+         * `theta` and `scale`. Without it the unfused per-head norms run. */
         rad_buf cos_sin = 0;
     };
 
@@ -137,26 +108,24 @@ struct QsaIndexer {
     LinearFP8   proj{};
     rad_kvgroup kv_bk = 0;
     rad_op      op_norm = 0, op_rope = 0, op_qprep = 0;
-    /* The most rows `op_qprep` may be issued over, 0 when it is not declared. It is the model's
-     * own `qk_fuse_rows` and it is NOT a tuning: the cos/sin table is filled only for steps at or
-     * under it, so above it the rows this op would read were never written. */
+    /* Most rows `op_qprep` may be issued over (0 when not declared): `qk_fuse_rows`, a correctness
+     * bound, since the cos/sin table is filled only for steps at or under it. */
     int64_t     qprep_rows = 0;
     rad_op      op_work = 0, op_bkey = 0, op_tail = 0, op_score = 0, op_select = 0;
 
     bool on() const { return op_rope != 0; }
 
-    /* `bk` is the block-key KV group, created on FIRST USE and shared by every QSA layer after
-     * that -- which is why it is an in/out parameter rather than a member. It cannot be declared
-     * with the model's other groups: `Builder::find_kv_consumer` binds a group to the first op
-     * declared AFTER it that carries a `block_size`, and between a model-level declaration and
-     * this block's `qsa_block_key` there is a whole layer of other ops. Declared immediately
-     * before its own consumer, the binding cannot be anything else. */
+    /* `bk` is the block-key KV group, created on first use and shared by all QSA layers (hence
+     * in/out). It must be declared immediately before `qsa_block_key`: `Builder::find_kv_consumer`
+     * binds a group to the first later-declared op with a `block_size`. */
     int declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Config& cfg,
                 const Wire& wire, const ActFP8& in, rad_kvgroup* bk);
-    void step(RadCtx* c, const ActFP8& in, const RadBatch* batch) const;
-    /* The block keys and the tail of the pass's rows and nothing else: no query, no score, no
-     * selection. What a pass that only leaves the layer's state behind asks for (see
-     * AttnGatedFP8::store_kv); the stores are the ones step() makes. */
+    /* `win_cu`, device: {0, plane_rows}, the one sequence of a window of a step wider than the
+     * score plane (Config::plane_rows); null where no step is. */
+    void step(RadCtx* c, const ActFP8& in, const RadBatch* batch,
+              const int32_t* win_cu = nullptr) const;
+    /* Stores the pass's block keys and tail exactly as step() does, with no query, score or
+     * selection (see AttnGatedFP8::store_kv). */
     void store(RadCtx* c, const ActFP8& in, const RadBatch* batch) const;
     bool store_keys(RadCtx* c, const RadBatch* batch) const;
 };
@@ -168,9 +137,8 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
     if (!c.qk_proj || !c.q_norm) return RAD_OK;          /* no indexer on this layer */
     if (c.heads <= 0 || c.head_dim <= 0 || c.ratio <= 0 || c.budget <= 0) return RAD_E_INVAL;
     if (!w.qk || !w.q) return RAD_E_INVAL;
-    /* The rotation is the LAYER's and it has to fit inside the index head, which the checkpoint's
-     * own validator also requires -- so a container that violated it is refused here by name
-     * rather than rotating past the end of a head. */
+    /* The layer's rotary width must fit inside the index head (as the checkpoint's validator also
+     * requires). */
     if (c.rot < 0 || c.rot > c.head_dim || (c.rot & 1)) return RAD_E_SHAPE;
 
     const int64_t nw = (c.heads + 1) * c.head_dim;       /* the projection width */
@@ -182,41 +150,23 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                   RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
     if (!w_qn) return RAD_E_INVAL;
 
-    /* ONE DECLARED NORM, ISSUED ONCE A HEAD, and the reason is the projection's layout rather
-     * than a preference. `qk` is `heads + 1` heads wide, so the query heads are 128 apart WITHIN
-     * a token and 640 apart ACROSS tokens -- which is not a stride any rank-2 view can express,
-     * and the ABI narrows dim 0 or the last dimension and nothing between. A column slice of ONE
-     * head is expressible, so the norm runs `heads` times and writes into a contiguous `q` that
-     * the rotation can then take whole.
+    /* Unfused, one norm op is issued once per head: in `qk` (`heads + 1` heads wide) the query
+     * heads are 128 apart within a token and 640 apart across tokens, which no rank-2 view can
+     * express, but a one-head column slice can. It writes a contiguous `q` that the rope takes
+     * whole. For 128-wide rows these launches are nearly all overhead.
      *
-     * Four extra launches a layer, and for a 128-wide row the launch IS the cost: the norms and
-     * the ropes across the model's indexer layers are a real slice of a decode step against
-     * microseconds of arithmetic. `op_qprep` is the fused form that replaces them.
-     *
-     * THE FUSED FORM IS `qk_norm_rope_gate`'S K SIDE, not a new op. That kernel already reads a
-     * plain [tokens, heads, head_dim] input at the operand's OWN row pitch and writes the heads
-     * contiguously -- which is exactly this projection's query half inside its `heads + 1` width
-     * -- and it already rounds the norm to bf16 before rotating, because that is what a norm that
-     * stores a tensor and a rope that reads it back do. The only thing its q side adds is the
-     * [q|gate] split, and there is no gate here, so `n_head` 0 asks for the half that fits and
-     * passes no q operands at all. Five launches a layer become one.
-     *
-     * IT NEEDS THE MODEL'S cos/sin TABLE and asks for nothing if it has none. The rotation is at
-     * the same `rot`, `theta` and `scale` as the attention block's, so `rope_table` has already
-     * written the rows this step's positions name -- and a plugin that builds no table leaves
-     * `w.cos_sin` at 0 and runs the per-head norms below unchanged.
-     *
-     * AND ONLY UP TO `qk_fuse_rows`, WHICH IS A CORRECTNESS BOUND AND NOT A TUNING. The model
-     * issues `rope_table` only for steps at or under that row count -- the fusion pays where the
-     * launch is the cost, and a prefill chunk's kernels already fill the card -- so ABOVE it the
-     * table rows this op would read were never written THIS step. It would rotate by another
-     * step's angles: fluent text with a subtly wrong sense of position, which is the failure
-     * `rope_table`'s own note calls out and which nothing downstream would flag. The bound is the
-     * attention block's, off the same function, so the two cannot drift apart. */
+     * `op_qprep` fuses them (five launches to one) using `qk_norm_rope_gate`'s k side: it reads
+     * [tokens, heads, head_dim] at the operand's row pitch, writes heads contiguously, and rounds
+     * the norm to bf16 before rotating. With no gate, `n_head` 0 selects that half and passes no
+     * q operands. It needs the model's cos/sin table (same `rot`, `theta`, `scale` as the
+     * attention block) and is used only up to `qk_fuse_rows`, a correctness bound: the table is
+     * filled only for steps that small, so a larger step would rotate by stale angles. The bound
+     * comes from the same function as the attention block's. */
     const bool qprep_neox = !std::strcmp(c.mode, "neox") || !std::strcmp(c.mode, "mrope") ||
                             g.rope_mc;
     qprep_rows = qk_fuse_rows(g);
-    if (w.cos_sin && qprep_neox && qprep_rows > 0 && (c.head_dim % 32) == 0)
+    if (w.cos_sin && qprep_neox && qprep_rows > 0 && (c.head_dim % 32) == 0 &&
+        rad_op_declared(b, "qk_norm_rope_gate"))
         op_qprep = rw(b, RAD_OP(b, "qk_norm_rope_gate",
                          RAD_PARAMS(RAD_RANGE("M", 1, qprep_rows),
                                     RAD_INT("head_dim", c.head_dim), RAD_INT("n_head", 0),
@@ -239,9 +189,7 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
     if (!c.k_norm || !w.stage || !c.topk || !c.max_blocks || !c.max_work)
         return RAD_E_INVAL;
     if (!c.kv_tail || c.ring < c.ratio) return RAD_E_INVAL;
-    /* THIS LAYER'S TAIL STATE. The group is the caller's -- it holds one state per sequence per
-     * BOUND LAYER, so binding is how this layer gets its own, and it is the same call the
-     * block-key group needs for the same reason. */
+    /* This layer's tail state: the caller's group holds one state per sequence per bound layer. */
     RAD_ARCH_TRY(rad_bind_layer_kv(b, l, c.kv_tail));
     RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.qsa_k_norm.weight", l), c.k_norm));
     w_kn = decl_w(b, nm.f("blk.%d.qsa_k_norm.weight", l), RAD_F32, { c.head_dim },
@@ -256,10 +204,9 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                     RAD_NOWEIGHTS),
                 {w.qk}, {w.stage, w.page, w.bpos, w.nc});
 
-    /* THE GROUP IS DECLARED HERE, immediately before the op that sizes it -- see declare()'s
-     * note. `kv_heads` 1, `block_size` the compress ratio and `head_dim` n/(2*ratio) make a page
-     * hold exactly `n` contiguous values, which is one block key, and make the manager allocate
-     * exactly one page per `ratio` tokens. The geometry is a container, not an attention shape. */
+    /* The block-key group, declared immediately before its consumer (see the declaration). One KV
+     * head, `block_size` = ratio and `head_dim` = n / (2 * ratio) make a page hold exactly one
+     * block key of `n` values, one page per `ratio` tokens. */
     if (*bk == 0) {
         if ((c.head_dim % (2 * c.ratio)) != 0) return RAD_E_SHAPE;
         RadKVGroupDecl d{};
@@ -271,27 +218,20 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
         if (!*bk) return RAD_E_INVAL;
     }
     kv_bk = *bk;
-    /* UNDER M-RoPE a block key rotates at its first token's three components, which qsa_work
-     * writes into a [work, 3] `bpos` when it is handed the step's rotary planes. */
-    op_bkey = g.rope_mc
-        ? decl_rotary(b, g, "qsa_block_key",
-                 RAD_PARAMS(RAD_RANGE("M", 1, c.max_work), RAD_INT("n", c.head_dim),
-                            RAD_INT("ratio", c.ratio), RAD_INT("rotary_dim", c.rot),
-                            RAD_INT("block_size", c.ratio),
-                            RAD_F64("eps", g.eps), RAD_F64("theta", g.theta),
-                            RAD_F64("scale", g.rope_scale), RAD_F64("wadd", g.wadd_qk),
-                            RAD_STR("dtype", g.dtype), RAD_STR("mode", g.rope_mode),
-                            RAD_STR("sections", g.rope_sections)),
-                 RAD_WEIGHTS(w_kn))
-        : decl_rotary(b, g, "qsa_block_key",
-                 RAD_PARAMS(RAD_RANGE("M", 1, c.max_work), RAD_INT("n", c.head_dim),
-                            RAD_INT("ratio", c.ratio), RAD_INT("rotary_dim", c.rot),
-                            RAD_INT("block_size", c.ratio),
-                            RAD_F64("eps", g.eps), RAD_F64("theta", g.theta),
-                            RAD_F64("scale", g.rope_scale), RAD_F64("wadd", g.wadd_qk),
-                            RAD_STR("dtype", g.dtype)),
-                 RAD_WEIGHTS(w_kn));
-    op_bkey = rw(b, op_bkey, {w.stage, w.page, w.bpos}, {});
+    /* Under M-RoPE a block key rotates at its first token's three components, which qsa_work
+     * writes into a [work, 3] `bpos` when given the step's rotary planes. */
+    {
+        const RadParam ps[] = { RAD_RANGE("M", 1, c.max_work), RAD_INT("n", c.head_dim),
+                                RAD_INT("ratio", c.ratio), RAD_INT("rotary_dim", c.rot),
+                                RAD_INT("block_size", c.ratio),
+                                RAD_F64("eps", g.eps), RAD_F64("theta", g.theta),
+                                RAD_F64("scale", g.rope_scale), RAD_F64("wadd", g.wadd_qk),
+                                RAD_STR("dtype", g.dtype), RAD_STR("mode", g.rope_mode),
+                                RAD_STR("sections", g.rope_sections) };
+        const int n_ps = (int)(sizeof ps / sizeof ps[0]) - (g.rope_mc ? 0 : 2);
+        op_bkey = rw(b, decl_rotary(b, g, "qsa_block_key", ps, n_ps, &w_kn, 1),
+                     {w.stage, w.page, w.bpos}, {});
+    }
     RAD_ARCH_TRY(rad_bind_layer_kv(b, l, kv_bk));
 
     op_tail = rw(b, RAD_OP(b, "qsa_tail_store",
@@ -302,8 +242,7 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                     RAD_NOWEIGHTS),
                 {w.qk}, {});
 
-    /* M IS QUERIES ON BOTH, up to a whole prefill chunk. A band stopping at max_seqs would be
-     * right only for a per-SEQUENCE selection; this one selects per QUERY. */
+    /* M is queries for both, up to a whole prefill chunk: the selection is per query. */
     op_score = rw(b, RAD_OP(b, "qsa_score",
                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", c.head_dim),
                                 RAD_INT("heads", c.heads), RAD_INT("blocks", c.max_blocks),
@@ -319,9 +258,9 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
     return RAD_OK;
 }
 
-/* THE KEYS A PASS LEAVES BEHIND: the block keys of the blocks its rows complete and the tail of
- * raw keys after them, out of the projection's raw-key head. False when the step carries no batch
- * for the indexer's groups. */
+/* Stores the block keys of the blocks the pass completes and the tail of raw keys after them,
+ * from the projection's raw-key head. False when the step has no batch for the indexer's
+ * groups. */
 inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch) const {
     const int64_t T = batch->n_tok, S = batch->n_seq;
     const int64_t nw = (c.heads + 1) * c.head_dim;
@@ -329,26 +268,18 @@ inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch) const {
     const RadKVGroupBatch* bkb = kv_batch(batch, kv_bk);
     const RadKVGroupBatch* tlb = kv_batch(batch, c.kv_tail);
     if (!bkb || !tlb) return false;
-    /* COLUMN 0 OF THE STATE ROW IS THE COMMITTED SLOT. The row is wider than one whenever the
-     * deployment speculates -- the manager gives every linear group a second copy then, because
-     * the kernel that needed one asked for it -- and this op wants the committed slot in every
-     * case. The pitch is the batch's, not a constant. */
+    /* Column 0 of the state row is the committed slot; the row is wider when speculating (linear
+     * groups get a second copy), so use the batch's pitch. */
     const int64_t tw = tlb->state_index_pitch > 0 ? tlb->state_index_pitch : 1;
 
-    /* THE WORK LIST BEFORE THE TAIL STORE, and the order is load-bearing rather than tidy: the
-     * gather reads the raw keys of the block that is completing, and up to `ratio - 1` of them
-     * are in the tail from earlier steps -- which the store is about to overwrite with this
-     * step's. Reversed, every block completing at decode would pool three of this step's keys.
-     *
-     * The ring makes the store's overwrite land `ring` positions later rather than `ratio`, so
-     * the two do not collide within a step either -- but the order still decides what a
-     * straddling block reads, and it is the cheaper of the two guarantees to keep. */
+    /* Invariant: the work list runs before the tail store. The gather reads a completing block's
+     * raw keys, up to `ratio - 1` of which are in the tail from earlier steps and are about to be
+     * overwritten. The ring also spaces overwrites by `ring` positions, but the order still decides
+     * what a straddling block reads. */
     const int64_t work = (T + c.ratio - 1) / c.ratio + S;
-    /* THE BLOCK POSITIONS: one component a block, or -- under M-RoPE with the planes -- three.
-     * Under M-RoPE `bpos` is declared [max_work, 3], a block a row, so a smaller step is fewer
-     * rows and the arena's sizing declare can shrink it; this step hands [work, 3], or its first
-     * column alone when the pass has no planes -- qsa_work then writes component 0 and the block
-     * key reads the one-component form. */
+    /* Block positions: one component per block, or three under M-RoPE with planes. Under M-RoPE
+     * `bpos` is [max_work, 3]; this step passes [work, 3], or only column 0 when the pass has no
+     * planes (qsa_work then writes component 0 and the block key reads the one-component form). */
     const bool mc = g.rope_mc && batch->rope_pos;
     RadOperand bpos = g.rope_mc ? RAD_B_COL(w.bpos, 0, mc ? 3 : 1) : brows(w.bpos, work);
     if (g.rope_mc) bpos.rows = work;
@@ -381,20 +312,18 @@ inline void QsaIndexer::store(RadCtx* c_, const ActFP8& in, const RadBatch* batc
     (void)store_keys(c_, batch);
 }
 
-inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch) const {
+inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch,
+                             const int32_t* win_cu) const {
     if (!on()) return;
     const int64_t T = batch->n_tok, S = batch->n_seq;
     const int64_t qw = c.heads * c.head_dim;
     const int64_t nw = (c.heads + 1) * c.head_dim;
 
     proj.step(c_, in, w.qk, T);
-    /* ONE LAUNCH OR `heads` + 1. The fused form takes the projection WHOLE -- the kernel picks
-     * head `h` out of it at the operand's own row pitch, so the strided view the unfused norm
-     * needs is not taken at all -- and it writes the query heads contiguous and rotated, which is
-     * what the pair below leaves behind. `n_head` 0 is the k-only form: no q_gate, no q_w, no
-     * q_out, and the ninth operand (`gate_out`) is absent as it is everywhere else.
-     *
-     * `T <= qprep_rows` IS THE TABLE'S BOUND and declare() says why it is correctness. */
+    /* One fused launch or `heads` + 1 unfused. The fused form takes the whole projection at its
+     * row pitch and writes the query heads contiguous and rotated. `n_head` 0 is the k-only form:
+     * no q_gate, q_w or q_out, and `gate_out` absent. `T <= qprep_rows` is a correctness bound
+     * (see declare()). */
     if (op_qprep && T <= qprep_rows && !rope_mixed(batch)) {
         RAD_ISSUE_N(c_, op_qprep, T,
                     RAD_NONE, brows(w.qk, T), RAD_B(w.cos_sin), rope_pos1(batch, T),
@@ -413,29 +342,57 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
     const RadKVGroupBatch* atb = kv_batch(batch, c.kv_attn);
     if (!atb || !store_keys(c_, batch)) return;
 
-    /* SCORE AND SELECT OVER EVERY QUERY IN THE STEP. A selection does not have to be per-SEQUENCE
-     * even though a block table is: both ops take `cu`, the block table stays the sequence's, and
-     * `m` is a query row. So a prefill chunk's queries each get their own selection out of the one
-     * history they share, which is what the checkpoint does, and there is no cap on the context a
-     * step may index. */
+    /* Score and select per query: both ops take `cu`, the block table stays per sequence, and `m`
+     * is a query row, so each query of a prefill chunk selects from the shared history, as the
+     * checkpoint does. */
     if (!c.emit_sel) return;
 
-    /* HOW MUCH HISTORY THERE ACTUALLY IS. The score plane is declared for `max_ctx`, so scoring
-     * and selecting to its width means a 2000-token prompt walks 50000 block slots -- and both
-     * kernels size their GRID from the declared width, because the live count is device data.
-     * Narrowing the operand is how the host tells them: the pitch stays the declaration's, only
-     * the column count moves, which is the same trick the attention block plays with `reach`.
+    /* Narrow the score columns to the live history. Both kernels size their grid from the
+     * operand's width (the live count is device data), so the full `max_ctx` width would make a
+     * 2000-token prompt walk 50000 block slots; the pitch stays declared, only the column count
+     * moves.
      *
-     * IT IS A CEILING AND EVERY TERM IS SLACK, because an UNDER-estimate silently drops blocks
-     * from the selection and nothing would say so. A query's complete-block count is at most
-     * (position + 1) / ratio; the highest position this step can reach is bounded by the
-     * host-side context bound plus every token in the step plus the draft window; and the +1
-     * keeps `n < nb`, which is what makes the partial page -- `bt[n]` -- readable at all. */
+     * This must be an upper bound: an underestimate silently drops blocks. A query has at most
+     * (position + 1) / ratio complete blocks; positions are bounded by the host context bound plus
+     * the step's tokens plus the draft window; the +1 keeps `n < nb` so the partial page `bt[n]`
+     * is readable. */
     const int64_t reach = (int64_t)batch->max_ctx_len + batch->n_tok + batch->n_spec + c.ratio;
     int64_t live = reach / c.ratio + 1;
     if (live > c.max_blocks) live = c.max_blocks;
     if (live < 1) live = 1;
 
+    /* A step wider than the score plane is one sequence (Config::plane_rows), scored and selected
+     * in windows of the plane's rows from the front, the last one ending at the step's end and
+     * overlapping the one before. A window is handed as a sequence of its own rows (`win_cu` =
+     * {0, rows}). Every operand a query row reads is its own (query, position, selection) and the
+     * block table and complete-block count are the step's, so each row is scored and selected as
+     * in one pass over the step, and a row two windows share is written twice with the same
+     * bytes. */
+    const int64_t PR = c.plane_rows > 0 ? c.plane_rows : T;
+    if (T > PR) {
+        if (S != 1 || !win_cu) {
+            rad_step_fail(c_, "qsa: a step wider than the score plane must be one sequence with "
+                              "its window bounds (RadBuildCtx::max_mixed_tok)");
+            return;
+        }
+        for (int64_t w0 = 0;;) {
+            RAD_ISSUE_N(c_, op_score, PR,
+                        brow_slice(w.q, w0, PR, qw), kv_cache(kv_bk, layer),
+                        praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
+                        praw(win_cu, RAD_I32, 2), brows(w.nc, S),
+                        bcol_at(w.score, 0, c.max_blocks, 0, live, PR));
+            RAD_ISSUE_N(c_, op_select, PR,
+                        bcol_at(w.score, 0, c.max_blocks, 0, live, PR),
+                        praw2(atb->block_table, RAD_I32, S, atb->block_table_pitch),
+                        brows(w.nc, S), praw(batch->positions + w0, RAD_I32, PR),
+                        praw(win_cu, RAD_I32, 2),
+                        brow_slice(w.sel, w0, PR, c.topk + 1), brow_slice(w.nsel, w0, PR, 1),
+                        brow_slice(w.sequ, w0, PR, 1));
+            if (w0 + PR >= T) break;
+            w0 = w0 + PR + PR <= T ? w0 + PR : T - PR;
+        }
+        return;
+    }
     RAD_ISSUE_N(c_, op_score, T,
                 brows(w.q, T), kv_cache(kv_bk, layer),
                 praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
@@ -448,14 +405,13 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
                 praw(batch->cu_seqlens, RAD_I32, S + 1),
                 brows(w.sel, T), brows(w.nsel, T), brows(w.sequ, T));
 
-    /* RADIANCE_DEBUG_QSA: the only window into a selection. Nothing else in the tree reports one,
-     * and the numbers it prints are what tell a divergence from the dense path apart from QSA
-     * doing its job -- `nc` above `topk` is blocks being dropped ON PURPOSE. It SYNCHRONISES THE
-     * STREAM, so it is an environment variable, off, and costs nothing when it is not set; the
-     * first few decode steps are enough to see the shape. */
-    if (getenv("RADIANCE_DEBUG_QSA")) {
-        static int seen = 0;
-        if (seen++ < 6) {
+    /* RADIANCE_DEBUG_QSA: prints the first few selections (nc, nsel, sequ, leading sel and score
+     * entries) to tell a divergence from intended dropping (`nc` above `topk`). Synchronises the
+     * stream; off unless set. */
+    static const bool dbg = std::getenv("RADIANCE_DEBUG_QSA") != nullptr;
+    if (dbg) {
+        static std::atomic<int> seen{0};
+        if (seen.fetch_add(1) < 6) {
             rad_stream_sync(rad_stream(c_));
             std::vector<int32_t> hnc(1), hns(1), hsu(1), hsel(8);
             std::vector<float>   hsc(8);

@@ -2,30 +2,29 @@
  *
  * ============================== THE SHAPE ==============================
  *
- * A hybrid of two layer kinds, in the order the checkpoint's `layer_types` lists them -- d1-3B's
- * schedule is irregular (attention at 2, 5, 9, 13, ...), so it is read, never derived:
+ * A hybrid of two layer kinds, in the order the checkpoint's `layer_types` lists them (read, not
+ * derived: d1-3B's schedule is irregular, attention at 2, 5, 9, 13, ...):
  *
  *   conv            in_proj -> [B | C | x], y = out_proj(C * conv(B * x)), where conv is a
  *                   depthwise causal convolution of width `conv_L_cache` with no activation
  *   full_attention  GQA with per-head RMS norms on q and k, NeoX rotary over the whole head
  *
  * each followed by a SwiGLU feed-forward (w1 the gate, w3 the up, w2 the down). Every norm is a
- * plain RMSNorm -- `x_hat * w`, not Gemma's `1 + w` -- and the final one is `embedding_norm`. At
+ * plain RMSNorm (`x_hat * w`, not Gemma's `1 + w`), and the final one is `embedding_norm`. At
  * d1-3B: 30 layers (10 attention), hidden 2048, 32 heads over 8 at head_dim 64, ffn 10752,
- * vocabulary 128000 with the lm_head TIED to the embedding, conv width 3.
+ * vocabulary 128000 with the lm_head tied to the embedding, conv width 3.
  *
  * LFM2-VL nests the same text model under `model.language_model` and adds a SigLIP2 tower and a
  * projector (siglip2.h), declared when the container carries their weights and the deployment
  * asked for media; the projector's rows replace the image placeholders' embeddings, which rotate
  * at their token positions like any other token. A text-only LFM2 checkpoint keeps the text model
- * under `model`. Which one this is is read off the config (a VL checkpoint has a `text_config`),
- * not off the model's name.
+ * under `model`. Which one this is comes from the config (a VL checkpoint has a `text_config`),
+ * not the model's name.
  *
  * ============================== WHAT IT DOES NOT SERVE ==============================
  *
- * Tensor parallelism: one rank. A 3B model has no need of a second card, and the vocabulary
- * shard, the head split and the all-reduces would be code no deployment runs. A drafter, MoE
- * (LFM2-8B-A1B), conv bias, or a checkpoint without the rotary: each is refused by name.
+ * Tensor parallelism (a 3B model needs one card). A drafter, MoE (LFM2-8B-A1B), conv bias, or a
+ * checkpoint without the rotary: each is refused by name.
  */
 #include <arch/rad_arch.h>
 #include <arch/rad_block_mlp.h>
@@ -96,7 +95,7 @@ static bool text_bool(const RadModelMeta* m, const char* key, bool dflt) {
     return std::strcmp(v, "true") == 0 || std::strcmp(v, "1") == 0;
 }
 
-/* `layer_types`, one word a layer. The container flattens the list space-separated. */
+/* `layer_types`, one word per layer, space-separated in the container. */
 static int read_schedule(const RadModelMeta* m, int64_t n_layer, std::vector<Layer>* out) {
     const char* s = text_key(m, "layer_types");
     if (!s || !*s) {
@@ -142,8 +141,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.nm = Names(ctx->scope);
     Names& nm = m.nm;
 
-    /* The FFN width as stated, unless the config asks for LFM2's sizing rule (the 1.2B and
-     * smaller releases): two thirds of it, times the multiplier, rounded up to `multiple_of`. */
+    /* The FFN width as stated, unless the config asks for LFM2's sizing rule (1.2B and smaller
+     * releases): two thirds of it, times the multiplier, rounded up to `multiple_of`. */
     RadModelMeta dims = *meta;
     if (text_bool(meta, "block_auto_adjust_ff_dim", false)) {
         int64_t ff = 2 * dims.n_ff / 3;
@@ -205,9 +204,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_logits   = decl_b(b, nm.f("logits"),   RAD_F32,  {g.max_logit_rows, g.n_vocab});
     RAD_ARCH_TRY(rad_declare_logits(b, m.b_logits));
 
-    /* ---- the vocabulary edges. The lm_head is tied in every release so far, and declared as a
-     * weight of its own anyway: the embedding lives in host memory (--embedding-placement) and the
-     * head on the card, and a kernel may ask the head for a layout the lookup does not read. */
+    /* ---- the vocabulary edges. The lm_head is tied but declared as its own weight: the
+     * embedding may live in host memory (--embedding-placement) and the head on the card, and a
+     * kernel may want a head layout the lookup does not read. */
     RAD_ARCH_TRY(map_copy(b, nm.f("token_embd.weight"), nm.ckpt("%s.embed_tokens.weight", pre)));
     RAD_ARCH_TRY(map_copy(b, nm.f("output_norm.weight"), nm.ckpt("%s.embedding_norm.weight", pre)));
     RAD_ARCH_TRY(map_copy_alt(b, nm.f("output.weight"), nm.ckpt("lm_head.weight"),
@@ -224,7 +223,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                    RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype)),
                         RAD_WEIGHTS(m.w_tok)),
                     {}, {m.b_x});
-    /* The encoder's rows, over the lookup: one rank, so nothing is reduced after it. */
+    /* The encoder's rows overwrite the lookup; with one rank there is no reduction after it. */
     m.media = Siglip2::present(meta) && ctx->max_enc_patches > 0;
     if (m.media) RAD_ARCH_TRY(m.mrows.declare(b, g.max_tok, g.n_embd, m.b_x));
 
@@ -281,14 +280,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             L.op_k  = gemm(g.kv_dim(), g.n_embd, L.w_k, m.b_h, m.b_k);
             L.op_v  = gemm(g.kv_dim(), g.n_embd, L.w_v, m.b_h, m.b_v);
             /* The head norms run over rows of head_dim: a [T, heads * head_dim] buffer is
-             * T * heads such rows. */
+             * T * heads rows. */
             L.op_q_norm = rmsnorm(g.max_tok * g.n_head, g.head_dim, L.w_q_norm, m.b_q, m.b_q);
             L.op_k_norm = rmsnorm(g.max_tok * g.n_head_kv, g.head_dim, L.w_k_norm, m.b_k, m.b_k);
             L.op_rope_q = rw(b, decl_rope(b, g, g.max_tok, g.head_dim, g.n_head, 0, g.head_dim,
                                           "neox"), {m.b_q}, {m.b_q});
             L.op_rope_k = rw(b, decl_rope(b, g, g.max_tok, g.head_dim, g.n_head_kv, 0, g.head_dim,
                                           "neox"), {m.b_k}, {m.b_k});
-            /* attn_paged before kv_store: the cache's block size is read off the resolved
+            /* attn_paged before kv_store: the cache's block size is read from the resolved
              * attention kernel. */
             L.op_attn = rw(b, RAD_OP(b, "attn_paged",
                                RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok),
@@ -371,7 +370,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                          RAD_WEIGHTS(m.w_lm_head)),
                      {m.b_hout}, {m.b_logits});
 
-    /* THE VISION TOWER, LAST, so its activations share the arena with every buffer above. */
+    /* The vision tower, last, so its activations share the arena with every buffer above. */
     if (m.media) RAD_ARCH_TRY(m.vit.declare(b, meta, ctx, nm, g.n_embd, (int)g.n_layer + 64));
 
     int64_t n_attn = 0;
@@ -384,12 +383,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     return RAD_OK;
 }
 
-/* THE CONVOLUTION IS ISSUED ONCE PER HALF OF THE STEP, as the PLE's and the gated delta net's
- * are: the decode rows [0, D) with `num_accepted`, which leaves the window in the layout a
- * partly rejected verify reads back from, and the prefill chunks [D, S) without it, each leaving
- * its tail at offset zero. `has_init` is `ctx_lens`: a sequence with tokens behind it has a
- * history. The per-sequence arrays of the prefill half move to `+ D`; the token operands stay at
- * their base, because the kernel reads rows at the absolute offsets in `cu`. */
+/* The convolution is issued once per half of the step, like the PLE's and the gated delta net's:
+ * the decode rows [0, D) with `num_accepted`, leaving the window in the layout a partly rejected
+ * verify reads back from, and the prefill chunks [D, S) without it, each leaving its tail at
+ * offset zero. `has_init` is `ctx_lens` (a sequence with earlier tokens has a history). The
+ * prefill half's per-sequence arrays start at `+ D`; the token operands stay at their base, since
+ * the kernel reads rows at the absolute offsets in `cu`. */
 static void conv_step(const Model& m, const Layer& L, RadCtx* c, const RadBatch* batch, int l) {
     const int64_t T = batch->n_tok, S = batch->n_seq;
     const RadKVGroupBatch* cv = kv_batch(batch, m.kv_conv);
@@ -421,7 +420,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
                          "and the program declares none of them");
         return;
     }
-    /* AN ENCODER PASS RUNS THE VISION TOWER AND NOTHING ELSE (RadBatch::enc). */
+    /* An encoder pass runs only the vision tower (RadBatch::enc). */
     if (batch->enc) {
         m.vit.step(c, batch);
         return;
@@ -468,8 +467,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
         L.mlp.step(c, batch);
     }
 
-    /* The lm_head runs on the rows the sampler asked for and on nothing else; a prefill chunk
-     * that finishes no sequence issues none of it. */
+    /* The lm_head runs only on the rows the sampler asked for; a prefill chunk that finishes no
+     * sequence skips it. */
     if (batch->n_out > 0) {
         RAD_ISSUE_N(c, m.op_gather, batch->n_out, brows(m.b_x, T),
                     praw(batch->out_ids, RAD_I32, batch->n_out), brows(m.b_hout, batch->n_out));

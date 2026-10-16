@@ -1,24 +1,22 @@
 /* images.cpp -- OpenAI's images API over an image generator (core/gen): /v1/images/generations
  * and /v1/images/edits.
  *
- * WHAT A REQUEST BECOMES. The prompt goes into the model's own template (ImageGenInfo), with the
- * fixed system turn the generator drops; a transparent background asks for one in the words the
- * model was trained on. An edit's pictures are each resized to the model's reference area at their
- * own aspect -- with PIL's premultiplied Lanczos, as diffusers resizes them -- and read twice: as
- * RGBA pixels by the generator's encoder, and composited on white by the conditioning network's.
- * With a mask, the first picture is repainted: the mask's transparent pixels are where it may
- * change, the rest is put back exactly after decoding.
+ * Request: the prompt goes into the model's own template (ImageGenInfo), including the fixed
+ * system turn the generator drops; a transparent background is requested in the model's trained
+ * wording. Each edit picture is resized to the model's reference area at its own aspect (PIL's
+ * premultiplied Lanczos, as diffusers does) and read twice: as RGBA by the generator's encoder,
+ * and composited on white by the conditioning network's. With a mask, the first picture is
+ * repainted where the mask is transparent; the rest is restored exactly after decoding.
  *
- * WHAT IS EXTENDED, beside OpenAI's fields, by vLLM-Omni's names: `seed`, `negative_prompt` with
- * `true_cfg_scale` (guidance), `num_inference_steps`, and `width` / `height` in place of `size`.
- * A model with a fixed schedule (a distilled one) takes no step count but its own.
+ * Extensions, under vLLM-Omni's names: `seed`, `negative_prompt` with `true_cfg_scale`
+ * (guidance), `num_inference_steps`, and `width` / `height` instead of `size`. A fixed-schedule
+ * (distilled) model accepts only its own step count.
  *
- * WHAT IS REFUSED: `response_format: url` -- nothing here stores an image to serve later, so the
- * picture comes back in the response (b64_json) or not at all.
+ * Refused: `response_format: url`, since no image is stored to serve later; only b64_json.
  *
- * STREAMING is OpenAI's: `image_generation.partial_image` (`image_edit.partial_image`) events
- * for the `partial_images` previews -- the step's estimate of the finished latent, decoded -- and
- * one `.completed` event an image.
+ * Streaming follows OpenAI: `image_generation.partial_image` (`image_edit.partial_image`) events
+ * for the `partial_images` previews (each step's decoded estimate of the final latent), and one
+ * `.completed` event per image.
  */
 #include "server.h"
 #include "oai.h"
@@ -28,6 +26,7 @@
 #include "mm/media.h"
 #include "mm/processor.h"
 #include "rad_internal.h"
+#include "rad_plugin.h"
 
 #include <nlohmann/json.hpp>
 
@@ -46,9 +45,9 @@ namespace {
 /* The largest picture a request may upload, before any resize. */
 constexpr int64_t kMaxSourcePixels = (int64_t)1 << 26;
 
-/* Below this alpha a pixel is transparent: where a mask lets the picture change, and what makes a
- * picture one with transparency. A decoder's alpha is not exactly 255 on an opaque picture, so a
- * picture this model made and is given back to edit stays opaque. */
+/* Below this alpha a pixel counts as transparent, both in a mask and when deciding whether a
+ * picture has transparency. A threshold, not 255, because a decoder's alpha on an opaque picture is
+ * not exactly 255, so this model's own output stays opaque when edited. */
 constexpr uint8_t kTransparentBelow = 128;
 
 struct ImgReq {
@@ -91,7 +90,7 @@ json form_value(const std::string& key, const std::string& v) {
     return json(v);
 }
 
-/* diffusers' calculate_dimensions: a target area at an aspect, each side rounded to 32. */
+/* diffusers' calculate_dimensions: a target area at an aspect, each side rounded to `mult`. */
 void dims_for(double area, double ratio, int32_t mult, int32_t* w, int32_t* h) {
     const double wd = std::sqrt(area * ratio);
     const double hd = wd / ratio;
@@ -107,15 +106,8 @@ std::string replace_all(std::string s, const std::string& what, const std::strin
     return s;
 }
 
-uint16_t f32_bf16(float f) {
-    uint32_t u;
-    std::memcpy(&u, &f, 4);
-    u += 0x7FFFu + ((u >> 16) & 1u);
-    return (uint16_t)(u >> 16);
-}
-
 /* A picture as the generator's encoder reads it: each channel u -> 2 * (u / 255) - 1 in f32, then
- * bf16 -- VaeImageProcessor's preprocess, cast to the VAE's dtype. */
+ * bf16 (VaeImageProcessor's preprocess, cast to the VAE's dtype). */
 gen::Pixels to_pixels(const mm::FrameRGBA& f) {
     gen::Pixels p;
     p.w = f.w;
@@ -123,7 +115,7 @@ gen::Pixels to_pixels(const mm::FrameRGBA& f) {
     p.ch = 4;
     p.bf16.resize(f.rgba.size());
     for (size_t i = 0; i < f.rgba.size(); ++i)
-        p.bf16[i] = f32_bf16(2.0f * ((float)f.rgba[i] / 255.0f) - 1.0f);
+        p.bf16[i] = rad_f32_to_bf16(2.0f * ((float)f.rgba[i] / 255.0f) - 1.0f);
     return p;
 }
 
@@ -168,15 +160,11 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
             }
         }
     } else {
-        try {
-            body = json::parse(req.body);
-        } catch (const std::exception& e) {
-            return error_response(err_bad("", std::string("the body is not JSON: ") + e.what()),
-                                  req.peer);
-        }
-        if (!body.is_object()) return error_response(err_bad("", "the body is not a JSON object"), req.peer);
-        /* An edit's pictures as JSON: `images: [{image_url: "data:..."}]` and `mask: {image_url}`,
-         * the newer form of the API, or `image` as one data URL or a list of them. */
+        ApiError err;
+        if (parse_request_object(req.body, lim_, &body, &err) < 0)
+            return error_response(err, req.peer);
+        /* An edit's pictures as JSON: `images: [{image_url: "data:..."}]` and `mask: {image_url}`
+         * (the newer API form), or `image` as one data URL or a list. */
         auto url_of = [](const json& v, std::string* u) {
             if (v.is_string()) { *u = v.get<std::string>(); return true; }
             if (v.is_object() && v.contains("image_url") && v["image_url"].is_string()) {
@@ -252,13 +240,13 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         return 1;
     };
     if (str("prompt", &r.prompt) < 0)
-        return error_response(err_bad("prompt", "a string"), req.peer);
+        return error_response(err_bad("prompt", "expected a string"), req.peer);
     if (!body.contains("prompt"))
         return error_response(err_bad("prompt", "the prompt is required"), req.peer);
     if (r.prompt.empty()) r.prompt = " ";
     std::string rf;
     if (str("response_format", &rf) < 0 || (!rf.empty() && rf != "b64_json" && rf != "url"))
-        return error_response(err_bad("response_format", "b64_json"), req.peer);
+        return error_response(err_bad("response_format", "expected b64_json"), req.peer);
     if (rf == "url") {
         ApiError e = err_unsupported("response_format",
                                      "url is not served: this server keeps no image to serve "
@@ -268,17 +256,18 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
     }
     int64_t v = 0;
     if (num("n", 1, info.max_lanes, &v) < 0)
-        return error_response(err_bad("n", "1.." + std::to_string(info.max_lanes)), req.peer);
+        return error_response(
+            err_bad("n", "expected an integer in 1.." + std::to_string(info.max_lanes)), req.peer);
     r.n = body.contains("n") && !body["n"].is_null() ? (int32_t)v : 1;
     if (str("background", &r.background) < 0 ||
         (r.background != "auto" && r.background != "transparent" && r.background != "opaque")) {
-        ApiError e = err_bad("background", "auto, transparent or opaque");
+        ApiError e = err_bad("background", "expected auto, transparent or opaque");
         e.supported = { "auto", "transparent", "opaque" };
         return error_response(e, req.peer);
     }
     if (str("output_format", &r.format) < 0 ||
         (r.format != "png" && r.format != "jpeg" && r.format != "webp")) {
-        ApiError e = err_bad("output_format", "png, jpeg or webp");
+        ApiError e = err_bad("output_format", "expected png, jpeg or webp");
         e.supported = { "png", "jpeg", "webp" };
         return error_response(e, req.peer);
     }
@@ -286,14 +275,16 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         return error_response(err_bad("background", "jpeg has no transparency; ask for png or "
                                                     "webp"), req.peer);
     if (num("output_compression", 0, 100, &v) < 0)
-        return error_response(err_bad("output_compression", "0..100"), req.peer);
+        return error_response(err_bad("output_compression", "expected an integer in 0..100"),
+                              req.peer);
     if (body.contains("output_compression")) r.compression = (int32_t)v;
     if (body.contains("stream") && !body["stream"].is_null()) {
-        if (!body["stream"].is_boolean()) return error_response(err_bad("stream", "a boolean"), req.peer);
+        if (!body["stream"].is_boolean())
+            return error_response(err_bad("stream", "expected a boolean"), req.peer);
         r.stream = body["stream"].get<bool>();
     }
     if (num("partial_images", 0, 3, &v) < 0)
-        return error_response(err_bad("partial_images", "0..3"), req.peer);
+        return error_response(err_bad("partial_images", "expected an integer in 0..3"), req.peer);
     if (body.contains("partial_images")) r.previews = (int32_t)v;
     if (r.previews > 0 && !r.stream)
         return error_response(err_bad("partial_images", "partial images are sent on a stream; "
@@ -301,14 +292,15 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
     if (str("quality", &r.quality) < 0 ||
         (r.quality != "auto" && r.quality != "low" && r.quality != "medium" &&
          r.quality != "high" && r.quality != "standard" && r.quality != "hd")) {
-        ApiError e = err_bad("quality", "auto, low, medium, high (standard, hd)");
+        ApiError e = err_bad("quality", "expected auto, low, medium or high (or standard, hd)");
         e.supported = { "auto", "low", "medium", "high", "standard", "hd" };
         return error_response(e, req.peer);
     }
     /* The step count: the request's, or what its quality asks for, or the model's. */
     int64_t steps = 0;
     if (num("num_inference_steps", 1, 200, &steps) < 0)
-        return error_response(err_bad("num_inference_steps", "1..200"), req.peer);
+        return error_response(err_bad("num_inference_steps", "expected an integer in 1..200"),
+                              req.peer);
     if (info.fixed_schedule) {
         if (steps != 0 && steps != info.fixed_steps)
             return error_response(err_unsupported("num_inference_steps",
@@ -322,23 +314,25 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         else if (r.quality == "medium") steps = std::max<int64_t>(1, info.default_steps * 3 / 4);
     }
     r.steps = (int32_t)steps;
+    /* -1 asks for a random seed, as llama-server and the chat endpoints read it. */
     if (body.contains("seed") && !body["seed"].is_null()) {
         if (!body["seed"].is_number_integer())
-            return error_response(err_bad("seed", "an integer"), req.peer);
+            return error_response(err_bad("seed", "expected an integer"), req.peer);
         r.seed = (uint64_t)body["seed"].get<int64_t>();
-        r.seed_given = true;
+        r.seed_given = body["seed"].is_number_unsigned() || body["seed"].get<int64_t>() != -1;
     }
     if (str("negative_prompt", &r.negative) < 0)
-        return error_response(err_bad("negative_prompt", "a string"), req.peer);
+        return error_response(err_bad("negative_prompt", "expected a string"), req.peer);
     if (body.contains("true_cfg_scale") && !body["true_cfg_scale"].is_null()) {
         if (!body["true_cfg_scale"].is_number())
-            return error_response(err_bad("true_cfg_scale", "a number"), req.peer);
+            return error_response(err_bad("true_cfg_scale", "expected a number"), req.peer);
         r.cfg = body["true_cfg_scale"].get<double>();
         if (!(r.cfg >= 1.0 && r.cfg <= 30.0))
-            return error_response(err_bad("true_cfg_scale", "1..30"), req.peer);
+            return error_response(err_bad("true_cfg_scale", "expected a number in 1..30"),
+                                  req.peer);
     }
-    /* Guidance needs both halves, as the reference pipeline does: a scale above one and a
-     * negative prompt (an empty one is " "). */
+    /* Guidance needs a scale above one and a negative prompt (empty becomes " "), as in the
+     * reference pipeline. */
     r.has_neg = r.cfg > 1.0 && body.contains("negative_prompt");
     if (r.has_neg && r.negative.empty()) r.negative = " ";
     if (r.cfg > 1.0 && !r.has_neg)
@@ -374,9 +368,8 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
     } else if (!files.empty() || have_mask) {
         return error_response(err_bad("image", "pictures go to /v1/images/edits"), req.peer);
     }
-    /* `auto` is decided by what was sent: an edit of a picture with transparency keeps it, and
-     * anything else is opaque -- a picture made without asking for transparency carries only the
-     * decoder's noise in its alpha. */
+    /* `auto`: an edit of a picture with transparency keeps it; anything else is opaque, since an
+     * image generated without transparency has only decoder noise in its alpha. */
     if (r.background == "auto") {
         bool alpha = false;
         if (r.format != "jpeg")
@@ -386,14 +379,17 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         r.background = alpha ? "transparent" : "opaque";
     }
 
-    /* ---- the size: `width`/`height`, or `size` "WxH", or auto -- the native size, at the last
-     * picture's aspect for an edit. Sides are rounded down to the model's multiple. */
+    /* ---- the size: `width`/`height`, `size` "WxH", or auto (the native area, at the last
+     * picture's aspect for an edit). Sides are rounded down to the model's multiple. */
     const int32_t mult = (int32_t)info.size_multiple;
     std::string size = "auto";
-    if (str("size", &size) < 0) return error_response(err_bad("size", "\"WxH\" or \"auto\""), req.peer);
+    if (str("size", &size) < 0)
+        return error_response(err_bad("size", "expected \"WxH\" or \"auto\""), req.peer);
     int64_t bw = 0, bh = 0;
-    if (num("width", 1, 16384, &bw) < 0 || num("height", 1, 16384, &bh) < 0)
-        return error_response(err_bad("width", "1..16384"), req.peer);
+    if (num("width", 1, 16384, &bw) < 0)
+        return error_response(err_bad("width", "expected an integer in 1..16384"), req.peer);
+    if (num("height", 1, 16384, &bh) < 0)
+        return error_response(err_bad("height", "expected an integer in 1..16384"), req.peer);
     if ((bw > 0) != (bh > 0))
         return error_response(err_bad(bw ? "height" : "width", "width and height go together"),
                               req.peer);
@@ -404,7 +400,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         int a = 0, b = 0;
         char x = 0;
         if (std::sscanf(size.c_str(), "%d%c%d", &a, &x, &b) != 3 || x != 'x' || a <= 0 || b <= 0)
-            return error_response(err_bad("size", "\"WxH\" or \"auto\""), req.peer);
+            return error_response(err_bad("size", "expected \"WxH\" or \"auto\""), req.peer);
         r.w = a;
         r.h = b;
     } else if (edit) {
@@ -427,8 +423,8 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
                                                   std::to_string(info.max_tokens * ls * ls) +
                                                   " pixels)"), req.peer);
     if (!r.seed_given) {
-        /* 53 bits: the seed goes back in the response to be sent again, and a JavaScript client
-         * reads a JSON number as a double -- a 64-bit seed would come back as another picture. */
+        /* 53 bits: the seed is returned for reuse, and JavaScript reads JSON numbers as doubles,
+         * so a wider seed would not round-trip. */
         std::random_device rd;
         r.seed = (((uint64_t)rd() << 32) ^ rd()) & (((uint64_t)1 << 53) - 1);
     }
@@ -461,8 +457,8 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
                                   req.peer);
         items.push_back(std::move(it));
     }
-    /* Repainting: the first picture at the size being made, and per latent token the share of
-     * its 16 x 16 pixels the mask leaves transparent -- those are repainted, the rest kept. */
+    /* Repainting: the first picture at the output size, and per latent token the fraction of
+     * its ls x ls pixels the mask leaves transparent. Those are repainted, the rest kept. */
     std::vector<uint8_t> keep_px, src_px;
     if (r.has_mask) {
         mm::FrameRGBA src, msk;
@@ -498,8 +494,8 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
             tmpl = replace_all(tmpl, "{images}", imgs);
         }
         const std::string rendered = replace_all(tmpl, "{prompt}", text);
-        /* Tokenised piece by piece around the markers, each marker replaced by its picture's
-         * token run -- the chat path's tokenize_with_media, with pictures already processed. */
+        /* Tokenised around the markers, each marker replaced by its picture's token run: the
+         * chat path's tokenize_with_media, with the pictures already processed. */
         auto pm = std::make_shared<mm::PromptMedia>();
         size_t pos = 0, mi = 0;
         for (;;) {
@@ -522,12 +518,12 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
             pm->layout();
             out->media = std::move(pm);
         }
-        /* The fixed turn the generator does not see, which must be where the prompt starts. */
+        /* The fixed turn the generator drops; the prompt must start with it. */
         const auto drop = deps_.tok->encode(info.drop_prefix, false, true);
         if (drop.size() > out->tokens.size() ||
             !std::equal(drop.begin(), drop.end(), out->tokens.begin())) {
-            *err = err_bad("prompt", "the prompt does not start with the model's fixed turn");
-            err->status = 500;
+            /* The model's own templates disagree; nothing the request did. */
+            *err = err_internal("the prompt does not start with the model's fixed turn");
             return RAD_E_STATE;
         }
         out->n_drop = (int32_t)drop.size();
@@ -547,12 +543,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
     }
 
     /* ---- admitted and queued */
-    sweep_abandoned();
-    if (!admit(1)) {
-        metrics_.observe_rejected();
-        return error_response(err_overloaded("the admission queue is full; retry after " +
-                                             std::to_string(opt_.retry_after_s) + "s"), req.peer);
-    }
+    if (auto no = admit(1, req.peer)) return *no;
     std::shared_ptr<gen::Ticket> ticket = g->ticket;
     {
         std::string why;
@@ -632,9 +623,9 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         }
         release(1);
         if (ticket->status() < 0 || (int32_t)done.size() != r.n) {
-            /* RAD_E_INVAL is the driver's refusal at admission -- a request this deployment can
-             * never serve, such as a conditioning longer than the cache -- and the client's to
-             * change; anything else failed while it ran. */
+            /* RAD_E_INVAL is the driver's admission refusal (a request this deployment can never
+             * serve, e.g. conditioning longer than the cache), so a 400; anything else failed
+             * while running. */
             ApiError e;
             const bool client = ticket->status() == RAD_E_INVAL;
             e.status = client ? 400 : 500;
@@ -669,7 +660,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         return HttpResponse::json_body(200, json_dump(out));
     }
 
-    /* ---- streamed: partial images as the previews arrive, a completed event an image */
+    /* ---- streamed: partial images as previews arrive, one completed event per image */
     HttpResponse res;
     res.status = 200;
     res.content_type = "text/event-stream";

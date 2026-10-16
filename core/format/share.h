@@ -1,14 +1,14 @@
 /* share.h -- which bytes of a container entry one rank's declaration takes.
  *
- * A container entry is a logical weight's planes, whole and canonical (rad_format.h). A rank
- * declares a VIEW of it (RadWeightDecl::source/planes) and, under tensor parallelism, only its
- * share: a ROW shard is rows of every selected plane and a COL shard is columns, each cut on the
- * plane's own block boundary and refused where a block would be split (spec §4.3). This is that
- * arithmetic, and nothing else -- the loader turns its rectangles into reads.
+ * A container entry holds a logical weight's planes, whole and canonical (rad_format.h). A rank
+ * declares a view of it (RadWeightDecl::source/planes) and, under tensor parallelism, only its
+ * share: a ROW shard takes rows of every selected plane, a COL shard takes columns. Each cut falls
+ * on the plane's own block boundary and is refused where it would split a block (spec §4.3). This
+ * is only the arithmetic; the loader turns the rectangles into reads.
  *
- * Pure, so a test can hold it to the shapes tensor parallelism actually produces: a stacked
- * [gate|up] whose every part is split, an uneven span, a block-fp8 scale plane cut at 1/128 of
- * its weight's rows, a per-tensor scale every rank carries whole.
+ * Pure, so tests can cover the shapes tensor parallelism produces: a stacked [gate|up] with every
+ * part split, an uneven span, a block-fp8 scale plane cut at 1/128 of its weight's rows, and a
+ * per-tensor scale every rank carries whole.
  */
 #pragma once
 #include "../rad_core.h"

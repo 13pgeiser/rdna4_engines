@@ -1,21 +1,13 @@
 /* rank_barrier.h -- the release point for the tensor-parallel rank threads.
  *
- * WHY THIS IS NOT IPC. Radiance is one process. One thread per rank, each owning one device
- * (spec §1). The ranks therefore share an address space, so the step batch is shared BY POINTER
- * rather than broadcast: there is nothing to serialise, no shared-memory segment to map, no file
- * descriptor, no pickling, and no handshake protocol that can get out of step with itself. All
- * that is left for the barrier to do is establish happens-before between the scheduler's release
- * and each rank's first rad_issue, and between the ranks' last issue and the scheduler's next
- * batch build.
+ * Radiance is one process with one thread per rank, each owning one device (spec §1), so the step
+ * batch is shared by pointer rather than serialised to other processes. The barrier only
+ * establishes happens-before between the scheduler's release and each rank's first rad_issue, and
+ * between the ranks' last issue and the scheduler's next batch build. A condvar round trip costs
+ * ~1-2 us; an IPC broadcast of the batch costs tens of microseconds per step.
  *
- * A futex round trip through a condvar is ~1-2 us on this class of machine. The multiprocessing
- * equivalent -- serialise the batch, write it down a pipe, wake N processes, have each one
- * deserialise it -- is tens of microseconds per step before any work happens, and it is most of
- * what a Python engine's multiprocessing budget actually buys. That difference is the reason §1
- * is written the way it is, and this class is the whole of the cost on our side.
- *
- * Sense reversal, not a counter reset, so a fast rank that comes back round for the next step
- * cannot slip through the barrier its slower peers have not left yet.
+ * Generation-based (sense reversal), so a fast rank re-entering for the next step cannot slip
+ * through a barrier its slower peers have not left yet.
  */
 #pragma once
 #include "../rad_core.h"
@@ -34,11 +26,9 @@ public:
 
     void arrive_and_wait();
 
-    /* Release everyone regardless of how many have arrived, and refuse every later arrival. The
-     * engine calls this on shutdown and on a device fault: a rank that has already exited must not
-     * leave its peers parked on a barrier that can no longer be completed (spec §17 -- a device
-     * fault is not recoverable in-process, and the engine exits rather than serving from a wedged
-     * queue, which it cannot do while a thread is blocked here). */
+    /* Release everyone regardless of how many have arrived, and make every later arrival return
+     * at once. Called on shutdown and on a device fault, so ranks are not left parked on a barrier
+     * an exited rank can no longer complete; the engine must be able to exit (spec §17). */
     void abort();
 
 

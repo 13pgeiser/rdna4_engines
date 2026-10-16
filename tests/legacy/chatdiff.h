@@ -2,10 +2,9 @@
  *
  * Shared by tests/chatparse_test.cpp and tools/rad_chatparse.cpp. A Bench holds one model's chat
  * template, its reply format and, for one rendered request, both parsers: the legacy path
- * (toolparse_legacy.h, the `old` side) and the streaming parser (core/text/chatparse.h, the `new`
- * side). compare() says whether they agree on a reply and, when they do not, which side left its
- * grammar; check_stream() feeds a reply to the streaming parser in pieces and checks the streaming
- * contract on every piece.
+ * (toolparse_legacy.h, `old`) and the streaming parser (core/text/chatparse.h, `new`). compare()
+ * says whether they agree on a reply and, if not, which side left its grammar; check_stream()
+ * feeds a reply in pieces and checks the streaming contract on every piece.
  */
 #pragma once
 #include "text/chat.h"
@@ -17,6 +16,7 @@ struct RadChatFormat;
 
 #include <nlohmann/json.hpp>
 
+#include <map>
 #include <memory>
 #include <random>
 #include <string>
@@ -70,12 +70,14 @@ public:
     legacy::Answer old_parse(const std::string& text, bool partial = false) const;
     ReplyMessage new_parse(const std::string& text, bool* strict = nullptr) const;
 
-    /* The reply as the template writes an assistant turn -- which is exactly what the model is
-     * trained to produce -- without the turn terminator the decoder would not render. "" when the
-     * template does not render the turn as a continuation of the generation prompt. */
+    /* The reply as the template writes an assistant turn (what the model is trained to produce),
+     * without the turn terminator the decoder would not render. "" when the template does not
+     * render the turn as a continuation of the generation prompt. */
     std::string render_reply(const ojson& assistant) const;
 
 private:
+    std::string render_reply_uncached(const ojson& assistant) const;
+
     Model model_;
     std::string jinja_;
     std::shared_ptr<ChatTemplate> tmpl_;
@@ -86,6 +88,8 @@ private:
     ChatPrompt prompt_;
     std::unique_ptr<legacy::ToolParser> old_;
     std::shared_ptr<const ReplyParser> parser_;
+    /* render_reply's results, by the message's JSON. */
+    mutable std::map<std::string, std::string> replies_;
 };
 
 struct Verdict {
@@ -93,15 +97,14 @@ struct Verdict {
     bool strict = false;        /* the streaming parser read the reply within the grammar */
     bool old_clean = false;     /* the legacy strict parse matched and nothing was lifted */
     bool bare_lift = false;     /* the legacy path lifted a call written without the call opener */
-    /* The legacy answer's content still carries a wrapped format's call syntax -- a call written
-     * without its wrapper, which the legacy lifter takes only when nothing else in the reply
-     * parses as a call, and which the streaming parser always reads as one. */
+    /* The legacy content still carries a wrapped format's call syntax: a call written without
+     * its wrapper, which the legacy lifter takes only when nothing else parses as a call and the
+     * streaming parser always reads as one. */
     bool old_call_syntax = false;
-    /* A call in the legacy answer has a raw control character in its arguments: its JSON reader
-     * took a string holding one, which the schema grammar refuses -- the reply goes on in the
-     * grammar's text arm, and ends the value at its suffix, where the legacy reader kept reading
-     * -- or it passed a typed value's text through bare. Neither is JSON, and neither is a
-     * reading to hold the streaming parser to. */
+    /* A legacy call has a raw control character in its arguments: either its JSON reader took a
+     * string holding one (the schema grammar refuses it, continues in its text arm and ends the
+     * value at its suffix, where the legacy reader kept reading), or it passed a typed value's
+     * text through bare. Neither is JSON, so the streaming parser is not held to it. */
     bool old_raw_control = false;
     std::string detail;         /* both answers, when they differ */
 };
@@ -111,10 +114,9 @@ Verdict compare(const Bench& b, const std::string& text);
  * within the grammar, and a documented difference otherwise. "" or the reason it is not. */
 std::string judge(const Verdict& v);
 
-/* Feed `text` to a fresh stream cut at `cuts` (ascending offsets), checking on every piece that
- * what has been emitted is a prefix of `expect` and that the held bytes stay under the bound, and
- * at the end that the concatenated deltas and the message both equal `expect`. "" or the first
- * violation. */
+/* Feed `text` to a fresh stream cut at `cuts` (ascending offsets). On every piece, the emitted
+ * text must be a prefix of `expect` and the held bytes within the bound; at the end, the
+ * concatenated deltas and the message must equal `expect`. Returns "" or the first violation. */
 std::string check_stream(const ReplyParser& p, const std::string& text,
                          const std::vector<size_t>& cuts, const ReplyMessage& expect);
 
@@ -126,7 +128,6 @@ bool same(const ReplyMessage& a, const ReplyMessage& b);
  * before any reply reaches a parser. */
 std::string sanitize(const std::string& s);
 
-
 /* ================================================================== the corpora */
 
 bool is_qwen(const Model& m);
@@ -136,13 +137,13 @@ ojson call(const std::string& name, const ojson& args);
 ojson message(const std::string& reasoning, const std::string& content,
               const std::vector<ojson>& calls);
 
-/* Assistant messages that, rendered through a model's template, are the replies the model is
- * trained to write: content only, reasoning, one to five calls, every argument type, unicode, and
- * values holding the format's own punctuation. */
+/* Assistant messages that, rendered through a model's template, are replies the model is trained
+ * to write: content only, reasoning, one to five calls, every argument type, unicode, and values
+ * holding the format's own punctuation. */
 std::vector<ojson> rendered_corpus();
 
-/* Replies written by hand in a model's own spelling: the shapes models actually write when they
- * leave their format, and the ones a streaming parser is easiest to get wrong. */
+/* Hand-written replies in a model's own spelling: shapes models write when they leave their
+ * format, and those a streaming parser most easily gets wrong. */
 struct Adversarial { std::string name, text; };
 std::vector<Adversarial> adversarial(const Model& m);
 

@@ -1,13 +1,7 @@
-// WHAT A SCATTERED KV EVICTION COSTS.
-//
-// Pricing a host-tiered prefix cache from a bulk device-to-host bandwidth figure assumes the
-// context moves as ONE transfer. It does not: the prefix cache is block-granular, the blocks are
-// scattered through the paged pool, and a long context is many thousands of them. A scattered copy
-// is a different machine from a contiguous one, and any such estimate rests on which one it is.
-//
-// So: one contiguous copy of N*B bytes, against N separate copies of B bytes from scattered
-// offsets, against N copies issued back-to-back on one stream (the batched form a real eviction
-// would use).
+// Cost of a scattered KV eviction. The prefix cache is block-granular and its blocks are scattered
+// through the paged pool, so a bulk device-to-host bandwidth figure does not price it. Compares one
+// contiguous copy of N*B bytes, N copies of B bytes from scattered offsets with a sync after each,
+// and the same N copies issued back-to-back on one stream (the batched form an eviction would use).
 //
 //   clang++ -x hip -O3 -std=c++17 --offload-arch=gfx1201 blockcopy.hip -o blockcopy
 #include <hip/hip_runtime.h>
@@ -35,8 +29,7 @@ int main(int argc, char** argv) {
     if (hipHostMalloc(&host, (size_t)bytes) != hipSuccess) { std::printf("hipHostMalloc failed\n"); return 1; }
     hipStream_t s; hipStreamCreate(&s);
 
-    /* SCATTERED, not sequential: a real pool hands out blocks in whatever order they were freed,
-     * so the eviction walks them in an order uncorrelated with address. */
+    /* Shuffled order: a pool hands out blocks in free order, uncorrelated with address. */
     std::vector<long long> order((size_t)n);
     for (long long i = 0; i < n; ++i) order[(size_t)i] = i;
     unsigned seed = 12345;

@@ -1,57 +1,42 @@
 // R4D mixture of experts: the router, the scatter/gather pair, and the grouped block-scaled FP8
-// GEMM. One translation unit, because the four are one graph and three of them exist only to feed
-// the fourth.
+// GEMM, in one translation unit because the first three exist to feed the GEMM.
 //
-// ---- WHAT THE GEMM IS SHAPED BY ---------------------------------------------------------------
+// ---- GEMM shape ---------------------------------------------------------------
 //
-// Qwen3.6-35B-A3B: 256 experts, 8 of them per token, 512 columns of intermediate each. So a decode
-// step at eight requests routes 64 (token, slot) rows across up to 64 distinct experts, and reads
-// ONE expert's gate_up [1024, 2048] plus its down [2048, 512] for each -- 3 MB an expert, 24 MB a
-// layer, and that read IS the step. A grouped GEMM on this model is a bandwidth problem wearing a
-// matmul's clothes, and everything below follows from that:
+// Qwen3.6-35B-A3B: 256 experts, 8 per token, 512 intermediate columns each. A decode step at eight
+// requests routes 64 (token, slot) rows across up to 64 experts and reads each one's gate_up
+// [1024, 2048] and down [2048, 512] (3 MB an expert, 24 MB a layer). The grouped GEMM is
+// bandwidth-bound, which shapes everything below:
 //
-//   * A BLOCK OWNS A CONTIGUOUS RANGE OF SORTED ROWS AND LOOPS OVER THE EXPERTS IN IT. No block
-//     map, no padded sort. The cost of a block that straddles two experts is that it stages two
-//     weight tiles instead of one, and the number of (block, expert) incidences -- which is what
-//     the weight traffic is proportional to -- is at most `n_expert + T/FM`. At prefill that is
-//     384 against an optimum of 256, at decode it is within one of the number of distinct experts.
+//   * A block owns a contiguous range of sorted rows and loops over the experts in it; no padded
+//     sort. A block straddling two experts stages two weight tiles, so weight traffic scales with
+//     (block, expert) incidences, at most `n_expert + T/FM`.
 //
-//     AT PREFILL A BLOCK MAP IS BUILT ALL THE SAME. See the AL note beside moe_blockmap_kernel:
-//     at the shipped 2048 chunk the uniform grid is 414 incidences against 254, and a duplicate
-//     staging of a POOLED expert is another pass of its shard over PCIe rather than an L2 hit. One
-//     run a block removes every straddle. It is worth 3.6% of prefill end to end, bit-identical --
-//     less than the incidence count suggests, because most duplicate stagings are served from
-//     cache, so a straddle never costs the full link price of its bytes.
+//     At prefill a block map gives one run per block anyway (see the AL note beside
+//     moe_blockmap_kernel): at a 2048 chunk the uniform grid has 414 incidences against 254, and a
+//     duplicate staging of a pooled expert is another pass over PCIe. Worth 3.6% of prefill,
+//     bit-identical. At decode the (tile, run) grid already gives one run per block.
 //
-//     At DECODE the map is not built: the (tile, run) grid already gives one run a block, and the
-//     incidence count is within one of the number of distinct experts.
+//   * FM is banded: decode runs are a row or two and get 16-row tiles, one run per block; prefill
+//     runs are tens of rows and get 32-row tiles, a wave skipping the 16-row M tiles its run does
+//     not reach. See r4d_moe_decode_band and the kernel's prefill-tile note.
 //
-//   * FM IS BANDED. A decode step's runs are a row or two, so it gets 16-row tiles spread one run a
-//     block; a prefill chunk's are tens of rows, so it gets 32-row tiles one run a block, and a wave
-//     skips the 16-row M tiles its run does not reach. See r4d_moe_decode_band for the crossover and
-//     the kernel's prefill-tile note for why 32.
+//   * Within a 16-row tile dead rows are masked, not skipped: free on a weight-bound kernel, and it
+//     keeps the K loop and its barriers wave-uniform.
 //
-//   * WITHIN A 16-ROW TILE, DEAD ROWS ARE MASKED, NOT SKIPPED. A run of one row still runs a
-//     16-row WMMA tile. On a kernel whose wall is the weight stream that is free, and it keeps the
-//     K loop and its barriers wave-uniform, which a dynamic tile range would not.
+// ---- the weight is a pointer table --------------------------------------------------------
 //
-// ---- WHY THE WEIGHT IS A POINTER TABLE --------------------------------------------------------
+// `Wtab[e]`, not `W + e * stride`: a layer's experts are separate movement units (spec §4.2) that
+// may sit in VRAM, behind the link or on disk, so no stride describes them (RAD_OPK_WTAB,
+// abi/rad_runtime.h). The stacked rank-3 [n_expert, N, K] form is accepted too, for callers with
+// no engine (rad-kbench fixtures); a zero leading stride distinguishes the table.
 //
-// `Wtab[e]` and not `W + e * stride`. A layer's experts are separate movement units (spec §4.1):
-// after placement one is in VRAM, the next is streamed over the link and the third is still on
-// disk, so there is no stride that describes them. RAD_OPK_WTAB is how the core says that; see
-// abi/rad_runtime.h. The STACKED form -- an ordinary rank-3 [n_expert, N, K] tensor -- is accepted
-// too, because a caller with no engine behind it (rad-kbench replaying a fixture) has nowhere to
-// put a pointer array, and the two are told apart by the leading stride being zero.
+// ---- determinism ------------------------------------------------------------------------------
 //
-// ---- DETERMINISM ------------------------------------------------------------------------------
-//
-// The scatter is a STABLE counting sort and it is stable without atomics ordering anything: a
-// slot's position is `expert_offset[e] + blocks_before[b][e] + rank_within_block`, all three of
-// which are computed by reduction rather than by whoever got there first. An atomic cursor would
-// have been four lines and would have made `sorted_tok` -- and therefore every row of the grouped
-// GEMM's output -- depend on the scheduler. This engine's reproducibility claims are byte-level
-// (spec §17) and a non-deterministic sort forfeits all of them.
+// The scatter is a stable counting sort with no atomic ordering: a slot's position is
+// `expert_offset[e] + blocks_before[b][e] + rank_within_block`, all computed by reduction. An
+// atomic cursor would make `sorted_tok`, and every row of the GEMM output, depend on scheduling,
+// breaking the byte-level reproducibility of spec §17.
 #include "r4d.h"
 #include "r4d_common.h"
 #include "r4d_fp8_wmma.h"
@@ -72,17 +57,14 @@
 namespace {
 
 constexpr uint32_t kWave  = 32;
-/* THE EXPERT-COUNT CEILING, and it is a real limit of these kernels rather than a policy.
- * Three of them size something by it: the router keeps a lane's own logits in registers
- * (kMaxOwn below), and both scatter forms keep a histogram of n_expert + 1 counters in LDS.
- * 512 is what Qwen3.8-Flash-Next asks for -- 512 experts of 640 at top-10 -- and it costs
- * 4 KiB of LDS in the scatter and, in the router, a second instantiation rather than sixteen
- * registers on every model. */
+/* Expert-count ceiling, a hard limit of these kernels: the router keeps a lane's logits in
+ * registers (MAXOWN) and both scatter forms keep n_expert + 1 counters in LDS. 512 covers
+ * Qwen3.8-Flash-Next (512 experts of 640, top-10) for 4 KiB of scatter LDS and a second router
+ * instantiation. */
 constexpr uint32_t kMaxExpert = 512;
 constexpr uint32_t kBlock = 128;          // the fp8 scale block, along K and along N
-/* A RUN-MAP ENTRY THAT OWNS NO EXPERT: the rows above `off[n_expert]` are dropped slots whose
- * output must be zeroed and which no run covers. Declared here because the GEMM reads it and the
- * map that writes it is built further down, beside the launcher it belongs to. */
+/* Run-map entry that owns no expert: rows above `off[n_expert]` are dropped slots whose output must
+ * be zeroed. Declared here because the GEMM reads it; the map is built further down. */
 constexpr uint32_t kMapTail = 0xffffffffu;
 constexpr uint32_t kFK    = 128;          // K bytes staged per pass; one scale block exactly
 
@@ -102,52 +84,34 @@ using r4d_fp8::lds_pitch;
 #define R4D_MOE_CHK() do { hipError_t e_ = hipGetLastError();                       \
                            if (e_ != hipSuccess) return -100 - (int)e_; } while (0)
 
-/* An entry of a weight-table operand. `tab` is the pointer array when `stride0` is 0, and the
- * base of a stacked plane otherwise. Resolved on the device rather than the host because the
- * table lives in device memory -- reading it host-side would be a synchronisation a step cannot
- * afford, and the mover may have rewritten it since the last one. */
+/* An entry of a weight-table operand: `tab` is the pointer array when `stride0` is 0, else the base
+ * of a stacked plane. Resolved on the device: the table is in device memory, the mover may rewrite
+ * it, and a host read would need a sync. */
 __device__ __forceinline__ const uint8_t* wtab_at(const void* const* tab, size_t stride0,
                                                   uint32_t e) {
     if (stride0 == 0) return (const uint8_t*)tab[e];
     return (const uint8_t*)tab + (size_t)e * stride0;
 }
 
-/* ONE SORTABLE INTEGER FOR (value, expert id), WHICH IS WHAT TAKES THE BRANCHES OUT OF THE
- * SELECTION -- and it is free only because the logits are BF16.
+/* One sortable u32 for (value, expert id), which removes the branches from the selection; possible
+ * because the logits are bf16.
  *
- * The selection wants "largest value, ties to the lower id". Written as a comparison that is what
- * it says -- `v > bv || (v == bv && id < bid)` over two registers -- and gfx12 compiles it, plus
- * the `continue` that skips an already-chosen entry, into exec-mask branches: 40 s_and_saveexec,
- * 80 s_cbranch_execz and 306 s_wait_alu in a 2137-instruction kernel that runs on ONE workgroup.
- * On four waves of one CU there is nothing to hide any of that behind.
+ * The selection wants the largest value, ties to the lower id. As a two-register comparison gfx12
+ * compiles it into exec-mask branches, and the kernel runs on one workgroup with nothing to hide
+ * them. Instead the order-preserving map of the bf16 (flip the sign bit if positive, invert all
+ * bits if negative; monotone including -inf) goes in the top half and `~id` in the low half, so a
+ * lower id wins ties. Selection is then an unsigned max, the wave reduction carries one register,
+ * and an entry is removed by zeroing its key.
  *
- * A bf16 has sixteen bits, so the ORDER-PRESERVING map of the value fits in the top half of a
- * u32 and the id fits under it. The map is the standard one -- flip the sign bit for a positive
- * float, invert every bit for a negative -- and it is monotone across the whole range including
- * -inf. `~id` in the low half makes a LOWER id compare HIGHER at equal value, which is the tie
- * rule exactly. The selection is then `v_max_u32`, the wave reduction carries one register
- * instead of two (half the ds_bpermute), and an entry is removed by setting its key to zero.
+ * Same answer as the comparison form, with two special cases handled:
+ *   - -0.0 compares equal to +0.0 but has a different pattern, so it is folded to +0.0.
+ *   - NaN never wins a float comparison, but a positive NaN's pattern sorts above +inf, so NaN gets
+ *     key 0 (never selected; an all-NaN row takes the `nothing left` exit).
  *
- * IT IS THE SAME ANSWER, and the two places it would not be are handled rather than assumed:
+ * Inverting the map returns the original bf16, so the softmax input is unchanged.
  *
- *   - NEGATIVE ZERO. -0.0 == +0.0 in float, so the comparison form breaks that tie on the id; as
- *     bit patterns they differ and the key would not. Folded to +0.0 when the key is built.
- *   - NaN. A NaN loses every float comparison, so the comparison form can never select one; a
- *     positive NaN's bit pattern sorts ABOVE +inf and the key would select it first. Given key
- *     zero, which is the same "never selected" and leaves the all-NaN row hitting the same
- *     `nothing left` exit.
- *
- * `bv` is recovered by inverting the map, which returns the ORIGINAL bf16 pattern and therefore
- * the identical f32 -- the softmax that reads it is untouched.
- *
- * WHAT IT BUYS is not instruction count but the DEPENDENCY CHAIN. Against the two-register
- * comparison the object is 2014 instructions and 78 basic blocks with 30 ds_bpermute and 214
- * s_wait_alu, where that form is 2137, 96, 40 and 306. This kernel runs on ONE workgroup at
- * decode, so a chain with exec-mask branches in it is what it costs.
- *
- * DO NOT CHASE rad-kbench's 6.354e-05 ON THE M=512 ROUTER CASE. The selection there is exact
- * (expert_ids rel_l2 0.000e+00); what differs by about one bf16 ulp is the WEIGHT, and it is not
- * this key form's doing. Every case from M=1 to M=256, decode included, is exact. */
+ * Note: rad-kbench's 6.354e-05 on the M=512 router case is a one-ulp difference in the weight, not
+ * the selection (expert_ids are exact); every case from M=1 to M=256 is exact. */
 __device__ __forceinline__ uint32_t topk_key(uint16_t raw, uint32_t e) {
     const bool nan = ((raw & 0x7F80u) == 0x7F80u) && (raw & 0x7Fu);
     uint16_t   u   = (raw == 0x8000u) ? (uint16_t)0u : raw;          /* -0.0 folds to +0.0 */
@@ -159,11 +123,9 @@ __device__ __forceinline__ uint16_t topk_key_raw(uint32_t key) {
     return (k & 0x8000u) ? (uint16_t)(k & 0x7FFFu) : (uint16_t)~k;
 }
 
-/* THE SELECTION'S WAVE MINIMUM, ON THE DPP AND PERMLANE EXCHANGE r4d_xor_lane provides rather than
- * `__shfl_xor`, which gfx1201 lowers to `ds_bpermute_b32`: an LDS round trip a stage. A row runs
- * this top_k times, five stages each, and nothing else is in flight on the wave to cover it, so
- * those round trips would be most of the selection. The minimum of unsigned integers has one answer
- * whatever order the lanes combine in. */
+/* The selection's wave minimum, on r4d_xor_lane's DPP/permlane exchange rather than `__shfl_xor`
+ * (an LDS round trip per stage on gfx1201, run top_k times per row with nothing to hide it). An
+ * unsigned minimum is order-independent. */
 __device__ __forceinline__ uint32_t wave_min_u32(uint32_t b) {
     uint32_t o;
     o = r4d_xor_lane_u32<16>(b); b = b < o ? b : o;
@@ -179,34 +141,22 @@ __device__ __forceinline__ uint32_t wave_min_u32(uint32_t b) {
  * Softmax over all n_expert logits, then the top_k of them by value, then -- if `norm` -- the kept
  * weights renormalised to sum to one.
  *
- * ONE WAVE A ROW, and the selection is k passes of a wave reduction rather than a sort. At
- * n_expert 256 and top_k 8 that is 8 passes over 8 values a lane, which is less work than any sort
- * and, more to the point, is EXACTLY the reference's selection: the largest remaining value, ties
- * broken on the lower expert id. A partial sort with a different tie rule is a different router on
- * exactly the rows where two experts score the same, and those rows are not rare in a trained
- * model's tail.
- *
- * The selection runs on the LOGITS, not on the probabilities: softmax is monotone, so the order is
- * identical and the comparison is exact rather than through an exp. libref says the same. */
-/* MAXOWN is how many of the row's logits ONE LANE holds, so n_expert <= MAXOWN * kWave. It is a
- * template parameter and not a constant because those are REGISTERS: a 512-expert model needs 16
- * of them a lane and a 256-expert one needs 8, and paying the larger everywhere would cost
- * occupancy on every model in the tree to serve one. Each entry is one u32 key -- see topk_key --
- * so MAXOWN is bounded by registers and by nothing else. */
-/* ONE ROW, ONE WAVE, AND NOTHING OUTSIDE THE WAVE. Every reduction below is a butterfly over the
- * row's own 32 lanes and every store is addressed by `m`, so WHICH wave of WHICH workgroup
- * runs a row cannot change its answer. That is what lets `router_topk_scatter_kernel` walk the
- * same rows from a different grid and still be byte-identical -- it is the same code, not a copy
- * of it, which is the only form of that claim that cannot drift. */
-/* WHERE A ROW ALSO HANDS ITS SLOTS TO THE SORT, when it runs inside the fused kernel: each slot's
- * expert relative to the slice, or -1 when it went to another rank, into `e`. The standalone
- * selection passes a null `e` and the branch folds away. */
-/* THE PROTECTED EXPERTS OF A SLICE, SORTED LAST. A layer may keep a few of its experts at a higher
- * precision than the rest -- the ones whose output dwarfs the others' -- and one grouped GEMM takes
- * one weight format. So the sort places those experts' runs after every other expert's, in the
- * order listed, and two GEMMs serve the two segments: the regular experts are [0, n - p) and the
- * protected ones [n - p, n) of the offsets. Local indices, strictly ascending; p <= kMaxProtect.
- * With none listed the place of an expert is the expert, which is every layer without them. */
+ * One wave per row; the selection is k passes of a wave reduction, not a sort. That matches the
+ * reference exactly (largest remaining value, ties to the lower id); a sort with another tie rule
+ * would be a different router on tied rows, which are not rare. Selection runs on the logits:
+ * softmax is monotone, so the order is the same and the comparison exact (as in libref). */
+/* MAXOWN is how many of a row's logits one lane holds (n_expert <= MAXOWN * kWave). It is a
+ * template parameter because they are registers: 16 per lane at 512 experts, 8 at 256. */
+/* One row per wave, with nothing outside the wave: reductions are butterflies over the row's 32
+ * lanes and stores are addressed by `m`, so the grid shape cannot change the answer. That lets
+ * `router_topk_scatter_kernel` run this same code from a different grid, byte-identically. */
+/* In the fused kernel a row also hands its slots to the sort through `e`: each slot's expert
+ * relative to the slice, or -1 for another rank's. The standalone selection passes a null `e`. */
+/* Protected experts of a slice, sorted last. A layer may keep a few experts (those whose output
+ * dwarfs the rest) at higher precision, and one grouped GEMM takes one weight format, so the sort
+ * places their runs after all others, in the listed order, and two GEMMs serve [0, n - p) and
+ * [n - p, n) of the offsets. Local indices, strictly ascending; p <= kMaxProtect. With none, an
+ * expert's place is itself. */
 constexpr uint32_t kMaxProtect = 8;
 struct Protect {
     uint32_t n;
@@ -237,30 +187,18 @@ __device__ __forceinline__ void router_topk_row(
     SlotSink snk) {
 
     const uint16_t* row = lg + (size_t)m * lg_ld;
-    /* Up to MAXOWN experts a lane: n_expert <= MAXOWN * kWave is a launch precondition, checked
-     * on the host, which is also what picks the instantiation.
+    /* Up to MAXOWN experts per lane; n_expert <= MAXOWN * kWave is checked on the host, which also
+     * picks the instantiation.
      *
-     * THE TRIP COUNT IS MAXOWN AND NOT `n_own`, AND THAT IS THE WHOLE COST OF THIS KERNEL.
-     *
-     * `for (e = lane; e < n_expert; e += kWave) v[n_own++] = ...` makes `n_own` a value the
-     * compiler derives from `lane`, so every later `v[i]` is a register index it must assume is
-     * DIVERGENT -- and a divergent VGPR index on gfx12 is not an addressing mode, it is a
-     * waterfall: `v_movrels_b32` inside an exec-masked loop that re-runs for each distinct index
-     * in the wave. The top-k loop reads `v[i]` top_k * MAXOWN times, so written that way the kernel
-     * disassembles to four such loops and takes tens of microseconds to rank 512 numbers -- tens of
-     * thousands of cycles, on one wave, for about a kilobyte of input.
-     *
-     * Unrolled to the compile-time bound every index is a constant, the array stays in registers
-     * and there are no waterfalls. Slots past `n_expert` hold -INFINITY and start out marked in
-     * `taken`, which is what keeps the result BIT-IDENTICAL: fmaxf against -inf is the identity,
-     * __expf(-inf - mx) is exactly zero and lands at the tail of the same ascending sum, and the
-     * selection loop skips a marked slot exactly as it skips a chosen one. At this model's 512
-     * experts every lane owns all 16 anyway, so nothing is even masked. */
-    /* ALL MAXOWN LOADS ARE ISSUED BEFORE ANY IS WAITED ON. Guarded as `if (ok) raw = row[e]`, each
-     * load sits in its own exec-masked branch with its use straight after it, so the compiler
-     * waits for every one before issuing the next: MAXOWN dependent round trips to L2, most of a
-     * row's time. So a slot past `n_expert` reads the row's first logit instead -- always in
-     * bounds -- and the select below discards it. */
+     * The trip count is MAXOWN, not a lane-derived `n_own`: a lane-derived count makes every later
+     * `v[i]` a divergent register index, which gfx12 implements as a v_movrels waterfall loop,
+     * costing tens of microseconds to rank 512 numbers. Unrolled to the constant bound, the array
+     * stays in registers. Slots past `n_expert` hold -INFINITY with key 0, which keeps the result
+     * bit-identical: fmaxf ignores -inf, __expf(-inf - mx) is exactly zero, and the selection
+     * never picks key 0 while a real entry remains. */
+    /* All MAXOWN loads issue before any is waited on. A guarded `if (ok) raw = row[e]` would put
+     * each load in its own exec-masked branch and serialise the round trips, so a slot past
+     * `n_expert` reads the row's first logit (always in bounds) and the select discards it. */
     uint16_t raw[MAXOWN];
 #pragma unroll
     for (uint32_t i = 0; i < MAXOWN; ++i) {
@@ -292,27 +230,21 @@ __device__ __forceinline__ void router_topk_row(
     sum = r4d_wave_sum(sum);
     const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
 
-    /* ---- THE SELECTION LEAVES IN A REGISTER, NOT THROUGH DEVICE MEMORY AND BACK.
+    /* ---- the selection stays in registers.
      *
-     * The reference stores each selected probability as bf16 and, if `norm`, scales the STORED
-     * value -- so that round trip is part of the answer. Done literally it is top_k scalar stores,
-     * top_k dependent loads and top_k more stores on one lane of one wave, and on a decode step
-     * this kernel is one workgroup, so that chain would be its whole cost. Round r parks its
-     * winner on LANE r instead, which needs top_k <= kWave; both launchers refuse more.
+     * The reference stores each selected probability as bf16 and, with `norm`, rescales the stored
+     * value. Doing that literally would chain top_k stores and dependent loads on one lane. Instead
+     * round r parks its winner on lane r (top_k <= kWave; both launchers refuse more).
      *
-     * ROUND r TAKES THE LARGEST KEY BELOW ROUND r-1's, rather than zeroing the last winner and
-     * taking the largest one left. Keys are unique -- the low half is ~id -- so the two are the
-     * same sequence, but zeroing is a compare and a select on every entry, each waiting on the
-     * one condition register, top_k times over. "Below" is one subtraction instead: with P the
-     * last winner minus one, P - key is at most P for every key not above P and wraps past P for
-     * every key already taken, so the smallest P - key names the largest key not yet taken. An
-     * absent or NaN entry (key 0) gives P itself, so it is chosen only once nothing real is left,
-     * and that is the `nothing left` exit.
+     * Round r takes the largest key below round r-1's, which equals zeroing the last winner (keys
+     * are unique) but costs one subtraction: with P the last winner minus one, P - key is at most P
+     * for keys not above P and wraps past P for taken keys, so the smallest P - key names the
+     * largest untaken key. Key 0 (absent or NaN) yields P itself and is chosen only when nothing
+     * real is left, the `nothing left` exit.
      *
-     * THE PROBABILITIES ARE WORKED OUT AFTER THE LOOP, each on the lane its winner is parked on,
-     * from the same expression on the same inputs, so the same bits. `wsum` then adds them in
-     * round order, the order the reference adds them in, and the renormalisation reads the bf16
-     * that was produced, not the f32 behind it, as the reference does. */
+     * Probabilities are computed after the loop on each winner's lane with the same expression, so
+     * the same bits. `wsum` adds them in round order, as the reference does, and the
+     * renormalisation reads the produced bf16, not the f32 behind it. */
     uint32_t P     = 0xFFFFFFFFu;     /* round 0 may take any key */
     uint32_t mykey = 0u;
     uint32_t nsel  = 0;
@@ -360,38 +292,28 @@ __global__ __launch_bounds__(NW * kWave) void router_topk_kernel(
 
 /* ================================================================== moe_scatter
  *
- * The small form: one workgroup does the whole sort. T <= kScatterSmall, which covers every decode
- * and verify step (a verify step at eight sequences and depth 3 is 32 rows at top_k 10, T = 320),
- * and it is one launch against the three the general form needs. The histogram is in LDS, the
- * offsets are an exclusive prefix over the n_expert <= kMaxExpert counts, and each slot finds its
- * own place from its rank inside its expert's run.
+ * The small form: one workgroup does the whole sort, for T <= kScatterSmall, which covers every
+ * decode and verify step (eight sequences at depth 3 and top_k 10 is T = 320), in one launch
+ * instead of three. Histogram in LDS, offsets an exclusive prefix over n_expert <= kMaxExpert
+ * counts, and each slot placed by its rank inside its expert's run.
  *
- * ON ONE WORKGROUP THE COST IS THE CRITICAL PATH, NOT THE WORK, and it goes to barriers and to
- * serial chains of LDS round trips. Phase by phase, a Hillis-Steele scan costs 0.72 us (sixteen
- * barriers), prefixing a per-wave cursor table 0.45 us, and placing with one lane a wave walking
- * its chunk of 40 slots -- each step an LDS read, a read-modify-write of its cursor and a store --
- * 2.24 us at T = 320. So:
+ * On one workgroup the critical path (barriers, serial LDS chains) is the cost, not the work:
  *
- *   - THE PREFIX is a DPP scan inside each wave and one exchange of the wave totals through LDS:
- *     a barrier a tile of 32 counts a wave, and n_expert <= 512 is at most two tiles at eight
- *     waves and one at sixteen or more.
- *   - THE PLACEMENT GROUPS FIRST AND ORDERS AFTER. The histogram's atomic hands each slot a ticket
- *     inside its expert's run; tickets come in arrival order, so the slots are first gathered
- *     into their runs in that order, and then each slot's place in the run is the number of the
- *     run's slots with a lower index. That count is as long as the run -- at most one slot a row,
- *     since a row picks an expert once -- where counting over every earlier slot is T/4 LDS
- *     reads long and slower than the walk.
+ *   - The prefix is a DPP scan inside each wave plus one exchange of wave totals through LDS: one
+ *     barrier per tile of 32 counts per wave (at most two tiles at eight waves for 512 experts).
+ *   - Placement groups first and orders after. The histogram atomic hands each slot a ticket in its
+ *     expert's run (arrival order); slots are gathered into runs in ticket order, then each slot's
+ *     place is the number of the run's slots with a lower index. That count is as long as the run
+ *     (a row picks an expert at most once), far shorter than counting all earlier slots.
  *
- * STABLE AND BYTE-IDENTICAL: the place in the run is the position among the same expert's slots
- * in ascending i, which is the order the reference produces, whatever order the tickets were
- * handed out in; and an exclusive prefix of non-negative integers
- * has one answer. Every barrier here orders LDS alone, so none of them waits on or invalidates
- * anything in the vector memory path. */
+ * Stable and byte-identical: a slot's place is its position among the same expert's slots in
+ * ascending i, as in the reference, whatever the ticket order. Every barrier orders LDS only, so
+ * none waits on or invalidates the vector memory path. */
 constexpr uint32_t kScatterSmall = 1024;
 constexpr uint32_t kScatWaves    = 8;          /* the standalone sort: 256 threads */
 
-/* THE SMALL SORT'S LDS, NAMED ONCE so the standalone kernel and the fused one cannot declare it
- * differently. About 16 KiB. NW is the workgroup's wave count, which sizes the scan's exchange. */
+/* The small sort's LDS (about 16 KiB), defined once for the standalone and fused kernels. NW is the
+ * workgroup's wave count, which sizes the scan's exchange. */
 template <uint32_t NW>
 struct ScatterLds {
     static constexpr uint32_t kTiles = (kMaxExpert + NW * kWave - 1) / (NW * kWave);
@@ -403,9 +325,9 @@ struct ScatterLds {
     int32_t wt[kTiles][NW];                      /* each wave's total, a slot per tile */
 };
 
-/* INCLUSIVE PREFIX SUM OVER A WAVE32, on the DPP row shifts: four steps inside each row of
- * sixteen, then the upper row adds the lower row's total. A lane shifted in from outside its row
- * reads zero (bound_ctrl), which is what a prefix sum wants there. */
+/* Inclusive prefix sum over a wave32 with DPP row shifts: four steps within each 16-lane row, then
+ * the upper row adds the lower row's total. Lanes shifted in from outside the row read zero
+ * (bound_ctrl). */
 __device__ __forceinline__ int32_t wave_incl_scan_i32(int32_t x, uint32_t lane) {
     x += __builtin_amdgcn_update_dpp(0, x, 0x111, 0xF, 0xF, true);    /* row_shr:1 */
     x += __builtin_amdgcn_update_dpp(0, x, 0x112, 0xF, 0xF, true);    /* row_shr:2 */
@@ -416,9 +338,8 @@ __device__ __forceinline__ int32_t wave_incl_scan_i32(int32_t x, uint32_t lane) 
 }
 
 /* The sort, from a filled slot list on: histogram, offsets and counts, placement. The caller has
- * written `sl.e[0, T)` and zeroed `sl.cnt[0, n_expert)`, and a barrier has passed since. Extracted
- * so the standalone sort and the fused kernel run THIS code and not a transcription of it. The
- * workgroup is exactly NW waves. */
+ * written `sl.e[0, T)` and zeroed `sl.cnt[0, n_expert)`, followed by a barrier. Shared by the
+ * standalone sort and the fused kernel. The workgroup is exactly NW waves. */
 template <uint32_t NW>
 __device__ __forceinline__ void scatter_small_place(
     int32_t* __restrict__ sorted, int32_t* __restrict__ off, int32_t* __restrict__ cnt,
@@ -431,8 +352,8 @@ __device__ __forceinline__ void scatter_small_place(
     }
     lds_barrier();
 
-    /* Every thread sums all NW wave totals, so `carry` -- and at the end the number of live
-     * slots -- is the same in every thread without another read. */
+    /* Every thread sums all NW wave totals, so `carry` (finally the live slot count) is the same
+     * in every thread. */
     int32_t carry = 0;
     for (uint32_t b = 0, t = 0; b < n_expert; b += NW * kWave, ++t) {
         const uint32_t e = b + tid;
@@ -490,40 +411,26 @@ __global__ __launch_bounds__(kScatWaves * kWave) void scatter_small_kernel(
 
 /* ================================================================== router_topk + moe_scatter
  *
- * ONE LAUNCH FOR THE PAIR, and the pair is worth fusing because NEITHER HALF IS WORK. At the
- * decode shape each is a single 256-thread workgroup -- `router_topk` is a wave a row and four rows
- * is one workgroup; the small sort is one workgroup by construction -- moving about a kilobyte,
- * so each launch is its dispatch floor plus a critical path of barriers and round trips. With one
- * of each per MoE layer per rank per step, a separate launch is a real share of the decode step.
+ * One launch for the pair: at decode each half is a single 256-thread workgroup moving about a
+ * kilobyte, so each launch is mostly dispatch floor and barriers, once per MoE layer per step.
  *
- * THE SLOTS REACH THE SORT THROUGH LDS, NOT THROUGH `expert_ids`. Each row's lanes write their
- * slot's expert (relative to the slice, or -1) into the sort's slot list as they finish, so the
- * one barrier between the halves orders LDS only: the sort neither re-reads what the selection
- * just stored nor waits for those stores to land. Nothing comes BEFORE the rows either -- the
- * histogram is zeroed by each thread on its way in and counted after that barrier -- because a
- * barrier at the top waits for the workgroup's last wave to be launched, about half a
- * microsecond that otherwise passes under the first rows' selection.
+ * Slots reach the sort through LDS, not `expert_ids`: each row's lanes write their slot's expert
+ * (relative to the slice, or -1) into the sort's slot list, so the one barrier between the halves
+ * orders LDS only. There is no barrier before the rows (each thread zeroes the histogram on its
+ * way in), since a top barrier would wait for the workgroup's last wave to launch.
  *
- * WHY IT IS BYTE-IDENTICAL: the selection is the same device function the standalone kernel
- * calls, wave-local in every reduction and addressing every store by `m`, so running the rows
- * from a different number of waves cannot move a bit; the placement is the same function the
- * standalone sort calls, and it is stable without an atomic ordering anything, so it does not
- * depend on which wave got there first. The one input on which the two paths differ is a row
- * with fewer live experts than top_k -- NaN logits -- whose unselected slots the standalone sort
- * reads from whatever `expert_ids` held and this one records as dropped.
+ * Byte-identical to the unfused pair: the selection and placement are the same device functions,
+ * wave-local and stable. The one difference is a row with fewer live experts than top_k (NaN
+ * logits): the standalone sort reads its unselected slots from whatever `expert_ids` held, this
+ * one records them as dropped.
  *
- * A LOOP AND NOT AN EARLY RETURN over the rows -- every thread has to reach the barrier, and
- * `router_topk_kernel`'s `if (m >= M) return;` is exactly what would make that fail on the tail
- * workgroup. The row bound is the caller's: T = M * top_k must fit `kScatterSmall`, which the shim
- * checks and the architecture asks about before it declares the op at all.
+ * The rows are a loop, not an early return, because every thread must reach the barrier. T =
+ * M * top_k must fit kScatterSmall, checked by the shim and by the architecture before declaring
+ * the op.
  */
-/* TWO EXPERT COUNTS AND THEY ARE NOT THE SAME NUMBER. The selection runs over the WHOLE router --
- * it is replicated, and every rank picks from every expert -- while the sort runs over THIS
- * RANK'S SLICE and drops what went elsewhere. On this model at two ranks that is 512 against 254.
- * Passing one count to both is the bug this signature exists to make impossible: the sort would
- * accept ids outside the slice and index its histogram out of range, and the selection would rank
- * half the experts. `n_expert` is the router's, `n_local` the slice's, exactly as the two
- * unfused ops declare them. */
+/* Two different expert counts: the selection runs over the whole (replicated) router, `n_expert`,
+ * while the sort runs over this rank's slice, `n_local`, dropping the rest (512 against 254 at two
+ * ranks here). Passing one count to both would let the sort index its histogram out of range. */
 template <uint32_t MAXOWN, uint32_t NW>
 __global__ __launch_bounds__(NW * kWave) void router_topk_scatter_kernel(
     const uint16_t* __restrict__ lg, int32_t* __restrict__ ids, uint16_t* __restrict__ w,
@@ -540,8 +447,8 @@ __global__ __launch_bounds__(NW * kWave) void router_topk_scatter_kernel(
     scatter_small_place(sorted, off, cnt, M * top_k, n_local, sl);
 }
 
-/* The general form, in three passes, and the three exist to keep it stable without an atomic
- * deciding anything. `bcnt` is [n_tile, n_expert] in scratch. */
+/* The general form, in three passes so it stays stable without an atomic deciding order. `bcnt` is
+ * [n_tile, n_expert] in scratch. */
 constexpr uint32_t kScatterTile = 256;
 
 __global__ __launch_bounds__(kScatterTile) void scatter_hist_kernel(
@@ -561,16 +468,13 @@ __global__ __launch_bounds__(kScatterTile) void scatter_hist_kernel(
         bcnt[(size_t)b * n_expert + e] = s_h[e];
 }
 
-/* ONE WORKGROUP, ONE THREAD AN EXPERT: the exclusive scan across tiles within each expert, in
- * place -- so `bcnt[b][e]` becomes "how many of expert e are in tiles before b" -- each expert's
- * total, and the exclusive scan of the totals across experts.
+/* One workgroup, one thread per expert: the exclusive scan across tiles within each expert, in
+ * place (`bcnt[b][e]` becomes the count of expert e in tiles before b), each expert's total, and
+ * the exclusive scan of the totals across experts.
  *
- * A thread's column of `bcnt` comes in kScanBatch loads at a time, all issued before any is used:
- * at a 2048-token chunk and top 10 that is 80 tiles, and walked a load at a time -- load, add,
- * store, then the next load -- it is 80 dependent round trips on the one workgroup a layer's sort
- * waits for. The prefix across experts is the small sort's: a DPP scan in each wave and one
- * exchange of the wave totals. Integers, and every sum has one answer whatever order it is formed
- * in. */
+ * A thread's column of `bcnt` is loaded kScanBatch at a time before use; one at a time it would be
+ * 80 dependent round trips at a 2048-token chunk and top 10. The prefix across experts is the small
+ * sort's (DPP scan per wave plus one exchange). Integer sums are order-independent. */
 constexpr uint32_t kScanBatch = 16;
 
 __global__ __launch_bounds__(kMaxExpert) void scatter_scan_kernel(
@@ -582,8 +486,8 @@ __global__ __launch_bounds__(kMaxExpert) void scatter_scan_kernel(
     int32_t run = 0;
     if (e < n_expert) {
         for (uint32_t b0 = 0; b0 < n_tile; b0 += kScanBatch) {
-            /* Every load in bounds -- a row past the last is the last row again, and discarded --
-             * so none of them sits in a branch the next one has to wait behind. */
+            /* Every load in bounds (past the end re-reads the last row, discarded), so no load sits
+             * in a branch. */
             int32_t v[kScanBatch];
 #pragma unroll
             for (uint32_t k = 0; k < kScanBatch; ++k) {
@@ -613,11 +517,10 @@ __global__ __launch_bounds__(kMaxExpert) void scatter_scan_kernel(
     if (e == 0) off[n_expert] = tot;
 }
 
-/* THE PLACEMENT, AND THE TAIL. Every routed slot of the tile goes to its expert's offset, plus the
- * expert's count in the tiles before this one, plus its rank in this tile. The sorted rows past the
- * live count are -1; they are never a placement target (every placed slot lands below
- * `off[n_expert]`), so the placement's own threads write them, each its own index, and no thread
- * can race another for a row. */
+/* Placement and tail. Each routed slot goes to its expert's offset plus the expert's count in
+ * earlier tiles plus its rank in this tile. Sorted rows past the live count are -1; no placement
+ * lands there (all placed slots are below `off[n_expert]`), so each thread writes its own index
+ * without races. */
 __global__ __launch_bounds__(kScatterTile) void scatter_place_kernel(
     const int32_t* __restrict__ ids, const int32_t* __restrict__ bcnt,
     const int32_t* __restrict__ off, int32_t* __restrict__ sorted,
@@ -625,9 +528,8 @@ __global__ __launch_bounds__(kScatterTile) void scatter_place_kernel(
     __shared__ int32_t s_id[kScatterTile];
     const uint32_t tid = threadIdx.x, b = blockIdx.x;
     const uint32_t i = b * kScatterTile + tid;
-    /* THE PLACE IN THE SORT throughout -- the local expert index, with any protected experts moved
-     * last: s_id, the range test and the rank scan all work in the indices the offsets and the
-     * weight tables are built from. */
+    /* Everything works in sort places (local index, protected experts last), the indices the
+     * offsets and weight tables use. */
     const int32_t  l = (i < T) ? ids[i] - base : -1;
     const int32_t  e = (l >= 0 && l < (int32_t)n_expert) ? sort_place(l, n_expert, prot) : -1;
     s_id[tid] = e;
@@ -635,8 +537,8 @@ __global__ __launch_bounds__(kScatterTile) void scatter_place_kernel(
     if (i >= live && i < T) sorted[i] = -1;
     __syncthreads();
     if (i >= T || e < 0) return;
-    /* Rank within the tile: how many earlier slots of this tile chose the same expert. A serial
-     * scan of at most 256 LDS words a thread, which is the price of stability. */
+    /* Rank within the tile: earlier slots of this tile with the same expert. A serial scan of at
+     * most 256 LDS words per thread, the price of stability. */
     int32_t rank = 0;
     for (uint32_t j = 0; j < tid; ++j) rank += (s_id[j] == e);
     sorted[off[e] + bcnt[(size_t)b * n_expert + e] + rank] = (int32_t)i;
@@ -644,24 +546,20 @@ __global__ __launch_bounds__(kScatterTile) void scatter_place_kernel(
 
 /* ================================================================== the 4-bit expert weight
  *
- * SIXTEEN PACKED BYTES TO THE THIRTY-TWO E4M3 BYTES OF A Stage8, and nothing downstream of it
- * changes: the padded LDS pitch, frag(), the WMMA and the store are the fp8 kernel's, untouched.
- * r4d_layout.cpp's moe w4 section states the stored plane; this is the decode it was chosen for.
+ * Sixteen packed bytes expand to the thirty-two E4M3 bytes of a Stage8; everything downstream (LDS
+ * pitch, frag(), WMMA, store) is the fp8 kernel's. The stored plane is described in
+ * r4d_layout.cpp's moe w4 section.
  *
- * Byte b of a packed dword holds element b in its low nibble and element b+4 in its high one, so
- * the two masks below produce elements 0..3 and 4..7 already in order and nothing has to be
- * interleaved afterwards. It is the same argument the dense w4a8 kernel's header makes for the
- * same pair of masks.
+ * Byte b of a packed dword holds element b in its low nibble and b+4 in its high one, so the two
+ * masks yield elements 0..3 and 4..7 in order with no interleave (as in the dense w4a8 kernel).
  *
- * Fifteen VALU per eight weights. At every shape this kernel runs it is DRAM-bound by better than
- * an order of magnitude -- a prefill layer reads about 3 GiB of expert weight for 134 GFLOP, which
- * is 25 FLOP a byte against a part that wants 400 -- so the dequant is free and the halved weight
- * stream is the whole of the win.
+ * Fifteen VALU per eight weights. The kernel is DRAM-bound by over an order of magnitude (a
+ * prefill layer: ~3 GiB of expert weight for 134 GFLOP), so the dequant is free and halving the
+ * weight stream is the win.
  */
 __device__ __forceinline__ uint32_t w4_e4m3(uint32_t nib, const uint32_t (&tab)[4]) {
-    /* SIXTEEN LEVELS OUT OF AN EIGHT-BYTE PERMUTE, which is the whole trick. V_PERM_B32 selects
-     * from a 64-bit source, so one table holds eight entries and no more -- and a nibble needs
-     * sixteen. Two tables and a selector that CHOOSES BETWEEN THEM gets there:
+    /* Sixteen levels from eight-byte permutes. V_PERM_B32 selects from a 64-bit source, so one
+     * table holds eight entries; two tables and a selector between them cover a nibble:
      *
      *   m   = nib & 7                      the index within a half, the same for both
      *   lo  = perm(tab[1], tab[0], m)      E4M3 of entries 0..7   (codes 0..7)
@@ -669,15 +567,11 @@ __device__ __forceinline__ uint32_t w4_e4m3(uint32_t nib, const uint32_t (&tab)[
      *   sel = 0x03020100 + ((nib & 8) >> 1)   byte i picks lo[i], or hi[i] four bytes further on
      *   out = perm(hi, lo, sel)
      *
-     * The add cannot carry: every selector byte is 0..3 before it and 4..7 after. Fifteen VALU per
-     * eight weights, and the same fifteen whatever the table holds -- on a kernel that is
-     * DRAM-bound by better than an order of magnitude.
+     * The add cannot carry: each selector byte is 0..3 before it and 4..7 after.
      *
-     * THE TABLE IS AN ARGUMENT, one of two (r4d_args.h): the integers -8..7 of a two's complement
-     * nibble (w4a8, w4a8h) or the w4nl levels (w4nla8h). Every entry of both is EXACT IN E4M3, so a
-     * code expands losslessly and the WMMA's product is entry * activation with no rounding the fp8
-     * path did not already have. That is what lets this weight ride the existing
-     * f32_16x16x16_fp8_fp8 inner loop untouched: only the STAGING changes. */
+     * The table is an argument (r4d_args.h): the integers -8..7 of a two's-complement nibble (w4a8,
+     * w4a8h) or the w4nl levels (w4nla8h). Every entry is exact in E4M3, so codes expand losslessly
+     * and the f32_16x16x16_fp8_fp8 inner loop is reused unchanged; only staging differs. */
     const uint32_t m   = nib & 0x07070707u;
     const uint32_t lo  = __builtin_amdgcn_perm(tab[1], tab[0], m);
     const uint32_t hi  = __builtin_amdgcn_perm(tab[3], tab[2], m);
@@ -699,11 +593,10 @@ __device__ __forceinline__ Stage8 w4_expand(uint4 p, const uint32_t (&tab)[4]) {
     return r;
 }
 
-/* w5nl64a8h's 32 codes: the magnitudes as w4_expand expands any nibble -- `tab` is the sixteen
- * magnitudes -- and then each byte's sign bit from `sg`. Output dword m holds elements 4m..4m+3,
- * and the relayout stores element 4m+b's sign at bit 7-m of byte b of `sg` (r4d_layout.cpp), so a
- * shift by m puts dword m's four signs at bit 7 of their bytes -- E4M3's sign -- and the mask keeps
- * just those: two VALU per four weights, one where m is 0. */
+/* w5nl64a8h's 32 codes: magnitudes via w4_expand (`tab` holds the sixteen magnitudes), then each
+ * byte's sign from `sg`. Output dword m holds elements 4m..4m+3, and the relayout stores element
+ * 4m+b's sign at bit 7-m of byte b of `sg` (r4d_layout.cpp), so shifting by m puts dword m's signs
+ * at bit 7 of their bytes (E4M3's sign bit) and the mask keeps them. */
 __device__ __forceinline__ Stage8 w5_expand(uint4 p, uint32_t sg, const uint32_t (&tab)[4]) {
     Stage8 r = w4_expand(p, tab);
     uint32_t o[8] = { r.v.x, r.v.y, r.v.z, r.v.w, r.w.x, r.w.y, r.w.z, r.w.w };
@@ -715,31 +608,23 @@ __device__ __forceinline__ Stage8 w5_expand(uint4 p, uint32_t sg, const uint32_t
     return r;
 }
 
-/* The packed half of a Stage8's worth of K, or zeros for a row this block does not own. A dead
- * lane's zeros expand to entry 0, which is E4M3 zero under -8..7 and 1.125 under w4nl; either way
- * the column contributes nothing, because the staging gives a column this block does not own a
- * weight scale of zero. */
+/* The packed half of a Stage8's worth of K, or zeros for a row this block does not own. Zeros
+ * expand to entry 0 (E4M3 zero under -8..7, 1.125 under w4nl); either way the column contributes
+ * nothing, since staging gives an unowned column a weight scale of zero. */
 __device__ __forceinline__ uint4 w4_load(const uint8_t* __restrict__ src, bool live) {
     return live ? *(const uint4*)src : make_uint4(0, 0, 0, 0);
 }
 
-/* ---- UW: THE WEIGHT STREAM FROM A UNIFORM GLOBAL ADDRESS ----------------------------------------
+/* ---- UW: the weight stream from a uniform global address ----------------------------------------
  *
- * The weight and its scales are reached through the table, so their base pointer is a value LOADED
- * by the kernel: `e` comes out of LDS, the compiler cannot prove it uniform, and the table entry is
- * fetched with a vector load into VGPRs and then used as a GENERIC pointer -- every weight load is
- * a flat_load. On gfx12 that combination serialises the staging. A flat load may also reach LDS, so
- * once one is in flight the waitcnt pass can only wait for a vector-load count of ZERO; and the
- * base pointer's own load is never seen as retired across the exec-masked `live` branches. The
- * disassembly of the decode form shows the result: `s_wait_loadcnt 0x0` in front of every weight
- * load, so a pass's activation, first weight row and second weight row go to memory one after the
- * other -- three round trips where one was written.
+ * The weight base pointer is loaded through the table with an index from LDS, so the compiler
+ * treats it as a divergent generic pointer and every weight load becomes a flat_load. On gfx12 a
+ * flat load may reach LDS, so the waitcnt pass waits for a load count of zero before every weight
+ * load, serialising a pass's activation and weight loads into three round trips.
  *
- * Under UW the two table entries are made uniform (readfirstlane: `e` is block-uniform, every lane
- * holds the same pointer) and the loads go through address_space(1), as the dense w4 kernels do:
- * an SGPR base, global_load, and nothing for the waitcnt pass to wait on until the LDS store that
- * consumes them. The same bytes reach the same registers: bit-identical. A table entry that points
- * into host memory (a pooled expert) is still a global address; nothing here can be LDS. */
+ * Under UW the table entries are made uniform with readfirstlane (`e` is block-uniform) and loaded
+ * through address_space(1), as in the dense w4 kernels: SGPR base, global_load, no premature wait.
+ * Bit-identical. A pooled expert's host-memory entry is still a global address. */
 typedef unsigned r4d_moe_u4v __attribute__((ext_vector_type(4)));
 typedef __attribute__((address_space(1))) const r4d_moe_u4v* r4d_moe_gu4;
 typedef __attribute__((address_space(1))) const uint32_t*    r4d_moe_gu32;
@@ -785,12 +670,10 @@ __device__ __forceinline__ uint32_t u32_load_w(const uint32_t* p) {
     if constexpr (!UW) return *p;
     return *(r4d_moe_gu32)p;
 }
-/* A 16-BIT SCALE LOADED ZERO-EXTENDED INTO A WHOLE REGISTER. Kept 16-bit, LLVM 24 loads it into a
- * register HALF (global_load_d16_b16), which leaves the other half live in the same register: the
- * load then depends on that register's last write, and the waitcnt pass answers with a full wait
- * at the branch joins around the scale loads. The first pass's three loads -- this scale, the
- * activation scale, the activation -- went out one round trip each, which cost the down
- * projection's four-pass blocks 25-30%. Widened here, it is LLVM 22's global_load_u16. */
+/* A 16-bit scale loaded zero-extended into a whole register. As a 16-bit value LLVM 24 loads it into
+ * a register half (global_load_d16_b16), which depends on the register's last write and forces a
+ * full wait at the surrounding branch joins (25-30% on the down projection's four-pass blocks).
+ * Widened, it is a global_load_u16. */
 template <bool UW>
 __device__ __forceinline__ uint32_t u16_load_w(const uint16_t* p) {
     if constexpr (!UW) return *p;
@@ -802,13 +685,10 @@ __device__ __forceinline__ uint32_t u16_load_w(const uint16_t* p) {
  * y[i, :] = a[row(i), :] @ w[e]^T, in SORTED order, both operands E4M3 with a scale per 128 along
  * K (and, for the weight, per 128 along N).
  *
- * `a_sorted` PICKS row(i), and it is an argument because the two grouped GEMMs of one routed block
- * disagree about it. The gate_up projection reads the block INPUT, one row per token, so row(i) is
- * `sorted[i] / top_k`. The down projection reads gate_up's OUTPUT, which is already one row per
- * (token, slot) in this very order, so row(i) is i -- gathering that a second time reads another
- * slot's activation, which is a model that still runs and answers wrongly. Only the resolution of
- * `s_tok` below changes; everything downstream reads a row index and does not care where it came
- * from.
+ * `a_sorted` picks row(i). gate_up reads the block input, one row per token, so row(i) is
+ * `sorted[i] / top_k`. down reads gate_up's output, already one row per (token, slot) in sorted
+ * order, so row(i) is i; gathering again would read another slot's activation. Only `s_tok`'s
+ * resolution differs.
  *
  * MT   M tiles a block, 16 rows each; the banded knob.
  * NTL  N tiles a block, 16 columns each.
@@ -817,118 +697,49 @@ __device__ __forceinline__ uint32_t u16_load_w(const uint16_t* p) {
  *
  * SK   skip, per wave, the M tiles that start at or past the end of the block's run.
  *
- * ---- THE PREFILL TILE IS 32 ROWS BY 64 COLUMNS, AND A WAVE SKIPS WHAT ITS RUN DOES NOT REACH ----
+ * ---- prefill tile: 32 rows x 64 columns, waves skipping rows their run does not reach ----
  *
- * (And by 128 columns over eight waves where the weight's parts allow it: see kPrefillCols.)
+ * (128 columns over eight waves where the weight's parts allow: see kPrefillCols.)
  *
- * At a prefill chunk a block serves one run (AL, below), and a run is `T / n_expert` rows on
- * average -- forty at Qwen3.8-Flash-Next's 2048 chunk, from none to a few hundred. A tile of 128
- * rows by 64 columns, eight waves of one 16-row M tile each, is therefore mostly rows past the end
- * of the run, and every wave runs its WMMA over them anyway: dead rows are masked at the load and
- * the store but not at the arithmetic. Reshaping that tile -- WGN 2, FN 128, or FM 64 at WGN 2 --
- * only moves the staging depth, and each is slower; none of them removes the dead work.
+ * At prefill a block serves one run (AL), averaging T / n_expert rows (forty at a 2048 chunk on
+ * Qwen3.8-Flash-Next). A 128-row tile is then mostly dead rows, masked at load and store but still
+ * computed; reshaping it only moves the staging depth. Two changes remove the dead work, both
+ * bit-identical:
  *
- * Two things do, and both are bit-identical -- every live element is still one wave's
- * accumulation over the same K in the same order:
+ *   SK     a wave skips fragment reads, WMMA and scale fold for M tiles starting at or past its
+ *          run's end (wave-uniform; it still stages and meets every barrier).
+ *   FM 32  the tile matches a typical run; a longer run spans blocks and re-stages from L2.
  *
- *   SK     a wave skips the fragment reads, the WMMA and the scale fold of any M tile that starts
- *          at or past the end of its run. The test is wave-uniform, and the wave still stages and
- *          meets every barrier. On the 128-row tile alone it is -18% on both projections.
- *   FM 32  the tile is what a run fills. A longer run is two or more blocks, and the second
- *          staging of its weight is an L2 hit.
+ * Measured (us per call, gate_up / down, 40 rows per run): 128 x 64 with 8 waves 3346 / 2081;
+ * 32 x 64 with 4 waves and SK 1552 / 987. 16- and 64-row tiles at 128 columns, and 32 x 128 at
+ * small runs, are slower, so the tile keeps 64 columns (and the op's "N a multiple of 64").
  *
- * r4d_selftest --perfmoe, rank 0's tp2 shape over a skewed routing, us a call (gate_up / down):
+ * At prefill the link is not the bottleneck: per-layer GEMM time does not correlate with how many
+ * experts are pooled. The deployment uses a 2048 chunk; larger chunks do not help (the checkpoint
+ * interval clamps them, and a larger activation arena costs expert residency).
  *
- *      rows a run (mean)          20             40             64 (256 experts, top 8)
- *      128 x 64, 8 waves          3138 / 1915    3346 / 2081    1920 / 1198
- *      32 x 64, 4 waves, SK       1067 / 667     1552 / 987     1115 / 717
+ * ES   one run per block instead of all of a tile's runs (below).
  *
- * At 128 columns a 16-row tile is slower again (1908 / 1193 at forty) and a 64-row one slower
- * still (1843 / 1206). A 128-column tile at 32 rows is within ~3% at forty rows and slower at
- * twenty, so the tile keeps 64 columns -- and the op's "N a multiple of 64" with them.
+ * ---- ES: spreading a decode step's runs over blocks -----------------------------------
  *
- * AT PREFILL IT IS NOT THE LINK. Across a prefill, each layer's GEMM time is uncorrelated with the
- * number of that layer's experts that are pooled rather than resident (61 to 78 of 512): the
- * pooled experts' reads overlap the resident ones', and the kernel's own time is the cost.
+ * At decode T is about eleven rows, one 16-row tile, so a row-range grid collapses to (1, N/FN)
+ * (20 workgroups for a 1280-column gate_up) and walks the experts serially (~89 GB/s). Runs are
+ * independent (run j reads expert e(j) and writes rows [rs, re), partitioning the tile), so
+ * `blockIdx.x` carries (tile, run) and each block does one run. Weight traffic and accumulation
+ * order are unchanged, so output is bit-identical. A tile has at most FM runs (each owns a row), so
+ * FM blocks per tile suffice; extra blocks exit at the loop head. The split is unconditional inside
+ * the decode band (r4d_moe_decode_band).
  *
- * THE DEPLOYMENT RUNS A 2048 CHUNK: a run fills more of its tile, and the whole expert plane is
- * swept once for four times the tokens of a 512 chunk. End to end on prompts of 8k and 24k, with
- * the 128-row tile:
- *
- *      chunk asked for      512      1024     2048     4096
- *      chunk actually run   512      1024     2048     2048
- *      tok/s               1750      2200     2706     2620
- *
- * 4096 IS NOT A 4096 CHUNK. `plan_chunk` clamps to the checkpoint interval BEFORE the token
- * budget, and the interval is 2048, so asking for 4096 runs 2048 chunks and pays for 4096: the
- * activation arena grows with the budget and is charged to the VRAM budget ahead of the
- * expert/KV division, so the expert slab loses residency for a chunk it never got -- 9458
- * resident units at 512, 9219 at 2048, 8980 at 4096. That is the whole of the 4096 column, and
- * it is why the number falls. AND A REAL 4096 CHUNK DOES NOT HELP EITHER: with
- * --checkpoint-interval 4096 the engine runs 4096-token chunks, and prefill is 2610 tok/s against
- * 2748. The arena takes another 239 resident experts and the extra amortisation does not pay for
- * them.
- *
- * AND IT DOES NOT COST CO-RUNNING DECODERS. A longer chunk holds the device longer per step, so
- * every decode step queued behind one waits longer -- but the prefill those steps are queued
- * behind is a third shorter, and that is the larger term. Four 1500-token decoders with a ~24k
- * prefill landing beside them:
- *
- *      chunk    decoders alone   beside the prefill   the prefill
- *      512          19.12 s           31.86 s          1840 tok/s
- *      2048         19.13 s           29.52 s          2434 tok/s
- *
- * Both halves improve.
- *
- * ES   one RUN a block instead of all of a tile's runs -- see below.
- *
- * ---- ES: WHY A DECODE STEP NEEDS THE RUNS SPREAD OVER BLOCKS -----------------------------------
- *
- * A block owning a contiguous row range and looping over the experts in it is a workable shape at
- * prefill, where a tile holds a handful of runs and there are enough tiles to fill the device. At
- * DECODE it is the whole problem: one token routes to `top_k` experts, so T is about eleven rows
- * -- ONE 16-row tile -- and the grid collapses to (1, N/FN). That is 20 workgroups for a
- * 1280-column gate_up on a 32-CU part, 80 waves against the ~1000 the device holds, and the
- * eleven experts are then walked SERIALLY inside those 20 blocks -- around 89 GB/s on a kernel
- * that is a bandwidth problem.
- *
- * The runs are independent: run `j` reads expert `e(j)`'s weight and writes rows [rs, re), and
- * those row ranges partition the tile. So `blockIdx.x` carries (tile, run) instead of tile alone
- * and each block does one run. The weight traffic is UNCHANGED -- every expert's N slice is still
- * read exactly once -- and so is every accumulation order, so the output is bit-identical; only
- * which workgroup does it moves. A tile has at most FM runs because a run owns at least one row,
- * so FM blocks a tile always suffices and the ones past the run count exit at the loop head.
- *
- * The split is unconditional inside the decode band; r4d_moe_decode_band says where that band
- * ends and why.
- *
- * ---- AT DECODE WHAT BINDS IT IS THE LINK, NOT THIS KERNEL ---------------------------------------
- *
- * This instantiation is the largest single item in a decode trace -- around a fifth of two-rank
- * device time -- so it is worth saying precisely what it is waiting for, because it is not anything
- * this file can change.
- *
- * A gate/up dispatch reads about 19.7 MB of expert weight. Its FASTEST dispatches run at 576 GB/s,
- * which IS this part's cold-stream peak, so the best case is already perfect and there is no
- * compute or bandwidth inefficiency left to find here. The MEAN is 270 GB/s, and the entire gap is
- * dispatches that routed to an expert the slab could not hold, whose shard is then streamed over
- * the link inside the kernel at ~26 GB/s: one pooled expert is 1.64 MB and about 63 us, which is
- * why the median sits near the resident cost and the upper quantiles near one and two misses.
- *
- * SO THE LEVER IS THE MISS RATE AND NOTHING ELSE. Residency is 82% of 256 experts a layer and it
- * is not raisable here: the KV pool lends the experts every block no live request holds, and what
- * live requests hold is set by --max-num-seqs and --max-model-len, which are the deployment's
- * capability rather than a tuning knob. If every routed expert were resident this
- * kernel would run at its resident rate and its share of device time would roughly halve. That is
- * the size of the prize for anything that raises capacity or sharpens the ranking, and it is why
- * the kernel's own arithmetic is not the lever.
+ * At decode the link binds, not this kernel: a gate/up dispatch reads ~19.7 MB; the fastest run at
+ * the part's 576 GB/s cold-stream peak, and the mean (270 GB/s) gap is entirely experts not
+ * resident in the slab, streamed over the link at ~26 GB/s (~63 us per 1.64 MB expert). The lever
+ * is the miss rate, not this kernel's arithmetic.
  */
-/* ONE CLASS OF EXPERTS: the even-numbered or the odd-numbered ones, whose weight tables are
- * separate operands because every entry of one table has one geometry. Expert e is entry e / 2 of
- * class e % 2. The classes differ when a rank holds an uneven slice of each expert's width -- three
- * 128-column blocks of one parity and two of the other -- and are the same geometry otherwise.
- * `moe_gemm_q_mod4` has four, by the expert's number mod 4: expert e is entry e / 4 of class e % 4,
- * which is what lets four ranks take the extra block of a five-block expert in turn.
+/* One class of experts: even- or odd-numbered, with separate weight tables because every entry of
+ * one table has one geometry. Expert e is entry e / 2 of class e % 2. The classes differ when a rank
+ * holds an uneven slice of each expert's width (three 128-column blocks of one parity, two of the
+ * other). `moe_gemm_q_mod4` has four classes, by expert number mod 4 (entry e / 4 of class e % 4),
+ * so four ranks take a five-block expert's extra block in turn.
  *
  * `n` is the weight's rows and `k` its K; `w_ld` the packed byte pitch of a weight row and `s_ld`
  * the scale plane's row pitch in elements. */
@@ -938,48 +749,30 @@ struct MoeCls {
     uint32_t w_s0, s_s0;   /* bytes an entry of a stacked plane; 0 marks a pointer table */
     uint32_t n, k, w_ld, s_ld;
 };
-/* W4: the code table, r4d_args.h's kW4IntPerm, kW4nlPerm or kW5nlMagPerm -- one for every class,
- * since every class is one format.
- *
- * FOUR CLASSES AND THE TABLE MUST FIT RAD_KPARAM_BLOB (256 bytes) BESIDE EVERYTHING ELSE, because
- * a kernel's arguments are packed into one descriptor whether it is launched or described: four
- * classes at 40 bytes, the five operand pointers and the map, eight words and this -- 160 + 48 +
- * 32 + 16, exactly 256, with no padding since a class is 8-aligned. That is why a class carries
- * 32-bit entry strides and no table of its own, and why `mode` packs three small values into one
- * word. The sizes are asserted here and the whole list after the kernel. */
+/* W4: the code table (r4d_args.h's kW4IntPerm, kW4nlPerm or kW5nlMagPerm), shared by all classes. */
 struct MoeTab { uint32_t v[4]; };
-static_assert(sizeof(MoeCls) == 40 && alignof(MoeCls) == 8,
-              "a class is two pointers and six words: the kernel's argument budget counts 40");
-static_assert(sizeof(MoeTab) == 16, "the code table is four words");
 
-/* W4 IS THE WEIGHT'S FORM: 0 block E4M3, 1 four-bit with one bf16 scale a (row, 128 of K), 2 the
- * same codes with one E4M3 scale a (row, 64 of K) times the fixed kW4G64Scale (w4nl64a8h), 3 the
- * same at one a (row, 32 of K) (w4nl32a8h), 4 five-bit codes -- 2's magnitudes and scales, and a
- * sign bit a code from the plane after a row's nibbles (w5nl64a8h). At 2, 3 and 4 a staged
- * 128-wide tile holds two or four scale groups, each summed in its own accumulator; a tile's E4M3
- * scales are one sixteen- or thirty-two-bit load.
+/* W4 is the weight's form: 0 block E4M3; 1 four-bit with one bf16 scale per (row, 128 of K); 2 the
+ * same codes with one E4M3 scale per (row, 64 of K) times the fixed kW4G64Scale (w4nl64a8h); 3 the
+ * same per (row, 32 of K) (w4nl32a8h); 4 five-bit codes, form 2's magnitudes and scales plus a sign
+ * bit per code from the plane after a row's nibbles (w5nl64a8h). At 2-4 a staged 128-wide tile holds
+ * two or four scale groups, each in its own accumulator; a tile's E4M3 scales are one 16- or 32-bit
+ * load.
  *
- * FK IS THE K STAGED A PASS: kFK, one 128-wide scale block, or -- at W4 2 to 4 only -- two of them.
- * At FK 256 a pass stages two blocks' worth of weight, so a block has twice the bytes in flight
- * behind each barrier pair and the K chain is half as many passes. Every scale group still has its
- * own accumulator, started fresh at its first WMMA, and the fold runs the two 128-wide blocks one
- * after the other in K order, each exactly the expression the 128 pass folds once a pass, under
- * its own activation scale. Same products, same sums, same order: bit-identical to FK 128.
+ * FK is the K staged per pass: kFK (one 128-wide scale block) or, at W4 2-4 only, two blocks, which
+ * doubles the bytes in flight per barrier pair and halves the passes. Each scale group keeps its
+ * own accumulator and the fold runs the two blocks in K order, so FK 256 is bit-identical to 128.
  *
- * UW reads the weight and its scales from a uniform global base -- see the UW note at w4_load.
- * The decode form and the run-aligned prefill form always take it; the aligned form needs it for
- * the first pass of weight it issues at the map read (see THE ALIGNED FORM'S FIRST PASS, below
- * the map read), and was measured with it. The uniform prefill grid keeps the plain loads: its
- * timing under UW was never measured, so its instructions stay as they were.
+ * UW: uniform global weight loads (see the UW note above). Used by the decode form and the
+ * run-aligned prefill form (whose first-pass prefetch at the map read needs it); the uniform
+ * prefill grid keeps plain loads, as it was never measured with UW.
  *
- * RS finds an ES block's run in one round trip -- see the RS note at the run search. It covers
- * up to kMaxExpert experts; a wider expert count takes the chunked search, which numbers the runs
- * the same way.
+ * RS finds an ES block's run in one round trip (see the RS note at the run search), for up to
+ * kMaxExpert experts; wider counts use the chunked search, which numbers runs the same way.
  *
- * THE WAVES A SIMD EACH FORM RUNS AT (R4D_WAVES), as every form was measured: the ES prefill grid
- * at 9-11 (5 at FK 256, where the staged pass is the register budget), the aligned form at 9-12,
- * the uniform grid at 8-9. Left to itself LLVM 24 spends about 30 more VGPRs on the aligned
- * split-K form for one to three fewer waves, which cost its prefill tiles 16-52%. */
+ * Waves per SIMD (R4D_WAVES), as tuned: ES prefill 9-11 (5 at FK 256, register-bound), aligned
+ * 9-12, uniform grid 8-9. Unconstrained, LLVM 24 spends ~30 more VGPRs on the aligned split-K form
+ * for one to three fewer waves (16-52% slower prefill tiles). */
 constexpr uint32_t moe_waves(uint32_t ntl, int w4, bool es, bool al, uint32_t fk, bool rs) {
     return es ? (fk == 256u ? 5u : w4 == 0 ? (rs ? 10u : 11u) : w4 == 1 ? 11u : w4 == 3 ? 9u : 10u)
          : al ? (ntl == 16u ? (w4 == 1 ? 12u : 9u) : ntl == 8u ? (w4 <= 1 ? 10u : 9u) : 9u)
@@ -997,20 +790,20 @@ void moe_gemm_q_kernel(
     uint16_t* __restrict__ Y, const uint32_t* __restrict__ map,
     uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
     uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
-    /* `mode`: bit 0 `a_sorted`, bits 1-2 the class shift (1 for two classes, 2 for four), bits
-     * 8 up `parts`. */
+    /* `mode`: bit 0 `a_sorted`, bits 1-2 the class shift (1 for two classes, 2 for four), bits 8+
+     * `parts`. */
     const uint32_t a_sorted = mode & 1u, cshift = (mode >> 1) & 3u, parts = mode >> 8;
     constexpr uint32_t FM = MT * 16, FN = NTL * 16;
     constexpr uint32_t NTHR = WGM * WGN * kWave;
     constexpr uint32_t WM = MT / WGM, WN = NTL / WGN;
     static_assert(MT % WGM == 0 && NTL % WGN == 0, "the wave grid must divide the tile");
-    /* The block-fp8 weight has one scale a 128x128 tile; a w4 weight one a ROW, so its block may
-     * span two of the fp8 grid's scale rows (the aligned form's 256-column down tile). */
+    /* The block-fp8 weight has one scale per 128x128 tile; a w4 weight one per row, so its block
+     * may span two fp8 scale rows (the aligned form's 256-column down tile). */
     static_assert(W4 != 0 || kBlock % FN == 0,
                   "a block's N rows must sit in one 128-row weight scale row");
-    /* Scale groups a 128-wide block: one, or at W4 2, 3 and 4 the 64- or 32-column ones. */
+    /* Scale groups per 128-wide block: one, or the 64- or 32-column groups at W4 2-4. */
     constexpr uint32_t kSub = W4 == 3 ? 4u : (W4 == 2 || W4 == 4) ? 2u : 1u;
-    /* 128-wide blocks a staged pass (one, or two at FK 256), and so scale groups a pass. */
+    /* 128-wide blocks per staged pass (one, or two at FK 256), and scale groups per pass. */
     constexpr uint32_t kBpS  = FK / kBlock;
     constexpr uint32_t kSubT = kSub * kBpS;
     static_assert(FK == kFK || (FK == 2 * kFK && kSub > 1),
@@ -1022,20 +815,19 @@ void moe_gemm_q_kernel(
     __shared__ uint8_t s_a[FM * lds_pitch<FK>()];
     __shared__ uint8_t s_b[FN * lds_pitch<FK>()];
     __shared__ int32_t s_tok[FM];
-    /* The staged K block's scales: one an activation row, and one a weight column (w4) or one for
-     * the whole block (fp8) -- each once a 128-wide block of the pass. See THE SCALES RIDE WITH THE
-     * TILE, at the K loop. */
+    /* The staged K block's scales: one per activation row, and one per weight column (w4) or one
+     * per block (fp8), for each 128-wide block of the pass. See "the scales ride with the tile" at
+     * the K loop. */
     __shared__ float   s_as[kBpS * FM];
     __shared__ float   s_ws[kSubT * FN];
 
     const uint32_t tid = threadIdx.x, lane = tid % kWave, wave = tid / kWave;
     const uint32_t wgm = wave / WGN, wgn = wave % WGN;
-    /* With ES the x axis is (tile, run) and the run index is the minor half, so a tile's blocks
-     * stay adjacent and land on neighbouring CUs -- they share the activation rows. */
+    /* With ES the x axis is (tile, run) with run minor, so a tile's blocks, which share activation
+     * rows, land on neighbouring CUs. */
     const uint32_t jrun = ES ? (blockIdx.x % FM) : 0u;
-    /* UNDER AL THE BLOCK IS NAMED BY THE MAP, not by arithmetic on blockIdx: entry i is
-     * (expert, first row) and the block serves that run and no other. The grid is the upper bound
-     * `n_expert + T/FM`, so the blocks past the real count exit here. */
+    /* Under AL the map names the block: entry i is (expert, first row) and the block serves only
+     * that run. The grid is the upper bound `n_expert + T/FM`; blocks past the real count exit. */
     const uint32_t n0 = blockIdx.y * FN;
     uint32_t r0, rN, e_al = 0;
     [[maybe_unused]] uint32_t al_end = 0;      /* AL: the run's end, off[e_al + 1] */
@@ -1044,10 +836,8 @@ void moe_gemm_q_kernel(
         const uint32_t* ent = map + 1 + 2 * blockIdx.x;
         e_al = ent[0];
         r0   = ent[1];
-        /* A TAIL BLOCK OWNS NO RUN: it exists to zero the rows past the live count, which no
-         * expert owns, and it does that here and leaves -- before the first pass's weight below is
-         * issued for an expert it does not have. Block-uniform (the map entry is the block's), so
-         * the early loads below are on one path with no join behind them. */
+        /* A tail block owns no run: it zeroes the rows past the live count and leaves before the
+         * early weight loads below. Block-uniform, so those loads stay on one path. */
         if (e_al == kMapTail) {
             const uint32_t live = (uint32_t)off[n_expert];
             const uint32_t rT = (r0 + FM < T) ? (r0 + FM) : T;
@@ -1056,8 +846,8 @@ void moe_gemm_q_kernel(
                     Y[(size_t)r * y_ld + n0 + c] = 0;
             return;
         }
-        /* The run's end, clamped to the output's rows: an operand may name fewer rows than its
-         * buffer, never more. */
+        /* The run's end, clamped to the output's rows (an operand may name fewer rows than its
+         * buffer, never more). */
         const uint32_t oe = (uint32_t)off[e_al + 1];
         al_end = oe < T ? oe : T;
         rN = (r0 + FM < al_end) ? (r0 + FM) : al_end;
@@ -1067,30 +857,20 @@ void moe_gemm_q_kernel(
         rN = (r0 + FM < T) ? (r0 + FM) : T;
     }
 
-    /* THE ALIGNED FORM'S FIRST PASS OF WEIGHT, IN FLIGHT AS SOON AS THE MAP HAS NAMED THE EXPERT
-     * (the `ew_` registers: the early weight). Under AL the map entry names the expert, and
-     * nothing the weight's address needs comes later -- not the tokens, not the run's rows, not
-     * the live count. Loaded in the run loop, the weight would wait behind the token loads, the
-     * barrier that publishes them, the live count, the run's end read again and the table entry:
-     * four round trips in front of the one that carries the bytes, on a block whose whole K is one
-     * or two passes at the down projection.
+    /* The aligned form's first pass of weight (`ew_`, the early weight), issued as soon as the map
+     * names the expert. Nothing the weight's address needs comes later, and in the run loop it
+     * would wait behind four round trips (tokens, barrier, live count, table entry) on a block
+     * whose whole K is one or two passes at the down projection.
      *
-     * So the block's loads go out in the order their waits want them. First everything the token
-     * barrier needs -- the block's sorted rows and the live count -- then the table entries
-     * (uniform: scalar) and the first pass's weight. The vector-load counter retires in order, so
-     * the wait for the tokens leaves the weight in flight; the token barrier orders LDS alone; and
-     * the run's end is the one the map read already loaded. The weight comes off UW's uniform global
-     * base, which a block whose expert the map names has as much as a decode block does -- a flat
-     * load would also count against the LDS counter the barrier waits on. The first issue() then
-     * takes these registers instead of loading. The same bytes reach the same registers and the
-     * same tokens the same LDS slots: bit-identical.
+     * Loads go out in the order their waits want: the block's sorted rows and the live count, then
+     * the (uniform, scalar) table entries and the first pass's weight. The vector-load counter
+     * retires in order, so waiting for the tokens leaves the weight in flight, and the token
+     * barrier orders LDS only. The weight uses UW's uniform global base (a flat load would also
+     * count against the LDS counter). The first issue() takes these registers. Bit-identical.
      *
-     * EVERY EARLY LOAD IS UNCONDITIONAL. A load under an exec mask -- `if (live) load` -- may not be
-     * issued at all, and the waitcnt pass, not knowing how many went out, then waits for every one
-     * of them where it needs the first. So a dead row (past the class's width) reads the expert's
-     * row 0 instead, a dead token slot reads a real one, and the zero is selected where the value
-     * is used -- the first issue() for the weight, the token's store for the slot. A tail block
-     * has already left: it has no expert to load for. */
+     * Every early load is unconditional: a load under an exec mask makes the waitcnt pass wait for
+     * all of them. A dead row reads the expert's row 0 and a dead token slot a real one; the zero
+     * is selected where the value is used. */
     constexpr uint32_t kEwTPR = FK / 32, kEwRPP = NTHR / kEwTPR;
     constexpr uint32_t kEwBP = (FN + kEwRPP - 1) / kEwRPP;
     [[maybe_unused]] uint4    ew_b4[AL && W4 ? kEwBP : 1];
@@ -1109,7 +889,7 @@ void moe_gemm_q_kernel(
             ew_f = sorted[i < T ? i : T - 1u];
         }
         ew_live = (uint32_t)off[n_expert];
-        /* Nothing below is scheduled in front of these two: the counter retires in order. */
+        /* Keep these two loads first: the counter retires in order. */
         __builtin_amdgcn_sched_barrier(0);
         const uint32_t cls = e_al & ((1u << cshift) - 1u);
         const MoeCls& C = cls == 0u ? c_even : cls == 1u ? c_odd : cls == 2u ? c_2 : c_3;
@@ -1118,8 +898,8 @@ void moe_gemm_q_kernel(
         ew_wp  = uw_ptr<true>(wtab_at(C.w, C.w_s0, e_al >> cshift));
         ew_wsp = uw_ptr<true>((const uint16_t*)wtab_at(C.s, C.s_s0, e_al >> cshift));
         const uint32_t sn = tid / kEwTPR, sk = (tid % kEwTPR) * 32u;
-        /* Where a staging pass covers the tile's rows exactly, every thread's every row exists:
-         * no guard, so no exec mask around a load (a thread's `sn` is below kEwRPP). */
+        /* When a staging pass covers the tile's rows exactly every thread's rows exist, so there
+         * is no guard and no exec mask around a load. */
 #pragma unroll
         for (uint32_t p = 0; p < kEwBP; ++p) {
             const uint32_t r = sn + p * kEwRPP;
@@ -1135,9 +915,8 @@ void moe_gemm_q_kernel(
         }
     }
 
-    /* RS: this thread's NPT experts' offsets (and the next one's), which of them hold a run that
-     * meets the tile, and its wave's running count of those -- carried from the loads below to the
-     * run search further down. See the RS note there. */
+    /* RS: this thread's NPT experts' offsets (plus the next), which of them hold a run meeting the
+     * tile, and the wave's running count of those, carried to the run search below. */
     constexpr uint32_t NPT = RS ? kMaxExpert / NTHR : 1;
     static_assert(!RS || (ES && kMaxExpert % NTHR == 0 && FM <= NTHR),
                   "RS is the decode grid's search: the offsets divide over the block's threads");
@@ -1147,9 +926,8 @@ void moe_gemm_q_kernel(
 
     uint32_t live;
     if constexpr (RS) {
-        /* EVERY LOAD THE SEARCH NEEDS, ISSUED AT ONCE: the block's sorted rows, its thread's share
-         * of the offsets and the live count. One round trip, then one barrier publishes the
-         * tokens and the waves' counts together. */
+        /* Every load the search needs, issued at once (sorted rows, this thread's offsets, live
+         * count): one round trip, then one barrier publishes tokens and wave counts together. */
         int32_t f = -1;
         if (tid < FM && r0 + tid < rN) f = sorted[r0 + tid];
 #pragma unroll
@@ -1170,12 +948,11 @@ void moe_gemm_q_kernel(
         }
         rs_inc = (uint32_t)wave_incl_scan_i32((int32_t)rs_cnt, lane);
         if (lane == kWave - 1) s_rc[wave] = rs_inc;
-        /* Both of RS's barriers order LDS alone -- the tokens, the counts, the selection. */
+        /* Both RS barriers order LDS only. */
         lds_barrier();
     } else if constexpr (AL) {
-        /* The tokens and the live count were loaded with the weight, ahead of it; see THE ALIGNED
-         * FORM'S FIRST PASS. A row past the block's is a dropped slot, as the loop of the plain
-         * form writes it. */
+        /* Tokens and live count were loaded ahead of the early weight (see above). A row past the
+         * block's is a dropped slot, as in the plain form. */
         if (tid < FM) {
             const int32_t f = r0 + tid < rN ? ew_f : -1;
             s_tok[tid] = f < 0 ? -1 : (a_sorted ? (int32_t)(r0 + tid) : f / (int32_t)top_k);
@@ -1198,10 +975,9 @@ void moe_gemm_q_kernel(
 
     live = (uint32_t)off[n_expert];
     }
-    /* Rows past the live count are dropped slots: zeroed here, and then the run loop below has
-     * nothing left to do for them. No run owns them, so under ES exactly one of the tile's blocks
-     * must -- every block writing the same zeros would be a benign race and is still a race. Under
-     * AL the tail blocks zeroed them at the map read, and every other block's rows are its run's. */
+    /* Rows past the live count are dropped slots, zeroed here. No run owns them, so under ES only
+     * one of the tile's blocks writes them (identical concurrent writes are still a race). Under AL
+     * the tail blocks zeroed them at the map read. */
     if constexpr (!AL) {
         if (!ES || jrun == 0)
             for (uint32_t r = (r0 > live ? r0 : live); r < rN; ++r)
@@ -1209,39 +985,27 @@ void moe_gemm_q_kernel(
                     Y[(size_t)r * y_ld + n0 + c] = 0;
     }
 
-    /* THE EXPERT OF THE BLOCK'S FIRST RUN. The row-tile grid finds the expert of its first row by
-     * binary search over the offsets and walks the runs from there, which the loop below does.
+    /* The expert of the block's first run. The row-tile grid binary-searches the offsets for its
+     * first row's expert, and the loop below walks runs from there.
      *
-     * UNDER ES THAT WALK WOULD BE THE KERNEL. A decode step routes a few dozen slots over hundreds
-     * of experts, so between two runs sit a dozen experts with no rows, and the walk to run `jrun`
-     * steps over every one of them a dependent load at a time -- a block serving a tile's last run
-     * walks most of the tile's expert range before it does anything, and a block past the tile's
-     * last run walks all of it to find it has nothing to do. At hundreds of experts a rank and a
-     * down projection a few K blocks long, that walk is a large part of the kernel.
-     *
-     * So the block finds its tile's runs in one parallel pass: every thread tests one expert for
-     * "has rows, and they meet this tile", a ballot and a count of the waves before it place the
-     * hits in expert order -- which is row order -- and run `jrun` is entry `jrun`. Chunks of
-     * experts wholly before or after the tile are skipped on one broadcast load, and the pass
-     * stops once it has found the block's run. The same rows reach the same expert: bit-identical.
+     * Under ES that walk would dominate: at decode a few dozen slots spread over hundreds of
+     * experts, so reaching run `jrun` would step over many empty experts one dependent load at a
+     * time. Instead the block finds its tile's runs in one parallel pass: each thread tests one
+     * expert for rows meeting this tile, and a ballot plus wave counts place hits in expert (= row)
+     * order, so run `jrun` is entry `jrun`. Chunks wholly before or after the tile are skipped with
+     * one broadcast load, and the pass stops at the block's run. Bit-identical.
      */
     uint32_t e = 0;
     [[maybe_unused]] uint32_t rs_first = 0, rs_end = 0;
     if constexpr (AL) {
         e = e_al;                      /* the map already named it */
     } else if constexpr (RS) {
-        /* RS: THE SAME SEARCH, IN ONE ROUND TRIP AND TWO BARRIERS. The pass above walks the
-         * experts a chunk of NTHR at a time, each chunk a broadcast load to skip it or two
-         * dependent loads and two barriers to scan it, after the tokens' own load and barrier and
-         * the live count's load: a block pays four to six round trips to L2 before it knows its
-         * expert, and a block past the tile's last run pays them to learn it has nothing to do.
-         *
-         * Here every thread holds NPT consecutive experts' offsets from the one batch of loads
-         * above. The hits are numbered in expert order -- a thread's own in order, then a running
-         * count over the wave (DPP) and the waves before it -- which is the order the chunked pass
-         * numbers them in, so run `jrun` is the same expert. Its owner hands the expert and the
-         * run's bounds over LDS, so neither `off[e]` nor `off[e + 1]` is loaded again. The same
-         * rows reach the same expert: bit-identical. */
+        /* RS: the same search in one round trip and two barriers, where the chunked pass costs four
+         * to six round trips to L2 before a block knows its expert. Each thread holds NPT
+         * consecutive experts' offsets from the batch above; hits are numbered in expert order (a
+         * thread's own, then a DPP running count over the wave and the waves before it), the same
+         * numbering as the chunked pass. The owner of run `jrun` hands the expert and the run's
+         * bounds over LDS, so `off[e]` and `off[e + 1]` are not reloaded. Bit-identical. */
         uint32_t before = rs_inc - rs_cnt, nrun = 0;
         for (uint32_t w = 0; w < NTHR / kWave; ++w) {
             if (w < wave) before += s_rc[w];
@@ -1266,10 +1030,9 @@ void moe_gemm_q_kernel(
         rs_first = s_sel[1];
         rs_end = s_sel[2];
     } else if constexpr (ES) {
-        /* THE CHUNKED SEARCH SERVES THE DECODE FORM ABOVE kMaxExpert EXPERTS. RS holds a thread's
-         * share of the offsets in NPT registers sized for kMaxExpert, so a wider expert count is
-         * this loop's, which walks any count a chunk of NTHR at a time. r4d_selftest runs the
-         * decode form at 640 experts against the uniform prefill grid, byte for byte. */
+        /* The chunked search serves the decode form above kMaxExpert experts (RS's registers are
+         * sized for kMaxExpert), walking NTHR experts at a time. r4d_selftest checks it at 640
+         * experts against the uniform prefill grid. */
         __shared__ int32_t  s_run[FM];
         __shared__ uint32_t s_wc[NTHR / kWave];
         uint32_t nrun = 0;
@@ -1307,12 +1070,11 @@ void moe_gemm_q_kernel(
         e = lo;
     }
 
-    /* THE OUTPUT IS `parts` STACKED PARTS OF N / parts COLUMNS, and so is every weight, each part
-     * of it `n / parts` rows. A weight part narrower than the output's fills the part's leading
-     * columns and the rest are ZERO: that is a rank's two-block slice of a gate/up pair written
-     * into the three-block layout the gated quantiser reads, and the zeros are what make the
-     * quantiser's output there zero rather than whatever the arena held. With one part and one
-     * geometry this is the whole weight at column n0. */
+    /* The output is `parts` stacked parts of N / parts columns, as is every weight (n / parts rows
+     * per part). A weight part narrower than the output's fills the part's leading columns and the
+     * rest are zero: a rank's two-block slice of a gate/up pair in the three-block layout the gated
+     * quantiser reads, whose output there must be zero. With one part this is the whole weight at
+     * column n0. */
     const uint32_t fy = N / parts;
     const uint32_t part = n0 / fy, j0 = n0 - part * fy;
 
@@ -1323,8 +1085,7 @@ void moe_gemm_q_kernel(
     constexpr uint32_t kBP  = (FN + kRPP - 1) / kRPP;
     const uint32_t sn = tid / kTPR, sk = (tid % kTPR) * kSeg;
 
-    /* Under ES the block's run was found above, so the loop starts at it: its first row in the
-     * tile, and the run count already at `jrun`. */
+    /* Under ES the loop starts at the block's run: its first row in the tile, run count `jrun`. */
     uint32_t rs = r0, run = 0;
     if constexpr (RS) {
         rs = rs_first;
@@ -1335,33 +1096,26 @@ void moe_gemm_q_kernel(
         run = jrun;
     }
     while (rs < rN && rs < live) {
-        /* This run: rows [rs, re) all belong to expert `e`. The advance is at the TOP so `e` can
-         * never be walked past the last expert -- `off[e + 1]` is read only for e < n_expert, and
-         * off[n_expert] is the live row count, which is the bound the loop already respects.
-         * Under RS the search handed over the run's end, and its start meets it: nothing to walk. */
+        /* This run: rows [rs, re) all belong to expert `e`. The advance is at the top so `e` never
+         * passes the last expert (`off[e + 1]` is read only for e < n_expert). Under RS the search
+         * supplied the run's end. */
         if constexpr (!RS && !AL) {
             while (e < n_expert && (uint32_t)off[e + 1] <= rs) ++e;
             if (e >= n_expert) break;
         }
-        /* AL: the map's run is e_al's from r0 on, so there is nothing to walk, and its end is the
-         * one the map read loaded. */
+        /* AL: the map's run is e_al's from r0, with its end already loaded. */
         const uint32_t ehi = RS ? rs_end : AL ? al_end : (uint32_t)off[e + 1];
         const uint32_t re  = rN < live ? (rN < ehi ? rN : ehi) : (live < ehi ? live : ehi);
         if (re <= rs) break;
-        /* Not this block's run: walk past it. Block-uniform, so no barrier is skipped by some
-         * threads and not others. */
-        /* Not this block's run: never true, since under ES the loop starts at the block's run.
-         * It stays for the fp8 weight (W4 0) alone, as the back edge it makes: the CFG
-         * structurizer keeps it, and LLVM 24's waitcnt pass then places the decode form's first-pass
-         * waits differently. With it the four-bit forms' first pass went out one load a round trip
-         * (FK 256 gate_up at one and two tokens 4-7% slower than 7.2); without it the fp8 form's
-         * K loop did (11-13% slower at one and two tokens). Each form is built the way it measured
-         * faster: r4d_selftest --perfmoe --cold and the MoE fixture's cold kbench. */
+        /* Never true (under ES the loop starts at the block's run), but kept for the fp8 weight
+         * (W4 0) for the back edge it creates: with it LLVM 24's waitcnt placement serialises the
+         * four-bit forms' first pass, without it the fp8 form's K loop (11-13% slower at one and two
+         * tokens). Each form is built the way it measured faster. */
         if (ES && W4 == 0 && run != jrun) { rs = re; ++run; continue; }
 
-        /* The expert's class, and where this block's columns sit in its weight. Block-uniform: a
-         * pad tile zeroes the run's rows and moves on without touching LDS or a barrier. `cshift`
-         * is 1 for two classes and 2 for four; c_2 and c_3 are never read at two. */
+        /* The expert's class and where this block's columns sit in its weight. Block-uniform: a pad
+         * tile zeroes the run's rows and moves on without LDS or a barrier. `cshift` is 1 for two
+         * classes, 2 for four; c_2 and c_3 are unused at two. */
         const uint32_t cls = e & ((1u << cshift) - 1u);
         const MoeCls& C = cls == 0u ? c_even : cls == 1u ? c_odd : cls == 2u ? c_2 : c_3;
         const uint32_t fc = C.n / parts;
@@ -1381,8 +1135,8 @@ void moe_gemm_q_kernel(
         const uint32_t kb_n = wn0 / kBlock;           /* the weight scale's N row for this block */
         if constexpr (W4) (void)kb_n;                 /* w4 scales vary per ROW, not per N block */
 
-        /* Both table entries are loaded before either is made uniform, so under UW the two
-         * readfirstlanes wait on one round trip and not on two. */
+        /* Both table entries load before either is made uniform, so the two readfirstlanes wait on
+         * one round trip. */
         const uint8_t*  Wp0;
         const uint16_t* Wsp0;
         if constexpr (AL) {
@@ -1395,106 +1149,71 @@ void moe_gemm_q_kernel(
         const uint8_t*  Wp   = uw_ptr<UW>(Wp0);
         const uint16_t* Wsp  = uw_ptr<UW>(Wsp0);
 
-        /* SK: A WAVE WHOSE M TILES ARE ALL PAST THE RUN has nothing to accumulate. Under AL the
-         * run is the block's rows [rs, re) from its first row, so that is a wave-uniform test;
-         * such a wave still stages and meets every barrier, and only its fragment reads, its
-         * WMMA and its scale fold are skipped. */
+        /* SK: a wave whose M tiles are all past the run has nothing to accumulate (wave-uniform
+         * test); it still stages and meets every barrier, skipping only fragment reads, WMMA and
+         * scale fold. */
         const bool wlive = !SK || (r0 + wgm * WM * 16 < re);
         f8v raw[WM][WN], out[WM][WN];
-        /* The other scale groups' accumulators at W4 2 and 3 (`raw` is the first's) -- the pass's,
-         * so both blocks' at FK 256; one unused element otherwise. Each starts fresh in its group's
-         * first WMMA, so none is zeroed. */
+        /* The other scale groups' accumulators at W4 2-4 (`raw` is the first's), for every block of
+         * the pass; one unused element otherwise. Each starts fresh at its group's first WMMA, so
+         * none is zeroed. */
         f8v rx[kSubT > 1 ? kSubT - 1 : 1][kSubT > 1 ? WM : 1][kSubT > 1 ? WN : 1];
 #pragma unroll
         for (uint32_t i = 0; i < WM; ++i)
 #pragma unroll
             for (uint32_t j = 0; j < WN; ++j) { raw[i][j] = acc_zero(); out[i][j] = acc_zero(); }
 
-        /* THE K LOOP IS SOFTWARE PIPELINED, and without that it spends most of its time waiting.
+        /* The K loop is software pipelined. Staged straight through, each of K/kFK = 20 iterations
+         * exposes its global latency, with under two blocks per CU at decode to cover it (~245 GB/s
+         * against the part's 486 cold). So the tile is loaded into registers one iteration ahead:
+         * tile i+1's loads issue right after tile i reaches LDS and are collected at the next LDS
+         * store, a barrier and a WMMA block later, for sixteen VGPRs. Bit-identical.
          *
-         * Staged straight through -- issue the loads, wait for them, store to LDS, barrier,
-         * compute -- the global latency of every one of K/kFK = 20 iterations is exposed in full,
-         * because nothing else in the block is runnable while the loads are outstanding. A decode
-         * layer puts about 110 of these blocks on 64 CUs, which is under two a CU: there is no
-         * second resident block to cover the stall either. Staged that way the kernel runs at
-         * about 245 GB/s on gate_up's 9.0 MB, against the 486 this part reaches on a cold stream,
-         * and its K loop disassembles to 432 instructions for 8 WMMA -- so it is not issue-bound
-         * and not short of blocks. It is waiting.
-         *
-         * So the tile is loaded into REGISTERS one iteration ahead. The loads for tile i+1 are
-         * issued right after tile i's bytes have been handed to LDS, and the `s_waitcnt` that
-         * collects them does not land until the next iteration's LDS store -- one barrier and the
-         * whole WMMA block later. Sixteen VGPRs a thread buys that; nothing else changes.
-         *
-         * BIT-IDENTICAL: the same bytes reach the same LDS addresses in the same order and the
-         * accumulation is untouched. Only WHEN the load is issued moves.
-         *
-         * ONE TILE AHEAD IS THE WHOLE OF IT -- do not go deeper. A two-slot ring is WORSE both ways
-         * it can be written: indexing the ring with a running `slot` puts the register arrays in
-         * SCRATCH, and unrolling the K loop by the depth to make the index a constant instead takes
-         * VGPRs 96 -> 112 and doubles the body. Neither is the reason it cannot win, though. This
-         * kernel is not waiting on DRAM at all: at eight concurrent sequences it serves eight times
-         * the tokens and several times the distinct experts in the SAME time it takes at one, and
-         * its duration barely moves with the number of experts routed. At decode it is
-         * critical-path bound -- 400 waves on 256 SIMDs, each stalled about 88% of cycles on its
-         * own dependencies -- and the only axis
-         * that shortens the 20-step serial K chain is a split-K, which is not bit-identical and so
-         * is not a decision this file gets to make. */
-        /* THE SCALES RIDE WITH THE TILE. The fold at the end of a K block needs the activation
-         * scale of eight rows a lane and the weight scale of a lane's columns; loaded there, from
-         * global memory, after the block's WMMA, they would be ten scattered loads a lane, issued
-         * behind the matrix work and waited on before the next block could start. They are
-         * one value a row and one a column, so the thread that stages a row or a column loads its
-         * scale with the tile, one K block ahead, and the fold reads them from LDS. The same
-         * values reach the same multiplies: bit-identical. */
+         * Do not go deeper than one tile: a two-slot ring puts the arrays in scratch (running
+         * index) or costs 16 VGPRs and a doubled body (unrolled). At decode the kernel is
+         * critical-path bound on the 20-step K chain, which only a split-K would shorten, and that
+         * is not bit-identical. */
+        /* The scales ride with the tile: the fold needs each row's activation scale and each
+         * column's weight scale, which loaded after the WMMA would be scattered dependent loads. So
+         * the thread staging a row or column loads its scale with the tile, one K block ahead, and
+         * the fold reads them from LDS. Bit-identical. */
         Stage8 apre[kAP];
         uint4  bpre4[kBP];      /* W4: packed nibbles, expanded at store time as before */
         uint32_t spre[W4 == 4 ? kBP : 1];   /* W4 4: the same 32 elements' sign bits */
         Stage8 bpre8[kBP];      /* otherwise: the fp8 bytes themselves */
-        /* kUL: WHETHER EACH STAGED ROW IS LIVE. Under kUL a row's tile is loaded whether it is
-         * live or not -- a dead row reads a row that exists -- and the zero it stages is selected
-         * at the LDS store, from these. Loaded only when live, the zero is written into the
-         * load's destination first, and that write lands on registers the previous pass's load
-         * filled: on the path where a wave's lanes all skipped that load's store branch, the
-         * waitcnt pass cannot see the load collected, so it waits for every load in flight before
-         * the write. Each pass's loads then went out one pair a round trip -- three a K step at
-         * the aligned down projection's tile, 15% of its time -- where an unconditional load into
-         * the same registers needs no wait at all (loads of one kind retire in order). The
-         * one-run-a-block form (ES) keeps the guarded loads: unconditional, it measured 1.5%
-         * slower, and it does not have the waits. */
+        /* kUL: whether each staged row is live. Under kUL every row's tile is loaded (a dead row
+         * reads a row that exists) and the zero is selected at the LDS store. A guarded load writes
+         * its zero into registers the previous pass's load filled, and the waitcnt pass then waits
+         * for every load in flight (15% of the aligned down projection's time); unconditional loads
+         * retire in order and need no wait. ES keeps the guarded loads (1.5% faster there). */
         constexpr bool kUL = UW && AL;
         [[maybe_unused]] bool aok[kUL ? kAP : 1];
         [[maybe_unused]] bool bok[kUL ? kBP : 1];
-        /* thread tid < FM: its row's activation scale, one a 128-wide block of the pass */
+        /* thread tid < FM: its row's activation scale, one per 128-wide block of the pass */
         float    pas[kBpS] = {};
-        /* thread FM + c: column c's weight scale (w4), or the block's (fp8); at W4 3 its four --
-         * again one a 128-wide block of the pass */
-        /* At W4 3 the scale IS 32 bits, its four E4M3 groups packed: a 16-bit register would keep
-         * two of them. Otherwise a 16-bit scale: under AL held zero-extended in a whole register
-         * (see u16_load_w), the other forms measured 1% slower that way and keep it 16-bit. */
+        /* thread FM + c: column c's weight scale (w4) or the block's (fp8), one per 128-wide block
+         * of the pass. At W4 3 it is 32 bits (four packed E4M3 groups). Otherwise 16-bit, held
+         * zero-extended in a whole register under AL (see u16_load_w); the other forms measured 1%
+         * slower that way. */
         using PwsT = std::conditional_t<AL || W4 == 3, uint32_t, uint16_t>;
         PwsT pws[kBpS] = {};
-        /* UW: the thread's scale as loaded, and whether it is live -- the zero is selected where
-         * it is staged. Two registers, one a role, and NOT initialised: the two branches run in
-         * one wave, gfx12 retires two vector loads into one register in no promised order, and a
-         * role initialised to zero is provably zero in the other role's branch, where the
-         * compiler then writes that zero -- each a wait for the other branch's load. */
+        /* UW: the thread's scale as loaded and whether it is live; the zero is selected where it is
+         * staged. One register per role, deliberately uninitialised: an initialised role is
+         * provably zero in the other role's branch, and the compiler's write of that zero would
+         * wait for the other branch's load (both branches run in one wave). */
         float pau[UW ? kBpS : 1];
         PwsT  pwu[UW ? kBpS : 1];
         bool  pok = false;
-        /* `first` is the pass at cc 0 as a TYPE, not a test of cc: the early weight is read there
-         * and nowhere else, and a runtime `cc == 0` in the loop's issue(c0 + FK) is one the compiler
-         * cannot rule out (the sum is unsigned and may wrap), so it kept the ew_ registers live
-         * across every pass -- under LLVM 24, sixteen VGPRs the WMMA block then went without: at
-         * the pinned occupancy it read each fragment pair behind a full LDS wait. */
+        /* `first` marks the cc 0 pass as a type, not a runtime test: the compiler cannot rule out
+         * `cc == 0` in issue(c0 + FK) (unsigned wrap) and would keep the ew_ registers live across
+         * every pass, starving the WMMA block of sixteen VGPRs. */
         auto issue = [&](uint32_t cc, auto first) {
             const uint32_t kbk = cc / kBlock;
             if constexpr (UW) {
-                /* UNDER UW THE SCALE LOADS ARE UNCONDITIONAL -- from a row that exists when this
-                 * one is dead -- and the zero is selected at the LDS store. Selected here, the zero
-                 * is a VALU write into a register that another lane's scale load is still filling
-                 * (the two branches run in one wave), and the waitcnt pass answers that write by
-                 * waiting for the load, in front of every other load of the pass. */
+                /* Under UW the scale loads are unconditional (from an existing row when this one is
+                 * dead) and the zero is selected at the LDS store; selecting it here would write a
+                 * register another lane's load is filling and force a wait before the pass's other
+                 * loads. */
                 if (tid < FM) {
                     const int32_t tok = s_tok[tid];
                     pok = tok >= 0 && (r0 + tid) >= rs && (r0 + tid) < re;
@@ -1584,10 +1303,10 @@ void moe_gemm_q_kernel(
                 const uint32_t r = sn + p * kRPP;
                 if (r >= FN) continue;
                 const bool ok = (j0 + r) < fc;
-                /* W4: half the bytes off the same row, expanded on the way in. `w_ld` is the
-                 * PACKED byte pitch there, which is why it is not divided here. At W4 4 the row's
-                 * sign plane follows its K/2 bytes of nibbles, a bit an element. Under kUL a dead
-                 * row reads the tile's first row, and the store selects its zero (see bok). */
+                /* W4: half the bytes of the row, expanded on the way in; `w_ld` is already the
+                 * packed byte pitch. At W4 4 the row's sign plane (one bit per element) follows its
+                 * K/2 bytes of nibbles. Under kUL a dead row reads the tile's first row and the
+                 * store selects its zero (see bok). */
                 const uint8_t* wr = Wp + (size_t)(kUL && !ok ? wn0 : wn0 + r) * w_ld;
                 if constexpr (kUL) bok[p] = ok;
                 if constexpr (W4) {
@@ -1600,32 +1319,27 @@ void moe_gemm_q_kernel(
                     bpre8[p] = stage8_load_w<UW>(wr + cc + sk, kUL || ok);
             }
         };
-        /* `s_tok` is settled by the barrier above the run loop and no run rewrites it, so priming
-         * ahead of the loop's own barrier reads nothing another thread is still writing. */
+        /* `s_tok` is settled by the barrier above the run loop and never rewritten, so priming
+         * before the loop's own barrier is safe. */
         issue(0u, std::true_type{});
 
-        /* THE K LOOP'S BARRIERS ORDER LDS AND NOTHING ELSE -- no thread reads what another wrote
-         * to global memory inside it. __syncthreads() is a workgroup fence over every address
-         * space, and on gfx12 that is `s_wait_loadcnt 0` in front of the barrier: the pass's
-         * prefetch is waited for right after it is issued, before the WMMA it was meant to hide
-         * behind. Under UW the barriers are lds_barrier(), and the loads stay in flight until the
-         * next pass's LDS store collects them.
+        /* The K loop's barriers order LDS only; no thread reads another's global writes inside it.
+         * __syncthreads() fences every address space, which on gfx12 waits for the prefetch right
+         * after issuing it, so under UW the barriers are lds_barrier() and the loads stay in flight
+         * until the next pass's LDS store.
          *
-         * AND THAT COLLECTION IS ONE EXPLICIT WAIT, for everything, where the stores begin. Left
-         * to the waitcnt pass, the wait sits inside the exec-masked branches of the stores; a wave
-         * that skips one keeps the register "in flight" as far as the pass can tell, and it then
-         * guards the next pass's load into that register with `s_wait_loadcnt 0` -- after the
-         * load just ahead of it has been issued, so the pass's loads are serial again. Nothing is
-         * in flight at this point that the stores do not need. */
+         * That collection is one explicit wait where the stores begin. Left to the waitcnt pass,
+         * the wait sits inside the stores' exec-masked branches, and a wave skipping one would
+         * guard the next pass's load with a full wait, serialising the loads again. */
         auto kbar = [] {
             if constexpr (UW) lds_barrier();
             else __syncthreads();
         };
         for (uint32_t c0 = 0; c0 < K; c0 += FK) {
             kbar();                                /* the previous run's reads are done */
-            /* The wait, as a release fence on the global address space: the only spelling of
-             * `s_wait_loadcnt 0` the waitcnt pass reads as one, so it then knows every register
-             * of the pass's prefetch has landed. No invalidate -- that is the acquire half. */
+            /* The wait, as a global release fence: the only form of `s_wait_loadcnt 0` the waitcnt
+             * pass recognises, so it knows the prefetch has landed. No invalidate (that is the
+             * acquire half). */
             if constexpr (UW) __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "global");
 #pragma unroll
             for (uint32_t p = 0; p < kAP; ++p) {
@@ -1661,8 +1375,8 @@ void moe_gemm_q_kernel(
                 for (uint32_t h = 0; h < kBpS; ++h) s_as[h * FM + tid] = pas_v(h);
             } else if (tid < FM + FN) {
                 if constexpr (kSub > 1) {
-                    /* The tile's scale groups in column order, the first in the low byte; at
-                     * FK 256 the first block's groups, then the second's. */
+                    /* The tile's scale groups in column order, first in the low byte; at FK 256
+                     * the first block's groups, then the second's. */
 #pragma unroll
                     for (uint32_t h = 0; h < kBpS; ++h)
 #pragma unroll
@@ -1678,8 +1392,8 @@ void moe_gemm_q_kernel(
             kbar();
 
             if (!wlive) continue;
-            /* One K step of the tile into the accumulator `acc`; `fresh` starts it from zero
-             * rather than from what it holds -- exactly the same sum, and no reset to pay. */
+            /* One K step of the tile into `acc`; `fresh` starts from zero instead of the held value
+             * (same sum, no reset). */
             auto kstep = [&](uint32_t ks, f8v (&acc)[WM][WN], bool fresh = false) {
                 i2v af[WM], bf[WN];
 #pragma unroll
@@ -1698,13 +1412,10 @@ void moe_gemm_q_kernel(
                         acc[i][j] = mma(af[i], bf[j], fresh ? acc_zero() : acc[i][j]);
                 }
             };
-            /* AT W4 2 AND 3 EACH SCALE GROUP OF THE TILE HAS ITS OWN ACCUMULATOR, because each
-             * has its own scale: folding a group as it ends would make the next group's WMMA wait
-             * on its results, and at a decode step -- a serial chain of tiles -- that wait is most
-             * of what the finer groups would cost. They fold once, at the end of the tile, and
-             * each group's first step starts its accumulator, so the fold resets none. At FK 256
-             * that is every group of both 128-wide blocks: group g of the pass is group g % kSub
-             * of block g / kSub, in K order. */
+            /* At W4 2-4 each scale group of the tile has its own accumulator, so no group's WMMA
+             * waits on the previous group's fold; all fold once at the end of the tile, and each
+             * group's first step starts its accumulator. At FK 256 group g of the pass is group
+             * g % kSub of block g / kSub, in K order. */
             if constexpr (kSubT > 1) {
                 constexpr uint32_t kG = FK / kSubT;
 #pragma unroll
@@ -1719,21 +1430,17 @@ void moe_gemm_q_kernel(
                 for (uint32_t ks = 0; ks < FK; ks += r4d_fp8::kK) kstep(ks, raw);
             }
             {
-                /* THE GRIDS DIFFER IN WHAT THE WEIGHT SCALE VARIES OVER, and that is the only
-                 * arithmetic difference between the instantiations.
+                /* The forms differ only in what the weight scale varies over:
                  *
-                 * fp8:  one bf16 per 128x128 tile, so it is uniform over the whole block and folds
-                 *       into the activation scale before the accumulate -- one multiply.
-                 * w4:   one bf16 per (ROW, group of 128 K), which a 4-bit grid needs: a 128x128
-                 *       block scale would spend all sixteen levels on the largest row in it. A
-                 *       fragment's lanes hold sixteen consecutive output COLUMNS, so the scale is
-                 *       a per-lane constant per N tile and comes out as a third factor.
-                 * W4 2-4: groups of 64 or 32 K, two or four a tile, each group's sum under its
-                 *       own scale.
+                 * fp8:  one bf16 per 128x128 tile, uniform over the block, folded into the
+                 *       activation scale before the accumulate.
+                 * w4:   one bf16 per (row, 128 of K); a 128x128 block scale would spend all sixteen
+                 *       levels on its largest row. A fragment's lanes hold sixteen consecutive
+                 *       output columns, so the scale is a per-lane constant per N tile.
+                 * W4 2-4: groups of 64 or 32 K, two or four per tile, each sum under its scale.
                  *
-                 * The fp8 form is written out separately rather than folded into a common
-                 * expression because a * (b * c) and (a * b) * c differ in the last bit, and that
-                 * kernel's output is byte-checked. */
+                 * The fp8 form is written out separately because a * (b * c) and (a * b) * c differ
+                 * in the last bit, and its output is byte-checked. */
                 float as[kBpS][WM][8];
 #pragma unroll
                 for (uint32_t h = 0; h < kBpS; ++h)
@@ -1760,9 +1467,9 @@ void moe_gemm_q_kernel(
                                 for (uint32_t q = 1; q < kSub; ++q) v += rx[q - 1][i][j][t] * wq[q][j];
                                 out[i][j][t] += v * as[0][i][t];
                                 if constexpr (kBpS > 1) {
-                                    /* FK 256: the pass's second 128-wide block, folded after the
-                                     * first in the very expression the next 128 pass would fold
-                                     * it with, so `out` sees the same sequence of updates. */
+                                    /* FK 256: the second 128-wide block, folded after the first
+                                     * with the expression a separate 128 pass would use, so `out`
+                                     * sees the same updates. */
                                     float v1 = rx[kSub - 1][i][j][t] * wq[kSub][j];
 #pragma unroll
                                     for (uint32_t q = 1; q < kSub; ++q)
@@ -1803,9 +1510,8 @@ void moe_gemm_q_kernel(
             }
         }
 
-        /* The store. For a fixed accumulator slot the wave's sixteen lanes hold sixteen
-         * consecutive output columns, so this is coalesced across the wave even though a lane's
-         * own eight values are eight rows apart. */
+        /* The store: for a fixed accumulator slot sixteen lanes hold sixteen consecutive columns,
+         * so it is coalesced across the wave. */
 #pragma unroll
         for (uint32_t i = 0; i < WM; ++i)
 #pragma unroll
@@ -1821,63 +1527,44 @@ void moe_gemm_q_kernel(
 
         rs = re;
         ++run;
-        /* One run a block under ES and AL, and it is done. Under AL a second pass of this loop would
-         * leave at once (the map's run ends at al_end), but as a loop it lets the compiler hoist
-         * the first pass's selects of the early weight out of it, to the top: LLVM 24 does, and
-         * then waits for that weight before the pass's other loads are issued. */
+        /* One run per block under ES and AL. Under AL a second iteration would exit at once, but
+         * without the break LLVM 24 hoists the early weight's selects to the top and waits for
+         * that weight before issuing the pass's other loads. */
         if (ES || AL) break;
     }
 }
-/* The whole argument list against the descriptor (see MoeTab): every instantiation takes the same
- * parameters, so the decode form stands for all of them. */
-using MoeQArgs = R4dParams<decltype(moe_gemm_q_kernel<1, 4, 1, 4, 0, true>)>;
-static_assert(MoeQArgs::bytes() <= RAD_KPARAM_BLOB,
-              "moe_gemm_q_kernel's arguments overflow RAD_KPARAM_BLOB");
-static_assert(MoeQArgs::count <= RAD_MAX_KPARAMS,
-              "moe_gemm_q_kernel has more arguments than RAD_MAX_KPARAMS");
 
 /* ================================================================== moe_gemm_q, the down decode form
  *
- * THE SORTED-OPERAND PROJECTION AT DECODE, ONE BLOCK A RUN TILE, G COLUMN TILES A BLOCK.
+ * The sorted-operand projection at decode: one block per run tile, G column tiles per block.
  *
- * The (tile, run) grid above gives down -- K 128 or 256 a rank, N the model width -- one block for
- * every 16-row tile's every run slot and every 64 columns: at sixteen sequences, 640 routed rows
- * over some three hundred experts, that is 640 x 40 = 25 600 blocks for about 63 MB of weight.
- * More than half of them find no run and leave after the search, and each of the others stages
- * 4 or 8 KB of weight behind a search, a table load and a barrier pair -- one or two K passes, so
- * nothing of its own to overlap. A run that crosses a tile boundary is staged by two blocks.
+ * The (tile, run) grid gives down (K 128 or 256 per rank, N the model width) a block per 16-row
+ * tile, run slot and 64 columns: 25 600 blocks at sixteen sequences for ~63 MB of weight, most
+ * finding no run, the rest staging 4-8 KB behind a search, a table load and a barrier pair. A run
+ * crossing a tile boundary is staged twice.
  *
- * Here a block owns ONE 16-ROW TILE OF ONE RUN -- the tiles start at the run's first row, as the
- * run-aligned prefill form's do -- and G 64-column tiles of its output:
+ * Here a block owns one 16-row tile of one run (tiles start at the run's first row, as in the
+ * run-aligned prefill form) and G 64-column tiles of output:
  *
- *   - THE GRID IS (run tile, column group). A run of n rows is ceil(n / 16) tiles, so there are at
- *     most min(T, n_expert) + T/16 of them; block j finds the j-th in expert order in one round
- *     trip (every offset, four a thread, one load wave, a DPP count and one exchange of the waves'
- *     totals), the way RS finds a tile's run. One more block at the end zeroes the rows past the
- *     live count, which no run owns.
- *   - A RUN IS NEVER SPLIT AT AN ARBITRARY ROW: a run of up to sixteen rows is one tile however it
- *     falls, so an expert's weight is staged once a column tile, not once for each 16-row band of
- *     the sorted rows it touches. A longer run is a block a tile, side by side, rather than one
- *     block walking all of them -- a popular expert does not become the kernel's tail.
- *   - THE PASSES OF ALL G COLUMN TILES ARE ONE PIPELINE: (column tile, K block), each pass's
- *     operands loaded one pass ahead as in the K loop above -- so the next tile's weight is in
- *     flight while this one's last block is computed. The chain the (tile, run) form pays once a
- *     block -- search, table, first load -- is paid once a G tiles here.
+ *   - The grid is (run tile, column group). A run of n rows is ceil(n / 16) tiles, at most
+ *     min(T, n_expert) + T/16 in all; block j finds the j-th in expert order in one round trip
+ *     (four offsets per thread, a DPP count and one exchange), as RS does. One extra last block
+ *     zeroes the rows past the live count.
+ *   - A run of up to sixteen rows is always one tile, so an expert's weight is staged once per
+ *     column tile; a longer run gets one block per tile, side by side.
+ *   - All G column tiles' passes form one pipeline over (column tile, K block), each loaded one
+ *     pass ahead, so the search/table/first-load chain is paid once per G tiles.
  *
- * G is the launcher's (kMoeDownDecG2Rows, kMoeDownDecG4Rows): one at a step of a few sequences,
- * where every run is needed to fill the part, and up to four at sixteen, where there are runs
- * enough. At most kMoeDownDecMaxG, so the block's column tiles are bits of one word. The loads are
- * UW's throughout -- uniform global bases and LDS-only barriers -- because a barrier that waits for
- * the prefetch would make the pipeline a chain again.
+ * G comes from the launcher (kMoeDownDecG2Rows, kMoeDownDecG4Rows): one at a few sequences, up to
+ * four at sixteen; at most kMoeDownDecMaxG so the column tiles are bits of one word. Loads are UW
+ * throughout (uniform bases, LDS-only barriers), since a barrier waiting on the prefetch would
+ * serialise the pipeline.
  *
- * BIT-IDENTICAL to the (tile, run) form: an output element is one wave's WMMA chain over the same K
- * in the same order, folded by the same expression under the same scales; only which block, and
- * which row of its 16-row tile, computes it moves -- the argument the AL form makes, and the
- * selftest compares every form with this one byte for byte.
+ * Bit-identical to the (tile, run) form: each output element is the same WMMA chain and fold; the
+ * selftest compares them byte for byte.
  *
- * ONLY THE SORTED OPERAND, where a run's activation rows are its own rows: [rs, re) of `Aq`, with
- * no gather. Inside a run every row is a placed slot -- the scatter fills [0, off[n_expert]) and
- * nothing else -- so `sorted` decides nothing here and is not read. */
+ * Sorted operand only: a run's activation rows are [rs, re) of `Aq` with no gather. Every row in a
+ * run is a placed slot (the scatter fills exactly [0, off[n_expert])), so `sorted` is not read. */
 template <int W4>
 __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
     const uint8_t* __restrict__ Aq, const float* __restrict__ As,
@@ -1908,9 +1595,8 @@ __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
     const uint32_t cend = cg0 + G * FN < N ? cg0 + G * FN : N;
     const uint32_t ng = (cend - cg0 + FN - 1) / FN;
 
-    /* THE LAST BLOCK OWNS NO RUN: the rows past the live count are dropped slots, or the protected
-     * experts' rows their own GEMM writes after this one, and here they are zero -- every column,
-     * as the (tile, run) form's first block of a tile leaves them. */
+    /* The last block owns no run: it zeroes every column of the rows past the live count (dropped
+     * slots, or protected experts' rows their own GEMM writes afterwards). */
     if (blockIdx.x == gridDim.x - 1) {
         const uint32_t live = (uint32_t)off[n_expert];
         for (uint32_t r = live; r < T; ++r)
@@ -1918,18 +1604,14 @@ __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
         return;
     }
 
-    /* THE TILE: the j-th 16-row tile of a run, in expert order and then row order. Every thread
-     * holds NPT consecutive experts' offsets and the next one, from one wave of loads; the tiles
-     * are numbered a thread's own in order, then over the wave (DPP) and the waves before it.
-     * Both barriers order LDS.
+    /* The tile: the j-th 16-row run tile in expert, then row, order. Each thread holds NPT
+     * consecutive experts' offsets plus the next; tiles are numbered by thread, then over the wave
+     * (DPP) and the waves before it. Both barriers order LDS.
      *
-     * EVERY OFFSET IS CLAMPED TO T, so every run ends at the output's last row at the latest, as
-     * the (tile, run) form's runs do: an operand may name fewer rows than its buffer, never more.
-     * A run that would start past T is then empty and has no tile, so the tile count also stays
-     * inside the grid's bound. */
-    /* The loads are unconditional -- a thread past the experts reads off[n_expert] again and a
-     * select drops it -- so the NPT + 1 of them issue in one round. Guarded, each sits in a branch
-     * of its own with its wait behind it: NPT + 1 round trips in front of the first barrier. */
+     * Every offset is clamped to T, so no run extends past the output (an operand may name fewer
+     * rows than its buffer, never more) and the tile count stays within the grid. */
+    /* Unconditional loads (a thread past the experts re-reads off[n_expert], dropped by a select),
+     * so all NPT + 1 issue in one round instead of one round trip each. */
     uint32_t ov[NPT + 1];
 #pragma unroll
     for (uint32_t k = 0; k <= NPT; ++k) {
@@ -1971,8 +1653,8 @@ __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
         }
     }
     lds_barrier();
-    /* Block-uniform from here on, and said so: the class, the table entry and every pass bound
-     * below are then scalar. The block's rows are [rs, re), at most a tile. */
+    /* Block-uniform from here (readfirstlane), so the class, table entry and pass bounds are
+     * scalar. The block's rows are [rs, re), at most a tile. */
     const uint32_t e  = (uint32_t)__builtin_amdgcn_readfirstlane((int)s_sel[0]);
     const uint32_t rs = (uint32_t)__builtin_amdgcn_readfirstlane((int)s_sel[1]);
     const uint32_t r1 = (uint32_t)__builtin_amdgcn_readfirstlane((int)s_sel[2]);
@@ -1987,8 +1669,8 @@ __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
     const uint8_t*  Wp   = uw_ptr<UW>(Wp0);
     const uint16_t* Wsp  = uw_ptr<UW>(Wsp0);
 
-    /* A COLUMN TILE PAST THE CLASS'S WIDTH holds no weight: the run's rows there are zero, as the
-     * (tile, run) form writes them, and it takes no pass. The others are `npm`. */
+    /* A column tile past the class's width holds no weight: its rows are zeroed and it takes no
+     * pass. The others are marked in `npm`. */
     uint32_t npm = 0;
     for (uint32_t g = 0; g < ng; ++g) {
         const uint32_t n0 = cg0 + g * FN, part = n0 / fy, j0 = n0 - part * fy;
@@ -2001,7 +1683,7 @@ __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
     }
     if (!npm) return;
 
-    /* THE PASSES: (column tile, K block), K innermost. The last pass's successor is never
+    /* Passes over (column tile, K block), K innermost. The last pass's successor is never
      * issued. */
     const uint32_t nK = K / FK;
     const uint32_t P = (uint32_t)__builtin_popcount(npm) * nK;
@@ -2021,9 +1703,8 @@ __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
     constexpr uint32_t kBP  = (FN + kRPP - 1) / kRPP;
     const uint32_t sn = tid / kTPR, sk = (tid % kTPR) * kSeg;
 
-    /* The operands one pass ahead, as moe_gemm_q_kernel's UW path holds them: the scale loads
-     * unconditional, the zero selected at the LDS store, and the two scale roles' registers not
-     * initialised -- see the note there. */
+    /* Operands one pass ahead, as in moe_gemm_q_kernel's UW path: unconditional scale loads, the
+     * zero selected at the LDS store, scale-role registers uninitialised (see the note there). */
     Stage8 apre[kAP];
     uint4  bpre4[kBP];
     uint32_t spre[W4 == 4 ? kBP : 1];
@@ -2190,38 +1871,23 @@ __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
         cur = nxt;
     }
 }
-using MoeDnArgs = R4dParams<decltype(moe_down_dec_kernel<2>)>;
-static_assert(MoeDnArgs::bytes() <= RAD_KPARAM_BLOB,
-              "moe_down_dec_kernel's arguments overflow RAD_KPARAM_BLOB");
-static_assert(MoeDnArgs::count <= RAD_MAX_KPARAMS,
-              "moe_down_dec_kernel has more arguments than RAD_MAX_KPARAMS");
 
 /* ================================================================== moe_gemm, bf16
  *
- * y[i, :] = a[row(i), :] @ w[e]^T in SORTED order, both operands bf16 and one f32 accumulator over
- * the whole of K -- the expert GEMM of a model served from its own bf16 checkpoint. That is the
- * reference deployment, and it is the forward pass a calibration run records its Hessians through,
- * where the activations reaching each layer have to be the ones the unquantised weights produce.
+ * y[i, :] = a[row(i), :] @ w[e]^T in sorted order, bf16 operands and one f32 accumulator over all
+ * of K: the expert GEMM for a model served from its bf16 checkpoint (the reference deployment, and
+ * the forward pass a calibration run records Hessians through).
  *
- * THE GROUPING IS moe_gemm_q_kernel's AND ONLY THE INNER LOOP DIFFERS. A block serves one run of
- * the run map at prefill (AL) and one run of a 16-row tile at decode (ES), a wave skips the M tiles
- * its run does not reach (SK), and `a_sorted` picks the activation row a sorted row reads -- every
- * argument made for those beside the fp8 kernel holds here unchanged. So does the reason the forms
- * are byte-identical to each other: every output element is one wave's accumulation over the whole
- * of K, in one order, whichever block computes it.
- *
- * WHAT DIFFERS:
- *   - ONE TABLE, one geometry. The parity classes and `parts` exist because a 640-column expert
- *     does not halve into 128-column scale blocks; a bf16 plane has no block to respect, so a rank
- *     holds whole experts or every expert at one width and every entry has one shape.
- *   - THE PLANE IS THE CHECKPOINT'S ROW-MAJOR [N, K] AS IT STANDS -- no layout hook, no relayout.
- *     The bytes the kernel reads are the bytes in the safetensors file, which is what lets a
- *     container's expert go from disk into a staging buffer and straight to this kernel.
- *   - K IS STAGED kBK16 = 64 ELEMENTS A PASS, 128 bytes a row like the fp8 kernel's 128 codes,
- *     through r4d_gemm_bf16_nt_tiled.hip's LDS pitch of 72 elements: a fragment read's sixteen rows
- *     then land on distinct bank pairs. The next pass is loaded into registers while the current
- *     one is computed, the one-ahead prefetch the fp8 kernel's K-loop note argues for.
- *   - NOTHING TO FOLD: the WMMA accumulates into the output tile across every pass of K.
+ * Grouping is moe_gemm_q_kernel's (AL at prefill, ES at decode, SK, `a_sorted`), so the forms are
+ * byte-identical to each other for the same reason. Differences:
+ *   - One table, one geometry: no parity classes or `parts`, since a bf16 plane has no scale
+ *     blocks to respect.
+ *   - The plane is the checkpoint's row-major [N, K] as stored, with no relayout, so an expert can
+ *     go from disk through a staging buffer straight to this kernel.
+ *   - K is staged kBK16 = 64 elements (128 bytes) per pass with r4d_gemm_bf16_nt_tiled.hip's LDS
+ *     pitch of 72, so a fragment's sixteen rows hit distinct bank pairs; the next pass is
+ *     prefetched into registers.
+ *   - Nothing to fold: the WMMA accumulates across every pass of K.
  */
 constexpr uint32_t kBK16 = 64;            // bf16 K elements staged per pass
 constexpr uint32_t kP16  = kBK16 + 8;     // the LDS row pitch, in elements
@@ -2233,10 +1899,9 @@ __device__ __forceinline__ mb_v8f mb_mma(mb_v8bf a, mb_v8bf b, mb_v8f c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
 }
 
-/* A 16x16 bf16 operand fragment out of an LDS tile whose row 0 is `tile`, already advanced to the k
- * step. Lane l reads row l % 16 at k = 4 * (l / 16) .. +3 and eight past that -- the wave32 bf16
- * WMMA operand layout, two runs of four (r4d_gdn_wmma.h probed it). Two 8-byte reads 16 bytes apart
- * off one base, which the assembler folds into one ds_load_2addr_b64. */
+/* A 16x16 bf16 operand fragment from an LDS tile whose row 0 is `tile`, advanced to the k step.
+ * Lane l reads row l % 16 at k = 4 * (l / 16) .. +3 and eight past that (the wave32 bf16 WMMA
+ * operand layout, r4d_gdn_wmma.h): two 8-byte reads 16 bytes apart, one ds_load_2addr_b64. */
 __device__ __forceinline__ mb_v8bf mb_frag(const uint16_t* __restrict__ tile, uint32_t lane) {
     const uint2* pw = (const uint2*)(tile + (lane & 15u) * kP16 + 4u * (lane >> 4));
     union { uint2 w[2]; mb_v8bf f; } u;
@@ -2257,7 +1922,7 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_bf16_kernel(
     constexpr uint32_t FM = MT * 16, FN = NTL * 16;
     constexpr uint32_t NTHR = WGM * WGN * kWave;
     constexpr uint32_t WM = MT / WGM, WN = NTL / WGN;
-    /* Sixteen-byte chunks: eight of them a staged row, and how many a thread carries per tile. */
+    /* Sixteen-byte chunks: eight per staged row, and how many a thread carries per tile. */
     constexpr uint32_t kCPR = kBK16 / 8;
     constexpr uint32_t kAC = (FM * kCPR + NTHR - 1) / NTHR;
     constexpr uint32_t kBC = (FN * kCPR + NTHR - 1) / NTHR;
@@ -2269,7 +1934,7 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_bf16_kernel(
 
     const uint32_t tid = threadIdx.x, lane = tid % kWave, wave = tid / kWave;
     const uint32_t wgm = wave / WGN, wgn = wave % WGN;
-    /* The block's rows and its run, named exactly as moe_gemm_q_kernel names them -- see there. */
+    /* The block's rows and run, as in moe_gemm_q_kernel. */
     const uint32_t jrun = ES ? (blockIdx.x % FM) : 0u;
     uint32_t r0, rN, e_al = 0;
     bool tail = false;
@@ -2355,10 +2020,9 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_bf16_kernel(
         rs = s0 > r0 ? s0 : r0;
         run = jrun;
     } else {
-        /* A CALL MAY SERVE A TRAILING SEGMENT of the sort -- a layer's protected experts, after
-         * the four-bit GEMM has served the rest -- and then its offsets begin at off[0] > 0 and the
-         * rows below are another call's output. The block map never names them and the run search
-         * above never finds one there; the plain row grid has to be told. */
+        /* A call may serve a trailing segment of the sort (a layer's protected experts, after the
+         * four-bit GEMM served the rest); then off[0] > 0 and the rows below belong to another
+         * call. The block map and run search never reach them; the plain row grid must skip them. */
         const uint32_t s0 = (uint32_t)off[0];
         rs = s0 > r0 ? s0 : r0;
     }
@@ -2378,12 +2042,10 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_bf16_kernel(
 #pragma unroll
             for (uint32_t j = 0; j < WN; ++j) acc[i][j] = (mb_v8f)(0.0f);
 
-        /* Chunk c of a tile is row c / kCPR, elements (c % kCPR) * 8 of it. A row outside the run,
-         * a dropped slot or a column past N stages zeros. EVERY LOAD IS ISSUED, a dead row's from a
-         * row that exists -- the activation's row 0, the tile's last weight row -- and the store
-         * selects its zero: a load under its own condition is an exec-masked branch, and the
-         * waitcnt pass then waits inside it, which serialises the pass's loads (moe_gemm_q_kernel's
-         * K-loop note). */
+        /* Chunk c of a tile is row c / kCPR, elements (c % kCPR) * 8. A row outside the run, a
+         * dropped slot or a column past N stages zeros. Every load is issued (a dead row reads an
+         * existing row) and the store selects the zero, since a conditional load would serialise
+         * the pass's loads (moe_gemm_q_kernel's K-loop note). */
         uint4 apre[kAC], bpre[kBC];
         bool aok[kAC], bok[kBC];
         auto issue = [&](uint32_t k0) {
@@ -2407,12 +2069,9 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_bf16_kernel(
         };
         issue(0);
 
-        /* THE K LOOP'S BARRIERS ORDER LDS AND NOTHING ELSE, so they are lds_barrier():
-         * __syncthreads() is a fence over global memory too, `s_wait_loadcnt 0` in front of the
-         * barrier, and the next pass's prefetch would be waited for right after it is issued
-         * instead of behind this pass's WMMA. The prefetch is collected by one explicit wait where
-         * the stores begin -- a release fence on the global address space, the spelling the
-         * waitcnt pass reads as `s_wait_loadcnt 0` (moe_gemm_q_kernel's K-loop note). */
+        /* The K loop's barriers order LDS only, so they are lds_barrier() (__syncthreads() would
+         * wait for the prefetch right after issuing it). The prefetch is collected by one global
+         * release fence where the stores begin (moe_gemm_q_kernel's K-loop note). */
         for (uint32_t k0 = 0; k0 < K; k0 += kBK16) {
             lds_barrier();                         /* the previous pass's fragments are read */
             __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "global");
@@ -2454,8 +2113,8 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_bf16_kernel(
             }
         }
 
-        /* Lane l holds column l % 16 of a tile and rows 8 * (l / 16) + t: the accumulator layout
-         * the fp8 kernel's acc_row / frag_c also describe. Rounded to nearest-even. */
+        /* Lane l holds column l % 16 and rows 8 * (l / 16) + t (the layout of acc_row / frag_c).
+         * Rounded to nearest-even. */
 #pragma unroll
         for (uint32_t i = 0; i < WM; ++i)
 #pragma unroll
@@ -2477,14 +2136,12 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_bf16_kernel(
 
 /* ================================================================== moe_gather
  *
- * y[t, :] = sum over a token's slots of expert_w[t, j] * y_expert[position of (t, j)], and the sum
- * runs in ASCENDING SLOT ORDER because that is what makes it reproducible -- walking the
- * expert-sorted rows instead would sum a token's contributions in expert-id order and the two
- * differ in the last bits.
+ * y[t, :] = sum over a token's slots of expert_w[t, j] * y_expert[position of (t, j)], summed in
+ * ascending slot order for reproducibility (expert-sorted order would differ in the last bits).
  *
- * The inverse permutation is built by a pass of its own rather than searched per token: `sorted` is
- * a permutation of the live slots, so `inv[sorted[i]] = i` is one scattered store per row. A slot
- * nothing claims keeps -1 and contributes nothing, which is how a dropped slot is expressed. */
+ * The inverse permutation is built by its own pass: `sorted` permutes the live slots, so
+ * `inv[sorted[i]] = i` is one scattered store per row. An unclaimed (dropped) slot keeps -1 and
+ * contributes nothing. */
 __global__ void gather_inv_kernel(int32_t* __restrict__ inv, uint32_t T) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < T) inv[i] = -1;
@@ -2498,35 +2155,20 @@ __global__ void gather_scatter_kernel(const int32_t* __restrict__ sorted,
     if (f >= 0 && f < (int32_t)T) inv[f] = (int32_t)i;
 }
 
-/* THE SLOT TABLE IS HOISTED, AND THAT IS THE WHOLE OF THIS KERNEL'S COST.
+/* The slot table is hoisted: `inv[t * top_k + j]` and `ew[t * ew_ld + j]` do not depend on the
+ * column, and read inside the column loop each `inv` load would serialise the `ye` load behind it
+ * (110 dependent latencies per layer at decode). Read once into LDS, the `ye` loads pipeline.
  *
- * `inv[t * top_k + j]` and `ew[t * ew_ld + j]` do not depend on the column. Read inside the column
- * loop -- `inv` IN FRONT OF the `ye` load that uses it -- every one of the top_k loads is a
- * dependent round trip: at a decode step's one token, 2560 columns and eleven slots, that is 110
- * serialised memory latencies, tens of microseconds a layer. Read once into LDS, the `ye` loads
- * are independent and pipeline.
- *
- * The column range is also split over blocks, because one token is one block otherwise and a
- * decode step has one token. Neither the hoist nor the split touches the sum: a column's slots are
- * still summed in ASCENDING SLOT ORDER, which is what the note above says is load-bearing, and no
- * column's sum is split across blocks. */
+ * The column range is also split over blocks, since decode has one token. Neither change touches
+ * the sum: each column's slots are still summed in ascending order within one block. */
 constexpr uint32_t kGatherSlots = 64;
-/* THE INVERSE PERMUTATION IS BUILT IN THIS KERNEL WHEN IT IS SMALL ENOUGH TO BE FREE, and the two
- * prepass kernels above are then not launched at all.
+/* When small, the inverse permutation is built in this kernel and the two prepass kernels are not
+ * launched. A block owns one token, so it scans `sorted` for entries in [t*top_k, (t+1)*top_k),
+ * giving exactly the table `inv` would hold. Every block repeats the scan, so the launcher caps it
+ * (r4d_rad_moe_gather); at decode T = 40 and the scan is one pass, against two dependent dispatches
+ * (~2.1 us each) of single-block kernels.
  *
- * A block owns one token, so it needs the inverse for `top_k` slots and not for all T of them:
- * scanning `sorted` for the entries that land in [t*top_k, (t+1)*top_k) gives exactly the same
- * table `inv` would have held, built from LDS instead of a device round trip. Every block repeats
- * the scan, which is why the launcher caps it -- at a decode step T is M*top_k = 40 and the scan
- * is one pass of a 256-thread block, against two dispatches and 2.9 us of kernel time for two
- * single-block kernels that between them touch 40 integers. See r4d_rad_moe_gather for the bound.
- *
- * WHAT IT SAVES IS DISPATCHES RATHER THAN KERNEL TIME, and the arithmetic is unchanged -- `inv`
- * holds exactly what the prepass would have put there. The two kernels it removes are together a
- * fraction of a millisecond a rank a step of device time across 96 dispatches, and at the ~2.1 us
- * this part charges for a dependent launch the dispatches are the larger half.
- *
- * `sorted == nullptr` is the prepass path, the one a prefill chunk takes. */
+ * `sorted == nullptr` selects the prepass path, used at prefill. */
 constexpr uint32_t kGatherSelfT = 512;
 
 template <uint32_t NTHR>
@@ -2542,16 +2184,15 @@ __global__ __launch_bounds__(NTHR) void gather_kernel(
     const uint32_t t = blockIdx.x;
     if (t >= M) return;
     const bool cached = top_k <= kGatherSlots;
-    /* The shared arm's scalar, read once a block exactly as scale_rows reads it once a row. */
+    /* The shared arm's scalar, read once per block as scale_rows reads it once per row. */
     float gate = 0.0f;
     if (sh) {
         const float v0 = bf16_to_f32(sg[(size_t)t * sg_ld]);
         gate = sig ? (1.0f / (1.0f + __expf(-v0))) : v0;
     }
     if (sorted) {
-        /* A slot no sorted row claims must read -1, which is why the fill and the scan are two
-         * phases with a barrier between them -- the same reason the prepass is two kernels. Here
-         * the barrier is __syncthreads() and costs nothing. */
+        /* An unclaimed slot must read -1, so fill and scan are separated by a barrier (as the
+         * prepass is two kernels). */
         for (uint32_t j = threadIdx.x; j < top_k; j += NTHR) s_i[j] = -1;
         __syncthreads();
         const int32_t lo = (int32_t)(t * top_k), hi = lo + (int32_t)top_k;
@@ -2579,26 +2220,23 @@ __global__ __launch_bounds__(NTHR) void gather_kernel(
         }
         const uint16_t g = f32_to_bf16(acc);
         if (!sh) { y[(size_t)t * y_ld + c] = g; continue; }
-        /* THE SHARED ARM, FOLDED. Both narrows are the unfused pair's: `scale_rows` reads this
-         * gather out of a bf16 buffer and narrows its own product before adding, so carrying
-         * either in f32 here would move the last bit of every channel. */
+        /* The shared arm, folded with the unfused pair's two narrows: `scale_rows` reads the gather
+         * as bf16 and narrows its own product before adding. */
         const uint16_t p = f32_to_bf16(bf16_to_f32(sh[(size_t)t * sh_ld + c]) * gate);
         y[(size_t)t * y_ld + c] = f32_to_bf16(bf16_to_f32(p) + bf16_to_f32(g));
     }
 }
 
-/* ---- THE PREFILL GATHER, A WAVE A TOKEN AND EIGHT COLUMNS A LANE ---------------------------------
+/* ---- prefill gather: a wave per token, eight columns per lane ---------------------------------
  *
- * At a prefill chunk this op is a read of `ye` -- one row a routed slot, 105 MB a layer at a 2048
- * chunk of Qwen3.8-Flash-Next on a rank of four -- and gather_kernel moves it TWO BYTES A LANE: a
- * block is one token's 256 columns, each of its loads one slot's 64 bytes a wave, and a lane's slots
- * are a loop whose loads wait on the slot table one after the other. That is about two thirds of
- * the part's cold-stream rate on the op's bytes.
+ * At prefill this op reads `ye` (105 MB per layer at a 2048 chunk of Qwen3.8-Flash-Next on four
+ * ranks), and gather_kernel moves two bytes per lane with slot loads serialised on the slot table
+ * (about two thirds of cold-stream rate).
  *
- * Here a wave owns one token and 256 columns, eight a lane. The token's slot table is read first
- * (uniform: scalar loads), then every slot's sixteen bytes are issued before any is used, then
- * summed. THE ARITHMETIC IS gather_kernel's: per column, ascending slot order, a dropped slot skipped,
- * `acc += w * x` in f32, and the shared arm's two narrows exactly as there -- the same bits.
+ * Here a wave owns one token and 256 columns, eight per lane: the slot table is read first (scalar
+ * loads), then every slot's sixteen bytes are issued before any is used. Arithmetic is
+ * gather_kernel's (ascending slot order, dropped slots skipped, f32 `acc += w * x`, the shared
+ * arm's two narrows), so the bits match.
  */
 constexpr uint32_t kGatherWideSlots = 16;      /* top_k at most this: the slots live in registers */
 constexpr uint32_t kGatherWideCols  = 8;       /* columns a lane, one sixteen-byte load */
@@ -2615,14 +2253,13 @@ __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
     const uint32_t wave = (uint32_t)__builtin_amdgcn_readfirstlane((int)(threadIdx.x / kWave));
     const uint32_t t = blockIdx.x * NW + wave;
     const uint32_t c = (blockIdx.y * kWave + lane) * kGatherWideCols;
-    /* No barrier anywhere below, so a wave past the last token simply leaves. */
+    /* No barrier below, so a wave past the last token simply leaves. */
     if (t >= M) return;
 
-    /* THE TOKEN'S SLOTS AND WEIGHTS IN ONE LOAD: lane j fetches slot j (a lane past top_k fetches
-     * slot 0 again, in bounds and never used) and every lane then reads them off the lanes, as
-     * constants into scalar registers. Loaded one a slot, each would be a scalar load waited on
-     * just before its own row's load is issued. Every lane of the wave takes part -- a lane past
-     * the last column leaves only after -- since a value is read off ANY lane. */
+    /* The token's slots and weights in one load: lane j fetches slot j (lanes past top_k re-fetch
+     * slot 0, unused) and every lane reads them off the lanes into scalar registers. Every lane
+     * takes part (a lane past the last column leaves only afterwards), since values are read off
+     * any lane. */
     const uint32_t jl = lane < top_k ? lane : 0u;
     const int32_t  il = inv[(size_t)t * top_k + jl];
     const int32_t  wl = (int32_t)ew[(size_t)t * ew_ld + jl];
@@ -2634,10 +2271,9 @@ __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
         sw[j] = bf16_to_f32((uint16_t)__builtin_amdgcn_readlane(wl, (int)j));
     }
     if (c >= n) return;
-    /* NO break AND NO continue IN THESE LOOPS: with an early exit the compiler keeps the slot loop
-     * rolled, `yv[j]` is then indexed at run time, and the whole array goes to scratch. Written as
-     * uniform branches over a constant trip count, every index is a constant and every slot a
-     * register. A slot is live exactly where gather_kernel's loop reaches it and does not skip it. */
+    /* No break or continue in these loops: an early exit keeps the slot loop rolled and `yv` goes
+     * to scratch. Uniform branches over a constant trip count keep every slot in a register. A slot
+     * is live exactly where gather_kernel's loop would use it. */
     bool  lv[kGatherWideSlots];
     uint4 yv[kGatherWideSlots];
 #pragma unroll
@@ -2646,7 +2282,7 @@ __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
         yv[j] = make_uint4(0, 0, 0, 0);
         if (lv[j]) yv[j] = *(const uint4*)(ye + (size_t)si[j] * ye_ld + c);
     }
-    /* The shared arm after the slots, so nothing it waits on stands in front of their loads. */
+    /* The shared arm after the slots, so its loads do not delay theirs. */
     float gate = 0.0f;
     uint4 shv  = make_uint4(0, 0, 0, 0);
     if (sh) {
@@ -2677,7 +2313,7 @@ __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
     for (uint32_t q = 0; q < 4; ++q) {
         uint16_t lo = f32_to_bf16(acc[2 * q]), hi = f32_to_bf16(acc[2 * q + 1]);
         if (sh) {
-            /* THE SHARED ARM, FOLDED, with gather_kernel's two narrows. */
+            /* The shared arm, folded with gather_kernel's two narrows. */
             const uint16_t plo = f32_to_bf16(bf16_to_f32((uint16_t)(s[q] & 0xFFFFu)) * gate);
             const uint16_t phi = f32_to_bf16(bf16_to_f32((uint16_t)(s[q] >> 16)) * gate);
             lo = f32_to_bf16(bf16_to_f32(plo) + bf16_to_f32(lo));
@@ -2690,14 +2326,11 @@ __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
 
 /* ================================================================== scale_rows
  *
- * y[m, i] = x[m, i] * act(s[m]). One workgroup a row, grid-strided along the row, and the scalar
- * read once into a register rather than once per element. It is the shared expert's gate and
- * nothing else in this tree uses it; see docs/OPS.md for why `mul` cannot serve it. */
-/* `ad` PRESENT IS THE FUSED GATE-AND-ADD FORM, `y = bf16(x * act(s)) + ad`, and the NARROW in the
- * middle is load-bearing: the pair this stands in for writes the product to a bf16 buffer and
- * then adds that buffer, so the product is rounded before the sum sees it. Carrying the f32
- * product into the add would differ in the last bit of every channel, and the emitted text with
- * it. */
+ * y[m, i] = x[m, i] * act(s[m]). One workgroup per row, grid-strided along it, with the scalar read
+ * once. Used only for the shared expert's gate; docs/OPS.md explains why `mul` cannot serve it. */
+/* With `ad`, the fused gate-and-add form `y = bf16(x * act(s)) + ad`. The middle narrow matches the
+ * unfused pair, which stores the product as bf16 before adding; an f32 product would change the
+ * last bit of every channel. */
 template <uint32_t NTHR>
 __global__ __launch_bounds__(NTHR) void scale_rows_kernel(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ sc,
@@ -2716,10 +2349,10 @@ __global__ __launch_bounds__(NTHR) void scale_rows_kernel(
 
 }  /* namespace */
 
-/* THE GATHER'S FORM, pinned for a test: 0 is the launcher's rule, 1 gather_kernel (a column a
- * thread), 2 gather_wide_kernel (a wave a token). The rule takes 2 past the self-scan bound wherever
- * the shape allows it; see r4d_rad_moe_gather. A pinned form the shape cannot take is refused. Both
- * are bit-identical, and r4d_selftest compares their bytes. */
+/* The gather's form, pinnable for tests: 0 the launcher's rule, 1 gather_kernel (a column per
+ * thread), 2 gather_wide_kernel (a wave per token). The rule takes 2 past the self-scan bound where
+ * the shape allows (r4d_rad_moe_gather); an impossible pin is refused. Both are bit-identical
+ * (r4d_selftest). */
 static int g_moe_gather_pin = 0;
 extern "C" void r4d_moe_gather_pin_form(int form) { g_moe_gather_pin = form; }
 
@@ -2735,9 +2368,8 @@ extern "C" int r4d_rad_router_topk(const RadArgs* a, RadStream s) {
     const long long norm     = r4d_geti_or(a, "norm", 0);
     if (n_expert <= 0 || n_expert > (long long)kMaxExpert || top_k <= 0 || top_k > n_expert)
         return R4D_NO(RAD_E_SHAPE);
-    /* The key packs `~e` into sixteen bits, so an expert id has to fit there: kMaxExpert is 512
-     * and the refusal above is what holds it. top_k is bounded by the wave, because round r parks
-     * its winner on lane r. */
+    /* The key packs `~e` into sixteen bits, which the kMaxExpert check above guarantees. top_k is
+     * bounded by the wave, since round r parks its winner on lane r. */
     if (top_k > (long long)kWave) return R4D_NO(RAD_E_SHAPE);
     if (lg->dtype != RAD_BF16 || w->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
     if (ids->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
@@ -2750,8 +2382,7 @@ extern "C" int r4d_rad_router_topk(const RadArgs* a, RadStream s) {
 
     constexpr uint32_t NW = 4;
     const dim3 grid((unsigned)((M + NW - 1) / NW)), blk(NW * kWave);
-    /* THE NARROWEST INSTANTIATION THAT COVERS n_expert, because the wider one costs eight
-     * registers a lane for nothing on a 256-expert model. */
+    /* The narrowest instantiation covering n_expert; the wider costs eight registers per lane. */
     if (n_expert <= (long long)(8 * kWave))
         hipLaunchKernelGGL((router_topk_kernel<NW, 8>), grid, blk, 0, (hipStream_t)s,
                            (const uint16_t*)lg->data, (int32_t*)ids->data, (uint16_t*)w->data,
@@ -2787,14 +2418,13 @@ static int protect_of(const RadArgs* a, long long n_local, Protect* p) {
     return RAD_OK;
 }
 
-/* THE PAIR IN ONE LAUNCH. Operands are the two ops' own, concatenated with the selection's first:
- * logits -> expert_ids, expert_w, sorted_tok, expert_offset, expert_count. Every check below is
- * one of the two shims' checks; nothing new is asserted, because nothing new is computed.
+/* The pair in one launch. Operands are the two ops' own, selection first: logits -> expert_ids,
+ * expert_w, sorted_tok, expert_offset, expert_count. The checks are the two shims' checks.
  *
- * IT REFUSES rather than falls back when the sort would not fit one workgroup. A silent fallback
- * would make the op's cost depend on a bound the caller cannot see, and the architecture already
- * asks the same question before declaring it (`moe_fuse_rows`). */
-static int rad_router_topk_scatter_body(const RadArgs* a, const R4dSink& sk) {
+ * It refuses, rather than falls back, when the sort would not fit one workgroup, so the op's cost
+ * does not hinge on a hidden bound; the architecture checks the same before declaring it
+ * (`moe_fuse_rows`). */
+extern "C" int r4d_rad_router_topk_scatter(const RadArgs* a, RadStream stream) {
     int emit_rc = RAD_OK;
     const RadTensor* lg     = r4d_opt(a, 0);
     const RadTensor* ids    = r4d_opt(a, 1);
@@ -2807,7 +2437,7 @@ static int rad_router_topk_scatter_body(const RadArgs* a, const R4dSink& sk) {
         return R4D_NO(RAD_E_INVAL);
 
     const long long n_expert = r4d_geti_or(a, "n_expert", 0);
-    /* Absent means "no expert parallelism", where the slice IS the router. */
+    /* Absent means no expert parallelism: the slice is the whole router. */
     const long long n_local  = r4d_geti_or(a, "n_local", n_expert);
     const long long top_k    = r4d_geti_or(a, "top_k", 0);
     const long long norm     = r4d_geti_or(a, "norm", 0);
@@ -2837,21 +2467,19 @@ static int rad_router_topk_scatter_body(const RadArgs* a, const R4dSink& sk) {
     if (r4d_numel(off) < n_local + 1 || r4d_numel(cnt) < n_local) return R4D_NO(RAD_E_SHAPE);
 
 #define R4D_RTS_L(OWN, NWV)                                                                     \
-    emit_rc = R4D_EMIT(sk, (router_topk_scatter_kernel<OWN, NWV>), dim3(1),                     \
+    emit_rc = R4D_EMIT(stream, (router_topk_scatter_kernel<OWN, NWV>), dim3(1),                 \
                        dim3((NWV) * kWave), 0,                                                  \
                        (const uint16_t*)lg->data, (int32_t*)ids->data,                          \
                        (uint16_t*)w->data, (int32_t*)sorted->data, (int32_t*)off->data,         \
                        (int32_t*)cnt->data, (uint32_t)M, (uint32_t)n_expert,                    \
                        (uint32_t)n_local, (uint32_t)top_k,                                      \
                        (uint32_t)lg_ld, (int)norm, (int32_t)base, prot)
-    /* The same narrowest-instantiation rule the standalone selection uses, and for the same
-     * reason: MAXOWN is registers a lane.
+    /* The narrowest instantiation, as in the standalone selection.
      *
-     * ONE WAVE A ROW, as a power of two between the sort's own eight waves and the workgroup's
-     * thirty-two. A wave selects its rows one after another, so at eight waves a 32-row verify
-     * step runs four selections back to back: 8.6 us against 5.4 at thirty-two waves. Fewer rows do
-     * not pay for more waves -- a launch of thirty-two costs about 0.4 us more than one of eight at
-     * four rows. Above 32 rows the waves wrap. */
+     * One wave per row, rounded to a power of two between 8 and 32 waves: a wave selects its rows
+     * serially, so a 32-row verify step at eight waves runs four selections back to back (8.6 us
+     * against 5.4 at 32 waves), while extra waves cost ~0.4 us at four rows. Above 32 rows the
+     * waves wrap. */
     const int nw = M <= 8 ? 8 : M <= 16 ? 16 : 32;
     if (n_expert <= (long long)(8 * kWave)) {
         if      (nw == 8)  R4D_RTS_L(8, 8);
@@ -2864,14 +2492,12 @@ static int rad_router_topk_scatter_body(const RadArgs* a, const R4dSink& sk) {
     }
 #undef R4D_RTS_L
     if (emit_rc != RAD_OK) return emit_rc;
-    if (!sk.desc) R4D_MOE_CHK();
+    R4D_MOE_CHK();
     return RAD_OK;
 }
-R4D_ENTRY(r4d_rad_router_topk_scatter, rad_router_topk_scatter_body)
 
-/* Scratch for the general scatter: the per-tile histogram plane. The small form needs none, and
- * the hook answers for the shape it is asked about rather than for the worst case, because the
- * band the op resolves in is what sizes the arena. */
+/* Scratch for the general scatter: the per-tile histogram plane (none for the small form). Sized
+ * for the shape asked about, since the resolved band sizes the arena. */
 static int scatter_dims(const RadArgs* a, long long* T, long long* n_expert) {
     const RadTensor* ids = r4d_opt(a, 0);
     *n_expert = r4d_geti_or(a, "n_expert", 0);
@@ -2909,9 +2535,8 @@ extern "C" int r4d_rad_moe_scatter(const RadArgs* a, RadStream s) {
     if (rc != RAD_OK) return rc;
     if (r4d_numel(sorted) < T) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(off) < n_expert + 1 || r4d_numel(cnt) < n_expert) return R4D_NO(RAD_E_SHAPE);
-    /* THIS RANK'S FIRST EXPERT, subtracted from every routed id so that everything downstream --
-     * the offsets, the counts, the weight table -- is indexed locally. 0 is the whole-model case,
-     * without expert parallelism. */
+    /* This rank's first expert, subtracted from every routed id so offsets, counts and the weight
+     * table are indexed locally. 0 without expert parallelism. */
     const long long base = r4d_geti_or(a, "expert_base", 0);
     if (base < 0) return R4D_NO(RAD_E_SHAPE);
     Protect prot;
@@ -2950,9 +2575,9 @@ extern "C" int r4d_rad_moe_scatter(const RadArgs* a, RadStream s) {
     return RAD_OK;
 }
 
-/* The weight-table operand, read off the tensor the core built. A zero leading stride is the
- * marker for a pointer array (abi/rad_runtime.h, RAD_WTAB); anything else is a stacked plane and
- * the stride is in ELEMENTS of the weight's dtype, which for E4M3 is bytes. */
+/* The weight-table operand from the core's tensor. A zero leading stride marks a pointer array
+ * (abi/rad_runtime.h, RAD_WTAB); otherwise it is a stacked plane with the stride in elements of the
+ * weight's dtype (bytes for E4M3). */
 static int wtab_of(const RadTensor* t, uint32_t dtype, int bits, long long n_expert,
                    long long rows, long long cols, const void* const** tab, size_t* stride0,
                    long long* ld) {
@@ -2962,120 +2587,72 @@ static int wtab_of(const RadTensor* t, uint32_t dtype, int bits, long long n_exp
         return R4D_NO(RAD_E_SHAPE);
     if (t->stride[2] != 1) return R4D_NO(RAD_E_STRIDE);
     *tab     = (const void* const*)t->data;
-    /* THE ELEMENT WIDTH IS PASSED IN, not looked up. A plugin-private dtype -- which the 4-bit
-     * expert plane is -- is not in the core's table, so rad_dtype_bits() answers 0 for it and a
-     * stacked stride would collapse to the very zero that marks a POINTER ARRAY. The bits are
-     * multiplied before the divide so a four-bit plane keeps its half-byte. */
+    /* The element width is passed in: for a plugin-private dtype such as the 4-bit plane,
+     * rad_dtype_bits() returns 0 and a stacked stride would collapse to the zero that marks a
+     * pointer array. Bits are multiplied before the divide so a 4-bit plane keeps its half-byte. */
     *stride0 = (size_t)((t->stride[0] * (int64_t)bits) / 8);
     *ld      = t->stride[1];
     return RAD_OK;
 }
 
-/* ---- AL: ONE RUN A BLOCK, SO A STREAMED EXPERT'S WEIGHT CROSSES THE LINK ONCE -----------------
+/* ---- AL: one run per block, so a streamed expert's weight crosses the link once -----------------
  *
- * The uniform row grid above puts a block on rows [i*FM, i*FM + FM) whatever expert those rows
- * belong to, so a run that straddles a tile boundary is served by TWO blocks and its weight is
- * staged twice. The kernel's tile note counts that as `n_expert + T/FM` incidences against an
- * optimum of `n_expert`, and for a resident expert a duplicated tile is not worth a prefix-sum
- * pass and an extra launch a layer.
+ * The uniform row grid serves a run straddling a tile boundary with two blocks, staging its weight
+ * twice. For a resident expert the second staging is an L2/MALL hit, but for a pooled one it is
+ * another pass over PCIe (~26 GB/s against VRAM's 576). At a 2048 chunk the grid has 414
+ * incidences over 254 experts, so a third of the link traffic would be re-reads.
  *
- * THAT IS TRUE OF A RESIDENT EXPERT AND FALSE OF A POOLED ONE. A second staging of a weight that
- * is in VRAM is an L2 or MALL hit. A second staging of one that is not is another pass of its
- * whole shard over PCIe, and the two differ by more than an order of magnitude: on this part the
- * streamed read runs at about 26 GB/s against VRAM's 576. At the shipped 2048 chunk the
- * grid is 160 tiles over 254 experts, so the incidence count is 414 against 254 -- a THIRD of the
- * link traffic is a re-read of weight a neighbouring block already pulled.
+ * So a block map gives one run per block: entry i names (expert, first row) and the block serves
+ * rows [first, min(first + FM, off[e+1])); an expert is staged by two blocks only if its run is
+ * longer than FM. This costs no extra activation traffic (stage8_load skips rows outside the run),
+ * no extra arithmetic (the uniform grid already runs a full tile per covered run), and no
+ * determinism (each output row still comes from one block and one expert in the same K order).
  *
- * So a block map is built here, and it is one run a block:
- * entry i names (expert, first row), the block serves rows [first, min(first + FM, off[e+1])), and
- * no expert is ever staged by two blocks unless its own run is longer than FM.
+ * The grid is an upper bound, `n_expert + T/FM` (each expert one block plus one per FM rows), since
+ * the true count needs the offsets on the host; the map's first slot holds the real count and
+ * extra blocks exit at the head.
  *
- * WHAT IT DOES NOT COST:
- *
- *   * NOT ACTIVATION TRAFFIC. An aligned block still stages FM rows, but `stage8_load` takes a
- *     live flag and issues no load at all for a row outside the run -- so the bytes read are the
- *     LIVE rows either way, and the block count does not enter it.
- *   * NOT ARITHMETIC. The uniform grid already runs the whole FM tile once per run it covers, with
- *     the rows of the other runs masked. At the shipped chunk that is 160 tiles x ~1.6 runs = 256
- *     full-tile passes; aligned it is 254, one a run. The dead-row work is the same work.
- *   * NOT DETERMINISM. Every output row is still produced by one block, from one expert, with the
- *     same K order -- only which workgroup does it moves, exactly as the ES split above. The
- *     result is bit-identical.
- *
- * THE GRID IS AN UPPER BOUND AND THE COUNT IS ON THE DEVICE. `sum_e ceil(run_e / FM)` cannot be
- * known on the host without reading the offsets back, which is a synchronisation a step does not
- * have. It is bounded by `n_expert + T/FM` -- every expert contributes one block plus at most one
- * more per FM rows -- so the launcher uses that, the map's first slot carries the real count, and
- * blocks past it exit at the head. Those are a few hundred empty workgroups on a grid of tens of
- * thousands.
- *
- * ROWS NO EXPERT OWNS still have to be zeroed: `off[n_expert]` is the live row count and anything
- * above it is a dropped slot whose output row must not be whatever the arena left there. The map
- * carries them as entries with expert `kMapTail`, and such a block zeroes and returns. */
+ * Rows past `off[n_expert]` (dropped slots) must still be zeroed: the map carries them as entries
+ * with expert `kMapTail`, whose block zeroes and returns. */
 
-
-/* THE PREFILL TILE'S ROWS -- see "THE PREFILL TILE IS 32 ROWS BY 64 COLUMNS" at the kernel. */
+/* The prefill tile's rows; see the prefill-tile note at the kernel. */
 constexpr long long kPrefillRows = 32;
-/* ...AND 128 COLUMNS OVER EIGHT WAVES where a column tile cannot straddle two stacked parts of the
- * weight. A wave's share is what the 64-column tile's four waves each had -- one 16-row tile by two
- * 16-column ones -- so the arithmetic of every element is unchanged; what the wider block buys is
- * the rows' activation staged once for twice the columns, and half the blocks. r4d_selftest
- * --perfmoe, rank 0's tp2 shape, 512 experts, top 10, us a call (gate_up / down), same bytes:
- *
- *      tokens               512          1024         2048          4096
- *      32 x 64, 4 waves     822 / 491    898 / 620    1305 / 884    2255 / 1477
- *      32 x 128, 8 waves    780 / 468    868 / 582    1242 / 845    2133 / 1450
- *
- * Four waves over 128 columns (two a wave across 64) are within ~3% of the 64-column tile at forty
- * rows a run and slower at twenty: the width is only worth it with the waves to go with it. */
+/* ...and 128 columns over eight waves where a column tile cannot straddle two stacked weight parts.
+ * Each wave's share is unchanged (one 16-row by two 16-column tiles), so every element's arithmetic
+ * is the same; the wider block stages the activation once for twice the columns, with half the
+ * blocks (~5% faster per call at 512-4096 tokens). 128 columns over only four waves is no better. */
 constexpr long long kPrefillCols = 128;
 
-/* WHERE THE (tile, run) DECODE GRID ENDS AND THE RUN-ALIGNED PREFILL GRID BEGINS: at an average of
- * one and a half routed rows an expert. At file scope because the scratch hook and the launcher
- * must answer for the SAME band -- a hook that sized a map for a shape the launcher then ran the
- * other form on would be arena charged to nothing, and the reverse would be a launcher finding
- * scratch it was not given.
+/* Where the (tile, run) decode grid ends and the run-aligned prefill grid begins: an average of 1.5
+ * routed rows per expert. At file scope because the scratch hook and the launcher must agree on
+ * the band.
  *
- * THE CROSSOVER IS A RUN LENGTH, NOT A TOKEN COUNT. The decode form gives every run its own block
- * and a 16-row tile; the prefill form gives it a 32-row tile. Where runs are a row or two the
- * narrower tile wins, and once they are several rows the wider one does. --perfmoe at 512
- * experts, gate_up + down in us:
+ * The crossover is a run length, not a token count: 16-row tiles win for runs of a row or two,
+ * 32-row tiles for several rows. Measured at 512 experts (gate_up + down, us):
  *
  *      T (rows)         640    800    1000   1280   2560   5120
  *      decode form      804    900    1006   1113   1541   2224
  *      prefill form     826    900     981   1053   1247   1413
  *
- * So the band is T <= 1.5 * n_expert: 768 rows here. The decode envelope is
- * `max_num_seqs * (1 + n_spec) * top_k` -- 320 rows at eight sequences, depth 3 and top 10 -- so
- * a decode step stays on the decode form with room; a server with a few dozen concurrent
- * sequences crosses onto the prefill form exactly where that form is the faster one. */
+ * So the band is T <= 1.5 * n_expert (768 rows here). Decode is at most
+ * `max_num_seqs * (1 + n_spec) * top_k` (320 rows at eight sequences, depth 3, top 10). */
 static inline bool r4d_moe_decode_band(long long T, long long n_expert) {
     return 2 * T <= 3 * n_expert;
 }
-/* THE ROW LIMIT OF TWO 128-WIDE K BLOCKS A PASS, by weight format: the decode form of the
- * TOKEN-operand projection (gate_up) stages two blocks a pass instead of one -- see FK at the
- * kernel -- at most this many routed rows. Only a shape whose weight format already folds scale
- * groups (W4 2 to 4) and whose every class's K is a multiple of 256 can take two; anything else
- * keeps one block. The two are bit-identical. A constant, so a recorded pass and a live one take
- * the same kernel.
+/* Row limit, per weight format, for staging two 128-wide K blocks per pass (FK 256) in the decode
+ * form of the token-operand projection (gate_up). Only formats that already fold scale groups
+ * (W4 2-4) with every class's K a multiple of 256 qualify. Bit-identical either way; a constant, so
+ * recorded and live passes take the same kernel.
  *
- * MEASURED, `r4d_selftest --perfmoe M` on gfx1201 at rank 0's tp2 width split (512 experts, top
- * 10), gate_up in us, one block a pass / two:
- *
- *      tokens (rows)     1 (10)   2 (20)   4 (40)   8 (80)   16 (160)   32 (320)
- *      w4nl64a8h  (2)   17.9/15.6 25.6/22.4 36.4/37.3 65.6/67.8 164.6/170.2 328.7/310.8
- *      w4nl32a8h  (3)   19.5/17.0 26.2/24.0 40.0/40.5 71.6/77.7 177.9/177.5 337.0/321.0
- *      w5nl64a8h  (4)   20.3/17.6 30.0/25.5 122.3/43.1 212.9/78.6 373.2/219.8 672.3/380.5
- *
- * The four-bit formats gain at one and two tokens and not in between, which is where a
- * speculative decode step sits (one sequence at depth 3 is 40 rows); the five-bit format's one
- * block a pass is two to three times slower from 40 rows on, and two blocks are the faster at
- * every row count. */
+ * Measured (gate_up, us, one block / two): the 4-bit formats gain at 10-20 rows but not at 40-160
+ * (e.g. w4nl64a8h 17.9/15.6 at 10 rows, 36.4/37.3 at 40); the 5-bit format is 2-3x faster with two
+ * blocks from 40 rows on (122.3/43.1 at 40) and faster at every row count. In a whole decode step
+ * the 4-bit formats still take two blocks up to 80 rows (two sequences at depth 3): on Flash-Next
+ * (w4nl64a8h) a one-stream step at depth 3 is 1.1% shorter at TP4 and no slower at TP2. */
 template <int W4>
-constexpr long long kMoeGuFk256Rows = W4 == 4 ? (1ll << 40) : (W4 == 2 || W4 == 3) ? 20 : 0;
-/* THE STAGED K OF THE DECODE FORM, pinned for a test: 0 is kMoeGuFk256Rows's rule, 1 one 128-wide
- * block a pass, 2 two wherever the shape allows it. r4d_selftest compares the two byte for byte,
- * so the two-block path is held to the one-block bytes whatever the row limit is. */
+constexpr long long kMoeGuFk256Rows = W4 == 4 ? (1ll << 40) : (W4 == 2 || W4 == 3) ? 80 : 0;
+/* The decode form's staged K, pinnable for tests: 0 kMoeGuFk256Rows's rule, 1 one 128-wide block
+ * per pass, 2 two wherever allowed. r4d_selftest compares both byte for byte. */
 static int g_moe_fk_pin = 0;
 template <int W4>
 static inline bool r4d_moe_gu_fk256(long long T, bool a_sorted) {
@@ -3083,68 +2660,45 @@ static inline bool r4d_moe_gu_fk256(long long T, bool a_sorted) {
     if (g_moe_fk_pin == 2) return true;
     return T <= kMoeGuFk256Rows<W4>;
 }
-/* THE SORTED-OPERAND PROJECTION'S DECODE KERNEL, and its column tiles a block. The decode form of
- * down -- the sorted operand, one part, at most kMaxExpert experts -- is moe_down_dec_kernel: a
- * block a 16-row tile of a run and G 64-column tiles a block, see its note. Any other shape takes
- * the (tile, run) form. G follows the routed-row count: one below kMoeDownDecG2Rows, two below
- * kMoeDownDecG4Rows, four from there, which keeps a few thousand working blocks from one sequence
- * to sixteen. Bit-identical to the (tile, run) form at every G. Constants, so a recorded pass and
- * a live one take the same kernel.
+/* The sorted-operand projection's decode kernel and its column tiles per block. The decode form of
+ * down (sorted operand, one part, at most kMaxExpert experts) is moe_down_dec_kernel; any other
+ * shape takes the (tile, run) form. G follows the routed-row count: one below kMoeDownDecG2Rows,
+ * two below kMoeDownDecG4Rows, four above, keeping a few thousand working blocks from one sequence
+ * to sixteen. Bit-identical at every G; constants, so recorded and live passes agree.
  *
- * MEASURED at TP4 on four R9700 (gfx1201), MTP depth 3, end to end: ms a decode step with this
- * rule against the (tile, run) form at the same concurrency.
- *
- *      concurrent sequences        4        8        16
- *      ms a step                 -0.9%    -3.1%    -7.8%
- *
- * At TP2 on two R9700, Qwen3.8-Flash-Next, MTP depth 3, distinct prompts a sequence, the same
- * measure (one window each; boot to boot the same arm moves about 0.5%):
- *
- *      concurrent sequences        1        4        6        8
- *      (tile, run) form         14.78    25.64      -      36.15   ms a step
- *      this rule                14.64    25.53      -      36.26
- *      G = 1 always                -        -      31.58    36.37
- *      G = 2 always                -      25.59    31.17    36.15
- *      G = 4 always                -        -      31.66    36.48
- *
- * Nothing at TP2 moves by more than that noise, so the TP4 thresholds stand: a rank holding twice
- * each expert's width already keeps its blocks busy at the (tile, run) form's grid. */
+ * At TP4 (MTP depth 3) this saves 0.9%, 3.1% and 7.8% of a decode step at 4, 8 and 16 sequences.
+ * At TP2 differences are within noise (a rank holding twice each expert's width already keeps the
+ * (tile, run) grid busy), so the TP4 thresholds stand. */
 constexpr long long kMoeDownDecG2Rows = 200;
 constexpr long long kMoeDownDecG4Rows = 480;
 /* G's bound: the kernel keeps its column tiles in one 32-bit mask. */
 constexpr long long kMoeDownDecMaxG = 16;
-/* THE SORTED OPERAND'S DECODE KERNEL, pinned for a test: 0 is the rule above, -1 the (tile, run)
- * form, n > 0 moe_down_dec_kernel at n column tiles a block (capped at kMoeDownDecMaxG). A pin to
- * the kernel on a shape it does not serve is refused. */
+/* The sorted operand's decode kernel, pinnable for tests: 0 the rule above, -1 the (tile, run)
+ * form, n > 0 moe_down_dec_kernel with n column tiles per block (capped at kMoeDownDecMaxG). A pin
+ * on an unsupported shape is refused. */
 static int g_moe_down_dec_pin = 0;
 static inline long long r4d_moe_down_dec_g(long long T) {
     if (g_moe_down_dec_pin < 0) return 0;
     if (g_moe_down_dec_pin > 0) return g_moe_down_dec_pin;
     return T >= kMoeDownDecG4Rows ? 4 : T >= kMoeDownDecG2Rows ? 2 : 1;
 }
-/* THE MAP'S UPPER BOUND, stated once because the scratch hook and the launcher must agree about
- * it exactly: a hook that answers for a different shape than the launch uses is how a kernel ends
- * up writing past the arena it was given. Every expert contributes one block, plus one more for
- * each FM rows its run exceeds; the dropped-slot tail contributes at most T/FM and one more. */
+/* The map's upper bound, defined once so the scratch hook and the launcher agree exactly (or the
+ * kernel writes past its arena). Each expert contributes one block plus one per FM rows beyond the
+ * first; the dropped-slot tail at most T/FM plus one. */
 static inline long long r4d_blockmap_cap(long long T, long long n_expert, long long FM) {
     return n_expert + (T + FM - 1) / FM + 1;
 }
-/* One count slot, then two uint32 an entry. */
+/* One count slot, then two uint32 per entry. */
 static inline long long r4d_blockmap_bytes(long long cap) {
     return (1 + 2 * cap) * (long long)sizeof(uint32_t);
 }
 
-
-/* ONE WORKGROUP, because the whole of it is a scan over at most kMaxExpert counters and a second
- * launch to split that across the device would cost more than the scan does. The offsets are read
- * once, in parallel, so the scan is not 512 dependent global loads. The launch is NT threads, a
- * thread owning experts tid, tid + NT, ...
+/* One workgroup: the job is a scan over at most kMaxExpert counters, cheaper than a second launch.
+ * NT threads, thread tid owning experts tid, tid + NT, ...; offsets are read once, in parallel.
  *
- * THE PREFIX IS PARALLEL: a DPP scan in each wave and one exchange of the wave totals, 256 counts
- * a tile -- three tiles at 512 experts, whose n_expert + 1 counts end one past the second. On one
- * thread it is 513 dependent LDS round trips in front of a GEMM that waits for the map, and the map
- * is built twice a routed layer. Integers: the offsets have one answer whatever order the sums are
- * formed in. */
+ * The prefix is parallel (a DPP scan per wave and one exchange of wave totals, 256 counts per tile;
+ * three tiles at 512 experts), not 513 dependent LDS round trips on one thread ahead of a GEMM that
+ * waits for the map. Integer sums are order-independent. */
 __global__ __launch_bounds__(256) void moe_blockmap_kernel(
     const int32_t* __restrict__ off, uint32_t n_expert, uint32_t T, uint32_t FM, uint32_t cap,
     uint32_t* __restrict__ map) {
@@ -3153,12 +2707,9 @@ __global__ __launch_bounds__(256) void moe_blockmap_kernel(
     __shared__ int32_t  s_wt[kTiles][NW];
     const uint32_t tid = threadIdx.x, lane = tid % kWave, wave = tid / kWave;
 
-    /* EVERY OFFSET THIS THREAD NEEDS IN ONE ROUND OF LOADS: both ends of each expert it owns
-     * (e = tid + i * NT), the index clamped so every load is unconditional, all issued before the
-     * first is waited on. A loop over e that stores each offset to LDS before the next load makes
-     * one dependent trip to memory per expert a thread owns -- three at 512 experts -- and the
-     * offsets are read cold, straight after the router wrote them. The counts and the map's rows
-     * then come from these registers, so the offsets never pass through LDS. */
+    /* Every offset this thread needs in one round of loads: both ends of each expert it owns
+     * (e = tid + i * NT), index clamped so every load is unconditional, all issued before the first
+     * wait. Counts and map rows come from these registers; offsets never pass through LDS. */
     int32_t lo[kTiles], hi[kTiles];
 #pragma unroll
     for (uint32_t i = 0; i < kTiles; ++i) {
@@ -3167,8 +2718,7 @@ __global__ __launch_bounds__(256) void moe_blockmap_kernel(
         hi[i] = off[e + 1 < n_expert ? e + 1 : n_expert];
     }
     const uint32_t live = (uint32_t)off[n_expert];
-    /* Blocks this expert needs. A zero-row run needs none, and asking for one would put an empty
-     * block in the map that the GEMM would then have to recognise. */
+    /* Blocks this expert needs; a zero-row run needs none. */
 #pragma unroll
     for (uint32_t i = 0; i < kTiles; ++i) {
         const uint32_t e = tid + i * NT;
@@ -3178,8 +2728,8 @@ __global__ __launch_bounds__(256) void moe_blockmap_kernel(
     if (tid == 0) s_cnt[n_expert] = T > live ? (T - live + FM - 1) / FM : 0u;
     __syncthreads();
 
-    /* Exclusive scan over the n_expert + 1 counts, a tile of NT at a time. Each tile has its own
-     * exchange slots, so no tile's writes meet the reads of the one before it. */
+    /* Exclusive scan over the n_expert + 1 counts, NT at a time. Each tile has its own exchange
+     * slots, so a tile's writes never meet the previous tile's reads. */
     uint32_t carry = 0;
     for (uint32_t b = 0, tl = 0; b <= n_expert; b += NT, ++tl) {
         const uint32_t e = b + tid;
@@ -3222,25 +2772,22 @@ __global__ __launch_bounds__(256) void moe_blockmap_kernel(
     }
 }
 
-/* WHICH FORM A LAUNCH TAKES: 0 is the rule; for a test, 1 pins the run-aligned prefill form, 2 the
- * (tile, run) decode form and 3 the uniform prefill grid, whatever the band. r4d_selftest --perfmoe
- * times each on one input and compares it with form 1: all three must match byte for byte. */
+/* Launch form: 0 the rule; for tests, 1 pins the run-aligned prefill form, 2 the (tile, run)
+ * decode form, 3 the uniform prefill grid, whatever the band. r4d_selftest --perfmoe requires all
+ * three to match byte for byte. */
 static int g_moe_prefill_form = 0;
-/* THE ALIGNED FORM'S COLUMN TILE, pinned for a test: 0 is the launcher's shape rule, 1 never the
- * down projection's 256-column tile (the 128- or 64-column one), 2 the 256-column tile, refused
- * where the shape cannot take it or the launch is not the aligned form. r4d_selftest compares the
- * two byte for byte. */
+/* The aligned form's column tile, pinnable for tests: 0 the launcher's rule, 1 never the down
+ * projection's 256-column tile (use 128 or 64), 2 the 256-column tile (refused where the shape
+ * cannot take it or the launch is not aligned). r4d_selftest compares them byte for byte. */
 static int g_moe_down_tile_pin = 0;
 
-/* Both instantiations, from one body. The only things that differ are the weight table's dtype and
- * its two pitches, so the fp8 launcher and the w4 one are the same forty lines with three values
- * swapped -- and writing them twice is how a shape check drifts between two paths that must agree.
+/* One body for the fp8 and w4 launchers, which differ only in the weight dtype and its two
+ * pitches, so their shape checks cannot drift apart.
  *
- * `ncls` is the op's class count: 2 for `moe_gemm_q`, whose odd class is operands 6 and 7 at
- * N_odd/K_odd, and 4 for `moe_gemm_q_mod4`, whose classes 1..3 are operands 6/7, 8/9 and 10/11 at
- * N_1/K_1, N_2/K_2 and N_3/K_3, with `y` after them at 12. Everything else is one body. */
+ * `ncls` is the class count: 2 for `moe_gemm_q` (odd class = operands 6 and 7 at N_odd/K_odd), 4
+ * for `moe_gemm_q_mod4` (classes 1..3 = operands 6/7, 8/9, 10/11 at N_1/K_1 .. N_3/K_3, `y` at 12). */
 template <int W4>
-static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
+static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     int emit_rc = RAD_OK;
     if (ncls != 2 && ncls != 4) return R4D_NO(RAD_E_INVAL);
     const RadTensor* Aq     = r4d_opt(a, 0);
@@ -3260,8 +2807,8 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
     if (!Aq->data || !As->data || !sorted->data || !off->data || !Y->data)
         return R4D_NO(RAD_E_INVAL);
 
-    /* Each class's weight geometry, the others defaulting to class 0's; the output is as wide as
-     * the widest class and the activation as long as the longest K. */
+    /* Each class's weight geometry (defaulting to class 0's); the output is as wide as the widest
+     * class and the activation as long as the longest K. */
     static const char* const kNk[4][2] = { { "N", "K" }, { "N_1", "K_1" }, { "N_2", "K_2" },
                                            { "N_3", "K_3" } };
     long long Nc[4] = { 0, 0, 0, 0 }, Kc[4] = { 0, 0, 0, 0 };
@@ -3300,27 +2847,24 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
     if (as_ld < 0 || Ms < M) return R4D_NO(RAD_E_STRIDE);
     if (r4d_numel(sorted) < T || r4d_numel(off) < n_expert + 1) return R4D_NO(RAD_E_SHAPE);
 
-    /* WHICH ROWS THE ACTIVATION HAS. Checked, not inferred: an operand a row short is the caller
-     * having handed the down projection the gate_up projection's buffer, and refusing it by name
-     * here is the only place that reads as what it is. */
+    /* The activation's row count is checked, not inferred: a short operand means the caller passed
+     * the gate_up projection's buffer to the down projection. */
     const char* ord = r4d_gets(a, "a_order");
     const bool a_sorted = ord && !std::strcmp(ord, "sorted");
     if (ord && !a_sorted && std::strcmp(ord, "token")) return R4D_NO(RAD_E_UNSUPPORTED);
     if (M < (a_sorted ? T : (T + top_k - 1) / top_k)) return R4D_NO(RAD_E_SHAPE);
 
-    /* WHICH TABLE THE CODES INDEX, read off the dtype the layout hook accepted the weight under:
-     * w4nla8h's levels, w5nl64a8h's magnitudes, or two's complement for w4a8 and w4a8h. The schema
-     * admits no other. */
+    /* The code table, from the dtype the layout hook accepted: w4nla8h's levels, w5nl64a8h's
+     * magnitudes, or two's complement for w4a8 and w4a8h. */
     const char* wdt = r4d_gets(a, "dtype");
     const uint32_t* tab = W4 == 4 ? kW5nlMagPerm
                         : (W4 && wdt && (!std::strcmp(wdt, "w4nla8h") ||
                                          !std::strcmp(wdt, "w4nl64a8h") ||
                                          !std::strcmp(wdt, "w4nl32a8h"))) ? kW4nlPerm : kW4IntPerm;
 
-    /* One class's tables. THE WEIGHT PITCH THE KERNEL WANTS IS IN BYTES, and for a 4-bit plane
-     * that is half the element count, for the 5-bit one five eighths. `wtab_of` reports the
-     * declared element stride, so the scaling happens here, once, where the forms are side by
-     * side. */
+    /* One class's tables. The kernel wants the weight pitch in bytes: half the element count for a
+     * 4-bit plane, five eighths for the 5-bit one. `wtab_of` reports the declared element stride,
+     * so the scaling happens here. */
     auto cls_of = [&](const RadTensor* w, const RadTensor* ws, long long cnt, long long n,
                       long long k, MoeCls* c) -> int {
         long long w_ld = 0, ws_ld = 0;
@@ -3330,21 +2874,20 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
                          W4 == 4 ? 5 : W4 ? 4 : 8, cnt, n, k, &c->w, &w_s0, &w_ld);
         if (rc != RAD_OK) return rc;
         if constexpr (W4 >= 2) {
-            /* One E4M3 byte per (row, group of 64 or 32 K), and the stored row is exactly those
-             * bytes. THE PITCH IS DERIVED, NOT READ: the scale view selects two planes, so the
-             * engine declares it at the weight's logical [n, k] and hands it over at that shape --
-             * its row stride is k, the stored row k/64 or k/32 (r4d_layout.cpp). A tile's scales
-             * are one sixteen- or thirty-two-bit word, so the kernel's pitch is k/128 words. */
+            /* One E4M3 byte per (row, group of 64 or 32 K). The pitch is derived, not read: the
+             * scale view arrives at the weight's logical [n, k] (row stride k) while the stored row
+             * is k/64 or k/32 bytes (r4d_layout.cpp). A tile's scales are one 16- or 32-bit word,
+             * so the kernel's pitch is k/128 words. */
             rc = wtab_of(ws, RAD_F8E4M3, 8, cnt, n, k / (kBlock / (W4 == 3 ? 4 : 2)), &c->s,
                          &s_s0, &ws_ld);
             if (rc != RAD_OK) return rc;
-            /* A 5-bit row is its nibbles then its sign bits, so its pitch is whole bytes of both;
-             * the kernel finds the signs K/2 bytes in. */
+            /* A 5-bit row is its nibbles then its sign bits; the kernel finds the signs K/2 bytes
+             * in. */
             if (W4 == 4 ? (w_ld % 8 || k % 32) : (w_ld % 2)) return R4D_NO(RAD_E_STRIDE);
             w_ld = W4 == 4 ? w_ld / 8 * 5 : w_ld / 2;
             ws_ld = k / kBlock;
         } else if constexpr (W4) {
-            /* The scale plane is one bf16 per (row, group of 128 K) -- not per 128x128 tile. */
+            /* The scale plane is one bf16 per (row, 128 of K), not per 128x128 tile. */
             rc = wtab_of(ws, RAD_BF16, 16, cnt, n, k / kBlock, &c->s, &s_s0, &ws_ld);
             if (rc != RAD_OK) return rc;
             if (w_ld % 2) return R4D_NO(RAD_E_STRIDE);
@@ -3364,8 +2907,8 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
         c->s_ld = (uint32_t)ws_ld;
         return RAD_OK;
     };
-    /* Class q holds the experts e with e % ncls == q, entry e / ncls: ceil((n - q) / ncls) of
-     * them. At two classes the last two are never read and stay zero. */
+    /* Class q holds experts e with e % ncls == q at entry e / ncls, ceil((n - q) / ncls) of them.
+     * At two classes the last two stay zero and unread. */
     MoeCls cl[4]{};
     for (int q = 0; q < ncls; ++q) {
         const int rc = cls_of(Wc[q], Wsc[q], (n_expert + ncls - 1 - q) / ncls, Nc[q], Kc[q],
@@ -3382,41 +2925,37 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
     MoeTab tabv{};
     for (int i = 0; i < 4; ++i) tabv.v[i] = tab[i];
 
-    /* THE BAND: a decode step takes the (tile, run) form -- one 16-row tile of runs spread over
-     * blocks, see the kernel's ES note -- and anything with runs of several rows takes the aligned
-     * 32-row form. r4d_moe_decode_band has the crossover. */
+    /* The band: a decode step takes the (tile, run) form (the kernel's ES note) and runs of several
+     * rows take the aligned 32-row form; r4d_moe_decode_band has the crossover. */
     const uint32_t ny = (uint32_t)(N / 64);
     const int form = g_moe_prefill_form;
     if ((form == 0 && r4d_moe_decode_band(T, n_expert)) || form == 2) {
-        /* THE DECODE GRID IS (tile, run) WIDE -- see the kernel's ES note. One tile of rows is all
-         * a decode step has, so without this the whole layer runs on N/64 workgroups. */
+        /* The decode grid is (tile, run) wide (the kernel's ES note); decode has one tile of rows,
+         * which alone would give only N/64 workgroups. */
         const unsigned tiles = (unsigned)((T + 15) / 16);
-        /* THE SORTED OPERAND'S OWN DECODE KERNEL, a block a run tile and G column tiles -- see
-         * moe_down_dec_kernel and kMoeDownDecG2Rows. Its grid is the run tiles' upper bound, a
-         * tile for every run and one more for every 16 rows, and one block for the dropped tail,
-         * by the column groups. */
+        /* The sorted operand's decode kernel (moe_down_dec_kernel, kMoeDownDecG2Rows): the grid is
+         * the run tiles' upper bound (one per run plus one per 16 rows) plus one tail block, by
+         * column groups. */
         const bool dn_dec = a_sorted && parts == 1 && n_expert <= (long long)kMaxExpert;
         const long long g2 = r4d_moe_down_dec_g(T);
         if (!dn_dec && g_moe_down_dec_pin > 0) return R4D_NO(RAD_E_UNSUPPORTED);
         if (dn_dec && g2 > 0) {
             const unsigned slots  = (unsigned)(std::min(T, n_expert) + (T + 15) / 16);
             const unsigned groups = (unsigned)((N + 64 * g2 - 1) / (64 * g2));
-            emit_rc = R4D_EMIT(sk, (moe_down_dec_kernel<W4>),
+            emit_rc = R4D_EMIT(stream, (moe_down_dec_kernel<W4>),
                                dim3(slots + 1u, groups), dim3(4 * kWave), 0,
                                (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
                                (const int32_t*)off->data, (uint16_t*)Y->data,
                                (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)g2,
                                (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
             if (emit_rc != RAD_OK) return emit_rc;
-            if (!sk.desc) R4D_MOE_CHK();
+            R4D_MOE_CHK();
             return RAD_OK;
         }
-        /* WHICH INSTANTIATION: the weight from a uniform global base (UW) always; the run search
-         * in one round trip (RS) up to kMaxExpert experts and the chunked search above that; and
-         * two 128-wide K blocks a pass where kMoeGuFk256Rows admits the row count, every class's
-         * K is whole passes of 256 and the format folds scale groups. All of them are
-         * bit-identical; the function moves with the choice, which a recorded pass sees as a new
-         * node. */
+        /* Instantiation: UW always; RS up to kMaxExpert experts, the chunked search above; two
+         * 128-wide K blocks per pass where kMoeGuFk256Rows admits the row count, every class's K is
+         * whole 256-wide passes and the format folds scale groups. All are bit-identical; a
+         * recorded pass sees a different choice as a new node. */
         const bool rs = n_expert <= (long long)kMaxExpert;
         auto pick = [&](auto fk) {
             constexpr uint32_t F = decltype(fk)::value;
@@ -3429,7 +2968,7 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
             for (int q = 0; q < ncls; ++q) fk2 = fk2 && Kc[q] % (2 * (long long)kBlock) == 0;
             if (fk2) kern = pick(std::integral_constant<uint32_t, 2 * kFK>{});
         }
-        emit_rc = R4D_EMIT(sk, kern,
+        emit_rc = R4D_EMIT(stream, kern,
                            dim3(tiles * 16u, ny), dim3(4 * kWave), 0,
                            (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
                            (const int32_t*)sorted->data, (const int32_t*)off->data,
@@ -3437,14 +2976,11 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
                            (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
                            (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
     } else {
-        /* THE PREFILL FORM IS ALIGNED TO RUNS when the scratch for a map is there, and uniform
-         * when it is not. A caller that never asked the scratch hook -- a tool replaying a
-         * recording, a plugin issuing this op by hand -- gets the uniform grid and the same
-         * answer: a run that straddles a tile is staged by both, and nothing else differs.
+        /* The prefill form is run-aligned when map scratch is present, uniform otherwise (e.g. a
+         * caller that never asked the scratch hook); the answer is the same.
          *
-         * The map's builder scans the offsets in LDS tables of kMaxExpert + 1 entries, so a wider
-         * expert count takes the uniform grid whatever scratch it was handed -- the GEMM itself
-         * reads `off` from global memory and serves any count. */
+         * The map builder's LDS tables hold kMaxExpert + 1 entries, so wider expert counts take the
+         * uniform grid regardless of scratch. */
         const long long cap = r4d_blockmap_cap(T, n_expert, kPrefillRows);
         uint32_t* map = (form != 3 && n_expert <= (long long)kMaxExpert && a->scratch &&
                          a->scratch_bytes >= r4d_blockmap_bytes(cap))
@@ -3452,13 +2988,11 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
         /* The 128-column tile where no column tile straddles two parts of the weight. */
         const bool wide_n = (N / parts) % kPrefillCols == 0;
         const unsigned nyw = (unsigned)(N / kPrefillCols);
-        /* THE DOWN PROJECTION'S 256-COLUMN TILE, a rule of shape: the sorted operand, one part, a
-         * w4 weight whose scale is a row's, and every class's width whole tiles of it take 256
-         * columns over sixteen waves instead of 128 over eight. Each wave's share is the
-         * 128-column tile's: one 16-row M tile by two N tiles, the same K passes and the same fold,
-         * so every element is the same sum in the same order. What the wider block buys is its
-         * rows' activation and its run's prologue once for twice the columns. Any other shape keeps
-         * the 128- or 64-column tile. */
+        /* The down projection's 256-column tile: the sorted operand, one part, a w4 weight with
+         * per-row scales and every class's width whole tiles take 256 columns over sixteen waves
+         * instead of 128 over eight. Each wave's share is unchanged, so every element is the same
+         * sum; the wider block stages the activation and run prologue once for twice the columns.
+         * Other shapes keep the 128- or 64-column tile. */
         bool dn_wide = W4 != 0 && a_sorted && parts == 1 && N % (2 * kPrefillCols) == 0;
         for (int q = 0; q < ncls; ++q) dn_wide = dn_wide && Nc[q] % (2 * kPrefillCols) == 0;
         const int tpin = g_moe_down_tile_pin;
@@ -3466,17 +3000,17 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
         if (tpin == 2 && (!map || !dn_wide)) return R4D_NO(RAD_E_UNSUPPORTED);
         if (tpin == 1) dn_wide = false;
         if (map) {
-            emit_rc = R4D_EMIT(sk, moe_blockmap_kernel, dim3(1), dim3(256), 0,
+            emit_rc = R4D_EMIT(stream, moe_blockmap_kernel, dim3(1), dim3(256), 0,
                                (const int32_t*)off->data, (uint32_t)n_expert, (uint32_t)T,
                                (uint32_t)kPrefillRows, (uint32_t)cap, map);
             if (emit_rc != RAD_OK) return emit_rc;
-            /* Every aligned instantiation reads the weight from a uniform base (UW) and issues its
-             * first pass at the map read -- see THE ALIGNED FORM'S FIRST PASS at the kernel. */
+            /* Every aligned instantiation uses UW and issues its first pass at the map read (see
+             * the early-weight note at the kernel). */
             if (dn_wide) {
-                /* Only a w4 weight takes it (dn_wide is false otherwise), and the block-fp8
-                 * instantiation would not compile: its scale is a 128x128 tile's. */
+                /* Only a w4 weight takes it (dn_wide is false otherwise); the block-fp8
+                 * instantiation would not compile, its scale being per 128x128 tile. */
                 if constexpr (W4 != 0)
-                    emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, 2 * kPrefillCols / 16, 2, 8, W4, false, true, true, kFK, true>),
+                    emit_rc = R4D_EMIT(stream, (moe_gemm_q_kernel<kPrefillRows / 16, 2 * kPrefillCols / 16, 2, 8, W4, false, true, true, kFK, true>),
                                dim3((unsigned)cap, (unsigned)(N / (2 * kPrefillCols))),
                                dim3(16 * kWave), 0,
                                (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
@@ -3485,7 +3019,7 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
                                (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
                                (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
             } else if (wide_n) {
-                emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, true, true, kFK, true>),
+                emit_rc = R4D_EMIT(stream, (moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, true, true, kFK, true>),
                                dim3((unsigned)cap, nyw), dim3(8 * kWave), 0,
                                (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
                                (const int32_t*)sorted->data, (const int32_t*)off->data,
@@ -3493,7 +3027,7 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
                                (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
                                (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
             } else {
-                emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, 4, 2, 2, W4, false, true, true, kFK, true>),
+                emit_rc = R4D_EMIT(stream, (moe_gemm_q_kernel<kPrefillRows / 16, 4, 2, 2, W4, false, true, true, kFK, true>),
                                dim3((unsigned)cap, ny), dim3(4 * kWave), 0,
                                (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
                                (const int32_t*)sorted->data, (const int32_t*)off->data,
@@ -3502,7 +3036,7 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
                                (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
             }
         } else if (wide_n) {
-            emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, false, true>),
+            emit_rc = R4D_EMIT(stream, (moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, false, true>),
                                dim3((unsigned)((T + kPrefillRows - 1) / kPrefillRows), nyw),
                                dim3(8 * kWave), 0,
                                (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
@@ -3511,7 +3045,7 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
                                (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
                                (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
         } else {
-            emit_rc = R4D_EMIT(sk, (moe_gemm_q_kernel<kPrefillRows / 16, 4, 2, 2, W4, false, false, true>),
+            emit_rc = R4D_EMIT(stream, (moe_gemm_q_kernel<kPrefillRows / 16, 4, 2, 2, W4, false, false, true>),
                                dim3((unsigned)((T + kPrefillRows - 1) / kPrefillRows), ny),
                                dim3(4 * kWave), 0,
                                (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
@@ -3522,21 +3056,16 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
         }
     }
     if (emit_rc != RAD_OK) return emit_rc;
-    if (!sk.desc) R4D_MOE_CHK();
+    R4D_MOE_CHK();
     return RAD_OK;
 }
 
-/* Bytes for the run map, and zero everywhere it is not used.
+/* Bytes for the run map, zero where it is not used.
  *
- * T IS COMPUTED FROM THE PARAMETERS, not from an operand, because a scratch hook is called at
- * DECLARE with the band's shape and the tensors need not be bound yet. `M * top_k` is the routed
- * row count by definition -- the same quantity the launcher reads off Y's row pitch -- so the two
- * agree at every shape that reaches the aligned form.
- *
- * IF THEY EVER DISAGREE THE FAILURE IS SAFE BY CONSTRUCTION, and that is deliberate rather than
- * lucky: the launcher checks the scratch it was actually handed against the size the map needs and
- * runs the uniform grid when it comes up short. A hook that underestimates costs the optimisation,
- * not the arena.
+ * T comes from the parameters (`M * top_k`, the routed row count), not an operand, since the hook
+ * runs at declare before tensors are bound; the launcher derives the same count from Y. If they
+ * ever disagree it is safe: the launcher checks the scratch it was handed and falls back to the
+ * uniform grid when it is short.
  */
 static int64_t moe_gemm_map_scratch(const RadArgs* a) {
     const long long n_expert = r4d_geti_or(a, "n_expert", 0);
@@ -3559,44 +3088,39 @@ extern "C" void r4d_moe_gemm_pin_down_dec(int pin) {
 }
 
 extern "C" int r4d_rad_moe_gemm_q(const RadArgs* a, RadStream s) {
-    return moe_gemm_launch<0>(a, r4d_stream_sink(s));
+    return moe_gemm_launch<0>(a, s);
 }
 
-/* The four-bit forms -- w4nl64a8h's and w4nl32a8h's E4M3 scale a 64 or 32 of K, or the others'
- * bf16 a 128 -- and the five-bit w5nl64a8h. */
-static int rad_moe_gemm_w4a8_body(const RadArgs* a, const R4dSink& sk) {
+/* The four-bit forms (an E4M3 scale per 64 or 32 of K for w4nl64a8h / w4nl32a8h, else a bf16
+ * scale per 128) and the five-bit w5nl64a8h. */
+extern "C" int r4d_rad_moe_gemm_w4a8(const RadArgs* a, RadStream stream) {
     const char* wdt = r4d_gets(a, "dtype");
-    if (wdt && !std::strcmp(wdt, "w4nl64a8h")) return moe_gemm_launch<2>(a, sk);
-    if (wdt && !std::strcmp(wdt, "w4nl32a8h")) return moe_gemm_launch<3>(a, sk);
-    if (wdt && !std::strcmp(wdt, "w5nl64a8h")) return moe_gemm_launch<4>(a, sk);
-    return moe_gemm_launch<1>(a, sk);
+    if (wdt && !std::strcmp(wdt, "w4nl64a8h")) return moe_gemm_launch<2>(a, stream);
+    if (wdt && !std::strcmp(wdt, "w4nl32a8h")) return moe_gemm_launch<3>(a, stream);
+    if (wdt && !std::strcmp(wdt, "w5nl64a8h")) return moe_gemm_launch<4>(a, stream);
+    return moe_gemm_launch<1>(a, stream);
 }
-R4D_ENTRY(r4d_rad_moe_gemm_w4a8, rad_moe_gemm_w4a8_body)
 
-/* `moe_gemm_q_mod4`: the same launches over four classes, by the expert's number mod 4. The run
- * map and its scratch are the two-class op's -- they depend on the offsets and nothing else. */
+/* `moe_gemm_q_mod4`: the same launches over four classes, by expert number mod 4. The run map and
+ * its scratch are the two-class op's, since they depend only on the offsets. */
 extern "C" int r4d_rad_moe_gemm_q_mod4(const RadArgs* a, RadStream s) {
-    return moe_gemm_launch<0>(a, r4d_stream_sink(s), 4);
+    return moe_gemm_launch<0>(a, s, 4);
 }
-static int rad_moe_gemm_w4a8_mod4_body(const RadArgs* a, const R4dSink& sk) {
+extern "C" int r4d_rad_moe_gemm_w4a8_mod4(const RadArgs* a, RadStream stream) {
     const char* wdt = r4d_gets(a, "dtype");
-    if (wdt && !std::strcmp(wdt, "w4nl64a8h")) return moe_gemm_launch<2>(a, sk, 4);
-    if (wdt && !std::strcmp(wdt, "w4nl32a8h")) return moe_gemm_launch<3>(a, sk, 4);
-    if (wdt && !std::strcmp(wdt, "w5nl64a8h")) return moe_gemm_launch<4>(a, sk, 4);
-    return moe_gemm_launch<1>(a, sk, 4);
+    if (wdt && !std::strcmp(wdt, "w4nl64a8h")) return moe_gemm_launch<2>(a, stream, 4);
+    if (wdt && !std::strcmp(wdt, "w4nl32a8h")) return moe_gemm_launch<3>(a, stream, 4);
+    if (wdt && !std::strcmp(wdt, "w5nl64a8h")) return moe_gemm_launch<4>(a, stream, 4);
+    return moe_gemm_launch<1>(a, stream, 4);
 }
-R4D_ENTRY(r4d_rad_moe_gemm_w4a8_mod4, rad_moe_gemm_w4a8_mod4_body)
 
-/* `moe_gemm` at bf16: operands a, w (one table), sorted_tok, expert_offset -> y. The band and the
- * three forms are moe_gemm_launch's and are chosen by the same rule from the same arguments, so the
- * scratch hook that sizes the run map is the same function too.
+/* `moe_gemm` at bf16: operands a, w (one table), sorted_tok, expert_offset -> y. Band and forms
+ * follow moe_gemm_launch's rule, so the same scratch hook sizes the run map.
  *
- * EVERY LOAD IS SIXTEEN BYTES, and that is what the alignment checks below are for: a row pitch
- * that is not a multiple of eight elements, or a stacked plane whose experts do not start on a
- * sixteen-byte boundary, would put a chunk across two lines. A pointer table's entries cannot be
- * checked from here -- they live in device memory -- and every allocator that fills one hands out
- * movement-unit-aligned addresses. */
-static int moe_gemm_bf16_body(const RadArgs* a, const R4dSink& sk) {
+ * Every load is sixteen bytes, hence the alignment checks: row pitches must be multiples of eight
+ * elements and stacked experts 16-byte aligned. Pointer-table entries live in device memory and
+ * cannot be checked here; their allocators hand out movement-unit-aligned addresses. */
+extern "C" int r4d_rad_moe_gemm_bf16(const RadArgs* a, RadStream stream) {
     int emit_rc = RAD_OK;
     const RadTensor* A      = r4d_opt(a, 0);
     const RadTensor* W      = r4d_opt(a, 1);
@@ -3613,7 +3137,7 @@ static int moe_gemm_bf16_body(const RadArgs* a, const R4dSink& sk) {
     const long long n_expert = r4d_geti_or(a, "n_expert", 0);
     const long long top_k = r4d_geti_or(a, "top_k", 0);
     if (N <= 0 || K <= 0 || n_expert <= 0 || top_k <= 0) return R4D_NO(RAD_E_SHAPE);
-    /* A column tile is 64 wide and every tile is all weight; a K pass is 64 deep. */
+    /* Column tiles are 64 wide and all weight; a K pass is 64 deep. */
     if (N % 64 || K % (long long)kBK16) return R4D_NO(RAD_E_SHAPE);
     if (A->dtype != RAD_BF16 || Y->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
     if (sorted->dtype != RAD_I32 || off->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
@@ -3626,7 +3150,7 @@ static int moe_gemm_bf16_body(const RadArgs* a, const R4dSink& sk) {
     if (a_ld < 0 || M <= 0 || a_ld % 8 || ((uintptr_t)A->data % 16)) return R4D_NO(RAD_E_STRIDE);
     if (r4d_numel(sorted) < T || r4d_numel(off) < n_expert + 1) return R4D_NO(RAD_E_SHAPE);
 
-    /* WHICH ROWS THE ACTIVATION HAS, checked rather than inferred -- see moe_gemm_launch. */
+    /* The activation's row count is checked, not inferred (see moe_gemm_launch). */
     const char* ord = r4d_gets(a, "a_order");
     const bool a_sorted = ord && !std::strcmp(ord, "sorted");
     if (ord && !a_sorted && std::strcmp(ord, "token")) return R4D_NO(RAD_E_UNSUPPORTED);
@@ -3643,7 +3167,7 @@ static int moe_gemm_bf16_body(const RadArgs* a, const R4dSink& sk) {
     const int form = g_moe_prefill_form;
     if ((form == 0 && r4d_moe_decode_band(T, n_expert)) || form == 2) {
         const unsigned tiles = (unsigned)((T + 15) / 16);
-        emit_rc = R4D_EMIT(sk, (moe_gemm_bf16_kernel<1, 4, 1, 4, true>),
+        emit_rc = R4D_EMIT(stream, (moe_gemm_bf16_kernel<1, 4, 1, 4, true>),
                            dim3(tiles * 16u, ny), dim3(4 * kWave), 0,
                            (const uint16_t*)A->data, tab, w_s0,
                            (const int32_t*)sorted->data, (const int32_t*)off->data,
@@ -3655,18 +3179,19 @@ static int moe_gemm_bf16_body(const RadArgs* a, const R4dSink& sk) {
         uint32_t* map = (form != 3 && n_expert <= (long long)kMaxExpert && a->scratch &&
                          a->scratch_bytes >= r4d_blockmap_bytes(cap))
                             ? (uint32_t*)a->scratch : nullptr;
-        /* The 128-column, eight-wave tile wherever the width allows it, as the fp8 forms do. */
+        /* The 128-column, eight-wave tile wherever the width allows, as in the fp8 forms. */
         const bool wide_n = N % kPrefillCols == 0;
         const unsigned nyw = (unsigned)(N / kPrefillCols);
         const unsigned gx = map ? (unsigned)cap : (unsigned)((T + kPrefillRows - 1) / kPrefillRows);
         if (map) {
-            emit_rc = R4D_EMIT(sk, moe_blockmap_kernel, dim3(1), dim3(256), 0,
+            emit_rc = R4D_EMIT(stream, moe_blockmap_kernel, dim3(1), dim3(256), 0,
                                (const int32_t*)off->data, (uint32_t)n_expert, (uint32_t)T,
                                (uint32_t)kPrefillRows, (uint32_t)cap, map);
             if (emit_rc != RAD_OK) return emit_rc;
         }
 #define R4D_MOE16(AL_, NTL_, WGN_, NYG_)                                                         \
-        R4D_EMIT(sk, (moe_gemm_bf16_kernel<kPrefillRows / 16, NTL_, 2, WGN_, false, AL_, true>),   \
+        R4D_EMIT(stream,                                                                       \
+                 (moe_gemm_bf16_kernel<kPrefillRows / 16, NTL_, 2, WGN_, false, AL_, true>),    \
                  dim3(gx, NYG_), dim3(2 * WGN_ * kWave), 0,                                      \
                  (const uint16_t*)A->data, tab, w_s0,                                            \
                  (const int32_t*)sorted->data, (const int32_t*)off->data,                        \
@@ -3680,10 +3205,9 @@ static int moe_gemm_bf16_body(const RadArgs* a, const R4dSink& sk) {
 #undef R4D_MOE16
     }
     if (emit_rc != RAD_OK) return emit_rc;
-    if (!sk.desc) R4D_MOE_CHK();
+    R4D_MOE_CHK();
     return RAD_OK;
 }
-R4D_ENTRY(r4d_rad_moe_gemm_bf16, moe_gemm_bf16_body)
 
 extern "C" int64_t r4d_rad_moe_gemm_bf16_scratch(const RadArgs* a) {
     return moe_gemm_map_scratch(a);
@@ -3711,7 +3235,7 @@ extern "C" int r4d_rad_moe_gather(const RadArgs* a, RadStream s) {
     if (ye->dtype != RAD_BF16 || ew->dtype != RAD_BF16 || Y->dtype != RAD_BF16)
         return R4D_NO(RAD_E_DTYPE);
     if (sorted->dtype != RAD_I32 || !r4d_contig(sorted)) return R4D_NO(RAD_E_STRIDE);
-    /* The shared arm is a PAIR: the plane and its per-row gate, or neither. */
+    /* The shared arm is a pair: the plane and its per-row gate, or neither. */
     if ((sh != nullptr) != (sg != nullptr)) return R4D_NO(RAD_E_INVAL);
     if (sh && (sh->dtype != RAD_BF16 || sg->dtype != RAD_BF16)) return R4D_NO(RAD_E_DTYPE);
 
@@ -3727,12 +3251,9 @@ extern "C" int r4d_rad_moe_gather(const RadArgs* a, RadStream s) {
     const long long T = M * top_k;
     if (Te < T || r4d_numel(sorted) < T) return R4D_NO(RAD_E_SHAPE);
 
-
-    /* SELF: small enough that the gather builds its own slot table and the two prepass kernels
-     * are not launched at all -- see gather_kernel. The bound is on T because every one of the
-     * M*gy blocks repeats the scan: at a decode step that is 4*10 blocks over 40 entries, and at
-     * the cap it is still under half a megabyte of L2 traffic, against two dispatches saved on
-     * every MoE layer of every step. A prefill chunk is far past it and takes the prepass. */
+    /* SELF: small enough for the gather to build its own slot table, skipping the two prepass
+     * kernels (see gather_kernel). Bounded on T because each of the M*gy blocks repeats the scan;
+     * at the cap it is under half a megabyte of L2 traffic. Prefill takes the prepass. */
     const bool self = T <= (long long)kGatherSelfT && top_k <= (long long)kGatherSlots;
 
     const int64_t need = self ? 0 : T * (long long)sizeof(int32_t);
@@ -3741,9 +3262,8 @@ extern "C" int r4d_rad_moe_gather(const RadArgs* a, RadStream s) {
         if (!a->scratch || a->scratch_bytes < need) return R4D_NO(RAD_E_SCRATCH);
         inv = (int32_t*)a->scratch;
         const unsigned blocks = (unsigned)((T + 255) / 256);
-        /* TWO PASSES AND NOT ONE: a slot no sorted row claims must read -1, and the clear cannot
-         * be fused into the scatter because a thread does not know which entries nobody will
-         * write. Both are T/256 workgroups of trivial work; the launch is the cost. */
+        /* Two passes: an unclaimed slot must read -1, and the clear cannot be fused into the
+         * scatter because no thread knows which entries nobody will write. */
         hipLaunchKernelGGL(gather_inv_kernel, dim3(blocks), dim3(256), 0, (hipStream_t)s,
                            inv, (uint32_t)T);
         R4D_MOE_CHK();
@@ -3762,11 +3282,9 @@ extern "C" int r4d_rad_moe_gather(const RadArgs* a, RadStream s) {
         else if (act && std::strcmp(act, "none"))  return R4D_NO(RAD_E_UNSUPPORTED);
     }
 
-    /* THE PREFILL FORM, a wave a token and sixteen bytes a lane (gather_wide_kernel), past the
-     * self-scan bound wherever the slots fit its registers and every row it reads or writes starts
-     * on sixteen bytes. The same sums as gather_kernel's; see the kernel. Anything else -- a decode
-     * step, a top_k past kGatherWideSlots, a width or a pitch sixteen-byte pieces do not tile --
-     * takes gather_kernel. */
+    /* The prefill form (gather_wide_kernel, a wave per token, sixteen bytes per lane) past the
+     * self-scan bound, where top_k fits kGatherWideSlots and every row is 16-byte aligned. Same
+     * sums as gather_kernel, which serves everything else. */
     auto al16 = [](const void* p, long long ld) {
         return ((uintptr_t)p % 16) == 0 && ld % (long long)kGatherWideCols == 0;
     };
@@ -3816,9 +3334,8 @@ extern "C" int r4d_rad_scale_rows(const RadArgs* a, RadStream s) {
     if (ad && ad->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
     const long long n = r4d_geti_or(a, "n", 0);
     if (n <= 0) return R4D_NO(RAD_E_SHAPE);
-    /* Read as a NAME, not through r4d_act_code: that helper's vocabulary is silu/sigmoid and this
-     * op's is sigmoid/none, so "none" would come back as "not in the list" and be indistinguishable
-     * from a typo. An unknown name is refused rather than run as the other activation. */
+    /* Read as a name, not via r4d_act_code (whose vocabulary is silu/sigmoid, not sigmoid/none), so
+     * "none" is distinguishable from a typo. An unknown name is refused. */
     const char* act = r4d_gets(a, "act");
     const int sig = (act && !std::strcmp(act, "sigmoid")) ? 1 : 0;
     if (act && std::strcmp(act, "sigmoid") && std::strcmp(act, "none")) return R4D_NO(RAD_E_INVAL);
@@ -3836,8 +3353,7 @@ extern "C" int r4d_rad_scale_rows(const RadArgs* a, RadStream s) {
         a_ld = r4d_rows_pitch(ad, n, &Ma);
         if (a_ld < 0 || Ma < M) return R4D_NO(RAD_E_STRIDE);
     }
-    /* One scalar a row. The stream arrives either as [M] rank 1 or as [M, 1] rank 2, and the row
-     * stride is dim 0's in both -- a rank-1 tensor's stride[0] is its element stride. */
+    /* One scalar per row, as [M] or [M, 1]; the row stride is dim 0's in both. */
     const long long s_ld = r4d_stride(sc, 0) > 0 ? r4d_stride(sc, 0) : 1;
 
     hipLaunchKernelGGL((scale_rows_kernel<256>), dim3((unsigned)M), dim3(256), 0, (hipStream_t)s,
@@ -3851,43 +3367,30 @@ extern "C" int r4d_rad_scale_rows(const RadArgs* a, RadStream s) {
 
 /* ================================================================== router GEMM + router_topk_scatter
  *
- * THE ROUTER, ITS SELECTION AND ITS SORT IN ONE LAUNCH -- and, where the layer has a shared expert,
- * that expert's one-column gate beside them. rad_block_moe_fp8.h asks for it wherever it declares
- * router_topk_scatter and issues it up to kRgMaxM rows; this is the kernel and its shim.
+ * The router GEMM, its selection and its sort in one launch, plus, where the layer has a shared
+ * expert, that expert's one-column gate. rad_block_moe_fp8.h issues it up to kRgMaxM rows wherever
+ * it declares router_topk_scatter.
  *
- * At a decode step the router is a [n_expert, n_embd] bf16 GEMM over a handful of rows, and what
- * follows it -- `router_topk_scatter` -- is one workgroup with almost no work in it. They are two
- * DEPENDENT dispatches on every routed layer, and the boundary between them is a command-processor
- * gap plus a second launch, on the critical path. The selection needs every logit of a row, so it
- * cannot run inside a column tile; it runs in whichever workgroup finishes LAST, which an arrival
- * counter names. That is the device-wide pattern gemm_fp8a8's split-K finisher and hc_up_mix's
- * quantiser already use, and its rule is theirs: self-resetting, and never shared by two launches
- * that can run at once. Here it is the op instance's, taken at init -- see THE ARRIVAL COUNTER.
+ * At decode the router GEMM and router_topk_scatter are two dependent dispatches per routed layer
+ * with almost no work in the second. The selection needs a row's every logit, so it runs in the
+ * workgroup that finishes last, named by an arrival counter (the pattern of gemm_fp8a8's split-K
+ * finisher and hc_up_mix's quantiser: self-resetting, never shared by concurrent launches). Here
+ * the counter is the op instance's, taken at init (see the arrival-counter note).
  *
- * The shared expert's gate is a gemm_nt at N = 1 over the SAME input, a launch of its own for one
- * output column. It rides along as one more workgroup of this grid (`skg` > 0), so the launch the
- * routed gate_up was overlapping disappears from the queue.
+ * The shared expert's gate (gemm_nt at N = 1 over the same input) rides along as one more
+ * workgroup (`skg` > 0), removing its separate launch.
  *
- * BYTE-IDENTICAL TO THE LAUNCHES IT STANDS IN FOR, and the claim rests on two things:
+ * Byte-identical to the launches it replaces:
+ *   - The GEMM is r4d_gemm_bf16_nt_m64_kernel's arithmetic: an output element is SK partial tiles,
+ *     each one wave's WMMA chain over a contiguous K slice, summed in ascending split order from
+ *     0.f and narrowed by the language's conversion. Only SK matters, so the split counts come from
+ *     the same law (cfg_for with the same N-tile count), and a wave may run several (tile, split)
+ *     items, each into its own LDS slot.
+ *   - The selection and sort are router_topk_scatter_kernel's body: wave-local and stable, so the
+ *     last block's wave count changes no bit.
  *
- *   - THE GEMM IS r4d_gemm_bf16_nt_m64_kernel'S ARITHMETIC, ELEMENT BY ELEMENT. An output element of
- *     that kernel is SK partial tiles, each ONE wave's WMMA chain over one contiguous K slice in
- *     ascending K, summed in ascending split order from 0.f and narrowed by the language's own
- *     conversion. Which block owns the tile, how many tiles a block holds (WV, MB) and how many
- *     waves a block has do not enter it -- only SK does. So the split counts are asked of the law
- *     the unfused launches ask (cfg_for with the same N-tile count: a 512-wide router and a
- *     one-column gate get different ones), and a wave here may run several (tile, split) items
- *     one after another: each item is the same chain from zero into an LDS slot of its own, so the
- *     sum sees exactly the operands it saw before.
- *   - THE SELECTION AND THE SORT ARE router_topk_scatter_kernel'S BODY: the same two device
- *     functions over the same logits, wave-local per row and stable without an atomic ordering
- *     anything, so the number of waves the last block happens to have moves no bit.
- *
- * A TUNED POINT for the unfused router would break the first of those: this row is NOTUNE and
- * always takes the law's split. No shipped configuration tunes these GEMMs.
- *
- * DECODE ONLY: at most kRgMaxM rows (four 16-row tiles), which is the skinny GEMM's decode band;
- * past it the router is the tiled kernel and the architecture issues the pair. */
+ * A tuned point for the unfused router would break the first, so this row is NOTUNE. Decode only:
+ * at most kRgMaxM rows (four 16-row tiles); beyond that the architecture issues the pair. */
 constexpr long long kRgMaxM = 64;
 
 namespace {
@@ -3916,8 +3419,8 @@ __device__ __forceinline__ unsigned rg_rowGo(unsigned rowstride, int row0, int l
     return (unsigned)r * rowstride + 4u * (unsigned)(lane >> 4);
 }
 
-/* ONE (tile, split) ITEM: the 16 x 16 partial tile r4d_gemm_bf16_nt_m64_kernel's wave (n0, ks)
- * accumulates at MT = 1 -- the same loads, the same WMMA chain in the same order from zero. */
+/* One (tile, split) item: the 16 x 16 partial tile r4d_gemm_bf16_nt_m64_kernel's wave (n0, ks)
+ * accumulates at MT = 1, with the same loads and WMMA chain from zero. */
 __device__ __forceinline__ rg_v8f rg_item(const uint16_t* __restrict__ A,
                                           const uint16_t* __restrict__ W, int M, int K, int N,
                                           int n0, int m0, int ks, int SK, int lane) {
@@ -3948,9 +3451,9 @@ __device__ __forceinline__ rg_v8f rg_item(const uint16_t* __restrict__ A,
     return acc;
 }
 
-/* The launch geometry, one argument: `sk` the router's split and `tpb` its 16-column tiles a
- * block, `nrb` the router's blocks along x, `skg` the gate's split (0: no gate; its block is
- * x = nrb). Rows are tiled along y, one 16-row tile a block. */
+/* Launch geometry: `sk` the router's split, `tpb` its 16-column tiles per block, `nrb` the
+ * router's blocks along x, `skg` the gate's split (0: no gate; its block is x = nrb). Rows are
+ * tiled along y, one 16-row tile per block. */
 struct RgGeom {
     uint32_t M, K, n_expert, n_local, top_k, lg_ld;
     int32_t  norm, base;
@@ -3965,8 +3468,8 @@ __global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
     int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
     int32_t* __restrict__ off, int32_t* __restrict__ cnt, unsigned int* __restrict__ ctr,
     RgGeom g, Protect prot) {
-    /* The partial tiles of the GEMM, then -- in the last block only, after two barriers -- the
-     * sort's LDS. The shim sizes it for the larger of the two. */
+    /* The GEMM's partial tiles, then (last block only, after two barriers) the sort's LDS; the
+     * shim sizes it for the larger. */
     extern __shared__ __align__(16) unsigned char rg_smem[];
     float* const red = (float*)rg_smem;
     const uint32_t tid = threadIdx.x, wave = tid / kWave, lane = tid % kWave;
@@ -3989,9 +3492,8 @@ __global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
         for (int e = 0; e < 8; e++) slot[e * (int)kWave + (int)lane] = acc[e];
     }
     __syncthreads();
-    /* THE REDUCTION, r4d_gemm_bf16_nt_m64_kernel's: the splits in ascending order from 0.f, and
-     * the language's float-to-bf16 conversion -- not f32_to_bf16, which is the same only away
-     * from NaN. */
+    /* The reduction, as in r4d_gemm_bf16_nt_m64_kernel: splits in ascending order from 0.f, and
+     * the language's float-to-bf16 conversion (not f32_to_bf16, which differs on NaN). */
     for (uint32_t idx = tid; idx < nti * 256u; idx += NW * kWave) {
         const uint32_t j = idx >> 8, o = idx & 255u;
         float v = 0.f;
@@ -4005,9 +3507,9 @@ __global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
         }
     }
 
-    /* ---- THE LAST BLOCK RANKS. Every store above is made visible device-wide before the
-     * arrival is published, and the block that completes the count resets it for the next
-     * launch and acquires the other blocks' logits. */
+    /* ---- the last block ranks. Every store is made visible device-wide before the arrival is
+     * published; the block completing the count resets it for the next launch and acquires the
+     * other blocks' logits. */
     __threadfence();
     __syncthreads();
     __shared__ unsigned int s_arrived;
@@ -4028,23 +3530,17 @@ __global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
     scatter_small_place(sorted, off, cnt, g.M * g.top_k, g.n_local, sl);
 }
 
-/* THE ARRIVAL COUNTER IS THE OP INSTANCE'S, taken at init and not on the launch path.
+/* The arrival counter belongs to the op instance and is taken at init, not on the launch path.
  *
- * It has to persist between launches, zeroed: the last block of every launch resets it, and a
- * launch that found it non-zero would rank before the GEMM was done. A scratch hook cannot carry
- * that -- the scratch is one arena region every other op's kernel writes between two of these
- * launches. The other counters in this library (gemm_fp8a8's split_ctr, hc_bf16's mix counters)
- * are allocated on first use from the launch path, which leaves them out of the VRAM budget and
- * puts an allocation on the describe path that must not allocate. The init hook has neither
- * problem: the engine calls it once per resolved instance during declare, on the rank's device,
- * and reads the free VRAM for its budget after every init has run, so what init takes is
- * counted.
+ * It must persist between launches, zeroed (the last block resets it; a non-zero start would rank
+ * before the GEMM finished), so scratch cannot hold it: other ops write the arena between
+ * launches. Allocating on first use (as gemm_fp8a8's split_ctr and hc_bf16's mix counters do)
+ * escapes the VRAM budget. Init runs once per resolved instance
+ * during declare, before the engine measures free VRAM, so its allocation is counted.
  *
- * ONE COUNTER AN INSTANCE -- one declared op, one band, one domain, one rank. Each routed layer
- * declares its own op, so two layers never share one, and the launches of one instance are
- * ordered: every one of them writes the same declared sort outputs, which the engine does not
- * reorder or overlap. The counters are 64-byte slots of one zeroed block a device, so a model's
- * few hundred instances cost one allocation; the block is freed with its last instance. */
+ * One counter per instance (op, band, domain, rank). Each routed layer declares its own op, and an
+ * instance's launches are ordered since they write the same declared outputs. Counters are 64-byte
+ * slots of one zeroed block per device, freed with its last instance. */
 constexpr uint32_t kRgCtrStride = 16;       /* uint32 words a slot: one 64-byte line each */
 constexpr uint32_t kRgCtrSlots  = 4096;     /* instances a device; a model declares hundreds */
 
@@ -4074,8 +3570,8 @@ extern "C" int r4d_rad_router_gemm_topk_scatter_init(const RadParam*, int, int, 
         const size_t bytes = (size_t)kRgCtrSlots * kRgCtrStride * sizeof(unsigned int);
         void* p = nullptr;
         if (hipMalloc(&p, bytes) != hipSuccess) return RAD_E_NOMEM;
-        /* Zero before any launch can read it: the memset is ordered on the null stream, and the
-         * engine's streams need not wait for that one, so it is waited for here. */
+        /* Zero before any launch reads it: the memset is on the null stream, which the engine's
+         * streams need not wait for, so wait here. */
         if (hipMemset(p, 0, bytes) != hipSuccess || hipDeviceSynchronize() != hipSuccess) {
             (void)hipFree(p);
             return RAD_E_DEVICE;
@@ -4083,8 +3579,8 @@ extern "C" int r4d_rad_router_gemm_topk_scatter_init(const RadParam*, int, int, 
         blk.base = (unsigned int*)p;
         blk.next = 0;
     }
-    /* A slot is never handed out twice while its block lives: one returned by fini is not known
-     * to be zero if its last launch did not finish, so it is not reused. */
+    /* A slot is never reused while its block lives: one returned by fini may not be zero if its
+     * last launch did not finish. */
     if (blk.next >= kRgCtrSlots) return RAD_E_FULL;
     RgInst* in = new RgInst;
     in->dev = dev;
@@ -4112,10 +3608,9 @@ extern "C" void r4d_rad_router_gemm_topk_scatter_fini(void* inst) {
 }
 
 /* Operands: a, b (the router), gate_b? -> logits, expert_ids, expert_w, sorted_tok,
- * expert_offset, expert_count, gate?. The two optional ones come together or not at all. Every
- * check of the two shims it stands in for is made here too; nothing new is asserted beyond the
- * row bound. */
-static int rad_router_gemm_topk_scatter_body(const RadArgs* a, const R4dSink& sk) {
+ * expert_offset, expert_count, gate?. The two optional ones come together or not at all. The
+ * replaced shims' checks are all made here, plus the row bound. */
+extern "C" int r4d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream stream) {
     int emit_rc = RAD_OK;
     const RadTensor* x      = r4d_opt(a, 0);
     const RadTensor* wr     = r4d_opt(a, 1);
@@ -4149,8 +3644,8 @@ static int rad_router_gemm_topk_scatter_body(const RadArgs* a, const R4dSink& sk
     if (ids->dtype != RAD_I32 || sorted->dtype != RAD_I32 || off->dtype != RAD_I32 ||
         cnt->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
 
-    /* The GEMM's operands, as gemm_ops reads them: A [M, K] contiguous, the output contiguous,
-     * A and the weights 16-byte aligned. */
+    /* The GEMM's operands, as gemm_ops reads them: A [M, K] and the output contiguous, A and the
+     * weights 16-byte aligned. */
     long long M = 0, K = 0;
     if (r4d_rows_of(x, &M, &K) != RAD_OK) return R4D_NO(RAD_E_SHAPE);
     if (!r4d_contig(x)) return R4D_NO(RAD_E_STRIDE);
@@ -4170,8 +3665,8 @@ static int rad_router_gemm_topk_scatter_body(const RadArgs* a, const R4dSink& sk
     if (r4d_numel(sorted) < T) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(off) < n_local + 1 || r4d_numel(cnt) < n_local) return R4D_NO(RAD_E_SHAPE);
 
-    /* THE SPLITS THE UNFUSED LAUNCHES TAKE: gemm_bf16_nt_m16/_m64 ask cfg_for with ceil(N/16)
-     * tiles, so the router asks with its own width and the gate with one tile. */
+    /* The unfused launches' splits: gemm_bf16_nt_m16/_m64 ask cfg_for with ceil(N/16) tiles, so
+     * the router asks with its width and the gate with one tile. */
     const long long ntiles = (n_expert + 15) / 16;
     Cfg cr{}, cg{};
     int rc = cfg_for(a, K, M, 16, BR_FLAT, &cr, ntiles);
@@ -4180,14 +3675,14 @@ static int rad_router_gemm_topk_scatter_body(const RadArgs* a, const R4dSink& sk
         rc = cfg_for(a, K, M, 16, BR_FLAT, &cg, 1);
         if (rc != RAD_OK) return rc;
     }
-    /* The instance's counter (see THE ARRIVAL COUNTER). A caller that ran no init has none, and
-     * the op is refused: a launch without it would have no last block to rank. */
+    /* The instance's counter (see the arrival-counter note). Without init there is none and the
+     * op is refused. */
     const RgInst* const inst = (const RgInst*)a->instance;
     if (!inst || !inst->ctr) return R4D_NO(RAD_E_STATE);
     unsigned int* const ctr = inst->ctr;
 
-    /* THE WAVE COUNT IS THE SELECTION'S, router_topk_scatter's rule: a wave a row up to 32. The
-     * GEMM then takes as many 16-column tiles a block as fills those waves at its split. */
+    /* The wave count follows router_topk_scatter's rule (a wave per row, up to 32); the GEMM takes
+     * as many 16-column tiles per block as fill those waves at its split. */
     const uint32_t nw = M <= 8 ? 8u : M <= 16 ? 16u : 32u;
     long long tpb = (long long)nw / cr.sk;
     if (tpb < 1) tpb = 1;
@@ -4209,7 +3704,7 @@ static int rad_router_gemm_topk_scatter_body(const RadArgs* a, const R4dSink& sk
     const dim3 grid((unsigned)(nrb + (wg ? 1 : 0)), (unsigned)((M + 15) / 16));
 
 #define R4D_RG_L(OWN, NWV)                                                                      \
-    emit_rc = R4D_EMIT(sk, (router_gemm_topk_scatter_kernel<OWN, NWV>), grid,                   \
+    emit_rc = R4D_EMIT(stream, (router_gemm_topk_scatter_kernel<OWN, NWV>), grid,               \
                        dim3((NWV) * kWave), lds,                                                \
                        (const uint16_t*)x->data, (const uint16_t*)wr->data,                     \
                        wg ? (const uint16_t*)wg->data : (const uint16_t*)nullptr,               \
@@ -4227,7 +3722,6 @@ static int rad_router_gemm_topk_scatter_body(const RadArgs* a, const R4dSink& sk
     }
 #undef R4D_RG_L
     if (emit_rc != RAD_OK) return emit_rc;
-    if (!sk.desc) R4D_MOE_CHK();
+    R4D_MOE_CHK();
     return RAD_OK;
 }
-R4D_ENTRY(r4d_rad_router_gemm_topk_scatter, rad_router_gemm_topk_scatter_body)

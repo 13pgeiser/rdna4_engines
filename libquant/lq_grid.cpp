@@ -1,5 +1,5 @@
 /* lq_grid.cpp -- parsing a grid, choosing a block's scale, and round-to-nearest on it. See
- * lq_grid.h for the options, and for why every rule below is exactly the one it is. */
+ * lq_grid.h for the options and why the rules must not change. */
 #include "lq_grid.h"
 #include "lq_common.h"
 
@@ -44,18 +44,8 @@ bool is_scale_dt(uint32_t dt) {
     return dt == RAD_F32 || dt == RAD_BF16 || dt == RAD_F16 || dt == RAD_F8E4M3 || dt == RAD_E8M0;
 }
 
-/* `v` as the scale dtype holds it, widened back. */
-float round_to(uint32_t dt, float v) {
-    switch (dt) {
-        case RAD_BF16:   return bf16_to_f32(f32_to_bf16(v));
-        case RAD_F16:    return f16_to_f32(f32_to_f16(v));
-        case RAD_F8E4M3: return rad_fp8e4m3_to_f32(f32_to_e4m3(v));
-        default:         return v;
-    }
-}
-
-/* The smallest positive value a float scale dtype holds: what a scale that would round to zero
- * becomes, so its reciprocal stays finite. */
+/* The smallest positive value of a float scale dtype; a scale that would round to zero becomes
+ * this, so its reciprocal stays finite. */
 float tiny_of(uint32_t dt) {
     switch (dt) {
         case RAD_F16:    return 0x1p-24f;
@@ -65,8 +55,8 @@ float tiny_of(uint32_t dt) {
     }
 }
 
-/* `v` rounded to a float scale dtype, never to zero: the general path's scales are finite and
- * nonzero whatever the block held. */
+/* `v` rounded to a float scale dtype, never to zero: general-path scales are always finite and
+ * nonzero. */
 float round_nz(uint32_t dt, float v) {
     float r = round_to(dt, v);
     if (r == 0.0f || !std::isfinite(r)) r = std::copysign(tiny_of(dt), v == 0.0f ? 1.0f : v);
@@ -87,22 +77,20 @@ const std::vector<NamedTable>& named_tables() {
                    0.7229568362236023f, 1.0f } },
         /* llama.cpp's IQ4_NL values: a non-linear 4-bit grid with no zero and unequal ends. */
         { "iq4nl", { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 } },
-        /* A Hadamard-rotated weight's own sixteen levels: Lloyd's quantiser fitted to the
-         * rotated, amax-normalised Qwen3.8-Flash-Next experts, the same in every layer and both
-         * projections, each level then rounded to the nearest E4M3 value. Every entry is exact in
-         * E4M3, so libr4d's w4nla8h kernel expands a code to the byte the fp8 WMMA reads with no
-         * rounding; its table (r4d_args.h, kW4nlTable) is these values in this CODE ORDER --
-         * magnitudes ascending, then their negatives -- and a container whose table differs is
-         * refused at load. Against -8..7 under the same searched scale it is ~11% less output
-         * error at the same bytes. */
+        /* Sixteen levels for Hadamard-rotated weights: Lloyd's quantiser fitted to the rotated,
+         * amax-normalised Qwen3.8-Flash-Next experts (the same in every layer and both
+         * projections), each level rounded to the nearest E4M3 value. Being exact in E4M3, a code
+         * expands with no rounding to the byte libr4d's w4nla8h fp8 WMMA reads. Its table
+         * (r4d_args.h, kW4nlTable) holds these values in this code order (magnitudes ascending,
+         * then their negatives), and a container whose table differs is refused at load. About
+         * 11% less output error than -8..7 under the same searched scale, at the same bytes. */
         { "w4nl", { 1.125f, 3.25f, 5.5f, 8.0f, 11.0f, 14.0f, 18.0f, 22.0f,
                     -1.125f, -3.25f, -5.5f, -8.0f, -11.0f, -14.0f, -18.0f, -22.0f } },
-        /* Its 32-level form, libr4d's w5nl64a8h: Lloyd's quantiser with sixteen magnitudes, fitted
-         * the same way at groups of 64 -- again the same in every layer and projection -- and
-         * rounded to E4M3 at the top level that leaves the sixteen distinct and moved least.
-         * Magnitudes ascending, then their negatives, so a code's high bit is its sign. Against
-         * w4nl under the same scales, GPTQ and coordinate descent: ~72% less output error energy
-         * for one more bit a weight. */
+        /* The 32-level form for libr4d's w5nl64a8h: sixteen magnitudes fitted the same way at
+         * groups of 64 (again shared by every layer and projection), rounded to E4M3 at the top
+         * level that keeps all sixteen distinct with least movement. Magnitudes ascending, then
+         * their negatives, so a code's high bit is its sign. About 72% less output error energy
+         * than w4nl under the same scales, GPTQ and coordinate descent, for one more bit. */
         { "w5nl", { 0.8125f, 2.5f, 4.0f, 5.5f, 7.5f, 9.0f, 11.0f, 12.0f,
                     14.0f, 16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 30.0f,
                     -0.8125f, -2.5f, -4.0f, -5.5f, -7.5f, -9.0f, -11.0f, -12.0f,
@@ -168,7 +156,7 @@ bool l1_int_range(uint32_t dt, int* lo, int* hi) {
 
 /* ------------------------------------------------------------------ one code, the general path */
 
-/* The unit value -- before the scale -- of code `c`. */
+/* The unit value (before the scale) of code `c`. */
 double unit_of(const Grid& g, int c) {
     if (!g.table.empty()) return g.table[(size_t)c];
     if (g.is_float) {
@@ -178,7 +166,7 @@ double unit_of(const Grid& g, int c) {
     return (double)c;
 }
 
-/* The codebook entry nearest `u`, a tie going to the lower value. */
+/* The codebook entry nearest `u`, ties to the lower value. */
 int nearest_entry(const Grid& g, float u) {
     const std::vector<int>& o = g.table_order;
     size_t a = 0, b = o.size();
@@ -231,16 +219,14 @@ Fit block_fit(const Grid& g, const float* w, int64_t cols, int64_t r0, int64_t r
     return f;
 }
 
-/* THE SEARCH, symmetric: a sweep of 21 multiples of the absmax scale from 0.70 to 1.10, and each
- * candidate's least-squares refit -- the scale that minimises the error for the codes that
- * candidate chose -- every one rounded to the scale dtype before it is judged, unless a second
- * level will round it later. What is returned is the best of the 42, unrounded only in that case.
- * The sweep is llama.cpp's make_qx_quants idea over any code; the refit is what makes a coarse
- * sweep enough.
+/* Symmetric search: 21 multiples of the absmax scale from 0.70 to 1.10, plus each candidate's
+ * least-squares refit (the scale minimising the error for the codes it chose). Each is rounded to
+ * the scale dtype before being judged, unless a second level will round it later, in which case
+ * the best is returned unrounded. The sweep is llama.cpp's make_qx_quants idea over any code; the
+ * refit makes a coarse sweep sufficient.
  *
- * `t2` IS THE SECOND LEVEL ONCE IT IS KNOWN: every candidate is then judged as it will be stored,
- * its first level rounded to the scale dtype relative to t2 (and held inside that dtype's range),
- * so the search chooses among the scales a reader can actually decode. */
+ * `t2` is the second level once known: candidates are then judged as stored, the first level
+ * rounded relative to t2 and clamped to its dtype's range, so only decodable scales are chosen. */
 double search_sym(const Grid& g, const float* w, int64_t cols, int64_t r0, int64_t r1, int64_t c0,
                   int64_t c1, const float* imp, double s0, double t2 = 0.0) {
     if (s0 == 0.0) return s0;
@@ -265,9 +251,9 @@ double search_sym(const Grid& g, const float* w, int64_t cols, int64_t r0, int64
     return best;
 }
 
-/* And asymmetric: both ends of the range pulled in, each to six fractions from 1.00 to 0.80, the
- * pair of least error kept. The zero is chosen against each candidate's rounded scale, as the
- * absmax rule chooses it. */
+/* Asymmetric search: both range ends shrunk to six fractions from 1.00 to 0.80; the pair with
+ * least error is kept. The zero is chosen against each candidate's rounded scale, as under the
+ * absmax rule. */
 void search_asym(const Grid& g, const float* w, int64_t cols, int64_t r0, int64_t r1, int64_t c0,
                  int64_t c1, const float* imp, float* lo, float* hi) {
     const float lo0 = *lo, hi0 = *hi;
@@ -282,6 +268,22 @@ void search_asym(const Grid& g, const float* w, int64_t cols, int64_t r0, int64_
             const double e = block_fit(g, w, cols, r0, r1, c0, c1, imp, sr, z).err;
             if (best_err < 0.0 || e < best_err) { best_err = e; *lo = l; *hi = h; }
         }
+}
+
+/* A first-level scale as stored under a transform. The plane holds s / N in the scale dtype and the
+ * reader undoes the transform after multiplying by it, so a code is decoded against N times the
+ * stored value, and codes are chosen against that. Dividing by N (a power of two) is exact unless
+ * it leaves the dtype's normal range (an f16 or E4M3 scale in its subnormals, or below them); only
+ * then does the scale the codes see move, and the stored value is never zero, so a non-empty block
+ * decodes to something. Without a transform the stored value is the scale itself. */
+void store_first_level(const Grid& g, float resid, BlockScale* b) {
+    b->stored = round_to(g.scale_dt, b->s * resid);
+    if (resid == 1.0f || b->stored / resid == b->s) return;
+    if (b->stored == 0.0f) b->stored = round_nz(g.scale_dt, b->s * resid);
+    b->s = b->stored / resid;
+    b->inv = 1.0f / b->s;
+    b->inv_d = 1.0 / (double)b->s;
+    if (g.asym) b->zero = clampi((int)(-b->lo / b->s + 0.5f), 0, g.qmax);
 }
 
 }  /* namespace */
@@ -355,7 +357,7 @@ int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
         g->asym = true;
     }
     if (tab) {
-        /* the codebook gave everything an integer code needs */
+        /* The codebook already set the code dtype. */
     } else if (!g->is_float) {
         if (g->asym && sgn) {
             if (why) *why = fmt("codes=%s is signed; an asymmetric grid's codes are unsigned "
@@ -394,7 +396,7 @@ int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
         }
     }
 
-    /* THE SECOND LEVEL first, because it decides which dtypes the first may be. */
+    /* The second level first, because it decides which dtypes the first may use. */
     if (const char* s2 = rad_param_gets(o, n_o, "scale2", nullptr)) {
         g->lv2 = true;
         g->scale2_dt = rad_dtype_parse(s2);
@@ -477,7 +479,7 @@ int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
         return RAD_E_INVAL;
     }
     if (g->lv2) {
-        /* each second-level block is a whole number of first-level ones */
+        /* Each second-level block must be a whole number of first-level ones. */
         auto nests = [](int64_t b1, int64_t b2) {
             if (b1 == 0) return b2 == 0;
             return b2 == 0 || b2 % b1 == 0;
@@ -546,8 +548,7 @@ RadEncoding grid_encoding(const Grid& g) {
     return e;
 }
 
-int64_t grid_row_block(const Grid& g, int64_t rows) {
-    (void)rows;
+int64_t grid_row_block(const Grid& g) {
     if (g.lv2) return g.br2;                 /* a multiple of the first level's, or 0 */
     if (g.br > 0) return g.br;
     return g.rule == Grid::FIXED ? 1 : 0;
@@ -559,10 +560,9 @@ BlockScale grid_block_scale(const Grid& g, const float* w, int64_t cols, int64_t
     const float resid = g.fwht ? 1.0f / (float)g.fwht : 1.0f;
 
     if (g.rule == Grid::FIXED) {
-        /* THE RECIPROCAL IS THE UNROUNDED VALUE'S, IN DOUBLE, and the stored scale is the value
-         * rounded. That is the n-gram table's rule, whose scale was chosen to be exact in bf16 --
-         * so the two agree there, and a value that is not exact is quantised against what was
-         * asked rather than against its rounding. */
+        /* The reciprocal is of the unrounded value, in double; the stored scale is the rounded
+         * value. This is the n-gram table's rule, whose scale is exact in bf16 so the two agree;
+         * an inexact value is quantised against what was asked, not its rounding. */
         b.s = round_to(g.scale_dt, (float)g.fixed);
         b.inv_d = 1.0 / g.fixed;
         b.inv = (float)b.inv_d;
@@ -571,10 +571,10 @@ BlockScale grid_block_scale(const Grid& g, const float* w, int64_t cols, int64_t
     }
 
     if (g.general()) {
-        /* THE GENERAL PATH. The ideal scale of the block for its code -- signed for a codebook
-         * whose ends are not mirror images -- searched when the rule says so, then rounded to
-         * the scale dtype and never to zero. Under a second level it is returned unrounded, and
-         * grid_scales rounds it relative to that level. */
+        /* General path: the block's ideal scale for its code (signed for a codebook with unequal
+         * ends), searched under rule=search, then rounded to the scale dtype, never to zero.
+         * Under a second level it is returned unrounded and grid_scales rounds it relative to
+         * that level. */
         if (g.asym) {
             float lo = 0.0f, hi = 0.0f;
             for (int64_t r = r0; r < r1; ++r)
@@ -592,7 +592,8 @@ BlockScale grid_block_scale(const Grid& g, const float* w, int64_t cols, int64_t
             b.inv = 1.0f / b.s;
             b.inv_d = 1.0 / (double)b.s;
             b.zero = clampi((int)(-lo / b.s + 0.5f), 0, g.qmax);
-            b.stored = g.lv2 ? b.s : round_to(g.scale_dt, b.s * resid);
+            if (g.lv2) b.stored = b.s;
+            else store_first_level(g, resid, &b);
             return b;
         }
         float amax = 0.0f, peak = 0.0f;
@@ -611,15 +612,16 @@ BlockScale grid_block_scale(const Grid& g, const float* w, int64_t cols, int64_t
         b.s = g.lv2 ? (float)s0 : round_nz(g.scale_dt, (float)s0);
         b.inv = b.s != 0.0f ? 1.0f / b.s : 0.0f;
         b.inv_d = b.s != 0.0f ? 1.0 / (double)b.s : 0.0;
-        b.stored = g.lv2 ? b.s : round_to(g.scale_dt, b.s * resid);
+        if (g.lv2) b.stored = b.s;
+        else store_first_level(g, resid, &b);
         return b;
     }
 
     if (g.asym) {
-        /* [lo, hi] widened to include 0, so a block of all-positive weights still has an exact
-         * zero; the scale spans it in (levels - 1) steps, is rounded to its dtype, and the integer
-         * zero is chosen against the ROUNDED scale -- which is what makes (code - zero) * scale
-         * decode to the grid point the code was chosen as. */
+        /* [lo, hi] is widened to include 0 so an all-positive block still has an exact zero. The
+         * scale spans it in (levels - 1) steps and is rounded to its dtype; the integer zero is
+         * chosen against the rounded scale, so (code - zero) * scale decodes to the grid point the
+         * code was chosen as. */
         float lo = 0.0f, hi = 0.0f;
         bool first = true;
         for (int64_t r = r0; r < r1; ++r)
@@ -633,10 +635,11 @@ BlockScale grid_block_scale(const Grid& g, const float* w, int64_t cols, int64_t
         if (hi < 0.0f) hi = 0.0f;
         float s = (hi - lo) / (float)(g.qmax);
         if (!(s > 0.0f)) s = 1e-12f;
+        b.lo = lo;
         b.s = round_to(g.scale_dt, s);
         b.inv = 1.0f / b.s;
         b.zero = clampi((int)(-lo / b.s + 0.5f), 0, g.qmax);
-        b.stored = round_to(g.scale_dt, b.s * resid);
+        store_first_level(g, resid, &b);
         return b;
     }
 
@@ -649,9 +652,9 @@ BlockScale grid_block_scale(const Grid& g, const float* w, int64_t cols, int64_t
         }
 
     if (g.rule == Grid::MX) {
-        /* THE OCP RULE, SATURATION INCLUDED: X = 2^(floor(log2 amax) - emax), so amax / X lands in
+        /* The OCP rule, saturation included: X = 2^(floor(log2 amax) - emax), so amax / X lands in
          * [2^emax, 2^(emax+1)) and the top of that range saturates to the code's largest value.
-         * Bumping the exponent would double the step for every other element to save one. */
+         * Bumping the exponent instead would double the step for every other element. */
         int exp = -127;
         if (amax > 0.0f) {
             uint32_t u;
@@ -659,34 +662,44 @@ BlockScale grid_block_scale(const Grid& g, const float* w, int64_t cols, int64_t
             exp = (int)((u >> 23) & 0xFFu) - 127 - g.emax;
         }
         b.e8 = clampi(exp + 127, 0, 254);
-        /* 2^-(e8 - 127) in the exponent field, exact and with no libm call */
+        /* 2^-(e8 - 127) built in the exponent field: exact, no libm call. */
         const uint32_t ui = (uint32_t)clampi(254 - b.e8, 1, 254) << 23;
         std::memcpy(&b.inv, &ui, 4);
         b.inv_d = b.inv;
         b.s = rad_e8m0_to_f32((uint8_t)b.e8);
         b.stored = b.s;
+        if (g.fwht) {
+            /* The exponent stored is the transform's order lower, exactly; codes are chosen
+             * against N times it, which differs only where the exponent's floor clamps it. */
+            int sh = 0;
+            while (((int64_t)1 << sh) < g.fwht) ++sh;
+            b.e8 = clampi(b.e8 - sh, 0, 254);
+            b.stored = rad_e8m0_to_f32((uint8_t)b.e8);
+            b.s = b.stored * (float)g.fwht;
+            b.inv = 1.0f / b.s;
+            b.inv_d = b.inv;
+        }
         return b;
     }
 
     if (g.is_float) {
-        /* A BLOCK OF ZEROS IS SCALED BY ONE, so its reciprocal is finite and its codes are zero.
-         * The quotient is formed by multiplying by 1/fmax when the scale is narrower than f32 and
-         * by dividing when it is f32 -- the two forms the block-fp8 linears and the fp8 hyper-
-         * connection rows were each quantised with, which differ in the last place of the f32 and
-         * can therefore round a narrow scale differently. */
+        /* An all-zero block gets scale 1, so its reciprocal is finite and its codes zero. The
+         * quotient multiplies by 1/fmax for a scale narrower than f32 and divides for f32: the
+         * forms the block-fp8 linears and the fp8 hyper-connection rows were quantised with. They
+         * differ in the last f32 place and can round a narrow scale differently. */
         float s = 1.0f;
         if (amax > 0.0f) s = g.scale_dt == RAD_F32 ? amax / g.fmax : amax * (1.0f / g.fmax);
         b.s = round_to(g.scale_dt, s);
         b.inv = 1.0f / b.s;
     } else {
-        /* A BLOCK OF ZEROS GETS 1e-12, whose reciprocal is finite and whose codes are zero. */
+        /* An all-zero block gets 1e-12: finite reciprocal, zero codes. */
         float s = amax / (float)g.qmax;
         if (!(s > 0.0f)) s = 1e-12f;
         b.s = round_to(g.scale_dt, s);
         b.inv = 1.0f / b.s;
     }
     b.inv_d = b.inv;
-    b.stored = round_to(g.scale_dt, b.s * resid);
+    store_first_level(g, resid, &b);
     return b;
 }
 
@@ -786,14 +799,13 @@ Scales grid_scales(const Grid& g, const float* w, int64_t rows, int64_t cols, co
     }
     if (!g.lv2) return s;
 
-    /* THE SECOND LEVEL. Each of its blocks takes the largest first-level magnitude under it over
-     * the largest value the first level's dtype holds -- so the widest block's sub-scale is the
-     * dtype's top and every other one is a fraction of it -- rounded to its own dtype (up to a
-     * power of two for e8m0, which may not round down past the top). Each first-level scale is
-     * then stored relative to it: rounded half away for an integer sub-scale, to nearest even for
-     * a float one, and never to zero for a block that held anything, which would decode it to
-     * nothing. The codes are chosen against the product, as a reader multiplies it. The
-     * transform's 1/N goes to the second level. */
+    /* Second level: each block takes the largest first-level magnitude under it divided by the
+     * first level's dtype maximum, so the widest sub-scale sits at the dtype's top. It is rounded
+     * to its own dtype (up to a power of two for e8m0, so it never rounds down past the top).
+     * Each first-level scale is then stored relative to it: half away from zero for an integer
+     * sub-scale, nearest even for a float one, and never zero for a non-empty block (which would
+     * decode to nothing). Codes are chosen against the product, as the reader multiplies it. The
+     * transform's 1/N goes into the second level. */
     const int64_t br2 = g.br2 > 0 ? g.br2 : rows, bc2 = g.bc2 > 0 ? g.bc2 : cols;
     s.nr2 = (rows + br2 - 1) / br2;
     s.nc2 = (cols + bc2 - 1) / bc2;
@@ -807,8 +819,8 @@ Scales grid_scales(const Grid& g, const float* w, int64_t rows, int64_t cols, co
     s.s2.resize(peak.size());
     for (size_t k = 0; k < peak.size(); ++k) {
         if (g.fixed2 > 0.0) {
-            /* FIXED: the stored value is the one asked for, and the level the first is relative to
-             * is that over the transform's residual -- what the reader's product undoes. */
+            /* Fixed: store the requested value; the first level is relative to it divided by the
+             * transform's residual, which the reader's product undoes. */
             s.s2[k] = (float)g.fixed2;
             s2r[k] = (float)(g.fixed2 / (double)resid);
             continue;
@@ -826,11 +838,13 @@ Scales grid_scales(const Grid& g, const float* w, int64_t rows, int64_t cols, co
             s2r[k] = round_nz(g.scale2_dt, v);
             s.s2[k] = round_nz(g.scale2_dt, s2r[k] * resid);
         }
+        /* As for a first level alone (store_first_level): the first level is taken relative to
+         * what the reader multiplies by, which is N times the stored second level. */
+        s2r[k] = s.s2[k] / resid;
     }
-    /* A SEARCHED FLOAT FIRST LEVEL IS SEARCHED AGAIN, now that its second level is known, over the
-     * candidates as they will be stored: an E4M3 sub-scale moves by up to 1/16 when it is rounded,
-     * which is most of what the first search won. The second level stays where the first search's
-     * peaks put it. */
+    /* A searched float first level is searched again against the now-known second level, over
+     * candidates as stored: rounding moves an E4M3 sub-scale by up to 1/16, most of what the first
+     * search gained. The second level stays where the first search's peaks put it. */
     if (g.rule == Grid::SEARCH && !g.l1_int && !g.asym) {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1) if (s.nr * s.nc > 64)
@@ -867,8 +881,8 @@ Scales grid_scales(const Grid& g, const float* w, int64_t rows, int64_t cols, co
             b.inv_d = 1.0 / (double)b.s;
             if (g.asym) b.zero = clampi((int)(-b.lo / b.s + 0.5f), 0, g.qmax);
         }
-    /* Only a fixed second level can put a first-level scale past its dtype's top: a derived one
-     * maps the largest under it to the top by construction. */
+    /* Only a fixed second level can push a first-level scale past its dtype's top; a derived one
+     * maps the largest under it exactly to the top. */
     if (held)
         std::fprintf(stderr, "libquant: %lld of %lld scales sat past %s's top under scale2_value=%g "
                              "and were held there\n", (long long)held, (long long)(s.nr * s.nc),
@@ -927,14 +941,14 @@ BlockScale grid_finish(const Grid& g, double s, float lo) {
     b.inv = 1.0f / b.s;
     b.inv_d = 1.0 / (double)b.s;
     if (g.asym) b.zero = clampi((int)(-lo / b.s + 0.5f), 0, g.qmax);
-    b.stored = round_to(g.scale_dt, b.s * resid);
+    store_first_level(g, resid, &b);
     return b;
 }
 
 int grid_rtn(const Grid& g, const float* w, int64_t row0, int64_t rows, int64_t cols,
              const Planes& p, const float* imp) {
     if (g.general()) {
-        const int64_t rb = grid_row_block(g, rows);
+        const int64_t rb = grid_row_block(g);
         if (rb > 0 && row0 % rb) return RAD_E_SHAPE;
         const Scales sc = grid_scales(g, w, rows, cols, imp);
         grid_store_scales(g, sc, p);
@@ -953,8 +967,8 @@ int grid_rtn(const Grid& g, const float* w, int64_t row0, int64_t rows, int64_t 
     const int64_t bc = g.bc > 0 ? g.bc : cols;
     if (g.br > 0 && row0 % g.br) return RAD_E_SHAPE;
     const int64_t nband = (rows + br - 1) / br;
-    /* A fixed scale over the whole extent is one element, written once rather than by every band
-     * at once. */
+    /* A fixed scale over the whole extent is one element, written once here rather than by every
+     * band concurrently. */
     const bool one_scale = g.br == 0;
     const bool int4 = g.codes == RAD_I4 && !g.is_float && !g.asym && g.rule != Grid::FIXED &&
                       g.rule != Grid::MX;
@@ -967,7 +981,7 @@ int grid_rtn(const Grid& g, const float* w, int64_t row0, int64_t rows, int64_t 
 #endif
     for (int64_t band = 0; band < nband; ++band) {
         const int64_t r0 = band * br, r1 = r0 + br < rows ? r0 + br : rows;
-        /* the scale plane's row for this band, relative to the call's first */
+        /* The scale plane's row for this band, relative to the call's first. */
         const int64_t srow = g.br > 0 ? band : 0;
         uint8_t* sr = p.scale + srow * p.scale_row;
         uint8_t* zr = p.zero ? p.zero + srow * p.zero_row : nullptr;
@@ -975,9 +989,9 @@ int grid_rtn(const Grid& g, const float* w, int64_t row0, int64_t rows, int64_t 
             const int64_t c1 = c0 + bc < cols ? c0 + bc : cols;
             const BlockScale b = grid_block_scale(g, w, cols, r0, r1, c0, c1);
             if (!(one_scale && g.rule == Grid::FIXED)) grid_store_scale(g, b, sr, zr, j);
-            /* SYMMETRIC INT4 OVER AN EVEN SPAN, two codes a byte: grid_code's arithmetic for this
-             * grid without its per-element branches, and a byte written whole instead of a
-             * nibble read, masked and written back. Every routed expert of a w4 model is this. */
+            /* Fast path for symmetric int4 over an even span (every routed expert of a w4 model):
+             * grid_code's arithmetic without per-element branches, two codes written as one whole
+             * byte instead of a nibble read-modify-write. */
             if (int4 && !(c0 & 1) && !((c1 - c0) & 1)) {
                 for (int64_t r = r0; r < r1; ++r) {
                     uint8_t* cr = p.codes + r * p.codes_row;
@@ -997,7 +1011,6 @@ int grid_rtn(const Grid& g, const float* w, int64_t row0, int64_t rows, int64_t 
             }
         }
     }
-    (void)row0;
     return RAD_OK;
 }
 

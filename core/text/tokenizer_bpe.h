@@ -1,15 +1,15 @@
 /* tokenizer_bpe.h -- the tables and the merge loop under Tokenizer's BPE.
  *
- * The merge is the textbook one and the one every reference implements: repeatedly merge the
- * adjacent pair with the lowest merge rank, the leftmost pair on a tie, until no adjacent pair
- * has a rank. It is kept rather than replaced by a linear-time encoder (GitHub's `bpe` crate)
- * because those are exact only for vocabularies whose every token re-encodes to itself, and a
- * vocabulary is not checked for that; this loop is exact for all of them. What makes it fast is
- * what it runs on: symbols are token ids, a rank lookup is one probe of an open-addressed table
- * keyed by the id pair, and a word of up to kLinearMax symbols is merged by a scan over a small
- * array instead of a heap, which for the four-to-eight-symbol words of real text is several times
- * cheaper. Long words take the heap. Both pick the same pair at every step -- lowest rank, then
- * lowest position -- so they produce the same merges.
+ * The merge is the textbook one every reference implements: repeatedly merge the adjacent pair
+ * with the lowest merge rank, leftmost on a tie, until no adjacent pair has a rank. Linear-time
+ * encoders (GitHub's `bpe` crate) are exact only for vocabularies whose every token re-encodes to
+ * itself, which is not checked; this loop is exact for all of them.
+ *
+ * Symbols are token ids, and a rank lookup is one probe of an open-addressed table keyed by the
+ * id pair. Words of up to kBpeLinearMax symbols are merged by scanning a small array, several
+ * times cheaper than a heap for the 4-8 symbol words of real text; longer words use the heap.
+ * Both pick the same pair at every step (lowest rank, then lowest position), so they produce the
+ * same merges.
  */
 #pragma once
 #include <cstddef>
@@ -45,9 +45,9 @@ inline uint64_t tok_hash(const void* data, size_t n) {
 }
 inline uint64_t tok_hash(std::string_view s) { return tok_hash(s.data(), s.size()); }
 
-/* Byte string -> id, open-addressed, keys packed in one buffer. FIRST INSERT WINS, which is the
- * rule every lookup in the tokeniser follows: when two ids spell the same text, the lower one is
- * the one the merge table and every published count refer to. */
+/* Byte string -> id, open-addressed, keys packed in one buffer. First insert wins, as for every
+ * lookup in the tokeniser: when two ids spell the same text, the merge table and every published
+ * count refer to the lower one. */
 class TokTable {
 public:
     void    reserve(size_t n);
@@ -64,7 +64,7 @@ private:
     void grow();
 };
 
-/* (left id, right id) -> (rank, id of the merged text or -1). FIRST INSERT WINS here too: a
+/* (left id, right id) -> (rank, id of the merged text or -1). First insert wins here too: a
  * duplicated merge keeps its lowest rank. */
 class MergeTable {
 public:
@@ -103,8 +103,8 @@ struct BpeSym { uint32_t start, len; int32_t id; };
 /* Words up to this many symbols are merged by linear scan; longer ones by heap. */
 constexpr size_t kBpeLinearMax = 64;
 
-/* Merge `syms` in place until no adjacent pair has a rank. `force_heap` exists for the test that
- * holds the two strategies to the same answer. */
+/* Merge `syms` in place until no adjacent pair has a rank. `force_heap` lets a test check that
+ * both strategies agree. */
 void bpe_merge(std::vector<BpeSym>& syms, const MergeTable& merges, bool force_heap = false);
 
 }  /* namespace rad */

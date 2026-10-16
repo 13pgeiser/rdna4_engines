@@ -1,25 +1,25 @@
 /* config_test.cpp -- the command line.
  *
- * WHAT THIS IS HOLDING DOWN. Every pool in this engine is budgeted explicitly (spec §6), and a
- * budget flag is the one kind of input where a typo and a decision look identical downstream:
- * nothing after this function can tell "the operator asked for 0.82" from "the operator asked for
- * 0.87 and it did not parse". The parser's whole job is to make that distinction at the door --
- * to refuse by name rather than to fall through to a default -- and a refusal that stops
- * refusing is silent everywhere else.
+ * Every pool is budgeted explicitly (spec §6), and downstream a mistyped budget flag looks like a
+ * decision: nothing after the parser can tell a requested value from one that failed to parse and
+ * fell back to a default. So the parser refuses by name, and these tests keep it refusing.
  *
- * Three groups of property here, and they fail differently:
- *
- *   TAKEN     the value reaches the field an operator thinks it reaches
- *   REFUSED   a value outside the legal set stops the server rather than being rounded into it
- *   RESOLVED  what is left unsaid comes from the environment or from a stated default
+ *   Taken     the value reaches the field an operator expects
+ *   Refused   a value outside the legal set stops the server instead of being rounded into it
+ *   Resolved  what is left unsaid comes from the environment or a stated default
  *
  * No device, no model, no container: argc/argv in, a Config out.
  */
 #include "rad_test.h"
 
 #include "rad_core.h"
+#include "diag/diag.h"
 
+#include <algorithm>
 #include <cstdlib>
+#include <map>
+#include <regex>
+#include <sstream>
 #include <cstdio>
 #include <string>
 #include <unistd.h>
@@ -30,37 +30,21 @@ using namespace rad;
 
 namespace {
 
-/* config_parse takes `char**`, so the argument strings have to be writable. Held by the caller
- * for the life of the call, which is what argv is. */
-struct Args {
-    std::vector<std::string> store;
-    std::vector<char*>       argv;
-
-    explicit Args(std::initializer_list<const char*> v) {
-        store.emplace_back("radiance");           /* argv[0], which the parser skips */
-        for (const char* s : v) store.emplace_back(s);
-        for (std::string& s : store) argv.push_back(s.data());
-    }
-    int argc() const { return (int)argv.size(); }
-};
-
-/* Parse, with a model so that the required-argument check is not what every case trips over. */
+/* Parse with a --model prepended, so the required-argument check does not trip every case. */
 int parse(std::initializer_list<const char*> v, Config* c) {
-    std::vector<std::string> store{ "radiance", "--model", "/m/x.rad" };
-    for (const char* s : v) store.emplace_back(s);
-    std::vector<char*> argv;
-    for (std::string& s : store) argv.push_back(s.data());
-    return config_parse((int)argv.size(), argv.data(), c);
+    std::vector<std::string> args{ "--model", "/m/x.rad" };
+    args.insert(args.end(), v.begin(), v.end());
+    Argv a(std::move(args));
+    return config_parse(a.argc(), a.argv.data(), c);
 }
 
-/* The same into a Config of its own, for a case whose answer depends on flags not carrying over
- * from an earlier parse. */
+/* Parse into a fresh Config, for cases that must not inherit flags from an earlier parse. */
 int parse_fresh(std::initializer_list<const char*> v) {
     Config c;
     return parse(v, &c);
 }
 
-/* The level `-v` moves and every other test in this binary reads. */
+/* Restores the log level, which `-v` changes and every test in this binary reads. */
 struct LogGuard {
     Log saved = log_level();
     ~LogGuard() { log_set_level(saved); }
@@ -71,20 +55,19 @@ struct LogGuard {
 /* ================================================================== the shape of the call */
 
 TEST(help_is_reported_separately_from_an_error) {
-    /* 1 rather than a negative: the caller prints usage and exits ZERO. Folding it into the error
-     * path would make `--help` a failed run in anything scripting the binary. */
+    /* 1, not an error: the caller prints usage and exits 0, so `--help` is not a failed run. */
     Config c;
-    Args a{ "--help" };
+    Argv a({ "--help" });
     CHECK_EQ(config_parse(a.argc(), a.argv.data(), &c), 1);
-    Args b{ "-h" };
+    Argv b({ "-h" });
     CHECK_EQ(config_parse(b.argc(), b.argv.data(), &c), 1);
-    /* And it wins from anywhere on the line, including ahead of an otherwise fatal argument. */
-    Args d{ "--tp", "0", "--help" };
+    /* It wins from anywhere on the line, even after an otherwise fatal argument. */
+    Argv d({ "--tp", "0", "--help" });
     CHECK_EQ(config_parse(d.argc(), d.argv.data(), &c), 1);
 }
 
-/* AN UNKNOWN FLAG IS AN ERROR NAMING IT, NOT A WARNING. A typo in a budget flag is the difference
- * between the plan you asked for and one the planner invented. */
+/* An unknown flag is an error naming it, not a warning: a typo in a budget flag would otherwise
+ * yield a plan the operator did not ask for. */
 TEST(an_unknown_option_is_refused) {
     Config c;
     CHECK_EQ(parse({ "--not-a-flag" }, &c), RAD_E_INVAL);
@@ -93,14 +76,11 @@ TEST(an_unknown_option_is_refused) {
     CHECK_EQ(parse({ "positional" }, &c), RAD_E_INVAL);
 }
 
-/* A RETIRED FLAG IS REFUSED, NOT ACCEPTED AND IGNORED. Each of these names a decision the engine
- * does not take from the operator: the KV cache is elastic on every run and derives its own
- * buffer, the activation arena is computed from the buffer plan and charged by name, and a
- * finished conversation is copied to host memory and on to disk as soon as it can be rather than
- * after an idle time. A command line carrying one expects behaviour the engine does not have, and
- * starting it anyway gives an operator a server that is not the one they asked for and no way to
- * tell. Refusing names the flag and stops; accepting and warning puts the
- * answer in a log nobody reads. */
+/* A retired flag is refused, not accepted and ignored. Each names a decision the engine does not
+ * take from the operator: the KV cache is elastic and derives its own buffer, the activation arena
+ * comes from the buffer plan, and a finished conversation is copied to host memory as soon as
+ * possible rather than after an idle time. Starting anyway would serve something other than what
+ * the command line expects; a warning would go unread. */
 TEST(a_retired_flag_is_refused) {
     Config c;
     CHECK_EQ(parse({ "--kv-flex-mib", "512" }, &c), RAD_E_INVAL);
@@ -110,20 +90,18 @@ TEST(a_retired_flag_is_refused) {
     CHECK_EQ(parse({ "--kv-host-cache-mib", "4096" }, &c), RAD_E_INVAL);
 }
 
-/* A FLAG WHOSE ARGUMENT IS OFF THE END OF THE LINE. Reading past argv is the failure this
- * prevents, and the one shape that reaches it is the flag written last. */
+/* A flag written last with no argument is refused rather than reading past argv. */
 TEST(a_flag_missing_its_argument_is_refused_rather_than_read_past) {
     Config c;
     CHECK_EQ(parse({ "--tp" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--port" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--kv-cache-dtype" }, &c), RAD_E_INVAL);
-    Args a{ "--model" };
+    Argv a({ "--model" });
     CHECK_EQ(config_parse(a.argc(), a.argv.data(), &c), RAD_E_INVAL);
 }
 
-/* THE KL MODE TAKES ONE DIRECTION AND WHAT THAT DIRECTION READS. Recording into a directory and
- * scoring against one in the same run would leave the engine to guess which the operator meant,
- * and guessing wrong makes a quantised model the yardstick. */
+/* KL mode records or scores, never both, and requires that direction's inputs. Guessing between
+ * them could make a quantised model the reference. */
 TEST(the_kl_mode_records_or_scores_and_says_which_input_it_lacks) {
     Config c;
     CHECK_EQ(parse({ "--kld-record", "/r", "--kld-corpus", "/c.jsonl" }, &c), RAD_OK);
@@ -151,7 +129,7 @@ TEST(the_kl_mode_records_or_scores_and_says_which_input_it_lacks) {
 
 TEST(the_model_is_required_and_nothing_else_is) {
     Config c;
-    Args none{};
+    Argv none({});
     CHECK_EQ(config_parse(none.argc(), none.argv.data(), &c), RAD_E_INVAL);
 
     Config ok;
@@ -162,8 +140,8 @@ TEST(the_model_is_required_and_nothing_else_is) {
 /* ================================================================== taken */
 
 TEST(the_pool_size_flags_are_gone_and_say_what_replaced_them) {
-    /* The card's split is the resolver's (core/mem/vram_budget.h); a launch line that sizes a
-     * pool is refused by name, not served with a split other than the one it asked for. */
+    /* The card's split belongs to the resolver (core/mem/vram_budget.h); a launch line that sizes
+     * a pool is refused by name rather than served with a different split. */
     Config c;
     CHECK_EQ(parse({ "--vram-weights-mib", "20480" }, &c), RAD_E_INVAL);
     Config k;
@@ -171,8 +149,8 @@ TEST(the_pool_size_flags_are_gone_and_say_what_replaced_them) {
 }
 
 TEST(the_prefix_cache_disk_flags_are_gone_and_the_host_size_was_renamed) {
-    /* The prefix cache keeps nothing on a drive. A launch line still naming the disk tier, or the
-     * host tier's old name, is refused rather than served without what it asked for. */
+    /* The prefix cache has no disk tier. A launch line naming the disk tier, or the host tier's
+     * old flag name, is refused. */
     for (const char* f : { "--prefix-cache-host-mib", "--prefix-cache-disk-mib", "--prefix-cache-dir" }) {
         Config c;
         CHECK_EQ(parse({ f, "4096" }, &c), RAD_E_INVAL);
@@ -215,8 +193,7 @@ TEST(the_sizes_and_counts_reach_the_fields_they_name) {
     CHECK_EQ(c.tp_wire_min_kb, 64ll);
     CHECK_EQ(c.port, 8100);
 
-    /* A CONTEXT BOUND THAT DOES NOT FIT IN AN int. --max-model-len is the flag most likely to
-     * carry a number past two billion, and atoi would wrap it. */
+    /* --max-model-len may exceed INT_MAX and must not wrap. */
     Config big;
     CHECK_EQ(parse({ "--max-model-len", "4294967296" }, &big), RAD_OK);
     CHECK_EQ(big.max_ctx, 4294967296ll);
@@ -242,7 +219,7 @@ TEST(the_paths_and_names_reach_their_fields) {
     CHECK_EQ(c.override_chat_template, std::string("/t.jinja"));
 }
 
-/* The reasoning budget is a count or nothing: unset is -1, which no request default can mean. */
+/* The reasoning budget is a count or unset (-1); a negative value cannot be given. */
 TEST(thinking_token_budget_takes_a_count_and_defaults_to_none) {
     Config c;
     CHECK_EQ(parse({}, &c), RAD_OK);
@@ -263,7 +240,7 @@ TEST(the_boolean_flags_are_off_until_they_are_given) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK(!d.deterministic);
-    CHECK(d.prefix_cache);                 /* on by default; the flag only turns it off */
+    CHECK(d.prefix_cache);                 /* on by default; the flag turns it off */
     CHECK(!d.debug_graph);
     CHECK(!d.debug_selection);
     CHECK(!d.debug_placement);
@@ -282,8 +259,8 @@ TEST(the_boolean_flags_are_off_until_they_are_given) {
     CHECK(c.live_view);
 }
 
-/* THE GRAPH DUMP IMPLIES THE SELECTION TABLE, because a graph without the kernel that resolved
- * each node is a picture of a program nobody can tell is the one that will run. */
+/* The graph dump implies the selection table: without the kernel chosen for each node, the graph
+ * does not show what will run. */
 TEST(debug_graph_turns_the_selection_table_on_too) {
     Config c;
     CHECK_EQ(parse({ "--debug-graph" }, &c), RAD_OK);
@@ -292,7 +269,7 @@ TEST(debug_graph_turns_the_selection_table_on_too) {
 
     Config s;
     CHECK_EQ(parse({ "--debug-selection" }, &s), RAD_OK);
-    CHECK(!s.debug_graph);                 /* and not the other way round */
+    CHECK(!s.debug_graph);                 /* not the reverse */
     CHECK(s.debug_selection);
 }
 
@@ -312,8 +289,257 @@ TEST(tp_below_one_is_refused) {
     Config c;
     CHECK_EQ(parse({ "--tp", "0" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--tp", "-1" }, &c), RAD_E_INVAL);
-    CHECK_EQ(parse({ "--tp", "notanumber" }, &c), RAD_E_INVAL);   /* atoi gives 0 */
+    CHECK_EQ(parse({ "--tp", "notanumber" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--tp", "1" }, &c), RAD_OK);
+}
+
+/* A span is a whole number of intervals, one or more; 1 is the default and plans as before. */
+TEST(a_prefill_span_below_one_interval_is_refused) {
+    Config c;
+    CHECK_EQ(c.prefill_span, 1);
+    CHECK_EQ(parse({ "--prefill-span", "0" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--prefill-span", "-2" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--prefill-span", "2x" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--prefill-span", "4" }, &c), RAD_OK);
+    CHECK_EQ(c.prefill_span, 4);
+}
+
+/* A budget flag takes a whole number; a typo is refused rather than read as 0 or its prefix. */
+TEST(a_numeric_flag_refuses_what_is_not_a_number) {
+    Config c;
+    CHECK_EQ(parse({ "--max-num-seqs", "8x" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--max-num-batched-tokens", "4k" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--host-pool-mib", "-1" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--checkpoint-interval", "" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--port", "70000" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--num-speculative-tokens", "three" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--num-speculative-tokens", "-1" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--num-speculative-tokens", "auto" }, &c), RAD_OK);
+    CHECK_EQ(c.n_spec, -1);
+    CHECK_EQ(parse({ "--num-speculative-tokens", "3" }, &c), RAD_OK);
+    CHECK_EQ(c.n_spec, 3);
+}
+
+/* --prefill-interleave is a step count, off by default and at most 64. */
+TEST(prefill_interleave_takes_a_step_count_up_to_64) {
+    Config d;
+    REQUIRE_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.prefill_interleave, 0);
+    Config c;
+    CHECK_EQ(parse({ "--prefill-interleave", "4" }, &c), RAD_OK);
+    CHECK_EQ(c.prefill_interleave, 4);
+    CHECK_EQ(parse({ "--prefill-interleave", "65" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--prefill-interleave", "-1" }, &c), RAD_E_INVAL);
+}
+
+/* ================================================================== the table, the parser and the help agree
+ *
+ * One table (g_flags) drives the help text and the startup report, and a separate chain of ifs
+ * parses. A flag in the table the parser does not take, a number read without the strict parser,
+ * or a default the help states by hand that the code does not have, each passes every sampled
+ * test. These walk the whole table. */
+namespace {
+
+/* Each option and its argument's metavariable as the help prints them ("" for a switch). */
+std::vector<std::pair<std::string, std::string>> usage_options() {
+    const std::string text = stderr_of([] { config_usage("radiance"); });
+    std::vector<std::pair<std::string, std::string>> out;
+    size_t at = 0;
+    while (at < text.size()) {
+        size_t nl = text.find('\n', at);
+        if (nl == std::string::npos) nl = text.size();
+        const std::string line = text.substr(at, nl - at);
+        at = nl + 1;
+        if (line.rfind("  -", 0) != 0) continue;
+        std::istringstream in(line);
+        std::string name, arg;
+        in >> name >> arg;
+        /* The help starts after the padded column; a metavariable is upper case. */
+        const bool is_arg = !arg.empty() && line.find(name + " " + arg) == 2 &&
+                            std::all_of(arg.begin(), arg.end(), [](char ch) {
+                                return (ch >= 'A' && ch <= 'Z') || ch == '_';
+                            });
+        out.emplace_back(name, is_arg ? arg : "");
+    }
+    return out;
+}
+
+/* A legal value for every option that takes one, with any option it cannot be given without. */
+const std::map<std::string, std::vector<std::string>>& legal_values() {
+    static const std::map<std::string, std::vector<std::string>> v = {
+        { "--model", { "/m/y.rad" } }, { "--download-dir", { "/d" } },
+        { "--radiance-home", { "/h1:/h2" } }, { "--kernels", { "libref" } },
+        { "--tp", { "2" } }, { "--tp-wire", { "wht6" } }, { "--tp-wire-min-kb", { "64" } },
+        { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
+        { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
+        { "--max-num-seqs", { "4" } },
+        { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
+        { "--gpu-headroom-mib", { "128" } }, { "--kv-cache-dtype", { "fp8" } },
+        { "--host-pool-mib", { "1024" } }, { "--embedding-placement", { "vram" } },
+        { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
+        { "--prefix-cache-mib", { "256" } }, { "--prefix-cache-ttl", { "60" } },
+        { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
+        { "--prefill-span", { "2" } },
+        { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
+        { "--num-speculative-tokens", { "2" } }, { "--draft-window", { "fixed" } },
+        { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
+        { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
+        { "--generation-config", { "/g.json" } }, { "--override-chat-template", { "/t.jinja" } },
+        { "--temp", { "0.7" } }, { "--top-k", { "40" } }, { "--top-p", { "0.9" } },
+        { "--min-p", { "0.05" } }, { "--reasoning-effort", { "low" } },
+        { "--reasoning-effort-map", { "high=xhigh" } }, { "--thinking-token-budget", { "128" } },
+        { "--typical-p", { "0.9" } }, { "--presence-penalty", { "0.5" } },
+        { "--frequency-penalty", { "0.5" } }, { "--repetition-penalty", { "1.1" } },
+        { "--repeat-last-n", { "64" } }, { "--dry-multiplier", { "0.8" } },
+        { "--dry-base", { "1.75" } }, { "--dry-allowed-length", { "2" } },
+        { "--dry-penalty-last-n", { "-1" } }, { "--dry-sequence-breakers", { "[\"\\n\"]" } },
+        { "--xtc-probability", { "0.5" } }, { "--xtc-threshold", { "0.1" } },
+        { "--default-max-tokens", { "256" } }, { "--max-tokens-cap", { "1024" } },
+        { "--max-n", { "4" } }, { "--max-queued-requests", { "4096" } },
+        { "--max-stop-strings", { "8" } }, { "--max-stop-bytes", { "256" } },
+        { "--chat-template-kwargs", { "{\"enable_thinking\": false}" } },
+        { "--reasoning-format", { "none" } }, { "--http-threads", { "4" } },
+        { "--read-timeout", { "10" } }, { "--write-timeout", { "10" } },
+        { "--keep-alive-timeout", { "2" } }, { "--max-body-mib", { "64" } },
+        { "--retry-after", { "2" } }, { "--image-min-pixels", { "1024" } },
+        { "--image-max-pixels", { "4096" } }, { "--video-min-pixels", { "1024" } },
+        { "--video-max-pixels", { "4096" } }, { "--video-fps", { "2" } },
+        { "--video-min-frames", { "2" } }, { "--video-max-frames", { "8" } },
+        { "--video-max-frame-tokens", { "70" } }, { "--image-tokens", { "280" } },
+        { "--max-source-pixels", { "1000000" } },
+        { "--kld-record", { "/r", "--kld-corpus", "/c.jsonl" } }, { "--kld-ref", { "/r" } },
+        { "--kld-corpus", { "/c.jsonl", "--kld-record", "/r" } },
+        { "--kld-out", { "/o.json", "--kld-ref", "/r" } },
+    };
+    return v;
+}
+
+}  /* namespace */
+
+/* Every option the table lists parses with a legal value (a switch with none) and is reported as
+ * given on the command line. --draft-model is listed to be refused by name, and --help is not a
+ * setting. */
+TEST(every_listed_option_parses_and_is_reported_as_given) {
+    LogGuard lg;
+    const auto opts = usage_options();
+    CHECK(opts.size() > 90);
+    const std::vector<std::string> names = diag::config_option_names();
+    int checked = 0;
+    for (const auto& [name, arg] : opts) {
+        if (name == "--help" || name == "--draft-model") continue;
+        CHECK(std::find(names.begin(), names.end(), name) != names.end());
+        std::vector<std::string> args{ "--model", "/m/x.rad", name };
+        if (!arg.empty()) {
+            auto it = legal_values().find(name);
+            if (it == legal_values().end()) {
+                std::fprintf(stderr, "    no legal value listed for %s %s\n", name.c_str(), arg.c_str());
+                CHECK(false);
+                continue;
+            }
+            args.insert(args.end(), it->second.begin(), it->second.end());
+        }
+        Config c;
+        Argv a(args);
+        int st = RAD_OK;
+        const std::string log = stderr_of([&] { st = config_parse(a.argc(), a.argv.data(), &c); });
+        if (st != RAD_OK) std::fprintf(stderr, "    %s refused: %s", name.c_str(), log.c_str());
+        CHECK_EQ(st, (int)RAD_OK);
+        auto g = c.given.find(name);
+        CHECK(g != c.given.end() && g->second == "command line");
+        ++checked;
+    }
+    CHECK(checked > 90);
+}
+
+/* A whole-number option refuses what is not one, and a number option a word: "8x" read as 8, ""
+ * as 0 or "12k" as 12 would each be served as a decision. Seconds are whole numbers too. */
+TEST(every_numeric_option_refuses_what_is_not_its_kind) {
+    const std::vector<std::string> seconds = { "--prefix-cache-ttl", "--read-timeout",
+                                               "--write-timeout", "--keep-alive-timeout",
+                                               "--retry-after" };
+    int n_int = 0, n_num = 0;
+    for (const auto& [name, arg] : usage_options()) {
+        const bool whole = arg == "N" ||
+                           std::find(seconds.begin(), seconds.end(), name) != seconds.end();
+        if (!whole && arg != "F") continue;
+        (whole ? n_int : n_num)++;
+        for (const char* bad : whole ? std::vector<const char*>{ "8x", "", "12k", "1.5", "high" }
+                                     : std::vector<const char*>{ "high", "", "0.5x" }) {
+            Config c;
+            int st = RAD_OK;
+            const std::string log = stderr_of([&] { st = parse({ name.c_str(), bad }, &c); });
+            if (st != RAD_E_INVAL)
+                std::fprintf(stderr, "    %s %s was not refused\n", name.c_str(), bad);
+            CHECK_EQ(st, (int)RAD_E_INVAL);
+            CHECK(has(log, name));
+        }
+    }
+    std::fprintf(stderr, "    %d whole-number and %d number option(s)\n", n_int, n_num);
+    CHECK(n_int >= 35);
+    CHECK(n_num >= 12);
+}
+
+/* A default the help states as a number is the default a parse with no flags reports. */
+TEST(every_default_the_help_states_is_the_one_reported) {
+    const std::string text = stderr_of([] { config_usage("radiance"); });
+    Config c;
+    REQUIRE_EQ(parse({}, &c), RAD_OK);
+    const std::vector<diag::ConfigRow> rows = diag::config_rows(c);
+    /* The help of one option: its line and the indented lines after it. */
+    std::string block, flag;
+    int compared = 0;
+    auto settle = [&] {
+        std::smatch m;
+        static const std::regex def(R"(\(default (-?[0-9][0-9.]*)\))");
+        if (flag.empty() || !std::regex_search(block, m, def)) return;
+        const std::string want = m[1];
+        const diag::ConfigRow* row = nullptr;
+        for (const diag::ConfigRow& r : rows) if (r.flag == flag) row = &r;
+        REQUIRE(row != nullptr);
+        const bool ok = row->value == want || row->value.rfind(want + " ", 0) == 0;
+        if (!ok) std::fprintf(stderr, "    %s: help says %s, the report %s\n", flag.c_str(),
+                              want.c_str(), row->value.c_str());
+        CHECK(ok);
+        ++compared;
+    };
+    size_t at = 0;
+    while (at < text.size()) {
+        size_t nl = text.find('\n', at);
+        if (nl == std::string::npos) nl = text.size();
+        const std::string line = text.substr(at, nl - at);
+        at = nl + 1;
+        if (line.rfind("  -", 0) == 0) {
+            settle();
+            std::istringstream in(line);
+            in >> flag;
+            block = line;
+        } else if (line.rfind("    ", 0) == 0) {
+            block += " " + line;
+        } else {
+            settle();
+            flag.clear();
+            block.clear();
+        }
+    }
+    settle();
+    CHECK(compared >= 8);
+}
+
+/* --placement names one of the planner's four strategies, refused at the command line rather than
+ * at startup once the model is open. */
+TEST(the_placement_is_one_of_the_planners_four) {
+    for (const char* ok : { "all_vram", "layer_offload", "expert_tiered", "auto" }) {
+        Config c;
+        CHECK_EQ(parse({ "--placement", ok }, &c), RAD_OK);
+        CHECK_EQ(c.placement, std::string(ok));
+    }
+    for (const char* bad : { "all-vram", "AUTO", "", "tiered" }) {
+        Config c;
+        int st = RAD_OK;
+        const std::string log = stderr_of([&] { st = parse({ "--placement", bad }, &c); });
+        CHECK_EQ(st, (int)RAD_E_INVAL);
+        CHECK(has(log, "--placement"));
+    }
 }
 
 TEST(the_wire_mode_is_one_of_two_names) {
@@ -322,9 +548,8 @@ TEST(the_wire_mode_is_one_of_two_names) {
     CHECK_EQ(c.tp_wire_exact, 1);
     CHECK_EQ(parse({ "--tp-wire", "wht6" }, &c), RAD_OK);
     CHECK_EQ(c.tp_wire_exact, 0);
-    /* A LOSSY WIRE IS A DEPLOYMENT CHOICE AND NOTHING DOWNSTREAM CAN DETECT IT: the sum a rank
-     * receives is not the sum it would have received. So a name this build does not know has to
-     * stop the server rather than fall through to whichever mode happens to be the default. */
+    /* A lossy wire is undetectable downstream (a rank just receives a different sum), so an
+     * unknown name stops the server instead of falling through to the default mode. */
     CHECK_EQ(parse({ "--tp-wire", "wht8" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--tp-wire", "" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--tp-wire", "EXACT" }, &c), RAD_E_INVAL);
@@ -339,8 +564,8 @@ TEST(the_p2p_mode_is_one_of_three_names) {
     CHECK_EQ(c.p2p, RAD_P2P_OFF);
     CHECK_EQ(parse({ "--p2p", "auto" }, &c), RAD_OK);
     CHECK_EQ(c.p2p, RAD_P2P_AUTO);
-    /* A name this build does not know stops the server: `on` exists so a deployment measured on
-     * P2P cannot quietly serve on host memory, and a typo falling through to auto would do that. */
+    /* An unknown name stops the server: `on` guarantees a deployment measured on P2P never
+     * silently serves through host memory, which a typo falling through to auto could do. */
     CHECK_EQ(parse({ "--p2p", "yes" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--p2p", "" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--p2p", "OFF" }, &c), RAD_E_INVAL);
@@ -352,8 +577,8 @@ TEST(the_kv_cache_dtype_is_one_of_two_names) {
     CHECK_EQ(c.kv_cache_dtype, std::string("bf16"));
     CHECK_EQ(parse({ "--kv-cache-dtype", "fp8" }, &c), RAD_OK);
     CHECK_EQ(c.kv_cache_dtype, std::string("fp8"));
-    /* Two values and not three: an "auto" resolving to bf16 would be a second name for the
-     * default, and a flag whose values are not all distinct cannot be read back out of a log. */
+    /* Two values only: an "auto" resolving to bf16 would be a second name for the default, and
+     * each value should be unambiguous in a log. */
     CHECK_EQ(parse({ "--kv-cache-dtype", "auto" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--kv-cache-dtype", "fp16" }, &c), RAD_E_INVAL);
 
@@ -362,17 +587,16 @@ TEST(the_kv_cache_dtype_is_one_of_two_names) {
     CHECK_EQ(d.kv_cache_dtype, std::string("bf16"));
 }
 
-/* THE TWO TABLE PLACEMENTS: the embedding takes ram (the default) or vram, the n-gram table auto
- * (the default), vram, ram or disk, and nothing else. A parse records whether the embedding's was
- * named and leaves the resolved values to Engine::plan: where each table may go is the engine's to
- * refuse, with the model in hand -- not the parser's. */
+/* The embedding takes ram (default) or vram; the n-gram table takes auto (default), vram, ram or
+ * disk. The parser records whether the embedding placement was named and leaves resolution to
+ * Engine::plan, which can refuse a placement with the model in hand. */
 TEST(the_embedding_is_ram_or_vram_and_the_ngram_table_takes_four) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK(d.embedding_placement == TablePlacement::Ram);
     CHECK(!d.embedding_placement_given);
     CHECK(d.ngram_placement == TablePlacement::Auto);
-    CHECK_EQ(d.embedding_host_mib, 0ll);                     /* the resolver's */
+    CHECK_EQ(d.embedding_host_mib, 0ll);                     /* set by the resolver */
     Config c;
     CHECK_EQ(parse({ "--embedding-placement", "ram", "--ngram-placement", "disk" }, &c), RAD_OK);
     CHECK(c.embedding_placement == TablePlacement::Ram);
@@ -395,9 +619,9 @@ TEST(the_embedding_is_ram_or_vram_and_the_ngram_table_takes_four) {
     CHECK_EQ(parse({ "--ngram-placement" }, &c), RAD_E_INVAL);
 }
 
-/* --draft-window takes its two names and nothing else; the default is kDraftWindowDefault, and the
- * help text states it from there. Whether the window CAN adapt -- a serial drafter, a depth above
- * zero -- is the scheduler's to say with the program in hand, not the parser's. */
+/* --draft-window takes exactly two names; the default is kDraftWindowDefault, which the help text
+ * also states. Whether the window can adapt (a serial drafter, depth above zero) is decided by the
+ * scheduler with the program in hand, not the parser. */
 TEST(the_draft_window_is_fixed_or_adaptive) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
@@ -417,8 +641,8 @@ TEST(the_draft_window_is_fixed_or_adaptive) {
     CHECK_EQ(std::string(draft_window_name(DraftWindow::Fixed)), std::string("fixed"));
 }
 
-/* A POLICY NAME THIS BUILD DOES NOT KNOW WOULD FALL THROUGH TO THE DEFAULT, and a measurement
- * comparing the default against itself is the failure that costs the most to notice. */
+/* An unknown policy name is refused; falling through to the default would make a comparison
+ * silently measure the default against itself. */
 TEST(the_checkpoint_policy_is_one_of_the_three_that_exist) {
     Config c;
     for (const char* p : { "geometric-backoff", "tip-only", "keep-all" }) {
@@ -433,9 +657,8 @@ TEST(the_checkpoint_policy_is_one_of_the_three_that_exist) {
     CHECK_EQ(d.checkpoint_policy, std::string("geometric-backoff"));
 }
 
-/* THE SAME RANGES THE REQUEST PARSER ENFORCES, refused here rather than at the first request: a
- * default outside them is a 400 on every request that omits the field, which is a server that
- * starts, reports healthy and answers nothing. */
+/* The request parser's ranges, enforced at startup: a default outside them would 400 every
+ * request omitting the field, from a server that reports healthy. */
 TEST(the_sampler_defaults_are_range_checked_at_startup) {
     Config c;
     CHECK_EQ(parse({ "--temp", "0.7", "--top-k", "20", "--top-p", "0.95",
@@ -445,7 +668,7 @@ TEST(the_sampler_defaults_are_range_checked_at_startup) {
     CHECK_NEAR(c.sample_top_p, 0.95f, 1e-6);
     CHECK_NEAR(c.sample_min_p, 0.05f, 1e-6);
 
-    /* The legal endpoints. Temperature 0 is greedy and top_k 0 is off: both are real settings. */
+    /* The legal endpoints. Temperature 0 is greedy and top_k 0 is off. */
     CHECK_EQ(parse({ "--temp", "0" }, &c), RAD_OK);
     CHECK_EQ(parse({ "--temp", "2" }, &c), RAD_OK);
     CHECK_EQ(parse({ "--top-k", "0" }, &c), RAD_OK);
@@ -454,21 +677,20 @@ TEST(the_sampler_defaults_are_range_checked_at_startup) {
     CHECK_EQ(parse({ "--min-p", "1" }, &c), RAD_OK);
 
     CHECK_EQ(parse({ "--temp", "2.1" }, &c), RAD_E_INVAL);
-    CHECK_EQ(parse({ "--top-p", "0" }, &c), RAD_E_INVAL);   /* a nucleus of nothing */
+    CHECK_EQ(parse({ "--top-p", "0" }, &c), RAD_E_INVAL);   /* empty nucleus */
     CHECK_EQ(parse({ "--top-p", "1.5" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--min-p", "1.5" }, &c), RAD_E_INVAL);
 
-    /* A negative value is refused rather than read as "unset", which is what a negative field
-     * means below the parser -- the container's default would be served in its place. */
+    /* A negative value is refused: below the parser a negative field means unset, and the
+     * container's default would be served instead. */
     CHECK_EQ(parse({ "--temp", "-0.5" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--top-k", "-5" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--top-p", "-0.5" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--min-p", "-0.5" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--temp", "nan" }, &c), RAD_E_INVAL);
 
-    /* UNSET IS NEGATIVE AND NOT ZERO, which is what lets the container's own generation config be
-     * resolved underneath: zero is a real temperature and a real top_k, so a default of zero
-     * would be indistinguishable from an operator asking for greedy. */
+    /* Unset is negative, not zero, so the container's generation config can be resolved
+     * underneath: zero is a real temperature and top_k, indistinguishable from asking for greedy. */
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK(d.sample_temp < 0.0f);
@@ -477,7 +699,7 @@ TEST(the_sampler_defaults_are_range_checked_at_startup) {
     CHECK(d.sample_min_p < 0.0f);
 }
 
-/* A NUMBER IS THE WHOLE ARGUMENT. atof read "high" as 0, which for --temp is greedy decoding. */
+/* A number must be the whole argument; atof would read "high" as 0, which for --temp is greedy. */
 TEST(a_sampler_default_that_is_not_a_number_is_refused) {
     Config c;
     CHECK_EQ(parse({ "--temp", "high" }, &c), RAD_E_INVAL);
@@ -490,9 +712,8 @@ TEST(a_sampler_default_that_is_not_a_number_is_refused) {
 
 /* ================================================================== request defaults and bounds
  *
- * NONE OF THEM MOVES ANYTHING UNTIL IT IS GIVEN. Each field's unset value is the one the server
- * used before the flag existed (or a marker the engine reads as "leave it"), so a command line
- * that names none of them serves exactly what it served before. */
+ * None of these changes anything until given: each unset value is the server's built-in behaviour
+ * or a marker the engine reads as "leave it". */
 TEST(the_request_defaults_and_bounds_are_unset_until_given) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
@@ -552,24 +773,24 @@ TEST(the_request_defaults_reach_their_fields) {
     CHECK_EQ(c.max_stop_bytes, 256ll);
     CHECK_EQ(c.reasoning_format, std::string("none"));
 
-    /* `auto` is 0, which the server resolves per request to what the context leaves. */
+    /* `auto` is 0, resolved per request to what the context leaves. */
     Config a;
     CHECK_EQ(parse({ "--default-max-tokens", "auto" }, &a), RAD_OK);
     CHECK_EQ(a.default_max_tokens, 0ll);
 
-    /* An empty breaker list is a stated value -- DRY with no breakers -- and stays one. */
+    /* An empty breaker list is a stated value (DRY with no breakers), not unset. */
     Config e;
     CHECK_EQ(parse({ "--dry-sequence-breakers", "[]" }, &e), RAD_OK);
     CHECK(e.sample_dry_seq_breakers && e.sample_dry_seq_breakers->empty());
 
-    /* A negative penalty is a value a request can send, so the flag can state it. */
+    /* A request may send a negative penalty, so the flag accepts one. */
     Config n;
     CHECK_EQ(parse({ "--presence-penalty", "-2" }, &n), RAD_OK);
     CHECK_NEAR(*n.sample_pres_penalty, -2.0f, 1e-6);
 }
 
-/* THE RANGES A REQUEST IS HELD TO, at startup: a default outside them would be a 400 on every
- * request that leaves the field to it. */
+/* Request ranges, enforced at startup: a default outside them would 400 every request that
+ * omits the field. */
 TEST(the_request_defaults_are_range_checked_like_a_request) {
     Config c;
     CHECK_EQ(parse({ "--typical-p", "0" }, &c), RAD_E_INVAL);
@@ -583,14 +804,19 @@ TEST(the_request_defaults_are_range_checked_like_a_request) {
     CHECK_EQ(parse({ "--xtc-probability", "1.5" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--xtc-threshold", "-0.1" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--dry-allowed-length", "3.5" }, &c), RAD_E_INVAL);
+    /* With DRY on, a request whose allowed length is below 1 is refused at admission, so a
+     * default below 1 is refused here rather than refusing every such request. */
+    CHECK_EQ(parse({ "--dry-allowed-length", "0" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--dry-allowed-length", "-1" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--dry-allowed-length", "1" }, &c), RAD_OK);
     CHECK_EQ(parse({ "--dry-sequence-breakers", R"("\n")" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--dry-sequence-breakers", "[1]" }, &c), RAD_E_INVAL);
-    /* The sampler takes at most 16 (sample/host_ref.h); every DRY request would be refused. */
+    /* The sampler takes at most 16 (sample/host_ref.h); more would refuse every DRY request. */
     CHECK_EQ(parse({ "--dry-sequence-breakers",
                      R"(["a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q"])" },
                    &c), RAD_E_INVAL);
 
-    CHECK_EQ(parse({ "--default-max-tokens", "0" }, &c), RAD_E_INVAL);   /* auto is the word */
+    CHECK_EQ(parse({ "--default-max-tokens", "0" }, &c), RAD_E_INVAL);   /* spell it `auto` */
     CHECK_EQ(parse({ "--default-max-tokens", "-1" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--default-max-tokens", "AUTO" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--default-max-tokens", "4294967296" }, &c), RAD_E_INVAL);
@@ -603,8 +829,8 @@ TEST(the_request_defaults_are_range_checked_like_a_request) {
     CHECK_EQ(parse({ "--reasoning-format", "" }, &c), RAD_E_INVAL);
 }
 
-/* BOUNDS THAT CONTRADICT EACH OTHER. A default above the cap is a default no request is served
- * at; an `n` above the queue is a request that is 429 however long its caller waits. */
+/* Contradictory bounds are refused: a default above the cap is never served, and an `n` above the
+ * queue size gets 429 however long its caller waits. */
 TEST(request_bounds_that_contradict_each_other_are_refused) {
     CHECK_EQ(parse_fresh({ "--default-max-tokens", "4096", "--max-tokens-cap", "1024" }), RAD_E_INVAL);
     CHECK_EQ(parse_fresh({ "--default-max-tokens", "1024", "--max-tokens-cap", "1024" }), RAD_OK);
@@ -612,10 +838,10 @@ TEST(request_bounds_that_contradict_each_other_are_refused) {
 
     CHECK_EQ(parse_fresh({ "--max-n", "65", "--max-queued-requests", "64" }), RAD_E_INVAL);
     CHECK_EQ(parse_fresh({ "--max-n", "64", "--max-queued-requests", "64" }), RAD_OK);
-    /* The queue's default is 8 x --max-num-seqs, and the check reads it. */
+    /* The queue's default is 8 x --max-num-seqs, and the check uses it. */
     CHECK_EQ(parse_fresh({ "--max-num-seqs", "2", "--max-n", "17" }), RAD_E_INVAL);
     CHECK_EQ(parse_fresh({ "--max-num-seqs", "2", "--max-n", "16" }), RAD_OK);
-    /* And a stated queue smaller than the default n (8, or --max-num-seqs). */
+    /* A stated queue smaller than the default n (8, or --max-num-seqs). */
     CHECK_EQ(parse_fresh({ "--max-queued-requests", "4" }), RAD_E_INVAL);
 }
 
@@ -629,17 +855,17 @@ TEST(the_template_variables_merge_key_by_key_and_later_wins) {
     CHECK_EQ(c.chat_template_kwargs["n"], std::string("3"));
 
     /* @FILE reads the object from a file. */
-    char path[] = "/tmp/rad_kwargs_XXXXXX";
-    const int fd = mkstemp(path);
-    REQUIRE(fd >= 0);
+    const std::string path = radtest::tmp_path("kwargs.json");
+    FILE* fp = std::fopen(path.c_str(), "w");
+    REQUIRE(fp != nullptr);
     const std::string body = R"({"date_string": "01 Jan 2026"})";
-    CHECK_EQ((size_t)write(fd, body.data(), body.size()), body.size());
-    close(fd);
+    CHECK_EQ(std::fwrite(body.data(), 1, body.size(), fp), body.size());
+    std::fclose(fp);
     Config f;
-    const std::string at = std::string("@") + path;
+    const std::string at = "@" + path;
     CHECK_EQ(parse({ "--chat-template-kwargs", at.c_str() }, &f), RAD_OK);
     CHECK_EQ(f.chat_template_kwargs["date_string"], std::string("\"01 Jan 2026\""));
-    unlink(path);
+    unlink(path.c_str());
     CHECK_EQ(parse({ "--chat-template-kwargs", at.c_str() }, &f), RAD_E_INVAL);   /* gone */
 }
 
@@ -648,12 +874,12 @@ TEST(a_template_variable_the_server_owns_or_cannot_read_is_refused) {
     CHECK_EQ(parse_fresh({ "--chat-template-kwargs", "{nope" }), RAD_E_INVAL);
     CHECK_EQ(parse_fresh({ "--chat-template-kwargs", R"("enable_thinking")" }), RAD_E_INVAL);
     CHECK_EQ(parse_fresh({ "--chat-template-kwargs", R"({"enable_thinking": "no"})" }), RAD_E_INVAL);
-    /* The renderer writes these over the context; one here would replace every conversation. */
+    /* The renderer sets these; one here would replace every conversation. */
     for (const char* k : { "messages", "tools", "bos_token", "eos_token", "add_generation_prompt" }) {
         const std::string j = std::string("{\"") + k + "\": 1}";
         CHECK_EQ(parse_fresh({ "--chat-template-kwargs", j.c_str() }), RAD_E_INVAL);
     }
-    /* Two defaults for thinking, in two flags, with no order between them. */
+    /* Two flags setting the thinking default, with no precedence between them. */
     CHECK_EQ(parse_fresh({ "--reasoning-effort", "low",
                            "--chat-template-kwargs", R"({"reasoning_effort": "high"})" }), RAD_E_INVAL);
     CHECK_EQ(parse_fresh({ "--chat-template-kwargs", R"({"enable_thinking": true})",
@@ -675,7 +901,7 @@ TEST(the_transport_flags_reach_their_fields_and_hold_their_floors) {
     CHECK_EQ(c.retry_after_s, 5);
     CHECK(!c.cors);
 
-    /* The transport keeps four workers whatever it is told, so fewer is refused, not ignored. */
+    /* The transport keeps at least four workers, so fewer is refused, not ignored. */
     CHECK_EQ(parse({ "--http-threads", "2" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--read-timeout", "0" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--write-timeout", "-1" }, &c), RAD_E_INVAL);
@@ -714,9 +940,8 @@ TEST(the_media_flags_reach_their_fields_and_refuse_an_empty_band) {
     CHECK_EQ(parse({ "--max-source-pixels", "0" }, &c), RAD_E_INVAL);
 }
 
-/* REFUSED, NOT QUIETLY IGNORED. Accepting it and then serving the container's own drafter -- or
- * none -- hands the caller a server that is not the one they asked for, with nothing in the
- * output to say so. A caller coming from vLLM will reach for this flag. */
+/* --draft-model (familiar from vLLM) is refused by name; accepting it and serving the container's
+ * own drafter, or none, would silently differ from what was asked. */
 TEST(draft_model_is_refused_by_name_rather_than_ignored) {
     Config c;
     CHECK_EQ(parse({ "--draft-model", "/d.rad" }, &c), RAD_E_INVAL);
@@ -726,8 +951,8 @@ TEST(draft_model_is_refused_by_name_rather_than_ignored) {
 /* ================================================================== resolved */
 
 TEST(auto_speculation_is_negative_one_and_not_zero) {
-    /* The depth is a property of the DRAFTER, which the architecture plugin states once the
-     * container is open -- so "auto" has to survive as a distinct value here. Zero is off. */
+    /* The depth is the drafter's, stated by the architecture plugin once the container is open,
+     * so "auto" survives as a distinct value here. Zero is off. */
     Config c;
     CHECK_EQ(parse({ "--num-speculative-tokens", "auto" }, &c), RAD_OK);
     CHECK_EQ(c.n_spec, -1);
@@ -735,7 +960,7 @@ TEST(auto_speculation_is_negative_one_and_not_zero) {
     CHECK_EQ(c.n_spec, 0);
     CHECK_EQ(parse({ "--num-speculative-tokens", "3" }, &c), RAD_OK);
     CHECK_EQ(c.n_spec, 3);
-    /* Only the word says auto: a negative depth would read as it downstream. */
+    /* Only the word means auto; a negative depth would be read as auto downstream. */
     CHECK_EQ(parse({ "--num-speculative-tokens", "-3" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--num-speculative-tokens", "-1" }, &c), RAD_E_INVAL);
 
@@ -744,8 +969,7 @@ TEST(auto_speculation_is_negative_one_and_not_zero) {
     CHECK_EQ(d.n_spec, -1);                /* auto is also the default */
 }
 
-/* IT TAKES THE SHORT NAME TOO: "-mib" is the unit, and this is the flag an operator reaches for.
- * Both spellings parse to the same field, so a line written either way means one thing. */
+/* --gpu-headroom is an alias for --gpu-headroom-mib; both set the same field. */
 TEST(gpu_headroom_parses_under_both_spellings) {
     Config a, b, d;
     CHECK_EQ(parse({ "--gpu-headroom-mib", "256" }, &a), RAD_OK);
@@ -756,15 +980,15 @@ TEST(gpu_headroom_parses_under_both_spellings) {
     CHECK_EQ(d.gpu_headroom_mib, 96ll);
 }
 
-TEST(the_kernel_hierarchy_is_comma_separated_and_ordered) {
+TEST(the_kernel_hierarchy_is_separated_by_commas_or_colons_and_ordered) {
     Config c;
     CHECK_EQ(parse({ "--kernels", "libr4d.so,libref.so" }, &c), RAD_OK);
     CHECK_EQ(c.kernel_hierarchy.size(), 2u);
-    CHECK_EQ(c.kernel_hierarchy[0], std::string("libr4d.so"));   /* first wins, so order is data */
+    CHECK_EQ(c.kernel_hierarchy[0], std::string("libr4d.so"));   /* first wins, so order matters */
     CHECK_EQ(c.kernel_hierarchy[1], std::string("libref.so"));
 
-    /* Empty segments are dropped rather than kept as empty names: a trailing comma is a typing
-     * artefact, and a plugin path of "" matches nothing and would warn on every start. */
+    /* Empty segments are dropped: a trailing comma is a typo, and a plugin path of "" matches
+     * nothing and would warn on every start. */
     Config t;
     CHECK_EQ(parse({ "--kernels", ",a,,b," }, &t), RAD_OK);
     CHECK_EQ(t.kernel_hierarchy.size(), 2u);
@@ -774,20 +998,28 @@ TEST(the_kernel_hierarchy_is_comma_separated_and_ordered) {
     Config one;
     CHECK_EQ(parse({ "--kernels", "solo" }, &one), RAD_OK);
     CHECK_EQ(one.kernel_hierarchy.size(), 1u);
+
+    /* A colon separates as a comma does: rad-kbench, rad-tune and rad-convert document
+     * `--kernels A:B`, and the engine must load the same list from the same spelling. */
+    Config col;
+    CHECK_EQ(parse({ "--kernels", "mykernels:libr4d,libref" }, &col), RAD_OK);
+    REQUIRE_EQ(col.kernel_hierarchy.size(), 3u);
+    CHECK_EQ(col.kernel_hierarchy[0], std::string("mykernels"));
+    CHECK_EQ(col.kernel_hierarchy[1], std::string("libr4d"));
+    CHECK_EQ(col.kernel_hierarchy[2], std::string("libref"));
 }
 
-/* AND THERE IS NO BUILT-IN DEFAULT HIERARCHY, deliberately: naming one card's kernel library in
- * the core would, on every other machine, rank the library that IS installed behind the reference
- * implementation. An empty hierarchy is not "no order" -- the loader supplies one. */
+/* There is deliberately no built-in default hierarchy: naming one card's kernel library in the
+ * core would rank the installed library behind the reference elsewhere. The loader orders an empty
+ * hierarchy. */
 TEST(an_unnamed_hierarchy_stays_empty_for_the_loader_to_order) {
     Config c;
     CHECK_EQ(parse({}, &c), RAD_OK);
     CHECK_EQ(c.kernel_hierarchy.size(), 0u);
 }
 
-/* THE ENGINE HONOURS THE SAME VARIABLE THE TOOLS DO. Otherwise an operator who validated a
- * third-party plugin with rad-kbench or rad-tune has no way to serve with it short of editing
- * every launcher's command line. */
+/* The engine honours the same environment variables as the tools, so a plugin validated with
+ * rad-kbench or rad-tune serves without editing every launcher's command line. */
 TEST(the_environment_supplies_what_the_line_left_unsaid) {
     const char* old_home = getenv("RADIANCE_HOME");
     const char* old_kern = getenv("RADIANCE_KERNELS");
@@ -803,33 +1035,45 @@ TEST(the_environment_supplies_what_the_line_left_unsaid) {
     CHECK_EQ(c.kernel_hierarchy.size(), 2u);
     CHECK_EQ(c.kernel_hierarchy[0], std::string("env_a"));
 
-    /* The command line wins over the environment, in both cases. */
+    /* The command line wins over the environment. */
     Config f;
     CHECK_EQ(parse({ "--radiance-home", "/flag/home", "--kernels", "flag_only" }, &f), RAD_OK);
     CHECK_EQ(f.radiance_home, std::string("/flag/home"));
     CHECK_EQ(f.kernel_hierarchy.size(), 1u);
     CHECK_EQ(f.kernel_hierarchy[0], std::string("flag_only"));
 
-    /* An empty variable says nothing rather than saying "the empty hierarchy". */
+    /* An empty variable is treated as unset, not as an empty hierarchy. */
     setenv("RADIANCE_KERNELS", "", 1);
     Config e;
     CHECK_EQ(parse({}, &e), RAD_OK);
     CHECK_EQ(e.kernel_hierarchy.size(), 0u);
 
+    /* $RADIANCE_KERNELS splits by the same rule as --kernels. */
+    setenv("RADIANCE_KERNELS", "env_a:env_b", 1);
+    Config k;
+    CHECK_EQ(parse({}, &k), RAD_OK);
+    CHECK(k.kernel_hierarchy == (std::vector<std::string>{ "env_a", "env_b" }));
+
     unsetenv("RADIANCE_HOME");
     Config h;
     CHECK_EQ(parse({}, &h), RAD_OK);
-    CHECK(!h.radiance_home.empty());               /* the compiled-in default, whatever it is */
+    CHECK(!h.radiance_home.empty());               /* the compiled-in default */
+
+    /* A home set but empty is unset too: as the tools read it, and an empty home would load no
+     * plugin. The source names the default, not the environment. */
+    setenv("RADIANCE_HOME", "", 1);
+    Config eh;
+    CHECK_EQ(parse({}, &eh), RAD_OK);
+    CHECK_EQ(eh.radiance_home, h.radiance_home);
+    CHECK(!eh.given.count("--radiance-home"));
 
     if (old_home) setenv("RADIANCE_HOME", save_home.c_str(), 1); else unsetenv("RADIANCE_HOME");
     if (old_kern) setenv("RADIANCE_KERNELS", save_kern.c_str(), 1); else unsetenv("RADIANCE_KERNELS");
 }
 
-/* LATER WINS, for every flag that takes a value. Scripts build these lines by appending, and a
- * parser that kept the first occurrence would make an override a no-op. */
 TEST(the_download_dir_is_taken_and_left_empty_until_given) {
-    /* Empty means "the XDG cache", which hf_model.cpp resolves only when --model is a repo id:
-     * a server started on a local file never reads HOME for it. */
+    /* Empty means the XDG cache, which hf_model.cpp resolves only when --model is a repo id, so a
+     * server started on a local file never reads HOME for it. */
     Config c;
     CHECK_EQ(parse({}, &c), 0);
     CHECK(c.download_dir.empty());
@@ -838,64 +1082,40 @@ TEST(the_download_dir_is_taken_and_left_empty_until_given) {
     CHECK_EQ(d.download_dir, std::string("/big/models"));
 }
 
+/* The last occurrence wins for every flag with a value: scripts append overrides. */
 TEST(a_repeated_flag_takes_the_last_one) {
     Config c;
     CHECK_EQ(parse({ "--port", "1", "--port", "8100" }, &c), RAD_OK);
     CHECK_EQ(c.port, 8100);
     CHECK_EQ(parse({ "--kv-cache-dtype", "bf16", "--kv-cache-dtype", "fp8" }, &c), RAD_OK);
     CHECK_EQ(c.kv_cache_dtype, std::string("fp8"));
-    /* And a bad value refuses even when a good one preceded it. */
+    /* A bad value is refused even after a good one. */
     CHECK_EQ(parse({ "--tp-wire", "exact", "--tp-wire", "nope" }, &c), RAD_E_INVAL);
 }
 
 TEST(usage_names_every_flag_it_documents) {
-    /* config_usage writes to stderr; the property worth holding is that it mentions the flags an
-     * operator is most likely to be looking for, so a flag added without a help line is caught. */
-    FILE* f = tmpfile();
-    CHECK(f != nullptr);
-    if (!f) return;
-    const int saved = dup(2);
-    CHECK(saved >= 0);
-    fflush(stderr);
-    dup2(fileno(f), 2);
-    config_usage("radiance");
-    fflush(stderr);
-    dup2(saved, 2);
-    close(saved);
-
-    std::string text;
-    rewind(f);
-    char buf[4096];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
-    fclose(f);
-
-    CHECK(text.find("--model") != std::string::npos);
-    CHECK(text.find("--host-pool-mib") != std::string::npos);
-    CHECK(text.find("--kv-cache-dtype") != std::string::npos);
-    CHECK(text.find("--num-speculative-tokens") != std::string::npos);
-    CHECK(text.find("--draft-window") != std::string::npos);
-    CHECK(text.find(std::string("Default ") + draft_window_name(kDraftWindowDefault)) !=
-          std::string::npos);
-    CHECK(text.find("--checkpoint-policy") != std::string::npos);
-    CHECK(text.find("--prefix-cache-mib") != std::string::npos);
-    CHECK(text.find("--prefix-cache-ttl") != std::string::npos);
-    CHECK(text.find("--tp-wire") != std::string::npos);
-    CHECK(text.find("--embedding-placement") != std::string::npos);
-    CHECK(text.find("--ngram-placement") != std::string::npos);
-    CHECK(text.find("--kld-record") != std::string::npos);
-    CHECK(text.find("--kld-ref") != std::string::npos);
-    for (const char* f : { "--default-max-tokens", "--max-tokens-cap", "--presence-penalty",
-                           "--dry-sequence-breakers", "--chat-template-kwargs",
-                           "--reasoning-format", "--max-n", "--max-queued-requests",
-                           "--max-stop-strings", "--http-threads", "--max-body-mib", "--no-cors",
-                           "--image-max-pixels", "--video-fps", "--max-source-pixels",
-                           "--download-dir" })
-        CHECK(text.find(f) != std::string::npos);
+    /* config_usage writes to stderr; it must mention the flags an operator most likely looks
+     * for, so a flag added without a help line is caught. */
+    const std::string text = stderr_of([] { config_usage("radiance"); });
+    for (const char* f : { "--model", "--host-pool-mib", "--kv-cache-dtype",
+                           "--num-speculative-tokens", "--draft-window", "--checkpoint-policy",
+                           "--prefix-cache-mib", "--prefix-cache-ttl", "--tp-wire",
+                           "--embedding-placement", "--ngram-placement", "--kld-record",
+                           "--kld-ref", "--default-max-tokens", "--max-tokens-cap",
+                           "--presence-penalty", "--dry-sequence-breakers",
+                           "--chat-template-kwargs", "--reasoning-format", "--max-n",
+                           "--max-queued-requests", "--max-stop-strings", "--http-threads",
+                           "--max-body-mib", "--no-cors", "--image-max-pixels", "--video-fps",
+                           "--max-source-pixels", "--download-dir" })
+        CHECK(has(text, f));
+    CHECK(has(text, std::string("Default ") + draft_window_name(kDraftWindowDefault)));
+    /* top_k 0 is the sampler's candidate width, not the whole vocabulary or "off". */
+    CHECK(has(text, "0 is the 1024 most"));
+    CHECK(!has(text, "top_k (0 = off)"));
     CHECK(text.size() > 1000);
 }
 
-/* --rope-scaling is checked at the command line: a typo is a refusal, not a model served with its
+/* --rope-scaling is validated at the command line: a typo is refused rather than serving the
  * trained rotary at a length it cannot reach. */
 TEST(rope_scaling_takes_yarn_with_a_factor_above_one_or_none) {
     for (const char* ok : { "yarn:4", "yarn:2.5", "yarn:4:262144", "none" }) {

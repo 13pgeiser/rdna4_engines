@@ -1,22 +1,18 @@
 /* core/server/sink.h -- the per-request channel from the scheduler thread to the HTTP thread.
  *
- * `Request::sink` is the void* hook for this (rad_core.h). Exactly one scheduler thread writes it
- * and exactly one HTTP thread reads it, so it is a single-producer single-consumer ring and needs
- * no lock on the data path: a relaxed load of the head, a store into a slot, a release store of
- * the head. The producer never allocates and never blocks, which is the requirement -- a step
- * that can be delayed by a slow HTTP client is a step that has coupled every request in the batch
- * to the worst one.
+ * `Request::sink` is the void* hook for this (rad_core.h). One scheduler thread writes and one
+ * HTTP thread reads, so it is a lock-free single-producer single-consumer ring: relaxed load of
+ * the head, store into a slot, release store of the head. The producer never allocates or
+ * blocks, so a slow HTTP client cannot delay a step for the whole batch.
  *
- * The wake-up is the one place a mutex appears, and only on the consumer's side of it. The
- * producer calls notify_one() without holding the lock, which can lose a wake-up in the window
- * between the consumer testing the predicate and sleeping; the consumer therefore waits with a
- * bounded timeout (RAD_SINK_POLL_MS) rather than indefinitely. The cost is named: a lost wake-up
- * adds at most that many milliseconds to one token's latency. The benefit is that the scheduler
- * thread never takes a lock an HTTP thread might be holding, and the same timeout doubles as the
- * interval at which the streaming path polls whether the client is still there.
+ * Only the consumer takes the mutex. The producer calls notify_one() without it, which can lose
+ * a wake-up between the consumer's predicate test and its sleep, so the consumer waits at most
+ * RAD_SINK_POLL_MS. A lost wake-up costs at most that much latency on one token; in exchange the
+ * scheduler never waits on a lock an HTTP thread holds. The same timeout is the streaming path's
+ * client-liveness poll interval.
  *
  * Tokens, not text: detokenisation is stateful and per-request (spec §12) and belongs on the HTTP
- * thread. Pushing an int32 keeps the producer's write to eight bytes and no allocation.
+ * thread, and the producer's write stays a fixed-size SinkToken.
  */
 #pragma once
 #include "rad_core.h"
@@ -43,8 +39,8 @@ enum class Finish : int {
     Error,         /* the engine failed the request; `status` says why */
 };
 
-/* The OpenAI `finish_reason` string. Cancelled has no OpenAI spelling; vLLM reports "abort" and
- * dashboards key off that, so we match vLLM rather than inventing one. */
+/* The OpenAI `finish_reason` string. Cancelled has no OpenAI spelling; it is "abort" as in vLLM,
+ * which dashboards key off. */
 const char* finish_reason_oai(Finish f);
 
 struct SinkToken {
@@ -61,21 +57,17 @@ struct SinkAlt {
 
 class Sink {
 public:
-    /* `capacity` is rounded up to a power of two. 8192 tokens is ~64 KiB and is far more than any
-     * HTTP consumer can fall behind by without being dead: at 100 tok/s that is 80 seconds of
-     * slack. Overflow is not silently dropped -- it fails the request, because a stream missing
-     * tokens in the middle is worse than a stream that stops and says so. */
+    /* `capacity` is rounded up to a power of two. 8192 tokens is 80 s of slack at 100 tok/s, far
+     * more than a live consumer falls behind. Overflow fails the request rather than dropping
+     * tokens from the middle of the stream. */
     explicit Sink(size_t capacity = 8192);
 
-    /* Waits for the producer to be finished touching this object before letting it go.
+    /* Waits until the producer has stopped touching this object.
      *
-     * Observing `done()` is not enough. The producer publishes the terminal state and only then
-     * wakes the consumer, so between those two instructions the consumer can already be inside
-     * this destructor -- and destroying a condition_variable while another thread is inside
-     * notify_one() on it is a use-after-free in pthread_cond_signal. The producer therefore sets
-     * a quiesced flag as its genuinely last act, and this waits for that flag rather than for the
-     * state. The window is a handful of instructions wide, so only a data-race detector reports
-     * it. */
+     * Observing `done()` is not enough: the producer publishes the terminal state and only then
+     * calls notify_one(), and destroying the condition_variable in between is a use-after-free in
+     * pthread_cond_signal. The producer's last act is to set a quiesced flag, which this waits
+     * for. The window is a few instructions wide. */
     ~Sink();
 
     /* ------------------------------------------------------------------ producer: scheduler */
@@ -84,30 +76,28 @@ public:
      * logprobs when the request asked for them (enable_logprobs), and null otherwise. */
     bool push(int32_t token, const TokenLogprobs* lp = nullptr);
 
-    /* Terminal. Idempotent -- the first call wins, so a cancel racing a natural stop does not
+    /* Terminal and idempotent: the first call wins, so a cancel racing a natural stop does not
      * produce two finish reasons. */
     void finish(Finish f);
-    /* `why` says what failed, in a sentence a client can read; a string that outlives the sink
-     * (a literal), or null. */
+    /* `why` is a client-readable sentence that outlives the sink (a literal), or null. */
     void fail(int rad_status, const char* why = nullptr);
 
-    /* The scheduler polls this to learn that the client hung up, and frees the blocks (spec §14).
-     * It is also told by IScheduler::cancel(); this is the cheap path that needs no lookup. */
+    /* The scheduler polls this to learn the client hung up, then frees the blocks (spec §14).
+     * IScheduler::cancel() also tells it; this is the cheap path with no lookup. */
     bool cancel_requested() const { return cancel_.load(std::memory_order_acquire); }
 
     /* Admission accounting, set once by the scheduler when the prompt is placed. */
     void set_prompt_stats(int32_t n_prompt, int32_t n_cached);
 
-    /* THE FIRST TIME THE SCHEDULER GIVES THIS REQUEST A STEP: where its prompt phase starts, so
-     * the time it waited in the queue is not counted as prefill. A preempted request admitted
-     * again keeps the first mark. */
+    /* Marks the first step the scheduler gives this request, where its prompt phase starts, so
+     * queue time is not counted as prefill. A preempted request keeps its first mark. */
     void mark_admitted();
-    /* A verify step's speculation for this request: `n` tokens proposed, `accepted` of them
-     * taken. Summed over the request, the per-request half of /metrics' draft counters. */
+    /* One verify step: `n` draft tokens proposed, `accepted` taken. Summed per request for
+     * /metrics' draft counters. */
     void add_drafts(int32_t n, int32_t accepted);
-    /* HOW MUCH OF THE PROMPT IS IN THE CACHE: at admission (what the prefix cache supplied) and
-     * after every prefill step, of `total`, of which `cached` came from the prefix cache. What
-     * llama-server streams as `prompt_progress` when a request asks for it; wakes the consumer. */
+    /* Prompt tokens processed of `total`, `cached` of them from the prefix cache. Set at
+     * admission and after every prefill step; streamed as llama-server's `prompt_progress` when
+     * a request asks for it. Wakes the consumer. */
     void set_prompt_progress(int32_t processed, int32_t total, int32_t cached);
     int32_t progress_processed() const { return prog_done_.load(std::memory_order_acquire); }
     int32_t progress_total() const    { return prog_total_.load(std::memory_order_acquire); }
@@ -115,9 +105,8 @@ public:
 
     /* ------------------------------------------------------------------ consumer: HTTP */
 
-    /* Copies up to `max` tokens out. Returns how many. Never blocks. With `alts`, each token's
-     * alternatives too: token i's n_alt of them at alts[i * alt_width()], which needs room for
-     * max * alt_width(). */
+    /* Copies up to `max` tokens out and returns how many; never blocks. With `alts`, token i's
+     * n_alt alternatives go to alts[i * alt_width()], which needs room for max * alt_width(). */
     size_t read(SinkToken* out, size_t max, SinkAlt* alts = nullptr);
 
     /* Sleeps until there is something to read, the request is terminal, or `timeout_ms` elapses.
@@ -130,8 +119,8 @@ public:
     const char* why() const { return why_.load(std::memory_order_acquire); }
     bool   overflowed() const { return overflow_.load(std::memory_order_acquire); }
 
-    /* The HTTP thread calls this when the peer disappears. It does NOT free anything itself --
-     * the server calls IScheduler::cancel(id) as well; this only stops the producer sooner. */
+    /* Called by the HTTP thread when the peer disappears. Frees nothing: the server also calls
+     * IScheduler::cancel(id); this only stops the producer sooner. */
     void request_cancel();
 
     /* Timings, in steady-clock nanoseconds since the sink was constructed. -1 until observed. */
@@ -139,7 +128,7 @@ public:
     int64_t t_last_token_ns() const  { return t_last_.load(std::memory_order_acquire); }
     int64_t t_admitted_ns() const    { return t_admit_.load(std::memory_order_acquire); }
     int64_t age_ns() const;
-    /* The steady clock at construction, which the times above count from: what puts two sinks'
+    /* The steady clock at construction, which the times above count from; puts two sinks'
      * times on one axis. */
     int64_t t_start_ns() const { return t_start_ns_; }
 
@@ -150,19 +139,18 @@ public:
     int32_t n_prompt() const { return n_prompt_.load(std::memory_order_acquire); }
     int32_t n_cached() const { return n_cached_.load(std::memory_order_acquire); }
 
-    /* THE ALTERNATIVES' RING, sized for `n` a token, beside the token ring: allocated only for a
-     * request that asks for them, because at RAD_MAX_LOGPROBS it is twenty times the token ring.
-     * Called by the consumer before the request is handed to the scheduler. */
+    /* Allocates the alternatives ring, `n` per token, beside the token ring. Only requests that
+     * ask for logprobs get one: at RAD_MAX_LOGPROBS it is twenty times the token ring. The
+     * consumer calls this before handing the request to the scheduler. */
     void enable_logprobs(int n);
     int  alt_width() const { return alt_w_; }
 
     /* The engine's request id, so a dropped connection can reach IScheduler::cancel. */
     uint64_t id = 0;
 
-    /* AN EMBEDDING REQUEST'S ANSWER: the pooled vector, written once by the engine before the
-     * step's commit finishes the request, and read by the consumer only after done(). finish()
-     * publishes with a release store and done() reads with an acquire load, so the vector is
-     * visible to anyone who has seen the request finish. Empty for every generating request. */
+    /* An embedding request's pooled vector; empty for generating requests. Written once by the
+     * engine before the request finishes and read only after done(): finish()'s release store
+     * and done()'s acquire load publish it. */
     void set_embedding(const float* v, int64_t n) { embd_.assign(v, v + n); }
     const std::vector<float>& embedding() const { return embd_; }
 
@@ -203,8 +191,8 @@ private:
     std::condition_variable cv_;
 };
 
-/* The scheduler's call sites, so core/sched needs one include and no casts of its own. A null
- * sink is legal and means nobody is listening -- an offline or benchmark request. */
+/* The scheduler's call sites, so core/sched needs no casts. A null sink means nobody is
+ * listening (an offline or benchmark request). */
 inline bool sink_push(void* s, int32_t token, const TokenLogprobs* lp = nullptr) {
     return s ? static_cast<Sink*>(s)->push(token, lp) : true;
 }

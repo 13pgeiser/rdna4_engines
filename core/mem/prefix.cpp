@@ -9,14 +9,11 @@
 namespace rad {
 
 /* ------------------------------------------------------------------ hashing */
-/* A 128-bit chained mix rather than a cryptographic hash. A prefix cache whose store is on disk,
- * shared and long-lived is usually keyed by SHA-256, because a cheap hash's collision would serve
- * one caller another caller's context. We get the same guarantee more cheaply: every entry keeps
- * its BLOCK'S TOKEN IDS and compares them on a hit, so a collision is a miss rather than a wrong
- * answer, and the hash only has to be good enough to keep the bucket chains short.
+/* A 128-bit chained mix, not a cryptographic hash: every entry stores its block's token ids and
+ * compares them on a hit, so a collision is a miss, and the hash only needs to keep buckets short.
  *
- * splitmix64's finaliser, which is a full 64-bit bijection -- so folding one token cannot lose the
- * bits of the previous one, which is the failure mode of a plain multiply-xor chain. */
+ * splitmix64's finaliser is a 64-bit bijection, so folding one token cannot lose the bits of the
+ * previous one (the weakness of a plain multiply-xor chain). */
 static inline uint64_t mix64(uint64_t x) {
     x += 0x9e3779b97f4a7c15ull;
     x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
@@ -27,24 +24,9 @@ static inline uint64_t mix64(uint64_t x) {
 std::string BlockHash::str() const { return fmt("%016llx%016llx", (unsigned long long)hi,
                                                 (unsigned long long)lo); }
 
-uint64_t mm_content_hash(const void* embedding, int64_t bytes) {
-    const uint8_t* p = (const uint8_t*)embedding;
-    uint64_t h = 0xcbf29ce484222325ull ^ mix64((uint64_t)bytes);
-    int64_t i = 0;
-    for (; i + 8 <= bytes; i += 8) {
-        uint64_t w; std::memcpy(&w, p + i, 8);
-        h = mix64(h ^ w);
-    }
-    uint64_t tail = 0;
-    for (int64_t k = 0; i + k < bytes; ++k) tail |= (uint64_t)p[i + k] << (8 * k);
-    return mix64(h ^ tail);
-}
-
 BlockHash chain_block_hash(const BlockHash& parent, const int32_t* toks, int32_t n,
                            const MMContentKey* mm, int32_t n_mm, int64_t block_begin) {
-    /* The parent seeds both lanes. That is the whole chained-hash property: a block with identical
-     * tokens under a different prefix lands somewhere else, so a block in the middle of another
-     * conversation cannot be served here. */
+    /* The parent seeds both lanes, so identical tokens under a different prefix hash differently. */
     BlockHash h;
     h.hi = mix64(parent.hi ^ 0x243f6a8885a308d3ull);
     h.lo = mix64(parent.lo ^ 0x13198a2e03707344ull);
@@ -56,9 +38,8 @@ BlockHash chain_block_hash(const BlockHash& parent, const int32_t* toks, int32_t
         h.hi = mix64(h.hi + h.lo + t);
     }
 
-    /* Multimodal spans that overlap this block, folded by CONTENT plus the overlap offsets, so the
-     * same image at the same position hashes the same and a different image never aliases behind
-     * the identical placeholder token ids (spec §11). */
+    /* Fold in overlapping multimodal spans by content hash plus offsets, so different images
+     * behind identical placeholder ids never alias (spec §11). */
     const int64_t lo_pos = block_begin, hi_pos = block_begin + n;
     for (int32_t i = 0; i < n_mm; ++i) {
         const MMContentKey& m = mm[i];
@@ -77,10 +58,18 @@ BlockHash chain_block_hash(const BlockHash& parent, const int32_t* toks, int32_t
 void GeometricBackoff::select(const std::vector<int64_t>& pos, std::vector<int64_t>* keep) const {
     keep->clear();
     if (pos.empty()) return;
-    const int64_t tip = (int64_t)pos.size() - 1;
+    const int64_t tip = pos.back();
     std::vector<char> mark(pos.size(), 0);
-    mark[(size_t)tip] = 1;                    /* THE TIP IS ALWAYS KEPT */
-    for (int64_t d = 1; tip - d >= 0; d *= 2) mark[(size_t)(tip - d)] = 1;
+    mark.back() = 1;                          /* the tip is always kept */
+    for (int64_t s = interval_;; s *= 2) {
+        const int64_t b = tip / s;
+        for (int64_t j = b > 0 ? b - 1 : 0; j <= b; ++j) {
+            const auto it = std::lower_bound(pos.begin(), pos.end(), j * s);
+            if (it != pos.end() && *it < (j + 1) * s) mark[(size_t)(it - pos.begin())] = 1;
+        }
+        /* At this scale every position is in bucket 0, and so at every larger one. */
+        if (b == 0 || s > INT64_MAX / 4) break;
+    }
     for (size_t i = 0; i < pos.size(); ++i) if (mark[i]) keep->push_back(pos[i]);
 }
 
@@ -104,12 +93,11 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
     groups_.clear();
     map_.clear(); lru_.clear();
     ck_by_prefix_.clear(); ck_by_session_.clear();
-    /* THE POLICY COMES FROM THE CONFIG, and set_policy() overrides it -- which is the order a
-     * test wants and the order an operator wants. The three names are checked in config_parse, so
-     * an unknown one cannot reach here and silently become the default. */
+    /* config_parse rejects unknown names, so the else branch is "geometric-backoff".
+     * set_policy() may override this afterwards. */
     if (cfg.checkpoint_policy == "tip-only")      policy_ = std::make_unique<KeepTipOnly>();
     else if (cfg.checkpoint_policy == "keep-all") policy_ = std::make_unique<KeepAll>();
-    else                                          policy_ = std::make_unique<GeometricBackoff>();
+    else policy_ = std::make_unique<GeometricBackoff>(checkpoint_interval);
     report_.clear();
 
     if (!kv) return RAD_E_INVAL;
@@ -118,11 +106,8 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
         return RAD_OK;
     }
 
-    /* The cache's granularity is the block size of the first FULL-attention group, because that is
-     * the group whose content a prefix hit actually reuses. A paged group with a different block
-     * size cannot be indexed at that granularity and is named in the report rather than silently
-     * skipped -- a group that quietly stops being prefix-cached is a hit-rate regression nobody
-     * can attribute. */
+    /* Granularity is the first full-attention group's block size, since that is what a hit
+     * reuses. Paged groups with another block size are not cached and are named in the report. */
     for (const auto& p : kv->plans()) {
         if (p.kind == RAD_KV_FULL && block_size_ == 0) block_size_ = p.block_size;
         if (p.stateful()) has_linear_ = true;
@@ -138,45 +123,35 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
     std::string skipped;
     for (const auto& p : kv->plans()) {
         if (!p.paged()) continue;
-        /* A WINDOW GROUP CANNOT BE SERVED A PREFIX. Its blocks below the window are recycled, so
-         * the block list a hit hands over does not describe it -- adopt() would take a prefix's
-         * worth of blocks into a table the manager only ever grows to window_blocks, and the slot
-         * mapping is computed against a first_block_pos that a hit does not set. The group is
-         * simply not prefix-cached, which is correct and costs the sequences that hit a drafter
-         * or a windowed layer whose cache starts where the hit ended. */
+        /* A window group is not prefix-cached. Its blocks below the window are recycled, adopt()
+         * would overfill a table capped at window_blocks, and a hit does not set first_block_pos.
+         * A drafter or windowed layer's cache then starts where the hit ended. */
         if (p.kind == RAD_KV_WINDOW) {
-            skipped += fmt("  group '%s' is windowed (%lld blocks) -- NOT cached, a hit's blocks "
-                           "do not describe a cache whose floor moves\n",
+            skipped += fmt("  group '%s' is windowed (%lld blocks): not cached\n",
                            p.name.c_str(), (long long)p.window_blocks);
             continue;
         }
         if (p.block_size == block_size_) groups_.push_back(p.index);
-        else skipped += fmt("  group '%s' block %lld != cache granularity %lld -- NOT cached\n",
+        else skipped += fmt("  group '%s' block %lld != cache granularity %lld: not cached\n",
                             p.name.c_str(), (long long)p.block_size, (long long)block_size_);
     }
 
     interval_ = checkpoint_interval;
-    /* A WINDOW SNAPSHOT is state in the same sense: a hit is reusable at a checkpoint only, where
-     * the slot carries the window behind it (KVManager::has_window_snapshot). */
+    /* A window snapshot is state too: a hit is reusable only at a checkpoint, whose slot carries
+     * the window behind it (KVManager::has_window_snapshot). */
     if (kv->has_window_snapshot() && interval_ > 0) has_linear_ = true;
     if (has_linear_) {
         if (interval_ <= 0) {
-            RAD_ERR("checkpoint_interval is %lld but the model has linear-attention state. A "
-                    "0 interval means no checkpoint is ever written and every hit replays the "
-                    "linear layers from zero.", (long long)interval_);
+            RAD_ERR("checkpoint_interval is %lld but the model has linear-attention state, which "
+                    "needs a checkpoint for a hit to be usable", (long long)interval_);
             return RAD_E_INVAL;
         }
         if (interval_ % block_size_ != 0) {
-            /* A checkpoint that does not land on an attention block boundary can never be found:
-             * the lookup identifies a checkpoint by the chained hash at its position, and that
-             * hash only exists at block boundaries. vLLM's answer is to inflate the block to the
-             * interval, which is what costs it attention hit rate on every short prompt. Ours is
-             * to refuse the misconfiguration by name. */
+            /* A checkpoint is found by the chained hash at its position, which exists only on
+             * block boundaries, so an interval off the block grid would never hit. */
             RAD_ERR("the checkpoint interval resolves to %lld (from --checkpoint-interval %lld, "
-                    "rounded up to the chunk quantum) and that is not a multiple of the attention "
-                    "block size %lld. The linear checkpoint is found by the chained block hash at "
-                    "its position, and that hash exists only on a block boundary, so this interval "
-                    "would never produce a single hit (spec §7.3).",
+                    "rounded up to the chunk quantum), which is not a multiple of the attention "
+                    "block size %lld, so no checkpoint would ever hit (spec §7.3)",
                     (long long)interval_, (long long)cfg.checkpoint_interval,
                     (long long)block_size_);
             return RAD_E_INVAL;
@@ -185,11 +160,11 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
 
     enabled_ = true;
     report_ = fmt("prefix cache: %zu paged group(s) at %lld-token blocks; linear checkpoints "
-                  "every %lld tokens (%s a rank x %s, pinned host memory), retention '%s'\n",
+                  "every %lld tokens (%lld slots of %s a rank, pinned host memory), retention "
+                  "'%s'\n",
                   groups_.size(), (long long)block_size_,
                   (long long)(has_linear_ ? interval_ : 0),
-                  humanb(kv->checkpoint_bytes()).c_str(),
-                  fmt("%lld slots", (long long)kv->checkpoint_slots()).c_str(),
+                  (long long)kv->checkpoint_slots(), humanb(kv->checkpoint_bytes()).c_str(),
                   policy_->name());
     report_ += skipped;
     return RAD_OK;
@@ -240,35 +215,20 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
     for (; matched < n_full; ++matched) {
         auto it = map_.find(hs[(size_t)matched]);
         if (it == map_.end()) break;
-        /* AN ENTRY THE TIERS HOLD IS NOT A HIT, and this is the guard that makes demotion safe at
-         * all. Moving an entry off the device releases its KV blocks; the map keeps the entry so
-         * the bytes can be found again, but its `blocks` now name blocks the pool has given to
-         * somebody else. Serving them would hand one conversation another's context -- exactly
-         * the failure the token compare below exists to rule out, arrived at from the other side.
-         *
-         * The prefix simply stops here. The caller may promote and ask again (see
-         * restorable_from), and until it does the answer is an honest shorter hit. An entry with
-         * a promotion still out on it stops the prefix too: its ids are the ones it left with. */
+        /* An off-device entry is not a hit: demotion released its blocks and its recorded ids now
+         * belong to other sequences. The prefix stops here (also while a promotion is in flight);
+         * the caller may promote and look up again (restorable_from). */
         if (!it->second.in_lru) break;
-        /* Compare the token ids, not just the hash. A 128-bit collision is improbable; serving one
-         * conversation's context to another is not a failure anybody would ever diagnose, so it is
-         * made impossible rather than unlikely. */
-        const int32_t* src = tokens.data() + matched * block_size_;
-        if ((int64_t)it->second.tokens.size() != block_size_ ||
-            std::memcmp(it->second.tokens.data(), src, (size_t)block_size_ * sizeof(int32_t)) != 0)
-            break;
+        if (!same_tokens(it->second, tokens.data() + matched * block_size_)) break;
     }
 
-    /* At least one token must remain for the step to compute a logit from. A full hit is backed
-     * off by one block rather than being handed to a caller that would then schedule a zero-token
-     * forward pass. */
+    /* Back a full hit off by one block so one token remains to compute a logit from. */
     if (matched * block_size_ >= (int64_t)tokens.size() && matched > 0) --matched;
 
-    /* OVER THE SNAPSHOTS, NOT OVER THE POSITIONS. A checkpoint sits on the interval or at the
-     * tail of a prompt (Scheduler::plan_chunk), which is any block boundary, so the deepest one
-     * at or below `limit` is found by asking each snapshot whether this chain passes through it:
-     * its key is the chained hash at its own position, which matches only on the same prefix. The
-     * index holds a few hundred snapshots against tens of thousands of block positions. */
+    /* Deepest valid snapshot at or below `limit` on this chain. Checkpoints sit on the interval or
+     * at a prompt's tail (Scheduler::plan_chunk), i.e. on any block boundary, so iterate the
+     * snapshots (a few hundred) rather than the block positions (tens of thousands); a snapshot is
+     * on this chain when its key equals the chain hash at its position. */
     auto deepest = [&](int64_t limit) {
         auto best = ck_by_prefix_.end();
         for (auto it = ck_by_prefix_.begin(); it != ck_by_prefix_.end(); ++it) {
@@ -282,8 +242,8 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
         }
         return best;
     };
-    /* What a hit of `m` blocks lets a sequence skip: all of it, or with recurrent state only up
-     * to the deepest checkpoint under it (Scheduler::admit_one resumes there). */
+    /* Tokens a hit of `m` blocks lets a sequence skip: all of them, or with recurrent state only
+     * up to the deepest checkpoint (Scheduler::admit_one resumes there). */
     auto reusable = [&](int64_t m) -> int64_t {
         if (!has_linear_) return m * block_size_;
         const auto b = deepest(m * block_size_);
@@ -302,29 +262,26 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
     }
 
     const uint64_t now = rad_mono_ns();
-    for (int64_t b = 0; b < matched; ++b) {
-        touch(hs[(size_t)b], now);
-        if (!blocks_out) continue;
-        const Entry& e = map_.find(hs[(size_t)b])->second;
-        for (size_t g = 0; g < groups_.size(); ++g)
-            (*blocks_out)[g].push_back(e.blocks[g]);
-    }
-    /* A HIT IS A USE, and the tiers' idle clock has to hear about it: it is what decides when an
-     * entry leaves the device, and without this it runs from when the chain was published, so a
-     * prefix hit on every turn -- or one just promoted back for this very lookup -- would read as
-     * idle and be demoted from under the request using it. */
+    /* Deepest first, so the chain's first block is the most recent: under pressure a conversation
+     * loses its end before its start, and what is left still hits. */
+    for (int64_t b = matched - 1; b >= 0; --b) touch(hs[(size_t)b], now);
+    if (blocks_out)
+        for (int64_t b = 0; b < matched; ++b) {
+            const Entry& e = map_.find(hs[(size_t)b])->second;
+            for (size_t g = 0; g < groups_.size(); ++g)
+                (*blocks_out)[g].push_back(e.blocks[g]);
+        }
+    /* A hit is a use for the tiers' idle clock too; otherwise a prefix hit every turn, or one just
+     * promoted for this lookup, would look idle since its publish. */
     if (tiers_ && matched > 0) tiers_->note_hits(hs.data(), matched, now);
     hit.n_attn_tokens = (int32_t)(matched * block_size_);
     stats_.block_hits += matched;
     stats_.block_misses += n_full - matched;
 
-    /* ---- the split: how far the LINEAR state can be reused ----
-     * The attention blocks are reusable up to n_attn_tokens. The recurrent state is only reusable
-     * at a checkpoint: the deepest snapshot at or below n_attn_tokens on this chain, in its store
-     * slot. The scheduler resumes from there (Scheduler::admit_one) and recomputes the tokens
-     * between the two. */
+    /* ---- the split: how far the linear state can be reused ----
+     * Recurrent state is reusable only at the deepest snapshot at or below n_attn_tokens; the
+     * scheduler resumes there (Scheduler::admit_one) and recomputes the tokens in between. */
     if (!has_linear_) {
-        /* No recurrent state means nothing to replay: the whole attention hit is directly usable. */
         hit.n_linear_tokens = hit.n_attn_tokens;
         return hit;
     }
@@ -335,7 +292,7 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
     }
     hit.n_linear_tokens = (int32_t)best->second.pos;
     hit.checkpoint_slot = best->second.slot;
-    best->second.used = ++clock_;
+    best->second.used = best->second.resumed = ++clock_;
     best->second.used_ns = now;
     handed_.push_back(best->first);
     ++stats_.ckpt_hits;
@@ -360,12 +317,11 @@ int PrefixCache::insert(uint64_t session,
     for (int64_t b = 0; b < n_full; ++b) {
         const BlockHash& h = hs[(size_t)b];
         auto it = map_.find(h);
-        if (it != map_.end() && it->second.in_lru) { touch(h, now); continue; }
+        if (it != map_.end() && it->second.in_lru) continue;     /* touched below */
         if (it != map_.end()) {
-            /* AN ENTRY WHOSE ONLY COPY IS OFF THE CARD, AND THIS REQUEST JUST COMPUTED IT AGAIN --
-             * a restore that did not fit, or a chain cut short. The request's blocks become the
-             * entry's device copy and the tier copy is let go (IdleTiers::rebound says why). One
-             * with a promotion still out on it is left alone: its record is the transfer's. */
+            /* An off-device entry this request recomputed (a restore that did not fit, or a chain
+             * cut short). Its blocks become the entry's device copy and the tier copy goes
+             * (IdleTiers::rebound). An entry with a promotion in flight is left alone. */
             if (!tiers_ || !tiers_->resident_off_device(h)) continue;
             std::vector<int32_t> mine(groups_.size(), -1);
             size_t held = 0;
@@ -384,7 +340,7 @@ int PrefixCache::insert(uint64_t session,
             lru_.push_back(h);
             e.lru = std::prev(lru_.end());
             e.in_lru = true;
-            tiers_->rebound(h, e.blocks, now);
+            tiers_->rebound(h, e.blocks, now, b);
             continue;
         }
 
@@ -397,9 +353,8 @@ int PrefixCache::insert(uint64_t session,
             e.blocks[held] = blk;
         }
         if (held != groups_.size()) {
-            /* Unwind exactly what was taken. A half-referenced entry leaks a block forever, and a
-             * released block that was never retained frees one out from under a live sequence --
-             * both are silent and neither is diagnosable later. */
+            /* Unwind exactly what was retained: anything else leaks a block or frees one under a
+             * live sequence. */
             for (size_t g = 0; g < held; ++g) kv_->release_block(groups_[g], e.blocks[g]);
             return RAD_E_STATE;
         }
@@ -411,37 +366,27 @@ int PrefixCache::insert(uint64_t session,
         e.in_lru = true;
         map_.emplace(h, std::move(e));
     }
+    /* Deepest first, as in lookup: the first block ends most recent. */
+    for (int64_t b = n_full - 1; b >= 0; --b) touch(hs[(size_t)b], now);
 
-    /* THE TIERS LEARN THE CHAIN HERE AND NOWHERE ELSE. insert() is the one call that knows a chain
-     * was COMPLETED rather than merely touched -- which is what a session is -- and it is also the
-     * only place every entry's block ids are in hand at once.
+    /* The tiers learn the chain only here: insert() is the one call that knows a chain was
+     * completed, and the only place every entry's block ids are in hand.
      *
-     * AND THE IDS COME OUT OF THE MAP, NOT OUT OF `blocks`. The two are the same for an entry this
-     * call just created and DIFFERENT for one that already existed, because the loop above keeps
-     * the entry the cache already holds and lets this request's own copy of those blocks go. Both
-     * block tables describe the same tokens, but only the cache's is REFERENCED: the other belongs
-     * to a sequence that is about to be freed.
-     *
-     * Recording the wrong one is not a bookkeeping detail. The tiers demote what they were told,
-     * so they would gather out of blocks the pool had already handed to somebody else -- putting a
-     * stranger's KV in the tier under this prefix's key -- and then release a reference nobody
-     * took. It shows as a flood of "double free of block N" in the log and, once the entry is
-     * promoted back, as fluent text with one word changed. */
+     * The ids come from the map, not from `blocks`. For an entry that already existed the loop
+     * above kept the cache's blocks, and `blocks` belongs to a sequence about to be freed; the
+     * tiers would copy from blocks reassigned to another sequence. */
     if (tiers_) {
         for (int64_t b = 0; b < n_full; ++b) {
             auto it = map_.find(hs[(size_t)b]);
             if (it == map_.end()) continue;
-            tiers_->note_used(hs[(size_t)b], it->second.blocks, now);
+            tiers_->note_used(hs[(size_t)b], it->second.blocks, now, b);
         }
         tiers_->note_session(session, hs, n_tokens, now, label);
     }
 
-    /* A CONVERSATION'S SNAPSHOTS BELONG TO ITS LATEST TURN. The index keys a session by REQUEST
-     * id, so each turn would otherwise keep its own tip forever: turn N-1's deepest snapshot stays
-     * a "tip" after turn N has resumed from it and written deeper ones, and the retention policy
-     * then guards a dozen dead tips across a long agent run while thinning the one conversation
-     * that is live. Every snapshot on the chain this request just published is a prefix of it,
-     * and is moved under this id, so the policy sees one session with one tip. */
+    /* A conversation's snapshots belong to its latest turn. Sessions are keyed by request id, so
+     * without this each earlier turn's deepest snapshot would stay a protected tip. Every snapshot
+     * on the chain just published moves under this id, so the policy sees one session, one tip. */
     for (auto& kvp : ck_by_prefix_) {
         Ckpt& c = kvp.second;
         if (c.session == session || c.pos <= 0 || c.pos > n_full * block_size_ ||
@@ -467,35 +412,20 @@ std::vector<BlockHash> PrefixCache::restorable_from(const std::vector<int32_t>& 
     std::vector<BlockHash> out;
     if (!enabled_ || !tiers_ || tokens.empty()) return out;
 
-    /* THE BLOCKS A HIT CAN USE: one token must remain to compute a logit from, so a prompt that
-     * ends on a block boundary never reuses its last block (lookup backs off by one) and neither
-     * restoring it would be read. */
+    /* Only blocks a hit can use: one token must remain, so a prompt ending on a block boundary
+     * never reuses its last block (lookup backs off by one). */
     const int64_t n_full = ((int64_t)tokens.size() - 1) / block_size_;
     std::vector<BlockHash> hs = chain_all(tokens, mm, n_full);
 
-    /* Walk exactly as lookup does, and keep walking past the point it stopped for as long as the
-     * chain holds. EVERY off-device block in it is collected, not just the first run of them.
-     *
-     * STOPPING AT THE FIRST RESIDENT BLOCK PAST A GAP, on the reasoning that "the run this call is
-     * about has ended", would be wrong, and the way it is wrong is worth stating because the
-     * symptom does not look like a caching bug at all. A hit needs the WHOLE prefix:
-     * restoring blocks 0..99 and stopping leaves block 200 off-device, so the hit ends at 200 and
-     * everything above it is re-prefilled -- and WHICH blocks are off-device at the moment this
-     * runs depends on how far the maintenance pass has got. The same prompt then gets a different
-     * hit length on each restore.
-     *
-     * That is not only a lost prefix. The hit length is what the scheduler chunks the remaining
-     * prefill against, so two restores that recovered different amounts run different GEMM shapes
-     * over the same tokens -- and greedy decoding is tie-level sensitive to that (§19). The
-     * session's answer moves between restores, intermittently, with nothing wrong in the KV at
-     * all. Restoring the whole chain makes the hit length a property of the prompt. */
+    /* Walk as lookup does, past where it stopped, and collect every off-device block on the
+     * chain, not just the first run. Stopping at the first gap would make the hit length depend on
+     * how far the maintenance pass had got; the scheduler chunks the rest of the prefill against
+     * that length, and greedy output is tie-level sensitive to the GEMM shapes (§19). Restoring
+     * the whole chain makes the hit length a function of the prompt. */
     for (int64_t b = 0; b < n_full; ++b) {
         auto it = map_.find(hs[(size_t)b]);
         if (it == map_.end()) break;
-        const int32_t* src = tokens.data() + b * block_size_;
-        if ((int64_t)it->second.tokens.size() != block_size_ ||
-            std::memcmp(it->second.tokens.data(), src, (size_t)block_size_ * sizeof(int32_t)) != 0)
-            break;
+        if (!same_tokens(it->second, tokens.data() + b * block_size_)) break;
         if (tiers_->resident_off_device(hs[(size_t)b])) out.push_back(hs[(size_t)b]);
     }
     return out;
@@ -504,15 +434,13 @@ std::vector<BlockHash> PrefixCache::restorable_from(const std::vector<int32_t>& 
 void PrefixCache::drop_offdevice(const BlockHash& key) {
     auto it = map_.find(key);
     if (it == map_.end()) return;
-    /* NO release_block HERE, and that is the whole point. The entry has been off-device since it
-     * was demoted; the ids in it name blocks the pool reassigned long ago, so releasing them
-     * would free somebody else's context and serving them would hand it over. */
+    /* No release_block: the ids name blocks the pool has reassigned (see the declaration). */
     if (it->second.in_lru) lru_.erase(it->second.lru);
     map_.erase(it);
     ++stats_.evictions;
-    /* A SNAPSHOT KEYED BY THE SAME HASH STAYS. No lookup reaches it past the missing block, and
-     * the retention policy or the expiry retires it through the path that tells the tiers
-     * (retire_ckpt) -- this one is called by the tiers, holding their lock. */
+    /* A snapshot under the same key stays: no lookup reaches it past the missing block, and
+     * retention or expiry retires it via retire_ckpt. It cannot be retired here because the tiers
+     * call this holding their lock. */
 }
 
 int PrefixCache::rebind(const BlockHash& key, const std::vector<int32_t>& blocks) {
@@ -520,11 +448,9 @@ int PrefixCache::rebind(const BlockHash& key, const std::vector<int32_t>& blocks
     if (it == map_.end()) return RAD_E_NOTFOUND;
     if (blocks.size() != groups_.size()) return RAD_E_SHAPE;
     for (int32_t b : blocks) if (b < 0) return RAD_E_INVAL;
-    /* THE RESERVATION'S REFERENCE BECOMES THE CACHE'S. KVManager::reserve_block left each block at
-     * a refcount of one with no sequence attached; assigning them here is the handover, and the
-     * cache's ordinary release path frees them from now on. Retaining and then releasing to "make
-     * it explicit" would be a round trip to the same number and would only obscure which reference
-     * is which. */
+    /* The reservation's reference becomes the cache's: KVManager::reserve_block left each block at
+     * refcount one with no sequence attached, and the cache's release path frees it from now on.
+     * No extra retain. */
     Entry& e = it->second;
     e.blocks = blocks;
     for (size_t g = 0; g < groups_.size(); ++g) kv_->cache_reserved_block(groups_[g], blocks[g]);
@@ -544,14 +470,22 @@ bool PrefixCache::shared_with_live(const Entry& e) const {
     return false;
 }
 
+/* Token ids are compared too, so a hash collision is a miss rather than another conversation's
+ * context. */
+bool PrefixCache::same_tokens(const Entry& e, const int32_t* src) const {
+    return (int64_t)e.tokens.size() == block_size_ &&
+           std::memcmp(e.tokens.data(), src, (size_t)block_size_ * sizeof(int32_t)) == 0;
+}
+
+void PrefixCache::release_blocks(const Entry& e) {
+    for (size_t g = 0; g < groups_.size(); ++g) kv_->release_block(groups_[g], e.blocks[g]);
+}
+
 int64_t PrefixCache::evict_lru(int64_t n) {
     int64_t done = 0;
-    /* ONE PASS OVER WHAT WAS ON THE LIST WHEN THE CALL BEGAN. An entry a live sequence also holds
-     * goes to the back rather than being evicted: releasing the cache's reference on it frees no
-     * block, and an entry that had no host copy would be erased for nothing. It is in use, which is
-     * what the back of the list means, and moving it is what keeps a caller that asks again from
-     * walking the same shared run every time. It is stamped as used, which keeps the list in the
-     * clock's order. */
+    /* One pass over the list as it was on entry. An entry a live sequence also holds is in use:
+     * it moves to the back, stamped, so the list stays in clock order and the next call does not
+     * walk the same shared run. */
     const uint64_t now = rad_mono_ns();
     for (int64_t seen = (int64_t)lru_.size(); done < n && seen > 0 && !lru_.empty(); --seen) {
         const BlockHash h = lru_.front();
@@ -565,10 +499,9 @@ int64_t PrefixCache::evict_lru(int64_t n) {
         }
         lru_.pop_front();
         e.in_lru = false;
-        for (size_t g = 0; g < groups_.size(); ++g)
-            kv_->release_block(groups_[g], e.blocks[g]);
+        release_blocks(e);
         if (tiers_) {
-            /* THE HOST COPY HAS LANDED: the entry leaves VRAM and stays in the index. */
+            /* Host copy landed: the entry leaves VRAM and stays in the index. */
             if (tiers_->droppable(h)) {
                 tiers_->drop_commit(h);
                 ++stats_.drops;
@@ -585,9 +518,8 @@ int64_t PrefixCache::evict_lru(int64_t n) {
 }
 
 int64_t PrefixCache::trim(int64_t n_blocks) {
-    /* TIERS ATTACHED AND OFF are no tiers: nothing becomes droppable, and waiting for a copy that
-     * nobody will make would leave the reserve unkept for good. */
-    const bool keep = tiers_ && tiers_->any_on();
+    /* Tiers attached but off count as no tiers: no copy will ever land, so do not wait for one. */
+    const bool keep = tiers_ && tiers_->host_on();
     const uint64_t now = rad_mono_ns();
     int64_t done = 0;
     auto it = lru_.begin();
@@ -598,7 +530,7 @@ int64_t PrefixCache::trim(int64_t n_blocks) {
         if (m == map_.end()) { it = lru_.erase(it); continue; }
         Entry& e = m->second;
         if (shared_with_live(e)) {
-            /* In use: to the back, as evict_lru does, and the walk carries on from the next. */
+            /* In use: to the back, as in evict_lru. */
             auto next = std::next(it);
             lru_.splice(lru_.end(), lru_, it);
             e.used_ns = now;
@@ -608,8 +540,7 @@ int64_t PrefixCache::trim(int64_t n_blocks) {
         if (keep && !tiers_->droppable(h)) { ++it; continue; }
         it = lru_.erase(it);
         e.in_lru = false;
-        for (size_t g = 0; g < groups_.size(); ++g)
-            kv_->release_block(groups_[g], e.blocks[g]);
+        release_blocks(e);
         if (keep) {
             tiers_->drop_commit(h);
             ++stats_.drops;
@@ -631,6 +562,10 @@ int64_t PrefixCache::drop_clean() {
     if (frees != frees_seen_ || released_) {
         frees_seen_ = frees;
         released_ = false;
+        for (const BlockHash& h : drop_wait_) {
+            auto it = map_.find(h);
+            if (it != map_.end()) it->second.drop_wait = false;
+        }
         drop_scratch_.insert(drop_scratch_.end(), drop_wait_.begin(), drop_wait_.end());
         drop_wait_.clear();
     }
@@ -639,20 +574,14 @@ int64_t PrefixCache::drop_clean() {
         auto it = map_.find(h);
         if (it == map_.end()) continue;
         Entry& e = it->second;
-        e.drop_wait = false;
         if (!e.in_lru || !tiers_->droppable(h)) continue;
-        /* A BLOCK A RUNNING SEQUENCE ALSO HOLDS WOULD FREE NOTHING, and its entry would then be
-         * off-device in the index while its bytes sat in VRAM under somebody else's table -- the
-         * next lookup would restore a second copy beside them. */
-        bool shared = held_.count(h) > 0;
-        for (size_t g = 0; g < groups_.size() && !shared; ++g)
-            shared = kv_->block_refcount(groups_[g], e.blocks[g]) > 1;
-        if (shared) {
+        /* Skip held entries and blocks a running sequence also holds: dropping would free nothing,
+         * and the next lookup would restore a second copy beside the one still in VRAM. */
+        if (held_.count(h) > 0 || shared_with_live(e)) {
             if (!e.drop_wait) { e.drop_wait = true; drop_wait_.push_back(h); }
             continue;
         }
-        for (size_t g = 0; g < groups_.size(); ++g)
-            kv_->release_block(groups_[g], e.blocks[g]);
+        release_blocks(e);
         lru_.erase(e.lru);
         e.in_lru = false;
         ++stats_.drops;
@@ -662,18 +591,9 @@ int64_t PrefixCache::drop_clean() {
     return n;
 }
 
-/* THE REFCOUNT IS WHAT SEPARATES A CACHE FROM A LEAK. A block the cache indexes and a running
- * sequence is reading is not memory the cache could give back; a block only the cache references
- * is exactly what the next eviction frees. Nothing else distinguishes them -- both are `used`,
- * both are in the index -- so the count is the manager's: it marks the blocks the cache holds and
- * keeps the number of marked blocks at a reference count of one current as the counts move.
- *
- * ONE GROUP, FOR THE REASON THE POOL'S OWN TOKEN FIGURES ARE ONE GROUP'S: the paged groups share
- * a token axis and an entry is one block in each of them, so counting every group would multiply
- * the answer by the group count.
- *
- * OFF-DEVICE ENTRIES COUNT FOR NOTHING. A demoted entry released its blocks, and the mark went
- * with the release; its bytes are in host memory and it is holding none of the card. */
+/* The KV manager tracks how many cache-held blocks are at refcount one. One group only: the paged
+ * groups share a token axis and an entry is one block in each, so summing groups would multiply
+ * the answer. Off-device entries hold no blocks and count for nothing. */
 int64_t PrefixCache::unshared_tokens() const {
     if (!kv_ || groups_.empty() || block_size_ <= 0) return 0;
     return kv_->cache_only_blocks(groups_[0]) * block_size_;
@@ -681,9 +601,7 @@ int64_t PrefixCache::unshared_tokens() const {
 
 void PrefixCache::clear() {
     for (auto& kv : map_) {
-        if (kv.second.in_lru)
-            for (size_t g = 0; g < groups_.size(); ++g)
-                kv_->release_block(groups_[g], kv.second.blocks[g]);
+        if (kv.second.in_lru) release_blocks(kv.second);
         if (tiers_) tiers_->forget(kv.first);
         ++stats_.evictions;
     }
@@ -734,24 +652,35 @@ int64_t PrefixCache::retain(uint64_t session) {
     for (const auto& a : all) pos.push_back(a.first);
     std::vector<int64_t> keep;
     policy_->select(pos, &keep);
+    /* A policy may return its keep set in any order; the lookup below needs it sorted. */
+    std::sort(keep.begin(), keep.end());
+    const uint64_t tip_made = all.empty() ? 0 : ck_by_prefix_.find(all.back().second)->second.made;
 
     int64_t freed = 0;
     for (const auto& a : all) {
         if (std::binary_search(keep.begin(), keep.end(), a.first)) { kept.push_back(a.second); continue; }
-        /* NOR ONE HANDED OUT THIS STEP, whatever the policy says of its position: the admission it
-         * was handed to restores from the slot ahead of the step, and that is after this runs. */
+        /* Keep one handed out this step regardless of policy: its admission restores from the
+         * slot ahead of the step. */
         if (handed(a.second)) { kept.push_back(a.second); continue; }
         auto e = ck_by_prefix_.find(a.second);
         if (e == ck_by_prefix_.end()) continue;
+        /* And one a lookup resumed from since the session's tip was written. The policy places
+         * its ladder from the tip, but a later turn that resumed below the tip has left this
+         * chain there (a rewritten last message), and its next turn most likely resumes there
+         * again. */
+        if (e->second.resumed > tip_made) { kept.push_back(a.second); continue; }
+        RAD_DEBUG("prefix cache: snapshot at %lld of session %llu released by retention '%s' "
+                  "(unused for %.1f s)", (long long)e->second.pos,
+                  (unsigned long long)e->second.session, policy_->name(),
+                  idle_s(e->second.used_ns));
         retire_ckpt(e);
         ++freed;
         ++stats_.ckpt_evictions;
+        ++stats_.ckpt_retired;
     }
-    /* ERASE THE SESSION WHEN NOTHING IS LEFT OF IT, and that is not tidiness. `session` is a
-     * REQUEST id, so without an eraser this map gains an entry for every request that ever writes
-     * a checkpoint: the vector empties, here and in the eviction below, and the key stays. The
-     * cost is not the bytes -- it is that the loop in reserve_checkpoint walks EVERY key on every
-     * allocation failure, which is the one path this cache exists to relieve. */
+    /* Erase an emptied session. Sessions are request ids, so otherwise the map grows by one key
+     * per request that ever checkpointed, and reserve_checkpoint walks every key on each
+     * allocation failure. */
     if (kept.empty()) { ck_by_session_.erase(it); return freed; }
     it->second = std::move(kept);
     return freed;
@@ -761,17 +690,17 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
                                     int32_t* slot_out) {
     if (!enabled_ || !has_linear_) return RAD_E_UNSUPPORTED;
     if (!slot_out) return RAD_E_INVAL;
-    /* ON A BLOCK BOUNDARY, because the key is the chained hash of whole blocks. The scheduler
-     * places checkpoints on the interval and at the tail of a prompt, both on its chunk quantum,
-     * which is a multiple of the block. */
+    /* The key is the chained hash of whole blocks, so `pos` must be on a block boundary. The
+     * scheduler places checkpoints on its chunk quantum, a multiple of the block. */
     if (interval_ <= 0 || pos <= 0 || pos % block_size_ != 0) {
-        RAD_ERR("checkpoint at %lld is not on a %lld-token block boundary; the scheduler splits "
-                "chunks on its quantum precisely so this cannot happen (spec §7.3)",
+        RAD_ERR("checkpoint at %lld is not on a %lld-token block boundary, which the scheduler's "
+                "chunk quantum rules out (spec §7.3)",
                 (long long)pos, (long long)block_size_);
         return RAD_E_INVAL;
     }
     auto existing = ck_by_prefix_.find(prefix);
     if (existing != ck_by_prefix_.end()) {
+        existing->second.used = ++clock_;
         existing->second.used_ns = rad_mono_ns();
         *slot_out = existing->second.slot;
         return RAD_OK;
@@ -779,64 +708,48 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
 
     int32_t slot = -1;
     if (kv_->alloc_checkpoint(&slot) < 0) {
-        /* Budgeted retention: run the policy over every session before giving up. The tip of each
-         * session survives it by construction, because that is what an appending agent transcript
-         * needs (spec §7.3).
-         *
-         * Over a SNAPSHOT of the keys, because retain() erases a session it empties and a
-         * range-for over the map would be iterating a container it is erasing from. */
+        /* Run retention over every session. Iterate a copy of the keys: retain() erases sessions
+         * it empties. */
         std::vector<uint64_t> sessions;
         sessions.reserve(ck_by_session_.size());
         for (const auto& s : ck_by_session_) sessions.push_back(s.first);
         for (uint64_t s : sessions) retain(s);
         if (kv_->alloc_checkpoint(&slot) < 0) {
-            /* Still nothing. Drop the globally least-recently-used snapshot, PREFERRING a non-tip
-             * one -- but falling back to a tip rather than giving up.
-             *
-             * MAKING A TIP UNEVICTABLE OUTRIGHT WEDGES THE POOL PERMANENTLY. A session here is a
-             * REQUEST id (PCBinding passes r.id), and a finished request's checkpoints are meant
-             * to outlive it -- they are keyed by chained prefix hash, which is exactly how the
-             * next turn of an agent transcript finds them. So every request that writes a
-             * checkpoint leaves a tip behind and nothing ever retires one: after
-             * --checkpoint-slots such requests, every slot holds a dead session's tip and this
-             * would return RAD_E_FULL for the life of the process. The scheduler ignores the
-             * failure (scheduler.cpp: `>= 0 && cs >= 0`), so linear prefix caching would simply
-             * stop, with nothing in the log.
-             *
-             * Two passes rather than one comparison, because "prefer a non-tip" is a tier and not
-             * a tiebreak: the oldest tip must lose to the newest non-tip. */
+            /* Evict the least recently used snapshot, where a use is its reservation or a lookup
+             * resuming from it, and never one handed out this step (its admission restores from
+             * the slot ahead of the step). A tip gets no protection beyond its recency: sessions
+             * are request ids, and a client that rewrites its last message leaves one tip per
+             * turn that no later turn reaches, while the anchor every turn resumes from is used
+             * each turn. */
             const Ckpt* victim = nullptr;
-            const Ckpt* tip_victim = nullptr;
             for (const auto& kvp : ck_by_prefix_) {
-                /* NOT ONE A LOOKUP HANDED OUT THIS STEP: its admission restores from the slot
-                 * ahead of the step, and a slot freed under it restores nothing. */
                 if (handed(kvp.first)) continue;
-                auto sit = ck_by_session_.find(kvp.second.session);
-                bool is_tip = false;
-                if (sit != ck_by_session_.end()) {
-                    int64_t tip = -1;
-                    for (const BlockHash& h : sit->second) {
-                        auto e = ck_by_prefix_.find(h);
-                        if (e != ck_by_prefix_.end()) tip = std::max(tip, e->second.pos);
-                    }
-                    is_tip = (kvp.second.pos == tip);
-                }
-                const Ckpt*& best = is_tip ? tip_victim : victim;
-                if (!best || kvp.second.used < best->used) best = &kvp.second;
+                if (!victim || kvp.second.used < victim->used) victim = &kvp.second;
             }
-            if (!victim) victim = tip_victim;
-            if (!victim) return RAD_E_FULL;
+            if (!victim) {
+                ++stats_.ckpt_refused;
+                RAD_DEBUG("prefix cache: no snapshot at %lld for session %llu: every one of the "
+                          "%lld slots was handed out this step", (long long)pos,
+                          (unsigned long long)session, (long long)ck_by_prefix_.size());
+                return RAD_E_FULL;
+            }
+            RAD_DEBUG("prefix cache: store full, snapshot at %lld of session %llu (%s) evicted "
+                      "as the least recently used, unused for %.1f s", (long long)victim->pos,
+                      (unsigned long long)victim->session,
+                      is_tip(*victim) ? "its tip" : "below its tip", idle_s(victim->used_ns));
             const BlockHash vh = victim->prefix;
             const uint64_t vs = victim->session;
             retire_ckpt(ck_by_prefix_.find(vh));
             ++stats_.ckpt_evictions;
+            ++stats_.ckpt_lru;
             unindex_ckpt(vs, vh);
-            if (kv_->alloc_checkpoint(&slot) < 0) return RAD_E_FULL;
+            if (kv_->alloc_checkpoint(&slot) < 0) { ++stats_.ckpt_refused; return RAD_E_FULL; }
         }
     }
 
     Ckpt c;
-    c.session = session; c.pos = pos; c.prefix = prefix; c.slot = slot; c.used = ++clock_;
+    c.session = session; c.pos = pos; c.prefix = prefix; c.slot = slot;
+    c.used = c.made = ++clock_;
     c.used_ns = rad_mono_ns();
     ck_by_prefix_.emplace(prefix, c);
     ck_by_session_[session].push_back(prefix);
@@ -847,12 +760,10 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
 void PrefixCache::commit_checkpoint(const BlockHash& prefix) {
     auto it = ck_by_prefix_.find(prefix);
     if (it == ck_by_prefix_.end()) return;
-    /* One that lost its slot between the reservation and now holds nothing to serve. */
+    /* One that lost its slot since the reservation holds nothing to serve. */
     if (it->second.slot < 0) return;
     it->second.valid = true;
-    /* THE TIERS LEARN THE SNAPSHOT HERE, for the session view: before the commit the slot still
-     * holds the previous tenant's state, so this is the earliest moment at which telling them
-     * would be true. */
+    /* Tell the tiers (for the session view) only now that the slot holds this state. */
     if (tiers_) tiers_->note_snapshot(prefix, it->second.slot, it->second.pos);
 }
 
@@ -861,12 +772,25 @@ void PrefixCache::commit_checkpoint(const BlockHash& prefix) {
 
 void PrefixCache::retire_ckpt(std::unordered_map<BlockHash, Ckpt, BlockHashHash>::iterator it) {
     if (it == ck_by_prefix_.end()) return;
-    /* THE TIERS ARE TOLD, because they name the slot too: note_snapshot records it for the session
-     * view, and a view that kept it would count a slot the store has since given to another
-     * session as this one's resume point. */
+    /* The tiers record the slot for the session view and must stop naming it before it is reused. */
     if (tiers_) tiers_->release_snapshot(it->first);
     if (it->second.slot >= 0) kv_->free_checkpoint(it->second.slot);
     ck_by_prefix_.erase(it);
+}
+
+bool PrefixCache::is_tip(const Ckpt& c) const {
+    auto s = ck_by_session_.find(c.session);
+    if (s == ck_by_session_.end()) return false;
+    for (const BlockHash& h : s->second) {
+        auto e = ck_by_prefix_.find(h);
+        if (e != ck_by_prefix_.end() && e->second.pos > c.pos) return false;
+    }
+    return true;
+}
+
+double PrefixCache::idle_s(uint64_t used_ns) {
+    const uint64_t now = rad_mono_ns();
+    return now > used_ns ? (double)(now - used_ns) * 1e-9 : 0.0;
 }
 
 void PrefixCache::unindex_ckpt(uint64_t session, const BlockHash& key) {
@@ -885,22 +809,10 @@ void PrefixCache::hold(uint64_t req, const std::vector<int32_t>& tokens,
     for (int64_t b = 0; b < n_full; ++b) {
         auto it = map_.find(hs[(size_t)b]);
         if (it == map_.end()) break;
-        const int32_t* src = tokens.data() + b * block_size_;
-        if ((int64_t)it->second.tokens.size() != block_size_ ||
-            std::memcmp(it->second.tokens.data(), src, (size_t)block_size_ * sizeof(int32_t)) != 0)
-            break;
+        if (!same_tokens(it->second, tokens.data() + b * block_size_)) break;
         mine.push_back(hs[(size_t)b]);
         ++held_[hs[(size_t)b]];
     }
-}
-
-size_t PrefixCache::resident_prefix(const std::vector<BlockHash>& chain) const {
-    size_t n = 0;
-    for (; n < chain.size(); ++n) {
-        auto it = map_.find(chain[n]);
-        if (it == map_.end() || !it->second.in_lru) break;
-    }
-    return n;
 }
 
 void PrefixCache::release(uint64_t req) {
@@ -921,9 +833,8 @@ int64_t PrefixCache::expire(uint64_t now_ns, uint64_t ttl_ns) {
     const uint64_t cutoff = now_ns - ttl_ns;
     int64_t n = 0;
 
-    /* ---- in VRAM: the LRU list is in the clock's order, so the walk stops at the first entry it
-     * keeps. A block a running sequence also holds stays allocated -- releasing the cache's
-     * reference is not freeing the block -- and that sequence publishes it again when it ends. */
+    /* ---- in VRAM: the LRU is in clock order, so stop at the first entry kept. A block a running
+     * sequence also holds stays allocated; that sequence republishes it when it ends. */
     while (!lru_.empty()) {
         const BlockHash h = lru_.front();
         auto it = map_.find(h);
@@ -932,15 +843,14 @@ int64_t PrefixCache::expire(uint64_t now_ns, uint64_t ttl_ns) {
         if (e.used_ns >= cutoff) break;
         lru_.pop_front();
         e.in_lru = false;
-        for (size_t g = 0; g < groups_.size(); ++g)
-            kv_->release_block(groups_[g], e.blocks[g]);
+        release_blocks(e);
         /* The host copy goes with it: an expired entry is not demoted. */
         if (tiers_) tiers_->forget(h);
         map_.erase(it);
         ++n;
     }
 
-    /* ---- only in host memory: the tiers keep these in the clock's order too. */
+    /* ---- only in host memory: the tiers keep these in clock order too. */
     if (tiers_) {
         std::vector<BlockHash> keys;
         tiers_->expired(cutoff, (size_t)-1, &keys);
@@ -953,10 +863,8 @@ int64_t PrefixCache::expire(uint64_t now_ns, uint64_t ttl_ns) {
         }
     }
 
-    /* ---- snapshots, used when their prefix entry is or when a lookup hands them out. Not one
-     * that is still being written (a reservation not yet committed) and not one handed out this
-     * step: its admission restores from the slot ahead of the step. There are --checkpoint-slots
-     * of them at most, so the whole index is walked. */
+    /* ---- snapshots: skip uncommitted reservations and ones handed out this step. At most
+     * --checkpoint-slots of them, so walk the whole index. */
     std::vector<BlockHash> gone;
     for (const auto& kvp : ck_by_prefix_) {
         const Ckpt& c = kvp.second;

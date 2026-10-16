@@ -1,10 +1,9 @@
-/* aql_code.cpp -- reading AMDGPU code objects: the offload bundle a HIP fat binary is, the ELF
- * inside it, and the msgpack metadata note that says where each kernel's arguments go.
+/* aql_code.cpp -- reads AMDGPU code objects: the offload bundle of a HIP fat binary, the ELF
+ * inside it, and the msgpack metadata note that gives each kernel's argument layout.
  *
- * The AQL backend dispatches kernels HIP compiled and registered, so it needs two things HIP keeps
- * to itself: the code object for this card, to load into an executable of its own, and each
- * kernel's argument layout, to write a kernarg segment without HIP's help. Both are in the fat
- * binary the compiler embedded, and this file reads them.
+ * The AQL backend dispatches HIP-registered kernels itself, so it needs two things HIP does not
+ * expose: the card's code object, to load into its own executable, and each kernel's argument
+ * layout, to write kernarg segments. Both come from the embedded fat binary.
  *
  * Nothing here touches a device, so it builds and is tested without one.
  */
@@ -21,10 +20,9 @@ namespace {
 
 const char kHsaPrefix[] = "amdgcn-amd-amdhsa--";
 
-/* A target ID as LLVM writes it after the triple: a processor and any number of target features,
- * each `name+` or `name-` ("gfx942:sramecc+:xnack-"). A feature left out of a code object's ID
- * means the code object runs in either mode; one left out of a card's ID means the card has no
- * such mode. */
+/* A target ID as LLVM writes it after the triple: a processor and target features, each `name+`
+ * or `name-` ("gfx942:sramecc+:xnack-"). A feature absent from a code object's ID means it runs in
+ * either mode; absent from a card's ID, the card has no such mode. */
 struct TargetId {
     std::string proc;
     std::vector<std::pair<std::string, char>> feat;
@@ -44,18 +42,22 @@ TargetId parse_target_id(const std::string& s) {
     return t;
 }
 
-/* The target ID out of an ISA name ("amdgcn-amd-amdhsa--gfx1036") or a bundle entry's triple
- * ("hipv4-amdgcn-amd-amdhsa--gfx1036"); empty for anything that is not an AMDGPU HSA target, such
- * as the bundle's host entry. */
+/* The target ID from an ISA name ("amdgcn-amd-amdhsa--gfx1036") or a bundle entry's triple
+ * ("hipv4-amdgcn-amd-amdhsa--gfx1036"); empty for non-AMDGPU targets such as the host entry. */
 std::string target_id_of(const std::string& name) {
     const size_t at = name.find(kHsaPrefix);
     if (at == std::string::npos) return std::string();
     return name.substr(at + sizeof kHsaPrefix - 1);
 }
 
-/* -1 when a code object built for `co` cannot run on a card that accepts `card`; otherwise how
- * many target features the code object pins, so that one built for the card's exact mode is
- * preferred to one built for either mode. */
+/* An ISA name's target ID, or the name itself when it carries no HSA prefix. */
+std::string isa_target(const std::string& isa) {
+    const std::string id = target_id_of(isa);
+    return id.empty() ? isa : id;
+}
+
+/* -1 if a code object for `co` cannot run on a card accepting `card`; otherwise the number of
+ * features the code object pins, so one built for the card's exact mode is preferred. */
 int target_fit(const TargetId& co, const TargetId& card) {
     if (co.proc != card.proc) return -1;
     for (const auto& f : co.feat) {
@@ -77,7 +79,7 @@ bool bundle_code_object(const void* bundle, const std::vector<std::string>& isas
     *out_size = 0;
     if (!b) { *why = "null bundle"; return false; }
     if (std::memcmp(b, "CCOB", 4) == 0) {
-        *why = "the fat binary is a COMPRESSED offload bundle; build the kernel library without "
+        *why = "the fat binary is a compressed offload bundle; build the kernel library without "
                "--offload-compress";
         return false;
     }
@@ -89,8 +91,8 @@ bool bundle_code_object(const void* bundle, const std::vector<std::string>& isas
     std::memcpy(&n, b + 24, 8);
     if (n == 0 || n > 4096) { *why = "offload bundle with an implausible entry count"; return false; }
 
-    /* Every device entry, as "<kind>-amdgcn-amd-amdhsa--<target ID>". Both kinds HIP has used,
-     * "hip" and "hipv4", carry the same code object format for this purpose. */
+    /* Device entries are "<kind>-amdgcn-amd-amdhsa--<target ID>"; both kinds, "hip" and "hipv4",
+     * carry the same code object format for this purpose. */
     struct Entry { uint64_t off, size; TargetId id; std::string text; };
     std::vector<Entry> ents;
     const unsigned char* p = b + 32;
@@ -107,13 +109,11 @@ bool bundle_code_object(const void* bundle, const std::vector<std::string>& isas
         ents.push_back({ off, size, parse_target_id(id), id });
     }
 
-    /* THE CARD'S LIST DECIDES, IN THE CARD'S ORDER. The runtime reports the processor itself
-     * first and then the generic target of its family ("gfx1036", then "gfx10-3-generic"), each
-     * with the modes the card runs in. So a library built for the exact chip is used where it
-     * exists, and one built once for a family runs on every member of it. Within one accepted
-     * target, a code object pinned to the card's mode beats one built for either mode. */
+    /* Walk the card's ISA list in its own order: the exact processor first, then its family's
+     * generic target. An exact-chip build wins where present; a family build runs on every
+     * member. Within one target, a code object pinned to the card's mode wins. */
     for (const std::string& isa : isas) {
-        const TargetId card = parse_target_id(target_id_of(isa).empty() ? isa : target_id_of(isa));
+        const TargetId card = parse_target_id(isa_target(isa));
         const Entry* best = nullptr;
         int best_fit = -1;
         for (const Entry& e : ents) {
@@ -130,7 +130,7 @@ bool bundle_code_object(const void* bundle, const std::vector<std::string>& isas
     std::string have, want;
     for (const Entry& e : ents) have += (have.empty() ? "" : ", ") + e.text;
     for (const std::string& isa : isas)
-        want += (want.empty() ? "" : ", ") + (target_id_of(isa).empty() ? isa : target_id_of(isa));
+        want += (want.empty() ? "" : ", ") + isa_target(isa);
     *why = "the fat binary has code objects for [" + (have.empty() ? std::string("none") : have) +
            "] and this card runs [" + want + "]";
     return false;
@@ -138,9 +138,9 @@ bool bundle_code_object(const void* bundle, const std::vector<std::string>& isas
 
 /* ------------------------------------------------------------------ msgpack
  *
- * The subset a code object's metadata uses: maps, arrays, strings, integers, booleans and nil.
- * A DOM, because the metadata is walked by key and is a few hundred kilobytes at most, read once
- * per module at the first dispatch into it. */
+ * The subset code object metadata uses: maps, arrays, strings, integers, booleans and nil. Parsed
+ * into a DOM: the metadata is looked up by key, is a few hundred KB at most, and is read once per
+ * module at its first dispatch. */
 namespace {
 
 struct MP {

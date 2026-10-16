@@ -1,9 +1,9 @@
 #ifndef RAD_PHILOX_H
 #define RAD_PHILOX_H
 
-/* Counter-based Gaussian noise, the one definition every kernel library computes it by, so an
- * image's starting latent is a function of its seed and of nothing else: not the batch it shares a
- * pass with, not the rank count, not the order its rows are visited in.
+/* Counter-based Gaussian noise, the single definition every kernel library uses, so an image's
+ * starting latent depends only on its seed: not on the batch it shares a pass with, the rank
+ * count, or the order its rows are visited in.
  *
  * Element e of a seed's stream is Philox4x32-10 at counter (e / 4, 0) keyed by the 64-bit seed,
  * its four words made uniform in (0, 1) as ((w >> 8) + 0.5) * 2^-24 and paired by Box-Muller --

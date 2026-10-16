@@ -14,7 +14,7 @@
 #
 # DIR holds each layer's pooled Grams, recorded from ten million tokens of the bf16 model, and each
 # expert's own down Gram, from one million tokens with the per-expert tap, side by side; libquant
-# takes an expert's own wherever it holds at least 4096 rows and the layer's otherwise
+# takes an expert's own wherever it holds at least 4 x K rows (2560 for down) and the layer's otherwise
 # (docs/MOE-W4.md, "Calibration"). A variant of this recipe converted with --reuse w4nl64-i8lm.rad
 # re-quantises only the weights whose rule changed.
 #

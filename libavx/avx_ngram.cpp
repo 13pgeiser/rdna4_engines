@@ -1,63 +1,34 @@
-/* avx_ngram.cpp -- where embed_lookup_q's rows come from, and the table's stored arrangement.
- * BASELINE-COMPILED: no -m flags, like avx_dispatch.cpp. Nothing here is vector arithmetic; the
- * decode that is arrives from the calling level (avx_rows.h).
+/* avx_ngram.cpp -- the row source for embed_lookup_q, and the table's stored layout.
+ * Baseline-compiled (no -m flags), like avx_dispatch.cpp; the vector decode comes from the calling
+ * level (avx_rows.h).
  *
- * ============================== WHY THIS GATHER IS A HOST KERNEL ==============================
+ * Why a host kernel. The n-gram embedding is 320,001,536 rows of 160 E4M3 bytes (51.2 GB), read 16
+ * rows per token. The engine's mechanisms for oversized weights do not fit that access pattern:
+ * Tier::SSD + DeviceStaged stages whole movement units, Site::DeviceZeroCopy needs pinned host RAM,
+ * and hipHostRegister on the mapping would pin all 51.2 GB. core/format/radfile.cpp mmaps the
+ * container, so the table already sits at a host address backed by an NVMe file. The gather runs
+ * on the host over that mapping and only the [T, n_embd] bf16 result crosses the link. The placement
+ * planner puts an op on the host when all its weight operands are Site::Host (core/runtime/ctx.cpp),
+ * so the table must be a weight operand (a plain `gather_rows` input would not trigger it), and a
+ * production host kernel is needed since libref is not served (rad_gate_reference_kernels).
  *
- * An n-gram embedding of 320,001,536 rows of 160 E4M3 is 51.2 GB, read SIXTEEN ROWS A TOKEN, and
- * every mechanism for an oversized weight is built for a different shape of access:
+ * Row cache plus direct reads. Decoding a row takes a few dozen cycles; fetching it is the cost,
+ * and at decode about half the rows a step wants have never been read before. The page cache is
+ * the wrong cache: a buffered miss costs the submitting thread ~4 us (page allocation, insertion,
+ * block mapping, bio), serialising a call's cold rows, and it keeps a 4 KiB page per 160-byte row
+ * (pages average ~1 useful row out of 25). So RowCache (below) holds rows, shared by every gathering
+ * thread, and a miss is an O_DIRECT read of the aligned span holding the row (~2 us to submit,
+ * 512 bytes instead of 4096). With eight varied sequences a 2^19-row cache (80 MiB) misses 51.0% of
+ * rows against 50.6% for an unbounded one.
  *
- *   Tier::SSD + DeviceStaged   stages a WHOLE movement unit into a slab slot and DMAs it. Staging
- *                              51.2 GB to use 5 KB is not a slow path, it is the wrong shape.
- *   Site::DeviceZeroCopy       wants it in pinned host RAM, which a table this size does not fit.
- *   hipHostRegister on the map pins, so it would force all 51.2 GB resident. Same wall.
+ * Each miss is read once. Every rank gathers every row. A thread claims a missing row by marking
+ * its slot LOADING, reads it and publishes it READY; others wait instead of re-reading. Ranks start
+ * at different rows of a call, so the misses are split between them with no barrier.
  *
- * core/format/radfile.cpp mmaps the whole container -- "LOAD IS MAP-AND-GO" -- so the table is at
- * a HOST virtual address the moment the model opens, backed by a file on an NVMe. A sparse gather
- * of sixteen rows out of 320 million is a caching problem -- nothing can predict which rows are hot
- * -- but for a cache of ROWS, not of the 4 KiB pages the OS would keep; see the row cache below.
- * (core/place/mover.h rejects mmap for the WEIGHT POOL and that argument does not reach here -- it
- * is about SWEEPING a working set, where residency is controlled explicitly.)
- *
- * So the gather runs on the host, over the container's own mapping, and its [T, n_embd] bf16
- * result crosses the link once -- a few kilobytes a token at decode. The placement planner puts an
- * op on the host when every WEIGHT operand of it is Site::Host (core/runtime/ctx.cpp), which is why
- * the table has to be a weight operand: `gather_rows` takes a plain IN operand and would never
- * trigger it. A host op needs a host kernel in a production plugin -- libref is the oracle and
- * rad_gate_reference_kernels refuses to serve on it -- and host kernels are this plugin's.
- *
- * ============================== A SHARED ROW CACHE, AND DIRECT READS FOR ITS MISSES ==============================
- *
- * The gather is not arithmetic. 160 table bytes decode to 160 bf16 in a few dozen cycles; what a
- * row costs is getting its bytes, and at decode most of them have never been read before: eight
- * varied sequences want ~487 distinct rows a step, and about half of those are an n-gram hashed for
- * the first time (see the trace note below). No cache serves those; they are reads.
- *
- * THE PAGE CACHE IS THE WRONG CACHE FOR THIS TABLE, twice over. A buffered read of an uncached page
- * costs the submitting thread ~4 us -- page allocation, page-cache insertion, block mapping and the
- * bio all run inside the submission -- so a call's cold rows are started one after another: ~380 of
- * them take ~1.5 ms to submit, and the drive finishes the burst ~0.25 ms after the last one. And it
- * caches a 4 KiB page for a 160-byte row that shares its page with nothing else a gather wants, so
- * every miss evicts 4 KiB of some other file's cache to keep 160 bytes of this one.
- *
- * SO THE ROWS HAVE THEIR OWN CACHE, AND A MISS IS A DIRECT READ. RowCache below holds rows, not
- * pages, and every thread that gathers from the table shares it. A miss is an O_DIRECT read of the
- * aligned span holding the row: ~2 us to submit, nothing inserted anywhere, 512 bytes off the drive
- * where a page read takes 4096. At eight varied sequences a cache of 2^19 rows (80 MiB at 160 bytes)
- * misses 51.0% of rows, against 50.6% for an unbounded one.
- *
- * EACH MISS IS READ ONCE, BY WHICHEVER THREAD CLAIMS IT. Every rank gathers every row. A thread
- * claims a missing row by marking its slot LOADING, reads it and publishes it READY; a thread that
- * finds a row another thread is loading waits for it instead of reading it again. The ranks walk a
- * call's rows from different starting points, so each claims about its own share of the misses and
- * the cold work is divided between them rather than duplicated -- with no barrier between the
- * ranks: a late rank finds the rows already there.
- *
- * THE FILE COMES FROM THE MAPPING. The table operand is a pointer into the container's mmap and the
- * plugin ABI carries no file, so /proc/self/maps says which file and offset back that address, once
- * a table. A table no file backs -- a test's heap buffer -- is read as the memory it is. A file on a
- * filesystem that cannot do direct I/O is refused; direct_granule below finds the alignment the
- * reads keep, including on a filesystem that does not report one. */
+ * The file is found from the mapping: the ABI passes a pointer, so /proc/self/maps gives the file
+ * and offset, once per table. A table not backed by a file (a test's heap buffer) is read as
+ * memory. A file on a filesystem without direct I/O is refused; direct_granule finds the read
+ * alignment, also where the filesystem reports none. */
 #include "avx_rows.h"
 #include "avx_common.h"
 
@@ -89,35 +60,33 @@
 
 namespace {
 
-/* How many rows ahead of the one being looked up or decoded its cache lines are requested. The
- * rows are scattered over an 80 MiB cache and the set words over 4 MiB, so every row is a miss to
- * L3 or DRAM; a row's lines requested this far ahead arrive while the rows before it are worked on
- * instead of one after another. */
+/* Prefetch distance, in rows, for cache lookups and decodes. Rows are scattered over an 80 MiB
+ * cache and the set words over 4 MiB, so each is an L3 or DRAM miss. */
 constexpr long long kPrefetchRows = 8;
 
-/* One read of a row's aligned span: row m of the call, its key, and its cache slot (-1: the row is
- * decoded straight from the read, not kept). */
+/* One read of a row's aligned span: row m of the call, its key, and its cache slot (-1: decoded
+ * straight from the read, not cached). */
 struct SpanRead {
     long long m;
     uint64_t  key;
     int64_t   slot;
 };
 
-/* A thread's working state for one call, kept between calls so a call allocates nothing once the
- * thread has seen its largest. */
+/* Per-thread working state for a call, kept between calls so steady-state calls do not
+ * allocate. */
 struct Gather {
     std::vector<int64_t>   slot;     /* per row: its cache slot */
     std::vector<uint8_t>   kind;     /* per row: a RowCache::Found, or PAD / DONE below */
     std::vector<SpanRead>  reads;    /* the rows this thread reads */
     std::vector<long long> waits;    /* rows another thread is reading */
     std::vector<long long> again;    /* rows whose slot changed under the decode */
-    /* One decode batch: each row's source and destination, and for a row decoded from the cache,
-     * its call index and the slot word it was read under. */
+    /* One decode batch: each row's source and destination and, for cached rows, its call index
+     * and the slot word it was read under. */
     std::vector<const uint8_t*> src;
     std::vector<uint16_t*>      dst;
     std::vector<long long>      dm;
     std::vector<uint64_t>       dw;
-    /* The same for rows decoded straight from a read's bounce buffer. */
+    /* Sources and destinations for rows decoded from a read's bounce buffer. */
     std::vector<const uint8_t*> bsrc;
     std::vector<uint16_t*>      bdst;
     uint8_t*              bounce = nullptr;
@@ -126,9 +95,8 @@ struct Gather {
 
     enum : uint8_t { PAD = 16, DONE };
 
-    /* A buffer of at least `bytes` on a page and on `align`, a power of two: a direct read's
-     * buffer has to keep the file's granule, which a filesystem with large blocks puts above a
-     * page. */
+    /* A buffer of at least `bytes`, aligned to max(page, `align`) (a power of two): direct reads
+     * need the file's granule, which can exceed a page on large-block filesystems. */
     uint8_t* bounce_for(size_t bytes, size_t align) {
         if (align < 4096) align = 4096;
         if (bytes > bounce_bytes || align > bounce_align) {
@@ -149,9 +117,8 @@ inline Gather& gather_state() {
 
 #if defined(__linux__)
 
-/* The file behind a table: the address range of its mapping, the file offset of that range's first
- * byte, and the file opened for direct reads with the granule their offsets and lengths must keep.
- * `fd` is -1 for memory no file backs. */
+/* The file behind a table: its mapping's address range, the file offset of the range's first byte,
+ * an O_DIRECT fd, and the granule reads must align to. `fd` is -1 for memory with no file. */
 struct TableFile {
     const uint8_t* lo    = nullptr;
     const uint8_t* hi    = nullptr;
@@ -160,23 +127,18 @@ struct TableFile {
     long long      align = 0;
 };
 
-/* THE GRANULE OF A DIRECT READ of `t`'s file, opened for them as `t.fd`: the alignment a read's
- * file offset, its length and its buffer's address must all keep. 0, with `*why` saying why, when
- * the file cannot be read that way. [p, p + n) is the table, inside the mapping, and `ino` the
- * mapped file's inode.
+/* Granule of a direct read of `t`'s file (`t.fd`): the alignment the file offset, length and buffer
+ * address must all keep. Returns 0, with `*why`, if the file cannot be read that way. [p, p + n) is
+ * the table inside the mapping; `ino` is the mapped file's inode.
  *
- * STATX_DIOALIGN is the filesystem's own answer, and not every filesystem gives one: btrfs does
- * direct reads and reports nothing, and so does a tmpfs since Linux 6.6. Without the report the
- * granule is the file's block size, stx_blksize. No block filesystem's direct reads need more --
- * a filesystem's blocks are never smaller than its device's sectors -- and btrfs needs exactly
- * that: its sector size, below which it does not refuse a direct read but serves it through the
- * page cache instead.
+ * STATX_DIOALIGN is used when reported. btrfs (and tmpfs since Linux 6.6) does direct reads but
+ * reports nothing; then the granule is stx_blksize. No block filesystem needs more (blocks are never
+ * smaller than device sectors), and btrfs needs exactly its sector size: below it, it silently
+ * serves direct reads through the page cache.
  *
- * Reported or not, one read proves the granule before any row is served: a span of the table at
- * an offset and into a buffer each aligned to the granule and to no more, which has to return the
- * bytes the mapping holds there. That catches a filesystem refusing the granule and a file that is
- * not the one mapped. A btrfs serving the read through the page cache returns the right bytes and
- * passes it; the block size is what keeps btrfs off that path. */
+ * One test read then proves the granule: a span at an offset and into a buffer aligned to the
+ * granule and no more, which must return the bytes the mapping holds. This catches a refused
+ * granule and a file that is not the one mapped. */
 long long direct_granule(const TableFile& t, const uint8_t* p, long long n, unsigned long long ino,
                          const char* path, const char** why) {
     struct statx sx;
@@ -204,7 +166,7 @@ long long direct_granule(const TableFile& t, const uint8_t* p, long long n, unsi
         return 0;
     }
 
-    /* An odd multiple of the granule, so neither the offset nor the buffer keeps more than it. */
+    /* An odd multiple of the granule, so neither offset nor buffer is over-aligned. */
     const long long tab_lo = t.off + (long long)(p - t.lo);
     long long o = (tab_lo + a - 1) & ~(a - 1);
     if ((o / a) % 2 == 0) o += a;
@@ -234,10 +196,9 @@ long long direct_granule(const TableFile& t, const uint8_t* p, long long n, unsi
     return a;
 }
 
-/* The file behind [p, p + n): the mapping holding `p`, extended over the mappings that continue it
- * in the same file (a madvise over a sub-range splits one mapping into several). Looked up once per
- * table and kept for the life of the process; every rank thread shares the entry and the fd, and a
- * read at an explicit offset has no file position to share. */
+/* The file behind [p, p + n): the mapping holding `p`, extended over following mappings of the same
+ * file (madvise on a sub-range splits a mapping). Looked up once per table and kept for the life of
+ * the process; rank threads share the entry and fd (reads use explicit offsets). */
 const TableFile* table_file(const uint8_t* p, long long n, int* err) {
     static std::mutex mu;
     static std::vector<std::unique_ptr<TableFile>> known;
@@ -267,7 +228,7 @@ const TableFile* table_file(const uint8_t* p, long long n, int* err) {
         while (!name.empty() && (name.back() == '\n' || name.back() == ' ')) name.pop_back();
         if (!found) {
             if ((uintptr_t)p < lo || (uintptr_t)p >= hi) continue;
-            if (inode == 0 || name.empty() || name[0] != '/') break;     /* no file: memory */
+            if (inode == 0 || name.empty() || name[0] != '/') break;     /* not file-backed */
             found = true;
             t->lo = (const uint8_t*)(uintptr_t)lo;
             t->off = (long long)off;
@@ -303,22 +264,21 @@ const TableFile* table_file(const uint8_t* p, long long n, int* err) {
     return known.back().get();
 }
 
-/* ============================== THE ROW CACHE ==============================
+/* ============================== the row cache ==============================
  *
- * Set-associative: a row's key -- its byte offset in the file -- hashes to a set of kWays slots, and
- * a slot is one atomic word plus the row's bytes. The word is the slot's whole state:
+ * Set-associative: a row's key (its byte offset in the file) hashes to a set of kWays slots; a slot
+ * is one atomic word plus the row's bytes. The word is the slot's whole state:
  *
  *      key << 10 | owner << 2 | state          state: EMPTY (word 0), LOADING, READY
  *
- * owner names the thread loading the row, so a thread that meets its own claim again (a row twice in
- * one call) does not wait on itself. A reader of a READY slot copies the bytes and then reads the
- * word again: a slot's bytes are only rewritten after its word has left READY, so an unchanged word
- * means the copy was that row's (a seqlock). The victim in a full set is chosen by CLOCK over
- * per-slot reference bits, kept outside the word so that marking a row used never fails another
- * reader's check; a LOADING slot is never a victim.
+ * `owner` is the loading thread, so a thread meeting its own claim (a row twice in one call) does
+ * not wait on itself. Readers copy a READY slot's bytes and re-read the word: bytes are rewritten
+ * only after the word leaves READY, so an unchanged word means a valid copy (a seqlock). Victims are
+ * chosen by CLOCK over per-slot reference bits kept outside the word (so marking a row used never
+ * fails a reader's check); LOADING slots are never victims.
  *
- * A set's eight words are one 64-byte line. The arrays are anonymous mappings, so a slot costs
- * memory once a row lands in it. */
+ * A set's eight words are one 64-byte line. The arrays are anonymous mappings, so memory is
+ * committed only as slots fill. */
 struct RowCache {
     static constexpr int      kWays = 8;
     static constexpr uint64_t kRows = 1ull << 19;
@@ -331,7 +291,7 @@ struct RowCache {
     std::atomic<uint8_t>*  ref      = nullptr;
     std::atomic<uint8_t>*  hand     = nullptr;
     uint8_t*               data     = nullptr;
-    std::atomic<uint32_t>  published{0};    /* bumped, and waited on, as a batch of rows lands */
+    std::atomic<uint32_t>  published{0};    /* bumped (and waited on) as each batch lands */
 
     static uint64_t ready(uint64_t key) { return key << 10 | READY; }
 
@@ -345,9 +305,8 @@ struct RowCache {
 
     enum Found { HIT, CLAIMED, MINE, THEIRS, NONE };
 
-    /* The slot holding `key` -- READY (HIT), being loaded by this thread (MINE) or by another
-     * (THEIRS) -- or a slot claimed for it now (CLAIMED), or none when every slot of its set is
-     * being loaded. */
+    /* The slot holding `key`: READY (HIT), loading by this thread (MINE) or another (THEIRS); or a
+     * slot claimed for it now (CLAIMED); or NONE when every slot of the set is loading. */
     Found find_or_claim(uint64_t key, uint64_t me, int64_t* slot) {
         const uint64_t set = mix(key) & set_mask;
         const uint64_t s0  = set * kWays;
@@ -367,7 +326,7 @@ struct RowCache {
                 if (x == EMPTY && victim < 0) victim = (int64_t)(s0 + w);
             }
             /* CLOCK: clear reference bits until a READY slot without one comes round. Two turns
-             * clear them all, so a victim is found unless every slot is LOADING. */
+             * clear them all, so this fails only if every slot is LOADING. */
             for (int k = 0; victim < 0 && k < 2 * kWays; ++k) {
                 const uint8_t  h = hand[set].load(std::memory_order_relaxed);
                 hand[set].store((uint8_t)((h + 1) % kWays), std::memory_order_relaxed);
@@ -384,12 +343,12 @@ struct RowCache {
             if (victim < 0) { *slot = -1; return NONE; }
             if (word[victim].compare_exchange_strong(vw, key << 10 | me << 2 | LOADING,
                                                      std::memory_order_acq_rel)) {
-                /* The bytes are rewritten only after this; see the seqlock note above. */
+                /* Bytes are rewritten only after this (seqlock, above). */
                 std::atomic_thread_fence(std::memory_order_release);
                 *slot = victim;
                 return CLAIMED;
             }
-            /* Another thread changed the set between the look and the claim: look again. */
+            /* The set changed between the scan and the claim: retry. */
         }
     }
 };
@@ -401,8 +360,7 @@ T* anon_array(size_t count) {
     return p == MAP_FAILED ? nullptr : static_cast<T*>(p);
 }
 
-/* The cache for rows of `n` bytes from `tf`, made on first use and kept for the life of the
- * process. */
+/* The cache for `n`-byte rows of `tf`, created on first use and kept for the process lifetime. */
 RowCache* row_cache(const TableFile* tf, long long n) {
     static std::mutex mu;
     static std::vector<std::unique_ptr<RowCache>> caches;
@@ -422,11 +380,31 @@ RowCache* row_cache(const TableFile* tf, long long n) {
     return caches.back().get();
 }
 
-/* This thread's owner tag in a LOADING word: distinct for every thread that gathers, 1..255. */
+/* This thread's owner tag for LOADING words, 1..255, or 0 while 255 live threads hold one (such a
+ * thread cannot gather through the cache). A thread holds LOADING words only inside a call, so its
+ * tag is returned for reuse when it exits. */
 inline uint64_t owner_tag() {
-    static std::atomic<uint32_t> next{0};
-    static thread_local const uint32_t me = ++next;
-    return me <= 255 ? me : 0;
+    struct Pool {
+        std::mutex mu;
+        std::vector<uint32_t> free;
+        uint32_t next = 0;
+    };
+    static Pool& pool = *new Pool;     /* never destroyed: threads may exit after statics are */
+    struct Tag {
+        uint32_t v = 0;
+        Tag() {
+            std::lock_guard<std::mutex> lk(pool.mu);
+            if (!pool.free.empty()) { v = pool.free.back(); pool.free.pop_back(); }
+            else if (pool.next < 255) v = ++pool.next;
+        }
+        ~Tag() {
+            if (!v) return;
+            std::lock_guard<std::mutex> lk(pool.mu);
+            pool.free.push_back(v);
+        }
+    };
+    static thread_local const Tag me;
+    return me.v;
 }
 
 struct ReadRing {
@@ -439,11 +417,10 @@ struct ReadRing {
     io_uring_cqe  *cqes     = nullptr;
     void          *sq_ring  = nullptr, *cq_ring = nullptr;
     size_t         sq_sz = 0, cq_sz = 0, sqe_sz = 0;
-    int            err      = 0;     /* the errno that stopped init(), for ring_refusal() */
+    int            err      = 0;     /* errno from a failed init(), for ring_refusal() */
 
-    /* One thread submits and reaps (SINGLE_ISSUER), and completions are run when it asks for them
-     * rather than by interrupting it (DEFER_TASKRUN): the ring is thread-local and the thread only
-     * ever waits for a batch it has just submitted. */
+    /* SINGLE_ISSUER and DEFER_TASKRUN: the ring is thread-local, and its thread only waits for
+     * batches it has just submitted, so completions run when it asks for them. */
     bool init() {
         io_uring_params p;
         std::memset(&p, 0, sizeof p);
@@ -489,9 +466,8 @@ struct ReadRing {
     }
     ~ReadRing() { shut(); }
 
-    /* The aligned span holding each row of `r[0, count)` (count <= entries) into `bounce`, one span
-     * every `stride` bytes; submitted with one call that also waits for all of them. Every read
-     * must return its whole span. */
+    /* Reads the aligned span holding each row of `r[0, count)` (count <= entries) into `bounce`,
+     * one span per `stride` bytes, submitting and waiting in one call. Short reads fail. */
     int read_spans(const TableFile& tf, const SpanRead* r, unsigned count, long long n,
                    long long stride, uint8_t* bounce) {
         const long long A = tf.align;
@@ -531,9 +507,8 @@ struct ReadRing {
     }
 };
 
-/* Thread-local: each rank thread issues its own step, so each gets its own ring and the two never
- * contend. Built on that thread's first gather over a file and torn down when the thread exits. */
-/* This thread's ring, made on its first gather. Null if it could not be made, with the errno in
+/* This thread's ring, created on its first gather over a file and destroyed at thread exit (each
+ * rank thread has its own, so they never contend). Null if it could not be made, with the errno in
  * `*why`. */
 inline ReadRing* read_ring(int* why) {
     static thread_local bool tried = false;
@@ -549,10 +524,9 @@ inline ReadRing* read_ring(int* why) {
     return r.get();
 }
 
-/* WHY THIS PROCESS CANNOT MAKE A RING, said in terms of what to change. Docker's default seccomp
- * profile is by far the commonest: it answers EPERM to io_uring_setup, and so does the
- * kernel.io_uring_disabled sysctl. A kernel too old for SINGLE_ISSUER and DEFER_TASKRUN answers
- * EINVAL. */
+/* Explains a ring failure in terms of the fix. EPERM: Docker's default seccomp profile or the
+ * kernel.io_uring_disabled sysctl. EINVAL: a kernel without SINGLE_ISSUER / DEFER_TASKRUN.
+ * ENOMEM: the ring's memory refused, e.g. over a locked-memory limit shared with other processes. */
 std::string ring_refusal(int e) {
     std::string s = "libavx: the n-gram table is read through io_uring, and this process cannot "
                     "make a ring (" + std::string(std::strerror(e)) + "). ";
@@ -565,11 +539,14 @@ std::string ring_refusal(int e) {
     else if (e == EINVAL)
         s += "The ring needs IORING_SETUP_SINGLE_ISSUER and IORING_SETUP_DEFER_TASKRUN, which "
              "Linux 6.1 added.";
+    else if (e == ENOMEM)
+        s += "The kernel refused the ring's memory. It can count against the locked-memory limit "
+             "(ulimit -l), which every process of this user shares: raise it (LimitMEMLOCK= in a "
+             "systemd unit, --ulimit memlock=-1 for Docker) or stop other io_uring users.";
     return s;
 }
 
-/* Whether this process can make the ring every gathering thread makes: 0, or the errno that
- * stopped it. Asked once, by making one and closing it. */
+/* 0 if this process can create a ring, else the errno. Tested once by creating and closing one. */
 int ring_errno() {
     static const int e = [] {
         ReadRing r;
@@ -578,10 +555,9 @@ int ring_errno() {
     return e;
 }
 
-/* Read `reads` through the ring, a batch at a time: a row with a slot is copied into the cache and
- * published READY; a row without one is decoded straight into its output row. On a failed read,
- * every claim not yet published is given up (its word back to EMPTY) so no other thread waits on
- * it. */
+/* Reads `reads` through the ring in batches: rows with a slot are copied into the cache and
+ * published READY; rows without one are decoded directly into their output rows. On a failed read,
+ * every unpublished claim is released (word back to EMPTY) so no thread waits on it. */
 int read_and_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
                      const std::vector<SpanRead>& reads, long long n, long long ne,
                      avx::RowDecode decode, const uint16_t* lut, uint16_t* out, long long x_ld) {
@@ -622,17 +598,15 @@ int read_and_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
     return RAD_OK;
 }
 
-/* out[m] = the decoded row ids[m] - voff for every m < M, through the cache: find or claim every
- * row starting at row `first`, read this thread's claims, wait for the rows other threads are
- * reading, then decode everything from the cache. A row whose slot is taken over while it is being
- * decoded is read again, without the cache. */
+/* out[m] = decoded row ids[m] - voff for every m < M, through the cache: find or claim each row
+ * starting at row `first`, read this thread's claims, wait for rows other threads are reading, then
+ * decode from the cache. A row whose slot is taken over during the decode is read again directly. */
 int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowGather& q,
                 long long first, avx::RowDecode decode, const uint16_t* lut) {
     Gather& g = gather_state();
     const uint64_t me = owner_tag();
     if (!me) return RAD_E_UNSUPPORTED;
-    /* `n` is a row's BYTES -- what the cache holds and the file offsets step by -- and `ne` its
-     * elements, what the decode and a padding row write. */
+    /* `n` is a row's bytes (cache and file offsets); `ne` its elements (decode and padding). */
     const long long M = q.M, n = q.row_bytes, ne = q.n_embd, x_ld = q.x_ld;
     const long long base = tf.off + (long long)(q.tab - tf.lo);
     auto row_of = [&](long long m) { return (long long)q.ids[m] - q.voff; };
@@ -666,9 +640,9 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
     int rs = read_and_publish(tf, rc, rr, g, g.reads, n, ne, decode, lut, q.out, x_ld);
     if (rs != RAD_OK) return rs;
 
-    /* The rows another thread claimed: wait for each to turn READY. `published` is read before the
-     * words, so a batch that lands after the look changes it and the wait returns at once. A claim
-     * given up (a failed read) or a slot that moved on is read here instead. */
+    /* Wait for rows other threads claimed to turn READY. `published` is read before the words, so
+     * a batch landing after the scan makes the wait return at once. Released claims (failed reads)
+     * and reused slots are read by this thread instead. */
     while (!g.waits.empty()) {
         const uint32_t e = rc.published.load(std::memory_order_acquire);
         size_t keep = 0;
@@ -684,9 +658,8 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
         if (keep) rc.published.wait(e, std::memory_order_acquire);
     }
 
-    /* Every READY row, decoded in one batch: each row's word is read before its bytes and read
-     * again after all of them (the seqlock above, over the batch), and a row whose word changed in
-     * between is read again. */
+    /* Decode all READY rows in one batch: each word is read before the bytes and again after the
+     * batch (the seqlock), and rows whose word changed are read again. */
     g.src.clear();
     g.dst.clear();
     g.dm.clear();
@@ -716,21 +689,17 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
     return read_and_publish(tf, rc, rr, g, g.reads, n, ne, decode, lut, q.out, x_ld);
 }
 
-/* ============================== THE READER THAT RUNS A STEP AHEAD ==============================
+/* ============================== the reader that runs a step ahead ==============================
  *
- * A prefill chunk gathers `heads` rows a token -- 32,768 at a 2048-token chunk -- and on text the
- * cache has not seen, most of them are reads from the file: ~30 ms of random reads a chunk on an
- * NVMe drive, during which the step's issuing thread waits in this op and the card idles
- * behind it. The NEXT chunk's ids are known a step early (RadBatch::n_ahead, ngram_ids'
- * `ahead_ids`), so the call hands them to one process-wide reader thread and returns. The reader
- * claims each row the cache lacks, reads it and publishes it READY while the chunk runs on the
- * card; the next call finds its rows in the cache, or LOADING under the reader's tag, and waits
- * for those exactly as it waits for a row the other rank is reading.
+ * A prefill chunk gathers `heads` rows per token (32,768 for a 2048-token chunk); on unseen text
+ * most are file reads (~30 ms per chunk on NVMe), during which the issuing thread waits and the card
+ * idles. The next chunk's ids are known a step early (RadBatch::n_ahead, ngram_ids' `ahead_ids`), so
+ * the call hands them to one process-wide reader thread, which claims, reads and publishes the
+ * missing rows while the chunk runs. The next call waits for LOADING rows as it would for the other
+ * rank's.
  *
- * Both ranks hand over the same ids, and the second hand-over of a list the reader already has is
- * dropped. A failed read gives its claims up (read_and_publish), and the next call reads those
- * rows itself. The reader lives as long as the process: it is never joined, so neither it nor its
- * queue is ever destroyed under it. */
+ * Both ranks hand over the same ids; a repeated list is dropped. A failed read releases its claims
+ * and the next call reads those rows itself. The reader is detached and never destroyed. */
 struct AheadJob {
     const TableFile*      tf = nullptr;
     RowCache*             rc = nullptr;
@@ -742,7 +711,7 @@ struct AheadReader {
     std::mutex              mu;
     std::condition_variable cv;
     std::deque<AheadJob>    q;
-    uint64_t                last = 0;     /* the last id list taken, hashed */
+    uint64_t                last = 0;     /* hash of the last id list accepted */
 
     void run() {
         Gather&        g  = gather_state();
@@ -765,7 +734,7 @@ struct AheadReader {
                 if (j.rc->find_or_claim(j.keys[i], me, &slot) == RowCache::CLAIMED)
                     g.reads.push_back({0, j.keys[i], slot});
             }
-            /* Every read has a slot, so nothing is decoded and there is no output to write. */
+            /* Every read has a slot, so nothing is decoded and there is no output. */
             (void)read_and_publish(*j.tf, *j.rc, *rr, g, g.reads, j.n, 0, nullptr, nullptr,
                                    nullptr, 0);
         }
@@ -781,7 +750,7 @@ AheadReader* ahead_reader() {
     return r;
 }
 
-/* Hand the rows of `q.ahead` -- rows a later call will gather -- to the reader. */
+/* Hands the rows of `q.ahead` (to be gathered by a later call) to the reader. */
 void read_ahead(const TableFile& tf, RowCache& rc, const avx::RowGather& q) {
     uint64_t h = 1469598103934665603ull ^ (uint64_t)(uintptr_t)&rc;
     for (long long m = 0; m < q.n_ahead; ++m) { h ^= (uint32_t)q.ahead[m]; h *= 1099511628211ull; }
@@ -808,61 +777,9 @@ void read_ahead(const TableFile& tf, RowCache& rc, const avx::RowGather& q) {
     r->cv.notify_one();
 }
 
-/* ============================== THE ROW-ID TRACE ==============================
- *
- * AVX_PLE_TRACE=<path> appends every row id this op gathers, one per line. Off unless the variable
- * is set, and it changes nothing the op computes. Two design questions -- "does the page cache ever
- * hit" and "would a userspace cache of 160-byte rows beat it, being 25x denser than a 4 KiB page
- * holding one useful row" -- are the SAME question about the n-gram reuse rate, and that is a
- * property of the text being generated rather than of this code. This is how to measure it on a
- * real generation.
- *
- * ---- WHAT IT SHOWS ON A PREFILL, WHICH IS WHERE THE ROWS ARE ----------------------------------
- *
- * A ~24k-token prefill of prose, both ranks traced, with the rows read through the container's
- * mapping rather than the row cache (fault counts from /proc/<pid>/stat):
- *
- *      762,432 rows gathered      277,911 distinct      450,608 MINOR faults      2 MAJOR
- *
- * THE PAGE CACHE HITS ESSENTIALLY ALWAYS once warm. Two major faults over a whole prefill: what a
- * read through the mapping pays instead is PAGE-TABLE POPULATION -- a minor fault to map an
- * already-cached page, about 1.2 of them per row gathered, at roughly a microsecond each.
- *
- * THE DENSITY ARGUMENT HOLDS AND IT IS THE WHOLE PRIZE. The distinct rows a prefill wants land on
- * 274,887 distinct 4 KiB pages: 1.011 USEFUL ROWS A PAGE, where a page holds 25. So 44.5 MB of
- * wanted row bytes is reached through 1.13 GB of page mapping. The packed row cache above keeps
- * only the rows touched and pays no mapping at all.
- *
- * THE REUSE RATE ALONE DOES NOT CARRY IT. Per rank the same prefill gathers 381,216 rows over
- * 277,911 distinct ones -- 1.37x, and 86% of rows are wanted exactly once. A cache justified by
- * reuse would be a poor bet; one justified by density is a good one, and those are different
- * arguments for the same structure.
- *
- * ---- AND AT DECODE, WHERE THE STEP WAITS ON IT ------------------------------------------------
- *
- * Eight varied sequences at a depth-3 verify, one rank traced: a call is 512 rows over ~487
- * distinct ones, and 50.6% of those are rows the generation has never asked for before -- the
- * floor for any cache. The rest recur within a short window: a row-granular LRU of 10^5 rows misses
- * 57.8%, of 4 x 10^5 rows 51.2%, and larger buys nothing. RowCache -- 2^19 rows, eight ways, CLOCK,
- * shared by the ranks -- misses 51.0% on the same trace.
- *
- * (The even split in the raw trace is the two RANKS, not reuse. Both hash the same ids and gather
- * the same rows -- see the replication note in arch/common/rad_block_ple.h, which prices that.) */
-inline std::FILE* trace_file() {
-    static thread_local bool tried = false;
-    static thread_local std::FILE* f = nullptr;
-    if (!tried) {
-        tried = true;
-        const char* p = std::getenv("AVX_PLE_TRACE");
-        if (p && *p) f = std::fopen(p, "ae");
-    }
-    return f;
-}
-
 #else   /* not Linux: no file reads; a table is read as memory */
 struct TableFile { int fd = -1; };
 inline const TableFile* table_file(const uint8_t*, long long, int*) { static TableFile m; return &m; }
-inline std::FILE* trace_file() { return nullptr; }
 #endif
 
 }  // namespace
@@ -872,25 +789,18 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
         q.row_bytes < q.n_embd)
         return RAD_E_INVAL;
 
-    /* WHAT THIS OP COSTS HAS TWO REGIMES, and a benchmark that repeats one prompt only ever shows
-     * the cheap one. Greedy repeat traffic walks the SAME n-gram rows every step, so every row is
-     * already in the row cache and the call reads nothing. Varied serving makes about half of every
-     * step's rows new, and the call waits on the NVMe for those. /proc/<pid>/io says which regime a
-     * number came from, and AVX_PLE_TRACE records the rows themselves. */
-    if (std::FILE* tf = trace_file()) {
-        for (long long m = 0; m < q.M; ++m)
-            std::fprintf(tf, "%lld\n", (long long)q.ids[m] - q.voff);
-    }
+    /* Cost has two regimes: repeated prompts hit the cache and read nothing, while varied serving
+     * makes about half of each step's rows new NVMe reads. A benchmark that repeats one prompt
+     * only measures the first. /proc/<pid>/io shows which regime applied. */
 
-    /* Every E4M3 code's bf16 at this call's scale, so the decode is a table lookup. The ABI's own
-     * converters, so the answer is libref's by construction. */
+    /* bf16 value of every E4M3 code at this call's scale, built with the ABI's converters (so it
+     * matches libref); the decode is a table lookup. */
     uint16_t lut[256];
     for (int b = 0; b < 256; ++b)
         lut[b] = rad_f32_to_bf16(rad_fp8e4m3_to_f32((uint8_t)b) * q.scale);
 
-    /* The rows: through the shared cache from the file behind the table, or, for a table no file
-     * backs, from the table itself. The caller has refused an id past the table already; an id
-     * turned into a file offset has to be one. */
+    /* File-backed tables go through the shared cache; others are read from memory. The caller
+     * has already refused ids past the table, which matters once they become file offsets. */
     int ferr = RAD_OK;
     const TableFile* tfile = table_file(q.tab, q.n_vocab * q.row_bytes, &ferr);
     if (!tfile) return ferr;
@@ -909,8 +819,7 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
         const long long first = q.rank > 0 && q.rank < ws ? q.M * q.rank / ws : 0;
         const int rs = gather_rows(*tfile, *rc, *rr, q, first, decode, lut);
         if (rs != RAD_OK) return rs;
-        /* The rows a later call will gather, read while the step runs. After this call's own
-         * rows, so they never compete with them. */
+        /* Queue the rows a later call will gather, after this call's own rows. */
         if (q.ahead && q.n_ahead > 0) read_ahead(*tfile, *rc, q);
         return RAD_OK;
     }
@@ -933,39 +842,34 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
     return RAD_OK;
 }
 
-/* ============================== THE TABLE'S ENCODING, AND ITS ONE SCALE ==============================
+/* ============================== the table's encoding and its one scale ==============================
  *
- * Asked at declare, not by a step (spec §4.3).
+ * Checked at declare (spec §4.3).
  *
- * The table is E4M3, row-major, with ONE bf16 scale for all of it -- `fp8_e4m3*bf16[*x*]`. That
- * is not a simplification of a per-block scheme: it is the shipped format, and the structure of
- * the data is why it works. E4M3 carries its own exponent; a row of this table has a dynamic range
- * of only about 2.3x; and the error sits on a THREE-OCTAVE PLATEAU in the scale, so any value from
- * 2^-13 to 2^-10 gives the same relative L2 error to five digits. A per-row scale would buy a few
- * percent of that error for 1.25% more bytes, which is why the format has none. (INT8 in the same
- * byte would buy several times more, because it spends all eight bits on resolution rather than
- * four on an exponent this data does not need. That is a different format.)
+ * The table is row-major E4M3 with one bf16 scale for the whole table, `fp8_e4m3*bf16[*x*]` (the
+ * shipped format). E4M3 carries its own exponent, a row's dynamic range is only ~2.3x, and the
+ * error is flat across scales from 2^-13 to 2^-10, so a per-row scale would buy a few percent of
+ * error for 1.25% more bytes. (INT8 in the same byte would do much better; that is a different
+ * format.)
  *
- * IT IS STORED AS IT IS: the gather reads the canonical rows, and that is what lets the table be
- * read in place from the container's mapping -- a relayout would need a copy of 51 GB. So this
- * hook only checks, and a table quantised any other way is refused at declare rather than
- * gathered as noise. A plain bf16 table -- the checkpoint's own, 102 GB -- is the one other form
- * it takes, read the same way with no scale. */
+ * The table is stored as is, so it can be read in place from the container's mapping (a relayout
+ * would copy 51 GB). This hook only validates; any other quantisation is refused. The one other
+ * accepted form is the checkpoint's plain bf16 table (102 GB), read the same way with no scale. */
 namespace {
 
 enum { EQ_TOK = 0, EQ_WTE, EQ_SCALE, EQ_X, EQ_AHEAD };
 
 }  /* namespace */
 
+/* RAD_E_UNSUPPORTED is the accepted answer: the plane is stored as is (rad_abi.h, RadLayoutFn). */
 extern "C" int avx_layout_ngram(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
-                                const int* sel, const RadTensor* pl, int n, RadLayout* out) {
-    (void)out;
+                                const int* sel, const RadTensor* pl, int n, RadLayout*) {
     if (operand != EQ_WTE && operand != EQ_SCALE) return RAD_E_UNSUPPORTED;
     const long long rows = rad_param_geti(p, n_p, "n_vocab", 0);
     const long long dim  = rad_param_geti(p, n_p, "n_embd", 0);
     if (rows <= 0 || dim <= 0) return RAD_E_SHAPE;
-    /* OR THE TABLE AS THE CHECKPOINT SHIPS IT: plain bf16, no scale -- the gather copies its rows
-     * through the same cache. It has no scale plane, so only the table is ever asked about. */
+    /* Or the checkpoint's plain bf16 table, with no scale plane; rows go through the same
+     * cache. */
     if (rad_enc_is(enc, "plain") && enc->n_planes == 1 && enc->plane[0].dtype == RAD_BF16) {
         if (operand != EQ_WTE) return RAD_E_DTYPE;
         if (n != 1 || !pl) return RAD_E_SHAPE;
@@ -985,14 +889,12 @@ extern "C" int avx_layout_ngram(const RadParam* p, int n_p, int operand, const R
     return RAD_E_UNSUPPORTED;
 }
 
-/* ============================== THE INSTANCE: CAN THIS PROCESS READ THE TABLE ==============================
+/* ============================== the instance: can this process read the table ==============================
  *
- * Every miss of the gather into bf16 is an io_uring read, and a process that may not make a ring
- * fails every step that gathers: the first request fails, after the whole model has loaded, and
- * the engine stops. So the instance asks at declare, before a byte is loaded, and refuses with
- * the reason. A gather into any other dtype takes the general path, which reads the table as
- * memory and makes no ring. rad-convert declares without instances -- it launches nothing -- so a
- * sandbox that forbids io_uring still converts the model. */
+ * A bf16 gather reads misses through io_uring, so a process that cannot create a ring would fail
+ * its first request after the whole model loaded. The instance checks at declare and refuses with
+ * the reason. Gathers into other dtypes read the table as memory and need no ring. rad-convert
+ * declares without instances, so a sandbox without io_uring can still convert models. */
 extern "C" int avx_init_ngram(const RadParam* p, int n_p, int rank, int world_size, void** out) {
     (void)rank;
     (void)world_size;

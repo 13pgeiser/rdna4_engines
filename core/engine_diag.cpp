@@ -1,9 +1,8 @@
-/* engine_diag.cpp -- the startup report's engine half: the facts only a started engine has, joined
- * to the machine's (core/diag/diag.h).
+/* engine_diag.cpp -- the startup report's engine half: facts only a started engine has, joined to
+ * the machine's (core/diag/diag.h).
  *
- * THE CARDS ARE JOINED BY PCI ADDRESS. The runtime numbers its devices its own way -- a visible-
- * device mask renumbers them, an integrated GPU may come first -- and the kernel describes them by
- * bus address; the backend's pci_address is the one key both sides agree on.
+ * Cards are joined by PCI address: the runtime numbers devices its own way (a visibility mask
+ * renumbers them, an integrated GPU may come first), while the kernel names them by bus address.
  */
 #include "engine_priv.h"
 #include "device/device.h"
@@ -81,9 +80,9 @@ diag::RunFacts Engine::run_facts(bool failed) const {
         rad_dev_alloc_totals(RAD_MEM_HOST_MAPPED, &mapped, &n);
         r.pinned_bytes = pinned + mapped;
     }
-    /* THE MOST ANY RANK READS FROM THE HOST: the ranks step together, so the one that streams most
-     * is the one each step waits for. The embedding the placement flag put in host memory is read
-     * a few rows a step, the encoder towers once an image, and neither is what this counts. */
+    /* The most any rank streams from the host, since each step waits for the slowest rank.
+     * Excludes host-placed tables (the embedding, read a few rows per step; the towers, once per
+     * image). */
     for (const auto& rk : ranks_) {
         const Plan& p = rk->plan;
         const int64_t host = p.totals.bytes[(int)Tier::HostPinned] +
@@ -115,8 +114,8 @@ void Engine::print_startup_report(int status) {
     const diag::Facts f = hardware_facts(false);
     const diag::RunFacts r = run_facts(status < 0);
     const std::vector<diag::Finding> found = diag::check(f, r);
-    /* A LINE A LOG CALL: the logger formats into a fixed buffer, and one line each keeps every line
-     * of the report on the same level tag a grep for the startup reads. */
+    /* One log call per line: the logger formats into a fixed buffer, and every line keeps the
+     * level tag. */
     const std::string text = diag::render(rows, derived, f, r, found);
     size_t at = 0;
     while (at < text.size()) {
@@ -125,13 +124,11 @@ void Engine::print_startup_report(int status) {
         RAD_INFO("%s", text.substr(at, nl - at).c_str());
         at = nl + 1;
     }
-    /* AND EACH WARNING ON A W LINE OF ITS OWN, because the warnings are what a reader filtering a
-     * production log for W and E lines is looking for. */
+    /* Each warning also on its own W line, for readers filtering a log by level. */
     for (const diag::Finding& x : found)
         if (x.level == diag::Finding::Warn)
             RAD_WARN("startup report: %s: %s. Fix: %s", x.id.c_str(), x.what.c_str(), x.fix.c_str());
-    /* THE FAILURE LAST. The line that said what stopped startup is above the report now, and
-     * `docker logs --tail` or a terminal's last screen shows only what is below it. */
+    /* Repeat the failure last, since the original error line is now above the report. */
     if (status < 0)
         RAD_ERR("startup stopped: %s (the reason is said above the startup report)",
                 rad_strerror(status));

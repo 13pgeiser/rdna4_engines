@@ -1,20 +1,19 @@
 /* chatparse_gemma4_test.cpp -- Gemma 4's reply format: a reasoning channel, and calls written as a
- * name and ONE object in a dialect of JSON.
+ * name and one object in a JSON dialect.
  *
- * Gemma 4's template is one llama.cpp reads with a hand-written handler, so the template analysis
- * finds no format in it and the plugins declare one (arch/common/rad_gemma4_chat.h):
+ * llama.cpp reads Gemma 4's template with a hand-written handler, so template analysis finds no
+ * format and the plugins declare one (arch/common/rad_gemma4_chat.h):
  *
  *   <|channel>thought\n ... <channel|>                         reasoning
  *   <|tool_call>call:NAME{key:<|"|>text<|"|>,n:3}<tool_call|>   a call, repeated for more
  *
- * Every case reads a reply under a request rendered through the model's REAL template
- * (tests/data/chat/gemma4), and where the reply is within the format the answer is held, byte for
- * byte, to llama.cpp's own Gemma 4 parser -- the PEG grammar and value mapper its handler builds
- * (tests/legacy, the `old` side). Every reply is also streamed cut every way (chatdiff.h
- * check_stream): each delta a prefix of the finished value, the deltas adding up to it, the bytes
- * held under the format's bound, and a closed call's arguments JSON.
+ * Each case reads a reply under a request rendered through the real template
+ * (tests/data/chat/gemma4). Where the reply is within the format, the result must match llama.cpp's
+ * Gemma 4 parser byte for byte (tests/legacy, the `old` side). Every reply is also streamed at
+ * every cut (chatdiff.h check_stream): each delta a prefix of the final value, the deltas summing
+ * to it, held bytes within the format's bound, and a closed call's arguments valid JSON.
  *
- * The object family itself -- JSON behind a name tag or a function tag -- is chatparse_test's.
+ * The object family in general (JSON behind a name or function tag) is chatparse_test's.
  */
 #include "rad_test.h"
 
@@ -55,8 +54,7 @@ static std::string fixture() {
     return ss.str();
 }
 
-/* The vocabulary's spellings: generation_config.json ends a turn on <eos>, <turn|> and
- * <|tool_response>. */
+/* Turn terminators, per generation_config.json: <eos>, <turn|> and <|tool_response>. */
 static const Model& gemma() {
     static const Model m = { "gemma4", "gemma4", "<bos>", "<eos>",
                              { "<eos>", "<turn|>", "<|tool_response>" },
@@ -88,7 +86,7 @@ static std::string quote(const std::string& s) {
     return json(s).dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
-/* One call as the model writes it. `args` is the object's inside. */
+/* One call as the model writes it; `args` is the object's body. */
 static std::string G(const std::string& name, const std::string& args) {
     return "<|tool_call>call:" + name + "{" + args + "}<tool_call|>";
 }
@@ -103,8 +101,8 @@ static std::vector<size_t> every(size_t n, size_t step) {
     return c;
 }
 
-/* Every cut of the reply against its one-shot parse: one piece, byte by byte, token-sized pieces,
- * and every two-way split. */
+/* Every cut of the reply against its one-shot parse: whole, byte by byte, token-sized pieces, and
+ * every two-way split. */
 static std::string stream_all(const ReplyParser& p, const std::string& text) {
     const ReplyMessage expect = reply_parse(p, text);
     std::string err = check_stream(p, text, {}, expect);
@@ -154,10 +152,9 @@ static std::shared_ptr<const ReplyParser> parser(const std::string& gp, bool too
     return p;
 }
 
-/* The three generation prompts a reply follows: a turn with thinking off (the template closes an
- * empty channel), a turn with thinking on (the model opens its own), and the continuation after a
- * tool response with thinking on (the template has opened the channel). With thinking off a
- * continuation has no generation prompt at all. */
+/* The three generation prompts: thinking off (the template closes an empty channel), thinking on
+ * (the model opens its own), and the continuation after a tool response with thinking on (the
+ * template has opened the channel). With thinking off a continuation has no generation prompt. */
 static const std::string kOff   = "<|turn>model\n<|channel>thought\n<channel|>";
 static const std::string kOn    = "<|turn>model\n";
 static const std::string kAfter = "<|channel>thought\n";
@@ -177,17 +174,17 @@ TEST(the_declaration_is_a_format_the_parser_runs) {
                          "anywhere; calls \"<|tool_call>\"\"call:\"NAME\"\" {OBJECT, strings "
                          "\"<|\\\"|>\"..\"<|\\\"|>\", bare keys} \"\"\"<tool_call|>\"; grammar on "
                          "\"<|tool_call>\""));
-    /* What the decoder must render as text: every delimiter, the string's included -- without it
-     * a string argument reaches the parser with its quotes gone. */
+    /* The decoder must render every delimiter as text, including the string delimiter, or string
+     * arguments lose their quotes. */
     const std::vector<std::string> m = chat_format_markers(f);
     for (const char* want : { "<|channel>thought", "<channel|>", "<|tool_call>", "<tool_call|>",
                               "call:", "<|\"|>" })
         CHECK(std::find(m.begin(), m.end(), std::string(want)) != m.end());
 }
 
-/* A plugin compiled against the header before the object family reads its new fields as zero:
- * the tagged family, no dialect, reasoning at the start only -- and Gemma's declaration read that
- * way is refused by name rather than run wrongly. */
+/* A plugin built against the header before the object family reads the new fields as zero (the
+ * tagged family, no dialect, reasoning at the start only); Gemma's declaration read that way is
+ * refused by name. */
 TEST(an_older_struct_reads_the_object_fields_as_zero) {
     RadChatFormat c = *rad::arch::gemma4_chat_format();
     c.struct_size = (uint32_t)offsetof(RadChatFormat, args_form);
@@ -228,7 +225,7 @@ TEST(an_object_format_the_parser_cannot_read_is_refused_by_name) {
     CHECK(refused([](RadChatFormat& c) { c.reasoning_open = ""; }, "reasoning_anywhere"));
     CHECK(refused([](RadChatFormat& c) { c.call_open = "<|channel>thought"; c.reasoning_breaks = nullptr;
                                          c.n_reasoning_breaks = 0; }, "content"));
-    /* The tagged family is untouched: a dialect field there is refused, not ignored. */
+    /* In the tagged family a dialect field is refused, not ignored. */
     CHECK(refused([](RadChatFormat& c) {
         c.args_form = RAD_CHAT_ARGS_TAGGED;
         c.name_suffix = ">"; c.call_end = "</f>"; c.arg_prefix = "<a="; c.arg_name_suffix = ">";
@@ -238,9 +235,9 @@ TEST(an_object_format_the_parser_cannot_read_is_refused_by_name) {
 /* ================================================================== the template's own replies
  *
  * An assistant message rendered through the template is what the model is trained to write. With
- * thinking on the reply is exactly what the template writes after the generation prompt; with it
- * off the template renders a past turn without the empty channel its generation prompt holds, so
- * those replies are read by the hand-written cases below instead. */
+ * thinking on, the reply is what the template writes after the generation prompt; with it off,
+ * a past turn omits the empty channel the generation prompt holds, so the hand-written cases below
+ * cover those. */
 TEST(rendered_replies_read_back_as_the_template_wrote_them) {
     Bench* b = bench(thinking(true));
     REQUIRE(b != nullptr);
@@ -252,7 +249,7 @@ TEST(rendered_replies_read_back_as_the_template_wrote_them) {
         const ReplyMessage m = b->new_parse(reply, &strict);
         const legacy::Answer o = b->old_parse(reply);
 
-        /* The calls come back as the message had them, arguments as JSON values. */
+        /* The calls come back as in the message, arguments as JSON values. */
         const size_t ncalls = msg.contains("tool_calls") ? msg["tool_calls"].size() : 0;
         REQUIRE_EQ(m.calls.size(), ncalls);
         for (size_t i = 0; i < ncalls; ++i) {
@@ -267,9 +264,9 @@ TEST(rendered_replies_read_back_as_the_template_wrote_them) {
         CHECK_EQ(m.reasoning, r.empty() ? r : r + "\n");
         CHECK_EQ(m.content, msg["content"].get<std::string>());
 
-        /* llama.cpp's parser reads the same calls and reasoning, byte for byte. Where the template
-         * wrote content AFTER the calls -- its order for a past turn, not the model's -- the old
-         * parser drops that content and the new one keeps it, leniently. */
+        /* llama.cpp's parser reads the same calls and reasoning byte for byte. Where the template
+         * writes content after the calls (its past-turn order, not the model's), the old parser
+         * drops it and the new one keeps it. */
         CHECK_EQ(o.calls.size(), m.calls.size());
         for (size_t i = 0; i < std::min(o.calls.size(), m.calls.size()); ++i) {
             CHECK_EQ(o.calls[i].name, m.calls[i].name);
@@ -285,8 +282,8 @@ TEST(rendered_replies_read_back_as_the_template_wrote_them) {
     CHECK(read > 10);
 }
 
-/* Every prefix of a rendered reply -- a reply the decoder stopped anywhere -- streams to its own
- * one-shot parse, and a call the reply ended inside reads back as its text. */
+/* Every prefix of a rendered reply (the decoder stopping anywhere) streams to its own one-shot
+ * parse, and a call cut off mid-way reads back as its text. */
 TEST(every_truncation_of_a_rendered_reply_keeps_the_contract) {
     Bench* b = bench(thinking(true));
     REQUIRE(b != nullptr);
@@ -313,9 +310,8 @@ TEST(every_truncation_of_a_rendered_reply_keeps_the_contract) {
 
 /* ================================================================== the decided shapes
  *
- * Replies written the way the model writes them, and the ways it leaves its format. Each reads as
- * stated, streams under the contract, and -- where `oracle` says so -- agrees with llama.cpp's
- * parser byte for byte. */
+ * Replies as the model writes them, including ways it leaves its format. Each reads as stated,
+ * streams under the contract, and where `oracle` is set matches llama.cpp's parser byte for byte. */
 
 struct Call { std::string name, args; bool closed = true; };
 struct Shape {
@@ -358,16 +354,15 @@ static std::vector<Shape> shapes() {
                      ",path:" + S("/x")), "", "",
           { { "write", "{\"content\":\"{a:1,} [<|tool_call>call:x()<tool_call|>] <channel|> <|\\\" .\","
                        "\"path\":\"/x\"}" } }, true, true },
-        /* Text ending in the start of the delimiter reads as written. (No grammar of this shape
-         * can write it -- llama.cpp's cannot either.) */
+        /* Text ending in the start of the delimiter reads as written (no grammar of this shape,
+         * llama.cpp's included, can produce it). */
         { "a string ending in the start of its own delimiter", kOff,
           G("write", "content:" + S("a <|\"") + ",path:" + S("/x")), "", "",
           { { "write", "{\"content\":\"a <|\\\"\",\"path\":\"/x\"}" } }, true, true },
-        /* llama.cpp's key rule takes everything up to the colon, delimiters included, and
-         * hands the client a key `<|"|>path<|"|>`. */
+        /* llama.cpp's key rule keeps the delimiters, yielding the key `<|"|>path<|"|>`. */
         { "a key written as a string", kOff, G("read", S("path") + ":" + S("/a")), "", "",
           { { "read", "{\"path\":\"/a\"}" } }, true, false },
-        /* And keeps the blank after a number, `"limit":3 }`, which is no JSON. */
+        /* It also keeps the blank after a number, `"limit":3 }`, which is not JSON. */
         { "whitespace inside the object", kOff, G("read", " path: " + S("/a") + ",\n limit: 3 "),
           "", "", { { "read", "{\"path\":\"/a\",\"limit\":3}" } }, true, false },
 
@@ -400,9 +395,9 @@ static std::vector<Shape> shapes() {
         /* leaving the object */
         { "a JSON string", kOff, G("bash", "command:\"ls -la\""), "", "",
           { { "bash", "{\"command\":\"ls -la\"}" } }, false, false },
-        /* Gemma's plain-quoted values are its own strings with, at most, the quotes escaped
-         * (measured: `code: "const s = \"a\nb\";"` for the JS `const s = "a\nb";`): an
-         * escaped quote is a quote, every other backslash is text. */
+        /* Gemma's plain-quoted values escape at most the quotes (the model writes
+         * `code: "const s = \"a\nb\";"` for the JS `const s = "a\nb";`): an escaped quote is a
+         * quote, every other backslash is text. */
         { "a plain-quoted value with its quotes escaped", kOff,
           G("bash", "command:\"a\\\"b\\\\c\\u00e9\\n\\q\""), "", "",
           { { "bash", "{\"command\":\"a\\\"b\\\\\\\\c\\\\u00e9\\\\n\\\\q\"}" } }, false,
@@ -411,16 +406,16 @@ static std::vector<Shape> shapes() {
           G("write", "content:\"const s = \"a\\nb\"; f(\"x\", {y: 1});\",path:" + S("/x")), "", "",
           { { "write", "{\"content\":\"const s = \\\"a\\\\nb\\\"; f(\\\"x\\\", {y: 1});\",\"path\":\"/x\"}" } },
           false, false },
-        /* Measured: asked for nested arguments, the model writes Python's quotes. */
+        /* For nested arguments the model writes Python-style quotes. */
         { "single-quoted values, as served", kOff,
           G("configure", "label: 'prod \"eu\"', extra: {note: 'x: {y}', tags: ['a,b', 'c}']}, mode: 'it\\'s'"),
           "", "", { { "configure", "{\"label\":\"prod \\\"eu\\\"\",\"extra\":{\"note\":\"x: {y}\",\"tags\":[\"a,b\",\"c}\"]},"
                                  "\"mode\":\"it's\"}" } }, false, false },
         { "a plain quote closed by the dialect's delimiter", kOff, G("bash", "command:\"ls" + Q), "",
           "", { { "bash", "{\"command\":\"ls\"}" } }, false, false },
-        /* The model leaves a string unclosed and writes the object's `}` and the call's close
-         * (measured: the close delimiter at p=0.86, `}` at p=0.08). The close ends the string and
-         * the call; the closers before it are the object's. */
+        /* The model may leave a string unclosed before the object's `}` and the call's close
+         * (observed: close delimiter at p=0.86, `}` at p=0.08). The close ends the string and the
+         * call; the closers before it are the object's. */
         { "a string the model left open, as served", kOff,
           "<|tool_call>call:execute{code:" + Q + "const s = \"line1\\nline2\"; console.log(...);}"
           "<tool_call|><tool_call|><|channel>thought\n<channel|><channel|>"
@@ -436,7 +431,7 @@ static std::vector<Shape> shapes() {
           "<|tool_call>call:configure{extra:{a:[" + Q + "x]}\n}<tool_call|>" + G("bash", "command:" + S("ls")),
           "", "", { { "configure", "{\"extra\":{\"a\":[\"x\"]}}" }, { "bash", "{\"command\":\"ls\"}" } },
           false, false },
-        /* Thinking on, measured: the close spelled as a plain quote, and text after the call. */
+        /* Observed with thinking on: the close spelled as a plain quote, and text after the call. */
         { "a string closed by a stray quote, text after the call", kOn,
           "<|tool_call>call:bash{command:" + Q + "f(\"a\");\n\"}<tool_call|>end", "end", "",
           { { "bash", "{\"command\":\"f(\\\"a\\\");\\n\"}" } }, false, false },
@@ -464,7 +459,7 @@ static std::vector<Shape> shapes() {
         { "an object the call's close cuts off", kOff,
           "<|tool_call>call:configure{extra:{a:[1,{b:" + S("c") + "<tool_call|>" + ls, "", "",
           { { "configure", "{\"extra\":{\"a\":[1,{\"b\":\"c\"}]}}" }, { "bash", LS } }, false, false },
-        /* llama.cpp's grammar has no arm for it and reads no call at all. */
+        /* llama.cpp's grammar has no arm for it and reads no call. */
         { "a call to a function that is not a tool", kOff, G("frobnicate", "x:1"), "", "",
           { { "frobnicate", "{\"x\":1}" } }, false, false },
         { "a call written without its wrapper", kOff, "call:bash{command:" + S("ls") + "}", "", "",
@@ -498,8 +493,8 @@ TEST(what_gemma_writes_reads_as_decided) {
     }
 }
 
-/* Where the reply is within the format, llama.cpp's own Gemma 4 parser -- run on the generation
- * prompt and the reply, as its handler runs it -- reads exactly what this one reads. */
+/* Where the reply is within the format, llama.cpp's Gemma 4 parser (run on generation prompt and
+ * reply, as its handler does) reads exactly what this one reads. */
 TEST(the_shapes_in_the_format_read_as_llama_cpp_reads_them) {
     int compared = 0;
     for (const Shape& s : shapes()) {
@@ -545,8 +540,8 @@ TEST(thinking_off_starts_the_reply_after_the_closed_channel) {
     CHECK(!parser("")->reasoning().starts_open);
 }
 
-/* reasoning_format "none": the channel stays in the content as the model wrote it, and with it
- * the call grammar's break -- a call still ends the text before it. */
+/* reasoning_format "none": the channel stays in the content as written, and a call still ends
+ * the text before it. */
 TEST(reasoning_format_none_keeps_the_channel_in_the_content) {
     std::shared_ptr<const ReplyParser> p = parser(kOn, true, /*reasoning=*/false);
     const std::string reply = "<|channel>thought\nhm\n<channel|>Yes." +
@@ -558,8 +553,8 @@ TEST(reasoning_format_none_keeps_the_channel_in_the_content) {
     streams(*p, reply, "reasoning none");
 }
 
-/* A request that sent no tools reads call syntax as the text it is -- but the thought channel is
- * still the model's reasoning, wherever it opens. */
+/* A request without tools reads call syntax as text, but the thought channel is still reasoning
+ * wherever it opens. */
 TEST(without_tools_a_call_is_text_and_a_late_channel_is_still_reasoning) {
     std::shared_ptr<const ReplyParser> p = parser(kOff, /*tools=*/false);
     const std::string reply = "Use <|tool_call>call:bash{} to run it.<|channel>thought\nx\n<channel|>";
@@ -580,9 +575,9 @@ TEST(parallel_tool_calls_false_still_reads_a_second_call) {
 
 /* ================================================================== a conversation
  *
- * The turn after a call: the assistant message carries the call, a `role: tool` message its
- * result, and the template writes both into the model's own turn -- the call in the model's
- * spelling, the result as a response block -- and leaves the turn open for the model to go on. */
+ * The turn after a call: the assistant message carries the call and a `role: tool` message its
+ * result. The template writes both into the model's turn (the call in the model's spelling, the
+ * result as a response block) and leaves the turn open. */
 static json conversation(bool two_calls) {
     json calls = json::array();
     calls.push_back({ { "id", "c1" }, { "type", "function" },
@@ -616,8 +611,8 @@ TEST(a_tool_result_renders_into_the_open_turn_and_the_reply_goes_on) {
             if (p.prompt.find(want) == std::string::npos)
                 ::radtest::fail(__FILE__, __LINE__, "the turn is not rendered as " + quote(want) +
                                 "\n  prompt: " + quote(p.prompt));
-            /* The model goes on in the same turn: thinking off with nothing written for it,
-             * thinking on inside a channel the template opened. */
+            /* The model continues the same turn: with thinking off nothing is written for it;
+             * with thinking on, inside a channel the template opened. */
             CHECK_EQ(p.generation_prompt, std::string(on ? kAfter : ""));
             CHECK(p.prompt.size() >= want.size() &&
                   p.prompt.compare(p.prompt.size() - p.generation_prompt.size() - 0,
@@ -667,8 +662,8 @@ TEST(fuzzed_replies_keep_the_contract) {
     CHECK(n > 0);
 }
 
-/* A long reply holds a bounded number of bytes, whatever it holds: a file written into a string
- * streams as it arrives. */
+/* A long reply holds a bounded number of bytes: a file written into a string streams as it
+ * arrives. */
 TEST(a_long_string_streams_and_holds_a_bounded_number_of_bytes) {
     std::string file;
     while (file.size() < 200000) file += "    x = compute(a, b)  # <tag> & \"quoted\" <| ]] \\n\n";
@@ -714,7 +709,7 @@ static std::string grammar_for(const ChatGrammarRequest& gq) {
 }
 
 /* The lazy call grammar admits every call the template writes and every strict call above, as
- * llama.cpp's own Gemma 4 grammar does; it refuses what leaves the dialect. */
+ * llama.cpp's Gemma 4 grammar does, and refuses what leaves the dialect. */
 TEST(the_call_grammar_admits_what_the_model_writes_and_refuses_the_rest) {
     Bench* b = bench(thinking(true));
     REQUIRE(b != nullptr);
@@ -769,9 +764,8 @@ TEST(the_call_grammar_admits_what_the_model_writes_and_refuses_the_rest) {
         CHECK_EQ(admits(g.text, "", bad), 0);
 }
 
-/* tool_choice "required" makes the grammar the whole reply: from the generation prompt, an
- * optional thought, then the calls and nothing after them; a named function admits that one, and
- * parallel_tool_calls false one call. */
+/* tool_choice "required" constrains the whole reply: an optional thought, then calls and nothing
+ * after. A named function admits only that one; parallel_tool_calls false admits one call. */
 TEST(a_required_call_is_the_whole_reply) {
     for (const std::string& gp : { kOff, kOn }) {
         ChatGrammarRequest gq;
@@ -810,9 +804,9 @@ TEST(a_response_format_is_the_whole_reply) {
 
 /* ================================================================== the server's view
  *
- * The chat bridge serves the model from the plugin's declaration: tool requests are no longer
- * refused, the grammar comes from the format, and the decoder renders the dialect's string
- * delimiter -- a control token like the format's tags -- so the parser sees it. */
+ * The chat bridge serves the model from the plugin's declaration: tool requests are accepted, the
+ * grammar comes from the format, and the decoder renders the dialect's string delimiter (a control
+ * token like the format's tags) so the parser sees it. */
 static std::shared_ptr<Vocab> gemma_vocab() {
     VocabBuild vb;
     vb.tokens = { "<pad>", "<eos>", "<bos>", "a", "<|tool_call>", "<tool_call|>", "<|tool_response>",
@@ -820,7 +814,7 @@ static std::shared_ptr<Vocab> gemma_vocab() {
                   "thought", "call:" };
     vb.types.assign(vb.tokens.size(), RAD_TT_CONTROL);
     vb.types[3] = vb.types[13] = vb.types[14] = RAD_TT_NORMAL;
-    /* The letters the markers' text is spelled with, so a marker tokenises whole. */
+    /* The letters the markers are spelled with, so a marker tokenises whole. */
     for (const char* c : { "t", "h", "o", "u", "g", "c", "l", ":" }) {
         vb.tokens.push_back(c);
         vb.types.push_back(RAD_TT_NORMAL);

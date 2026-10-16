@@ -1,17 +1,14 @@
-/* toolparse_legacy.h -- a whole-reply parser built on llama.cpp's PEG auto-parser, kept as the
- * ORACLE the differential tests compare the streaming parser (core/text/chatparse.h) against. It
- * is test code: it is built into the test binaries and the acceptance tool, never into the engine.
+/* toolparse_legacy.h -- a whole-reply parser built on llama.cpp's PEG auto-parser, the oracle the
+ * differential tests compare the streaming parser (core/text/chatparse.h) against. Built into the
+ * test binaries and the acceptance tool, never into the engine.
  *
- * It is the whole legacy path, layer for layer, because its answer is what all of them produce
- * together:
+ * It keeps every layer of the legacy path, since the answer is what they produce together:
  *
- *   * ToolParser -- llama.cpp's PEG parser, generated per request by the vendored auto-parser from
- *     the chat template (vendor/llama/common/chat-auto-parser*.cpp) and run over the WHOLE reply;
- *   * legacy_parse -- the bridge's reading of that: a turn terminator trimmed off the content,
- *     and, when the strict parse produced no call but the content still carries call syntax,
- *     calls lifted out of the text by hand;
- *   * LegacyDeltaStream -- a streaming diff that re-parses the accumulated reply on every chunk and
- *     sends what has grown.
+ *   * ToolParser -- llama.cpp's PEG parser, generated per request from the chat template by the
+ *     vendored auto-parser (vendor/llama/common/chat-auto-parser*.cpp), run over the whole reply;
+ *   * legacy_parse -- the bridge: trims a turn terminator off the content and, when the strict
+ *     parse produced no call but the content still carries call syntax, lifts calls by hand;
+ *   * LegacyDeltaStream -- re-parses the accumulated reply on every chunk and sends what grew.
  */
 #pragma once
 #include "rad_internal.h"
@@ -38,9 +35,9 @@ struct ParsedReply {
     std::vector<ToolCall> tool_calls;
 };
 
-/* The by-hand lifter: `<function name="N"><param name="K">V</param></function>` and
- * `<tool_call><function=N><parameter=K>V</parameter></function></tool_call>` spans read out of
- * `text` whatever the model's format, appended to `out` and removed. */
+/* The by-hand lifter: reads `<function name="N"><param name="K">V</param></function>` and
+ * `<tool_call><function=N><parameter=K>V</parameter></function></tool_call>` spans out of `text`
+ * regardless of the model's format, appends them to `out` and removes them. */
 size_t toolparse_lift_xml_calls(std::string& text, std::vector<ToolCall>& out);
 
 /* The earliest byte of `text` that could begin a call in either spelling, or npos. */
@@ -74,8 +71,8 @@ struct Answer {
 Answer legacy_parse(const ToolParser& tp, const std::string& text, bool is_partial,
                     bool want_calls, const std::vector<std::string>& terminators);
 
-/* The legacy streaming diff over the accumulated text: returns how many bytes of deltas it sends,
- * and fills the concatenation of what it sent. */
+/* The legacy streaming diff over the accumulated text. push() returns the bytes of deltas sent;
+ * the accessors hold the concatenation of what was sent. */
 class LegacyDeltaStream {
 public:
     LegacyDeltaStream(const ToolParser& tp, bool want_calls, std::vector<std::string> terminators)

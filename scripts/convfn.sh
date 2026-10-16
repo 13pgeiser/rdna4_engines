@@ -1,31 +1,32 @@
 #!/bin/sh
-# Rebuild the Qwen3.8-Flash-Next container `fnserve.sh` serves. THE CONVERSION OF RECORD.
+# Rebuild the Qwen3.8-Flash-Next container `fnserve.sh` serves; the canonical conversion.
 #
-# The recipe is the whole format decision: it names what each weight is quantised to, and the
-# container records it (rad-info --recipe), so the engine serves the file in the format it was
-# packed in and nothing else. The default, data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe, builds the
-# production container w4nl64-i8lm.rad; its header says what each weight becomes and what that
-# measures.
+# The recipe names what each weight is quantised to and the container records it (rad-info
+# --recipe), so the engine serves the file in the format it was packed in. The default,
+# data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe, builds the production container w4nl64-i8lm.rad;
+# its header describes each weight's format.
 #
-# CALIB=<dir> IS REQUIRED BY THAT RECIPE. Its routed-expert rule runs GPTQ against `calib=$CALIB`,
-# and the converter refuses a recipe that names an unset variable. The directory holds each
-# layer's pooled Grams and each expert's own down Gram, recorded from the bf16 model over THIS
-# checkpoint (docs/MOE-W4.md, "Calibration"): Grams taken from another checkpoint are not
-# transferable, and a layer with no file is packed without error feedback.
+# That recipe requires CALIB=<dir>: its routed-expert rule runs GPTQ against `calib=$CALIB`, and
+# the converter refuses a recipe that names an unset variable. The directory holds each layer's
+# pooled Grams and each expert's down Gram, recorded from the bf16 model of this checkpoint
+# (docs/MOE-W4.md, "Calibration"). Grams from another checkpoint do not transfer, and a layer with
+# no file is packed without error feedback.
 #
-# A recipe whose rules do not name $CALIB (RECIPE=data/recipes/qwen4exp-w4.recipe, say) rounds its
-# experts to nearest with absmax scales; CALIB=<dir> then puts them through int4 GPTQ instead, by
-# the --quant rule that recipe's header names, which goes ahead of the recipe's own.
+# A recipe that does not name $CALIB (e.g. RECIPE=data/recipes/qwen4exp-w4.recipe) rounds experts
+# to nearest with absmax scales; setting CALIB=<dir> then applies int4 GPTQ through the --quant
+# rule that recipe's header names, which takes precedence over the recipe's own rule.
 #
-# OUT is removed before the conversion starts, so its default is a .new.rad beside the served
-# container rather than the served container itself.
+# OUT is removed before conversion starts, so it defaults to a .new.rad beside the served
+# container.
 #
 #   CALIB=<dir> [SRC=<checkpoint dir>] [OUT=<container>] [RECIPE=<file>] scripts/convfn.sh
 set -e
-cd "$HOME/workspace/radiance/build" || exit 1
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BUILD="${BUILD:-$ROOT/build}"
+cd "$BUILD" || exit 1
 SRC=${SRC:-$HOME/models/Qwen/Qwen3.8-Flash-Next}
 OUT=${OUT:-$HOME/models/rad/w4nl64-i8lm.new.rad}
-RECIPE=${RECIPE:-$HOME/workspace/radiance/data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe}
+RECIPE=${RECIPE:-$ROOT/data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe}
 [ -d "$SRC" ] || { echo "no checkpoint at $SRC"; exit 1; }
 [ -f "$SRC/tokenizer.json" ] || { echo "no tokenizer.json in $SRC"; exit 1; }
 [ -f "$RECIPE" ] || { echo "no recipe at $RECIPE"; exit 1; }
@@ -42,7 +43,7 @@ else
 fi
 rm -f "$OUT"
 ./bin/rad-convert "$SRC" -o "$OUT" \
-    --home "$HOME/workspace/radiance/build/radiance_home" \
+    --home radiance_home \
     --tokenizer "$SRC/tokenizer.json" \
     --recipe "$RECIPE" "$@" \
     -v 2>&1 | tail -30

@@ -1,22 +1,20 @@
 /* r4d_attn_paged_window.hip -- paged attention at head_dim 256 and 512, 1/2/4/8 queries per KV
- * head, ANY sliding window, causal or not, bf16 or fp8-e4m3 cache, q at any row pitch.
+ * head, any sliding window, causal or not, bf16 or fp8-e4m3 cache, q at any row pitch.
  *
- * Gemma 4's text layers are two of these geometries: its sliding layers are 16 query heads over 8
- * KV heads at head_dim 256 with a 1024-token window (gqa 2 at every TP), and its full layers 16
- * over 2 at head_dim 512 (gqa 8 at TP1/TP2, 4 at TP4, 2 at TP8). The library's other h256 legs are
- * gqa 2 (windowed, q dense) and gqa 4/6/8/12 (`window == 0`); the row table says which serves
- * where two meet (r4d_rows.cpp).
+ * Gemma 4's text layers: sliding layers are 16 query heads over 8 KV heads at head_dim 256 with a
+ * 1024-token window (gqa 2 at every TP); full layers are 16 over 2 at head_dim 512 (gqa 8 at
+ * TP1/TP2, 4 at TP4, 2 at TP8). Where this overlaps the library's other h256 legs, the row table
+ * decides (r4d_rows.cpp).
  *
- * WHAT THIS IS. Two kernels behind one entry point. The scalar one, for decode and verify steps: one
- * workgroup owns one (sequence, KV head, slice of BQ query positions, split of the key range); each
- * wave owns RW of the tile's R = BQ*gqa query rows; K and V come through LDS one paged block (or
- * two) at a time, prefetched into registers while the previous tile is being consumed; the dot
- * products are scalar FMAs with a butterfly reduce-scatter that leaves key j's score in lane j; the
- * softmax is online, in the log2 domain. It is memory-bound at decode, where that is the only thing
- * that matters. A prefill-shaped launch takes the WMMA kernel further down instead (its own header
- * says how), which feeds RDNA4's matrix cores.
+ * Two kernels behind one entry point:
+ *   - Scalar, for decode and verify: a workgroup owns one (sequence, KV head, slice of BQ query
+ *     positions, split of the key range); each wave owns RW of the tile's R = BQ*gqa query rows.
+ *     K/V go through LDS one or two paged blocks at a time, prefetched into registers while the
+ *     previous tile is consumed. Dot products are scalar FMAs with a butterfly reduce-scatter that
+ *     leaves key j's score in lane j; online softmax in the log2 domain. Memory-bound at decode.
+ *   - WMMA, for prefill-shaped launches (see its header below).
  *
- * WHAT IT COMPUTES is libref's ref_attn_paged, predicate for predicate:
+ * Both compute libref's ref_attn_paged, predicate for predicate:
  *   pos     = seqused[s] - q_len(s) + i                  (seqused INCLUDES this step's queries)
  *   causal  key j visible when j <= pos;  non-causal when j < seqused[s]
  *   window  causal: pos - j < window;  non-causal: |pos - j| < window;  0 = none
@@ -24,16 +22,15 @@
  *   no visible key at all -> a zero row
  *   k_descale / v_descale per (sequence, kv head), absent = 1
  *
- * THE PAGED LAYOUT is kv_cache[n_blocks, kv_heads, 16, 2*head_dim], K then V inside a slot, which
- * makes one block of one KV head ONE contiguous run of 16 * 2 * head_dim elements: a key tile is
- * one or two such runs, fetched as 16-byte loads.
+ * Paged layout: kv_cache[n_blocks, kv_heads, 16, 2*head_dim], K then V per slot, so one block of
+ * one KV head is a contiguous run of 16 * 2 * head_dim elements; a key tile is one or two runs,
+ * fetched as 16-byte loads.
  *
- * SPLIT-KV. A launch with few (tile, kv head) pairs -- a decode step, a short verify -- would leave
- * most of the card idle, so the key range of each tile is cut into `n_split` pieces, each written
- * as an unnormalised partial (acc, max, sum) into the op's scratch, and a second kernel merges
- * them. The split count is chosen at launch from host-side numbers only (rows, sequences, the
- * window or max_ctx); each workgroup divides ITS OWN key range by it, so a split that receives no
- * keys writes (0, -inf, 0) and the merge needs no host knowledge of the device-side context.
+ * Split-KV: with few (tile, kv head) pairs (decode, short verify) each tile's key range is cut into
+ * `n_split` pieces, each writing an unnormalised partial (acc, max, sum) to scratch, merged by a
+ * second kernel. The split count comes from host-side numbers only (rows, sequences, window or
+ * max_ctx); each workgroup divides its own key range, so a split with no keys writes (0, -inf, 0)
+ * and the merge needs no device-side context.
  *
  * Nothing here allocates, synchronises, or uses anything but hipLaunchKernel (docs/PLUGIN.md §5).
  * Wave32 (RDNA): the shuffles and the reduce-scatter are written for 32 lanes.
@@ -56,16 +53,15 @@ namespace r4d_win {
 constexpr int kThreads = 256;
 constexpr int kWaves = kThreads / 32;
 
-/* split-KV bookkeeping: at most this many (tile, kv head, split) triples carry partials, and the
- * tile table behind them holds at most kTinfoMax tiles. The launch keeps under both by
- * construction; the scratch hook sizes for exactly these. */
+/* Split-KV bookkeeping: at most kPartBudget (tile, kv head, split) triples carry partials and the
+ * tile table holds at most kTinfoMax tiles. The launch stays under both; scratch is sized for them. */
 constexpr int kPartBudget = 192;
 constexpr int kTinfoMax = 128;
 constexpr int kMaxSplit = 64;
 
 template <int HD> struct Geo;
-/* R query rows a workgroup (R / 8 a wave), BK keys a tile. BK * 2 * HD bf16 = 32 KiB of LDS either
- * way: two paged blocks at 256, one at 512. */
+/* R query rows per workgroup (R / 8 per wave), BK keys per tile. BK * 2 * HD bf16 = 32 KiB of LDS
+ * either way: two paged blocks at 256, one at 512. */
 template <> struct Geo<256> { static constexpr int R = 32, BK = 32; };
 template <> struct Geo<512> { static constexpr int R = 16, BK = 16; };
 
@@ -102,10 +98,9 @@ __device__ __forceinline__ float ex2(float x) {
 __device__ __forceinline__ int imin(int a, int b) { return a < b ? a : b; }
 __device__ __forceinline__ int imax(int a, int b) { return a > b ? a : b; }
 
-/* f(Ic<0>{}), ..., f(Ic<N-1>{}): a loop whose index is a CONSTANT in every body, unconditionally.
- * `#pragma unroll` is a request the unroller drops past a size threshold -- the fp8 legs of the
- * row loop crossed it -- and a register array indexed by a loop variable that survives is demoted
- * to scratch memory. This cannot be dropped. */
+/* f(Ic<0>{}), ..., f(Ic<N-1>{}): a loop whose index is a compile-time constant in every body.
+ * `#pragma unroll` is dropped past a size threshold (the fp8 row loop crosses it), and a register
+ * array indexed by a surviving loop variable is demoted to scratch. This guarantees the unroll. */
 template <int I> struct Ic { static constexpr int value = I; };
 template <int I, int N> struct StaticFor {
     template <typename F> __device__ __forceinline__ static void run(F& f) {
@@ -122,7 +117,7 @@ __device__ __forceinline__ void bf16x4(uint2 w, float (&f)[4]) {
     f[2] = __uint_as_float(w.y << 16);
     f[3] = __uint_as_float(w.y & 0xffff0000u);
 }
-/* OCP E4M3 (e4m3fn, bias 7, 0x7f/0xff NaN, no infinity) -- the KV cache's bytes at
+/* OCP E4M3 (e4m3fn, bias 7, 0x7f/0xff NaN, no infinity), the KV cache format at
  * --kv-cache-dtype fp8 (docs/PLUGIN.md §10). Exact; subnormals kept. */
 __device__ __forceinline__ float fp8e4m3(unsigned b) {
     const unsigned e = (b >> 3) & 15u, m = b & 7u;
@@ -132,8 +127,7 @@ __device__ __forceinline__ float fp8e4m3(unsigned b) {
 }
 __device__ __forceinline__ void fp8x4(unsigned w, float (&f)[4]) {
 #if defined(__GFX12__)
-    /* v_cvt_pk_f32_fp8: RDNA4 converts OCP E4M3 in hardware, two bytes an instruction -- the same
-     * instruction the library's other attention kernels read their fp8 cache with. */
+    /* v_cvt_pk_f32_fp8: RDNA4 hardware OCP E4M3 conversion, two bytes per instruction. */
     const auto a = __builtin_amdgcn_cvt_pk_f32_fp8((int)w, false);
     const auto b = __builtin_amdgcn_cvt_pk_f32_fp8((int)w, true);
     f[0] = a[0]; f[1] = a[1]; f[2] = b[0]; f[3] = b[1];
@@ -160,18 +154,17 @@ __device__ __forceinline__ void lds4(const unsigned char* row, int e, float (&f)
     else bf16x4(*(const uint2*)(row + 2 * e), f);
 }
 
-/* THE REDUCE-SCATTER. Each lane holds a partial dot for every key of the tile; after it, lane l
- * holds key l's full sum. Each step keeps the half of the vector its lane bit selects and adds the
- * partner's copy of that half: 16 + 8 + 4 + 2 + 1 = 31 shuffles for 32 keys, against 32 * 5 for 32
- * separate reductions. */
+/* Reduce-scatter: each lane holds a partial dot for every key of the tile; afterwards lane l holds
+ * key l's full sum. Each step keeps the half its lane bit selects and adds the partner's copy:
+ * 16 + 8 + 4 + 2 + 1 = 31 shuffles for 32 keys, instead of 32 * 5 for separate reductions. */
 template <int H, int N>
 __device__ __forceinline__ void reduce_scatter(float (&v)[N], int lane) {
     if constexpr (H >= 1) {
         const bool up = (lane & H) != 0;
 #pragma unroll
         for (int i = 0; i < H; ++i) {
-            /* VALUES, not lvalues: `up ? v[i + H] : v[i]` selects between two ADDRESSES, and an
-             * array addressed by a lane-dependent pointer is demoted to scratch memory. */
+            /* Select values, not lvalues: `up ? v[i + H] : v[i]` selects an address, and an array
+             * addressed by a lane-dependent pointer is demoted to scratch. */
             const float lo = v[i], hi = v[i + H];
             const float keep = up ? hi : lo;
             const float send = up ? lo : hi;
@@ -197,10 +190,9 @@ struct AttnArgs {
     int   max_blocks, n_seq, q_len, tps, kv_heads, causal, window, n_split;
 };
 
-/* Tile `tile` of a ragged batch: the sequence it belongs to and which BQ-position slice of that
- * sequence's query it is. Tiles are numbered sequence by sequence, ceil(q_len(s) / BQ) each, so the
- * answer is a prefix sum over cu_seqlens -- done by the whole block, 256 sequences a pass. Every
- * thread returns the same answer: it is read back out of LDS after a barrier. */
+/* Tile `tile` of a ragged batch: its sequence and which BQ-position slice of that sequence's query
+ * it is. Tiles are numbered sequence by sequence, ceil(q_len(s) / BQ) each, so this is a block-wide
+ * prefix sum over cu_seqlens, NT sequences per pass. All threads get the same answer from LDS. */
 template <int BQ, int NT = kThreads>
 __device__ void find_tile(const int* cu, int n_seq, int tile, int* s_scan, int* s_res, int& s_out,
                           int& lt_out) {
@@ -336,9 +328,9 @@ __global__ __launch_bounds__(kThreads) void attn_kernel(AttnArgs A) {
             int blk = -1;
             if (lb < A.max_blocks && (lb << 4) < hi) blk = A.bt[(long long)s * A.bt_rs + lb];
             pre_ok[b] = blk >= 0;
-            /* never a null: a select against null makes the pointer FLAT rather than global, and
-             * every tile load a flat_load. A missing block points at the cache's base and its
-             * value is replaced by zeros below. */
+            /* Never null: selecting against null makes the pointer flat instead of global, and every
+             * tile load a flat_load. A missing block points at the cache base; its value is
+             * replaced by zeros below. */
             src[b] = A.kv + ((long long)(blk >= 0 ? blk : 0) * A.kv_sb + (long long)kh * A.kv_sh) * ESZ;
         }
 #pragma unroll
@@ -451,42 +443,33 @@ __global__ __launch_bounds__(kThreads) void attn_kernel(AttnArgs A) {
 
 /* ================================================================== the WMMA prefill kernel
  *
- * WHY A SECOND KERNEL. The kernel above is scalar FMAs: right for decode, where a step is a few
- * rows and the cache read is the whole cost, and about 8 TFLOP/s a card on a long prefill, where
- * the global layers' attention is quadratic in the prompt and 46% of a 48k-token prefill. RDNA4's
- * matrix cores do a 16x16x16 bf16 product a WMMA instruction; this kernel feeds them. It is chosen
- * at launch for prefill-shaped steps only (a sequence with >= kWmmaMinQ query rows) and computes
- * the same function, predicate for predicate.
+ * The scalar kernel reaches ~8 TFLOP/s on a long prefill, where global-layer attention is
+ * quadratic and 46% of a 48k-token prefill. This kernel uses RDNA4's 16x16x16 WMMA instead. It is
+ * chosen only for prefill-shaped steps (a sequence with >= kWmmaMinQ query rows) and computes the
+ * same function.
  *
- * THE LAYOUTS (RDNA4, wave32, v_wmma_f32_16x16x16_bf16 -- confirmed against llama.cpp's mma.cuh,
- * which runs on the card): A[M][K] gives lane L row M = L % 16 and K = 8 * (L / 16) .. + 7; B[K][N]
- * gives lane L column N = L % 16 and the same K; the f32 result gives lane L column N = L % 16 and
- * rows M = 8 * (L / 16) .. + 7. So the kernel computes S TRANSPOSED: S^T = K * Q^T puts each
- * lane's eight values in ONE query row (row L % 16, keys 8h .. 8h + 7), the row's other eight keys
- * in lane L ^ 16 -- the softmax statistics are one shuffle -- and those eight values, as bf16, are
- * exactly the B operand of O^T = V^T * P^T. O^T's lane L likewise holds only row L % 16, so the
- * online-softmax rescale is a per-lane scalar.
+ * Layouts (wave32 v_wmma_f32_16x16x16_bf16): A[M][K] gives lane L row M = L % 16 and
+ * K = 8 * (L / 16) .. + 7; B[K][N] gives lane L column N = L % 16, same K; the f32 result gives lane
+ * L column N = L % 16, rows M = 8 * (L / 16) .. + 7. So the kernel computes S^T = K * Q^T: each lane
+ * holds eight keys of one query row (row L % 16, keys 8h .. 8h + 7), the other eight are in lane
+ * L ^ 16 (softmax statistics are one shuffle), and those values as f16 are the B operand of
+ * O^T = V^T * P^T. O^T's lane L also holds only row L % 16, so the rescale is a per-lane scalar.
  *
- * THE SPLIT. O^T for 16 rows of a 512-dim head is 256 f32 a lane -- the whole register file. So a
- * wave owns 16 rows by a 128-dim slice of the head (kDQ): its Q^T (32 VGPRs) and O^T (64). The
- * slices of one row group each compute S^T over their own dims; the partials meet in LDS and every
- * slice sums them in the same order, so all of them see bit-identical scores and take identical
- * softmax steps. 16 waves: h512 is 4 row groups of 4 slices (64 rows), h256 8 of 2 (128 rows).
+ * Head split: O^T for 16 rows of a 512-dim head is 256 f32 per lane, the whole register file, so a
+ * wave owns 16 rows by a 128-dim slice (kDQ): Q^T in 32 VGPRs, O^T in 64. Slices compute partial
+ * S^T over their own dims; partials meet in LDS and every slice sums them in the same order, so all
+ * see bit-identical scores. 16 waves: h512 is 4 row groups x 4 slices (64 rows), h256 8 x 2 (128).
  *
- * THE TILE is one paged block, 16 keys. K goes to LDS as it is ([key][dim] bf16, a 16-byte pad a row
- * so the A-fragment reads hit 32 different banks); V goes TRANSPOSED ([dim][key], rows of 48
- * bytes), since the PV product reduces over keys and an operand's eight K-values must be
- * contiguous. The transposed write is two keys' dims packed a dword, the dword index rotated per
- * lane group so a wave's 32 writes land in 32 banks. An fp8 cache is widened on the way in -- exact,
- * e4m3 has 3 mantissa bits. Keys outside the tile's range or in a missing block are written as
- * zeros: a probability of 0 times a NaN in a recycled slot is still NaN.
+ * Tile = one paged block, 16 keys. K goes to LDS as [key][dim] bf16 with a 16-byte row pad so
+ * A-fragment reads hit 32 banks. V goes transposed ([dim][key], 48-byte rows) because P.V reduces
+ * over keys; two keys are packed per dword with the dword index rotated per lane group so a wave's
+ * 32 writes hit 32 banks. An fp8 cache is widened on load (exact). Keys outside the range or in a
+ * missing block are written as zeros, since 0 * NaN from a recycled slot is still NaN.
  *
- * P AND V IN f16, Q AND K IN bf16. The probabilities are rounded for the matrix product, and bf16's
- * 8 bits leave 2^-9 of |v| in every output -- measured in the emulator against f64 at up to 0.25%
- * of the V range, four times the scalar kernel's error. f16 runs at the same rate with 11 bits. V's
- * bf16 values are exact in f16 between 2^-14 and 65504 (clamped beyond, NaN kept); an fp8 cache's
- * are exact outright. The denominator sums the probabilities as rounded, so a row is a true
- * weighted mean of V: a dominant key keeps weight 1 exactly.
+ * P and V in f16, Q and K in bf16: bf16 P leaves up to 2^-9 |v| error per output (up to 0.25% of the
+ * V range against f64, 4x the scalar kernel), while f16 runs at the same rate with 11 bits. bf16 V
+ * is exact in f16 within [2^-14, 65504] (clamped beyond, NaN kept); fp8 V is always exact. The
+ * denominator sums P as rounded, so a row is a true weighted mean of V.
  */
 typedef short win_v8s __attribute__((ext_vector_type(8)));   /* 8 bf16, as the builtin takes them */
 typedef float win_v8f __attribute__((ext_vector_type(8)));
@@ -733,9 +716,9 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
 #pragma unroll
         for (int e = 0; e < 8; ++e) sacc[e] = 0.0f;
         {
-            /* one accumulator: a second one hides the chain's latency but costs 12 VGPRs, and at
-             * 187 two 16-wave workgroups share a WGP (8 waves a SIMD, 1536 VGPRs) where at 200
-             * one does -- the other waves hide the latency better */
+            /* One accumulator: a second hides the chain latency but costs 12 VGPRs; at 187 VGPRs
+             * two 16-wave workgroups fit a WGP (8 waves per SIMD), at 200 only one, and the extra
+             * waves hide latency better. */
             const unsigned char* ka = kb + n * KS + (sl * kDQ + 8 * h) * 2;
 #pragma unroll
             for (int kc = 0; kc < kDQ / 16; ++kc)
@@ -813,12 +796,9 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
 
 /* ------------------------------------------------------------------ the split-KV merge
  *
- * ONE WAVE A ROW, THE SPLITS ACROSS ITS LANES. Lane z reads split z's (max, sum) and lane z + 32
- * split z + 32's -- kMaxSplit is 64 -- so the row's max and denominator are one wave reduction
- * each; then one sweep over the splits that saw a key, four at a time, every lane accumulating
- * its 4 * NC dims. The first version walked the splits three times over,
- * serially, in one thread block per tile: at the 64 splits a decode step of a full-attention layer
- * gets, that was 750 us a call, a quarter of the step's device time. */
+ * One wave per row, splits across lanes: lane z holds split z's (max, sum) and z + 32's
+ * (kMaxSplit is 64), so the row max and denominator are one wave reduction each. Then one sweep
+ * over the splits that saw a key, four at a time, each lane accumulating its 4 * NC dims. */
 template <int HD, int GQA>
 __global__ __launch_bounds__(kThreads) void merge_kernel(AttnArgs A) {
     constexpr int R = Geo<HD>::R, NC = HD / 128;
@@ -855,10 +835,9 @@ __global__ __launch_bounds__(kThreads) void merge_kernel(AttnArgs A) {
         for (int c = 0; c < NC; ++c)
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[c][e] = 0.0f;
-        /* The splits that carry weight, as a 64-bit set every lane holds the same copy of, taken
-         * four at a time so 4 * NC loads are in flight before the first FMA waits on one. A short
-         * group repeats its first split at weight 0: the index is a written one, so the product is
-         * 0 * finite. An empty split's accumulator was never written and is never read. */
+        /* Splits with weight, as a wave-uniform 64-bit set, taken four at a time so 4 * NC loads
+         * are in flight before the first FMA. A short group repeats its first split at weight 0
+         * (a written split, so 0 * finite). An empty split's accumulator is never read. */
         uint64_t live = (uint64_t)__builtin_amdgcn_ballot_w32(w0 != 0.0f) |
                         ((uint64_t)__builtin_amdgcn_ballot_w32(w1 != 0.0f) << 32);
         while (live) {
@@ -898,9 +877,9 @@ __global__ __launch_bounds__(kThreads) void merge_kernel(AttnArgs A) {
 
 /* ------------------------------------------------------------------ host: the launch adapter */
 
-/* q and out as [rows, heads, head_dim] at whatever rank they arrived in: rank 3 (or more, leading
- * axes dense), or rank 2 [rows, heads * head_dim] with its own row pitch -- a column slice of a
- * fused projection. The last axis must be dense. */
+/* q and out as [rows, heads, head_dim]: rank >= 3 (leading axes dense), rank 2
+ * [rows, heads * head_dim] with its own row pitch (a column slice of a fused projection), or flat.
+ * The last axis must be dense. */
 static bool head_view(const RadTensor* t, int64_t heads, int64_t hd, int64_t* rows, int64_t* rs,
                       int64_t* hs) {
     if (t->rank >= 3) {
@@ -1015,11 +994,10 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
     if (nt <= 0) return RAD_OK;
     if (nt > 0x7fffffff) return RAD_E_SHAPE;
 
-    /* THE WMMA PATH, for a prefill-shaped step: the longest query at least kWmmaMinQ rows and the
-     * mean at least half that -- a decode or verify batch, a few rows a sequence however many
-     * sequences, keeps the scalar kernel and its split-KV below. 16-byte query and output rows.
-     * Both forms agree with libref's attention within 0.02 on the engine's own operands (the op
-     * oracle, Gemma 4 26B-A4B at two ranks); they differ from each other by summation order. */
+    /* WMMA path for prefill-shaped steps: longest query >= kWmmaMinQ rows and mean >= half that.
+     * Decode and verify batches keep the scalar kernel and its split-KV. Needs 16-byte aligned
+     * query and output rows. Both kernels agree with libref within 0.02 (Gemma 4 26B-A4B operands)
+     * and differ from each other only in summation order. */
     {
         int64_t qmax_w = qlen_u;
         if (cu) {
@@ -1067,7 +1045,7 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
         }
     }
 
-    /* SPLIT-KV: only where (tile, kv head) pairs are too few to fill the card */
+    /* Split-KV only when (tile, kv head) pairs are too few to fill the GPU */
     int64_t ns = 1;
     const int64_t pairs = nt * kvh;
     if (pairs < kTinfoMax) {
@@ -1130,8 +1108,8 @@ R4D_WIN_DEF(256, 1) R4D_WIN_DEF(256, 2) R4D_WIN_DEF(256, 4) R4D_WIN_DEF(256, 8)
 R4D_WIN_DEF(512, 1) R4D_WIN_DEF(512, 2) R4D_WIN_DEF(512, 4) R4D_WIN_DEF(512, 8)
 #undef R4D_WIN_DEF
 
-/* Called at declare with the band's bound and no tensors: the split-KV partials are capped at
- * kPartBudget (tile, head, split) triples whatever the batch, so the answer is a constant. */
+/* Called at declare with no tensors. Partials are capped at kPartBudget (tile, head, split)
+ * triples for any batch, so the size is a constant. */
 int64_t r4d_rad_attn_window_h256_scratch(const RadArgs*) { return r4d_win::scratch_need<256>(); }
 int64_t r4d_rad_attn_window_h512_scratch(const RadArgs*) { return r4d_win::scratch_need<512>(); }
 

@@ -59,8 +59,8 @@ struct XpState {
     std::vector<XpLayer> layers;
     uint32_t     seq[kXpGroups] = {};
     int          last_layer = -1;      /* the last layer predicted for: a lower one starts a pass */
-    /* WHETHER IT PAYS: the share of its copies the steps use, judged every kXpWindow predictions from
-     * the counters (stats_h, one window on their way to the host); under kXpMinUse it rests. */
+    /* Payoff: the share of copies the steps use, judged every kXpWindow predictions from the
+     * counters (stats_h lags one window); below kXpMinUse the prefetch rests. */
     int64_t      passes = 0, rest_until = 0, rests = 0;
     int64_t      calls = 0;
     uint32_t     snap_copied = 0, snap_routed = 0;

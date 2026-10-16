@@ -1,31 +1,30 @@
 #pragma once
-// r4d_ar_ti8.h: the three-tiered INT8 all-reduce wire codec, shared machinery for the wide
-// quantized kernels. A group's record tags which tier encoded it: Tier 1 is a plain amax-scaled
-// int8, Tier 2 lifts one dominant element out of the scale and ships it exactly in the record, and
-// Tier 3 rotates by an orthonormal WHT-32 first. The tiering keeps a massive outlier exact while
-// leaving ordinary groups on the cheapest path.
-// WIRE LAYOUT per slot, ng = numel/32 groups (fixed size, no escapes, no atomics):
+// r4d_ar_ti8.h: the three-tier INT8 all-reduce wire codec shared by the wide quantized kernels.
+// A group's record tags its tier: Tier 1 is plain amax-scaled int8, Tier 2 lifts one dominant
+// element out of the scale and ships it exactly in the record, Tier 3 applies an orthonormal
+// WHT-32 first. A massive outlier stays exact while ordinary groups take the cheapest path.
+// Wire layout per slot, ng = numel/32 groups (fixed size, no escapes, no atomics):
 //   codes  u8 [32*ng]  at 0        (uint2 per 8-element lane vector)
 //   rec    u32[ng]     at 32*ng
 //   scale  fp16[ng]    at 36*ng    -> 38 bytes/group = 9.5 bits/element
 // Slot base must be 16B-aligned; 32*ng keeps the u32 records 4B-aligned for any ng.
 //
-// A group of 32 = TI8_LPG=4 adjacent lanes x TI8_EPL=8 consecutive elements. All
-// cross-lane exchanges use masks < 4, so a group never leaves its 4-lane cluster and
-// never straddles a wave; kernels partition work in whole groups so the cluster always
-// branches together (the shuffles sit inside tier branches).
+// A group of 32 = TI8_LPG=4 adjacent lanes x TI8_EPL=8 consecutive elements. Cross-lane
+// exchanges use masks < 4, so a group stays in its 4-lane cluster and never straddles a wave.
+// Kernels partition work in whole groups so a cluster branches together (the shuffles sit inside
+// tier branches).
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
 #include <cfloat>
 
-// TI8_-prefixed (unlike the 2-rank header's bare GROUP/EPL): these must be includable
-// beside other codec headers in one TU without a macro collision.
+// TI8_-prefixed (unlike the 2-rank header's bare GROUP/EPL) so this header can share a TU with
+// other codec headers without macro collisions.
 #define TI8_GROUP 32
 #define TI8_EPL 8
 #define TI8_LPG 4
-// Per-group wire layout, derived from the spec above so a codec rev lands everywhere at once:
-// codes u8[GROUP] at 0, the u32 record at TI8_REC_OFF, the fp16 scale at TI8_SC_OFF.
+// Per-group wire layout: codes u8[GROUP] at 0, the u32 record at TI8_REC_OFF, the fp16 scale at
+// TI8_SC_OFF.
 #define TI8_REC_OFF TI8_GROUP
 #define TI8_SC_OFF (TI8_GROUP + 4)
 #define TI8_GROUP_BYTES (TI8_SC_OFF + 2)
@@ -116,13 +115,12 @@ __device__ __forceinline__ void ti8_wht32(float* v, int lig) {
   for (int i = 0; i < TI8_EPL; ++i) v[i] *= nrm;
 }
 
-// Encode one lane's 8 elements of a group into the wire words: this lane's 8 int8 codes,
-// plus the group record and scale (identical on all 4 lanes; the lig==0 lane stores them).
-// All 4 lanes of the group must call together (cross-lane classifier + Tier 3 rotation);
-// the caller fans the words to every destination slot. The _v form takes the values
-// already in registers (the phase-2 reduced vector, never stored exact) and consumes
-// them -- Tier 3 rotates v in place, so a caller wanting the reconstruction must decode
-// the wire words, exactly as every peer will.
+// Encode one lane's 8 elements of a group: this lane's 8 int8 codes, plus the group record and
+// scale (identical on all 4 lanes; the lig==0 lane stores them). All 4 lanes of the group must
+// call together (cross-lane classifier and Tier 3 rotation); the caller fans the words out to every
+// destination slot. The _v form consumes values already in registers (the phase-2 reduced vector):
+// Tier 3 rotates v in place, so a caller wanting the reconstruction must decode the wire words as
+// every peer does.
 template <typename T>
 __device__ __forceinline__ void ti8_encode_group_v(float* v, int lig, uint2* codes,
                                                    unsigned int* rec, __half* scale) {

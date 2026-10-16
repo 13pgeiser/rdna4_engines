@@ -1,13 +1,8 @@
-/* safetensors.h -- an 8-byte length, a JSON object, and a blob.
+/* safetensors.h -- an 8-byte header length, a JSON object mapping tensor name to {dtype, shape,
+ * data_offsets}, and raw little-endian bytes. A small fixed-shape parser rather than a dependency,
+ * since the converter must run wherever a checkpoint lands.
  *
- * Written rather than depended on. The whole format is a header length, one JSON object mapping
- * tensor name to {dtype, shape, data_offsets}, and raw little-endian bytes; the parser below is
- * two hundred lines and it does not need to be a general JSON parser, because the document's shape
- * is fixed. A dependency here would be a dependency in the converter, which is the one tool that
- * has to run on a machine that has just been handed a checkpoint.
- *
- * mmap, no copy. A 46-shard model is opened one shard at a time, so peak RSS stays bounded
- * regardless of model size.
+ * Shards are mmapped, not copied.
  */
 #pragma once
 #include "../rad_internal.h"
@@ -59,8 +54,8 @@ private:
     std::unordered_map<std::string, size_t> index_;
 };
 
-/* model.safetensors.index.json -> { tensor name: shard filename }. A single-file checkpoint has
- * no index; the caller falls back to opening model.safetensors directly. */
+/* model.safetensors.index.json -> { tensor name: shard filename }. A single-file checkpoint has no
+ * index; the caller then opens model.safetensors. */
 int st_load_index(const std::string& index_path,
                   std::unordered_map<std::string, std::string>* out);
 

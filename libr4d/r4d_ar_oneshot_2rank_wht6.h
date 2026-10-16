@@ -1,37 +1,34 @@
 #pragma once
 // r4d_ar_oneshot_2rank_wht6.h: device code for r4d_ar_oneshot_2rank_wht6, the rotated 6-bit payload of the
-// one-shot 2-rank P2P all-reduce on dual R9700 (gfx1201/RDNA4, PCIe). Companion to
-// r4d_ar_oneshot_2rank_exact.hip: reuses the IPC scratch, per-block flags and device-resident seq
-// counters that module allocates. Dispatched for large messages, where the wire time dominates
-// and 6.25 bits per element buys more than the rotation and packing cost.
+// one-shot 2-rank P2P all-reduce on dual R9700 (gfx1201/RDNA4, PCIe). Reuses the IPC scratch,
+// per-block flags and device-resident seq counters of r4d_ar_oneshot_2rank_exact.hip. Used for
+// large messages, where wire time dominates and 6.25 bits per element saves more than the rotation
+// and packing cost.
 //
 // Design:
-//  * Each group of GROUP=64 is rotated by an orthonormal Walsh-Hadamard, scaled by its own
-//    amax and stored as BITS=6 uniform bits plus a bf16 scale -> 6.25 bits/element. The
-//    rotation removes the outlier channel, which is what makes 6 uniform bits enough.
-//  * PUSH rotates, quantizes and packs straight into the peer's scratch, keeping a copy of
-//    the same words locally. REDUCE unpacks both halves, adds in fp32, inverse-rotates (the
-//    transform is its own inverse) and stores bf16/fp16.
-//  * The local half is kept packed rather than recomputed: re-deriving it would repeat the
-//    rotation and the amax reduction.
-//  * Both ranks fold the identical pair and fp32 add commutes, so the ranks stay
-//    bit-identical. MUST be built with -ffp-contract=off: the two ranks see the two products
-//    in opposite order, and contracting either into an FMA makes them disagree by ~1 ULP.
-//  * cudagraph-safe and double-buffered as in r4d_ar_oneshot_2rank_exact.hip: per-block device-resident
-//    seq counter, slot from the per-launch parity counters (r4d_ar_seq.h).
+//  * Each group of GROUP=64 is rotated by an orthonormal Walsh-Hadamard, scaled by its own amax
+//    and stored as BITS=6 uniform bits plus a bf16 scale (6.25 bits/element). The rotation
+//    spreads the outlier channel, which is what makes 6 uniform bits enough.
+//  * Push rotates, quantizes and packs straight into the peer's scratch and keeps a local copy
+//    of the same words (cheaper than repeating the rotation and amax). Reduce unpacks both
+//    halves, adds in fp32, inverse-rotates (the transform is its own inverse) and stores
+//    bf16/fp16.
+//  * Both ranks fold the same pair and fp32 add commutes, so the ranks stay bit-identical. Must
+//    be built with -ffp-contract=off: the ranks see the two products in opposite order, and an
+//    FMA on either makes them differ by ~1 ULP.
+//  * Graph-safe and double-buffered as in r4d_ar_oneshot_2rank_exact.hip: per-block
+//    device-resident seq counter, slot from the per-launch parity counters (r4d_ar_seq.h).
 //
 // Layout, per slot, inside the shared 2*max_bytes scratch:
 //   [ packed symbols, chunk-interleaved ] ... [ scale_off_bytes ] ... [ bf16 scales: n_groups ]
-// A CHUNK is 32 groups = 2048 elements here. One wave owns a chunk and every lane emits exactly 64
-// symbols = 384 bits = three uint4, so flush points are lane-uniform and lane L's u-th uint4
-// lands at c*96 + u*WAVE + L: one coalesced 512B store per wave. A chunk of fewer groups
-// (Wht6Chunk, below) packs its lane's NW words the same way, as dwords when NW is not a multiple of
-// four.
+// A chunk is 32 groups = 2048 elements by default. One wave owns a chunk and every lane emits 64
+// symbols = 384 bits = three uint4, so flush points are lane-uniform and lane L's u-th uint4 lands
+// at c*96 + u*WAVE + L: one coalesced 512B store per wave. Smaller chunks (Wht6Chunk) pack a
+// lane's NW words the same way, as dwords when NW is not a multiple of four.
 //
-// n_groups need not tile a chunk. Groups past the end quantize zeros and are skipped on the way
-// out. That is only safe because a group spans LPG lane-contiguous lanes and every cross-lane
-// exchange in wht() is intra-group (m < LPG), so a group is wholly active or wholly inactive and
-// no shuffle is ever split across the guard.
+// n_groups need not tile a chunk: groups past the end quantize zeros and are skipped on output.
+// This is safe only because a group spans LPG contiguous lanes and every cross-lane exchange in
+// wht() stays inside the group (m < LPG), so no shuffle is split across the guard.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
@@ -67,8 +64,8 @@ __device__ __forceinline__ float rd_to_f(const __hip_bfloat16& x) { return (floa
 __device__ __forceinline__ void rd_from_f(float v, __half& o) { o = __float2half(v); }
 __device__ __forceinline__ void rd_from_f(float v, __hip_bfloat16& o) { o = (__hip_bfloat16)v; }
 
-// RTNE to bf16 and back: the scale ships as its top 16 bits, so the sender's local copy has to be
-// exactly what the receiver reconstructs.
+// RTNE to bf16 and back: the scale ships as its top 16 bits, and the sender's local copy must
+// equal what the receiver reconstructs.
 __device__ __forceinline__ float bf16_round(float v) {
   unsigned u = __float_as_uint(v);
   const unsigned lsb = (u >> 16) & 1u;
@@ -77,9 +74,9 @@ __device__ __forceinline__ float bf16_round(float v) {
 }
 
 
-// `lo ? (v + o) : (o - v)` written as `o + (lo ? v : -v)`: the sign flip is one XOR against a mask
-// that is uniform over the whole stage, so the per-element select disappears.  Bit-identical --
-// IEEE negation is exact and addition commutes.
+// `lo ? (v + o) : (o - v)` written as `o + (lo ? v : -v)`: the sign flip is one XOR with a mask
+// uniform over the stage, so the per-element select disappears. Bit-identical, since IEEE negation
+// is exact and addition commutes.
 template <int M>
 __device__ __forceinline__ void ar6_xstage(float* v, int lig) {
   const unsigned int sm = (lig & M) ? 0x80000000u : 0u;
@@ -108,17 +105,16 @@ __device__ __forceinline__ void wht(float* v, int lig) {
   for (int i = 0; i < EPL; ++i) v[i] *= nrm;
 }
 
-// THE WIRE'S TWO HALVES OVER ONE WAVE-CHUNK, so every kernel carrying the rotated payload -- the
-// all-reduce below and the fused gated-residual writes in r4d_ar_oneshot_2rank_wht6.hip -- packs and
-// unpacks the same bytes by the same arithmetic. `ld(off, v)` fills the EPL elements of a LIVE group
-// that start at message element `off`; `st(off, v)` takes the reduced EPL elements there. Each is
-// called once per live group a lane, and a dead group quantizes zeros and is skipped on the way out.
+// Push and reduce over one wave-chunk, shared by every kernel carrying the rotated payload (the
+// all-reduce below and the fused gated-residual writes in r4d_ar_oneshot_2rank_wht6.hip), so all
+// pack and unpack the same bytes. `ld(off, v)` fills the EPL elements of a live group starting at
+// message element `off`; `st(off, v)` takes the reduced EPL elements there. Each runs once per
+// live group per lane; a dead group quantizes zeros and is skipped on output.
 //
-// CG IS THE CHUNK, in groups: 32 here (2048 elements, three uint4 a lane), fewer where a kernel
-// wants more waves at work. It decides who owns which bytes and where they sit in the slot, never
-// their values -- the rotation and the amax close over a group at any chunking -- so two kernels
-// agree on the wire exactly when they agree on CG, which the kernel pair on the two ranks always
-// does. A chunk of NW words a lane that is not a whole number of uint4 goes out as dwords.
+// CG is the chunk in groups: 32 by default (2048 elements, three uint4 per lane), fewer where a
+// kernel wants more waves. It sets byte ownership and placement in the slot, never values (the
+// rotation and amax are per group), so two kernels agree on the wire iff they agree on CG. A
+// lane's NW words go out as dwords when NW is not a multiple of four.
 template <int CG>
 struct Wht6Chunk {
   static constexpr int ITERS = CG * GROUP / (WAVE * EPL);    // group-iterations a chunk
@@ -129,7 +125,7 @@ struct Wht6Chunk {
   static_assert(ITERS * EPL * BITS % 32 == 0, "a lane's symbols fill whole words");
 };
 
-// PUSH: rotate, amax, quantize, pack -> peer scratch, plus a local copy for the reduce.
+// Push: rotate, amax, quantize, pack into peer scratch, plus a local copy for the reduce.
 template <int CG = CHUNK_GROUPS, typename Ld>
 __device__ __forceinline__ void wht6_push_chunk(const Ld& ld, int c, int n_groups, int lane,
                                                 int lig, int gw, uint4* p_pay,
@@ -194,9 +190,8 @@ __device__ __forceinline__ void wht6_push_chunk(const Ld& ld, int c, int n_group
   }
 }
 
-// The handshake: drain the pushes into the fabric, then a per-block release flag and a spin on the
-// peer's. A handshake that cannot complete is a lockstep violation -- reducing a slot the peer never
-// filled would hand stale bytes on as a sum -- so it traps instead.
+// Handshake: drain the pushes into the fabric, set a per-block release flag and spin on the peer's.
+// A handshake that cannot complete is a lockstep violation; trap rather than sum stale bytes.
 __device__ __forceinline__ void wht6_handshake(unsigned int* peer_flags, unsigned int* my_flags,
                                                int b, unsigned int s, int tid, int drain,
                                                int acq) {
@@ -214,7 +209,7 @@ __device__ __forceinline__ void wht6_handshake(unsigned int* peer_flags, unsigne
   if (acq) __threadfence_system();
 }
 
-// REDUCE: unpack both halves, add in fp32, inverse-rotate, hand each live group's EPL elements on.
+// Reduce: unpack both halves, add in fp32, inverse-rotate, pass each live group's EPL elements to st.
 template <int CG = CHUNK_GROUPS, typename St>
 __device__ __forceinline__ void wht6_reduce_chunk(const St& st, int c, int n_groups, int lane,
                                                   int lig, int gw, const uint4* m_pay,
@@ -293,7 +288,7 @@ __global__ void r4d_ar_oneshot_2rank_wht6_kernel(
   const int lane = tid & (WAVE - 1), wid = tid / WAVE, nwarp = nt / WAVE;
   const int lig = lane & (LPG - 1), gw = lane / LPG;
   __shared__ unsigned int s_seq, s_slot;
-  r4d_ar_seq_take(seq_ctrs, nbw, s_seq, s_slot);   // device-resident, replay-safe (cudagraph)
+  r4d_ar_seq_take(seq_ctrs, nbw, s_seq, s_slot);   // device-resident, replay-safe
   const unsigned int s = s_seq;
   const Wht6Slot w = wht6_slot(peer_scratch, my_scratch, loc_pack, (int)s_slot,
                                slot_stride_bytes, scale_off_bytes);

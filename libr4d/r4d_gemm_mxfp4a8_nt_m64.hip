@@ -3,87 +3,51 @@
 // e4m3 and W stored as OCP micro-scaling fp4: an e2m1 element per nibble and one E8M0 exponent
 // per 32 elements along K.
 //
-// WHY THIS EXISTS ALONGSIDE r4d_gemm_w4a8_nt_m64.  That kernel's 4-bit code is an int4 the library
-// derives at load; this one's is a checkpoint format it does not get to choose.  An MXFP4
-// checkpoint arrives with its own per-32 E8M0 exponents, and a serving stack that re-derives them
-// as int4 has quantised twice.  The two also want different matrix instructions -- iu8 there, fp8
-// here -- and on this part both run at the same rate, so the format is the whole decision:
+// Unlike r4d_gemm_w4a8_nt_m64, whose int4 code the library derives, this reads a checkpoint
+// format: MXFP4 ships its own per-32 E8M0 exponents, and re-deriving int4 would quantise twice. The
+// fp8 WMMA runs at the iu8 rate on this part (f16 207 TF/s; fp8 412; iu8 407).
 //
-//     v_wmma_f32_16x16x16_f16       207 TF/s      5.95 cyc/instr
-//     v_wmma_f32_16x16x16_fp8_fp8   412           2.99
-//     v_wmma_i32_16x16x16_iu8       407           3.03
+// The per-32 exponent is folded into the element. With a per-row reference Wref[n] =
+// max_k E8M0[n][k] (computed offline), d = Wref[n] - E8M0[n][blk] is folded into the e4m3 value:
+// the e2m1 magnitudes {0, .5, 1, 1.5, 2, 3, 4, 6} scaled by 2^-d are e4m3 numbers, so a 16-entry
+// table indexed by d replaces the per-element multiply with a v_perm_b32. One factor per row,
+// 2^(Wref[n]-127), is applied in the epilogue with the activation scale.
 //
-// THE PER-32 EXPONENT IS FOLDED INTO THE ELEMENT, WHICH IS WHY THE UNPACK IS CHEAP.  The naive
-// MXFP4 dequant multiplies each element by 2^(E8M0-127), which is a per-32-block rescale inside
-// the inner loop and puts a multiply on every weight.  Instead, take a per-ROW reference exponent
-// Wref[n] = max_k E8M0[n][k] once, offline, and fold the difference d = Wref[n] - E8M0[n][blk]
-// into the e4m3 VALUE: the eight e2m1 magnitudes {0, .5, 1, 1.5, 2, 3, 4, 6} scaled by 2^-d are
-// themselves e4m3 numbers, so a 16-entry table of packed e4m3 bytes indexed by d replaces the
-// multiply with a v_perm_b32.  What is left is one factor per row, 2^(Wref[n]-127), applied once
-// in the epilogue next to the activation's own per-row scale.
+// The table extends into e4m3 subnormals: stopping at 2^-6 would flush 6.7% of one checkpoint's
+// weights (per-channel errors up to 18.7%). Down to 2^-9 every d <= 8 is exact, which relies on the
+// gfx12 fp8 WMMA honouring e4m3 subnormals (exact for every m*2^-9, m = 1..7). d >= 13 is zero.
 //
-// The table runs into e4m3 SUBNORMALS on purpose.  Stopping at the smallest normal (2^-6) flushes
-// every element whose block exponent is more than 5 binades below its row reference; on this
-// checkpoint that is 6.7% of the weights on 36 output channels, for per-channel errors up to
-// 18.7%.  Extending to 2^-9 makes every d <= 8 exact.  That is only sound because the gfx12 fp8
-// WMMA HONOURS e4m3 subnormals rather than flushing them: the product is exact for every m*2^-9,
-// m = 1..7.  d >= 13 rounds to zero, which is correct: those elements are below the
-// representable range of the row.
+// Unpack (r4d_mxfp4.h): four v_perm_b32 per eight weights, no multiply. The scale lookup is once
+// per fragment: eight consecutive k at an offset that is a multiple of 8 lie in one 32-block.
 //
-// UNPACK IS FOUR v_perm_b32 PER EIGHT WEIGHTS.  A lane's fragment is eight consecutive k, which is
-// four packed bytes.  Splitting the low and high nibbles gives the even and odd elements; each is
-// mapped through the folded-magnitude table by a v_perm_b32 that indexes it with the 3-bit
-// magnitude, the sign rides along as bit 3 shifted into the e4m3 sign position, and two more
-// v_perm_b32 interleave the halves back into k order.  No multiply, no exponent arithmetic in the
-// loop, and the scale lookup is once per fragment rather than once per element: eight consecutive
-// k always lie inside one 32-element block, because the fragment's k offset is a multiple of 8.
+// Split-K is within the workgroup, reduced in LDS: N/16 tiles alone do not fill the part (320
+// waves at N=5120), and a cross-workgroup split would need an HBM partial buffer and a counter.
+// The kernel needs no scratch, so it is graph-replay safe.
 //
-// SPLIT-K IS IN THE WORKGROUP, AS EVERYWHERE ELSE IN THIS LIBRARY.  With one 16-row M fragment the
-// independent N fragments number N/16 -- 320 waves at N=5120 -- which does not fill the part, so
-// the K range has to be split.  Doing it across workgroups needs an fp32 partial buffer in HBM and
-// a counter to decide who reduces; doing it across waves of one workgroup reduces in LDS and needs
-// neither.  The LDS form is also what keeps this kernel cudagraph-safe with no scratch to register:
-// a caller can replay it without having handed the library any memory.
-//
-// THE WEIGHT IS PRE-PERMUTED INTO FRAGMENT ORDER, AS IT IS FOR w4a16/w4a8.  A B fragment maps lane
-// l onto N row l&15, so in checkpoint order the sixteen lanes of a half-wave read sixteen rows K/2
-// bytes apart -- a fully strided read on the operand that dominates traffic.  Reordering the weight
-// once at load fixes it and is what lets this kernel skip LDS entirely.
-//
-// The layout is one 32-lane slot per (n-tile, k-step):
+// The weight is pre-permuted into fragment order (as for w4a16/w4a8). In checkpoint order the
+// sixteen lanes of a half-wave would read rows K/2 bytes apart. The layout is one 32-lane slot per
+// (n-tile, k-step):
 //
 //     Wp[((n/16) * (K/16) + (k/16)) * 32 + lane]      one uint32 = 4 packed bytes = 8 elements
 //
-// where lane's row is 16*(n/16) + (lane&15) and its eight elements start at k + 8*(lane>>4).  A
-// wave then reads 128 contiguous bytes per step.  In checkpoint terms, taking W as
-// [N/16][16][K/16][8] bytes, slot l of tile (nt, ks) is W[nt][l&15][ks][4*(l>>4) .. +4].
-// permute_w() in mxfp4_layout.py is the reference implementation.
+// where lane's row is 16*(n/16) + (lane&15) and its eight elements start at k + 8*(lane>>4); a wave
+// reads 128 contiguous bytes per step. Taking W as [N/16][16][K/16][8] bytes, slot l of tile
+// (nt, ks) is W[nt][l&15][ks][4*(l>>4) .. +4]. permute_w() in mxfp4_layout.py is the reference.
+// With the permute this LDS-free kernel beats an LDS-staged one on every shape; without it, it
+// loses on every shape. The E8M0 scales stay in [K/32][N] order (a half-wave reads sixteen
+// consecutive bytes).
 //
-// The permute is what makes the LDS-free form worth having.  Reading checkpoint order directly,
-// this kernel is slower than an LDS-staged one on every shape; with the permute it is faster than
-// the LDS-staged form on every shape, at both ends of the M range.  It also moves the tuning: the
-// fastest configs are the ones with deeper split-K (SK 4-8) and NPW 2, which only pay once the
-// weight read coalesces.
+// Two activation scale grids, as in r4d_gemm_mxfp4a8_tiled.hip: one f32 per row (ABLK=false) or
+// one per (row, 128 of K) (ABLK=true). With ABLK each wave carries its partial sums in units of the
+// current block's scale, rescaling by s_prev / s_next at each boundary. Split-K segments end in
+// different blocks, so each partial is multiplied by its last scale before the LDS reduction, and
+// the epilogue applies only the weight's reference factor.
 //
-// The E8M0 scales are left in [K/32][N] order -- a half-wave reads sixteen consecutive bytes of
-// those already.
+// Benchmarking note: a weight of tens of MB streamed in a loop stays Infinity-Cache resident, so
+// such a bandwidth figure can exceed the DRAM roofline.
 //
-// TWO ACTIVATION SCALE GRIDS, as in r4d_gemm_mxfp4a8_tiled.hip: one f32 per row (ABLK=false), or
-// one per (row, 128 of K) (ABLK=true, the block-scaled fp8 family's grid). With ABLK each wave
-// carries its partial sums in units of the current 128-block's scale and rescales them by
-// s_prev / s_next at each block boundary inside its split-K segment. The segments end in
-// DIFFERENT blocks, so each partial is brought back to absolute units -- multiplied by its own
-// last scale -- before the LDS reduction adds them, and the epilogue applies only the weight's
-// reference factor.
-//
-// TRAP FOR ANYONE MEASURING THIS KERNEL: a weight of tens of megabytes streamed in a loop is
-// Infinity-Cache resident on this part, so a bandwidth figure taken that way can read above the
-// DRAM roofline.  It ranks kernels reading the same bytes; it is not achieved DRAM bandwidth.
-//
-// A IS NOT STAGED IN LDS.  A lane's A fragment is eight consecutive bytes of one row, so the
-// global load already has the shape the fragment wants; staging it would cost LDS, a barrier and a
-// second read for nothing.  Rows past M are CLAMPED rather than masked -- a tile past M recomputes
-// the last valid row and the store discards it -- which keeps the inner loop branch-free.
+// A is not staged in LDS: a lane's A fragment is eight consecutive bytes of one row. Rows past M are
+// clamped, not masked, keeping the inner loop branch-free.
 #include "r4d_gemm_args.h"
 #include "r4d_common.h"
 #include "r4d_mxfp4.h"
@@ -99,8 +63,8 @@
 typedef int      v2i    __attribute__((ext_vector_type(2)));
 typedef unsigned uint2v __attribute__((ext_vector_type(2)));
 
-// Eight e2m1 codes (four packed bytes) -> the B fragment, eight e4m3 bytes in k order with the
-// block's exponent difference folded in (r4d_mxfp4.h, shared with the other two MXFP4 kernels).
+// Eight e2m1 codes (four packed bytes) -> the B fragment: eight e4m3 bytes in k order with the
+// block's exponent difference folded in (r4d_mxfp4.h).
 __device__ __forceinline__ v2i r4d_mxfp4_frag8(unsigned int wv, int d) {
   unsigned int lo, hi;
   r4d_mxfp4_unpack8(wv, d, &lo, &hi);
@@ -130,11 +94,9 @@ __global__ void r4d_gemm_mxfp4a8_nt_m64_kernel(
 #pragma unroll
     for (int i = 0; i < MT; i++) acc[j][i] = (v8f)(0.f);
 
-  // Column tiles this wave owns, CLAMPED to the last real tile. grid.x rounds N/16 up to a
-  // multiple of ncols = WV*NPW, so the tail block addresses tiles that do not exist -- at N=48
-  // with ncols=4 it reaches tile 3 of 3. Clamping the TILE (not just the row) matters because the
-  // weight is indexed by tile: an unclamped tile index walks off the end of the buffer, which is a
-  // GPU memory fault rather than a wrong answer. The epilogue still drops these columns.
+  // Column tiles this wave owns, clamped to the last real tile: grid.x rounds N/16 up to a multiple
+  // of WV*NPW, and the weight is indexed by tile, so an unclamped index would fault. The epilogue
+  // drops these columns.
   const int ntmax = N / 16 - 1;
   int wtile[NPW], wrow[NPW];
   unsigned char wref[NPW];
@@ -149,7 +111,7 @@ __global__ void r4d_gemm_mxfp4a8_nt_m64_kernel(
   const unsigned int* __restrict__ Wp = (const unsigned int*)W;
   const int ksteps = K / 16;
 
-  // ABLK: the scale each accumulator row of this lane is carried in -- row (mt0+i)*16 + mhalf + e.
+  // ABLK: the scale each accumulator row of this lane is carried in (row (mt0+i)*16 + mhalf + e).
   float scur[ABLK ? MT : 1][8];
   if constexpr (ABLK) {
 #pragma unroll
@@ -196,9 +158,7 @@ __global__ void r4d_gemm_mxfp4a8_nt_m64_kernel(
 #pragma unroll
     for (int j = 0; j < NPW; j++) {
       const int n = wrow[j];
-      // Fragment-order weight: lane l's four bytes for this (n-tile, k-step) sit at slot l, so the
-      // wave reads 128 contiguous bytes. In checkpoint order these would be sixteen rows K/2 bytes
-      // apart -- a fully strided read on the operand that dominates traffic.
+      // Fragment-order weight: lane l's four bytes for this (n-tile, k-step) are at slot l.
       const unsigned int wv = Wp[((size_t)wtile[j] * ksteps + kstep) * WAVE32 + lane];
       const v2i wf = r4d_mxfp4_frag8(wv, r4d_mxfp4_fold_d(wref[j], Ws[(size_t)blk * ldws + n]));
 #pragma unroll
@@ -223,10 +183,9 @@ __global__ void r4d_gemm_mxfp4a8_nt_m64_kernel(
     // One pass over the block's 256-element tiles; every thread takes a stride.
     for (int t = tid; t < ncols * 256; t += blockDim.x) {
       const int col = t >> 8, off = t & 255;
-      // off = lane*8 + e, so the lane is off>>3 -- but a lane's N index is lane&15, and its
-      // eight accumulator elements are the M values 8*(lane>>4)+e. Using the whole lane id for N
-      // writes the upper half-wave into the NEXT column tile; it is invisible for M <= 8 because
-      // those rows are then out of range and dropped by the guard below.
+      // off = lane*8 + e. A lane's N index is lane&15 and its eight elements are M rows
+      // 8*(lane>>4)+e; using the whole lane id for N would write the upper half-wave into the
+      // next column tile.
       const int n = (blockIdx.x * ncols + col) * 16 + ((off >> 3) & 15);
       const int m = (mt0 + i) * 16 + ((off >> 7) << 3) + (off & 7);
       if (n >= N || m >= M) continue;
@@ -245,9 +204,8 @@ extern "C" void r4d_gemm_mxfp4a8_nt_m64(long a, long ascale, long wq, long ws, l
                                         int M, int K, int N, int WV, int SK, int MB, int NPW,
                                         int as_group, int as_rs, long stream,
                                         int lda, int ldws, int ldc) {
-  // The operands of one PART of a partitioned weight (ParoQuant) are windows of larger planes:
-  // the activation a row of lda bytes, the exponents a row of ldws, the output a row of ldc.
-  // 0 is the plane's own width, which is every other caller.
+  // A part of a partitioned weight (ParoQuant) reads windows of larger planes: activation rows of
+  // lda bytes, exponent rows of ldws, output rows of ldc. 0 means the plane's own width.
   if (!lda) lda = K;
   if (!ldws) ldws = N;
   if (!ldc) ldc = N;
@@ -304,8 +262,7 @@ extern "C" void r4d_gemm_mxfp4a8_nt_m64(long a, long ascale, long wq, long ws, l
 
 // ============================================================== the plugin ABI entry points
 //
-// The operand reader and the split law are in r4d_gemm_args.h. See libr4d/r4d_args.h for why there
-// is no adapter directory between the core and these launches.
+// The operand reader and the split law are in r4d_gemm_args.h; see libr4d/r4d_args.h.
 extern "C" int r4d_rad_gemm_mxfp4a8_m64(const RadArgs* a, RadStream s) {
     GemmOps g;
     int rc = gemm_ops(a, &g, 1, /*parts=*/1);
@@ -313,9 +270,8 @@ extern "C" int r4d_rad_gemm_mxfp4a8_m64(const RadArgs* a, RadStream s) {
     if (g.N % 16) return R4D_NO(RAD_E_SHAPE);
     if (g.M > r4d_gemm_mxfp4a8_nt_m64_max_m()) return R4D_NO(RAD_E_SHAPE);
     if (!g.ascale) return R4D_NO(RAD_E_INVAL);
-    /* The per-row reference exponent is a weight aux stream and RadArgs has no way to deliver one,
-     * so gemm_nt_q carries it as a trailing optional weight operand. Without it the fold has no
-     * reference and every element would be scaled against zero. */
+    /* The per-row reference exponent arrives as gemm_nt_q's trailing optional operand (RadArgs
+     * cannot carry a weight aux stream); the fold needs it. */
     if (!g.bref) return R4D_NO(RAD_E_INVAL);
     MxParts mp;
     rc = mx_parts(a, &g, &mp);

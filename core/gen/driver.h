@@ -1,28 +1,25 @@
-/* driver.h -- the image generator's pass driver (gen.h says what the passes are).
+/* driver.h -- the image generator's pass driver (gen.h describes the passes).
  *
- * ONE THREAD DRIVES IT, the engine's, and it asks two things a pass: `next()` decides what runs
- * and stages it, `done()` folds the result back once every rank has run it. Requests arrive from
- * HTTP threads through `submit()` and leave through their Ticket; the queue is the only thing the
- * two kinds of thread share, behind one mutex.
+ * Driven by the engine thread: `next()` picks and stages a pass, `done()` folds its result back
+ * once every rank has run it. Requests arrive from HTTP threads through `submit()` and leave
+ * through their Ticket; the job queue is the only shared state, behind one mutex.
  *
- * WHAT RUNS NEXT, in this order, one pass at a time:
+ * Pass priority, one pass at a time:
  *
- *   1. a DECODE an image is owed -- a finished image, or a preview its last step marked. First,
+ *   1. DECODE an image is owed: a finished image, or a preview its last step marked. Goes first
  *      because a finished image frees its lane and answers its caller, and a preview must be read
- *      before the lane's next step writes the preview latent again.
- *   2. a COND an admitted request is owed: its conditioning, so its images can join the next
- *      denoise pass.
- *   3. a DENOISE over as many images in flight as fit the step's rows, oldest request first, each
+ *      before the lane's next step overwrites the preview latent.
+ *   2. COND an admitted request is owed, so its images can join the next denoise pass.
+ *   3. DENOISE over as many in-flight images as fit the step's rows, oldest request first, each
  *      at its own step.
  *
- * A request is ADMITTED when it can get lanes for every image and KV for every conditioning
- * sequence; until then it waits, in order -- a request that does not fit blocks the ones behind
- * it, so a large request is not starved by a stream of small ones.
+ * A request is admitted once it can get lanes for every image and KV for every conditioning
+ * sequence. Admission is in order: a request that does not fit blocks those behind it, so a large
+ * request is not starved by a stream of small ones.
  *
- * THE STAGING is one region per rank on its card and one pinned host region with the same layout.
- * Every pass is synchronised before the next is built (Engine::gen_loop), so one host region is
- * enough: an image pass is tens of milliseconds and more, and the host work between two is
- * microseconds.
+ * Staging is one device region per rank plus one pinned host region with the same layout. Every
+ * pass is synchronised before the next is built (Engine::gen_loop), so one host region suffices:
+ * a pass takes tens of milliseconds, the host work between passes microseconds.
  */
 #pragma once
 #include "gen.h"
@@ -42,21 +39,20 @@ public:
     };
 
     /* `kv` is rank 0's KV manager: one block table serves every rank. */
-    int  init(const Program& prog, const Config& cfg, IKVManager* kv, const std::vector<RankIO>& ranks);
+    int  init(const Program& prog, IKVManager* kv, const std::vector<RankIO>& ranks);
     void fini();
     ~Driver() { fini(); }
 
     /* The bytes init() allocates on each rank's card, for the VRAM budget. */
-    static int64_t device_bytes(const Program& prog, const Config& cfg);
+    static int64_t device_bytes(const Program& prog);
 
     /* ---------------------------------------------------------- HTTP threads */
-    /* Queue a request. Refused at once -- with `why` -- when it can never run: a size past the
+    /* Queue a request. Refused at once, with `why`, when it can never run: a size past the
      * largest image, more pictures than the model takes, a conditioning longer than a pass. */
     int  submit(std::unique_ptr<Request> r, std::string* why);
-    /* What a request may ask for: the model's own limits, for the server to check before it does
-     * the expensive part of preparing one. */
+    /* The model's limits, for the server to check before the expensive part of preparing a
+     * request. */
     const RadGeneratorDecl&    decl() const { return decl_; }
-    const std::vector<double>& fixed_sigmas() const { return fixed_; }
     int64_t max_cond_tokens() const { return max_tok_; }
     /* Fail every request queued or in flight, and refuse new ones. */
     void shutdown(const char* why, int status);
@@ -66,8 +62,8 @@ public:
      * `step` is the engine's pass counter, carried into RadBatch::step. */
     const RadBatch* next(int step);
     const RadBatch* batch_for(int rank) const;
-    /* The bytes of the generator's image buffer the pass just staged makes, 0 for a pass that
-     * makes none: the engine copies them to `host()` behind the pass. */
+    /* Bytes of image output the staged pass produces, 0 if none; the engine copies them to
+     * host_image() behind the pass. */
     int64_t decode_bytes() const { return dec_bytes_; }
     void*   host_image() const { return img_host_; }
     /* The pass has run on every rank and its streams are drained. */
@@ -101,7 +97,7 @@ private:
         bool     failed = false;
     };
     struct Lane {
-        int64_t  job = -1;          /* index into jobs_ by id; -1 free */
+        bool     busy = false;      /* held by request job_id */
         uint64_t job_id = 0;
         int32_t  index = 0;
         int32_t  step = 0;
@@ -112,7 +108,7 @@ private:
         bool     final_due = false;
         bool     finished = false;
     };
-    /* What the pass being run is, for done(). */
+    /* The pass in flight, for done(). */
     struct Pass {
         int      kind = 0;
         uint64_t job = 0;
@@ -138,6 +134,7 @@ private:
     void finish_batches(int64_t n_tok, int64_t n_seq, int32_t max_q, int step);
 
     int  admit_locked();
+    void release_kv_locked(Job& j);
     void release_locked(Job& j);
     void fail_locked(Job& j, int status, const std::string& why);
     Job* job_locked(uint64_t id);
@@ -168,7 +165,7 @@ private:
     std::vector<RadGenBatch>     gout_;
     std::vector<RadKVGroupBatch> kout_;
     Pass                         pass_;
-    /* The host arrays a COND pass's plugin reads on the host (RadGenBatch's _h fields). */
+    /* Host arrays a COND pass's plugin reads on the host (RadGenBatch's _h fields). */
     std::vector<int32_t>         host_bidi_, host_px_, host_lanes_;
 
     mutable std::mutex           mu_;

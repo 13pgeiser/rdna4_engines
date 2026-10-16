@@ -15,8 +15,8 @@ constexpr int64_t kAlign = 256;
 
 int64_t align_up(int64_t v) { return (v + kAlign - 1) / kAlign * kAlign; }
 
-/* A reference picture's latent tokens at most: its area, a little over for the rounding of its
- * sides to the size multiple. */
+/* Upper bound on a reference picture's latent tokens: its area plus slack for rounding its sides
+ * to the size multiple. */
 int64_t ref_tokens_max(const RadGeneratorDecl& d) {
     const int64_t s2 = d.latent_scale * d.latent_scale;
     return (d.ref_area + s2 - 1) / s2 * 11 / 10 + 64;
@@ -42,8 +42,8 @@ Sizes sizes_of(const Program& prog, int64_t block_size) {
     return z;
 }
 
-/* The regions, in order, and the total. One function for both the allocation and the budget's
- * count of it, so the two cannot disagree. */
+/* Region offsets and sizes, in order, and the total. Shared by the allocation and the VRAM budget
+ * so the two always agree. */
 int64_t carve(const Sizes& z, int64_t pixel_ch, int64_t (*bytes)[2], int n) {
     const int64_t I = 4, H = 2;
     const int64_t rope_rows = std::max(z.P, z.T);
@@ -58,7 +58,7 @@ int64_t carve(const Sizes& z, int64_t pixel_ch, int64_t (*bytes)[2], int n) {
         { 0, (z.R + 2) * I },           /* R_ENCCU */
         { 0, z.P * I },                 /* R_SRC */
         { 0, 3 * rope_rows * I },       /* R_GROPE */
-        { 0, (12 * z.R + 24) * I },     /* R_SEG: offsets, {0, length} and start a segment, {0, tokens} a picture */
+        { 0, (12 * z.R + 24) * I },     /* R_SEG: offsets; per segment a {0, length} pair and a start; per picture a {0, tokens} pair */
         { 0, z.P * I },                 /* R_SLOT */
         { 0, z.PX * pixel_ch * H },     /* R_PX */
         { 0, z.NT * 4 },                /* R_MASK */
@@ -83,26 +83,22 @@ int64_t carve(const Sizes& z, int64_t pixel_ch, int64_t (*bytes)[2], int n) {
 
 }  /* namespace */
 
-int64_t Driver::device_bytes(const Program& prog, const Config& cfg) {
-    (void)cfg;
+int64_t Driver::device_bytes(const Program& prog) {
     if (!prog.is_generator() || prog.kv_groups.size() < 2) return 0;
     const Sizes z = sizes_of(prog, prog.kv_groups[1].block_size);
     int64_t b[R_N][2];
     return carve(z, prog.generator.pixel_channels, b, R_N);
 }
 
-int Driver::init(const Program& prog, const Config& cfg, IKVManager* kv,
-                 const std::vector<RankIO>& ranks) {
-    (void)cfg;
+int Driver::init(const Program& prog, IKVManager* kv, const std::vector<RankIO>& ranks) {
     fini();
     if (!prog.is_generator()) return RAD_E_STATE;
     decl_   = prog.generator;
     fixed_  = prog.gen_str.sigmas;
     kv_     = kv;
     ranks_  = ranks;
-    /* ONE KV GROUP, PAGED: the conditioning's keys and values. A generator with no conditioning
-     * cache, or two, is not a shape this driver stages. Group handles start at 1 -- the program's
-     * group 0 is the null handle -- and the KV manager and a batch both index by handle. */
+    /* Exactly one paged full-attention KV group, holding the conditioning. Group handles start at
+     * 1 (group 0 is the null handle); the KV manager and a batch both index by handle. */
     if (prog.kv_groups.size() != 2 || prog.kv_groups[1].decl.kind != RAD_KV_FULL ||
         prog.kv_groups[1].block_size <= 0) {
         RAD_ERR("image generator: the program declares %zu KV group(s); the driver stages exactly "
@@ -262,12 +258,16 @@ Driver::Job* Driver::job_locked(uint64_t id) {
     return nullptr;
 }
 
-void Driver::release_locked(Job& j) {
+void Driver::release_kv_locked(Job& j) {
     for (int b = 0; b < 2; ++b)
         if (j.cond[b].have_kv) {
             kv_->free_sequence(j.cond[b].seq);
             j.cond[b].have_kv = false;
         }
+}
+
+void Driver::release_locked(Job& j) {
+    release_kv_locked(j);
     for (int32_t l : j.lanes) {
         lanes_[(size_t)l] = Lane{};
         free_lanes_.push_back(l);
@@ -280,14 +280,14 @@ void Driver::fail_locked(Job& j, int status, const std::string& why) {
     j.req->ticket->finish(status, why);
 }
 
-/* IN ORDER, AND A REQUEST THAT DOES NOT FIT STOPS THE ONES BEHIND IT. */
+/* In arrival order; a request that does not fit stops the ones behind it. */
 int Driver::admit_locked() {
     for (auto& jp : jobs_) {
         Job& j = *jp;
         if (j.admitted || j.failed) continue;
         Request& r = *j.req;
         if ((int64_t)free_lanes_.size() < r.n) break;
-        /* The sequences, once: their length is what the KV has to hold. */
+        /* Build the layouts once; their length sizes the KV. */
         if (j.cond[0].lay.rows == 0) {
             j.ref_hw.clear();
             for (const Pixels& p : r.refs)
@@ -329,9 +329,8 @@ int Driver::admit_locked() {
         }
         if (j.failed) continue;
         if (!ok) {
-            /* The KV is short now: give back what this one took and wait. */
-            for (int b = 0; b < 2; ++b)
-                if (j.cond[b].have_kv) { kv_->free_sequence(j.cond[b].seq); j.cond[b].have_kv = false; }
+            /* KV is short: release what this request took and wait. */
+            release_kv_locked(j);
             break;
         }
         j.sigmas = schedule(decl_, fixed_, r.steps, j.tokens);
@@ -346,7 +345,7 @@ int Driver::admit_locked() {
             free_lanes_.pop_back();
             Lane& ln = lanes_[(size_t)l];
             ln = Lane{};
-            ln.job = 0;
+            ln.busy = true;
             ln.job_id = j.id;
             ln.index = i;
             ln.seed = r.seed + (uint64_t)i;
@@ -398,6 +397,16 @@ void Driver::finish_batches(int64_t n_tok, int64_t n_seq, int32_t max_q, int ste
         B.n_seq_decode = 0;
         B.n_tok_decode = 0;
         B.max_q_len_prefill = max_q;
+        /* No rotary table and no encoder input; build_cond sets its own. */
+        B.rope_pos = nullptr;
+        B.rope_mixed = 0;
+        B.n_mm_rows = 0;
+        B.mm_rows = nullptr;
+        B.enc_n_patch = 0;
+        B.enc_pixels = nullptr;
+        B.enc_coord = nullptr;
+        B.enc_n_seg = 0;
+        B.enc_cu = nullptr;
         K.group = (rad_kvgroup)kv_group_;
         K.slot_mapping = reg_[R_SLOT].used > 0 ? dptr<int32_t>(ri, R_SLOT) : nullptr;
         K.block_table = dptr<int32_t>(ri, R_BT);
@@ -431,15 +440,14 @@ const RadBatch* Driver::next(int step) {
     pass_ = Pass{};
     dec_bytes_ = 0;
     if (closed_) return nullptr;
-    /* What finished, failed or was given up on since the last pass leaves now: its KV and lanes
-     * go back before anything is admitted. Nothing is in flight -- next() runs between passes. */
+    /* Retire finished, failed and cancelled jobs, returning their KV and lanes before admitting.
+     * Safe because next() runs between passes, with nothing in flight. */
     for (auto it = jobs_.begin(); it != jobs_.end();) {
         Job& j = **it;
-        const bool gone = j.failed || j.req->ticket->cancel.load(std::memory_order_acquire) ||
-                          (j.admitted && j.images_done >= j.req->n);
+        const bool cancelled = j.req->ticket->cancel.load(std::memory_order_acquire);
+        const bool gone = j.failed || cancelled || (j.admitted && j.images_done >= j.req->n);
         if (!gone) { ++it; continue; }
-        if (j.req->ticket->cancel.load(std::memory_order_acquire) && !j.failed &&
-            j.images_done < j.req->n)
+        if (cancelled && !j.failed && j.images_done < j.req->n)
             j.req->ticket->finish(RAD_E_CANCELLED, "the request was cancelled");
         release_locked(j);
         it = jobs_.erase(it);
@@ -449,7 +457,7 @@ const RadBatch* Driver::next(int step) {
     /* 1. A decode an image is owed. */
     for (int32_t l = 0; l < (int32_t)lanes_.size(); ++l) {
         Lane& ln = lanes_[(size_t)l];
-        if (ln.job < 0 || ln.finished) continue;
+        if (!ln.busy || ln.finished) continue;
         if (ln.preview_due) return build_decode(l, true, step);
         if (ln.final_due) return build_decode(l, false, step);
     }
@@ -515,8 +523,8 @@ const RadBatch* Driver::build_cond(Job& j, int branch, int step) {
     reg_[R_ROPE].used = 3 * T * 4;
     reg_[R_CU].used = 2 * 4;
 
-    /* The pictures, for the conditioning network's encoder: every item's patches in prompt order,
-     * one segment an item, and the prompt rows the encoder's output rows replace. */
+    /* Pictures for the conditioning network's encoder: every item's patches in prompt order, its
+     * segments, and the prompt rows the encoder's output replaces. */
     int64_t n_patch = 0, n_seg = 0, n_mm = 0;
     int32_t max_seg = 0;
     if (br.media) {
@@ -525,8 +533,6 @@ const RadBatch* Driver::build_cond(Job& j, int branch, int step) {
         int32_t* ecu = hptr<int32_t>(R_ENCCU);
         int64_t total = 0;
         for (const mm::Placed& p : br.media->items) total += p.item->n_patch;
-        std::vector<int64_t> row0;
-        int64_t rows_at = 0;
         ecu[0] = 0;
         std::vector<int32_t> tmp;
         for (const mm::Placed& p : br.media->items) {
@@ -544,24 +550,19 @@ const RadBatch* Driver::build_cond(Job& j, int branch, int step) {
                 max_seg = std::max<int32_t>(max_seg, (int32_t)(e - a));
                 ++n_seg;
             }
-            row0.push_back(rows_at);
-            rows_at += it.n_rows();
             n_patch += it.n_patch;
         }
         int32_t* mmr = hptr<int32_t>(R_MMROW);
-        for (const mm::RopeLayout::Run& run : br.media->rope.runs) {
-            const int64_t base = row0[(size_t)run.item] + run.row0;
-            (void)base;
+        for (const mm::RopeLayout::Run& run : br.media->rope.runs)
             for (int32_t k = 0; k < run.n; ++k) mmr[n_mm++] = run.tok + k;
-        }
         reg_[R_ENCPIX].used = n_patch * patch_dim_ * 2;
         reg_[R_ENCCRD].used = 4 * total * 4;
         reg_[R_ENCCU].used = (n_seg + 1) * 4;
         reg_[R_MMROW].used = n_mm * 4;
     }
 
-    /* The generator's sequence, which the plugin runs a segment at a time: each segment's rotary
-     * positions as one dense [3, length] block, its own {0, length} and its first row. */
+    /* The generator's sequence, run by the plugin a segment at a time: per segment, its rotary
+     * positions as a dense [3, length] block, a {0, length} cu pair and its first row. */
     std::memcpy(hptr<int32_t>(R_SRC), c.lay.src.data(), (size_t)P * 4);
     const int64_t nsg = (int64_t)c.lay.bidi.size();
     int32_t* grope = hptr<int32_t>(R_GROPE);
@@ -593,8 +594,8 @@ const RadBatch* Driver::build_cond(Job& j, int branch, int step) {
     hptr<int32_t>(R_USED)[0] = (int32_t)P;
     reg_[R_USED].used = 4;
 
-    /* The pictures again, for the generator's own encoder, and with a mask the picture being
-     * repainted -- only the positive conditioning's pass writes the lanes. */
+    /* Pictures again for the generator's own encoder, plus the inpainting source when masked.
+     * Only the positive conditioning's pass writes the lanes. */
     const int64_t ch = decl_.pixel_channels;
     uint16_t* px = hptr<uint16_t>(R_PX);
     std::vector<int32_t> pxh;
@@ -626,13 +627,12 @@ const RadBatch* Driver::build_cond(Job& j, int branch, int step) {
     /* The conditioning is modulated at t = 0. */
     hptr<float>(R_SIG)[0] = 0.0f;
     reg_[R_SIG].used = 4;
-    /* The host arrays the plugin reads on the host: the segments' kinds, the pixel blocks and the
-     * lanes. Kept here, in the driver, for the life of the pass. */
+    /* Host-side arrays the plugin reads (segment kinds, pixel blocks, lanes), owned by the driver
+     * for the life of the pass. */
     host_bidi_ = c.lay.bidi;
     host_px_ = pxh;
     host_lanes_ = inp ? j.lanes : std::vector<int32_t>{};
-    /* ...and the lanes on the device too: the repainted picture's latent and mask are copied into
-     * each of them by an op. */
+    /* The lanes on the device too: an op copies the inpainting latent and mask into each. */
     if (!host_lanes_.empty()) {
         std::memcpy(hptr<int32_t>(R_LANE), host_lanes_.data(), host_lanes_.size() * 4);
         reg_[R_LANE].used = (int64_t)host_lanes_.size() * 4;
@@ -689,12 +689,11 @@ const RadBatch* Driver::build_cond(Job& j, int branch, int step) {
 
 const RadBatch* Driver::build_denoise(const std::vector<int32_t>& take, int step) {
     for (int g = 0; g < R_N; ++g) reg_[g].used = 0;
-    /* Two passes over the images: the entries and their rows, then the per-entry arrays. */
+    /* Two passes: collect the entries and their rows, then fill the per-entry arrays. */
     struct E { const Job* j; int32_t lane; int branch; };
     std::vector<E> es;
     for (int32_t l : take) {
-        const Job* j = nullptr;
-        for (auto& jp : jobs_) if (jp->id == lanes_[(size_t)l].job_id) { j = jp.get(); break; }
+        const Job* j = job_locked(lanes_[(size_t)l].job_id);
         if (!j) continue;
         for (int b = 0; b < j->n_branch; ++b) es.push_back({ j, l, b });
     }
@@ -777,15 +776,6 @@ const RadBatch* Driver::build_denoise(const std::vector<int32_t>& take, int step
         RadBatch& B = out_[rr];
         const int ri = (int)rr;
         B.max_ctx_len = max_ctx;
-        B.rope_pos = nullptr;
-        B.rope_mixed = 0;
-        B.n_mm_rows = 0;
-        B.mm_rows = nullptr;
-        B.enc_n_patch = 0;
-        B.enc_pixels = nullptr;
-        B.enc_coord = nullptr;
-        B.enc_n_seg = 0;
-        B.enc_cu = nullptr;
         B.gen = RAD_GEN_PASS_DENOISE;
         kout_[rr].block_table_pitch = pitch;
         kout_[rr].slot_mapping = nullptr;
@@ -808,8 +798,7 @@ const RadBatch* Driver::build_denoise(const std::vector<int32_t>& take, int step
 const RadBatch* Driver::build_decode(int32_t l, bool preview, int step) {
     for (int g = 0; g < R_N; ++g) reg_[g].used = 0;
     const Lane& ln = lanes_[(size_t)l];
-    const Job* j = nullptr;
-    for (auto& jp : jobs_) if (jp->id == ln.job_id) { j = jp.get(); break; }
+    const Job* j = job_locked(ln.job_id);
     if (!j) return nullptr;
     int32_t* cu = hptr<int32_t>(R_CU);
     cu[0] = 0;
@@ -820,15 +809,6 @@ const RadBatch* Driver::build_decode(int32_t l, bool preview, int step) {
     for (size_t rr = 0; rr < ranks_.size(); ++rr) {
         RadBatch& B = out_[rr];
         B.max_ctx_len = 0;
-        B.rope_pos = nullptr;
-        B.rope_mixed = 0;
-        B.n_mm_rows = 0;
-        B.mm_rows = nullptr;
-        B.enc_n_patch = 0;
-        B.enc_pixels = nullptr;
-        B.enc_coord = nullptr;
-        B.enc_n_seg = 0;
-        B.enc_cu = nullptr;
         B.gen = RAD_GEN_PASS_DECODE;
         B.n_kv_groups = 0;
         B.kv = nullptr;

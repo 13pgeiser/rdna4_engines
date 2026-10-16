@@ -1,30 +1,24 @@
-/* imatrix.h -- llama.cpp's importance matrix, both of the formats it has written.
+/* imatrix.h -- llama.cpp's importance matrix, in both formats it has written.
  *
- * An imatrix is a per-column activation second moment, collected over a calibration set. It does
- * two jobs here and they are unrelated:
+ * An imatrix is a per-column activation second moment over a calibration set. Two unrelated uses:
  *
- *   - the QUANTISER weights its per-block error by it, so bits go where the activations are
- *     (spec §4.3);
- *   - the CONVERTER derives the expert-popularity profile from its activation counts, which is
- *     what the placement planner warm-starts from (spec §5.3). That is a warm start and not a
- *     policy: imatrix popularity is not decode popularity, and the heat engine re-ranks from real
- *     routing within a few dispatches regardless.
+ *   - the quantiser weights its per-block error by it, so bits go where activations are
+ *     (spec §4.5);
+ *   - the converter derives the expert-popularity profile from its counts, the planner's warm
+ *     start (spec §5.3). Only a warm start: the heat engine re-ranks from real routing within a
+ *     few dispatches.
  *
- * Two formats, because llama.cpp has written two and both are in the wild:
+ * Formats:
  *
- *   LEGACY  a flat little-endian binary: int32 n_entries, then per entry
- *           int32 name_len, char[name_len], int32 ncall, int32 nval, float[nval].
- *           The values are SUMS OF SQUARES ALREADY DIVIDED BY ncall by the writer in some
- *           versions and not in others, which is exactly why the newer format exists.
- *   GGUF    a GGUF v3 container whose tensors are `<name>.in_sum2` (f32 [cols] or [cols,n_expert])
- *           and `<name>.counts` (f32 [1] or [1,n_expert]), plus `imatrix.chunk_count`,
- *           `imatrix.chunk_size` and `imatrix.datasets` in the KV block. Per-expert data is a
- *           second dimension, which the legacy format could not express at all.
+ *   legacy  flat little-endian binary: int32 n_entries, then per entry int32 name_len,
+ *           char[name_len], int32 ncall, int32 nval, float[nval]. Whether values are already
+ *           divided by ncall varies by writer version.
+ *   GGUF    a GGUF v3 container with tensors `<name>.in_sum2` (f32 [cols] or [cols,n_expert]) and
+ *           `<name>.counts` (f32 [1] or [1,n_expert]), plus `imatrix.chunk_count`,
+ *           `imatrix.chunk_size` and `imatrix.datasets`. Only this format has per-expert data.
  *
- * The GGUF walker below is local rather than core/text's. That is deliberate: the imatrix is a
- * file format and core/format owns file formats, the walker is a hundred lines, and coupling the
- * quantiser's input to the tokeniser component's reader would join two things with no other
- * relationship. It also has to sit beside the legacy reader, which is not GGUF at all.
+ * The GGUF walker is local rather than core/text's: it is small, and keeps the quantiser's input
+ * independent of the tokeniser's reader.
  */
 #pragma once
 #include "../rad_internal.h"
@@ -35,9 +29,8 @@
 
 namespace rad {
 
-/* `sum2` and `counts` point into the mapped file for a GGUF imatrix, at whatever offset its
- * general.alignment put them -- which may be 1 -- so they are read with memcpy, never in place.
- * importance() and count() do that. */
+/* For a GGUF imatrix, `sum2` and `counts` point into the mapping at general.alignment (possibly 1),
+ * so importance() and count() read them with memcpy, never in place. */
 struct ImatrixEntry {
     std::string  name;              /* the checkpoint tensor name, suffix stripped */
     const float* sum2   = nullptr;  /* [n_expert][cols], expert-major and contiguous */
@@ -67,13 +60,17 @@ public:
     bool               is_gguf()     const { return gguf_; }
     const std::string& path()        const { return path_; }
 
-    /* Column importance for one expert, NORMALISED TO MEAN 1. The normalisation is what makes a
-     * weighted error comparable with an unweighted one, and therefore what makes a quantiser's
-     * error report mean the same thing with and without an imatrix. Returns false if the tensor
-     * is absent, the expert is out of range, or the entry carries no values. */
+    /* Column importance for one expert, normalised to mean 1 so weighted and unweighted errors are
+     * comparable. False if the tensor is absent, the expert out of range, or no values. */
     bool importance(const std::string& name, int64_t expert, std::vector<float>* out) const;
 
-    /* Raw activation count for one expert -- the popularity signal, unnormalised. 0 if absent. */
+    /* importance() for a weight as the converter names it. The imatrix uses GGUF names without the
+     * `.weight` suffix and keeps a MoE layer's experts as one entry, so `blk.5.ffn_down.weight` is
+     * entry `blk.5.ffn_down` (expert 0) and an expert slice `blk.5.ffn_down_exps.9.weight` is
+     * expert 9 of `blk.5.ffn_down_exps`. False when no entry matches or its width is not `cols`. */
+    bool importance_for(const std::string& weight, int64_t cols, std::vector<float>* out) const;
+
+    /* Raw activation count for one expert (the popularity signal). 0 if absent. */
     double count(const std::string& name, int64_t expert) const;
 
 private:
@@ -87,8 +84,8 @@ private:
     std::string path_, dataset_;
     int64_t     chunk_count_ = 0, chunk_size_ = 0;
 
-    /* The legacy format's floats are not aligned in the file and are followed by no counts, so
-     * they are copied out rather than pointed at. GGUF payloads are pointed at. */
+    /* Legacy floats are unaligned in the file, so they are copied out; GGUF payloads are pointed
+     * at. */
     std::vector<std::vector<float>>         owned_;
     std::vector<ImatrixEntry>               entries_;
     std::unordered_map<std::string, size_t> index_;

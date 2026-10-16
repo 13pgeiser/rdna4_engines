@@ -1,17 +1,15 @@
-# THE ARCHITECTURES libr4d SERVES, declared here and nowhere else. Its kernels are written for
-# RDNA4: wave32, the gfx12 WMMA fragment layouts, and gfx12-only instructions such as
-# global_load_tr_b128. Compiled for anything else they would launch and compute garbage, so the
-# coverage is a property of the library and the library is what states it.
+# libr4d serves RDNA4 only, declared here and nowhere else. Its kernels rely on wave32, the gfx12
+# WMMA fragment layouts and gfx12-only instructions such as global_load_tr_b128; built for other
+# targets they would compute garbage.
 #
-# A build targeting other cards skips libr4d and keeps going. What it gets is an engine with no
-# device kernel library for that card, which REFUSES TO SERVE an op only a reference library
-# implements unless --debug-accept-reference-kernels is passed (spec §17) -- an unserved card that
-# says so, rather than a project that will not configure. Supplying a kernel library for that card
-# is the supported answer, and it is the same one an out-of-tree author gives.
+# A build targeting other cards skips libr4d. The engine then has no device kernel library for that
+# card and refuses ops only a reference library implements, unless
+# --debug-accept-reference-kernels is passed (spec §17). The supported fix is a kernel library for
+# that card.
 #
-# A plugin like any other: built here inside radiance's tree, or on its own against an installed
-# radiance (`cmake -S libr4d -B build -DCMAKE_PREFIX_PATH=<radiance prefix>`, with the HIP compiler
-# named as for the tree) -- the same rad_add_plugin either way (cmake/RadAddPlugin.cmake).
+# Built in radiance's tree, or standalone against an installed radiance
+# (`cmake -S libr4d -B build -DCMAKE_PREFIX_PATH=<radiance prefix>`, naming the HIP compiler as for
+# the tree); see cmake/RadAddPlugin.cmake.
 if(NOT COMMAND rad_add_plugin)
   cmake_minimum_required(VERSION 3.21)
   project(libr4d LANGUAGES CXX HIP)
@@ -26,87 +24,72 @@ if(NOT R4D_GPU_TARGETS)
   return()
 endif()
 
-# The libr4d kernel plugin, and THE ONLY BUILD libr4d HAS: this list is the definition of its
-# translation units.
+# R4D_UNITS is the definitive list of libr4d's device translation units, as "unit|extra flags".
+# The GDN chunk scan needs -mcumode. The quantised GEMMs' group sizes are source constants, not
+# build options: the host packer reads r4d_args.h and the units their own defaults, which must
+# agree (r4d_gemm_args.h static_asserts the w4 and w8 groups).
 #
-# THE PER-UNIT FLAGS ARE NOT DECORATION: the GDN chunk scan needs -mcumode, and every quantised
-# GEMM needs its group size, which must match the group the weights were packed at or the kernel
-# reads the wrong scales.
-#
-# Every unit is compiled -ffp-contract=off. The quantised all-reduce REQUIRES it: it sums two
-# dequantised products per element, the two ranks see the products in the opposite order, and
-# contracting either into an FMA makes them disagree by ~1 ULP -- which breaks the replicated-state
-# invariant. For the rest it is reproducibility: the costs the kernels' comments state hold at
-# this setting.
+# Every unit is compiled -ffp-contract=off. The quantised all-reduce requires it: the two ranks sum
+# two dequantised products per element in opposite order, and an FMA on either side makes them
+# differ by ~1 ULP, breaking the replicated-state invariant. Elsewhere it keeps results and the
+# costs quoted in kernel comments reproducible.
 
-# ONE DIRECTORY: the kernels and libr4d's own declaration -- the row table, the layouts -- live
-# together. There is no launch adapter between the plugin ABI and the kernels: every entry point
-# takes `(const RadArgs*, RadStream)` and sits beside the kernel it launches.
-#
-# THIS PLUGIN LINKS rad_abi AND NOTHING ELSE: it is a standalone plugin built on abi/, exactly like
-# one written out of tree.
-
-# The weight group size, as the DEVICE units see it. It is NOT one variable covering both sides:
-# the packer is r4d_layout.cpp, a host source in R4D_DECLARATION below, which no -D here reaches --
-# it reads R4D_W4_GROUP from r4d_args.h, a hardcoded 128. So changing this alone re-groups the
-# kernel and leaves the packer at 128, which is precisely the silently-wrong-output the single
-# variable was supposed to rule out.
-# CHANGING THE GROUP MEANS CHANGING BOTH, and the enum is the one that decides what is on disk.
-set(RAD_W4_GROUP 128 CACHE STRING "libr4d quantised-weight group size (must match R4D_W4_GROUP in r4d_args.h)")
+# Kernels and libr4d's declaration (row table, layouts) share one directory. There is no launch
+# adapter: every entry point takes `(const RadArgs*, RadStream)` and sits beside its kernel. The
+# plugin links rad_abi only, like one written out of tree.
 
 set(R4D_UNITS
   "r4d_attn_paged_h256_gqa6|"
   "r4d_attn_paged_h128_gqa4|"
   # Gemma 4 dense sliding window: head_dim 256, 2 queries per KV head, windowed decode and
-  # prefill. The windowed twin of the drafter leg above.
+  # prefill.
   "r4d_attn_paged_h256_gqa2|"
-  # Eight queries per KV head, at both head widths: the routed 35B-A3B is 16 over 2 at 256
-  # and MiniCPM5-2B is 16 over 2 at 128. Same device code, different instantiations.
+  # Eight queries per KV head, one body instantiated at head_dim 256 (the routed 35B-A3B) and 128
+  # (MiniCPM5-2B).
   "r4d_attn_paged_gqa8|"
-  # Twelve, head_dim 256 only: Qwen3.8-Flash-Next's QSA layers are 24 over 2. Four lines that
-  # set the ratio and include the unit above, which is the parameterised body.
+  # The gqa12, gqa4 and gqa6_bs4 units set the ratio and include the parameterised body above.
+  # gqa12, head_dim 256: Qwen3.8-Flash-Next's QSA layers (24 query heads over 2).
   "r4d_attn_paged_h256_gqa12|"
-  # Four, head_dim 256: Qwen3.5-0.8B is 8 over 2 at the 27B's head width. Again the body above
-  # with the ratio set.
+  # gqa4, head_dim 256: Qwen3.5-0.8B (8 over 2).
   "r4d_attn_paged_h256_gqa4|"
-  # Six, head_dim 256 and the same 4-token page: the same QSA layers at four ranks, where each KV
-  # head is replicated across a rank pair. Again four lines that set the ratio and include the body.
+  # gqa6, head_dim 256, 4-token page: the same QSA layers at four ranks, each KV head replicated
+  # across a rank pair.
   "r4d_attn_paged_h256_gqa6_bs4|"
-  # head_dim 256 and 512 at 1, 2, 4 or 8 queries per KV head with ANY window: Gemma 4's sliding
-  # (h256/gqa2, window 1024) and full (h512, gqa 8 at TP1/TP2) layers. One kernel a geometry for
-  # every q_len, reading q at any row pitch, which is what attn_paged_qrow is.
+  # head_dim 256 and 512 at 1, 2, 4 or 8 queries per KV head with any window: Gemma 4's sliding
+  # (h256/gqa2, window 1024) and full (h512, gqa 8 at TP1/TP2) layers. One kernel per geometry
+  # covers every q_len and reads q at any row pitch (attn_paged_qrow).
   "r4d_attn_paged_window|"
+  # Two queries per KV head at head_dim 128 only (Qwen3-1.7B's 16 over 8, Qwen3-ASR's decoder):
+  # the gqa8 body with the ratio set.
+  "r4d_attn_paged_h128_gqa2|"
   "r4d_attn_vit_h72_bf16|"
   # An encoder's dense attention (bidirectional, GQA in the workgroup, a two-sided window) and
   # the small ops around it: act_mul, seg_mean, qk_norm_rope with a v norm, the f32 widening.
   "r4d_attn_dense_bf16|"
   "r4d_encoder_bf16|"
-  # The image generator: attention over a paged prefix and the pass's own rows, the causal
-  # head_dim-128 dense form and the 1152-wide decoder head; and the sampler, adaptive norm,
-  # implicit-GEMM convolution and pixel ops around them.
+  # The image generator: attention over a paged prefix plus the pass's own rows, the causal
+  # head_dim-128 dense form and the 1152-wide decoder head; plus the sampler, adaptive norm,
+  # implicit-GEMM convolution and pixel ops.
   "r4d_attn_gen|"
   "r4d_gen|"
-  # The vision tower's own small ops: layer norm, the learned-grid position embedding, and the
-  # biased GEMM with a linear layer's activation and residual in its store.
+  # Vision tower ops: layer norm, the learned-grid position embedding, and the biased GEMM with
+  # activation and residual fused into its store.
   "r4d_vit_bf16|"
   "r4d_gdn_chunk_scan_k128_v128_c64_bf16|-mcumode"
   "r4d_gdn_conv_w4_h128_bf16|"
   "r4d_gdn_kkt_solve_k128_c64_bf16|"
   "r4d_gdn_recurrent_update_k128_v128_bf16_fp32state|"
   "r4d_gdn_gated_rmsnorm_h128_bf16|"
-  # The gated residual, which is what a hyper-connection model has instead of a pre-norm and a
-  # residual add. ONE unit: hc_read is two launches behind one entry point, because the mix
-  # depends on every column of the low-rank waist and a kernel boundary is the grid-wide
-  # barrier that says so.
+  # The hyper-connection gated residual (in place of pre-norm plus residual add). hc_read is two
+  # launches behind one entry point: the mix depends on every column of the low-rank waist, so it
+  # needs a grid-wide barrier.
   "r4d_hc_bf16|"
   "r4d_ngram_ids|"
   "r4d_ple_gate_bf16|"
   "r4d_ple_conv_bf16|"
-  # The all-reduce family is ONE unit and not one per kernel: they share a single instance --
-  # peer scratch, IPC-equivalent pointers, per-block flags, device sequence counters -- and one
-  # rendezvous that establishes it across every rank before the first launch. Splitting the entry
-  # points across the six kernel units would put that state in a header and give each unit its own
-  # copy of it, which is the one thing it must not have.
+  # The all-reduce kernels share one instance (peer scratch, IPC-equivalent pointers, per-block
+  # flags, device sequence counters) set up by one rendezvous across ranks, so all entry points
+  # live in r4d_ar_entry. Spreading them across the kernel units would give each its own copy.
   "r4d_ar_entry|"
   "r4d_ar_gather_2rank|"
   "r4d_ar_gather_Nrank|"
@@ -118,23 +101,22 @@ set(R4D_UNITS
   "r4d_gemm_bf16_nt_m16|"
   "r4d_gemm_bf16_nt_m64|"
   "r4d_gemm_bf16_nt_tiled|"
-  "r4d_gemm_w4a16_nt_m64|-DR4D_GEMM_W4_GROUP=${RAD_W4_GROUP}"
-  "r4d_gemm_w5a16_nt_m64|-DR4D_GEMM_W4_GROUP=${RAD_W4_GROUP}"
+  "r4d_gemm_w4a16_nt_m64|"
+  "r4d_gemm_w5a16_nt_m64|"
   "r4d_gemm_wpa8i8_tiled|"
   "r4d_givens_dense|"
-  "r4d_gemm_w8a16_nt_m64|-DR4D_GEMM_W8_GROUP=${RAD_W4_GROUP}"
-  "r4d_gemm_w2a8_nt|-DR4D_GEMM_W2A8_GROUP=${RAD_W4_GROUP}"
-  "r4d_gemm_w4a8_nt_m64|-DR4D_GEMM_W4A8_GROUP=${RAD_W4_GROUP}"
-  "r4d_gemm_w8a8_nt_m64|-DR4D_GEMM_W8A8_GROUP=${RAD_W4_GROUP}"
-  "r4d_gemm_w8a8_tiled|-DR4D_GEMM_W8A8_GROUP=${RAD_W4_GROUP}"
-  "r4d_gemm_w4a8_tiled|-DR4D_GEMM_W4A8_GROUP=${RAD_W4_GROUP}"
-  "r4d_gemm_w4a8_prefill|-DR4D_GEMM_W4A8_GROUP=${RAD_W4_GROUP}"
+  "r4d_gemm_w8a16_nt_m64|"
+  "r4d_gemm_w2a8_nt|"
+  "r4d_gemm_w4a8_nt_m64|"
+  "r4d_gemm_w8a8_nt_m64|"
+  "r4d_gemm_w8a8_tiled|"
+  "r4d_gemm_w4a8_tiled|"
+  "r4d_gemm_w4a8_prefill|"
   "r4d_gemm_mxfp4a8_nt_m64|"
   "r4d_gemm_mxfp4a8_tiled|"
   "r4d_gemm_mxfp4a8_decode|"
-  # Block-scaled FP8 -- the format Qwen3.8-27B-FP8 ships in.
-  # No -D: the 128x128 block is a property of the checkpoint on disk and not a quantiser choice
-  # like RAD_W4_GROUP, so it is a constant in the source and the entry points reject a mismatch.
+  # Block-scaled FP8 (the format Qwen3.8-27B-FP8 ships in). The 128x128 block is fixed by the
+  # checkpoint, and the entry points reject a mismatch.
   "r4d_gemm_fp8a16_nt_m1|"
   "r4d_gemm_fp8a8|"
   "r4d_quant_act_fp8|"
@@ -163,14 +145,14 @@ set(R4D_UNITS
   "r4d_rowtopk_bf16|"
   # The vocab-sharded draft head's cross-rank top-1, one id a row.
   "r4d_pair_argmax_f32|"
-  # Gemma 4's two sandwich-norm joins (norm_add_norm, norm_add_norm_route, join_add_scale) and
-  # expert_scale: each one kernel for a chain of small ones.
+  # Gemma 4's sandwich-norm joins (norm_add_norm, norm_add_norm_route, join_add_scale) and
+  # expert_scale, each one kernel for a chain of small ones.
   "r4d_norm_join_bf16|"
   "r4d_expert_scale_bf16|"
   "r4d_dflash_conv_t2_g16_bf16|"
   "r4d_dflash_select_bf16|"
-  # The routed mixture of experts: router, scatter, the grouped block-scaled fp8 GEMM and
-  # gather, in one unit because the other three exist only to feed the GEMM.
+  # Routed MoE: router, scatter, the grouped block-scaled fp8 GEMM and gather, in one unit because
+  # the other three only feed the GEMM.
   "r4d_moe|"
 )
 
@@ -193,16 +175,9 @@ foreach(u ${R4D_UNITS})
   list(APPEND R4D_SRC "${src}")
 endforeach()
 
-# THE HOST SOURCES IN libr4d/ ARE DECLARATION. There is no launch adapter: every entry point
-# takes `(const RadArgs*, RadStream)` and lives beside the kernel it launches, in libr4d.
-# These are the plugin's statements ABOUT those kernels -- the row table, the weight layouts and
-# their relayouts, the operand descriptions, the fusion claims -- and all of them are PURE HOST
-# C++ that include neither r4d.h nor hip_runtime.h.
-#
-# That split is what lets the tables a transcription error hides in be compiled and read on a box
-# with no ROCm, and it is why an operand description (answered before anything is allocated) and a
-# declared fusion (a statement about the op vocabulary, answered with no tensors in hand) belong
-# here rather than in a translation unit that needs a compiler for the card.
+# The host sources are declaration only: the row table, weight layouts and relayouts, operand
+# descriptions and fusion claims. They are pure host C++ that includes neither r4d.h nor
+# hip_runtime.h, so these tables compile and can be inspected without ROCm.
 set(R4D_DECLARATION r4d_rows.cpp r4d_layout.cpp r4d_fp8_layout.cpp r4d_shapes.cpp r4d_fuse.cpp)
 
 rad_add_plugin(libr4d kernels
@@ -211,18 +186,15 @@ rad_add_plugin(libr4d kernels
   GPU_TARGETS ${R4D_GPU_TARGETS}
   INCLUDES    ${CMAKE_CURRENT_SOURCE_DIR})
 
-# The catalogue dump: prints every row and, on a card, calls each launch with a minimal valid
-# input. This is how a transcription error in the constraint table is found -- otherwise it is
-# invisible until a model silently picks the wrong kernel. It dlopens the plugin rather than
-# linking it, because an undefined symbol in the .so is itself one of the things being tested.
+# Catalogue dump: prints every row and, on a card, calls each launch with a minimal valid input, to
+# catch transcription errors in the constraint table. It dlopens the plugin so an undefined symbol
+# in the .so is caught too.
 add_executable(r4d_selftest ${CMAKE_CURRENT_SOURCE_DIR}/r4d_selftest.cpp)
-# It dlopens the plugin but allocates the device buffers it feeds the kernels itself, so it needs
-# the HIP runtime even though it links no kernel.
+# Links the HIP runtime to allocate the device buffers it feeds the kernels.
 target_link_libraries(r4d_selftest PRIVATE radiance::abi ${CMAKE_DL_LIBS} ${RAD_HIP_RUNTIME})
 target_include_directories(r4d_selftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(r4d_selftest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-# libr4d is built at -std=c++17: at C++20 clang tightens the address-space check on
-# __builtin_amdgcn_global_load_tr_b128_v8i16 in r4d_common.h, and C++17 is the configuration every
-# cost stated in the kernels' comments was taken in.
+# C++17: at C++20 clang tightens the address-space check on
+# __builtin_amdgcn_global_load_tr_b128_v8i16 in r4d_common.h. Kernel cost figures are for C++17.
 set_target_properties(libr4d PROPERTIES HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON)

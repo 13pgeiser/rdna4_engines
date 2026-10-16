@@ -1,14 +1,21 @@
 /* quant_test.cpp -- libquant through the plugin registry, read back through the core's decoder.
  *
- * Every case quantises through the quantiser's own hooks, exactly as rad-convert will, and checks
- * the result through enc_decode_rows rather than through anything libquant says about itself: the
- * point of an encoding is that a reader who never saw the quantiser recovers the weight. Where a
- * rule is exact -- a block scale that is the bf16 of amax/448, an MX exponent that is a power of
- * two, a fixed scale -- the exact value is checked; where it is approximate, the error is bounded
- * by the grid's own step, which a wrong block, a wrong zero or a missing rotation all exceed.
+ * Every case quantises through the quantiser's own hooks, as rad-convert does, and checks the
+ * result through enc_decode_rows, never through anything libquant reports about itself: an
+ * encoding must let a reader that never saw the quantiser recover the weight. Exact rules (a
+ * block scale equal to the bf16 of amax/448, a power-of-two MX exponent, a fixed scale) are
+ * checked exactly; approximate ones are bounded by the grid's step, which a wrong block, a wrong
+ * zero or a missing rotation all exceed.
  */
 #include "quant_fixture.h"
+#include "format/recipe.h"
 
+#include <deque>
+#include <fstream>
+#include <sstream>
+
+#include <algorithm>
+#include <functional>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -64,10 +71,10 @@ TEST(a_rotated_int4_group_decodes_back_through_the_hadamard) {
     CHECK_EQ(enc_name(b.enc), std::string("i4*bf16[1x128]/fwht128"));
     const double ea = rel_err(w, decode(a, R, C)), eb = rel_err(w, decode(b, R, C));
     std::fprintf(stderr, "    int4 g128: plain %.4f, rotated %.4f\n", ea, eb);
-    /* Both are a 4-bit grid's error, and the rotated one is decoded THROUGH the rotation, so a
-     * reader that forgot it would see noise, ~1.0. On weights with outliers the rotation is also
-     * the better grid: it spreads one large value over the group instead of letting it set the
-     * scale every other value is rounded against. */
+    /* Both errors are a 4-bit grid's. The rotated one is decoded through the rotation, so a
+     * reader that skipped it would see noise (~1.0). With outliers the rotation is also the
+     * better grid: it spreads one large value over the group instead of letting it set the scale
+     * everything else rounds against. */
     CHECK(ea < 0.35);
     CHECK(eb < 0.15);
     CHECK(eb < ea);
@@ -75,10 +82,10 @@ TEST(a_rotated_int4_group_decodes_back_through_the_hadamard) {
 
 TEST(the_w4nl_table_is_exact_in_e4m3_and_beats_minus_8_to_7_after_the_rotation) {
     NEED_LIBQUANT();
-    /* The sixteen levels libr4d's w4nla8h kernel decodes, in its code order, as a container stores
-     * them; and against -8..7 at the same bytes, under the same rotation and scale search, they
-     * are the better grid for the near-normal weight they were fitted to. Not with outliers: the
-     * rotation turns one outlier into a +-o pattern across its whole group, which is bimodal. */
+    /* The sixteen levels libr4d's w4nla8h kernel decodes, in its code order, as a container
+     * stores them. Against -8..7 at the same bytes, rotation and scale search, they are the
+     * better grid for the near-normal weight they were fitted to. Not with outliers: the rotation
+     * turns one outlier into a +-o pattern across its group, which is bimodal. */
     const int64_t R = 32, C = 512;
     const std::vector<float> w = draw(R * C, 2);
     Opts i4, nl;
@@ -186,7 +193,7 @@ TEST(gptq_without_a_hessian_is_round_to_nearest_byte_for_byte) {
 TEST(gptq_with_a_hessian_lowers_the_output_error) {
     NEED_LIBQUANT();
     /* Correlated activations: x = A z, so H = sum x x^T is far from diagonal and error feedback
-     * has something to exploit that rounding each column alone cannot. */
+     * can beat rounding each column alone. */
     const int64_t R = 48, C = 128, T = 2048;
     const std::vector<float> w = draw(R * C, 7, 10.0f);
     const std::vector<float> z = draw(T * C, 8);
@@ -205,8 +212,9 @@ TEST(gptq_with_a_hessian_lowers_the_output_error) {
             for (int64_t j = 0; j < C; ++j)
                 h[(size_t)(i * C + j)] += x[(size_t)(t * C + i)] * x[(size_t)(t * C + j)];
 
-    char dir[] = "/tmp/rad_quant_test_XXXXXX";
-    REQUIRE(mkdtemp(dir) != nullptr);
+    const TempDir td("rad_quant_test");
+    REQUIRE(!td.path.empty());
+    const char* dir = td.path.c_str();
     const std::string path = std::string(dir) + "/gram.r0.blk.3.ffn_down_exps.bin";
     REQUIRE(write_gram(path, C, T, h));
 
@@ -236,8 +244,8 @@ TEST(gptq_with_a_hessian_lowers_the_output_error) {
     std::fprintf(stderr, "    output error: rtn %.4f, gptq %.4f\n", er, eg);
     CHECK(eg < er * 0.9);
 
-    /* COORDINATE DESCENT AFTER IT never raises the form it descends, which on the corpus the
-     * Gram came from is the output error, and on a correlated Hessian it finds codes to move. */
+    /* Coordinate descent afterwards never raises the quadratic form it descends (the output
+     * error on the corpus the Gram came from), and on a correlated Hessian it finds codes to move. */
     Opts c;
     c.s("codes", "i4").i("group", 32).s("scale", "f32").s("calib", dir).i("cd", 3);
     Quantised gc = quantise(quantizer("gptq"), c, "blk.3.ffn_down_exps.17.weight", R, C, w);
@@ -247,17 +255,472 @@ TEST(gptq_with_a_hessian_lowers_the_output_error) {
     CHECK(ec < eg);
     /* The scales are GPTQ's, untouched: only codes move. */
     CHECK(gc.planes[1] == g.planes[1]);
-    std::remove(path.c_str());
-    rmdir(dir);
+}
+
+/* ------------------------------------------------------------------ recipes, compiled
+ *
+ * A rule's options are typed by its quantiser's own table before declare runs, so a misspelt key or
+ * a value of the wrong type is refused before a checkpoint of hundreds of GB is opened. */
+TEST(a_rule_compiles_its_options_by_the_quantisers_types) {
+    NEED_LIBQUANT();
+    Recipe r;
+    std::string why;
+    REQUIRE_EQ(r.add_text("a  gptq codes=i4 group=010 damp=0.02 calib=/x\n"
+                          "b  rtn  codes=i4 codez=i8\n"
+                          "c  rtn  codes=i4 group=0x80\n"
+                          "d  rtn  codes=i4 group=\n"
+                          "e  gptq codes=i4 damp=nan\n"
+                          "f  gptq codes=i4 damp=1e999\n"
+                          "g  rtn  codes=i4 group=99999999999999999999\n"
+                          "h  nope codes=i4\n", "t", &why), RAD_OK);
+    const std::vector<RecipeRule>& rules = r.rules();
+    REQUIRE_EQ(rules.size(), (size_t)8);
+
+    /* Decimal, so the text the container records is the number the quantiser was given. */
+    CompiledRule a;
+    REQUIRE_EQ(a.build(rules[0], reg(), &why), RAD_OK);
+    REQUIRE_EQ(a.params.size(), (size_t)4);
+    CHECK_EQ(a.params[1].kind, (int)RAD_P_INT);
+    CHECK_EQ(a.params[1].ival, 10ll);
+    CHECK_EQ(std::string(a.params[1].key), std::string("group"));
+    CHECK_EQ(a.params[2].kind, (int)RAD_P_F64);
+    CHECK_EQ(a.params[2].dval, 0.02);
+    CHECK_EQ(std::string(a.params[3].sval), std::string("/x"));
+
+    CompiledRule b;
+    CHECK_EQ(b.build(rules[1], reg(), &why), RAD_E_INVAL);
+    CHECK(has(why, "t:2") && has(why, "takes no option 'codez'"));
+    for (size_t i = 2; i < 7; ++i) {
+        CompiledRule c;
+        CHECK_EQ(c.build(rules[i], reg(), &why), RAD_E_INVAL);
+        CHECK(has(why, rules[i].origin));
+    }
+    CompiledRule h;
+    CHECK_EQ(h.build(rules[7], reg(), &why), RAD_E_NOTFOUND);
+    CHECK(has(why, "no quantiser 'nope'") && has(why, "rtn"));
+}
+
+/* Every rule of every shipped recipe names a loaded quantiser and options it takes, and the
+ * quantiser accepts the kind of weight its pattern names, or declines it; none is refused as
+ * malformed. Recipes ship beside the published containers, and a broken one would otherwise be
+ * found only hours into a conversion. */
+TEST(every_shipped_recipe_compiles_and_its_grids_are_accepted) {
+    NEED_LIBQUANT();
+    std::string dir = __FILE__;
+    dir = dir.substr(0, dir.find_last_of('/')) + "/../data/recipes";
+    const TempDir calib("rad_quant_recipes");
+    REQUIRE(!calib.path.empty());
+    const char* old = std::getenv("CALIB");
+    const std::string saved = old ? old : "";
+    setenv("CALIB", calib.path.c_str(), 1);
+
+    int files = 0, rules = 0;
+    std::error_code ec;
+    for (const auto& ent : std::filesystem::directory_iterator(dir, ec)) {
+        if (ent.path().extension() != ".recipe") continue;
+        ++files;
+        std::ifstream f(ent.path());
+        std::stringstream ss;
+        ss << f.rdbuf();
+        Recipe r;
+        std::string why;
+        const int st = r.add_text(ss.str(), ent.path().filename().string(), &why);
+        if (st != RAD_OK) std::fprintf(stderr, "    %s\n", why.c_str());
+        CHECK_EQ(st, RAD_OK);
+        std::deque<CompiledRule> compiled;
+        for (const RecipeRule& rule : r.rules()) {
+            ++rules;
+            compiled.emplace_back();
+            CompiledRule& c = compiled.back();
+            if (c.build(rule, reg(), &why) != RAD_OK) {
+                std::fprintf(stderr, "    %s\n", why.c_str());
+                CHECK(false);
+                continue;
+            }
+            /* A weight the pattern names: every wildcard a layer or expert 0. */
+            std::string name = rule.pattern;
+            for (char& ch : name) if (ch == '*' || ch == '?') ch = '0';
+            const RadQuantWeight qw = weight_of(name.c_str(), 256, 4096);
+            RadEncoding e;
+            const int es = c.q->encoding(c.params.data(), (int)c.params.size(), &qw, &e);
+            if (es != RAD_OK && es != RAD_E_UNSUPPORTED)
+                std::fprintf(stderr, "    %s (%s %s): %s\n", rule.origin.c_str(),
+                             rule.quantizer.c_str(), rule.options_text().c_str(), rad_strerror(es));
+            CHECK(es == RAD_OK || es == RAD_E_UNSUPPORTED);
+            if (es == RAD_OK) CHECK(rad_enc_valid(&e));
+        }
+    }
+    std::fprintf(stderr, "    %d recipe(s), %d rule(s)\n", files, rules);
+    CHECK(files >= 20);
+    CHECK(rules >= 250);
+    if (old) setenv("CALIB", saved.c_str(), 1); else unsetenv("CALIB");
+}
+
+/* ------------------------------------------------------------------ GPTQ against the textbook
+ *
+ * Frantar et al.'s GPTQ, written plainly in double: damp the Hessian (lambda = damp x mean
+ * diagonal, a dead column's diagonal set to that mean), take U, the upper Cholesky factor of its
+ * inverse, then for each column in order round it under its block's fixed scale and spread
+ * (w_i - q_i) / U_ii over every later column j with weight U_ij. libquant's loop is blocked
+ * (128 columns at a time, a lazy update across blocks) and in f32, so the codes are checked
+ * column by column against the textbook target with libquant's earlier codes taken as given: a
+ * code must be the nearest under its scale to that target, up to a tie. A wrong index in the
+ * cross-block update, a transposed U or damping applied twice moves targets across rounding
+ * boundaries and shows as codes that are not nearest. */
+namespace {
+
+/* Lower Cholesky of the SPD `a` [k x k] in place; false if it is not positive definite. */
+bool ref_chol(std::vector<double>& a, int64_t k) {
+    for (int64_t j = 0; j < k; ++j) {
+        double d = a[(size_t)(j * k + j)];
+        for (int64_t t = 0; t < j; ++t) d -= a[(size_t)(j * k + t)] * a[(size_t)(j * k + t)];
+        if (!(d > 0)) return false;
+        d = std::sqrt(d);
+        a[(size_t)(j * k + j)] = d;
+        for (int64_t i = j + 1; i < k; ++i) {
+            double v = a[(size_t)(i * k + j)];
+            for (int64_t t = 0; t < j; ++t) v -= a[(size_t)(i * k + t)] * a[(size_t)(j * k + t)];
+            a[(size_t)(i * k + j)] = v / d;
+        }
+        for (int64_t i = 0; i < j; ++i) a[(size_t)(i * k + j)] = 0;
+    }
+    return true;
+}
+
+/* U with U^T U = (H + damping)^-1, upper, in double: the inverse by solving L L^T X = I column by
+ * column, then the lower factor of the inverse transposed. */
+std::vector<double> ref_gptq_u(const std::vector<float>& h, int64_t k, double damp) {
+    std::vector<double> a(h.begin(), h.end());
+    double tr = 0;
+    for (int64_t i = 0; i < k; ++i) tr += a[(size_t)(i * k + i)];
+    const double mean = tr / (double)k;
+    for (int64_t i = 0; i < k; ++i) {
+        double& d = a[(size_t)(i * k + i)];
+        if (!(d > 0)) d = mean;
+        d += damp * mean;
+    }
+    if (!ref_chol(a, k)) return {};
+    std::vector<double> inv((size_t)(k * k)), y((size_t)k);
+    for (int64_t c = 0; c < k; ++c) {
+        for (int64_t i = 0; i < k; ++i) {                      /* L y = e_c */
+            double v = i == c ? 1.0 : 0.0;
+            for (int64_t t = 0; t < i; ++t) v -= a[(size_t)(i * k + t)] * y[(size_t)t];
+            y[(size_t)i] = v / a[(size_t)(i * k + i)];
+        }
+        for (int64_t i = k - 1; i >= 0; --i) {                 /* L^T x = y */
+            double v = y[(size_t)i];
+            for (int64_t t = i + 1; t < k; ++t) v -= a[(size_t)(t * k + i)] * inv[(size_t)(t * k + c)];
+            inv[(size_t)(i * k + c)] = v / a[(size_t)(i * k + i)];
+        }
+    }
+    if (!ref_chol(inv, k)) return {};
+    std::vector<double> u((size_t)(k * k), 0.0);
+    for (int64_t i = 0; i < k; ++i)
+        for (int64_t j = i; j < k; ++j) u[(size_t)(i * k + j)] = inv[(size_t)(j * k + i)];
+    return u;
+}
+
+/* The codes of `w` [n x k] (stored column order) that are not the nearest i4 code to the textbook
+ * GPTQ target, with libquant's own earlier codes fed forward. `scale(r, j)` is column j's stored
+ * scale. Each mismatch is printed. */
+int ref_gptq_mismatches(const std::vector<float>& w, const std::vector<int>& codes,
+                        const std::function<double(int64_t, int64_t)>& scale,
+                        const std::vector<double>& u, int64_t n, int64_t k) {
+    int bad = 0;
+    for (int64_t r = 0; r < n; ++r) {
+        std::vector<double> t(w.begin() + r * k, w.begin() + (r + 1) * k);
+        for (int64_t i = 0; i < k; ++i) {
+            const double s = scale(r, i);
+            const double q = t[(size_t)i] / s;
+            const double nearest = std::min(7.0, std::max(-8.0, std::round(q)));
+            const int c = codes[(size_t)(r * k + i)];
+            /* A tie, to rounding in f32 against double: within 1e-3 of a code step. */
+            if (c != (int)nearest && std::fabs(q - c) > std::fabs(q - nearest) + 1e-3) {
+                if (bad < 5)
+                    std::fprintf(stderr, "    row %lld col %lld: code %d, the target is %.4f steps\n",
+                                 (long long)r, (long long)i, c, q);
+                ++bad;
+            }
+            const double e = (t[(size_t)i] - c * s) / u[(size_t)(i * k + i)];
+            for (int64_t j = i + 1; j < k; ++j) t[(size_t)j] -= e * u[(size_t)(i * k + j)];
+        }
+    }
+    return bad;
+}
+
+}  /* namespace */
+
+TEST(gptq_chooses_the_codes_of_textbook_gptq) {
+    NEED_LIBQUANT();
+    /* K = 320 is two whole 128-column blocks and a partial third; column 37 is dead (no input
+     * reaches it), so its Hessian row and column are zero. */
+    const int64_t N = 8, K = 320, T = 384, dead = 37;
+    const std::vector<float> w = draw(N * K, 21, 8.0f);
+    const std::vector<float> z = draw(T * K, 22);
+    std::vector<float> x((size_t)(T * K));
+    for (int64_t t = 0; t < T; ++t)
+        for (int64_t i = 0; i < K; ++i) {
+            /* Each input shares most of its energy with its neighbour, so H is far from diagonal. */
+            const float own = z[(size_t)(t * K + i)], next = z[(size_t)(t * K + (i + 1) % K)];
+            x[(size_t)(t * K + i)] = i == dead ? 0.0f : (own + 3.0f * next) * (1.0f + (float)(i % 7));
+        }
+    std::vector<float> h((size_t)(K * K), 0.0f);
+    for (int64_t t = 0; t < T; ++t) {
+        const float* xr = x.data() + t * K;
+        for (int64_t i = 0; i < K; ++i)
+            for (int64_t j = 0; j < K; ++j) h[(size_t)(i * K + j)] += xr[i] * xr[j];
+    }
+    const TempDir td("rad_quant_gptq");
+    REQUIRE(!td.path.empty());
+    REQUIRE(write_gram(td.path + "/gram.r0.blk.4.ffn_up.bin", K, T, h));
+    const char* name = "blk.4.ffn_up.weight";
+
+    /* The stored codes as values: decode, then divide by the scale the plane holds. */
+    auto codes_of = [&](const Quantised& q, const std::vector<int32_t>* perm) {
+        const std::vector<float> d = decode(q, N, K);
+        std::vector<int> c((size_t)(N * K));
+        for (int64_t r = 0; r < N; ++r)
+            for (int64_t j = 0; j < K; ++j) {
+                const int64_t col = perm ? (*perm)[(size_t)j] : j;   /* stored column j */
+                float s;
+                std::memcpy(&s, q.planes[1].data() + (r * (K / 32) + j / 32) * 4, 4);
+                c[(size_t)(r * K + j)] = (int)std::lround(d[(size_t)(r * K + col)] / s);
+            }
+        return c;
+    };
+    auto scale_of = [&](const Quantised& q) {
+        return [&q, K](int64_t r, int64_t j) {
+            float s;
+            std::memcpy(&s, q.planes[1].data() + (r * (K / 32) + j / 32) * 4, 4);
+            return (double)s;
+        };
+    };
+
+    Opts o;
+    o.s("codes", "i4").i("group", 32).s("scale", "f32").s("calib", td.path.c_str());
+    const Quantised g = quantise(quantizer("gptq"), o, name, N, K, w);
+    REQUIRE_EQ(g.status, RAD_OK);
+    const std::vector<double> u = ref_gptq_u(h, K, 0.01);
+    REQUIRE(!u.empty());
+    CHECK_EQ(ref_gptq_mismatches(w, codes_of(g, nullptr), scale_of(g), u, N, K), 0);
+
+    /* The check has teeth: against a factor damped twice as hard, codes stop being nearest. */
+    int stronger = 0;
+    (void)stderr_of([&] {
+        stronger = ref_gptq_mismatches(w, codes_of(g, nullptr), scale_of(g), ref_gptq_u(h, K, 0.02),
+                                       N, K);
+    });
+    CHECK(stronger > 0);
+
+    /* Act order: columns by descending input energy, ties in column order (the dead column last),
+     * stored in that order with the permutation as t.perm; the same textbook loop on the permuted
+     * weight and Hessian. */
+    Opts a;
+    a.s("codes", "i4").i("group", 32).s("scale", "f32").s("calib", td.path.c_str()).i("act_order", 1);
+    const Quantised ga = quantise(quantizer("gptq"), a, name, N, K, w);
+    REQUIRE_EQ(ga.status, RAD_OK);
+    std::vector<int32_t> want((size_t)K);
+    for (int64_t i = 0; i < K; ++i) want[(size_t)i] = (int32_t)i;
+    std::stable_sort(want.begin(), want.end(), [&](int32_t p, int32_t q) {
+        return h[(size_t)p * (size_t)K + (size_t)p] > h[(size_t)q * (size_t)K + (size_t)q];
+    });
+    const int tp = rad_enc_find(&ga.enc, "t.perm");
+    REQUIRE(tp >= 0);
+    std::vector<int32_t> perm((size_t)K);
+    std::memcpy(perm.data(), ga.planes[(size_t)tp].data(), (size_t)K * 4);
+    CHECK(perm == want);
+    CHECK_EQ(perm[(size_t)(K - 1)], (int32_t)dead);
+    std::vector<float> wp((size_t)(N * K)), hp((size_t)(K * K));
+    for (int64_t r = 0; r < N; ++r)
+        for (int64_t j = 0; j < K; ++j) wp[(size_t)(r * K + j)] = w[(size_t)(r * K + perm[(size_t)j])];
+    for (int64_t i = 0; i < K; ++i)
+        for (int64_t j = 0; j < K; ++j)
+            hp[(size_t)(i * K + j)] = h[(size_t)perm[(size_t)i] * (size_t)K + (size_t)perm[(size_t)j]];
+    const std::vector<double> up = ref_gptq_u(hp, K, 0.01);
+    REQUIRE(!up.empty());
+    CHECK_EQ(ref_gptq_mismatches(wp, codes_of(ga, &perm), scale_of(ga), up, N, K), 0);
+}
+
+/* ------------------------------------------------------------------ round to nearest, every grid
+ *
+ * Round-to-nearest must store, for every value, a code whose decoded value is nearest to it among
+ * every code the grid has, given the block's stored scale (and zero, codebook and second level).
+ * The expectation is the core decoder's, not libquant's: each candidate code is written into every
+ * element of the codes plane and the weight decoded, so each element's value under every code comes
+ * from the reader. A wrong rounding mode, a wrong fp6 encoding or an off-by-one table index decodes
+ * to a plausible value inside an error bound, and fails here. Each grid is also quantised a row
+ * block at a time and in one call, which must give the same bytes: the converter bands what it
+ * quantises. Under a transform the comparison is in the rotated domain, the decoder's own before
+ * it applies the Hadamard: H x / n for the value x. */
+namespace {
+
+/* "codes=i4,group=32" as typed options: the integer and number keys rtn takes, strings for the
+ * rest. */
+Opts opts_of(const std::string& spec) {
+    Opts o;
+    size_t at = 0;
+    while (at < spec.size()) {
+        size_t c = spec.find(',', at);
+        if (c == std::string::npos) c = spec.size();
+        const std::string kv = spec.substr(at, c - at);
+        const size_t eq = kv.find('=');
+        const std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
+        if (k == "group" || k == "group2") o.i(k.c_str(), std::atoll(v.c_str()));
+        else if (k == "scale_value" || k == "scale2_value") o.f(k.c_str(), std::atof(v.c_str()));
+        else o.s(k.c_str(), v.c_str());
+        at = c + 1;
+    }
+    return o;
+}
+
+}  /* namespace */
+
+TEST(round_to_nearest_stores_the_nearest_code_on_every_grid) {
+    NEED_LIBQUANT();
+    const char* const kGrids[] = {
+        /* integer codes, symmetric and asymmetric, every width the options name */
+        "codes=i2,group=32,scale=bf16",
+        "codes=i3,group=64,scale=f16",
+        "codes=i4,group=128,scale=f32",
+        "codes=i4,group=32,scale=bf16,clamp=sym",
+        "codes=i5,group=32,scale=f16",
+        "codes=i6,block=4x64,scale=bf16",
+        "codes=i8,group=64,scale=f32",
+        "codes=i8,block=*x*,scale=bf16",
+        "codes=u1,group=32,scale=f16,zero=u8",
+        "codes=u2,group=64,scale=bf16,zero=u4",
+        "codes=u4,group=32,scale=f16,zero=u8",
+        "codes=u8,group=128,scale=f32,zero=u8",
+        "codes=i4,group=32,scale=fp8_e4m3",
+        "codes=i4,group=32,scale=bf16,rule=search",
+        "codes=u4,group=64,scale=f16,zero=u4,rule=search",
+        "codes=i4,group=64,scale=bf16,transform=fwht128",
+        "codes=i8,group=128,scale=f16,transform=fwht128",
+        "codes=i4,block=8x128,scale=bf16",
+        "codes=i4,group=64,rule=fixed,scale_value=0.0078125,scale=f32",
+        /* float codes */
+        "codes=fp8_e4m3,block=8x128,scale=bf16",
+        "codes=fp8_e5m2,group=32,scale=bf16",
+        "codes=fp6_e2m3,group=32,scale=f16",
+        "codes=fp6_e3m2,group=64,scale=bf16",
+        "codes=fp4_e2m1,group=32,scale=e8m0",
+        "codes=fp6_e2m3,group=32,scale=e8m0",
+        "codes=fp8_e4m3,group=32,scale=e8m0",
+        "codes=fp4_e2m1,group=16,scale=fp8_e4m3,scale2=f32",
+        "codes=fp8_e5m2,group=64,scale=f16,transform=fwht128",
+        "codes=fp4_e2m1,group=32,scale=e8m0,transform=fwht32",
+        "codes=i8,group=32,scale=fp8_e4m3,transform=fwht64",
+        /* second levels */
+        "codes=i4,group=32,scale=bf16,scale2=e8m0,group2=256",
+        "codes=i4,group=32,scale=fp8_e4m3,scale2=fp8_e4m3,group2=128",
+        "codes=i4,group=16,scale=u6,scale2=f16",
+        "codes=i4,group=16,scale=i8,scale2=bf16,group2=128",
+        "codes=u4,group=32,scale=u6,scale2=f16,zero=u4",
+        "codes=fp8_e5m2,group=32,scale=bf16,scale2=f16,group2=256,transform=fwht128",
+        "codes=i4,group=32,scale=fp8_e4m3,scale2=fp8_e4m3,group2=128,transform=fwht128",
+        /* codebooks */
+        "table=nf4,group=64,scale=bf16",
+        "table=iq4nl,group=32,scale=f16",
+        "table=w4nl,group=128,scale=bf16,transform=fwht128",
+        "table=w5nl,group=64,scale=fp8_e4m3,scale2=f32",
+        "table=binary,group=32,scale=f16,rule=search",
+        "table=ternary,group=32,scale=bf16",
+        "table=-1.5;-0.25;0;0.5;2,group=32,scale=f32",
+        "table=nf4,group=32,scale=bf16,rule=search",
+    };
+    const int64_t R = 8, C = 256;
+    const std::vector<float> w = draw(R * C, 31, 12.0f);
+    std::vector<float> imp((size_t)C);
+    for (int64_t c = 0; c < C; ++c) imp[(size_t)c] = 0.25f + (float)((c * 37) % 11);
+    const RadQuantizerInfo* q = quantizer("rtn");
+    int grids = 0;
+    for (const char* spec : kGrids) {
+        Opts o = opts_of(spec), ob = opts_of(spec);
+        const bool search = std::strstr(spec, "rule=search") != nullptr;
+        Quantised a = quantise(q, o, "blk.0.ffn_down.weight", R, C, w,
+                               search ? imp.data() : nullptr, R);
+        if (a.status != RAD_OK) std::fprintf(stderr, "    refused: %s\n", spec);
+        REQUIRE_EQ(a.status, RAD_OK);
+        ++grids;
+
+        /* A row block at a time gives the same bytes as one call. */
+        const RadQuantWeight qw = weight_of("blk.0.ffn_down.weight", R, C);
+        const int64_t rb = q->row_block(o.data(), o.n(), &qw);
+        if (rb > 0 && rb < R) {
+            const Quantised b = quantise(q, ob, "blk.0.ffn_down.weight", R, C, w,
+                                         search ? imp.data() : nullptr, rb);
+            REQUIRE_EQ(b.status, RAD_OK);
+            bool same = true;
+            for (size_t k = 0; k < a.planes.size(); ++k) same = same && a.planes[k] == b.planes[k];
+            if (!same) std::fprintf(stderr, "    banded differs: %s\n", spec);
+            CHECK(same);
+        }
+
+        /* Decode in the decoder's own domain, before any transform. */
+        RadEncoding e = a.enc;
+        const int64_t n = rad_enc_fwht(&e);
+        e.transform[0] = 0;
+        std::vector<float> t = w;
+        if (n > 0)
+            for (int64_t r = 0; r < R; ++r)
+                for (int64_t c = 0; c < C; c += n) {
+                    fwht_inplace(t.data() + r * C + c, n);
+                    for (int64_t i = 0; i < n; ++i) t[(size_t)(r * C + c + i)] /= (float)n;
+                }
+        auto decode_as = [&](const std::vector<std::vector<uint8_t>>& planes, std::vector<float>* out) {
+            std::vector<const void*> d;
+            for (const auto& pl : planes) d.push_back(pl.data());
+            EncodedView v;
+            enc_view(e, R, C, d.data(), &v);
+            out->assign((size_t)(R * C), 0.0f);
+            return enc_decode_rows(v, 0, R, out->data()) == RAD_OK;
+        };
+        std::vector<float> got;
+        REQUIRE(decode_as(a.planes, &got));
+        /* Nearest is relative to the stored scale, which a scale lost to rounding (zero, or off by
+         * the transform's order) would still satisfy; the whole decode must also be the weight. */
+        const double whole = rel_err(w, decode(a, R, C));
+        if (!(whole < 1.0)) std::fprintf(stderr, "    %s: decodes at relative error %g\n", spec, whole);
+        CHECK(whole < 1.0);
+
+        /* Every code the plane's dtype holds, written into every element. */
+        const uint32_t cdt = e.plane[0].dtype;
+        const int bits = rad_dtype_bits(cdt);
+        REQUIRE(bits >= 1 && bits <= 8);
+        std::vector<float> best((size_t)(R * C), INFINITY), cand;
+        std::vector<std::vector<uint8_t>> pl = a.planes;
+        const int64_t row_bytes = rad_enc_row_bytes(cdt, C);
+        for (int code = 0; code < (1 << bits); ++code) {
+            for (int64_t r = 0; r < R; ++r)
+                for (int64_t c = 0; c < C; ++c)
+                    rad_store_code(pl[0].data() + r * row_bytes, cdt, c, code);
+            if (!decode_as(pl, &cand)) continue;               /* past a codebook's end */
+            for (size_t i = 0; i < cand.size(); ++i)
+                if (std::isfinite(cand[i]))
+                    best[i] = std::min(best[i], std::fabs(t[i] - cand[i]));
+        }
+        int bad = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            const float err = std::fabs(t[i] - got[i]);
+            /* A tie, or an f32 rounding of the division away from one. */
+            if (err > best[i] + 1e-6f * (std::fabs(t[i]) + std::fabs(got[i])) + 1e-30f) {
+                if (bad < 3)
+                    std::fprintf(stderr, "    %s: element %zu is %.8g, stored as %.8g, but a code "
+                                 "decodes %.8g from it\n", spec, i, t[i], got[i], best[i]);
+                ++bad;
+            }
+        }
+        CHECK_EQ(bad, 0);
+    }
+    CHECK_EQ(grids, (int)(sizeof kGrids / sizeof kGrids[0]));
 }
 
 TEST(w4nl_at_64_with_e4m3_scales_under_a_row_scale_beats_128_with_bf16_at_the_same_bytes) {
     NEED_LIBQUANT();
-    /* The rotated expert grid two ways at the same bytes a row: a bf16 scale a 128 columns, or an
-     * E4M3 one a 64 under a bf16 scale a row (whose bytes are a row's, not a group's). The second
-     * searches its sub-scales as they are stored -- rounded to E4M3 relative to the row's -- so
-     * its rounding does not give back what the finer groups won. Rows whose magnitude varies
-     * along K, so a 64-column group is worth having. */
+    /* The rotated expert grid two ways at the same bytes per row: a bf16 scale per 128 columns,
+     * or an E4M3 scale per 64 under a bf16 scale per row. The second searches its sub-scales as
+     * stored (rounded to E4M3 relative to the row scale), so rounding does not give back what the
+     * finer groups won. Row magnitude varies along K, so 64-column groups pay off. */
     const int64_t R = 64, C = 1024;
     std::vector<float> w = draw(R * C, 21, 1.0f);
     for (int64_t r = 0; r < R; ++r)
@@ -282,9 +745,9 @@ TEST(w4nl_at_64_with_e4m3_scales_under_a_row_scale_beats_128_with_bf16_at_the_sa
     CHECK(eb < ea * 0.97);
     CHECK(bb <= ba + (size_t)R * 2 + 64);
 
-    /* THE SAME GRID WITH THE SECOND LEVEL FIXED, one f32 for the tensor: the E4M3 sub-scales
-     * carry every row's magnitude themselves, which they can because this weight's scales sit well
-     * inside E4M3's range -- and the error is the per-row form's, at a row's two bytes fewer. */
+    /* The same grid with the second level fixed to one f32 for the tensor: the E4M3 sub-scales
+     * carry each row's magnitude themselves (this weight's scales sit well inside E4M3's range),
+     * and the error matches the per-row form at two bytes less per row. */
     Opts c;
     c.s("table", "w4nl").i("group", 64).s("scale", "fp8_e4m3").s("scale2", "f32")
      .s("block2", "*x*").f("scale2_value", 0x1p-13).s("transform", "fwht128").s("rule", "search");
@@ -336,8 +799,8 @@ TEST(a_codebook_indexes_its_table_and_the_scale_multiplies_it) {
         std::fprintf(stderr, "    nf4 g64: %.4f\n", e);
         CHECK(e < 0.15);
     }
-    /* IQ4_NL's values: unequal ends, so a block's scale takes its largest value's sign and that
-     * value lands on -127 exactly (to the bf16 of the scale) */
+    /* IQ4_NL's values have unequal ends, so a block's scale takes its largest value's sign and
+     * that value lands exactly on -127 (to the bf16 of the scale) */
     {
         Opts o;
         o.s("table", "iq4nl").i("group", 32).s("scale", "f32");
@@ -386,7 +849,7 @@ TEST(nvfp4_is_two_scale_levels_the_second_a_tensor) {
     Quantised q = quantise(quantizer("rtn"), o, "x", R, C, w);
     REQUIRE_EQ(q.status, RAD_OK);
     CHECK_EQ(enc_name(q.enc), std::string("fp4_e2m1*fp8_e4m3[1x16]*f32[*x*]"));
-    /* the second level is the widest block's ideal scale, amax / 6, over E4M3's top, so that
+    /* the second level is the largest block's ideal scale (amax / 6) over E4M3's top, so that
      * block's sub-scale is 448 */
     float amax = 0;
     for (float v : w) amax = std::fmax(amax, std::fabs(v));
@@ -403,7 +866,7 @@ TEST(nvfp4_is_two_scale_levels_the_second_a_tensor) {
 
 TEST(an_integer_sub_scale_under_a_superblock_scale) {
     NEED_LIBQUANT();
-    /* a K-quant's shape: 4-bit codes a group of 32, a six-bit sub-scale each, an f16 a 256 */
+    /* a K-quant's shape: 4-bit codes, a six-bit sub-scale per 32, an f16 per 256 */
     const int64_t R = 8, C = 512;
     const std::vector<float> w = draw(R * C, 13, 6.0f);
     Opts o;
@@ -508,7 +971,7 @@ TEST(cast_converts_to_nearest_even_with_no_scale) {
         CHECK_EQ(enc_name(q.enc), std::string(k.dt));
         int off = 0;
         for (int64_t i = 0; i < R * C; ++i) {
-            std::vector<uint8_t> one(4);
+            std::vector<uint8_t> one(8);     /* rad_store_f32 writes up to eight bytes */
             rad_store_f32(one.data(), k.code, 0, w[(size_t)i]);
             off += std::memcmp(one.data(), q.planes[0].data() + i * rad_dtype_bytes(k.code, 1),
                                (size_t)rad_dtype_bytes(k.code, 1)) != 0;
@@ -555,12 +1018,10 @@ TEST(a_grid_the_options_do_not_describe_is_refused) {
     }
 }
 
-RAD_TEST_MAIN()
-
-/* A SCHEME OF A QUANTISER'S OWN IS READ THROUGH THAT QUANTISER. The core decodes plain and affine
- * and nothing else; for any other scheme enc_decode_rows asks the loaded quantisers' decode hooks
- * (abi/rad_quant.h) -- which is how the oracle, rad-kbench and rad-convert's error report read a
- * weight whose format the engine has never heard of. Unloaded, the same weight is refused by name. */
+/* A scheme a quantiser defines is decoded through that quantiser. The core decodes plain and
+ * affine only; for any other scheme enc_decode_rows asks the loaded quantisers' decode hooks
+ * (abi/rad_quant.h), which is how the oracle, rad-kbench and rad-convert's error report read a
+ * format the engine does not know. Once the plugin is unloaded, the weight is refused by name. */
 TEST(a_quantisers_own_scheme_decodes_through_its_hook_and_only_while_it_is_loaded) {
     const std::string so = home() + "/testquant/radtest_quant.so";
     struct stat st {};
@@ -602,3 +1063,5 @@ TEST(a_quantisers_own_scheme_decodes_through_its_hook_and_only_while_it_is_loade
     CHECK_EQ(enc_decode_rows(v, 0, R, out.data(), &why), RAD_E_UNSUPPORTED);
     CHECK(why.find("radtest-halves") != std::string::npos);
 }
+
+RAD_TEST_MAIN()

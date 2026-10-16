@@ -1,25 +1,23 @@
 #!/bin/sh
-# tiercross.sh -- two conversations through the tiers at once. Does either get the other's state?
+# tiercross.sh -- two conversations through the KV tiers at once; checks that neither is served
+# the other's state.
 #
-# WHY THIS IS NOT tierident.sh WITH A SECOND PROMPT. That script asks ONE prompt four times and
-# compares the four answers, which proves a session survives the round trip. It cannot, by
-# construction, see the failure this one is for: with a single conversation in the server there is
-# no other conversation's bytes for it to be served. The cross-contamination failures a tiered
-# cache can have -- an entry holding reassigned block ids, a checkpoint slot freed by one session
-# and still named by another -- need two sessions in flight to show up at all.
+# tierident.sh checks that one session survives the round trip, but with one conversation there is
+# nothing else to be served. Cross-contamination (an entry holding reassigned block ids, a
+# checkpoint slot freed by one session and still named by another) needs two sessions in flight.
 #
-# A HOST TIER THE FILLER OVERFLOWS, so the arena's drops run as well as its restores:
+# Start the server with a host tier the filler overflows, so the arena's drops run as well as its
+# restores:
 #
 #   --prefix-cache-mib 512
 #
-# AND ENOUGH SNAPSHOT SLOTS FOR BOTH SESSIONS. On a hybrid model a hit is clamped to the deepest
-# snapshot it reaches, and a store too small for both makes each session retire the other's: every
-# arm then re-prefills from zero and restores nothing, so the device arm's reuse is checked below.
-# The default --checkpoint-slots holds both.
+# It also needs snapshot slots for both sessions. On a hybrid model a hit is clamped to the deepest
+# snapshot it reaches; a store too small for both makes each session retire the other's, and every
+# arm re-prefills from zero (checked below via the device arm's reuse). The default
+# --checkpoint-slots holds both.
 #
-# EACH SESSION IS COMPARED ONLY TO ITSELF. A and B are different prompts and their answers differ
-# for ordinary reasons; what must hold is that A's restored answer is A's cold answer. Corrupt
-# state does not produce babble, it produces B's train of thought under A's question.
+# Each session is compared only to itself: A's restored answer must equal A's reference. Corrupt
+# state typically shows as B's train of thought under A's question.
 set -e
 
 P=${P:-8100}
@@ -32,14 +30,12 @@ trap 'rm -rf "$work"' EXIT INT TERM
 
 command -v jq >/dev/null || { echo "tiercross: jq is required" >&2; exit 2; }
 
-# TWO PROMPTS THAT SHARE NO PREFIX. A shared opening would put both sessions on the same chain for
-# its length, and the blocks they then share are legitimately one another's -- which is the whole
-# point of a prefix cache and would make a difference here unreadable. They diverge at token one.
+# Two prompts that diverge at the first token: a shared opening would legitimately share blocks
+# and blur the comparison.
 #
-# EACH HAS TO PRODUCE AN ANSWER. A wall of repeated sentences is a passage an instruction-tuned
-# model can reasonably answer with a single EOS, and every arm of that session would then compare
-# an empty string to an empty string. Both lengths are checked below, because a vacuous green here
-# is worse than a red.
+# Each must produce a real answer. An instruction-tuned model may answer a wall of repeated
+# sentences with a single EOS, and every arm would then compare empty strings; both lengths are
+# checked below.
 mk() {                        # mk <file> <subject> <opening> <question>
     : > "$1"
     i=0
@@ -53,10 +49,8 @@ mk "$work/a.txt" "Chapter" "The paged pool is layer-major, so one logical block 
    "Using only the passage above, write three sentences about it."
 mk "$work/b.txt" "Entry"   "The linear layer keeps one state per sequence and updates it token by token." \
    "Using only the passage above, write three sentences about it."
-# THE FILES ARE THE PROMPTS, READ VERBATIM, through jq's --rawfile. Flattening them into shell
-# variables deletes the line breaks the prompts' SHAPE depends on, and a passage whose question
-# ends up welded to the last sentence is one this model answers with an immediate EOS (the same
-# reasoning is in tierident.sh).
+# The files are sent verbatim through jq's --rawfile. Shell variables would lose the line breaks,
+# and a question joined to the passage's last sentence gets an immediate EOS (as in tierident.sh).
 
 ask() {                       # ask <who> <label> -> sha of the answer
     f="$work/$(printf '%s' "$1" | tr 'AB' 'ab').txt"
@@ -69,30 +63,23 @@ ask() {                       # ask <who> <label> -> sha of the answer
     sha1sum < "$work/$2.txt" | cut -d' ' -f1
 }
 
-# THE HIT LENGTH, which is what decides how the prefill is chunked and therefore the shape every
-# GEMM in it runs at. Two restores that recovered different amounts of prefix are not the same
-# computation, and comparing their output hashes would be comparing two different runs -- so this
-# is printed beside every arm and checked before a mismatch is called corruption.
+# The hit length decides how the prefill is chunked and so every GEMM's shape. Restores that
+# recovered different prefix lengths are different computations, so the hit is printed beside every
+# arm and checked before a mismatch is called corruption.
 hit() { jq -r '.usage.prompt_tokens_details.cached_tokens' < "$work/$1.json"; }
 
 fail=0
-# WHAT A DIFFERING HASH MEANS, AND THE ONE THING THAT HAS TO BE RULED OUT FIRST.
+# A hybrid session's reuse is clamped by the scheduler to the last linear checkpoint it can reach,
+# not the attention hit (core/sched/scheduler.cpp, admit_one: RadBatch carries one query length for
+# every KV group). Reuse is therefore a multiple of the checkpoint interval, depending on which
+# snapshots survived: 0 on a cold run, 4096 or 6144 on a restored one.
 #
-# A hybrid session's reuse is clamped by the scheduler to the last LINEAR CHECKPOINT it can reach,
-# not to the attention hit (core/sched/scheduler.cpp, admit_one: RadBatch carries one query length
-# for every KV group, so the linear layers cannot be replayed over a longer range than the
-# attention ones). So reuse is always a multiple of the checkpoint interval, and which multiple
-# depends on which snapshots survived -- 0 on a cold run, 4096 or 6144 on a restored one.
+# On Qwen3.8-Flash-Next with no tiers, the same prompt at reuse 0, 4096 and 6144 gives the same
+# bytes, so a differing hash is a real difference. On another model, re-check that first: a
+# near-tie that flips at the chunk boundary looks like corruption.
 #
-# Reuse does not change the answer on Qwen3.8-Flash-Next: with no tiers running at all, the same
-# prompt at reuse 0, 4096 and 6144 gives the same bytes. So a differing hash is a real difference
-# and not an artefact of a shorter hit -- but it is the first thing to re-check if this fails on
-# another model, because a near-tie that flips with the chunk boundary would look exactly like
-# corruption and is not.
-#
-# THE COMPARISON IS AGAINST THE DEVICE-HIT ARM, not the cold one. A cold run reuses nothing by
-# definition, so comparing a restore to it would always be comparing two different hit lengths;
-# the device hit is the same query the restored arms run, served out of VRAM.
+# Restored arms are compared against the device-hit arm, not the cold one: the device hit is the
+# same query served from VRAM, while a cold run always has a different hit length.
 cmp_arm() {                   # cmp_arm <label> <sha> <ref sha> <reuse> <ref reuse>
     if [ "$2" = "$3" ]; then
         echo "  ok    $1 (reuse $4)"
@@ -109,11 +96,10 @@ cmp_arm() {                   # cmp_arm <label> <sha> <ref sha> <reuse> <ref reu
     fi
 }
 # ---- pushing a session out of host memory --------------------------------------------------------
-# A FULL HOST TIER DROPS ITS LEAST RECENTLY USED ENTRIES, so the way to push the sessions out is to
-# give the arena something else to hold: a prompt that shares no prefix with anything here and is
-# bigger than the room the arena has left. The server must be started with a host tier FILL
-# sections of it overflow; --prefix-cache-mib 512 holds about 27K tokens on Qwen3.8-Flash-Next, and
-# the default FILL is about 30K.
+# A full host tier drops its least recently used entries, so the sessions are pushed out by a
+# prompt that shares no prefix with them and exceeds the arena's free room. The host tier must be
+# small enough for FILL sections to overflow it: --prefix-cache-mib 512 holds about 27K tokens on
+# Qwen3.8-Flash-Next, and the default FILL is about 30K.
 fill_arena() {
     : > "$work/fill.txt"
     i=0
@@ -134,8 +120,7 @@ CKS=$(curl -sS --fail "http://$H:$P/sessions" | jq -r .snapshot_store.bytes_each
 A0=$(ask A a0); B0=$(ask B b0)
 echo "  first     A $A0  reuse $(hit a0)"
 echo "            B $B0  reuse $(hit b0)"
-# AND THEY MUST DIFFER. Two prompts that produce the same answer would make every comparison
-# below pass whatever the tiers did with them.
+# The two answers must differ, or every comparison below would pass regardless.
 if [ "$A0" = "$B0" ]; then
     echo "tiercross: both prompts produced the same answer, so no comparison here can tell the" >&2
     echo "           two sessions apart. Change the prompts." >&2
@@ -148,13 +133,12 @@ for f in a0 b0; do
 done
 
 # ---- the control: both sessions again, straight out of VRAM -------------------------------------
-# THE SAME QUERY THE RESTORED ARMS WILL RUN. Without it a differing hash below proves nothing: this
-# engine could be irreproducible across requests for reasons that have nothing to do with tiering,
-# and the two sessions could be contaminating each other while both are still resident.
+# The same query the restored arms run. Without this control a differing hash below could come from
+# non-tiering irreproducibility, or from contamination while both sessions are still resident.
 AH=$(ask A ah); BH=$(ask B bh)
 echo "  device    A $AH  reuse $(hit ah)"
 echo "            B $BH  reuse $(hit bh)"
-# A DEVICE HIT THAT REUSED NOTHING TESTS NOTHING: every arm below would be a fresh prefill.
+# A device hit that reused nothing makes every arm below a fresh prefill, testing nothing.
 for f in ah bh; do
     case "$(hit $f)" in 0|null|"") echo "  FAIL  the $f arm reused nothing -- no hit, so no restore below can be tested
         (a snapshot store too small for both sessions? --checkpoint-slots)"; fail=$((fail + 1)) ;; esac
@@ -185,7 +169,7 @@ cmp_arm "B after the arena's drops is still B" "$B2" "$BH" "$(hit b2)" "$(hit bh
 
 curl -sS --fail "http://$H:$P/sessions" > "$work/s.json"
 echo "  moved: blocks to_host=$(jq -r .moved.to_host < "$work/s.json") promoted=$(jq -r .moved.promoted < "$work/s.json") host_drops=$(jq -r .moved.host_drops < "$work/s.json")"
-# A RUN WITH NO CONTENTION TESTED THE EASY CASE: the arena has to run out for its drop path to run.
+# The drop path runs only if the arena ran out of room.
 [ "$(jq -r .moved.host_drops < "$work/s.json")" = "0" ] && \
     echo "  note: the host tier never overflowed -- lower --prefix-cache-mib or raise FILL"
 

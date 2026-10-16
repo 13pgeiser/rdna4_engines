@@ -1,18 +1,15 @@
 /* hf_model.cpp -- resolve a --model that is a Hugging Face repo id (hf_model.h).
  *
- * The entry point (main.cpp) calls resolve_hf_model() once, between config_parse and the Engine,
- * and the rest of bring-up sees a plain file or directory. The fetching is scripts/hfget.sh (curl
- * and jq, no Python), run as a child process; it is installed to libexec/radiance/ and the build
- * copies it to the same place under the build tree, so it is found beside the binary either way.
+ * main.cpp calls resolve_hf_model() once, between config_parse and the Engine; bring-up then sees
+ * a plain file or directory. Fetching is scripts/hfget.sh (curl and jq), run as a child process
+ * from libexec/radiance/ beside the binary, installed or in the build tree.
  *
- * WHERE IT GOES. Not under $RADIANCE_HOME: that is a ':'-separated search path for plugins, and
- * its default is the install's share/ directory, which a user cannot write. A model is a cache --
- * the XDG cache directory by default, --download-dir (vLLM's name) to put it on another disk.
+ * Downloads go to the XDG cache by default, or --download-dir (vLLM's name), not $RADIANCE_HOME,
+ * which is a plugin search path whose default is not user-writable.
  *
- * A HUB THAT CANNOT BE REACHED DOES NOT STOP A RESTART. hfget.sh exits 3 when it changed nothing
- * on disk (the listing failed, or an update does not fit), and the copy a complete fetch left --
- * marked by the manifest it writes only on success -- is then served with a warning. Any other
- * failure may have left a file half-transferred, so it is not served. */
+ * An unreachable hub does not stop a restart: hfget.sh exits 3 when it changed nothing on disk,
+ * and the copy a complete fetch left (marked by its success manifest) is served with a warning.
+ * Any other failure may leave a partial file, so nothing is served. */
 #include "hf_model.h"
 
 #include "rad_internal.h"

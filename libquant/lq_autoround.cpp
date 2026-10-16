@@ -1,23 +1,21 @@
 /* lq_autoround.cpp -- AutoRound: rounding by signed gradient descent (Cheng et al., 2023).
  *
- * WHAT IT DOES. Rounding to nearest decides each value on its own; the output error is a property
- * of the whole row against the input it meets. AutoRound learns, for every value, an offset V in
- * [-0.5, 0.5] added before the rounding -- q = round(w / s + V) -- and for every scale block a
- * factor on its range (one for a symmetric block, one for each end of an asymmetric one, in
- * [0.5, 1]), and descends on the output error with the SIGN of each gradient, through the rounding
- * by the straight-through estimator: d round(x) / dx = 1. The step is `lr` (by default 1/iters)
- * decaying linearly to zero, and every row keeps the parameters of its lowest error seen, so
- * the result is never worse than the start -- which is rounding to nearest.
+ * Rounding to nearest decides each value alone, but the output error depends on the whole row.
+ * AutoRound learns a per-value offset V in [-0.5, 0.5], q = round(w / s + V), and per scale block a
+ * range factor in [0.5, 1] (one for a symmetric block, one per end for an asymmetric one). It
+ * descends on the output error with the sign of each gradient, through the rounding by the
+ * straight-through estimator (d round(x) / dx = 1). The step is `lr` (default 1/iters) decaying
+ * linearly to zero. Each row keeps its lowest-error parameters, so the result is never worse than
+ * the starting point, round-to-nearest.
  *
- * THE ERROR IS THE HESSIAN'S QUADRATIC FORM (lq_hess.h) rather than the block output over
- * calibration samples the paper uses: it is the same function of the weight for one linear layer,
- * and it decomposes over rows, so every row descends on its own -- no batch, no sample noise, and
- * a row block per call. What it costs is N K^2 multiply-adds a step, which at the default 200 steps
- * is the whole of a conversion's time; `iters` trades it.
+ * Error: the Hessian's quadratic form (lq_hess.h) instead of the paper's block output over
+ * calibration samples. For one linear layer it is the same function of the weight, and it
+ * decomposes over rows, so each row descends alone: no batch, no sample noise, a row block per
+ * call. Cost is N K^2 multiply-adds per step, which dominates conversion time at the default 200
+ * steps; `iters` trades it.
  *
- * THE GRID is integer codes, symmetric or with a zero, with blocks of one row: the descent is over
- * a rounding, so a codebook or a float code has none to learn, and a second level or a scale block
- * that spans rows ties rows together.
+ * Grid: integer codes, symmetric or with a zero, blocks of one row. A codebook or float code has
+ * no rounding to learn, and a second level or a multi-row block would tie rows together.
  */
 #include "lq_autoround.h"
 #include "lq_hess.h"
@@ -156,10 +154,10 @@ void autoround_rows(const Grid& g, const float* w, int64_t N, int64_t K, const f
         errors();
         keep();
         const float step = (float)(lr * (1.0 - (double)t / iters));
-        /* THE GRADIENTS, by the straight-through rounding: dL/dw_hat = 2 G, and w_hat = s (q - z)
+        /* Gradients through the straight-through rounding: dL/dw_hat = 2 G, and w_hat = s (q - z)
          * with q = round(w/s + V) + z clamped. Unclamped, dw_hat/dV = s and dw_hat/ds = (q - z) -
          * w/s; clamped, the first is 0 and the second (q - z). The range factors reach the loss
-         * through s alone (the zero is held where the rounding put it). */
+         * through s only (the zero is held where the rounding put it). */
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -198,7 +196,7 @@ void autoround_rows(const Grid& g, const float* w, int64_t N, int64_t K, const f
     errors();
     keep();
 
-    /* ---- the best parameters, written: each block's scale and zero, then the codes */
+    /* Write the best parameters: each block's scale and zero, then the codes. */
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -235,7 +233,7 @@ int ar_grid(const RadParam* o, int n_o, const RadQuantWeight* w, Grid* g) {
     if (st != RAD_OK) return st;
     const std::string no = autoround_refusal(*g);
     if (!no.empty()) return refuse(w, ("autoround: " + no).c_str());
-    if (rad_param_geti(o, n_o, "iters", 200) < 0) return refuse(w, "iters= is >= 0");
+    if (rad_param_geti(o, n_o, "iters", 200) < 0) return refuse(w, "iters= must be >= 0");
     return RAD_OK;
 }
 
@@ -248,8 +246,8 @@ int ar_encoding(const RadParam* o, int n_o, const RadQuantWeight* w, RadEncoding
     return RAD_OK;
 }
 
-/* Rows descend on their own, so a call is any number of them; 512 keeps the state a few hundred
- * megabytes at the widest K while every call still fills the threads. */
+/* Rows descend independently, so any block size works; 512 keeps the state to a few hundred MB at
+ * the widest K while still filling the threads. */
 int64_t ar_row_block(const RadParam*, int, const RadQuantWeight*) { return 512; }
 
 int ar_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* src, int64_t row0,
@@ -257,7 +255,6 @@ int ar_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* src,
     Grid g;
     const int st = ar_grid(o, n_o, w, &g);
     if (st != RAD_OK) return st;
-    (void)row0;
     const int64_t K = w->cols;
     grid_transform_rows(g, src, rows, K);
     const char* dir = rad_param_gets(o, n_o, "calib", nullptr);
@@ -269,7 +266,7 @@ int ar_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* src,
     const float* diag = (!H && !g.fwht) ? w->importance : nullptr;
     const Planes p = grid_planes(g, K, planes);
     if (!H && !diag) {
-        /* with nothing to weigh the error by, the best rounding of each value is the nearest */
+        /* With no error weighting, round-to-nearest is optimal. */
         return grid_rtn(g, src, row0, rows, K, p, nullptr);
     }
     if (!H)

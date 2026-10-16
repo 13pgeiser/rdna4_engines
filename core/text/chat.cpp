@@ -1,9 +1,9 @@
 #include "text/chat.h"
 #include "text/tokenizer.h"
 
-/* The lifted headers live here and nowhere else in core/. See chat.h for why. */
+/* Lifted headers: only this file, chatfmt.cpp and chatparse.cpp include them (see chat.h). */
 #include "llama/common/chat.h"
-/* For jinja::enable_debug only -- see RADIANCE_DEBUG_JINJA below. */
+/* For jinja::enable_debug (RADIANCE_DEBUG_JINJA). */
 #include "llama/common/jinja/runtime.h"
 #include "shim/log.h"
 
@@ -16,7 +16,6 @@ namespace rad {
 
 using ojson = nlohmann::ordered_json;
 
-
 struct ChatTemplate::Impl {
     common_chat_templates_ptr tmpls;
     ChatCaps                  caps;
@@ -28,9 +27,8 @@ ChatTemplate::ChatTemplate() : impl_(std::make_unique<Impl>()) {}
 ChatTemplate::~ChatTemplate() = default;
 
 const char* ChatTemplate::chatml_source() {
-    /* Byte-identical to CHATML_TEMPLATE_SRC in the lift. Duplicated rather than exported because
-     * exporting it would mean editing the lifted header; the string is stable upstream, and if it
-     * ever moves this is the single place that has to follow it. */
+    /* Byte-identical to CHATML_TEMPLATE_SRC in the lift, copied so the lifted header stays
+     * unedited. Keep in sync on a vendor refresh. */
     return
         "{%- for message in messages -%}\n"
         "  {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>\n' -}}\n"
@@ -42,35 +40,29 @@ const char* ChatTemplate::chatml_source() {
 
 int ChatTemplate::load(const std::string& jinja_source, const std::string& bos,
                        const std::string& eos, bool add_bos, bool add_eos) {
-    /* The vendored files' LOG_DBG goes to stderr behind this switch. It has to be set HERE, where
-     * the template is first touched: the auto-parser analyses the template inside apply() and
-     * again when the reply format is derived (chatfmt.cpp), and a switch set any later comes too
-     * late to trace a format the analyzer could not crack. */
+    /* Gates the vendored LOG_DBG to stderr. Set here, where the template is first touched,
+     * because the auto-parser analyses it in apply() and again in chatfmt.cpp; any later is too
+     * late to trace a format the analyzer could not handle. */
     rad_vendor_log::verbose() = (int)log_level() >= (int)Log::Debug;
 
-    /* THE TEMPLATE ENGINE'S OWN TRACE, and there is no other way to get at this one.
-     * common_chat_templates_init runs a capability PROBE: it renders the template with a
-     * synthetic tool and a synthetic tool call and watches which values were read. It SWALLOWS
-     * every exception -- "ignore exceptions during capability analysis" -- so a template that
-     * genuinely has no tool support and a template that THROWS on the probe both arrive here as
-     * tools=0, and the difference is the difference between a model that cannot call tools and a
-     * gap in the engine. Loud: every statement of every render, the serving ones included. */
+    /* The template engine's own trace. The capability probe in common_chat_templates_init
+     * swallows every exception, so a template without tool support and one that throws on the
+     * probe both report tools=0; this trace tells them apart. Very verbose: it logs every
+     * statement of every render, serving ones included. */
     if (const char* dbg = std::getenv("RADIANCE_DEBUG_JINJA"); dbg && *dbg && *dbg != '0')
         jinja::enable_debug(true);
 
     const bool fallback = jinja_source.empty();
     if (fallback) {
-        /* A model with no template is a model whose prompt format we are guessing. ChatML is the
-         * best guess there is and it is still a guess, so it is said out loud once rather than
-         * discovered later from output that reads fine and is formatted wrong. */
+        /* ChatML is only a guess at the prompt format, so warn once. */
         RAD_WARN("chat: the model declares no chat template; falling back to ChatML. "
                  "If the model was not trained on ChatML its replies will be subtly wrong.");
     }
     const std::string src = fallback ? std::string(chatml_source()) : jinja_source;
 
     try {
-        /* model = nullptr: everything common_chat_templates_init() would read off a llama_model
-         * is passed in as an override instead. See vendor/shim/llama.h. */
+        /* model = nullptr: what would be read off a llama_model is passed in as overrides
+         * (vendor/shim/llama.h). */
         impl_->tmpls = common_chat_templates_init(nullptr, src, bos, eos);
     } catch (const std::exception& e) {
         RAD_ERR("chat: template did not compile: %s", e.what());
@@ -106,9 +98,8 @@ int ChatTemplate::load(const std::string& jinja_source, const std::string& bos,
 }
 
 int ChatTemplate::load_from_vocab(const Vocab& v) {
-    /* The template references bos_token and eos_token by TEXT, not by id, so what goes in is the
-     * piece -- and a control token's piece is its literal spelling, which is what Vocab::text()
-     * returns for it. */
+    /* Templates reference bos_token/eos_token by text; Vocab::text() returns a control token's
+     * literal spelling. */
     const std::string bos = v.bos() >= 0 ? v.text(v.bos()) : std::string();
     const std::string eos = v.eos() >= 0 ? v.text(v.eos()) : std::string();
     return load(v.chat_template(), bos, eos, v.add_bos(), v.add_eos());
@@ -118,16 +109,14 @@ bool ChatTemplate::ready() const { return impl_ && impl_->tmpls != nullptr; }
 const ChatCaps& ChatTemplate::caps() const { return impl_->caps; }
 const std::string& ChatTemplate::source() const { return impl_->src; }
 
-/* HOW DEEPLY A CLIENT'S SCHEMA MAY NEST, in objects and arrays. The tools' parameter schemas and
- * a response format's schema reach the JSON-schema converter, which recurses once per level and
- * names each rule after its whole path, so its output grows with the square of the depth; a few
- * thousand levels exhaust the memory or the stack of the thread rendering the request. At this
- * depth it still converts in tens of milliseconds, far deeper than a schema describing data
- * nests. grammar.cpp bounds the same converter on the path that bypasses the template. */
+/* Maximum nesting (objects and arrays) of a client's tool or response schema. The JSON-schema
+ * converter recurses once per level and names each rule after its full path, so its output grows
+ * with the square of the depth; a few thousand levels exhaust memory or the rendering thread's
+ * stack. 512 still converts in tens of milliseconds. grammar.cpp bounds the same converter on the
+ * path that bypasses the template. */
 static constexpr size_t kMaxSchemaDepth = 512;
 
-/* Walked with an explicit stack, because the values it exists to catch are the ones too deep to
- * recurse over. */
+/* Iterative, because the values it must catch are too deep to recurse over. */
 static size_t json_depth(const ojson& root) {
     std::vector<std::pair<const ojson*, size_t>> todo{ { &root, 1 } };
     size_t deepest = 0;
@@ -149,8 +138,8 @@ int ChatTemplate::apply(const ojson& messages, const ojson& tools, const ChatOpt
     }
     if (!out) return RAD_E_INVAL;
 
-    /* Checked before either schema reaches the converter. The response format arrives as text;
-     * one that does not parse is left for the template to refuse in its own words. */
+    /* Checked before either schema reaches the converter. A response format that does not parse
+     * is left for the template to refuse. */
     {
         const ojson schema = opt.json_schema.empty()
                            ? ojson()
@@ -166,19 +155,17 @@ int ChatTemplate::apply(const ojson& messages, const ojson& tools, const ChatOpt
     common_chat_templates_inputs in;
     try {
         in.messages = common_chat_msgs_parse_oaicompat(messages);
-        if (!tools.is_null() && tools.is_array() && !tools.empty())
+        if (tools.is_array() && !tools.empty())
             in.tools = common_chat_tools_parse_oaicompat(tools);
         in.tool_choice = common_chat_tool_choice_parse_oaicompat(opt.tool_choice);
     } catch (const std::exception& e) {
-        /* A malformed request, not a broken engine. It must come back as a 400 rather than as a
-         * throw through the request loop. */
+        /* A malformed request: return a 400, never throw through the request loop. */
         RAD_WARN("chat: request did not parse: %s", e.what());
         out->error = e.what();
         return RAD_E_INVAL;
     }
     if (!in.tools.empty() && !impl_->caps.tools) {
-        RAD_WARN("chat: the model's template declares no tool support; refusing the request "
-                 "rather than dropping the tools silently");
+        RAD_WARN("chat: the model's template declares no tool support; request refused");
         out->error = "this model's chat template declares no tool support";
         return RAD_E_UNSUPPORTED;
     }
@@ -228,11 +215,8 @@ int ChatTemplate::apply(const ojson& messages, const ojson& tools, const ChatOpt
               out->grammar.size(), out->grammar_lazy ? " (lazy)" : "",
               out->additional_stops.size());
     if ((int)log_level() >= (int)Log::Trace) {
-        /* THE PROMPT ITSELF, at Trace and nowhere else. A chat endpoint that answers fluently in
-         * the wrong format looks exactly like a chat endpoint that works, and the only way to tell
-         * the two apart is to read what the template actually produced -- control tokens included,
-         * which is why this prints the raw bytes rather than the detokenised form. It is at Trace
-         * because it is user content and does not belong in an ordinary server log. */
+        /* The rendered prompt as raw bytes, control tokens included, for checking the template's
+         * output format. Trace only, because it is user content. */
         RAD_TRACE("chat: prompt <<<%s>>>", out->prompt.c_str());
         if (!out->grammar.empty()) RAD_TRACE("chat: grammar <<<%s>>>", out->grammar.c_str());
         for (const auto& s : out->additional_stops) RAD_TRACE("chat: extra stop <<<%s>>>", s.c_str());

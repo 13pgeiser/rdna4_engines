@@ -1,28 +1,23 @@
-/* dashcheck -- run the dashboard's own script against real /stats payloads and report what a
- * reader would call a bug: NaN, undefined, Infinity, or a throw.
+/* dashcheck -- run the dashboard's own script against a sequence of real /stats payloads and
+ * report NaN, undefined, Infinity, a throw, or a badly formatted figure.
  *
- * WHY THIS AND NOT A BROWSER. The dashboard is one self-contained page driven by one endpoint, so
- * the interesting failures are arithmetic rather than layout -- a rate differenced over a zero
- * interval, a panel whose model has no expert plane, a counter that went backwards. Those need the
- * real payloads, which a browser adds nothing to, and they need a SEQUENCE of them, which is
- * awkward to arrange in one.
+ * The dashboard is one page driven by one endpoint, so its failures are arithmetic, not layout (a
+ * rate differenced over a zero interval, a model with no expert plane, a counter that went
+ * backwards). Those need real payloads in sequence, which no browser adds anything to.
  *
- * AND poll() SWALLOWS EVERYTHING update() THROWS, marking the dot stale and nothing else. That is
- * the right behaviour for a server that stopped answering and the wrong one for a page that
- * cannot render what it was sent: the two look identical from outside. So this intercepts the
- * exception where it is caught, and reads the dot afterwards -- "dot stale" means it threw.
+ * poll() catches whatever update() throws and only marks the dot stale, so a page that cannot
+ * render looks like a server that stopped answering. The exception is intercepted where it is
+ * caught, and "dot stale" afterwards means update() threw.
  *
- * AND A FIGURE CAN BE WRONG WITHOUT BEING NaN. The page formats every number through one block of
- * functions (three significant figures rounded before the unit is chosen, binary sizes, decimal
- * rates, SI prefixes, shares that never round onto 0% or 100%), so those functions are run against
- * a table of boundary cases first, and every text the polls write is then searched for the shapes
- * that rule exists to prevent: a raw float, a four-digit figure in front of a unit or a prefix the
- * next rung replaces, a locale's thousands separator.
+ * The page formats every number through one block of functions (three significant figures rounded
+ * before the unit is chosen, binary sizes, decimal rates, SI prefixes, shares that never round onto
+ * 0% or 100%). Those run against a table of boundary cases first; then every text the polls write
+ * is searched for a raw float, four digits in front of a unit or prefix, or a thousands separator.
  *
  *   node tools/dashcheck.js <saved dashboard html> <json array of /stats payloads>
  *
- * Take the payloads UNDER LOAD. Idle ones exercise none of the differencing, and every rate on the
- * page is a difference.
+ * Capture the payloads under load: every rate on the page is a difference, which idle payloads do
+ * not exercise.
  */
 const fs = require('fs');
 const html = fs.readFileSync(process.argv[2], 'utf8');
@@ -61,9 +56,8 @@ const mkEl = (id) => {
     clientWidth: 800, clientHeight: 400,
   };
   el.parentElement = el.parentNode;
-  /* A REAL ELEMENT HAS A TEXT NODE IN IT, and the page writes through it: setMetric sets
-   * firstChild.nodeValue rather than textContent. A stub without one throws inside the page's
-   * own try/catch and reads exactly like the bug it is meant to find. */
+  /* setMetric writes firstChild.nodeValue, not textContent, so every stub needs a text node; a
+   * stub without one throws inside the page's own try/catch and looks like a real bug. */
   const tn = { nodeType: 3, _v: '' };
   Object.defineProperty(tn, 'nodeValue', {
     get(){ return tn._v; },
@@ -118,8 +112,7 @@ global.fetch = async (u) => ({
 });
 
 let threw = null;
-/* poll() swallows whatever update() throws and only marks the dot stale, so the exception
- * has to be intercepted where it is caught or it is gone. */
+/* Record what update() throws at the one place poll() catches it. */
 js = js.replace('$("dot").className = "dot stale";',
                 'globalThis.__err = globalThis.__err || e; $("dot").className = "dot stale";');
 js += "\n;globalThis.__poll = typeof poll === 'function' ? poll : null;";
@@ -127,8 +120,8 @@ js += "\n;globalThis.__fmt = typeof ladder === 'function' ? { hb, hbOf, rate, cn
       "pct, pctn, dur, stepTime } : null;";
 try { (0, eval)(js); } catch (e) { threw = e; }
 
-/* THE BOUNDARIES, where a formatter that picks its unit before rounding prints a figure in the
- * unit the next one up exists to replace. Each value sits on or just either side of one. */
+/* Unit boundaries, where a formatter that picks its unit before rounding prints a figure the
+ * next unit up should replace. Each value sits on or just either side of one. */
 const G = 2 ** 30, T = 2 ** 40, NB = '\u202f';
 const CASES = [
   ['hb', [0], '0 B'], ['hb', [999], '999 B'], ['hb', [1023], '1.00 KiB'], ['hb', [1536], '1.50 KiB'],
@@ -167,14 +160,12 @@ if (!globalThis.__fmt) {
 }
 
 (async () => {
-  /* show() hid the dashboard view during startup; poll() returns early when it is hidden,
-   * so without this the harness measures nothing and says everything is fine. */
+  /* show() hid the dashboard view during startup, and poll() returns early while it is hidden. */
   get('view-dash').hidden = false;
   for (let i = 0; i < payloads.length + 1; i++) {
     try { if (globalThis.__poll) await globalThis.__poll(); } catch (e) { threw = threw || e; }
   }
-  /* poll() catches everything update() throws and only marks the dot stale, so a real UI
-   * failure is invisible from outside. Read the dot: "dot stale" means it threw. */
+  /* "dot stale" means update() threw (see the header). */
   const dot = els.has('dot') ? els.get('dot').className : '(never set)';
   console.log('  dot after last poll: ' + dot);
   if (/stale/.test(dot)) console.log('  UPDATE THREW (dashboard would read as stale, not broken)');

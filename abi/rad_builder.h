@@ -1,9 +1,8 @@
-/* rad_builder.h -- the declare phase. An architecture plugin states everything it will ever do
- * before it does any of it: every weight, every buffer, every op, in order. See spec.md §3.1.
+/* rad_builder.h -- the declare phase. An architecture plugin states everything it will do before
+ * doing any of it: every weight, every buffer, every op, in order. See spec.md §3.1.
  *
- * Between declare and plan the whole model is known statically -- every op, every kernel that
- * will service it, every weight it touches, and the order. That is the property the rest of the
- * engine spends.
+ * After declare, the whole model is known statically (every op, the kernel serving it, the weights
+ * it touches, and the order), and the rest of the engine relies on that.
  */
 #ifndef RAD_BUILDER_H
 #define RAD_BUILDER_H
@@ -39,10 +38,10 @@ typedef struct RadModelMeta {
 
     float   rms_eps;
     float   rope_theta;
-    /* Always 1. A rotary's scaling is a TYPE with parameters -- linear, YaRN, llama3, longrope --
-     * and it is carried in the free-form keys below (rope_parameters.* / rope_scaling.*, with
-     * text_config.* and draft.* forms), which arch/common/rad_arch.h's yarn_from reads and refuses
-     * by name. A bare factor here would read every scheme as a linear position divide. */
+    /* Always 1. Rotary scaling is a type with parameters (linear, YaRN, llama3, longrope) carried
+     * in the free-form keys below (rope_parameters.* / rope_scaling.*, with text_config.* and
+     * draft.* forms); arch/common/rad_arch.h's yarn_from reads them and refuses unknown schemes by
+     * name. A bare factor here would read every scheme as a linear position divide. */
     float   rope_scale;
 
     /* Free-form key/value from the container header, for anything the struct above does not
@@ -59,104 +58,102 @@ const char* rad_meta_gets(const RadModelMeta* m, const char* key, const char* df
 /* ================================================================== build context */
 typedef struct RadBuildCtx {
     int      rank;            /* declare runs once per rank; the plugin declares dimensions */
-    int      world_size;      /* ALREADY DIVIDED -- the core inserts no collectives (spec §9) */
+    int      world_size;      /* already divided -- the core inserts no collectives (spec §9) */
 
     int64_t  max_tok;         /* the largest token count one step may carry */
     int64_t  max_seqs;        /* the largest number of sequences one step may carry */
     int64_t  max_ctx;         /* context bound this deployment was configured for */
     int      max_spec;        /* speculative window bound, 0 if speculation is off */
 
-    /* THE TENSOR-PARALLEL WIRE. 0 -- which is what a zero-initialised context gives, and that is
-     * deliberate -- is the EXACT all-reduce. Nonzero says this deployment accepts a lossy wire,
-     * which at two ranks libr4d serves as a Walsh-Hadamard-rotated 6-bit payload: 6 bits an
-     * element plus a bf16 scale per group of 64, against 16 bits an element, so the message a
-     * prefill chunk pushes across the link drops by 2.4x. The plugin inverts it into
-     * `all_reduce`'s `exact` parameter. The polarity is this way round because the sum a rank
-     * receives is then not the sum it would have received, and a field that defaults to lossy
-     * when someone forgets to fill it is the failure spec §17 exists to prevent. */
+    /* The tensor-parallel wire. 0 (the zero-initialised default) is the exact all-reduce. Nonzero
+     * accepts a lossy wire: at two ranks libr4d serves a Walsh-Hadamard-rotated 6-bit payload (6
+     * bits an element plus a bf16 scale per group of 64, so a prefill chunk's message shrinks
+     * 2.4x), at three and four ranks a tiered int8 two-shot. The plugin inverts it into
+     * `all_reduce`'s `exact` parameter.
+     * The polarity makes a context that forgets the field exact, not lossy (spec §9). */
     int      tp_wire_lossy;
 
-    /* WHERE THE LOSSY WIRE STARTS PAYING, in bytes of one all-reduce message. Below it the exact
-     * kernel wins and the plugin must use it even when `tp_wire_lossy` is set: compression only
-     * pays once the transfer is bandwidth-bound, and a decode step's message is not -- it is a few
-     * tokens of the residual stream, where the rotate/pack/unpack costs more than the bytes it
-     * saves. Above it a prefill chunk is squarely on the wire and the 2.4x is real. 0 means the
-     * plugin's own default, which is 128 KiB. */
+    /* The all-reduce message size, in bytes, from which the lossy wire is used. Below it the
+     * plugin must use the exact kernel even when `tp_wire_lossy` is set: compression pays only
+     * once the transfer is bandwidth-bound, and a decode step's few residual rows cost more to
+     * rotate/pack/unpack than they save. 0 means the plugin's default, 128 KiB. */
     int64_t  tp_wire_min_bytes;
 
 
-    /* THE KV CACHE'S WIDTH, AND IT IS A DEPLOYMENT CHOICE RATHER THAN A PROPERTY OF THE
-     * CHECKPOINT. `kv_dtype` follows the CACHE, not the weights: a container whose weights are
-     * fp8 may well want a bf16 cache and vice versa, and one field read as "the cache is bf16
-     * because the weights are" was true of one checkpoint and never a rule.
+    /* The KV cache dtype, a deployment choice rather than a property of the checkpoint: fp8
+     * weights may want a bf16 cache and vice versa.
      *
-     * RAD_DT_INVALID -- which is what a zero-initialised context gives -- means the plugin's own
-     * default, which every architecture in this tree takes as bf16. RAD_F8E4M3 is the other
-     * value anything implements today; the fp8kv attention family is band-gated on it and the
-     * store side writes E4M3 with per-(sequence, head) descales.
+     * RAD_DT_INVALID (the zero-initialised default) means the plugin's default, bf16 for every
+     * architecture in this tree. RAD_F8E4M3 is the only other implemented value: the fp8kv
+     * attention family is band-gated on it, and the store side writes E4M3 with per-(sequence,
+     * head) descales.
      *
-     * IT IS AN ABI FIELD AND NOT AN ENVIRONMENT VARIABLE because it changes what the model
-     * computes. A per-architecture environment switch gives "is the cache fp8" one answer per
-     * architecture, each with its own default, and none of them appears in the startup log or in
-     * a bug report. --kv-cache-dtype is the one answer. */
+     * An ABI field rather than an environment variable because it changes what the model
+     * computes, so it must have one visible answer: --kv-cache-dtype. */
     int      kv_dtype;        /* RAD_DT_INVALID = the plugin's default (bf16); or RAD_F8E4M3 */
     int      is_draft;        /* this builder scope is a drafter (spec §10) */
     const char* scope;        /* "", "draft", "vision", "audio" -- prefixes declared names */
 
-    /* A DECLARE THAT ONLY SIZES THE ACTIVATIONS, at a `max_tok` smaller than the deployment's.
-     * The core runs one per level of the activation arena it lends out: what the plugin declares
-     * says how big every buffer is when no step carries more than `max_tok` tokens, and the top of
-     * the arena past that is lent to the expert slab while the steps are that small.
+    /* Nonzero: a declare that only sizes the activations, at a `max_tok` smaller than the
+     * deployment's. The core runs one per level of the activation arena it lends out; the result
+     * gives every buffer's size when no step carries more than `max_tok` tokens, and the arena
+     * above that is lent to the expert slab while steps are that small.
      *
-     * THE PLUGIN MUST LEAVE ITS OWN STATE ALONE WHILE THIS IS SET. The state its step function
-     * reads was written by the real declare, at the real `max_tok`, and a sizing declare that
-     * overwrote it would run every later step against the smaller configuration. Declare into
-     * scratch storage instead; nothing a sizing declare produces is ever issued, and its op
-     * handles are the real declare's.
+     * Invariant: the plugin must not touch its own state while this is set. Its step function
+     * reads state the real declare wrote at the real `max_tok`; overwriting it would run every
+     * later step against the smaller configuration. Declare into scratch storage instead: nothing
+     * a sizing declare produces is issued, and its op handles are the real declare's.
      *
      * Only asked of a plugin that set RadArchProbe::shape_probe_ok. Trailing and zero-defaulted,
      * so a plugin built against the older struct is unchanged. */
     int      shape_probe;
 
-    /* THE MOST PATCHES ONE ENCODER PASS MAY CARRY, and 0 means this deployment serves no media:
-     * the plugin declares no encoder, so a tower the container carries stays off the card. It is
-     * the encoder's `max_tok` -- every activation it declares is sized against it -- and it bounds
-     * the largest single image the server accepts, since one image is one attention segment and a
-     * segment is never split across passes. */
+    /* The most patches one encoder pass may carry; 0 means the deployment serves no media, the
+     * plugin declares no encoder, and a tower the container carries stays off the card. It is the
+     * encoder's `max_tok` (its activations are sized against it) and bounds the largest single
+     * image accepted, since one image is one attention segment and is never split across passes. */
     int64_t  max_enc_patches;
 
-    /* THE MOST LOGITS ROWS ONE STEP MAY NAME, when that is more than the plugin's own rule of one
-     * per sequence (1 + max_spec at a speculative step). 0 is the rule. The engine's KL mode sets
-     * it to a whole step's tokens plus a row a sequence, because it reads a full-vocabulary row at
-     * every prompt position; the logits buffer and the lm_head's row range are sized from it. The
-     * engine reads the declared logits buffer back and refuses the mode when it is shorter, so a
-     * plugin that ignores the field is refused rather than overrun.
+    /* The most logits rows one step may name, when that exceeds the plugin's own rule of one per
+     * sequence (1 + max_spec at a speculative step); 0 is the rule. The engine's KL mode sets it to
+     * a step's tokens plus a row per sequence, since it reads a full-vocabulary row at every prompt
+     * position; the logits buffer and the lm_head's row range are sized from it. The engine checks
+     * the declared logits buffer and refuses the mode when it is shorter, so a plugin that ignores
+     * the field is refused rather than overrun.
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int64_t  max_out_rows;
 
-    /* THE MOST FRAMES ONE AUDIO ENCODER PASS MAY CARRY, and 0 means this deployment serves no
-     * audio: the plugin declares no audio encoder. An audio encoder's `max_tok`, the way
-     * max_enc_patches is a vision tower's -- its activations are sized against it -- and it bounds
-     * the longest clip, since one clip is one segment. The engine takes it from
-     * RadArchProbe::audio_frames, which is the plugin's statement of its longest clip.
+    /* The most frames one audio encoder pass may carry; 0 means no audio and no audio encoder.
+     * It is the audio encoder's `max_tok`, as max_enc_patches is a vision tower's, and bounds the
+     * longest clip, since one clip is one segment. The engine takes it from
+     * RadArchProbe::audio_frames.
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int64_t  max_audio_frames;
+
+    /* The most tokens a step of more than one sequence may carry, when that is less than
+     * max_tok; 0 means max_tok. Under --prefill-span a prefill alone in its step may take max_tok
+     * and every other step is planned at a shared budget, so a step wider than this is one
+     * sequence. A plugin may size a buffer holding a row per query of every sequence in a step at
+     * this, and serve a wider step a window at a time.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    int64_t  max_mixed_tok;
 } RadBuildCtx;
 
 /* ================================================================== weights */
-/* Access class, declared per weight because it is information only the architecture plugin has.
- * It is what tells the placement planner whether prefetch can be exact (spec §5.2). */
+/* Access class, declared per weight because only the architecture plugin knows it. It tells the
+ * placement planner whether prefetch can be exact (spec §5.2). */
 enum {
     RAD_ACCESS_PER_TOKEN   = 0,  /* read every forward pass -- dense weights */
     RAD_ACCESS_PER_REQUEST = 1,  /* read once per request -- an encoder tower, with an image */
     RAD_ACCESS_CONDITIONAL = 2,  /* read only if selected -- routed experts */
     RAD_ACCESS_RARE        = 3,  /* may not be read at all in a given deployment */
-    RAD_ACCESS_VOCAB       = 4   /* lm_head and the embedding table: read every token, enormous,
-                                  * and one of them is a gather rather than a GEMM. Its own class
-                                  * because neither PER_TOKEN's prefetch nor CONDITIONAL's
-                                  * prediction describes it (spec §19.2). */
+    RAD_ACCESS_VOCAB       = 4   /* lm_head and the embedding table: read every token, very
+                                  * large, and one is a gather rather than a GEMM. Neither
+                                  * PER_TOKEN's prefetch nor CONDITIONAL's prediction fits it
+                                  * (spec §5.2). */
 };
 
 /* How a weight is split across tensor-parallel ranks. The plugin says; the core does not infer. */
@@ -167,88 +164,83 @@ enum {
 };
 
 /* Grouping key: the unit of movement. An expert's gate/up/down share one, because the unit of
- * transfer is an expert, not a tensor (spec §4.1). Layer grouping is what makes layer offload a
- * contiguous run rather than a scatter. */
+ * transfer is an expert, not a tensor (spec §4.2). Layer grouping makes layer offload a contiguous
+ * run rather than a scatter. */
 typedef struct RadWeightGroup {
     int32_t layer;    /* -1 for a model-level weight */
     int32_t expert;   /* -1 for a non-expert weight */
     int32_t slot;     /* free index within the group, e.g. gate=0 up=1 down=2 */
 } RadWeightGroup;
 
-/* NOTE: these are C compound literals, which C++ accepts only as a GNU extension. An architecture
- * plugin written in C++ -- which is the norm -- should use the grp_layer()/grp_expert()/grp_model()
- * inline functions in `<arch/rad_arch.h>` instead: the installed spelling, which the plugins in
- * radiance's own tree use as well. Same values, no extension. */
+/* Note: these are C compound literals, which C++ accepts only as a GNU extension. A C++ plugin
+ * should use the equivalent grp_layer()/grp_expert()/grp_model() inline functions in
+ * `<arch/rad_arch.h>`, as the in-tree plugins do. */
 #define rad_group_layer(l)      ((RadWeightGroup){ (int32_t)(l), -1, 0 })
 #define rad_group_expert(l, e)  ((RadWeightGroup){ (int32_t)(l), (int32_t)(e), 0 })
 #define rad_group_model()       ((RadWeightGroup){ -1, -1, 0 })
 
-/* The most projections one stored tensor may stack along dim 0. Five is what the bf16 delta net
- * needs -- q, k, v, a, b in one row -- and eight leaves room without making the decl big. */
+/* The most projections one stored tensor may stack along dim 0. The bf16 delta net needs five
+ * (q, k, v, a, b); eight leaves room without making the decl big. */
 enum { RAD_MAX_ROW_PARTS = 8 };
 
 typedef struct RadWeightDecl {
     uint32_t       dtype;       /* what the kernel reads; the stored layout comes from the kernel */
     uint32_t       rank;
-    int64_t        shape[RAD_MAX_RANK];   /* THIS RANK's extent of what `planes` select (below) */
+    int64_t        shape[RAD_MAX_RANK];   /* this rank's extent of what `planes` select (below) */
     int            access;      /* RAD_ACCESS_* */
     int            shard;       /* RAD_SHARD_* */
     RadWeightGroup group;
     int            optional;    /* absent in the container is not an error */
-    /* WHAT IS STACKED IN DIM 0, for a RAD_SHARD_ROW weight whose stored tensor is several
-     * projections concatenated -- [gate|up], or the delta net's [q|k|v]. Rows of THIS RANK, in
-     * stored order, summing to shape[0]; 0 parts means one part and dim 0 is one projection.
+    /* What is stacked in dim 0, for a RAD_SHARD_ROW weight whose stored tensor concatenates
+     * several projections ([gate|up], the delta net's [q|k|v]). Rows of this rank, in stored
+     * order, summing to shape[0]; 0 parts means dim 0 is one projection.
      *
-     * It exists because a tensor-parallel rank owns a slice of EACH stacked projection and not a
-     * contiguous slice of the stack. Taking rows [rank*D, (rank+1)*D) of a fused gate_up hands
-     * rank 0 the whole gate and rank 1 the whole up; both ranks then compute a perfectly
-     * well-formed wrong thing and the model produces fluent wrong text, which is the failure
-     * class spec §17 exists to prevent. The parts are NOT inferable from the container: it holds
-     * the fused result and not the shapes it was fused from, and a single checkpoint tensor may
-     * already be a fusion nothing in the name map mentions (in_proj_qkv is three head groups in
-     * one [10240, 5120]). The plugin is the only component that knows, so the plugin says. */
+     * A tensor-parallel rank owns a slice of each stacked projection, not a contiguous slice of
+     * the stack: rows [rank*D, (rank+1)*D) of a fused gate_up would give rank 0 the whole gate and
+     * rank 1 the whole up, and the model would produce fluent wrong text (spec §9). The parts
+     * cannot be inferred from the container, which holds only the fused result, and a checkpoint
+     * tensor may already be a fusion the name map does not mention (in_proj_qkv is three head
+     * groups in one [10240, 5120]). Only the plugin knows them. */
     int            n_row_parts;
     int64_t        row_parts[RAD_MAX_ROW_PARTS];
 
-    /* WHICH STORED WEIGHT THIS IS A VIEW OF, AND WHICH OF ITS PLANES. spec.md §4.3.
+    /* Which stored weight this is a view of, and which of its planes. spec.md §4.3.
      *
-     * A container entry, or a checkpoint tensor, is a LOGICAL weight: the planes of its encoding
-     * (rad_encoding.h) -- a block-fp8 linear's codes and its scale plane are one weight, not two.
-     * A kernel takes them as whatever operands its schema has: gemm_nt_q takes the codes and the
-     * scales as two, the fp8 lm_head one operand holding both. So a declared weight names its
-     * `source` -- null for the logical weight of its own name -- and the `planes` it takes, by
-     * role, comma-separated: "codes", "scale", "codes,scale". Null takes every plane, which for a
-     * plain weight is its one.
+     * A container entry or checkpoint tensor is a logical weight: the planes of its encoding
+     * (rad_encoding.h). A block-fp8 linear's codes and scale plane are one weight, not two. A
+     * kernel takes them as whatever operands its schema has: gemm_nt_q takes codes and scales as
+     * two, the fp8 lm_head one operand holding both. So a declared weight names its `source` (null
+     * for the logical weight of its own name) and the `planes` it takes, by role, comma-separated:
+     * "codes", "scale", "codes,scale". Null takes every plane, which for a plain weight is one.
      *
      * One declared weight is one stored buffer. Its dtype and shape describe what is selected: a
-     * single plane's own dtype and extents, or, for several, the codes' dtype and the logical
-     * extents. A dtype other than the plane's is legal only as an exact widening -- a bf16 norm
-     * read as f32 -- which the loader performs; anything lossy is a quantiser's job and happens
-     * before a container is written. */
+     * single plane's own dtype and extents, or for several, the codes' dtype and the logical
+     * extents. A dtype other than the plane's is legal only as an exact widening (a bf16 norm read
+     * as f32), which the loader performs; anything lossy is the quantiser's job, done before the
+     * container is written. */
     const char*    source;
     const char*    planes;
 } RadWeightDecl;
 
 rad_weight rad_decl_weight(RadBuilder* b, const char* name, const RadWeightDecl* d);
 
-/* WHAT A STORED WEIGHT IS: its encoding, and its logical extents in `shape` (RAD_MAX_RANK
- * entries, may be null) with the rank returned in `rank` (may be null). RAD_OK, or RAD_E_NOTFOUND
- * when the model has no such weight.
+/* A stored weight's encoding, its logical extents in `shape` (RAD_MAX_RANK entries, may be null)
+ * and its rank in `rank` (may be null). RAD_OK, or RAD_E_NOTFOUND when the model has no such
+ * weight.
  *
- * The answer comes from wherever the model is being loaded from -- a container's entry, a
- * checkpoint's tensor, or, in rad-convert, the recipe that will quantise it -- so a plugin learns
- * the same thing the same way at convert and at load, and chooses its ops by it: an fp8 GEMM for
- * a block-fp8 weight, the rotated expert kernels for `i4*bf16[1x128]/fwht128`. Ask after the
- * weight's name map entry (rad_decl_name_map), which is how a checkpoint is searched for it. A
- * builder with no model behind it -- a test, a synthetic tool -- answers RAD_E_NOTFOUND, and a
- * weight declared there is read as plain in its declared dtype. */
+ * The answer comes from whatever the model is loaded from (a container entry, a checkpoint tensor,
+ * or in rad-convert the recipe that will quantise it), so a plugin chooses its ops the same way at
+ * convert and at load: an fp8 GEMM for a block-fp8 weight, the rotated expert kernels for
+ * `i4*bf16[1x128]/fwht128`. Ask after the weight's name map entry (rad_decl_name_map), which is how
+ * a checkpoint is searched for it. A builder with no model behind it (a test, a synthetic tool)
+ * answers RAD_E_NOTFOUND, and a weight declared there is read as plain in its declared dtype. */
 int rad_weight_encoding(RadBuilder* b, const char* source, RadEncoding* out, int64_t* shape,
                         uint32_t* rank);
 
 /* ================================================================== buffers */
-/* Activations are declared too, or the buffer plan has nothing to analyse. Liveness is computed
- * over the declared op list, so scratch and intermediates come from one arena sized once instead
- * of an allocator called per step (spec §3.1). */
+/* Activations are declared too, so the buffer plan can analyse them. Liveness is computed over the
+ * declared op list, so scratch and intermediates come from one arena sized once instead of an
+ * allocator called per step (spec §3.1). */
 enum {
     RAD_BUF_TRANSIENT = 0,  /* liveness-analysed, may share storage with another transient */
     RAD_BUF_PERSIST   = 1,  /* survives across steps: a KV-adjacent scratch, a routing histogram */
@@ -262,14 +254,13 @@ typedef struct RadBufDecl {
     int         kind;                  /* RAD_BUF_* */
     int         domain;                /* RAD_DOMAIN_DEVICE or RAD_DOMAIN_HOST */
     const char* derive;                /* RAD_BUF_DERIVED: the derivation the core runs */
-    /* WHICH KV GROUP A DERIVATION IS ABOUT, or 0 for "the only one of its kind".
+    /* The KV group a derivation is about, or 0 for the only one of its kind.
      *
-     * `conv_state_index` computes a read cursor inside a rolling window, which means it needs THAT
-     * GROUP's slot per sequence and THAT GROUP's window depth -- and a model may declare several.
-     * Qwen4-Exp's PLE layer has two conv states of different depths and dtypes beside the gated
-     * delta net's third. Leaving this 0 with more than one group of the kind a derivation reads is
-     * refused rather than guessed at: the wrong window's depth produces a plausible cursor and a
-     * convolution that reads history it never wrote.
+     * `conv_state_index` computes a read cursor inside a rolling window, so it needs that group's
+     * slot per sequence and window depth, and a model may declare several (Qwen4-Exp's PLE layer
+     * has two conv states of different depths and dtypes beside the gated delta net's). 0 with
+     * more than one group of the kind a derivation reads is refused: the wrong window depth gives
+     * a plausible cursor and a convolution that reads history it never wrote.
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     rad_kvgroup kv;
@@ -278,10 +269,10 @@ typedef struct RadBufDecl {
 rad_buf rad_decl_buffer(RadBuilder* b, const char* name, const RadBufDecl* d);
 
 /* ================================================================== KV groups */
-/* Each distinct state kind is a KV group with its own block geometry, its own pool, and its own
- * slot mapping in the step batch. Linear-attention state is a KV group too: it is not paged the
- * same way, but it is allocated, mapped and freed by the same manager, because otherwise two
- * allocators disagree about what a sequence owns (spec §7.2). */
+/* Each distinct state kind is a KV group with its own block geometry, pool and slot mapping in the
+ * step batch. Linear-attention state is a KV group too: not paged the same way, but allocated,
+ * mapped and freed by the same manager, so there is one record of what a sequence owns
+ * (spec §7.2). */
 enum {
     RAD_KV_FULL    = 0,   /* paged, per-token, growing -- full attention */
     RAD_KV_WINDOW  = 1,   /* paged, per-token, bounded by the window */
@@ -297,10 +288,9 @@ typedef struct RadKVGroupDecl {
     int64_t  head_dim;
     int64_t  state_dim[2];    /* RAD_KV_LINEAR: the per-head state geometry, e.g. {128,128} */
     int64_t  conv_width;      /* RAD_KV_CONV */
-    /* Block size is NOT declared. It is taken off the resolved attention kernel's constraints at
-     * declare, because a core that picked its own would be a core that has to be edited when a
-     * kernel changes (spec §7.2). Read it back with rad_kv_block_size() after declaring the
-     * attention op that consumes this group. */
+    /* Block size is not declared. It is taken from the resolved attention kernel's constraints at
+     * declare, so the core needs no edit when a kernel changes (spec §7.2). Read it back with
+     * rad_kv_block_size() after declaring the attention op that consumes this group. */
 } RadKVGroupDecl;
 
 /* `rad_kvgroup` is in rad_types.h with the other handles -- RadBufDecl above carries one. */
@@ -312,9 +302,9 @@ int64_t     rad_kv_block_size(RadBuilder* b, rad_kvgroup g);
 int rad_bind_layer_kv(RadBuilder* b, int layer, rad_kvgroup g);
 
 /* ================================================================== ops */
-/* Declared with their parameters and their weight operands. The core resolves each against the
- * kernel hierarchy, per band, per domain. This phase ALWAYS completes; if anything failed to
- * resolve, the full list is reported at the end rather than the first failure at the top. */
+/* Declared with their parameters and weight operands. The core resolves each against the kernel
+ * hierarchy, per band, per domain. This phase always completes, and every op that failed to
+ * resolve is reported together at the end. */
 rad_op rad_decl_op(RadBuilder* b, const char* op,
                    const RadParam* params, int n_params,
                    const rad_weight* weights, int n_weights);
@@ -332,89 +322,79 @@ rad_op rad_decl_op(RadBuilder* b, const char* op,
 #define RAD_NOWEIGHTS     ((const rad_weight*)0), 0
 #define RAD_OP(b, op, ...) rad_decl_op((b), (op), __VA_ARGS__)
 
-/* An op's BUFFER operands, which rad_decl_op does not name -- it names weights, because those are
- * what placement moves. But the buffer planner needs liveness, and liveness is exactly which ops
- * read and write which buffers. Without these a transient has no declared use and must be assumed
- * live for the whole program, which is sound (a plugin may issue any handle in any order) and as
- * wasteful as it sounds; --debug-graph prints how many buffers fell into that case so the cost is
- * never invisible.
- *
- * Separate from rad_decl_op rather than more arguments to it, because the common case is one call
- * with one read set and one write set and the alternative is four more parameters on every
- * declaration. */
+/* An op's buffer operands. rad_decl_op names only weights, which placement moves; the buffer
+ * planner needs liveness, i.e. which ops read and write which buffers. A transient with no
+ * declared use is assumed live for the whole program, which is sound (a plugin may issue any
+ * handle in any order) but wasteful; --debug-graph prints how many buffers fell into that case.
+ * Separate calls rather than four more parameters on every rad_decl_op. */
 int rad_op_reads (RadBuilder* b, rad_op h, const rad_buf* bufs, int n);
 int rad_op_writes(RadBuilder* b, rad_op h, const rad_buf* bufs, int n);
 
-/* A BUFFER THE ARCHITECTURE TOUCHES FROM THE SECOND LANE, which is the one case where the op
- * range a buffer's declarations imply is NOT a bound on when its bytes are in use.
+/* A buffer the architecture touches from the second lane, the one case where the op range a
+ * buffer's declarations imply does not bound when its bytes are in use.
  *
- * The planner packs transients from ONE LINEAR ORDER (spec §3.1): two whose declared lives do not
- * overlap share arena bytes. `rad_lane` breaks that assumption rather than the declarations --
- * lane 1's ops are issued at op indices that sit inside lane 0's, so a shared-arm scratch whose
- * life is "ops 41..42" can be laid over a routed-arm scratch whose life is "ops 37..38", and on
- * two streams those two runs OVERLAP IN TIME. Nothing downstream can tell: it reads as data.
+ * The planner packs transients from one linear order (spec §3.1): two whose declared lives do not
+ * overlap share arena bytes. `rad_lane` breaks that: lane 1's ops sit at op indices inside lane
+ * 0's, so a shared-arm scratch live over ops 41..42 can overlay a routed-arm scratch live over ops
+ * 37..38, and on two streams those runs overlap in time, corrupting data silently.
  *
- * So a buffer named here is given the WHOLE PROGRAM, which is what a buffer with no declared use
- * already gets and is sound for the same reason. It is deliberately per-buffer and not a mode:
- * unsharing every buffer would cost ~220 MiB on a model this size, where the lane-1 transients
- * of one block are a few MiB. Call it at declare, for every buffer the
- * second lane reads or writes -- the ones lane 0 touches in the same window are covered by
- * symmetry, since sharing needs both sides.
+ * A buffer named here is live for the whole program, like a buffer with no declared use. It is
+ * per-buffer rather than a mode because unsharing every buffer costs ~220 MiB on a large model,
+ * against a few MiB for one block's lane-1 transients. Call it at declare for every buffer the
+ * second lane reads or writes; the lane-0 buffers they could share with are covered, since
+ * sharing needs both sides.
  *
- * Calling it for a PERSIST or DERIVED buffer is a no-op: those are live everywhere already. */
+ * A no-op for a PERSIST or DERIVED buffer, which is live everywhere already. */
 int rad_buf_concurrent(RadBuilder* b, rad_buf buf);
 
-/* AN UNEVEN SHARD: this rank's slice of a RAD_SHARD_ROW or RAD_SHARD_COL weight's split dimension
- * is [lo, hi) and not the even 1/tp of it -- rows of EACH stacked row part for ROW, columns for
- * COL, in the container's (unsharded) units. The declared extent must already be `hi - lo` (each
- * row part's, for ROW).
+/* An uneven shard: this rank's slice of a RAD_SHARD_ROW or RAD_SHARD_COL weight's split dimension
+ * is [lo, hi) rather than an even 1/tp. Rows of each stacked row part for ROW, columns for COL, in
+ * the container's unsharded units. The declared extent must already be `hi - lo` (per row part,
+ * for ROW).
  *
- * For a width that does not divide into equal whole blocks across the ranks: a 640-column
- * projection with 128-column scale blocks is five blocks, which two ranks can split three and two
- * but not in half. The stacked parts of a ROW weight must be equal in the container, since only
- * the rank's own part sizes are declared. Refused by a container converted for more than one
- * rank, whose entries are already even shares, and by a stored layout whose row runs or column
- * groups the span would cut. */
+ * For a width that does not divide into equal whole blocks across ranks: a 640-column projection
+ * with 128-column scale blocks is five blocks, split three and two. The stacked parts of a ROW
+ * weight must be equal in the container, since only the rank's own part sizes are declared.
+ * Refused for a container converted for more than one rank (its entries are already even shares)
+ * and for a stored layout whose row runs or column groups the span would cut. */
 int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, int64_t hi);
 
-/* A STACKED weight's span, ONE [lo, hi) PER ROW PART, with each part's whole extent in the
- * container: the delta net's [q|k|v|z] is 2048, 2048, 6144, 6144 rows on Flash-Next, and parts
- * that are not the same width cannot take rad_weight_shard_span's one span. `n` is the declared
- * part count; part g of the container is `total[g]` rows, of which this rank takes [lo[g], hi[g])
- * and declared `hi[g] - lo[g]`; the totals must sum to the entry's rows. A rank's UNEVEN share of
- * the heads -- 6 of 16 K heads where three ranks take 6, 5 and 5 -- is declared this way, and
- * nothing is padded. Additive export: a plugin that does not call it declares as before. */
+/* A stacked weight's span, one [lo, hi) per row part, with each part's whole extent in the
+ * container, for parts of unequal width that rad_weight_shard_span's single span cannot express
+ * (the delta net's [q|k|v|z] is 2048, 2048, 6144, 6144 rows on Flash-Next). `n` is the declared
+ * part count; container part g is `total[g]` rows, of which this rank takes [lo[g], hi[g]) and
+ * declared `hi[g] - lo[g]`; the totals must sum to the entry's rows. An uneven share of the heads
+ * (6 of 16 K heads, with three ranks taking 6, 5 and 5) is declared this way, without padding.
+ * Additive export. */
 int rad_weight_shard_span_parts(RadBuilder* b, rad_weight w, const int64_t* lo, const int64_t* hi,
                                 const int64_t* total, int n);
 
-/* THIS RANK KEEPS NO CACHE FOR THE GROUP. The group is declared as on every other rank -- the
+/* This rank keeps no cache for the group. The group is still declared as on every other rank (the
  * scheduler indexes groups by position and one block table serves every rank, so it must exist
- * here with the same block size and layers -- and nothing is carved for it: it costs this rank no
- * pool. It is for a rank the geometry gives no attention heads (rad_arch.h Geom::attn_zero),
- * whose attention is a `fill` of zeros and never reads a key. No op on this rank may name the
- * group as a RAD_KV operand after this; the engine refuses one at issue. Additive export. */
+ * with the same block size and layers), but no pool is carved for it. For a rank the geometry
+ * gives no attention heads (rad_arch.h Geom::attn_zero), whose attention is a `fill` of zeros.
+ * After this, no op on this rank may name the group as a RAD_KV operand; the engine refuses one
+ * at issue. Additive export. */
 int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g);
 
 #define RAD_BUFS(...)  ((const rad_buf[]){ __VA_ARGS__ }), \
                        (int)(sizeof((const rad_buf[]){ __VA_ARGS__ }) / sizeof(rad_buf))
 
 /* Did the last rad_decl_op resolve? A plugin asks for the fused op first and emits the unfused
- * sequence when it does not, which is what makes fusion a selection rather than a compiler pass
- * (spec §2.3). A handle that did not resolve is RAD_NULL_HANDLE and is NOT an error yet -- it
- * becomes one only if the plugin issues it. */
+ * sequence when it does not, which makes fusion a selection rather than a compiler pass
+ * (spec §2.3). An unresolved handle is RAD_NULL_HANDLE and becomes an error only if issued. */
 int rad_op_resolved(RadBuilder* b, rad_op h);
 
-/* Does a loaded kernel library declare op `op` -- is it in the vocabulary at all? Declaring an op
- * nobody declares is an error, because that is what a misspelt name looks like; an op that is
- * declared and only resolved to no kernel is not (rad_op_resolved). A plugin asks this first for a
- * fused op that only an optional library defines, and emits the chain when the answer is 0.
- * Additive export. */
+/* Does any loaded kernel library declare op `op`? Declaring an op outside the vocabulary is an
+ * error, since that is what a misspelt name looks like; an op that is declared but resolves to no
+ * kernel is not (rad_op_resolved). A plugin asks this first for a fused op only an optional
+ * library defines, and emits the chain when the answer is 0. Additive export. */
 int rad_op_declared(RadBuilder* b, const char* op);
 
 /* ================================================================== checkpoint name map */
 /* The plugin owns the map from checkpoint tensor names to declared weight names, including
- * convert-time fusions -- q/k/v into a single qkv, gate and up into gate_up. It is the only
- * component that knows both sides, and rad-convert reads the map from it (spec §2.4). */
+ * convert-time fusions (q/k/v into one qkv, gate and up into gate_up). It is the only component
+ * that knows both sides, and rad-convert reads the map from it (spec §2.4). */
 enum { RAD_MAP_COPY = 0, RAD_MAP_CONCAT = 1 };
 
 typedef struct RadNameMap {
@@ -426,86 +406,65 @@ typedef struct RadNameMap {
 
     /* A sub-tensor index within src[i], or -1 for the whole tensor. GGUF stores a MoE layer's
      * experts stacked as one ffn_gate_exps of shape [.., n_expert], while placement needs one
-     * declared weight per expert -- the movement unit is an expert, not a tensor. Without this
-     * the expert index survives only inside the declared NAME, which is an unwritten convention
-     * rad-convert would have to parse. */
+     * declared weight per expert; this carries the expert index so rad-convert need not parse it
+     * out of the declared name. */
     int         src_index[8];
 } RadNameMap;
 
-/* RAD_MAP_COPY with n_src > 1 means FIRST SOURCE PRESENT IN THE CONTAINER WINS. That is how a
- * tied lm_head is expressed -- output.weight if the checkpoint has one, else token_embd.weight --
- * and without it a model family whose members differ only in tying needs two plugins.
- * RAD_MAP_CONCAT with n_src > 1 concatenates all of them along concat_dim and requires every one. */
+/* RAD_MAP_COPY with n_src > 1: the first source present in the container wins. This expresses a
+ * tied lm_head (output.weight if present, else token_embd.weight), so one plugin covers family
+ * members that differ only in tying. RAD_MAP_CONCAT with n_src > 1 concatenates all sources along
+ * concat_dim and requires every one. */
 
 int rad_decl_name_map(RadBuilder* b, const RadNameMap* m);
 
 
 /* ================================================================== the step's output */
-/* WHICH BUFFER HOLDS THIS STEP'S LOGITS. The core samples from it -- the sampler chain is core
- * logic and its ops resolve through the same hierarchy at the same time as the plugin's (spec
- * §13) -- so the core has to be told which buffer that is, and the plugin is the only one who
- * knows.
+/* Which buffer holds this step's logits. The core samples from it (the sampler chain is core logic
+ * whose ops resolve through the same hierarchy as the plugin's, spec §13), and only the plugin
+ * knows which buffer it is. A name match would be wrong: a drafter or encoder tower declares into
+ * a scope (RadBuildCtx::scope, spec §10, §11), so "the buffer called logits" can be two buffers in
+ * one Program.
  *
- * A name convention would do it and is wrong: a drafter or an encoder tower declares into a SCOPE
- * (RadBuildCtx::scope, spec §10, §11), so "the buffer called logits" is two different buffers in
- * one Program and matching on the string would sample the draft model's distribution into the
- * target's tokens. It is one call and it removes a string match from startup.
+ * Its extent along dim 0 bounds RadBatch::n_out: one row per sampled position, not per token of
+ * the step. Declaring it [max_tok, n_vocab] is legal but, at a 248K vocabulary, 8 GiB.
  *
- * Its extent along dim 0 bounds RadBatch::n_out: the buffer holds one row per sampled position,
- * not one per token of the step. Declaring it [max_tok, n_vocab] is legal and, at a 248K
- * vocabulary, 8 GiB.
- *
- * A Program with no logits buffer cannot serve, and the engine says so at startup rather than at
- * the first step. An embedding-only or encoder-only plugin declares none, deliberately. */
+ * A Program with no logits buffer cannot serve, and the engine says so at startup. An
+ * embedding-only or encoder-only plugin declares none. */
 int rad_declare_logits(RadBuilder* b, rad_buf logits);
 
-/* WHICH BUFFER HOLDS THIS STEP'S POOLED VECTORS: what an EMBEDDING model returns instead of logits,
- * one row a sequence of the step -- row s is sequence s's whole input pooled into one vector,
- * whatever pooling the model was trained with (a mean, the last token, a CLS row). The core reads
- * rows [0, n_seq) back after the step and hands each to its request; it does not normalise them,
- * because that is the API's choice and not the model's.
+/* Which buffer holds this step's pooled vectors, what an embedding model returns instead of
+ * logits. Row s is sequence s's whole input pooled into one vector, with whatever pooling the
+ * model was trained with (a mean, the last token, a CLS row). The core reads rows [0, n_seq) back
+ * after the step and hands each to its request. It does not normalise them; that is the API's
+ * choice, not the model's.
  *
- * DECLARING IT MAKES THE PROGRAM AN EMBEDDING PROGRAM, and that changes what a step is:
+ * Declaring it makes the Program an embedding program:
+ *   - every sequence in a step is a whole input. The scheduler never splits one across steps,
+ *     since a bidirectional encoder cannot be fed half its input, and refuses an input longer
+ *     than one step rather than truncating it;
+ *   - there is no sampler, drafter or prefix cache, and nothing is generated: a request ends at
+ *     the step that carried it.
  *
- *   - every sequence in a step is a WHOLE input. The scheduler never splits one across steps,
- *     because an encoder that attends both ways cannot be fed half of its input, and it refuses
- *     an input longer than one step's tokens rather than truncating it;
- *   - there is no sampler, no drafter and no prefix cache, and nothing is generated: a request
- *     ends at the step that carried it.
- *
- * f32, device, [>= max_seqs, dim]: `dim` is the vector's width and the extent the core reads. A
- * Program declares this or logits, never both -- a model that both generates and embeds is two
- * deployments. */
+ * f32, device, [>= max_seqs, dim]: `dim` is the vector width the core reads. A Program declares
+ * this or logits, never both. */
 int rad_declare_pooled(RadBuilder* b, rad_buf pooled);
 
 
 /* ================================================================== the drafter */
-/* WHAT THE PLUGIN'S DRAFT HEAD IS, declared the same way and for the same reason the logits
- * buffer above is: the core drives the extra passes, so it has to be told what it is driving,
- * and the plugin is the only one who knows.
+/* The plugin's draft head. The core drives the extra passes, and only the plugin knows what it
+ * is, so it is declared rather than detected from weight names (`mtp.fc.weight`) with the core
+ * re-reading the drafter's configuration keys the plugin already read.
  *
- * IT REPLACES A WEIGHT-NAME MATCH. The alternative is for the engine to decide whether a
- * container drafts by scanning the declared weights for names like `mtp.fc.weight` or
- * `dflash.fc.weight`, and then to re-read the drafter's own configuration keys -- block size,
- * mask token, sliding window, predicted-layer count -- every one of them a key the plugin has
- * already read to build the thing. Two readers of one fact is two places for it to disagree, and
- * the second reader would be the core, which is the one that must not know.
+ * The kind is a drive shape, not a model. SERIAL runs `depth` dependent passes, each embedding the
+ * last one's proposal, so tokens arrive one at a time and a pass that declines ends the chain
+ * (MTP, EAGLE, Medusa-serial). BLOCK runs a context pass, then one pass that fills every drafted
+ * position at once (DFlash2 and other block-diffusion drafters).
  *
- * KIND IS A SHAPE, NOT A MODEL. There are two ways a draft head can be driven and the difference
- * is visible from outside it: SERIAL runs `depth` dependent passes, each embedding what the last
- * one proposed, so the tokens arrive one at a time and a pass that declines ends the chain.
- * BLOCK runs a context pass and then ONE pass that fills every drafted position at once. MTP,
- * EAGLE and Medusa-serial are all SERIAL; DFlash2 and any other block-diffusion drafter is
- * BLOCK. A plugin picks the shape that describes it and needs no core change to do it.
+ * `proposal` is the buffer a pass writes its token ids into; 0 means the sampler's token buffer,
+ * which suits a head whose logits go through the ordinary sampler chain.
  *
- * `proposal` is the buffer a pass writes its token ids into, and 0 means "the sampler's token
- * buffer" -- which is what a head whose logits go through the ordinary sampler chain wants. A
- * by-name lookup cannot supply this field: it would have to suffix-match a name that is not
- * unique in the Program, in exactly the way the comment above rad_declare_logits explains is
- * wrong -- a drafter declares into its own scope.
- *
- * A plugin that declares no drafter is not an error and is the normal case; the scheduler's
- * prompt-lookup drafter still runs. */
+ * Declaring no drafter is the normal case; the scheduler's prompt-lookup drafter still runs. */
 typedef enum {
     RAD_DRAFT_NONE   = 0,
     RAD_DRAFT_SERIAL = 1,   /* `depth` dependent passes, one proposal each */
@@ -521,77 +480,67 @@ typedef struct RadDrafterDecl {
     rad_buf     proposal;
     int64_t     proposal_pitch;  /* elements a row in `proposal`; 0 means 1 */
 
-    /* BLOCK only. `mask_token` is the id every unfilled position of the block embeds, and a
-     * block drafter without one has nothing to run. `window` is the drafter's OWN sliding
-     * window over its OWN cache, 0 for unbounded -- the core stages the block pass against it,
-     * so it must be the same number the plugin gated its attention with. */
+    /* BLOCK only. `mask_token` is the id every unfilled block position embeds; a block drafter
+     * without one cannot run. `window` is the drafter's own sliding window over its own cache, 0
+     * for unbounded. The core stages the block pass against it, so it must match the window the
+     * plugin gated its attention with. */
     int32_t     mask_token;
     int64_t     window;
 
-    /* BLOCK only: HOW MANY ROWS THE QUERY PASS RUNS OVER, one sequence's worth. 0 means
-     * `depth + 1`.
+    /* BLOCK only: how many rows the query pass runs over, per sequence. 0 means `depth + 1`.
      *
-     * IT IS NOT ALWAYS depth + 1, AND THE DIFFERENCE IS A ROW ALIGNMENT. The core stages the
-     * block as an anchor -- the token the sampler just chose -- followed by `block - 1` copies of
-     * `mask_token`, and THE HEAD RUNS OVER THE LAST `depth` ROWS. That one rule covers both
-     * conventions a block-diffusion drafter can be trained in:
+     * The core stages the block as an anchor (the token the sampler just chose) followed by
+     * `block - 1` copies of `mask_token`, and the head runs over the last `depth` rows. That covers
+     * both training conventions:
      *
-     *   block = depth + 1    the anchor row predicts NOTHING and each mask row predicts the token
-     *                        at ITS OWN position. The head sees rows 1..depth. DFlash2.
-     *   block = depth        every row predicts the token at the position AFTER it, the anchor
-     *                        row included -- the ordinary next-token relation, so the anchor is
-     *                        not a wasted row. The head sees rows 0..depth-1. DSpark, whose
-     *                        reference takes `hidden[:, -block_size:, :]` over exactly this.
+     *   block = depth + 1    the anchor row predicts nothing; each mask row predicts the token at
+     *                        its own position. The head sees rows 1..depth. DFlash2.
+     *   block = depth        every row, the anchor included, predicts the token at the next
+     *                        position (the ordinary next-token relation). The head sees rows
+     *                        0..depth-1. DSpark, whose reference takes `hidden[:, -block_size:, :]`.
      *
-     * GETTING IT WRONG IS INVISIBLE FROM THE OUTSIDE. Both values run, both produce `depth`
-     * tokens, and the model's own output stays exactly correct because every draft is verified;
-     * what happens instead is that the proposals are shifted by one position and acceptance
-     * collapses to roughly the rate of chance. That is why this is declared by the plugin that
-     * knows how its checkpoint was trained, and not inferred here. */
+     * A wrong value is not visible in the output: both run, every draft is verified so the text
+     * stays correct, but the proposals shift by one position and acceptance drops to about chance.
+     * Hence it is declared by the plugin, which knows how the checkpoint was trained. */
     int64_t     block;
 } RadDrafterDecl;
 
 int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d);
 
-/* A SERIAL HEAD WITH NO CACHE OF ITS OWN. Every attention layer of it reads one of the TRUNK's
- * layers' K and V and writes none -- Gemma 4's assistant head, whose layers have a query
- * projection and nothing else, reads the last sliding and the last global trunk layer. Called
- * once, after rad_declare_drafter, by a plugin whose serial head is that shape. Additive export: a
- * plugin that does not call it drafts exactly as before, and RAD_ABI_VERSION does not move.
+/* A serial head with no cache of its own: each of its attention layers reads one trunk layer's K
+ * and V and writes none. Gemma 4's assistant head, whose layers have only a query projection,
+ * reads the last sliding and last global trunk layer. Called once, after rad_declare_drafter.
+ * Additive export; RAD_ABI_VERSION does not move.
  *
- * What it changes in the serial driver, and each item follows from the head writing nothing:
+ * Effect on the serial driver, all following from the head writing nothing:
  *
- *   NO HISTORY IS OWED. A history pass exists to fill a head's own K and V, and there are none to
- *   fill. The pass carries round 1 alone: ONE row a drafting sequence, at the committed position,
- *   with the token the trunk chose after it and the trunk's hidden state there (out_ids). A
- *   sequence that does not draft gets no row, and a step with nothing to draft no pass.
+ *   No history pass, since there is no K and V of its own to fill. The pass carries round 1
+ *   alone: one row per drafting sequence, at the committed position, with the token the trunk
+ *   chose after it and the trunk's hidden state there (out_ids). A sequence that does not draft
+ *   gets no row, and a step with nothing to draft no pass.
  *
- *   EVERY ROUND RUNS AT THAT SAME POSITION, OVER THE SAME CONTEXT. A head with a cache of its own
- *   steps one position a round and attends to what it wrote there. This one has nowhere to write,
- *   and the trunk's cache past the committed position holds the K and V of drafts the last verify
- *   REJECTED, or of nothing. So every round's `seqused` ends at the committed position, and what
- *   the head proposed travels forward in its hidden state and its next input token instead.
+ *   Every round runs at that same position over the same context. The trunk's cache past the
+ *   committed position holds K and V of drafts the last verify rejected, or nothing, so every
+ *   round's `seqused` ends at the committed position; the head's proposals travel forward in its
+ *   hidden state and next input token instead.
  *
- * `pos_offset` is where those rows sit for the rotary, as an offset from the committed position:
- * 0 is the position of the trunk hidden state the head continues from, 1 the position of the token
- * it embeds. It moves nothing else -- the context ends at the committed position either way -- and
- * which one a checkpoint was trained with is the plugin's to know. */
+ * `pos_offset` is the rotary position of those rows relative to the committed position: 0 is the
+ * position of the trunk hidden state the head continues from, 1 that of the token it embeds. It
+ * moves nothing else (the context ends at the committed position either way), and which one a
+ * checkpoint was trained with is the plugin's to know. */
 int rad_drafter_shared_kv(RadBuilder* b, int pos_offset);
 
 /* ================================================================== the encoder */
-/* A MEDIA ENCODER THE PLUGIN RUNS ON AN ENCODER PASS (RadBatch::enc), declared for the reason the
- * logits buffer and the drafter are: the core drives the pass and reads its result, so it has to
- * be told what it is driving, and only the plugin knows. A plugin that declares none serves text,
- * and the server refuses a media part by name.
+/* A media encoder the plugin runs on an encoder pass (RadBatch::enc). The core drives the pass and
+ * reads its result, so the plugin declares it. A plugin that declares none serves text only, and
+ * the server refuses a media part by name.
  *
- * WHAT IS HERE IS THE SHAPE OF THE INTERFACE, NOT THE MODEL. The core stages patches of
- * `patch_dim` elements and reads back one `n_embd`-wide row for every `merge` of them; what turns
- * the one into the other -- the tower's depth, its attention, its position scheme -- is the
- * plugin's business and appears nowhere in the core. How an image or a video becomes patches is
- * the processor's (core/mm), which reads its geometry from the container: the two agree through
- * `patch_dim` and `merge`, and the core refuses a program whose encoder disagrees with the
- * processor about either. */
-/* A PROGRAM DECLARES AT MOST TWO: one serving images and video, one serving audio. An audio
+ * This is the shape of the interface, not the model. The core stages patches of `patch_dim`
+ * elements and reads back one `n_embd`-wide row per `merge` of them; the tower itself is the
+ * plugin's business. How an image or video becomes patches is the processor's (core/mm), which
+ * reads its geometry from the container; the core refuses a program whose encoder disagrees with
+ * the processor about `patch_dim` or `merge`. */
+/* A program declares at most two: one serving images and video, one serving audio. An audio
  * encoder's "patch" is one feature frame (a mel row), its `merge` is frames per output row, and
  * its `max_patches` is RadBuildCtx::max_audio_frames. RadBatch::enc names which one a pass runs. */
 enum {
@@ -616,30 +565,29 @@ typedef struct RadEncoderDecl {
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d);
 
 /* ================================================================== the image generator */
-/* A PROGRAM THAT MAKES IMAGES: a conditioning network that reads a prompt (and pictures), a
- * denoiser that turns a latent from noise into an image's latent over a number of steps, and a
- * decoder that turns the latent into pixels. Declared for the reason the logits buffer is: the
- * core drives the passes, so it has to be told what it is driving, and only the plugin knows.
+/* A program that makes images: a conditioning network reads a prompt (and pictures), a denoiser
+ * turns a noise latent into an image latent over a number of steps, and a decoder turns the
+ * latent into pixels. The core drives the passes, so the plugin declares them.
  *
- * DECLARING ONE MAKES THE PROGRAM A GENERATOR, and a generator is driven by passes rather than by
- * token steps (RadBatch::gen):
+ * Declaring one makes the program a generator, driven by passes rather than token steps
+ * (RadBatch::gen):
  *
- *   RAD_GEN_PASS_COND     one conditioning sequence -- the prompt, and any reference pictures --
- *                         encoded into the generator's KV group. Read once per request (twice
- *                         with guidance: the negative prompt is a sequence of its own).
- *   RAD_GEN_PASS_DENOISE  one step of every image in flight that the pass carries: each image's
- *                         latent rows, read from and written back to the plugin's own state at the
- *                         image's lane, against its conditioning's KV.
+ *   RAD_GEN_PASS_COND     one conditioning sequence (the prompt and any reference pictures)
+ *                         encoded into the generator's KV group. Once per request, twice with
+ *                         guidance (the negative prompt is its own sequence).
+ *   RAD_GEN_PASS_DENOISE  one step of every image the pass carries: each image's latent rows,
+ *                         read from and written back to the plugin's state at the image's lane,
+ *                         against its conditioning's KV.
  *   RAD_GEN_PASS_DECODE   one image's latent to pixels, in `image_out`, which the core reads back.
  *
- * A program declares this, logits or pooled vectors -- one of the three.
+ * A program declares exactly one of this, logits or pooled vectors.
  *
- * WHAT IS HERE IS THE MODEL'S CONTRACT WITH A CLIENT: the prompt it was trained on, the sizes it
- * makes, the schedule its sampler follows. The core turns a request into passes with it and
- * nothing in the core names a model. */
+ * The fields are the model's contract with a client: the prompt it was trained on, the sizes it
+ * makes, its sampler's schedule. The core turns a request into passes from them without naming
+ * any model. */
 enum { RAD_GEN_PASS_COND = 1, RAD_GEN_PASS_DENOISE = 2, RAD_GEN_PASS_DECODE = 3 };
 
-/* HOW THE GENERATOR'S SEQUENCE IS LAID OUT, which the core builds from the conditioning prompt.
+/* How the generator's sequence is laid out; the core builds it from the conditioning prompt.
  *
  *   JOINT_GRID   the prompt's rows after `drop_prefix`, each media slot standing for `slot_rows`
  *                rows that a reference picture's latent tokens take in raster order, then the
@@ -654,32 +602,31 @@ typedef struct RadGeneratorDecl {
     const char* name;             /* "qwen-image" -- for messages */
     int32_t     layout;           /* RAD_GEN_LAYOUT_* */
 
-    /* THE CONDITIONING PROMPT, as text the core tokenises. `{prompt}` is replaced by the user's
-     * prompt; in `tmpl_edit`, `{images}` by one `tmpl_image` for each reference picture, joined by
-     * `tmpl_image_sep`. In `tmpl_image`, `{n}` is the picture's 1-based number and `{image}` where
-     * the picture's own tokens go -- the run the media processor makes of it, its markers
-     * included. */
+    /* The conditioning prompt, as text the core tokenises. `{prompt}` is replaced by the user's
+     * prompt; in `tmpl_edit`, `{images}` by one `tmpl_image` per reference picture, joined by
+     * `tmpl_image_sep`. In `tmpl_image`, `{n}` is the picture's 1-based number and `{image}` marks
+     * where the picture's own tokens go (the media processor's run for it, markers included). */
     const char* tmpl_text;
     const char* tmpl_edit;
     const char* tmpl_image;
     const char* tmpl_image_sep;
-    /* The tokens this text tokenises to at the start of the prompt are ENCODED but not handed to
-     * the generator: the conditioning starts after them (a fixed system turn, say). */
+    /* The tokens of this text at the start of the prompt are encoded but not handed to the
+     * generator; the conditioning starts after them (e.g. a fixed system turn). */
     const char* drop_prefix;
-    /* A TRANSPARENT IMAGE, asked for in the words the model was trained on: `{prompt}` is the
+    /* Prompt for a transparent image, in the words the model was trained on; `{prompt}` is the
      * user's description. Empty when the model makes no alpha. */
     const char* tmpl_transparent;
 
-    /* GEOMETRY. One latent token covers `latent_scale` x `latent_scale` pixels and holds
+    /* Geometry. One latent token covers `latent_scale` x `latent_scale` pixels and holds
      * `latent_channels` values; a side is a multiple of `size_multiple` pixels; an image has
-     * `pixel_channels` channels (4: RGBA). A media slot of the conditioning prompt -- one
-     * encoder output row -- stands for `slot_rows` rows of the generator's sequence. */
+     * `pixel_channels` channels (4: RGBA). A media slot of the conditioning prompt (one encoder
+     * output row) stands for `slot_rows` rows of the generator's sequence. */
     int64_t latent_channels;
     int64_t latent_scale;
     int64_t size_multiple;
     int64_t pixel_channels;
     int64_t slot_rows;
-    /* The largest image, in latent tokens: every buffer the plugin sized for one image. */
+    /* The largest image, in latent tokens; the plugin sizes its per-image buffers for it. */
     int64_t max_tokens;
     /* Reference pictures: at most `max_refs` a request, each resized to `ref_area` pixels. */
     int64_t max_refs;
@@ -687,8 +634,8 @@ typedef struct RadGeneratorDecl {
     /* The size a request that names none is made at. */
     int64_t default_width, default_height;
 
-    /* THE SAMPLER: flow matching, an Euler step from sigma 1 towards 0.
-     *   A FIXED SCHEDULE: `n_sigmas` values, the terminal 0 implied; a request may not change the
+    /* The sampler: flow matching, Euler steps from sigma 1 towards 0.
+     *   A fixed schedule: `n_sigmas` values, the terminal 0 implied; a request may not change the
      *   step count. Otherwise `default_steps` sigmas from 1 to 1/steps, shifted:
      *     dyn_shift 0   sigma' = shift * s / (1 + (shift - 1) * s)
      *     dyn_shift 1   mu linear in the image's token count, 256 -> base_shift .. max_seq ->
@@ -706,9 +653,9 @@ typedef struct RadGeneratorDecl {
     /* Guidance a request gets when it names none; 1 is off. */
     double        default_cfg;
 
-    /* WHERE THINGS ARE. `max_lanes` images may be in flight at once, each in a lane of the
-     * plugin's own state; `image_out` is [max_tokens * latent_scale^2, pixel_channels] u8 on the
-     * device, row-major pixels of the image a decode pass made. */
+    /* `max_lanes` images may be in flight at once, each in a lane of the plugin's own state.
+     * `image_out` is [max_tokens * latent_scale^2, pixel_channels] u8 on the device: row-major
+     * pixels of the image a decode pass made. */
     int64_t max_lanes;
     rad_buf image_out;
 } RadGeneratorDecl;
@@ -722,92 +669,78 @@ void rad_note(RadBuilder* b, const char* fmt, ...);
 /* ================================================================== the arch plugin exports */
 const char* rad_arch_id(void);
 
-/* THE QUANTISATION THIS PLUGIN SERVES, and the second half of the key that selects it.
+/* The quantisation this plugin serves: the second half of the key that selects it.
  *
  * spec §2.4 is one plugin per (architecture, quantisation): a w4a8 model wants
- * rmsnorm_had_quant_i8 where a bf16 model wants a plain rmsnorm, and a plugin full of branches on
- * a quant descriptor is how you get back to "unclear what actually runs". So `qwen35_bf16` and
- * `qwen35_fp8` both answer "qwen35" to rad_arch_id and are told apart HERE, by the string the
- * container already carries in RadModelMeta::quant.
+ * rmsnorm_had_quant_i8 where a bf16 model wants a plain rmsnorm, and branching on a quant
+ * descriptor inside one plugin obscures what actually runs. So `qwen35_bf16` and `qwen35_fp8` both
+ * answer "qwen35" to rad_arch_id and are told apart here, by RadModelMeta::quant.
  *
- * The match is EXACT and there is no fallback. An unquantised container and an unquantised plugin
- * both say "" -- the symbol is optional and a plugin that does not export it is read as "".
- * Falling back from a quantised container to a plugin that declares dense weights would fail
- * later, at the name map, with a worse message than "no plugin claims qwen35 at fp8_e4m3; qwen35
- * is served at: (unquantised)". */
+ * The match is exact, with no fallback. Unquantised containers and plugins both say ""; the
+ * symbol is optional and a plugin without it reads as "". A fallback to a dense plugin would fail
+ * later at the name map with a worse message than "no plugin claims qwen35 at fp8_e4m3; qwen35 is
+ * served at: (unquantised)". */
 const char* rad_arch_quant(void);
 
-/* WHAT THE PLUGIN CAN SAY BEFORE IT DECLARES ANYTHING. OPTIONAL: a plugin that does not export
- * it answers every question with the zero, which is each field's default.
+/* What the plugin can say before it declares anything. Optional: a plugin that does not export
+ * it answers zero to everything, each field's default.
  *
- * It exists for the ONE fact that is an INPUT to declaration and a property of the model:
- * the draft depth. `RadBuildCtx::max_spec` sizes buffers, bands kernels and sets the scheduler's
- * window, so it must be fixed before rad_arch_declare runs -- but "how deep does this container's
- * drafter want to go" is answerable only by reading the drafter's own configuration, which is the
- * plugin's job. The alternative is a core that reads those keys itself, by name, with an
- * architecture's own prefix in the string.
+ * The main case is the draft depth, a model property that is an input to declaration:
+ * `RadBuildCtx::max_spec` sizes buffers, bands kernels and sets the scheduler's window, so it is
+ * fixed before rad_arch_declare runs, yet only the plugin reads the drafter's configuration. 0
+ * means the container carries no drafter.
  *
- * A serial head names a THROUGHPUT TRADE-OFF: more rounds cost a pass each and acceptance decays,
- * so the number is measured, not derived. A block drafter names the block length ITS CHECKPOINT
- * WAS TRAINED AT, and asking for anything else is a silently worse draft. Both are the plugin's
- * to know. 0 means "this container carries no drafter", which is the right answer to "speculate
- * as deeply as this model can" on a model that cannot.
- *
- * --num-speculative-tokens overrides whatever comes back, and the plugin sees the result in
- * RadBuildCtx::max_spec; a plugin whose checkpoint cannot serve that depth refuses in declare,
- * where it has the whole configuration in front of it. */
+ * --num-speculative-tokens overrides the answer, and the plugin sees the result in
+ * RadBuildCtx::max_spec; a plugin whose checkpoint cannot serve that depth refuses in declare. */
 typedef struct RadArchProbe {
     int draft_depth;
 
-    /* WHETHER THAT DEPTH IS THE ONLY ONE THE DRAFTER SERVES, and the two callers of this need
-     * different answers. A SERIAL head names a throughput trade-off: more passes cost one each
-     * and acceptance decays, so the depth it reports is an operating point and one more pass
-     * still runs. A BLOCK drafter
-     * names the block length its checkpoint was TRAINED at -- its convolution masks the position
-     * within that block -- so any other depth is not a shorter proposal, it is a refusal.
+    /* Nonzero when `draft_depth` is the only depth the drafter serves. A serial head's depth is a
+     * throughput operating point (each extra pass costs one pass and acceptance decays, but it
+     * still runs). A block drafter's depth is the block length its checkpoint was trained at (its
+     * convolution masks the position within the block), so any other depth is refused.
      *
-     * `--num-speculative-tokens auto` takes `draft_depth` either way; it is choosing an operating
-     * point. rad-convert must not: a CONTAINER carries what the model can serve, so narrowing it
-     * to a serial head's preferred depth would mean a deployment asking for one more had to
-     * convert again. It widens to `draft_depth` only when this says the drafter has no choice. */
+     * `--num-speculative-tokens auto` takes `draft_depth` either way. rad-convert does not: a
+     * container carries everything the model can serve, so it widens to `draft_depth` only when
+     * this says the drafter has no choice; otherwise a deployment wanting a deeper serial draft
+     * would have to convert again. */
     int draft_depth_fixed;
 
-    /* THE PLUGIN HONOURS RadBuildCtx::shape_probe: a sizing declare leaves the state its step
-     * function reads untouched. Zero -- what a plugin that never heard of it leaves -- means the
-     * core does not ask, and the activation arena is not lent. */
+    /* The plugin honours RadBuildCtx::shape_probe: a sizing declare leaves the state its step
+     * function reads untouched. Zero means the core does not ask, and the activation arena is not
+     * lent. */
     int shape_probe_ok;
 
-    /* THE ENCODER'S MERGE: input patches a output row (RadEncoderDecl::merge), when the plugin
+    /* The encoder's merge, input patches per output row (RadEncoderDecl::merge), when the plugin
      * declares an encoder. A pass carries whole output rows, so the core rounds the pass size it
-     * picks itself (`--mm-max-patches auto`) down to a multiple of this; a size the operator
-     * names is the operator's, and a plugin refuses one that does not divide. 0 is no opinion. */
+     * picks itself (`--mm-max-patches auto`) down to a multiple of this; an operator-named size is
+     * kept, and the plugin refuses one that does not divide. 0 is no opinion. */
     int64_t enc_merge;
 
-    /* THE LONGEST AUDIO CLIP THE PLUGIN'S AUDIO ENCODER TAKES, in feature frames (a whole
-     * number of its merge), when it declares one: the engine sizes the audio pass with it
-     * (RadBuildCtx::max_audio_frames). 0 is no audio. */
+    /* The longest clip the audio encoder takes, in feature frames (a whole number of its merge);
+     * the engine sizes the audio pass with it (RadBuildCtx::max_audio_frames). 0 is no audio. */
     int64_t audio_frames;
 
-    /* AN IMAGE GENERATOR (rad_declare_generator), and the rows its largest pass carries: the
-     * engine sizes the step for it before declare -- a denoise pass carries an image's every
-     * latent row at once, twice with guidance -- and turns off what a generator has no use for.
-     * 0 is a program that generates text or embeds. */
+    /* Nonzero for an image generator (rad_declare_generator): the rows its largest pass carries.
+     * The engine sizes the step for it before declare (a denoise pass carries all of an image's
+     * latent rows at once, twice with guidance) and turns off what a generator does not use. 0 is
+     * a program that generates text or embeds. */
     int64_t gen_rows;
-    /* ...and the patches its conditioning pass encodes at most: every reference picture a request
-     * may carry, at the size the model resizes them to. The encoder's pass size (max_enc_patches). */
+    /* The most patches the generator's conditioning pass encodes: every reference picture a
+     * request may carry, at the model's resize target. This is the encoder's pass size
+     * (max_enc_patches). */
     int64_t gen_patches;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);
 
-/* HOW THIS MODEL SPELLS A TURN, AS DATA. OPTIONAL: a plugin that does not export it leaves the
- * engine to derive the format by analysing the chat template.
+/* How this model spells a turn, as data. Optional: without it the engine derives the format by
+ * analysing the chat template.
  *
- * A reply is read back into reasoning, content and tool calls by one streaming parser driven by
- * this description, and the lazy grammar that constrains a call and the literal words that
- * trigger it are generated from it too -- so a model whose format the template analysis cannot
- * find, or finds wrongly, is supported by stating the format here once. What it describes is the
- * tagged family:
+ * One streaming parser driven by this description splits a reply into reasoning, content and tool
+ * calls, and the lazy grammar that constrains a call and its trigger words are generated from it,
+ * so a model whose format the template analysis misses or gets wrong is supported by stating it
+ * here. It describes the tagged family:
  *
  *   [reasoning_open] reasoning [reasoning_close]  content
  *   [call_open] name_prefix NAME name_suffix
@@ -820,7 +753,7 @@ int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);
  * UTF-8; NULL reads as "". The engine copies what it needs while loading, so static storage in
  * the plugin is enough.
  *
- * The other family is a call written as a name and ONE object holding its arguments
+ * The other family is a call written as a name and one object holding its arguments
  * (args_form = RAD_CHAT_ARGS_OBJECT):
  *
  *   [call_open] name_prefix NAME name_suffix { key: value, ... } [call_end] [call_close]
@@ -832,13 +765,11 @@ int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);
  * arguments are that object respelled as JSON. The arg_* fields describe tagged arguments only
  * and are empty in this family.
  *
- * THE STRUCT GROWS AT ITS END AND NEVER CHANGES IN THE MIDDLE. `struct_size` is
- * sizeof(RadChatFormat) as the plugin was compiled; the engine reads only the fields that size
- * covers and treats the rest as zero, so a plugin built against an older header keeps loading
- * and a field added later is appended with a zero that means "as before". That is why this
- * export does not move RAD_ABI_VERSION: it is additive, and a plugin that lacks it or predates a
- * field is read correctly. A change that is NOT additive -- a field reordered, retyped or
- * removed -- is a layout change and bumps RAD_ABI_VERSION like any other. */
+ * The struct only grows at its end. `struct_size` is sizeof(RadChatFormat) as the plugin was
+ * compiled; the engine reads only the fields that size covers and treats the rest as zero, so a
+ * plugin built against an older header keeps loading, and a new field must make zero mean "as
+ * before". So this export does not move RAD_ABI_VERSION. A field reordered, retyped or removed is
+ * a layout change and bumps RAD_ABI_VERSION like any other. */
 enum {
     RAD_CHAT_VALUE_RAW   = 0,  /* the text between the delimiters, verbatim */
     RAD_CHAT_VALUE_CDATA = 1,  /* verbatim, unless wrapped in <![CDATA[ ... ]]>, which is removed */
@@ -870,9 +801,9 @@ typedef struct RadChatFormat {
     uint32_t    n_reasoning_breaks;
     uint32_t    reasoning_in_prompt; /* RAD_CHAT_THINK_* */
 
-    /* Around ALL of a turn's calls, and between two calls beyond whitespace. The parser does not
-     * read either yet, so a format that needs one is refused at startup by name; they are fields
-     * so that supporting them does not change the struct. */
+    /* Around all of a turn's calls, and between two calls beyond whitespace. The parser does not
+     * read these yet, so a format that sets one is refused at startup by name; they are fields so
+     * supporting them later does not change the struct. */
     const char* section_open;
     const char* section_close;
     const char* call_separator;
@@ -910,14 +841,64 @@ typedef struct RadChatFormat {
     /* RAD_CHAT_ARGS_OBJECT: non-zero when the dialect writes a key bare, `key:value`. */
     uint32_t    object_bare_keys;
 
-    /* Non-zero: a reasoning block may open again LATER in the reply -- after its answer, between
-     * calls -- and is read as reasoning there as well, and a reasoning_close with no block open
-     * is not part of the answer. Zero: only a block the reply starts with is reasoning. */
+    /* Non-zero: a reasoning block may open again later in the reply (after its answer, between
+     * calls) and is read as reasoning there too, and a reasoning_close with no block open is not
+     * part of the answer. Zero: only a block the reply starts with is reasoning. */
     uint32_t    reasoning_anywhere;
 } RadChatFormat;
 
 /* Return the format, or NULL for "derive it from the chat template". Called once at startup. */
 const RadChatFormat* rad_arch_chat_format(const RadModelMeta* meta);
+
+/* How a speech model's prompt carries audio, as data. Optional: a plugin that does not export it
+ * is a model the speech routes do not serve.
+ *
+ * It states the tokens that open and close a clip, the turn a transcription is asked in, how a
+ * language is named and forced, and where the transcript starts in the reply, so the core's
+ * routes know nothing of any one model. Qwen3-ASR, for example:
+ *
+ *   audio_open "<|audio_start|>"  audio_close "<|audio_end|>"
+ *   transcribe_prompt  "<|im_start|>system\n{context}<|im_end|>\n<|im_start|>user\n{audio}"
+ *                      "<|im_end|>\n<|im_start|>assistant\n{language}"
+ *   language_prompt    "language {language}<asr_text>"
+ *   transcript_open "<asr_text>"   language_lead "language "
+ *   languages { "en", "English", "zh", "Chinese", ... }
+ *
+ * Every string is NUL-terminated UTF-8 and NULL reads as "". The engine copies what it needs while
+ * loading, so static storage in the plugin is enough.
+ *
+ * The struct only grows at its end, as RadChatFormat does: `struct_size` is sizeof(RadAudioFormat)
+ * as the plugin was compiled, the engine reads only the fields that size covers, and a field added
+ * later reads as zero for an older plugin. So this export does not move RAD_ABI_VERSION. */
+typedef struct RadAudioFormat {
+    uint32_t    struct_size;
+
+    /* The literal tokens around a clip's placeholder run, as the vocabulary spells them, for a
+     * model whose config names no id for them. NULL: the config's own (boa/eoa_token_id). */
+    const char* audio_open;
+    const char* audio_close;
+
+    /* The transcription prompt (POST /v1/audio/transcriptions), with three slots: {context} is
+     * the request's `prompt` text, {audio} the clip, and {language} `language_prompt` with the
+     * request's language named in it, or "" when the request names none and the model is to say
+     * which it heard. Each slot appears once. NULL: this model does not transcribe. */
+    const char* transcribe_prompt;
+    const char* language_prompt;
+
+    /* A reply whose language was not forced names it first: `language_lead` and the language's
+     * name, then `transcript_open`, then the transcript. "" for a model whose reply is the
+     * transcript alone. */
+    const char* transcript_open;
+    const char* language_lead;
+
+    /* The languages the model names, as n_languages (ISO 639-1 code, the model's own name) pairs:
+     * a request's `language` matches either spelling, and the name is what {language} takes. */
+    const char* const* languages;
+    uint32_t    n_languages;
+} RadAudioFormat;
+
+/* Return the format, or NULL when this model serves no speech route. Called once at startup. */
+const RadAudioFormat* rad_arch_audio_format(const RadModelMeta* meta);
 
 int         rad_arch_declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx);
 /* Forward declaration; the signature is in rad_runtime.h. */

@@ -1,0 +1,46 @@
+# Kernel rows a replay of this fixture reaches (rad-kbench --coverage).
+# A row listed here and not reached fails the replay; regenerate with
+# --coverage-write when a row is added or deliberately retired.
+avx_add
+avx_attn_dense
+avx_attn_paged
+avx_cast
+avx_embed_lookup
+avx_gated_quant_fp8
+avx_gather_rows
+avx_gdn_chunk_scan
+avx_gdn_conv_update
+avx_gdn_gated_rmsnorm
+avx_gdn_kkt_solve
+avx_gdn_recurrent_update
+avx_gemm_nt
+avx_gemm_nt_bias
+avx_gemm_nt_q
+avx_grid_embed
+avx_kv_store
+avx_layernorm
+avx_logits_gemm
+avx_moe_gather
+avx_moe_gemm_q
+avx_moe_scatter
+avx_quant_act_fp8
+avx_quant_act_i8
+avx_rmsnorm
+avx_rmsnorm_quant_fp8
+avx_rope
+avx_rope_table
+avx_router_topk
+avx_row_topk
+avx_sample_argmax
+avx_sample_dry
+avx_sample_logprobs
+avx_sample_mask
+avx_sample_minp
+avx_sample_penalties
+avx_sample_pick
+avx_sample_temp
+avx_sample_topk
+avx_sample_topp
+avx_sample_typical
+avx_sample_xtc
+avx_scatter_rows

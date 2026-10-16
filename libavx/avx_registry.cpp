@@ -1,64 +1,40 @@
-/* avx_registry.cpp -- what libavx contains, in the two forms the core reads it in.
+/* avx_registry.cpp -- the op schemas and kernel rows libavx exports.
  *
- * ============================== THE SCHEMAS ARE libref's, DELIBERATELY IDENTICAL ==============================
+ * Schemas match libref's exactly. The first plugin in hierarchy order to declare an op fixes its
+ * schema; a later plugin declaring it differently is refused at load (rad_abi.h,
+ * core/plugin/loader.cpp: schema_same). That compares parameters position by position (key, type,
+ * requiredness) and operands (role, optionality), not operand names. The table is copied rather
+ * than shared because a plugin links only abi/; rad-avx-check runs the loader's comparison against
+ * libref over every schema before checking any number, so the copy cannot drift silently.
  *
- * The first plugin in hierarchy order to declare an op FIXES its schema, and a later plugin
- * declaring the same op name with a different one is refused AT LOAD with both plugins named
- * (rad_abi.h). The check is core/plugin/loader.cpp:schema_same, and what it holds is: the
- * parameter list position for position -- key, type, requiredness -- and the operand list position
- * for position -- role and optionality. Operand NAMES are explicitly not load-bearing.
+ * No opd_shape. That hook sizes an op's operands for a tool calling it cold; libref implements it
+ * for the whole conventional vocabulary (docs/OPS.md), and libavx computes the same ops at the same
+ * shapes. A second set of answers could disagree with libref's. A tool with libavx but not libref
+ * could not size buffers; both host plugins ship together.
  *
- * So this table is libref's, slot for slot. It is COPIED rather than shared, and that is the ABI
- * boundary working as designed rather than a missed refactor: a plugin links abi/ and nothing
- * else, so there is no header for libref's table to live in that libavx could include without
- * making one plugin depend on another's source. What replaces the shared header is a TEST:
- * rad-avx-check opens both plugins and runs the loader's own comparison over all seventy-five
- * schemas before it checks a single number, and fails loudly on the first disagreement. A copy
- * that is checked on every run is a copy that cannot drift; a copy that is merely intended to
- * match is a copy that eventually does.
- *
- * ============================== WHY THE ROWS CARRY NO opd_shape ==============================
- *
- * `RadKernelInfo::opd_shape` answers "how big is operand i of this op at this geometry" for a tool
- * calling the op cold, and libref implements one for every op in the conventional vocabulary --
- * 88 KB of judgement calls about index ranges, fill domains and what a ragged batch means. libavx
- * computes exactly those ops at exactly those shapes, so libref's answers are libavx's answers,
- * and the ABI says so in as many words: "libref supplies it for the whole conventional vocabulary,
- * so an op that stays inside docs/OPS.md is describable even when the kernel under test is not."
- *
- * Writing a second copy would be writing a second set of judgement calls about the SAME ops, and
- * the two would disagree somewhere -- which is worse than having one, because a tool would then
- * size a buffer from one plugin and check it against the other. The cost is stated plainly: a
- * tool that has libavx and NOT libref cannot size libavx's buffers. That tool does not exist (both
- * are host plugins and ship together) and if it ever does, the fix is to implement the hook, not
- * to have guessed.
- *
- * ============================== AND NO TUNABLES ==============================
- *
- * ABI v8 has kernels declare tunable AXES and the core take the cross product (rad_abi.h). libavx
- * declares none, and the reason is that its axes are not free: the vector width is fixed by the
- * ISA level, which is fixed by the CPU, and the GEMM's blocking is chosen from the cache sizes
- * CPUID reports rather than from a search. There is one thing worth tuning -- the L2 block edge --
- * and it is read from the machine rather than measured per shape, because unlike a GPU tile it
- * does not interact with an occupancy limit. A declared axis whose best value is computable is a
- * declared axis that wastes the tuner's time.
+ * No tunables. The vector width is fixed by the ISA level, and the GEMM's M block is derived from K
+ * against a fixed L2 byte target (avx_gemm.cpp), with no occupancy interaction to search over.
  */
 #include "avx_isa.h"
+#include "avx_planes.h"
 #include "avx_rows.h"
 
 #include "rad_abi.h"
+#include "rad_planes.h"
 #include "rad_plugin.h"
 
+#include <cstring>
+
 /* ================================================================== parameter specs
- * The macro names are libref's too. Two files that must agree line for line should look the same
- * when they are diffed, and `diff libref/ref_registry.cpp libavx/avx_registry.cpp` over the schema
- * section is a real review step. */
+ * Same macro names as libref, so the schema sections of libref/ref_registry.cpp and this file can
+ * be diffed directly. */
 #define P_INT(k)   { k, RAD_P_INT, RAD_REQUIRED }
 #define P_INTO(k)  { k, RAD_P_INT, RAD_OPTIONAL }
 #define P_STR(k)   { k, RAD_P_STR, RAD_REQUIRED }
 #define P_STRO(k)  { k, RAD_P_STR, RAD_OPTIONAL }
 #define P_INTD(k)  { k, RAD_P_INT, RAD_DERIVED }
 #define P_CHUNK(k) { k, RAD_P_INT, RAD_DERIVED, RAD_PROLE_SEQ_CHUNK }
+#define P_CAP(k)   { k, RAD_P_INT, RAD_REQUIRED, RAD_PROLE_CAPACITY }
 #define P_F64(k)   { k, RAD_P_F64, RAD_REQUIRED }
 #define P_F64O(k)  { k, RAD_P_F64, RAD_OPTIONAL }
 
@@ -75,12 +51,12 @@
 #define ARR(a)  (a), (int)(sizeof(a) / sizeof((a)[0]))
 
 /* ---- elementwise and norms ---------------------------------------------------------------- */
-/* rmsnorm_add has no `mult`: it is the fused pair, and nothing fuses a scaled branch. */
+/* rmsnorm_add has no `mult`: no fused residual-norm site uses a scaled branch. */
 static const RadParamSpec pRmsnormAdd[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype"),
                                           P_F64O("wadd") };
 static const RadParamSpec pRmsnorm[]   = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype"),
                                            P_F64O("wadd"), P_F64O("mult") };
-/* `w` optional: absent, the gain is one. */
+/* `w` is optional; absent means a gain of 1. */
 static const RadOperandSpec oRmsnorm[] = { OPD("x"), WGT_O("w"), OUT("y") };
 
 static const RadParamSpec pHcRead[]    = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("lowrank"),
@@ -136,7 +112,7 @@ static const RadOperandSpec oGridEmbed[] = { INOUT("x"), WGT("table"), OPD("coor
 
 static const RadParamSpec pMnD[]      = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 static const RadParamSpec pMulWeight[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_INTO("scalar") };
-/* `cap` required, for the reason libref's pMnCap states: a softcap without a cap is a different op. */
+/* `cap` is required (as in libref's pMnCap). */
 static const RadParamSpec pMnCap[]    = { P_INT("M"), P_INT("n"), P_F64("cap"), P_STR("dtype") };
 static const RadOperandSpec oBinary[] = { OPD("a"), OPD("b"), OUT("y") };
 static const RadOperandSpec oMulWeight[] = { OPD("x"), WGT("w"), OUT("y") };
@@ -147,26 +123,36 @@ static const RadParamSpec pPoolRows[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_
                                           P_STR("dtype") };
 static const RadOperandSpec oGateUp[] = { OPD("gate_up"), OUT("y") };
 static const RadOperandSpec oUnary[]  = { OPD("x"), OUT("y") };
-/* The audio (USM conformer) tower's operators; libref's lists, field for field. */
+/* The audio (USM conformer) tower's operators, as in libref. */
 static const RadOperandSpec oClamp[]  = { OPD("x"), WGT("lo"), WGT("hi"), OUT("y") };
 static const RadParamSpec pConv2d[]   = { P_INT("M"), P_INT("width"), P_INT("cin"), P_INT("cout"),
                                           P_INT("kh"), P_INT("kw"), P_INT("stride"), P_INT("pad"),
                                           P_INTO("cu_div"), P_INTO("valid_stride"),
-                                          P_STR("dtype") };
+                                          P_STR("dtype"), P_INTO("t_last"), P_STRO("act") };
 static const RadOperandSpec oConv2d[] = { OPD("x"), WGT("w"), OPD("cu_seqlens"), OPD_O("valid"),
-                                          OUT("y") };
+                                          OUT("y"), WGT_O("b") };
+static const RadParamSpec pConv2dUnfold[] = { P_INT("M"), P_INT("width"), P_INT("cin"),
+                                              P_INT("kh"), P_INT("kw"), P_INT("stride"),
+                                              P_INT("pad"), P_INTO("cu_div"),
+                                              P_INTO("valid_stride"), P_INTO("t_last"),
+                                              P_STR("dtype") };
+static const RadOperandSpec oConv2dUnfold[] = { OPD("x"), OPD("cu_seqlens"), OPD_O("valid"),
+                                                OUT("y") };
 static const RadParamSpec pConv1dDw[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_INTO("cu_div"),
                                           P_STR("dtype") };
 static const RadOperandSpec oConv1dDw[] = { OPD("x"), WGT("w"), OPD("cu_seqlens"), OUT("y") };
 static const RadParamSpec pRelSin[]   = { P_INT("M"), P_INT("n"), P_F64O("max_timescale"),
                                           P_STR("dtype") };
 static const RadOperandSpec oRelSin[] = { OUT("y") };
+static const RadParamSpec pSegSin[]   = { P_INT("M"), P_INT("n"), P_INT("period"),
+                                          P_F64O("max_timescale"), P_INTO("cu_div"), P_STR("dtype") };
+static const RadOperandSpec oSegSin[] = { OPD("cu_seqlens"), OUT("y") };
 static const RadParamSpec pAttnLocalRel[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
                                               P_INT("left"), P_INT("right"), P_F64("softcap"),
                                               P_INTO("cu_div"), P_STR("dtype") };
 static const RadOperandSpec oAttnLocalRel[] = { OPD("q"), OPD("k"), OPD("v"), OPD("relk"),
                                                 WGT("pds"), OPD("cu_seqlens"), OUT("out") };
-/* `fill` has no input: `value` is the whole of what it writes. */
+/* `fill` has no input; it writes `value`. */
 static const RadParamSpec pFill[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("value") };
 static const RadOperandSpec oFill[] = { OUT("y") };
 static const RadOperandSpec oScale[]  = { OPD("x"), WGT("s"), OUT("y") };
@@ -181,8 +167,8 @@ static const RadParamSpec pQuant[]      = { P_INT("M"), P_INT("n"), P_INT("group
 static const RadOperandSpec oQuant[]    = { OPD("x"), OUT("q"), OUT("scale"), OUT_O("asum") };
 static const RadOperandSpec oHadQuant[] = { OPD("x"), OUT("q"), OUT("scale") };
 static const RadOperandSpec oQuantFp8[] = { OPD("x"), OUT("q"), OUT("scale") };
-/* ParoQuant's rotation, libref's declaration: the tables are the "givens" encoding's
- * (abi/rad_encoding.h) and WEIGHT operands, resolved and placed with the weight they belong to. */
+/* ParoQuant's rotation, as libref declares it: the tables come from the "givens" encoding
+ * (abi/rad_encoding.h) and are weight operands, placed with the weight they belong to. */
 static const RadParamSpec pGivensRotate[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
                                              P_INT("stages"), P_INT("parts") };
 static const RadParamSpec pGivensDense[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
@@ -192,8 +178,8 @@ static const RadOperandSpec oGivensDense[] = { OPD("x"), WGT("tdense"), WGT("rsc
 static const RadOperandSpec oGivensRotate[] = { OPD("x"), WGT("pairs"), WGT("angle"), WGT("rscale"),
                                                 OUT("y") };
 
-/* The fp8 fusions: the unfused pair's operands minus the tensor between them, and `out_bf16` to
- * put even that back. */
+/* The fp8 fusions: the unfused pair's operands minus the intermediate tensor, which `out_bf16`
+ * can optionally still produce. */
 static const RadParamSpec pRmsQuantFp8[]     = { P_INT("M"), P_INT("n"), P_F64("eps"),
                                                  P_INT("group"), P_STR("dtype"), P_F64O("wadd") };
 static const RadOperandSpec oRmsQuantFp8[]   = { OPD("x"), INOUT_O("residual"), WGT("w"),
@@ -212,7 +198,7 @@ static const RadParamSpec pGatedQuant[]   = { P_INT("M"), P_INT("n"), P_INT("gro
                                               P_STR("dtype"), P_STRO("act"), P_INTO("mode") };
 static const RadOperandSpec oGatedQuant[] = { OPD("a"), OPD_O("b"), OUT("q"), OUT("scale") };
 
-/* `a_scale` is optional: dtype "bf16" is a plain activation and carries none. */
+/* `a_scale` is optional: a "bf16" activation has none. */
 static const RadOperandSpec oGram[] = { OPD("a"), OPD_O("a_scale"), INOUT("h") };
 
 static const RadParamSpec pDequant[]   = { P_INT("M"), P_INT("n"), P_INT("group"),
@@ -235,7 +221,7 @@ static const RadOperandSpec oGemmQ[]      = { OPD("a"), OPD_O("a_scale"), WGT("b
                                               OUT("y"), OPD_O("a_sum"), WGT_O("b_ref") };
 static const RadOperandSpec oGemmQBias[]  = { OPD("a"), OPD("a_scale"), WGT("b"), WGT("b_scale"),
                                               WGT("bias"), OUT("y") };
-/* `act` REQUIRED, where the quantiser has it optional; `N` is the weight's rows, twice the output's
+/* `act` is required here (optional in the quantiser); `N` is the weight's rows, twice the output
  * width. */
 static const RadParamSpec pGemmQGated[]    = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
                                                P_STR("dtype"), P_STR("act") };
@@ -256,7 +242,8 @@ static const RadConstraint cPagedBlock[] = { RAD_CGE("block_size", 1) };
 
 static const RadParamSpec pAttnDense[]   = { P_INT("M"), P_INT("head_dim"), P_INT("gqa"),
                                              P_INT("causal"), P_STR("dtype"), P_F64O("scale"),
-                                             P_INTO("max_seqlen"), P_INTO("window") };
+                                             P_INTO("max_seqlen"), P_INTO("window"),
+                                             P_INTO("cu_div"), P_INTO("block") };
 static const RadOperandSpec oAttnDense[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"),
                                              OUT("out") };
 
@@ -281,8 +268,8 @@ static const RadParamSpec pRopeTable[]   = { P_INT("M"), P_INT("rot"), P_F64("th
                                              P_INTO("head_dim"), P_STRO("ladder") };
 static const RadOperandSpec oRopeTable[] = { OPD("positions"), OUT("cos_sin") };
 
-/* QSA's compressed key, libr4d's schema exactly (libr4d/r4d_rows.cpp): `block_size` is `ratio`
- * spelled for the KV group the block-key store is, `page` and `pos` are optional. */
+/* QSA's compressed key, libr4d's schema (libr4d/r4d_rows.cpp): `block_size` is `ratio` under the
+ * name the block-key store's KV group uses; `page` and `pos` are optional. */
 static const RadParamSpec pQsaBlockKey[] = { P_INT("M"), P_INT("n"), P_INT("ratio"),
                                              P_INT("rotary_dim"), P_INTO("pos0"),
                                              P_INTO("block_size"), P_F64("eps"), P_F64("theta"),
@@ -292,6 +279,27 @@ static const RadParamSpec pQsaBlockKey[] = { P_INT("M"), P_INT("n"), P_INT("rati
                                              P_F64O("yarn_high"), P_F64O("yarn_magnitude") };
 static const RadOperandSpec oQsaBlockKey[] = { OPD("k"), WGT("w"), OPD_O("page"), OPD_O("pos"),
                                                OUT("out") };
+
+/* The rest of the QSA indexer, as libref declares it. `M` counts query rows (score, select) or
+ * tokens (tail store, work list); `seqs` is the declared height of `cu`'s sequences, whose count is
+ * cu's length less one. `work` bounds the blocks that can complete. */
+static const RadParamSpec pQsaScore[] = { P_INT("M"), P_INT("n"), P_INT("heads"), P_INT("blocks"),
+                                          P_INT("seqs"), P_STR("dtype") };
+static const RadOperandSpec oQsaScore[] = { OPD("q"), OPD("bk"), OPD("bt"), OPD("cu"), OPD("nc"),
+                                            OUT("score") };
+static const RadParamSpec pQsaSelect[] = { P_INT("M"), P_INT("blocks"), P_INT("topk"),
+                                           P_INT("ratio"), P_INT("seqs") };
+static const RadOperandSpec oQsaSelect[] = { OPD("score"), OPD("bt"), OPD("nc"), OPD("pos"),
+                                             OPD("cu"), OUT("sel"), OUT("nsel"), OUT("seqused") };
+static const RadParamSpec pQsaTailStore[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("ring"),
+                                              P_INT("seqs"), P_STR("dtype") };
+static const RadOperandSpec oQsaTailStore[] = { OPD("k"), OPD("pos"), OPD("cu"), INOUT("state"),
+                                                OPD("sidx") };
+static const RadParamSpec pQsaWork[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("ring"),
+                                         P_INT("seqs"), P_CAP("work"), P_STR("dtype") };
+static const RadOperandSpec oQsaWork[] = { OPD("k"), OPD("pos"), OPD("cu"), OPD("state"),
+                                           OPD("sidx"), OPD("bt"), OPD_O("rope"), OUT("stage"),
+                                           OUT("page"), OUT("bpos"), OUT("nc") };
 
 static const RadParamSpec pQkNormRope[]   = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
                                               P_INT("n_head_kv"), P_F64("theta"), P_F64("eps"),
@@ -305,10 +313,7 @@ static const RadOperandSpec oQkNormRope[] = { INOUT("qkv"), OPD("positions"), WG
 /* ---- mixture of experts ------------------------------------------------------------------- */
 static const RadParamSpec pScaleRows[]   = { P_INT("M"), P_INT("n"), P_STR("act"),
                                              P_STR("dtype") };
-/* `add` is OPTIONAL and sits BEFORE `y`, which is the kind of detail a hand-kept copy gets wrong:
- * operands are positional, so reading `y` at index 2 writes the output into the residual the
- * caller passed. rad-avx-check compares this table against libref's on every run, which is what
- * catches exactly this drift. */
+/* `add` is optional and comes before `y`; operands are positional, so `y` is index 3. */
 static const RadOperandSpec oScaleRows[] = { OPD("x"), OPD("s"), OPD_O("add"), OUT("y") };
 
 static const RadParamSpec pRouter[]   = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
@@ -326,9 +331,9 @@ static const RadParamSpec pMoeGemm[]   = { P_INT("M"), P_INT("N"), P_INT("K"), P
 static const RadOperandSpec oMoeGemm[] = { OPD("a"), WTAB("w"), OPD("sorted_tok"),
                                            OPD("expert_offset"), OUT("y") };
 
-/* The experts are two tables by parity -- `w` the even ones at [N, K], `w_odd` the odd ones at
- * [N_odd, K_odd] -- with `parts` stacked parts along the rows and the output; libr4d's schema
- * says why. */
+/* Experts in two tables by parity: `w` the even ones at [N, K], `w_odd` the odd ones at
+ * [N_odd, K_odd], with `parts` parts stacked along the rows and the output (see libr4d's
+ * schema). */
 static const RadParamSpec pMoeGemmQ[]   = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"),
                                             P_INT("top_k"), P_INT("group"), P_STR("a_order"),
                                             P_STR("dtype"), P_INTO("N_odd"), P_INTO("K_odd"),
@@ -336,8 +341,8 @@ static const RadParamSpec pMoeGemmQ[]   = { P_INT("M"), P_INT("N"), P_INT("K"), 
 static const RadOperandSpec oMoeGemmQ[] = { OPD("a"), OPD_O("a_scale"), WTAB("w"), WTAB("w_scale"),
                                             OPD("sorted_tok"), OPD("expert_offset"),
                                             WTAB("w_odd"), WTAB("w_odd_scale"), OUT("y") };
-/* The same over four classes by the expert's number mod 4, `w_q` class q at [N_q, K_q]. Mirrors
- * libref's and libr4d's schema exactly. */
+/* The same over four classes by expert number mod 4, `w_q` class q at [N_q, K_q], as in libref
+ * and libr4d. */
 static const RadParamSpec pMoeGemmQMod4[]   = { P_INT("M"), P_INT("N"), P_INT("K"),
                                                 P_INT("n_expert"), P_INT("top_k"), P_INT("group"),
                                                 P_STR("a_order"), P_STR("dtype"), P_INTO("N_1"),
@@ -349,10 +354,9 @@ static const RadOperandSpec oMoeGemmQMod4[] = { OPD("a"), OPD_O("a_scale"), WTAB
                                                 WTAB("w_1_scale"), WTAB("w_2"), WTAB("w_2_scale"),
                                                 WTAB("w_3"), WTAB("w_3_scale"), OUT("y") };
 
-/* `shared` + `shared_gate` present = the shared arm folded in: y = narrow(shared *
- * act(gate)) + narrow(gathered), the unfused pair's two narrows carried in the stores. `act` is
- * scale_rows' spelling, sigmoid or none, and applies to the SCALAR. Mirrors libref's schema
- * exactly -- the loader refuses the whole plugin on any disagreement. */
+/* With `shared` and `shared_gate`, the shared expert is folded in: y = narrow(shared * act(gate))
+ * + narrow(gathered), the unfused pair's roundings. `act` is sigmoid or none, as in scale_rows,
+ * applied to the per-token gate scalar. */
 static const RadParamSpec pMoeGather[]   = { P_INT("M"), P_INT("n"), P_INT("top_k"),
                                              P_STR("dtype"), P_STRO("act") };
 static const RadOperandSpec oMoeGather[] = { OPD("y_expert"), OPD("expert_w"), OPD("sorted_tok"),
@@ -368,9 +372,9 @@ static const RadOperandSpec oRowTopkMerge[] = { OPD("gathered"), OUT("idx"), OUT
 static const RadParamSpec pPairArgmax[]     = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 static const RadOperandSpec oPairArgmax[]   = { OPD("pairs"), OUT("idx"), OUT_O("val") };
 
-/* Mirrors libref's row exactly: R candidates rescored against the full-precision head, ties to the
- * lower id, pads sort last. libref's shape hook declines to describe this op, so the checker skips
- * its geometries -- but the row must exist or the whole-plugin coverage gate fails. */
+/* As libref: R candidates rescored against the full-precision head, ties to the lower id, pads
+ * last. libref's shape hook does not describe this op, so the checker skips its geometries, but
+ * the row is needed for the coverage gate. */
 static const RadParamSpec pLogitRerank[] = { P_INT("M"), P_INT("R"), P_INT("n_vocab"),
                                              P_INT("n_embd"), P_INTO("vocab_off"),
                                              P_STR("dtype") };
@@ -416,8 +420,7 @@ static const RadOperandSpec oRecurrent[] = {
 };
 
 /* gdn_conv_update folded into gdn_recurrent_update: the convolution's operands, then the
- * recurrence's minus q, k and v; the parameters are the union of the two ops' under their own
- * names. */
+ * recurrence's minus q, k and v; parameters are the union of both ops'. */
 static const RadParamSpec pConvRecurrent[] = { P_INT("q_len"), P_INT("head_k"), P_INT("head_v"),
                                                P_INT("conv_width"), P_INTO("n_head_v"),
                                                P_F64O("scale"), P_F64O("eps"), P_F64O("l2_eps"),
@@ -444,6 +447,46 @@ static const RadParamSpec pAllGather[]   = { P_INT("world_size"), P_INT("numel")
                                              P_INTO("row") };
 static const RadOperandSpec oAllGather[] = { OPD("x"), OUT("y") };
 
+/* ---- image generation --------------------------------------------------------------------- */
+static const RadParamSpec pLnMod[]   = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype") };
+static const RadOperandSpec oLnMod[] = { OPD("x"), OPD("s"), OPD("cu_seqlens"), OUT("y") };
+static const RadOperandSpec oGateAdd[] = { OPD("y"), OPD("g"), OPD("cu_seqlens"), INOUT("x") };
+static const RadParamSpec pLnModQ[]  = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
+                                         P_INT("gated"), P_STR("dtype") };
+static const RadOperandSpec oLnModQ[] = { OPD_O("y"), OPD_O("g"), OPD("s"), OPD("cu_seqlens"),
+                                          INOUT("x"), OUT("q"), OUT("scale"), OUT_O("z") };
+static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale"), P_F64("max_period"),
+                                          P_INTO("round"), P_STR("dtype") };
+static const RadOperandSpec oTimestep[] = { OPD("t"), OUT("y") };
+static const RadOperandSpec oGather2[]  = { OPD("a"), OPD("b"), OPD("idx"), OUT("y") };
+static const RadParamSpec pLane[] = { P_INT("M"), P_INT("n"), P_INT("stride"), P_STR("dtype") };
+static const RadOperandSpec oLaneGather[] = { OPD("src"), OPD("lane"), OPD("cu_seqlens"), OUT("y") };
+static const RadOperandSpec oLaneStore[]  = { OPD("src"), OPD("lane"), INOUT("dst") };
+static const RadOperandSpec oRandnLanes[] = { OPD("flags"), OPD("seed"), OPD("lane"),
+                                              OPD("cu_seqlens"), INOUT("dst") };
+static const RadOperandSpec oFlowEuler[]  = { OPD("v"), OPD("sigma"), OPD("sigma_next"), OPD("cfg"),
+                                              OPD("pair"), OPD("lane"), OPD("flags"), OPD("seed"),
+                                              OPD("cu_seqlens"), OPD_O("inp_lat"), OPD_O("inp_mask"),
+                                              INOUT("state"), INOUT_O("preview") };
+static const RadParamSpec pChanAffine[] = { P_INT("M"), P_INT("n"), P_STR("mul"), P_STR("add"),
+                                            P_STR("mode"), P_STR("dtype") };
+static const RadParamSpec pConvNhwc[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
+                                          P_INT("stride"), P_STR("pad"), P_INT("up"), P_STR("dtype") };
+static const RadOperandSpec oConvNhwc[] = { OPD("x"), WGT("w"), WGT("b"), OUT("y") };
+static const RadParamSpec pL2Norm[] = { P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype") };
+static const RadOperandSpec oL2Norm[] = { OPD("x"), WGT("gamma"), OUT("y") };
+static const RadParamSpec pSpaceDepth[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("ft"),
+                                            P_STR("dtype") };
+static const RadOperandSpec oSpaceDepth[] = { OPD("x"), INOUT("y") };
+static const RadParamSpec pAttnPS[] = { P_INT("q_len"), P_INT("head_dim"), P_INT("gqa"),
+                                        P_INTD("block_size"), P_INT("causal"), P_STR("q_dtype"),
+                                        P_STR("kv_dtype"), P_F64O("scale"), P_INTO("max_ctx"),
+                                        P_INTO("n_head"), P_INTO("max_seqs"), P_STRO("qk") };
+static const RadOperandSpec oAttnPS[] = { OPD("q"), OPD("k"), OPD("v"), OPD("kv_cache"),
+                                          OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"),
+                                          OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("k_i8"),
+                                          OPD_O("k_scale"), OUT("out") };
+
 /* ---- vocabulary edges --------------------------------------------------------------------- */
 static const RadParamSpec pEmbed[]    = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
                                           P_STR("dtype"), P_INTO("vocab_offset"),
@@ -462,8 +505,8 @@ static const RadOperandSpec oLogits[] = { OPD("x"), WGT("lm_head"), OUT("logits"
 /* ---- sampling ----------------------------------------------------------------------------- */
 static const RadParamSpec pMVocab[] = { P_INT("M"), P_INT("n_vocab") };
 static const RadParamSpec pMCand[]  = { P_INT("M"), P_INT("n_cand") };
-/* libref's schema: the history stages take the rank's first vocabulary row, and DRY an optional
- * plane of breaker marks beside the history. */
+/* As libref: the history stages take the rank's first vocabulary row (`vocab_off`), and DRY an
+ * optional plane of breaker marks beside the history. */
 static const RadParamSpec pPenal[]  = { P_INT("M"), P_INT("n_vocab"), P_INTO("vocab_off") };
 
 static const RadOperandSpec oPenalties[] = { INOUT("logits"), OPD("params"), OPD("history") };
@@ -491,23 +534,25 @@ static const RadParamSpec pDflashSelect[]    = { P_INT("M"), P_INT("steps"), P_I
 static const RadOperandSpec oDflashSelect[]  = { OPD("cand"), OPD("unary"), OPD_O("hp"),
                                                  OPD("anchor"), WGT("pred"), WGT("succ"),
                                                  OUT("tokens") };
+/* DFlash2's grouped convolution, as libref declares it. */
+static const RadParamSpec pDflashConv[] = { P_INT("T"), P_INT("hidden_size"), P_INT("taps"),
+                                            P_INT("group_size"), P_INT("NG"), P_INT("block_size"),
+                                            P_STR("dtype") };
+static const RadOperandSpec oDflashConv[] = { OPD("x"), OPD("delta"), WGT("base"), OUT("out") };
 
 /* ================================================================== the schema table
- * The doc strings are libavx's own and say what this plugin does with the op -- which of the two
- * plugins' strings a reader sees depends on which one fixed the schema first, and schema_same does
- * not compare them. Where the op is subtle the string points at libref's, which is the definition.
+ * Doc strings are libavx's own (schema_same does not compare them); which plugin's string a reader
+ * sees depends on which fixed the schema first. libref's are the definition.
  */
 static const RadOpSchema kSchemas[] = {
 { "rmsnorm", ARR(pRmsnorm), ARR(oRmsnorm),
-  "y = x * rsqrt(mean(x^2) + eps) * (w + wadd). The sum of squares is a four-accumulator vector "
-  "reduction, so it does not sum in libref's order and does not claim to." },
+  "y = x * rsqrt(mean(x^2) + eps) * (w + wadd); the sum of squares is a four-accumulator vector "
+  "reduction, in a different order from libref's." },
 { "rmsnorm_p", ARR(pLayernorm), ARR(oUnary),
-  "y = x * rsqrt(mean(x^2) + eps), the rmsnorm with no gain at all. Same four-accumulator sum of "
-  "squares as rmsnorm; the only difference is there is no weight to widen, so the op has no `w`." },
+  "y = x * rsqrt(mean(x^2) + eps): rmsnorm with no gain, summed as rmsnorm sums." },
 { "rmsnorm_add", ARR(pRmsnormAdd), ARR(oRmsnormAdd),
-  "residual_out = x + residual, then y = rmsnorm(residual_out) * w. The variance is taken from the "
-  "unrounded f32 sum and the multiply reads residual_out back AFTER narrowing -- both are libref's "
-  "rule and both are observable, so both are reproduced exactly." },
+  "residual_out = x + residual, then y = rmsnorm(residual_out) * w: the variance from the unrounded "
+  "f32 sum, the multiply from residual_out after narrowing, as libref." },
 { "hc_enter", ARR(pHcWrite), ARR(oHcEnter),
   "h[s] = x for each of the hc streams -- the wide residual stream's first value." },
 { "hc_read", ARR(pHcRead), ARR(oHcRead),
@@ -525,9 +570,9 @@ static const RadOpSchema kSchemas[] = {
   "x += a side x side position table resampled bilinearly to the row's grid." },
 { "grid_embed_aa", ARR(pGridEmbed), ARR(oGridEmbed),
   "x += the table resampled as torch's antialiased half-pixel bilinear, SigLIP2's." },
-{ "add", ARR(pMnD), ARR(oBinary), "elementwise sum." },
-{ "mul", ARR(pMnD), ARR(oBinary),
-  "elementwise product; `b` may have extent 1 on any axis `a` does not and is broadcast along it." },
+{ "add", ARR(pMnD), ARR(oBinary),
+  "y = a + b; a `b` of exactly n elements against a taller output broadcasts along rows." },
+{ "mul", ARR(pMnD), ARR(oBinary), "y = a * b, with the same broadcast rule as `add`." },
 { "mul_weight", ARR(pMulWeight), ARR(oMulWeight),
   "y = x * w, `w` a weight of one element or one row, broadcast; f32 product rounded once." },
 { "act_mul", ARR(pActMul), ARR(oBinary),
@@ -541,6 +586,10 @@ static const RadOpSchema kSchemas[] = {
 { "conv1d_dw", ARR(pConv1dDw), ARR(oConv1dDw),
   "segment-wise causal depthwise convolution over time." },
 { "rel_sinusoid", ARR(pRelSin), ARR(oRelSin), "the sinusoidal relative-position table." },
+{ "conv2d_unfold", ARR(pConv2dUnfold), ARR(oConv2dUnfold),
+  "a convolution's receptive fields as rows, columns in the weight's order." },
+{ "seg_sinusoid", ARR(pSegSin), ARR(oSegSin),
+  "sinusoidal absolute positions restarting every `period` rows of a segment." },
 { "attn_local_rel", ARR(pAttnLocalRel), ARR(oAttnLocalRel),
   "local attention with a relative-position term and a softcap (Gemma 4's audio)." },
 { "pool_rows", ARR(pPoolRows), ARR(oUnary),
@@ -568,12 +617,13 @@ static const RadOpSchema kSchemas[] = {
   "x[idx[i],:] = v[i,:], the mirror of gather_rows: `x` is INOUT and the write is partial, a "
   "negative index writes nothing, and indices are distinct." },
 { "cast", ARR(pCast), ARR(oUnary),
-  "dtype conversion. The narrowing direction is the ABI's RTNE, bit for bit -- a vectorised cast "
-  "that rounded differently could not be checked against anything." },
+  "dtype conversion; narrowing is the ABI's round-to-nearest-even, bit for bit." },
 { "softmax", ARR(pMnD), ARR(oUnary), "row-wise softmax, max-subtracted." },
 { "quant_act_i8", ARR(pQuant), ARR(oQuant),
-  "symmetric int8 activation quantiser, one f32 scale per `group` contiguous elements. `asum` is "
-  "not produced -- libavx has no asymmetric grid to feed, exactly as libref has none." },
+  "symmetric int8, one f32 scale a row, codes in the int8 WMMA's step order; `asum` gets the "
+  "per-`group` code sums (libref's description)." },
+{ "quant_act_i8g", ARR(pQuant), ARR(oQuantFp8),
+  "symmetric int8, one f32 scale per `group` contiguous elements, row-major." },
 { "quant_act_fp8", ARR(pQuant), ARR(oQuantFp8), "symmetric block-scaled E4M3 quantiser." },
 { "had_quant_act_fp8", ARR(pQuant), ARR(oQuantFp8),
   "width-`group` Hadamard, then the same symmetric block-scaled E4M3 quantiser. No normalisation: "
@@ -603,9 +653,8 @@ static const RadOpSchema kSchemas[] = {
   "act(gate) * up over a packed [M, 2n] plane, gate half first, then the E4M3 quantiser over the "
   "bf16-narrowed product. `act` is silu or sigmoid, silu by default." },
 { "gemm_nt", ARR(pGemm), ARR(oGemm),
-  "C = A B^T, f32 accumulate, cache-blocked with a register-blocked microkernel. Sums in a "
-  "different order from libref's straight loop by construction; the kbench tolerance for a bf16 "
-  "gemm_nt (8e-3) is what that costs." },
+  "C = A B^T, f32 accumulate, cache-blocked with a register-blocked microkernel; it sums in a "
+  "different order from libref's straight loop." },
 { "gemm_nt_bias", ARR(pGemmBias), ARR(oGemmBias),
   "C = act(A B^T + bias) + res, each step rounded to C's dtype." },
 { "gemm_nt_q", ARR(pGemmQ), ARR(oGemmQ),
@@ -625,6 +674,21 @@ static const RadOpSchema kSchemas[] = {
   "QSA's compressed key: the mean of a block's `ratio` rows rounded to k's dtype, RMS-normed with "
   "gain (wadd + w), rotated at the block's position with `rope`'s ladder and YaRN; libref's "
   "arithmetic with the angles from one table a block." },
+{ "qsa_score", ARR(pQsaScore), ARR(oQsaScore),
+  "score[m][b] = (sum over heads of relu(q[m][h] . bk[bt[seq(m)][b]])) / sqrt(n) for the sequence's "
+  "first min(nc, width) blocks, a negative page id scoring -inf; the dots in vector order, the "
+  "heads summed in order. Columns past the bound are not written." },
+{ "qsa_select", ARR(pQsaSelect), ARR(oQsaSelect),
+  "the topk highest-scoring complete blocks as page ids, libref's order exactly: the blocks above "
+  "the threshold in block order, then its ties in block order, then the partial page, then -1 to "
+  "topk + 1; a radix select, linear in the blocks." },
+{ "qsa_tail_store", ARR(pQsaTailStore), ARR(oQsaTailStore),
+  "state[sidx[s][0]][pos[t] % ring] = k[t] for the last `ring` tokens of each sequence; the other "
+  "rows of the tail keep what they held." },
+{ "qsa_work", ARR(pQsaWork), ARR(oQsaWork),
+  "the blocks completing in this batch: each block's `ratio` raw keys staged contiguously, its "
+  "block-key page and first-token position; slots past the count get page -1. nc is each "
+  "sequence's complete-block count." },
 { "rope", ARR(pRope), ARR(oRope), "rotary embedding in place." },
 { "qk_norm_rope", ARR(pQkNormRope), ARR(oQkNormRope), "per-head QK norm then rotary embedding." },
 { "scale_rows", ARR(pScaleRows), ARR(oScaleRows),
@@ -652,9 +716,10 @@ static const RadOpSchema kSchemas[] = {
 { "gdn_kkt_solve", ARR(pKkt), ARR(oKkt), "gdn chunk preamble: the triangular inverse." },
 { "gdn_chunk_scan", ARR(pChunkScan), ARR(oChunkScan), "gdn chunked scan." },
 { "gdn_recurrent_update", ARR(pRecurrent), ARR(oRecurrent),
-  "gdn decode recurrence against the paged state cache, in the PER-CANDIDATE reading libref "
-  "implements. `state_form` names the reading; any other form, libr4d's two-slot \"anchor\" "
-  "among them, is declined by name as libref declines it." },
+  "gdn decode recurrence against the paged state cache. `state_form` names the reading: "
+  "\"per_candidate\" (one state per candidate token) or libr4d's two-slot \"anchor\" (one "
+  "committed state and its tokens' replay factors), both as libref reads them; any other form is "
+  "declined by name." },
 { "gdn_conv_recurrent_update", ARR(pConvRecurrent), ARR(oConvRecurrent),
   "gdn_conv_update followed by gdn_recurrent_update, with q, k and v never written: the operands "
   "are the convolution's (`conv_idx` is its state_idx) and then the recurrence's without those "
@@ -663,6 +728,49 @@ static const RadOpSchema kSchemas[] = {
 { "all_reduce", ARR(pAllReduce), ARR(oAllReduce),
   "sum across ranks, f32, ascending rank order." },
 { "all_gather", ARR(pAllGather), ARR(oAllGather), "gather every rank's shard." },
+{ "ln_mod_quant_fp8", ARR(pLnModQ), ARR(oLnModQ),
+  "gate_add (with `gated` 1), ln_mod and quant_act_fp8 in one pass, each value rounded as its own "
+  "store would round it; z written when bound." },
+{ "ln_mod", ARR(pLnMod), ARR(oLnMod),
+  "y = bf16(bf16(LN(x)) * bf16(1 + s[seq])): a gainless layer norm and the row's entry's "
+  "modulation row of `s` ([n_seq, >= n] at its own pitch)." },
+{ "gate_add", ARR(pMnD), ARR(oGateAdd),
+  "x = bf16(x + bf16(bf16(tanh(g[seq])) * y)), bit for bit libref's." },
+{ "timestep_embed", ARR(pTimestep), ARR(oTimestep),
+  "the sinusoidal timestep embedding [cos | sin], libref's libm calls; `round` 1 takes t through "
+  "bf16 at scale and back first." },
+{ "gather_rows2", ARR(pMnD), ARR(oGather2),
+  "y[i] = idx[i] >= 0 ? a[idx[i]] : b[-1 - idx[i]], zeros past either source." },
+{ "lane_gather", ARR(pLane), ARR(oLaneGather),
+  "y[cu[e] + k] = src[lane[e] * stride + k]; every entry checked before a row is written." },
+{ "lane_store", ARR(pLane), ARR(oLaneStore),
+  "dst[l * stride + k] = src[k] for every lane l listed." },
+{ "randn_lanes", ARR(pLane), ARR(oRandnLanes),
+  "an image's first step: its lane's rows become its seed's normal stream (abi/rad_philox.h), "
+  "bit for bit libref's." },
+{ "flow_euler", ARR(pLane), ARR(oFlowEuler),
+  "one flow-matching Euler step per entry that moves a lane, with guidance, the preview and the "
+  "repaint's kept region; libref's roundings bit for bit." },
+{ "chan_affine", ARR(pChanAffine), ARR(oUnary),
+  "a per-channel affine from two lists of n bf16 values, `fma` or `inv`." },
+{ "conv2d_nhwc", ARR(pConvNhwc), ARR(oConvNhwc),
+  "an image convolution, channels innermost, as GEMMs over bands of patch rows; `up` 2 reads the "
+  "input upsampled nearest-neighbour, `pad` same or down." },
+{ "l2norm_chan", ARR(pL2Norm), ARR(oL2Norm),
+  "each pixel's channels to unit L2, times sqrt(n), times gamma (three roundings), then `act`." },
+{ "d2s_add", ARR(pSpaceDepth), ARR(oSpaceDepth),
+  "y [2H, 2W * cout] += x [H, W * cin] repeated and dealt into 2x2 blocks (DupUp3D, one frame)." },
+{ "s2d_avg_add", ARR(pSpaceDepth), ARR(oSpaceDepth),
+  "y [H, W * cout] += the 2x2 blocks of x dealt into channels and averaged in groups (AvgDown3D, "
+  "one frame)." },
+{ "to_rgba8", ARR(pMnD), ARR(oUnary),
+  "decoded pixels in [-1, 1] to bytes as diffusers' postprocess makes them, u8 out." },
+{ "gelu_tanh", ARR(pMnD), ARR(oUnary), "the tanh approximation of gelu." },
+{ "scatter_add_rows", ARR(pMnD), ARR(oScatterRows),
+  "x[idx[i]] += v[i], rounded to x's dtype; a negative index adds nothing." },
+{ "attn_prefix_self", ARR(pAttnPS), ARR(oAttnPS),
+  "attention over `seqused[s]` prefix positions in the paged cache and the step's own rows, "
+  "flash-attention tiles; `qk` \"i8\" is the int8 score form (docs/OPS.md)." },
 { "embed_lookup", ARR(pEmbedM), ARR(oEmbed),
   "embedding gather, vocab-parallel with an offset; `mult` multiplies every row (rounded once)." },
 { "embed_lookup_q", ARR(pEmbed), ARR(oEmbedQ),
@@ -681,13 +789,16 @@ static const RadOpSchema kSchemas[] = {
 { "sample_mask", ARR(pMVocab), ARR(oMask), "grammar bitmask application." },
 { "sample_pick", ARR(pMCand), ARR(oPick),
   "seeded inverse-CDF draw. The uniform is splitmix64 over (seed * 0x9E3779B97F4A7C15 + pos), "
-  "top 24 bits as a float in [0,1) -- specified rather than left to a library, because the same "
-  "stream has to come out of a host reference, a device kernel and a rerun." },
+  "top 24 bits as a float in [0,1), so a host reference, a device kernel and a rerun draw the "
+  "same stream." },
 { "sample_merge_topk", ARR(pMCand), ARR(oMerge), "the vocab-parallel candidate merge." },
 { "sample_argmax", ARR(pMVocab), ARR(oArgmax), "greedy, ties to the lower token id." },
 { "sample_logprobs", ARR(pLogprobs), ARR(oLogprobs),
   "the raw logits' max, sum of exp(l - max) and k largest (id, logit) pairs, for a row with "
   "RAD_SP_LOGPROBS." },
+{ "dflash_conv", ARR(pDflashConv), ARR(oDflashConv),
+  "DFlash2's grouped dynamic depthwise convolution: out[t][h] = sum over taps j, j == 0 or "
+  "t % block_size >= j, of (base[j][h] + delta[t][j][h / group_size]) * x[t - j][h]." },
 { "dflash_select", ARR(pDflashSelect), ARR(oDflashSelect),
   "a greedy walk over a candidate lattice: score[l, c] = unary[l, c] + sum_r pred[pid(l)][r] * "
   "hp[l][r] * succ[cand[l, c]][r], pid(0) the anchor and pid(l) the walk's own previous pick. "
@@ -696,18 +807,13 @@ static const RadOpSchema kSchemas[] = {
 
 /* ================================================================== the kernel table
  *
- * Every row is domain HOST at priority 0, unconstrained except where the op's own structure needs
- * a value the operands do not carry. That last clause is kv_store's `block_size`, and it is
- * libref's rule for the same reason: the constraint admits every value and refuses only a query
- * that does not NAME one, because an absent key fails a constraint and a cache cannot be walked
- * without knowing its block edge.
+ * Every row is domain HOST at priority 0 and unconstrained, except `block_size` on attn_paged and
+ * kv_store (as in libref): the constraint admits any value but requires the key to be present,
+ * since the cache cannot be walked without the block edge.
  *
- * SHAPE SAYS "any" ON EVERY ROW, and that is a claim about this plugin rather than a copied
- * phrase: every extent is read off the operands (avx_common.h), so there is no geometry these
- * refuse. Which ISA level runs is NOT part of the shape and deliberately does not appear in a
- * constraint -- a row that said `avx512` would be a row that vanishes from the hierarchy on a
- * machine without it, and the whole point of the dispatch is that the ROW is the same everywhere
- * and only the instruction stream underneath it changes. */
+ * Every row's shape is "any", since every extent is read from the operands (avx_common.h). The
+ * ISA level is deliberately not a constraint: rows are identical on every CPU and only the code
+ * underneath changes. */
 #define SHAPE_ANY "any: every extent is read off the operands, strides included"
 
 #define ROW(nm, opname, fam, what, dts, cons, ncons, fn)                                          \
@@ -717,11 +823,88 @@ static const RadOpSchema kSchemas[] = {
 
 #define SIMPLE(nm, opname, fam, what, dts, fn) ROW(nm, opname, fam, what, dts, nullptr, 0, fn)
 
+/* ---- the codebook experts' layout hooks, on moe_gemm_q and moe_gemm_q_mod4
+ *
+ * A codebook expert's codes view (`codes,table`) and two-level scale view (`scale,scale.1`) are
+ * stored joined (abi/rad_planes.h); a view of one plane is stored as it is. The selections
+ * accepted are libref's (libref/ref_moe.cpp: cb_check), so a weight libref refuses at declare is
+ * refused here too, and both libraries store the same bytes under one tag. */
+struct CbForm { int bits; int64_t group; uint32_t sdt; bool level; };
+static CbForm cb_form(const RadParam* p, int n_p) {
+    const RadParam* d = rad_param_find(p, n_p, "dtype");
+    const char* s = d && d->kind == RAD_P_STR ? d->sval : nullptr;
+    if (s && !std::strcmp(s, "w4nla8h"))   return CbForm{ 4, 128, RAD_BF16, false };
+    if (s && !std::strcmp(s, "w4nl64a8h")) return CbForm{ 4, 64, RAD_F8E4M3, true };
+    if (s && !std::strcmp(s, "w4nl32a8h")) return CbForm{ 4, 32, RAD_F8E4M3, true };
+    if (s && !std::strcmp(s, "w5nl64a8h")) return CbForm{ 5, 64, RAD_F8E4M3, true };
+    return CbForm{ 0, 0, 0, false };
+}
+static int cb_check(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                    const int* sel, int n_planes) {
+    const CbForm f = cb_form(p, n_p);
+    const bool codes = operand == 2 || operand == 6 || operand == 8 || operand == 10;
+    const bool scale = operand == 3 || operand == 7 || operand == 9 || operand == 11;
+    if (!f.bits || (!codes && !scale) || !enc || !sel || n_planes != 2 ||
+        std::strcmp(enc->transform, "fwht128") != 0)
+        return RAD_E_DTYPE;
+    for (int i = 0; i < 2; ++i)
+        if (sel[i] < 0 || sel[i] >= enc->n_planes) return RAD_E_SHAPE;
+    const RadEncPlane& a = enc->plane[sel[0]];
+    const RadEncPlane& b = enc->plane[sel[1]];
+    if (codes)
+        return !std::strcmp(a.role, "codes") && a.kind == RAD_PLANE_TILED &&
+               a.dtype == (f.bits == 5 ? (uint32_t)RAD_U5 : (uint32_t)RAD_U4) &&
+               a.block[0] == 1 && a.block[1] == 1 && !std::strcmp(b.role, "table") &&
+               b.kind == RAD_PLANE_TABLE && b.dtype == RAD_F32 && b.extent[0] == 1 &&
+               b.extent[1] == ((int64_t)1 << f.bits)
+                   ? RAD_OK : RAD_E_DTYPE;
+    return f.level && !std::strcmp(a.role, "scale") && a.kind == RAD_PLANE_TILED &&
+           a.dtype == f.sdt && a.block[0] == 1 && a.block[1] == f.group &&
+           !std::strcmp(b.role, "scale.1") && b.kind == RAD_PLANE_TILED && b.dtype == RAD_F32 &&
+           b.block[0] == 0 && b.block[1] == 0
+               ? RAD_OK : RAD_E_DTYPE;
+}
+static int avx_moe_cb_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                             const int* sel, const RadTensor* planes, int n_planes,
+                             RadLayout* out) {
+    if (n_planes <= 1) return RAD_E_UNSUPPORTED;
+    const int rc = cb_check(p, n_p, operand, enc, sel, n_planes);
+    return rc < 0 ? rc : rad_planes_layout(enc, sel, planes, n_planes, out);
+}
+static int avx_moe_cb_relayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                               const int* sel, const RadTensor* planes, int n_planes, void* dst,
+                               int64_t dst_bytes) {
+    if (n_planes <= 1) return RAD_E_UNSUPPORTED;
+    const int rc = cb_check(p, n_p, operand, enc, sel, n_planes);
+    return rc < 0 ? rc : rad_planes_relayout(enc, sel, planes, n_planes, dst, dst_bytes);
+}
+static int avx_moe_cb_unrelayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                                 const int* sel, const void* src, int64_t src_bytes,
+                                 const RadTensor* planes, int n_planes) {
+    if (n_planes <= 1) return RAD_E_UNSUPPORTED;
+    const int rc = cb_check(p, n_p, operand, enc, sel, n_planes);
+    return rc < 0 ? rc : rad_planes_unrelayout(enc, sel, src, src_bytes, planes, n_planes);
+}
+
+#define ROW_CB(nm, opname, fam, what, dts, fn)                                                    \
+    { nm, opname, fam, what, SHAPE_ANY, dts, RAD_DOMAIN_HOST, 0,                                  \
+      nullptr, 0, nullptr, 0, nullptr, nullptr, nullptr, fn, nullptr, avx_moe_cb_layout,          \
+      avx_moe_cb_relayout, nullptr, avx_moe_cb_unrelayout, nullptr }
+
+/* A row whose weight operands may be joined over several planes (avx_planes.h): libref's hooks for
+ * the op, restated, so both libraries store and read one form. */
+#define ROWL(nm, opname, fam, what, dts, fn, lay)                                                 \
+    { nm, opname, fam, what, SHAPE_ANY, dts, RAD_DOMAIN_HOST, 0,                                  \
+      nullptr, 0, nullptr, 0, nullptr, nullptr, nullptr, fn, nullptr, avxp::lay,                  \
+      avxp::avx_relayout_planes<avxp::lay>, nullptr, avxp::avx_unrelayout_planes<avxp::lay>,     \
+      nullptr }
+
 #define DT_FLOAT "bf16 f16 f32 fp8_e4m3 fp8_e5m2 i8 i32, chosen per operand from its own dtype"
 #define DT_ANY   "any dtype rad_types.h names, per operand"
+#define DT_FLOAT_CB DT_FLOAT "; or u4 / u5 codes into an f32 table, joined (w4nl* / w5nl*)"
 
-/* The launch is the baseline-compiled thunk, never the level's own symbol -- see avx_dispatch.cpp
- * on why the row must be correct before rad_plugin_open has run. */
+/* Rows launch through the baseline-compiled thunks, which are valid before rad_plugin_open
+ * (avx_dispatch.cpp). */
 #define L(nm) avx_thunk_##nm
 #define AVX_THUNK_DECL(nm) extern "C" int avx_thunk_##nm(const RadArgs*, RadStream);
 AVX_OP_LIST(AVX_THUNK_DECL)
@@ -735,12 +918,16 @@ SIMPLE("avx_rmsnorm_add", "rmsnorm_add", "norm", "residual add then RMS norm", D
        L(rmsnorm_add)),
 SIMPLE("avx_hc_enter", "hc_enter", "norm", "gated residual entry: hc copies of x", DT_FLOAT,
        L(hc_enter)),
-SIMPLE("avx_hc_read", "hc_read", "norm",
-       "gated residual read: grouped norm, low-rank gate, stream mix", DT_FLOAT, L(hc_read)),
+ROWL("avx_hc_read", "hc_read", "norm",
+     "gated residual read: grouped norm, low-rank gate, stream mix",
+     DT_FLOAT ", or mixing matrices of E4M3 / int8 codes with a scale plane, joined", L(hc_read),
+     avx_layout_hc),
 SIMPLE("avx_hc_write", "hc_write", "norm", "gated residual write: h[s] += inj[s] * y", DT_FLOAT,
        L(hc_write)),
-SIMPLE("avx_mtp_enter", "mtp_enter", "norm",
-       "MTP head entry: two norms, a per-sub-stream fc and a broadcast fc", DT_FLOAT, L(mtp_enter)),
+ROWL("avx_mtp_enter", "mtp_enter", "norm",
+     "MTP head entry: two norms, a per-sub-stream fc and a broadcast fc",
+     DT_FLOAT ", or fc matrices of E4M3 / int8 codes with a scale plane, joined", L(mtp_enter),
+     avx_layout_mtp),
 SIMPLE("avx_layernorm", "layernorm", "norm", "layer norm with gain and bias", DT_FLOAT,
        L(layernorm)),
 SIMPLE("avx_grid_embed", "grid_embed", "elem",
@@ -765,6 +952,12 @@ SIMPLE("avx_conv1d_dw", "conv1d_dw", "elem", "segment-wise causal depthwise conv
        DT_FLOAT, L(conv1d_dw)),
 SIMPLE("avx_rel_sinusoid", "rel_sinusoid", "elem", "sinusoidal relative-position table",
        DT_FLOAT, L(rel_sinusoid)),
+SIMPLE("avx_conv2d_unfold", "conv2d_unfold", "elem",
+       "a convolution's receptive fields as rows, for a GEMM against its weight",
+       DT_FLOAT, L(conv2d_unfold)),
+SIMPLE("avx_seg_sinusoid", "seg_sinusoid", "elem",
+       "sinusoidal absolute positions, restarting every `period` rows of a segment",
+       DT_FLOAT, L(seg_sinusoid)),
 SIMPLE("avx_attn_local_rel", "attn_local_rel", "attn",
        "local attention with a relative-position term and a softcap", DT_FLOAT,
        L(attn_local_rel)),
@@ -795,8 +988,12 @@ SIMPLE("avx_softmax", "softmax", "elem", "row-wise softmax", DT_FLOAT, L(softmax
 SIMPLE("avx_scale_rows", "scale_rows", "elem", "one scalar per row, broadcast across the row",
        DT_FLOAT, L(scale_rows)),
 
-SIMPLE("avx_quant_act_i8", "quant_act_i8", "quant", "symmetric int8 activation quantiser",
+SIMPLE("avx_quant_act_i8", "quant_act_i8", "quant",
+       "symmetric int8 activation quantiser, one scale a row, codes in the WMMA step order",
        "float in, i8 out, f32 scale", L(quant_act_i8)),
+SIMPLE("avx_quant_act_i8g", "quant_act_i8g", "quant",
+       "symmetric int8 activation quantiser, one scale per group, row-major",
+       "float in, i8 out, f32 scale", L(quant_act_i8g)),
 SIMPLE("avx_had_quant_act_i8", "had_quant_act_i8", "quant",
        "Walsh-Hadamard rotation then symmetric int8", "float in, i8 out, f32 scale",
        L(had_quant_act_i8)),
@@ -835,8 +1032,9 @@ SIMPLE("avx_gated_quant_fp8", "gated_quant_fp8", "quant",
 SIMPLE("avx_gemm_nt", "gemm_nt", "gemm", "C = A B^T, f32 accumulate, cache-blocked", DT_FLOAT,
        L(gemm_nt)),
 SIMPLE("avx_gemm_nt_bias", "gemm_nt_bias", "gemm", "C = A B^T + bias", DT_FLOAT, L(gemm_nt_bias)),
-SIMPLE("avx_gemm_nt_q", "gemm_nt_q", "gemm", "C = A B^T with group-scaled quantised operands",
-       "i8 / fp8 / float A; w4, w2, mxfp4, i8 or float B; f32 accumulate", L(gemm_nt_q)),
+ROWL("avx_gemm_nt_q", "gemm_nt_q", "gemm", "C = A B^T with group-scaled quantised operands",
+     "i8 / fp8 / float A; w4, w2, mxfp4, i8 or float B; u2 / u4 / u5 codes with an f16 scale "
+     "and integer zero per group, joined; f32 accumulate", L(gemm_nt_q), avx_layout_gemm_q),
 SIMPLE("avx_gemm_nt_q_bias", "gemm_nt_q_bias", "gemm", "quantised C = A B^T + bias",
        "i8 / fp8 / float A; w4, w2, mxfp4, i8 or float B; f32 accumulate", L(gemm_nt_q_bias)),
 SIMPLE("avx_gemm_nt_q_gated", "gemm_nt_q_gated", "gemm",
@@ -860,6 +1058,16 @@ SIMPLE("avx_qsa_block_key", "qsa_block_key", "attn",
        L(qsa_block_key)),
 SIMPLE("avx_qk_norm_rope", "qk_norm_rope", "attn", "per-head QK norm then rotary embedding",
        DT_FLOAT, L(qk_norm_rope)),
+SIMPLE("avx_qsa_score", "qsa_score", "attn",
+       "QSA block scores: per-head relu dots summed over the heads", DT_FLOAT, L(qsa_score)),
+SIMPLE("avx_qsa_select", "qsa_select", "attn",
+       "QSA selection: the top-k blocks as a page-id table, partial page last",
+       "f32 scores, i32 tables", L(qsa_select)),
+SIMPLE("avx_qsa_tail_store", "qsa_tail_store", "attn",
+       "QSA tail: the raw keys of open blocks into a per-sequence ring", DT_FLOAT,
+       L(qsa_tail_store)),
+SIMPLE("avx_qsa_work", "qsa_work", "attn",
+       "QSA work list: completing blocks' keys, pages and positions", DT_FLOAT, L(qsa_work)),
 
 SIMPLE("avx_router_topk", "router_topk", "moe", "softmax then exact top-k routing", DT_FLOAT,
        L(router_topk)),
@@ -867,11 +1075,12 @@ SIMPLE("avx_moe_scatter", "moe_scatter", "moe", "stable counting sort of routing
        "i32 indices", L(moe_scatter)),
 SIMPLE("avx_moe_gemm", "moe_gemm", "moe", "grouped GEMM over the expert-sorted rows", DT_FLOAT,
        L(moe_gemm)),
-SIMPLE("avx_moe_gemm_q", "moe_gemm_q", "moe",
-       "grouped GEMM over the expert-sorted rows, quantised operands", DT_FLOAT, L(moe_gemm_q)),
-SIMPLE("avx_moe_gemm_q_mod4", "moe_gemm_q_mod4", "moe",
+ROW_CB("avx_moe_gemm_q", "moe_gemm_q", "moe",
+       "grouped GEMM over the expert-sorted rows, quantised operands", DT_FLOAT_CB,
+       L(moe_gemm_q)),
+ROW_CB("avx_moe_gemm_q_mod4", "moe_gemm_q_mod4", "moe",
        "grouped GEMM over the expert-sorted rows, quantised operands, four classes by number mod 4",
-       DT_FLOAT, L(moe_gemm_q_mod4)),
+       DT_FLOAT_CB, L(moe_gemm_q_mod4)),
 SIMPLE("avx_moe_gather", "moe_gather", "moe", "weighted scatter back to token order", DT_FLOAT,
        L(moe_gather)),
 SIMPLE("avx_row_topk", "row_topk", "moe", "exact per-row top-R", DT_FLOAT, L(row_topk)),
@@ -880,9 +1089,10 @@ SIMPLE("avx_row_topk_merge", "row_topk_merge", "moe",
 SIMPLE("avx_pair_argmax", "pair_argmax", "moe",
        "the global top-1 of a row of gathered (id, value) pairs, one id a row", DT_FLOAT,
        L(pair_argmax)),
-SIMPLE("avx_logit_rerank", "logit_rerank", "moe",
-       "R candidates a row rescored exactly against the full-precision head", DT_FLOAT,
-       L(logit_rerank)),
+ROWL("avx_logit_rerank", "logit_rerank", "moe",
+     "R candidates a row rescored exactly against the full-precision head",
+     DT_FLOAT ", or a head of E4M3 / int8 codes with a scale plane, joined", L(logit_rerank),
+     avx_layout_head),
 
 SIMPLE("avx_gdn_conv_prep", "gdn_conv_prep", "gdn",
        "gdn prefill preamble: conv, split, l2 norm, gate cumsum, beta", DT_FLOAT,
@@ -901,33 +1111,65 @@ SIMPLE("avx_gdn_conv_recurrent_update", "gdn_conv_recurrent_update", "gdn",
 SIMPLE("avx_gdn_gated_rmsnorm", "gdn_gated_rmsnorm", "gdn", "gated RMS norm over a head", DT_FLOAT,
        L(gdn_gated_rmsnorm)),
 
-/* THE COLLECTIVES HAVE NO init/fini AND THAT IS NOT AN OVERSIGHT. libref's rows carry
- * ref_collective_init because its all-reduce establishes a shared rendezvous across ranks in one
- * process. libavx serves the ONE-RANK case only -- world_size 1, where an all-reduce is a copy and
- * an all-gather is a copy -- and refuses anything wider by name rather than pretending. A
- * multi-rank host collective is a real piece of work (shared memory, a barrier, an ordering rule)
- * and it is not this plugin's: a CPU kernel library has no business owning the wire. */
+/* No init/fini on the collectives: unlike libref's (ref_collective_init sets up a cross-rank
+ * rendezvous), these serve world_size 1 only, where both are copies (see avx_misc.cpp). */
 SIMPLE("avx_all_reduce", "all_reduce", "ar", "sum across ranks; world_size 1 only", DT_FLOAT,
        L(all_reduce)),
 SIMPLE("avx_all_gather", "all_gather", "ar", "gather every rank's shard; world_size 1 only",
        DT_FLOAT, L(all_gather)),
 
+SIMPLE("avx_ln_mod", "ln_mod", "norm", "gainless layer norm times (1 + an entry's scale row)",
+       DT_FLOAT, L(ln_mod)),
+SIMPLE("avx_gate_add", "gate_add", "elem", "x += tanh(gate row) * y", DT_FLOAT, L(gate_add)),
+SIMPLE("avx_ln_mod_quant_fp8", "ln_mod_quant_fp8", "norm",
+       "gated residual, adaptive norm and the E4M3 quantiser in one pass",
+       "float in, fp8_e4m3 out, f32 scale, bf16 z", L(ln_mod_quant_fp8)),
+SIMPLE("avx_timestep_embed", "timestep_embed", "elem", "sinusoidal timestep embedding", DT_FLOAT,
+       L(timestep_embed)),
+SIMPLE("avx_gather_rows2", "gather_rows2", "elem", "rows from two sources by a signed index",
+       DT_ANY, L(gather_rows2)),
+SIMPLE("avx_lane_gather", "lane_gather", "elem", "each entry's rows out of its lane", DT_ANY,
+       L(lane_gather)),
+SIMPLE("avx_lane_store", "lane_store", "elem", "one source's rows into several lanes", DT_ANY,
+       L(lane_store)),
+SIMPLE("avx_randn_lanes", "randn_lanes", "elem", "a lane's rows from its seed's normal stream",
+       DT_FLOAT, L(randn_lanes)),
+SIMPLE("avx_flow_euler", "flow_euler", "elem", "a flow-matching Euler step with guidance",
+       DT_FLOAT, L(flow_euler)),
+SIMPLE("avx_chan_affine", "chan_affine", "elem", "a per-channel affine from parameter lists",
+       DT_FLOAT, L(chan_affine)),
+SIMPLE("avx_conv2d_nhwc", "conv2d_nhwc", "conv",
+       "an image convolution, channels innermost, as GEMMs over patch rows", DT_FLOAT,
+       L(conv2d_nhwc)),
+SIMPLE("avx_l2norm_chan", "l2norm_chan", "norm", "unit-L2 channel norm, scaled, optional silu",
+       DT_FLOAT, L(l2norm_chan)),
+SIMPLE("avx_d2s_add", "d2s_add", "elem", "an upsampling shortcut added in", DT_FLOAT, L(d2s_add)),
+SIMPLE("avx_s2d_avg_add", "s2d_avg_add", "elem", "a downsampling shortcut added in", DT_FLOAT,
+       L(s2d_avg_add)),
+SIMPLE("avx_to_rgba8", "to_rgba8", "elem", "decoded pixels to bytes", DT_FLOAT, L(to_rgba8)),
+SIMPLE("avx_gelu_tanh", "gelu_tanh", "elem", "tanh gelu", DT_FLOAT, L(gelu_tanh)),
+SIMPLE("avx_scatter_add_rows", "scatter_add_rows", "elem", "x[idx[i]] += v[i]", DT_FLOAT,
+       L(scatter_add_rows)),
+SIMPLE("avx_attn_prefix_self", "attn_prefix_self", "attn",
+       "attention over a paged prefix and the step's own rows, flash-attention tiles",
+       "bf16 or f32 q, k, v and cache; int8 score form", L(attn_prefix_self)),
+
 SIMPLE("avx_embed_lookup", "embed_lookup", "vocab", "embedding gather", DT_FLOAT, L(embed_lookup)),
-/* THE ONE ROW WITH A LAYOUT HOOK, and it only checks: the table is read as it is stored, and the
- * hook refuses a table encoded any other way (avx_ngram.cpp). An E4M3 table into bf16 goes through
- * the row cache; every other dtype pair takes the general gather. Its init refuses a process that
- * may not make the io_uring ring the cache's misses are read through, at declare and not at the
- * first request. */
+/* Its layout hook only validates: the table is read as stored and other encodings are refused
+ * (avx_ngram.cpp). An E4M3 table into bf16 goes through the row cache; other dtype pairs take
+ * the general gather. The init hook refuses, at declare, a process that cannot create the
+ * io_uring ring the cache misses are read through. */
 { "avx_embed_lookup_q", "embed_lookup_q", "vocab",
   "embedding gather, one scale for the table: an E4M3 table into bf16 through a shared row cache "
   "and direct reads of the container, a later call's rows read ahead",
   SHAPE_ANY, DT_ANY, RAD_DOMAIN_HOST, 0,
   nullptr, 0, nullptr, 0, nullptr,
-  /* INIT, fini, LAUNCH, scratch, layout, relayout, opd_shape, unrelayout */
+  /* init, fini, launch, scratch, layout, relayout, opd_shape, unrelayout, replaces */
   avx_init_ngram, nullptr, L(embed_lookup_q), nullptr, avx_layout_ngram, nullptr, nullptr, nullptr,
-  nullptr, nullptr },
-SIMPLE("avx_logits_gemm", "logits_gemm", "vocab", "the lm_head projection", DT_FLOAT,
-       L(logits_gemm)),
+  nullptr },
+ROWL("avx_logits_gemm", "logits_gemm", "vocab", "the lm_head projection",
+     DT_FLOAT ", or a head of E4M3 / int8 codes with a scale plane, joined", L(logits_gemm),
+     avx_layout_head),
 
 SIMPLE("avx_sample_penalties", "sample_penalties", "sample",
        "repetition, frequency and presence penalties", DT_FLOAT, L(sample_penalties)),
@@ -954,6 +1196,8 @@ SIMPLE("avx_sample_pick", "sample_pick", "sample", "seeded inverse-CDF draw", DT
 SIMPLE("avx_sample_argmax", "sample_argmax", "sample", "greedy pick", DT_FLOAT, L(sample_argmax)),
 SIMPLE("avx_sample_logprobs", "sample_logprobs", "sample", "the raw distribution's summary",
        DT_FLOAT, L(sample_logprobs)),
+SIMPLE("avx_dflash_conv", "dflash_conv", "draft",
+       "DFlash2 grouped dynamic depthwise convolution", DT_FLOAT, L(dflash_conv)),
 SIMPLE("avx_dflash_select", "dflash_select", "draft",
        "DFlash2's greedy walk over the candidate lattice",
        "i32 candidates and tokens, float unary and codebooks", L(dflash_select)),
@@ -965,10 +1209,9 @@ static const RadPluginInfo kInfo = {
     "libavx",
     "0.1.0",
     "the conventional op vocabulary in hand-written x86 SIMD, dispatched by CPU feature at load: "
-    "scalar / AVX / AVX2+FMA / AVX-512. Same ops as libref, same schemas, same answers to a "
-    "tolerance -- the difference is the instruction stream",
-    /* NOT a -march string. The binary runs everywhere x86-64 runs and picks its own path, so a
-     * build_target naming one machine would be a claim the plugin does not make. */
+    "scalar / AVX / AVX2+FMA / AVX-512. Same ops and schemas as libref, the same answers to a "
+    "tolerance",
+    /* Not a -march string: the binary runs on any x86-64 and picks its own path at load. */
     "host"
 };
 

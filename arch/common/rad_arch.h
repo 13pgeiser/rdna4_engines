@@ -1,14 +1,12 @@
 /* rad_arch.h -- the scaffolding an architecture plugin sits on.
  *
- * spec.md §2.4 commits to one plugin per (architecture, quantisation). That is deliberate: a w4a8
- * model wants rmsnorm_had_quant_i8 where a bf16 model wants a plain rmsnorm, and pretending
- * otherwise means a plugin full of branches on a quant descriptor -- which is how you get back to
- * "unclear what actually runs". A declare function with no branches in it is a readable list of
- * what this model does, in order.
+ * spec.md §2.4 has one plugin per (architecture, quantisation): a w4a8 model wants
+ * rmsnorm_had_quant_i8 where a bf16 model wants a plain rmsnorm, and a declare function without
+ * branches on a quant descriptor reads as the list of what the model does, in order.
  *
- * The file-count mitigation for the quant axis is this library. It is header-only, it is C++
- * (nothing here crosses an .so boundary -- only the four exported C symbols do), and it holds one
- * small struct per transformer block with a declare() and a step(). A plugin is COMPOSITION.
+ * This header-only C++ library keeps that from multiplying files: one small struct per
+ * transformer block with a declare() and a step(), composed by the plugin. Nothing here crosses
+ * an .so boundary; only the exported C symbols do.
  */
 #ifndef RAD_ARCH_H
 #define RAD_ARCH_H
@@ -28,6 +26,7 @@
 #include <initializer_list>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -35,29 +34,25 @@
 namespace rad {
 namespace arch {
 
-/* One thread per tensor-parallel rank, all in one process (spec §1), and declare runs once per
- * rank. So a plugin's declared handles are per-rank state, not process state: a single global
- * would have rank 1's declare overwrite rank 0's. libr4d supports 2/4/8-rank all-reduce, so eight
- * is the bound worth carrying. */
+/* One thread per tensor-parallel rank in one process (spec §1), and declare runs once per rank,
+ * so declared handles are per-rank state; a single global would let rank 1 overwrite rank 0.
+ * libr4d all-reduces over 2/4/8 ranks, hence eight. */
 enum { MAX_RANKS = 8 };
-
 
 /* ================================================================== a debug residual probe
  *
- * THE ONE INSTRUMENT FOR A COMPOSITION FAULT, and it exists because nothing else in the tree can
- * see one: rad-kbench falsifies an op against the oracle on the same inputs and a graph that wires
- * the right ops to the wrong buffers -- or a block whose output is the wrong SIZE -- passes every
- * one of those checks and still serves a different model. What a reader needs then is the residual
- * stream's magnitude down the stack, which is smooth in a working model and steps in a broken one.
+ * Finds composition faults: rad-kbench checks each op against the oracle, so a graph that wires
+ * the right ops to the wrong buffers, or a block whose output has the wrong size, passes kbench
+ * and still serves a different model. The residual stream's magnitude down the stack is smooth in
+ * a working model and steps in a broken one.
  *
- * It SYNCHRONISES THE STREAM and copies one row, so it is off unless RADIANCE_DEBUG_RESID is set,
- * and it prints each (layer, site) once. bf16 buffers only -- every activation in this tree is. */
+ * It synchronises the stream and copies one row, so it is off unless RADIANCE_DEBUG_RESID is set,
+ * and prints each (layer, site) once. bf16 buffers only, as is every activation in this tree. */
 struct DbgStat { double rms = -1.0, med = -1.0, max = -1.0; };
 
-/* RMS, MEDIAN AND MAX TOGETHER, because a residual stream carries a handful of channels two orders
- * of magnitude above the rest (the "massive activations" every model in this family has) and the
- * RMS is theirs alone. The MEDIAN is the bulk, which is what a block's delta has to be compared
- * against; reading the RMS by itself says twenty layers did nothing when they did. */
+/* RMS, median and max of |x| over one row. A few "massive activation" channels sit two orders of
+ * magnitude above the rest and dominate the RMS; the median is the bulk, which is what a block's
+ * delta should be compared against. */
 inline DbgStat dbg_row_stat(RadCtx* c, rad_buf b, int64_t n) {
     DbgStat s;
     if (!b || n <= 0) return s;
@@ -88,12 +83,17 @@ inline bool dbg_resid_on() {
     return on;
 }
 
+/* True the first time any rank thread reaches (layer, site), so a probe prints each once. */
+inline bool dbg_first(int layer, const char* site) {
+    static std::mutex mu;
+    static std::set<std::pair<int, std::string>> seen;
+    std::lock_guard<std::mutex> lk(mu);
+    return seen.emplace(layer, site).second;
+}
+
 inline void dbg_resid(RadCtx* c, int layer, const char* site, int64_t n_embd,
                       rad_buf x, rad_buf delta) {
-    if (!dbg_resid_on()) return;
-    static int seen[512] = {0};
-    const int slot = ((layer * 4) + (site[0] & 3)) & 511;
-    if (seen[slot]++) return;
+    if (!dbg_resid_on() || !dbg_first(layer, site)) return;
     const DbgStat sx = dbg_row_stat(c, x, n_embd), sd = dbg_row_stat(c, delta, n_embd);
     std::fprintf(stderr, "D resid layer %2d %-4s: x rms %8.4f med %8.5f max %9.3f | "
                          "delta rms %8.4f med %8.5f max %9.3f\n",
@@ -101,34 +101,29 @@ inline void dbg_resid(RadCtx* c, int layer, const char* site, int64_t n_embd,
 }
 /* ================================================================== the GPTQ calibration tap
  *
- * A block that wants to characterise one of its own activations declares an f32 [K, K] PERSIST
- * buffer and a `gram_accum` op into it, then calls calib_write() when the corpus is done. These
- * three helpers are the parts that are not block-specific: whether it is on, when to stop, and
- * the file.
+ * A block that characterises one of its activations declares an f32 [K, K] PERSIST buffer and a
+ * `gram_accum` op into it, then calls calib_write() when the corpus is done. These helpers are
+ * the block-independent parts: whether the tap is on, when to stop, and the file.
  *
- * PERSIST AND NOT TRANSIENT, and that is the whole reason this is not a debug probe: a transient
- * buffer is liveness-analysed and may share storage with any other transient, so an accumulator
- * declared transient would be overwritten between the launches it is meant to sum.
+ * The accumulator must be PERSIST: a transient buffer may share storage with other transients
+ * and would be overwritten between the launches it sums.
  *
- * THE CONSUMER IS ANOTHER PROCESS. rad-convert reads these files; the engine writes them. That
- * is not an architectural preference but the only order that works -- GPTQ needs the Hessian of
- * a layer's real input, which needs the model running, and a container is written before it can
- * be served. The bootstrap is: convert with plain absmax, serve THAT, calibrate on it, convert
- * again with the Hessians. A second moment is robust to the small perturbation the first
- * container's own error puts on the activation.
+ * rad-convert reads these files in a separate process, because GPTQ needs the Hessian of a
+ * layer's real input and so a running model. The bootstrap is: convert with plain absmax, serve
+ * that, calibrate on it, convert again with the Hessians. The second moment is robust to the
+ * first container's small quantisation error.
  *
- * PER RANK, AND THE CONSUMER SUMS. Under expert parallelism a rank's `down` input is only the
- * tokens routed to ITS experts, so no single rank holds the layer's distribution. Its `gate_up`
- * input is the whole token set on every rank, so summing those double-counts by `world` -- which
- * is a positive scale on H, and GPTQ is invariant to one (the damping is a fraction of the trace
- * and the update uses ratios). So one rule, sum everything, and the gate_up case is harmless. */
+ * Files are per rank and the consumer sums them. Under expert parallelism a rank's `down` input
+ * covers only its own experts' tokens. `gate_up` input is the full token set on every rank, so
+ * the sum scales H by `world`; GPTQ is invariant to a positive scale (damping is a fraction of
+ * the trace and the update uses ratios). */
 inline const char* calib_dir() {
     static const char* d = std::getenv("RADIANCE_CALIB_DIR");
     return d && *d ? d : nullptr;
 }
 
-/* The token count at which the tap dumps and switches itself off. Off by default in the sense
- * that calib_dir() gates it; this only says how much is enough. */
+/* Token count at which the tap dumps and switches itself off (RADIANCE_CALIB_TOKENS, default
+ * 65536). Whether the tap runs at all is calib_dir()'s decision. */
 inline long long calib_target() {
     static const long long n = [] {
         const char* s = std::getenv("RADIANCE_CALIB_TOKENS");
@@ -149,12 +144,11 @@ inline long long calib_target() {
  *                       weight's kernel multiplies
  *   uint32_t pad
  *
- * `rows` is not a normaliser: nothing downstream divides by it, because H is used only up to a
- * positive scale. It is there so a reader can tell a full calibration from one that was killed
- * early -- and, for one expert's file (CalibExperts), an expert the corpus barely routed to from
- * one it exercised: libquant reads a per-expert file only when it holds several times K rows.
- * `domain` is what the tap actually summed, so a reader quantising in another one -- a rotated
- * recipe over a bf16 model's Hessian -- brings the file there itself (libquant's calib_sum). */
+ * `rows` is not a normaliser (H is used only up to a positive scale). It tells a full
+ * calibration from a killed one, and for a per-expert file (CalibExperts) a barely-routed expert
+ * from an exercised one: libquant reads a per-expert file only when it holds several times K
+ * rows. `domain` is what the tap summed; a reader quantising in another domain converts the file
+ * itself (libquant's calib_sum). */
 inline bool calib_write_host(const float* h, int64_t k, long long rows, const char* what,
                              uint32_t domain, int rank) {
     const char* dir = calib_dir();
@@ -194,9 +188,8 @@ inline bool calib_write(RadCtx* c, rad_buf b, int64_t k, long long rows, const c
     return calib_write_host(h.data(), k, rows, what, domain, rad_rank(c));
 }
 
-/* A pinned host buffer of at least `bytes`, one a rank and held for the life of the process, so a
- * tap that brings a scratch back every pass copies it at the link's speed and not a pageable
- * copy's. Null, said once, when the allocation fails. */
+/* A pinned host buffer of at least `bytes`, one per rank, held for the process lifetime, so a tap
+ * that copies a scratch back every pass runs at link speed. Null (and logged) on failure. */
 inline float* calib_staging(RadCtx* c, int64_t bytes) {
     static std::mutex mu;
     static std::map<int, std::pair<void*, int64_t>> per_rank;
@@ -212,21 +205,18 @@ inline float* calib_staging(RadCtx* c, int64_t bytes) {
     return (float*)s.first;
 }
 
-/* ONE HESSIAN AN EXPERT, which is what a routed expert's `down` projection needs and the layer's
- * pooled Gram is not. That projection's input is the expert's OWN intermediate units: channel i
- * of one expert has nothing to do with channel i of another, so a Gram summed over the layer's
- * experts describes none of them. It is dominated by whichever expert carries the most energy --
- * on Qwen3.8-Flash-Next one expert holds a quarter of some layers' -- and GPTQ fitted to it spends
- * every other expert's error budget on that expert's channels.
+/* One Hessian per expert, for a routed expert's `down` projection. Its input is the expert's own
+ * intermediate units, so channel i means something different in each expert and a pooled Gram
+ * describes none of them; it is dominated by the highest-energy expert (a quarter of some layers'
+ * energy on Qwen3.8-Flash-Next), and GPTQ fitted to it spends every expert's error budget there.
  *
- * ON THE HOST, because the card has no room for it: 640^2 f32 for each of 256 experts a rank is
- * 419 MB a layer, 20 GB over 48. A pass sums each expert's rows into one layer-sized scratch on
- * the card; the scratch comes back through calib_staging() and its upper triangles are added
- * here, packed -- a Gram is symmetric, so half the bytes, 10 GB a rank for that model. The cost is
- * a stream sync a layer, which a calibration run reading its experts from disk does not notice.
+ * Kept on the host: 640^2 f32 for 256 experts per rank is 419 MB a layer, 20 GB over 48 layers.
+ * A pass sums each expert's rows into one layer-sized device scratch, which comes back through
+ * calib_staging() and is added here as packed upper triangles (half the bytes, 10 GB per rank for
+ * that model). The cost is one stream sync per layer.
  *
- * Accumulated in f32: each pass adds one partial sum an expert, so a 10M-token corpus is a few
- * hundred adds deep, and the consumer damps H by a percent of its trace. */
+ * f32 accumulation suffices: each pass adds one partial sum per expert, so a 10M-token corpus is
+ * a few hundred adds deep, and the consumer damps H by a percent of its trace. */
 struct CalibExperts {
     int64_t ne = 0, k = 0;
     std::vector<float>   acc;    /* `ne` upper triangles of k*(k+1)/2, row by row */
@@ -239,7 +229,7 @@ struct CalibExperts {
         rows.assign((size_t)ne, 0);
     }
 
-    /* `full` is `ne` row-major k x k Grams, back to back -- the scratch as the card wrote it. */
+    /* `full` is `ne` row-major k x k Grams back to back, as the device scratch holds them. */
     void add(const float* full) {
         const int64_t tri = k * (k + 1) / 2;
         const unsigned hw = std::thread::hardware_concurrency();
@@ -270,9 +260,9 @@ struct CalibExperts {
             }
     }
 
-    /* One file an expert, `<stem>.<global expert>`: the weight it will pack minus `.weight`, which
-     * is the name libquant looks for before the pooled `<stem>`. Every expert gets one, a
-     * never-routed expert's saying `rows` 0. */
+    /* One file per expert, `<stem>.<global expert>`, where stem is the packed weight's name minus
+     * `.weight`; libquant looks for it before the pooled `<stem>`. A never-routed expert's file
+     * has `rows` 0. */
     bool write(const char* stem, int64_t expert_base, uint32_t domain, int rank) const {
         std::vector<float> h((size_t)(k * k));
         bool ok = true;
@@ -287,12 +277,12 @@ struct CalibExperts {
 };
 
 /* ================================================================== names */
-/* Declared names outlive the call that built them -- the weight manifest, the graph dump and the
- * checkpoint name map all hold the pointer. Interning in a deque keeps every c_str() stable for
- * the life of the plugin, which a vector<string> would not (it reallocates).
+/* Declared names outlive the call that built them (the weight manifest, graph dump and name map
+ * hold the pointer). A deque keeps every c_str() stable for the plugin's life; a vector would
+ * reallocate.
  *
- * The scope prefix comes from RadBuildCtx: a drafter or an encoder tower declared into the same
- * builder must not collide with the language model's names (spec §10, §11). */
+ * The scope prefix comes from RadBuildCtx, so a drafter or encoder tower in the same builder does
+ * not collide with the language model's names (spec §10, §11). */
 class Names {
 public:
     explicit Names(const char* scope = "")
@@ -318,71 +308,28 @@ private:
     std::string             scope_;
 };
 
-/* Errors are values. Declare walks a long list and any step of it can refuse; this propagates the
- * first refusal without an early-return ladder swallowing the reason. */
+/* Returns the first negative status from a declare step. */
 #define RAD_ARCH_TRY(expr)  do { int _s = (expr); if (_s < 0) return _s; } while (0)
 
 /* ================================================================== C++-side decl helpers */
-/* rad_group_layer() and friends are C compound literals, which compile in C++ only as a GNU
- * extension -- rad_builder.h says so and points here. A named function also reads better in an
- * initialiser list than a cast-shaped macro does. */
+/* C++ forms of rad_group_layer() and friends, which are C compound literals (a GNU extension in
+ * C++; rad_builder.h points here). */
 inline RadWeightGroup grp_model()               { RadWeightGroup g{}; g.layer = -1; g.expert = -1; return g; }
 inline RadWeightGroup grp_layer(int l)          { RadWeightGroup g{}; g.layer = l;  g.expert = -1; return g; }
 inline RadWeightGroup grp_expert(int l, int e)  { RadWeightGroup g{}; g.layer = l;  g.expert = e;  return g; }
-/* ...AND THE SLOT, WHICH IS NOT OPTIONAL FOR AN EXPERT WITH MORE THAN ONE TENSOR. The container
- * writes a layer's experts as fixed-stride units and checks that each unit's slots arrive
- * 0..n-1 (core/format/radfile.cpp, check_unit_invariant) -- so two tensors of one expert that
- * both leave `slot` at 0 are refused by name at convert time. A routed fp8 expert has four: the
- * gate_up codes, their scale plane, the down codes and theirs. */
+/* An expert with more than one tensor needs a slot per tensor. The container writes a layer's
+ * experts as fixed-stride units whose slots must arrive 0..n-1 (core/format/radfile.cpp,
+ * check_unit_invariant); two tensors both at slot 0 are refused at convert time. A routed fp8
+ * expert has four: gate_up codes, their scales, down codes, their scales. */
 inline RadWeightGroup grp_expert_slot(int l, int e, int s) {
     RadWeightGroup g{}; g.layer = l; g.expert = e; g.slot = s; return g;
 }
 
-/* `row_parts` is rows of THIS RANK per stacked projection, see RadWeightDecl. A single part is
- * the same thing as none, so it is not recorded and the load path stays on its plain-rows
- * branch. The pointer form exists because the fp8 linear derives its scale plane's parts by
- * dividing the weight's, which an initializer_list cannot express. */
-inline rad_weight decl_w_n(RadBuilder* b, const char* name, uint32_t dtype,
-                           std::initializer_list<int64_t> shape,
-                           int access, int shard, RadWeightGroup group, int optional,
-                           const int64_t* row_parts, int n_row_parts) {
-    RadWeightDecl d{};
-    d.dtype = dtype;
-    d.rank  = (uint32_t)shape.size();
-    int i = 0;
-    for (int64_t s : shape) d.shape[i++] = s;
-    d.access   = access;
-    d.shard    = shard;
-    d.group    = group;
-    d.optional = optional;
-    if (row_parts && n_row_parts > 1) {
-        d.n_row_parts = n_row_parts < RAD_MAX_ROW_PARTS ? n_row_parts : RAD_MAX_ROW_PARTS;
-        for (int j = 0; j < d.n_row_parts; ++j) d.row_parts[j] = row_parts[j];
-    }
-    return rad_decl_weight(b, name, &d);
-}
-
-inline rad_weight decl_w(RadBuilder* b, const char* name, uint32_t dtype,
-                         std::initializer_list<int64_t> shape,
-                         int access, int shard, RadWeightGroup group, int optional = 0,
-                         std::initializer_list<int64_t> row_parts = {}) {
-    int64_t p[RAD_MAX_ROW_PARTS] = {0};
-    int     n = 0;
-    for (int64_t v : row_parts) if (n < RAD_MAX_ROW_PARTS) p[n++] = v;
-    return decl_w_n(b, name, dtype, shape, access, shard, group, optional, p, n);
-}
-
-/* A VIEW: `planes` of the logical weight `source` (null: the weight named `name` itself), declared
- * at what they select -- one plane's own dtype and extents, several planes' codes dtype and the
- * logical extents (RadWeightDecl::source, spec §4.3). A block-fp8 linear is ONE stored weight
- * that gemm_nt_q takes as two operands, so it is declared twice over the same source: its codes
- * as `<base>.weight` and its scales as `<base>.scale`, `source` = `<base>.weight`. Every view of
- * a weight takes the weight's movement group. */
-inline rad_weight decl_view(RadBuilder* b, const char* name, const char* source,
-                            const char* planes, uint32_t dtype,
-                            std::initializer_list<int64_t> shape, int access, int shard,
-                            RadWeightGroup group, const int64_t* row_parts = nullptr,
-                            int n_row_parts = 0) {
+/* `row_parts` is this rank's rows per stacked projection (RadWeightDecl). A single part equals
+ * none and is not recorded, keeping the load path on its plain-rows branch. */
+inline RadWeightDecl weight_decl(uint32_t dtype, std::initializer_list<int64_t> shape, int access,
+                                 int shard, RadWeightGroup group, const int64_t* row_parts,
+                                 int n_row_parts) {
     RadWeightDecl d{};
     d.dtype = dtype;
     d.rank  = (uint32_t)shape.size();
@@ -395,20 +342,53 @@ inline rad_weight decl_view(RadBuilder* b, const char* name, const char* source,
         d.n_row_parts = n_row_parts < RAD_MAX_ROW_PARTS ? n_row_parts : RAD_MAX_ROW_PARTS;
         for (int j = 0; j < d.n_row_parts; ++j) d.row_parts[j] = row_parts[j];
     }
+    return d;
+}
+
+/* The pointer form of decl_w's row parts, for a caller that derives them (the fp8 linear divides
+ * its weight's parts for the scale plane). */
+inline rad_weight decl_w_n(RadBuilder* b, const char* name, uint32_t dtype,
+                           std::initializer_list<int64_t> shape,
+                           int access, int shard, RadWeightGroup group, int optional,
+                           const int64_t* row_parts, int n_row_parts) {
+    RadWeightDecl d = weight_decl(dtype, shape, access, shard, group, row_parts, n_row_parts);
+    d.optional = optional;
+    return rad_decl_weight(b, name, &d);
+}
+
+inline rad_weight decl_w(RadBuilder* b, const char* name, uint32_t dtype,
+                         std::initializer_list<int64_t> shape,
+                         int access, int shard, RadWeightGroup group, int optional = 0,
+                         std::initializer_list<int64_t> row_parts = {}) {
+    return decl_w_n(b, name, dtype, shape, access, shard, group, optional, row_parts.begin(),
+                    (int)row_parts.size());
+}
+
+/* A view: `planes` of the logical weight `source` (null: the weight named `name`), declared at
+ * what they select: one plane's own dtype and extents, or for several planes the codes dtype and
+ * the logical extents (RadWeightDecl::source, spec §4.3). A block-fp8 linear is one stored weight
+ * that gemm_nt_q takes as two operands, so it is declared twice over `<base>.weight`: codes as
+ * `<base>.weight`, scales as `<base>.scale`. Every view takes the weight's movement group. */
+inline rad_weight decl_view(RadBuilder* b, const char* name, const char* source,
+                            const char* planes, uint32_t dtype,
+                            std::initializer_list<int64_t> shape, int access, int shard,
+                            RadWeightGroup group, const int64_t* row_parts = nullptr,
+                            int n_row_parts = 0) {
+    RadWeightDecl d = weight_decl(dtype, shape, access, shard, group, row_parts, n_row_parts);
     d.source = source;
     d.planes = planes;
     return rad_decl_weight(b, name, &d);
 }
 
-/* What the model holds `source` as -- its encoding, from the container, the checkpoint, or the
- * recipe rad-convert is applying -- or false when nothing is known about it: a builder with no
- * model behind it, or a name the name map has not been told about yet (declare the map first). */
+/* The encoding `source` is held in (from the container, the checkpoint, or rad-convert's recipe),
+ * or false when unknown: a builder with no model behind it, or a name not yet in the name map
+ * (declare the map first). */
 inline bool weight_enc(RadBuilder* b, const char* source, RadEncoding* out) {
     return rad_weight_encoding(b, source, out, nullptr, nullptr) == RAD_OK;
 }
 
-/* The dtype a view of every plane of `source` is declared at: the codes', when the encoding is
- * known, else `dflt` -- the dtype a weight with nothing behind it is read as. */
+/* The dtype for a view of all of `source`'s planes: the codes' dtype when the encoding is known,
+ * else `dflt`. */
 inline uint32_t weight_codes_dtype(RadBuilder* b, const char* source, uint32_t dflt) {
     RadEncoding e{};
     return weight_enc(b, source, &e) && e.n_planes > 0 ? e.plane[0].dtype : dflt;
@@ -427,8 +407,8 @@ inline rad_buf decl_b(RadBuilder* b, const char* name, uint32_t dtype,
     return rad_decl_buffer(b, name, &d);
 }
 
-/* Every map starts with src_index all -1: "the whole tensor", which is what all but the stacked
- * expert case wants. Zero would mean sub-tensor 0 of every source, which is a silently wrong map. */
+/* src_index starts at -1, "the whole tensor"; 0 would silently select sub-tensor 0 of every
+ * source. */
 inline RadNameMap map_base(const char* declared, int mode) {
     RadNameMap m{};
     m.declared = declared;
@@ -445,10 +425,9 @@ inline int map_copy(RadBuilder* b, const char* declared, const char* src) {
     return rad_decl_name_map(b, &m);
 }
 
-/* A checkpoint tensor copied through, with alternatives: the first source the container actually
- * holds wins. This is how a tied lm_head is expressed -- Qwen3 0.6B and 1.7B ship no
- * output.weight and the embedding table serves as both, while 8B and up ship one. Without it the
- * plugin would need two builds of the same architecture. */
+/* A copy with an alternative source; the first one the container holds wins. Expresses a tied
+ * lm_head: Qwen3 0.6B and 1.7B ship no output.weight and reuse the embedding, 8B and up ship
+ * one. */
 inline int map_copy_alt(RadBuilder* b, const char* declared, const char* a, const char* c) {
     RadNameMap m = map_base(declared, RAD_MAP_COPY);
     m.n_src    = 2;
@@ -458,10 +437,8 @@ inline int map_copy_alt(RadBuilder* b, const char* declared, const char* a, cons
 }
 
 /* One expert's slice of a stacked checkpoint tensor. GGUF stores a MoE layer's experts as one
- * ffn_gate_exps of shape [.., n_expert] while placement needs one declared weight per expert,
- * because the movement unit is an expert and not a tensor (spec §4.1). src_index carries the
- * expert; without it the index would survive only inside the declared name, as a convention
- * rad-convert would have to parse. */
+ * ffn_gate_exps [.., n_expert], while placement moves one expert at a time and so needs one
+ * declared weight per expert (spec §4.2). src_index carries the expert index explicitly. */
 inline int map_slice(RadBuilder* b, const char* declared, const char* src, int index) {
     RadNameMap m = map_base(declared, RAD_MAP_COPY);
     m.n_src       = 1;
@@ -481,11 +458,9 @@ inline int map_slice_concat(RadBuilder* b, const char* declared,
     return rad_decl_name_map(b, &m);
 }
 
-/* A convert-time fusion: q/k/v into one qkv, gate and up into one gate_up. The plugin is the only
- * component that knows both sides, and rad-convert reads the map from it (spec §2.4). The fusion
- * is worth a comment on its cost: it buys one GEMM launch instead of three and one movement unit
- * instead of three, and it costs the ability to place q, k and v on different tiers, which
- * nothing wants to do. */
+/* A convert-time fusion: q/k/v into qkv, gate and up into gate_up. Only the plugin knows both
+ * sides, and rad-convert reads the map from it (spec §2.4). One GEMM launch and one movement unit
+ * instead of three, at the cost of placing q, k and v on different tiers. */
 inline int map_concat(RadBuilder* b, const char* declared, std::initializer_list<const char*> src,
                       int dim = 0) {
     RadNameMap m = map_base(declared, RAD_MAP_CONCAT);
@@ -496,15 +471,13 @@ inline int map_concat(RadBuilder* b, const char* declared, std::initializer_list
     return rad_decl_name_map(b, &m);
 }
 
-/* ONE LOGICAL TENSOR THE CHECKPOINT STORES AS N SHARDS, named `<prefix><i><suffix>` for i in
- * [0, n). Qwen3.8-Flash-Next's n-gram embedding is 320,001,536 rows in 128 tensors called
- * `...ngram_embedding.shard_0.weight` ... `shard_127.weight`, which is thirty times what
- * RadNameMap's `src[8]` holds.
+/* One logical tensor stored as n shards named `<prefix><i><suffix>`, i in [0, n). Qwen3.8-Flash-
+ * Next's n-gram embedding is 320,001,536 rows in 128 tensors (`...ngram_embedding.shard_0.weight`
+ * .. `shard_127.weight`), far more than RadNameMap's `src[8]`.
  *
- * So this emits ceil(n/8) CONCAT maps and the core joins them in call order -- see the merge rule
- * in core/build/rad_builder.cpp for why the pieces are the answer rather than a bigger array. The
- * ORDER IS THE CONCATENATION and shard 0 must come first: a hashed row id addresses the whole
- * table and a permuted table is a model that loads, runs, and looks up the wrong embeddings.
+ * Emits ceil(n/8) CONCAT maps, which the core joins in call order (merge rule in
+ * core/build/rad_builder.cpp). Call order is the concatenation order and shard 0 must come first:
+ * hashed row ids address the whole table, and a permuted table silently looks up wrong rows.
  *
  * Returns the first refusal, or RAD_OK. */
 inline int map_concat_shards(RadBuilder* b, const char* declared, const char* prefix,
@@ -526,14 +499,10 @@ inline int map_concat_shards(RadBuilder* b, const char* declared, const char* pr
 }
 
 /* ================================================================== buffer liveness */
-/* An op's WEIGHT operands are named at declare; its BUFFER operands are not, and without them a
- * transient has no declared use and the planner must assume it live for the whole program --
- * sound, because a plugin may issue any handle in any order, and as wasteful as it sounds.
- *
- * So every op this library emits states its read and write sets. Returning the handle rather than
- * a status is what keeps the declaration one statement: a refusal from rad_op_reads is recorded by
- * the builder, with the op named, and surfaces in declare's final report -- the same way a refusal
- * from rad_decl_op does. */
+/* States an op's buffer read and write sets. Weight operands are named at declare but buffer
+ * operands are not, and a transient with no declared use must be assumed live for the whole
+ * program. Returns the handle so a declaration stays one statement; a refusal from rad_op_reads
+ * is recorded by the builder with the op named and surfaces in declare's final report. */
 inline rad_op rw(RadBuilder* b, rad_op h,
                  std::initializer_list<rad_buf> reads,
                  std::initializer_list<rad_buf> writes) {
@@ -544,20 +513,13 @@ inline rad_op rw(RadBuilder* b, rad_op h,
 }
 
 /* ================================================================== geometry */
-/* Dimensions come from model metadata, so one plugin covers every size in a family. Everything
- * here is ALREADY DIVIDED by world_size where it is sharded: the plugin declares divided
- * dimensions and emits the collectives itself, because a sharding inference pass is a compiler
- * pass whose failure mode is a model that produces fluent wrong text on a rank count nobody
- * tested (spec §9). */
-/* THE PAGED BLOCK, IN TOKENS. `attn_paged` declares `block_size` RAD_DERIVED -- a value the
- * KERNEL supplies -- and libr4d's rows all carry C_EQ("block_size", 16), so on the shipped path
- * this is the value that would have been derived anyway and pinning it changes no resolution.
- *
- * It has to be pinned because DERIVED ONLY WORKS WHEN SOMETHING DERIVES IT. A geometry libr4d has
- * no attention kernel for -- Qwen3.5-0.8B is head_dim 256 at gqa 4, and libr4d has 256/6 and
- * 128/4 -- resolves to libref, which serves any block size and therefore names none; the KV
- * group then cannot be sized and declare refuses the model by name. The block size is a property
- * of the CACHE the model is asking for, so the model is the right place to say it. */
+/* Dimensions come from model metadata, so one plugin covers every size in a family. Sharded
+ * dimensions are already divided by world_size: the plugin declares divided dimensions and emits
+ * the collectives itself rather than relying on a sharding inference pass (spec §9). */
+/* The paged KV block, in tokens. `attn_paged` declares `block_size` RAD_DERIVED (kernel-supplied)
+ * and every libr4d row has C_EQ("block_size", 16), so pinning it changes nothing there. It must be
+ * pinned for geometries that resolve to libref (e.g. Qwen3.5-0.8B, head_dim 256 at gqa 4), which
+ * serves any block size and so derives none; the KV group could not be sized. */
 enum { RAD_KV_BLOCK = 16 };
 
 struct Geom {
@@ -571,21 +533,17 @@ struct Geom {
     int64_t n_head_kv  = 0;    /* per rank */
     int64_t n_head_all = 0;
     int64_t n_head_kv_all = 0;
-    /* THIS RANK'S FIRST KV ROW inside the checkpoint's UNSHARDED k/v projection rows, used only
-     * when the KV heads are replicated over ranks instead of split (world > n_head_kv_all, see
-     * geom_from). It is in container rows, the same unit a LinearFP8 span takes, so a block that
-     * declares a row-sharded k/v passes it straight through as `span_lo`. Zero on every split
-     * deployment, which is what keeps TP2 reading the projection exactly as it always did. */
+    /* This rank's first row in the checkpoint's unsharded k/v projection, in container rows (the
+     * unit of a LinearFP8 span, passed as `span_lo`). Nonzero when KV heads are replicated over
+     * ranks (world > n_head_kv_all) or under a smaller attention world; zero on a plain split. */
     int64_t kv_off   = 0;
-    /* THE ATTENTION WORLD. A world size the KV head count neither divides nor is a multiple of
-     * -- three ranks over Flash-Next's two KV heads -- serves attention on the largest multiple
-     * of the head count below it (`attn_world`, here 2: split, or replicated when that is still
-     * above the count) and the remaining ranks are ATTENTION-ZERO: they declare the same heads and
-     * the same program as their peers, compute no attention (a `fill` of the block's output and
-     * a zero KV group, rad_kv_group_zero) and add exactly zero to the reduce. `attn_rank` is this
-     * rank's index inside the attention world (an attention-zero rank clamps to the last). When
-     * attn_world == world nothing here is used and every block declares as it always did. Set
-     * only for a plugin that asks for it (geom_from's `attn_world_ok`). */
+    /* The attention world. When world neither divides nor is a multiple of the KV head count
+     * (three ranks over Flash-Next's two KV heads), attention runs on the largest multiple of the
+     * head count below world (`attn_world`; split, or replicated if still above the count). The
+     * remaining ranks are attention-zero: same heads and program as their peers, but they compute
+     * no attention (a `fill` of the block's output and a zero KV group, rad_kv_group_zero) and
+     * add zero to the reduce. `attn_rank` is the index inside the attention world (attention-zero
+     * ranks clamp to the last). Only set for plugins that pass geom_from's `attn_world_ok`. */
     int     attn_world = 1;
     int     attn_rank  = 0;
     bool    attn_zero  = false;
@@ -595,63 +553,52 @@ struct Geom {
     int64_t max_seqs   = 0;
     int64_t max_ctx    = 0;
     int     max_spec   = 0;
-    /* The most rows the sampler can want in one step: one per sequence, or one per draft position
-     * per sequence at a speculative verify. It bounds the logits buffer, which at a 248K vocab is
-     * the difference between 63 MiB and 8 GiB. */
+    /* Most rows the sampler can want in one step: one per sequence, or one per draft position per
+     * sequence at a speculative verify. Bounds the logits buffer (at a 248K vocab, 63 MiB rather
+     * than 8 GiB for max_tok rows). */
     int64_t max_logit_rows = 0;
     int     rank       = 0;
     int     world      = 1;
-    /* 1 = the exact all-reduce, 0 = this deployment accepts a lossy wire. Straight through to
-     * every `all_reduce` this library emits; RadBuildCtx says what it costs and buys. */
+    /* 1 = exact all-reduce, 0 = a lossy wire is accepted. Passed to every `all_reduce` this
+     * library emits; RadBuildCtx describes the trade-off. */
     int     wire_exact = 1;
-    /* The byte floor under which the lossy wire is refused and the exact kernel serves the
-     * message anyway. Straight through to `all_reduce`'s `min_bytes`; 0 leaves the choice to
-     * the kernel plugin, which has the measured default. */
+    /* Messages below this many bytes use the exact all-reduce even with a lossy wire. Passed as
+     * `all_reduce`'s `min_bytes`; 0 leaves the default to the kernel plugin. */
     int64_t wire_min_bytes = 0;
     float   eps        = 1e-6f;
     /* GemmaRMSNorm's `1 +`. Qwen3.5, Qwen3-Next and Gemma normalise with `x_hat * (1 + w)` and
-     * store `w` around 0.1, not around 1.0 -- so reading the gain as a plain RMSNorm gain shrinks
-     * every normed activation by five to ten times, at every norm, in every layer. It is a
-     * property of the ARCHITECTURE and not of a block, which is why it lives here: `rmsnorm`,
-     * `rmsnorm_add`, `qk_norm_rope_gate` and `rmsnorm_had_quant_i8` all carry a `wadd` parameter
-     * for it (libref/ref_registry.cpp), every block that declares one passes this, and a
-     * family whose norms are plain leaves it at zero.
+     * store `w` near 0.1, so reading it as a plain gain shrinks every normed activation 5-10x. An
+     * architecture property: `rmsnorm`, `rmsnorm_add`, `qk_norm_rope_gate` and
+     * `rmsnorm_had_quant_i8` take a `wadd` parameter (libref/ref_registry.cpp) and every block
+     * passes this; plain-norm families leave it 0.
      *
-     * NOT the gated delta net's own `ssm_norm`: RMSNormGated is a plain RMS norm in this family
-     * too, its gains are around 0.88 in the checkpoint, and `gdn_gated_rmsnorm` has no such
-     * parameter. Two conventions in one model, which is exactly why this is not a build flag. */
+     * Not used by the gated delta net's `ssm_norm`: RMSNormGated is a plain RMS norm in these
+     * families too (gains near 0.88) and `gdn_gated_rmsnorm` has no such parameter. */
     float   wadd       = 0.0f;
-    /* The same question for the per-head q/k norms, separately: they are a different
-     * tensor with a different distribution (this checkpoint's are PARTLY NEGATIVE, which
-     * only `1 + w` explains) and a family could answer the two differently. */
+    /* The same for the per-head q/k norms, set separately: a different tensor (partly negative
+     * gains in this family, which only `1 + w` explains) that a family could treat differently. */
     float   wadd_qk    = 0.0f;
     float   theta      = 1e6f;
     float   rope_scale = 1.0f;
     RadYarn yarn;
-    /* M-RoPE: the checkpoint's `mrope_section`, when it has one. A model whose rotary has several
-     * position components declares `rope` with `rope_mode` and these sections and hands it
-     * RadBatch::rope_pos; empty, the rotary is one-component NeoX over `positions`. Stored here
-     * rather than pointed at, because the container's strings are not guaranteed to outlive
-     * declare. */
+    /* M-RoPE: the checkpoint's `mrope_section`, if any. A multi-component rotary declares `rope`
+     * with `rope_mode` and these sections and passes RadBatch::rope_pos; empty means
+     * one-component NeoX over `positions`. Copied, because the container's strings may not
+     * outlive declare. */
     bool    rope_mc    = false;
     char    rope_mode[8]      = "neox";
     char    rope_sections[24] = "";
     const char* dtype  = "bf16";   /* the OPERAND COMBINATION, spec §2.3's dtype key */
     uint32_t act_dtype = RAD_BF16; /* what activation buffers are made of */
-    /* THE KV CACHE'S OWN WIDTH, and it is separate from `dtype` because it is a separate decision:
-     * `dtype` says what the WEIGHTS are and follows the checkpoint, while this follows the cache
-     * and is a deployment choice the checkpoint has no opinion about. They were one field, which
-     * read as "the cache is bf16 because the weights are fp8-with-bf16-activations" -- a sentence
-     * that is true of this checkpoint and is not a rule. Whatever this says must be the spelling
-     * `rad_dtype_name` gives, because the attention and kv_store rows band on it verbatim. */
+    /* The KV cache dtype, separate from `dtype`: weights follow the checkpoint, the cache is a
+     * deployment choice. Must be spelled as `rad_dtype_name` gives it, because the attention and
+     * kv_store rows band on it verbatim. */
     const char* kv_dtype = "bf16";
-    /* THE LINEARS ARE PLAIN bf16 WEIGHTS, read by `gemm_nt` over the bf16 activation, in a model
-     * whose blocks are the fp8 family's (rad_fp8.h). A checkpoint served as it ships -- a dense bf16
-     * release, converted without a quantising recipe -- has no scale planes and no use for E4M3
-     * activations, so in this mode the producers in front of a linear quantise nothing and declare
-     * no codes: an `ActFP8` is its bf16 plane alone. It is the MODEL's answer and not a linear's,
-     * because the producer and its consumers have to agree on it; the plugin reads it off a trunk
-     * weight's encoding and every linear checks its own against it. */
+    /* The linears are plain bf16 weights read by `gemm_nt`, in a model built from the fp8 blocks
+     * (rad_fp8.h): a dense bf16 checkpoint converted without a quantising recipe. Producers in
+     * front of a linear then quantise nothing, so an `ActFP8` is its bf16 plane alone. A model-wide
+     * setting because producers and consumers must agree; the plugin reads it off a trunk weight's
+     * encoding and every linear checks its own against it. */
     bool    w_bf16 = false;
 
     int64_t q_dim()   const { return n_head * head_dim; }
@@ -660,20 +607,13 @@ struct Geom {
     int64_t gqa()     const { return n_head_kv ? n_head / n_head_kv : 0; }
 };
 
-
-/* THE KV CACHE'S WIDTH, RESOLVED ONCE FOR EVERY ARCHITECTURE. RadBuildCtx::kv_dtype is
- * --kv-cache-dtype; RAD_DT_INVALID means the operator did not state one and the plugin's own
- * default stands. Every architecture in this tree passes RAD_BF16 as that default.
- *
- * It is one flag on the build context rather than a per-plugin environment switch: a switch read
- * at declare is invisible in the startup log and gives "is this cache fp8" a different answer per
- * architecture. It changes what the model computes, so it is a flag. */
+/* The KV cache dtype: RadBuildCtx::kv_dtype (--kv-cache-dtype), or `dflt` when it is
+ * RAD_DT_INVALID (not given). Every architecture in this tree passes RAD_BF16 as the default. */
 static inline uint32_t rad_kv_cache_dtype(const RadBuildCtx* c, uint32_t dflt) {
     return (c && c->kv_dtype != RAD_DT_INVALID) ? (uint32_t)c->kv_dtype : dflt;
 }
-/* Divide, refusing rather than rounding. A rank count that does not divide the head count is not
- * a configuration to approximate: it is a configuration to reject at declare, by name, before any
- * weight is mapped. */
+/* Divide, refusing (with a message naming `what`) rather than rounding, before any weight is
+ * mapped. */
 inline int divide_or_fail(int64_t v, int world, const char* what, int64_t* out) {
     if (world <= 0 || v % world != 0) {
         fprintf(stderr, "radiance: %s = %lld is not divisible by world_size = %d\n",
@@ -684,23 +624,16 @@ inline int divide_or_fail(int64_t v, int world, const char* what, int64_t* out) 
     return RAD_OK;
 }
 
-/* The vocabulary is the one dimension that does not divide -- 151669 and 248320 are not multiples
- * of anything convenient -- and refusing tensor parallel over an awkward vocab size would be
- * absurd. So the last rank holds fewer rows. The sampler merges candidate sets rather than
- * gathering full logits (spec §9, §13), so a ragged shard costs it nothing; a padded one would
- * cost a fake token id that has to be masked everywhere forever. */
-/* THE VOCABULARY SPLIT: ceil(total / world) rows a rank, ROUNDED UP TO A WHOLE 128-ROW BLOCK, the
- * last rank short. The block is RAD_FP8_BLOCK: a block-scaled fp8 lm_head is stored in 128x128
- * tiles and a row span that cuts a tile is refused (rad_weight_shard_span), so the cut has to land
- * on one. At two ranks on 248320 or 151936 the rounding changes nothing -- both halves are block
- * multiples -- and a vocabulary the world divides is never rounded; at three it is what makes the
- * head shardable at all (248320 / 3 = 82773.3; the ranks take 82816, 82816, 82688). core/engine.cpp
- * RESTATES this rule and checks it against the width the plugin declared; the two must move together. */
+/* The vocabulary split. The vocab need not divide by world (151669, 248320), so the last rank
+ * holds fewer rows. The sampler merges candidate sets rather than gathering full logits (spec §9,
+ * §13), so a ragged shard is free, while padding would need a fake token id masked everywhere.
+ *
+ * A vocabulary world divides keeps the even share. Otherwise each rank takes ceil(total / world)
+ * rounded up to a 128-row block (RAD_FP8_BLOCK), the last rank short: a block-scaled fp8 lm_head
+ * is stored in 128x128 tiles and a row span that cuts a tile is refused (rad_weight_shard_span).
+ * Example: 248320 over 3 ranks gives 82816, 82816, 82688. core/engine.cpp restates this rule and
+ * checks it against the declared width; keep the two in step. */
 inline int64_t vocab_per_rank(int64_t total, int world) {
-    /* A vocabulary the world divides keeps the even share, whatever the world: every container
-     * served today splits that way (248320 at 2 and 4, 151936 at 2 -- the last halves mid-block and
-     * is served with an untiled head). Only a vocabulary the world does NOT divide takes the
-     * block-aligned ceil, which is what makes a tiled head shardable at all. */
     if (total % world == 0) return total / world;
     const int64_t per = (total + world - 1) / world;
     return (per + 127) / 128 * 128;
@@ -717,11 +650,9 @@ inline int64_t shard_begin(int64_t total, int world, int rank) {
     return beg < total ? beg : total;
 }
 
-/* A container-header integer under either of the two spellings a key reaches us in: the GGUF one
- * (`qwen35.ssm.state_size`) and the HuggingFace one (`linear_key_head_dim`). One plugin serves a
- * .rad converted from either source, and the alternative is a second plugin that differs only in
- * its string literals. `found` says whether the value was read or defaulted, because a geometry
- * that silently defaults is a model that silently becomes a different model. */
+/* A container-header integer under its GGUF (`qwen35.ssm.state_size`) or HuggingFace
+ * (`linear_key_head_dim`) spelling, so one plugin serves a .rad converted from either. `found`
+ * reports whether the value was read or defaulted, so a caller can refuse a silent default. */
 inline long long meta_int2(const RadModelMeta* m, const char* gguf_key, const char* hf_key,
                            long long dflt, bool* found = nullptr) {
     const long long sentinel = -0x7FFFFFFFll;
@@ -731,15 +662,130 @@ inline long long meta_int2(const RadModelMeta* m, const char* gguf_key, const ch
     return v == sentinel ? dflt : v;
 }
 
-/* THE REMAINDER-FIRST ORDER OF THE RANKS. What does not divide evenly over the world and is a
- * HEAD'S worth of work -- the extra delta-net head -- goes to the ranks with NO attention first:
- * they pay nothing for attention (rad_block_attn_gated_fp8.h: one fill) and keep no attention
- * cache (rad_kv_group_zero), so they have the time for it, and the rank that held the extra head
- * AND attention -- the step's slowest -- is lighter for it. An expert's extra block is not a
- * head's worth (qwen4exp_fp8.cpp says why it stays on the rotation). This is a rank's PLACE in
- * that order: the attention-zero ranks take places 0..n-1 whatever `parity` is, and the attention
- * ranks follow in the rotation by `parity` -- so where no rank is attention-zero (every world the
- * heads divide) the place is exactly (rank - parity) mod world and every cut is the even one. */
+/* The key a text-model value is under: `<pre>text_config.<key>`, where a multimodal config nests
+ * its language model, when the container has it, else `<pre><key>`. `pre` is "" for the model and
+ * "draft." for a drafter's config. */
+inline const char* meta_text_key(const RadModelMeta* m, const char* key, const char* pre,
+                                 char (&buf)[192]) {
+    std::snprintf(buf, sizeof buf, "%stext_config.%s", pre, key);
+    if (!rad_meta_gets(m, buf, nullptr)) std::snprintf(buf, sizeof buf, "%s%s", pre, key);
+    return buf;
+}
+inline long long meta_text_geti(const RadModelMeta* m, const char* key, long long dflt,
+                                const char* pre = "") {
+    char k[192];
+    return rad_meta_geti(m, meta_text_key(m, key, pre, k), dflt);
+}
+inline double meta_text_getf(const RadModelMeta* m, const char* key, double dflt,
+                             const char* pre = "") {
+    char k[192];
+    return rad_meta_getf(m, meta_text_key(m, key, pre, k), dflt);
+}
+inline const char* meta_text_gets(const RadModelMeta* m, const char* key, const char* dflt,
+                                  const char* pre = "") {
+    char k[192];
+    return rad_meta_gets(m, meta_text_key(m, key, pre, k), dflt);
+}
+
+/* ================================================================== config arrays */
+/* Calls fn(token, length) for each token of a flattened config array until fn returns false.
+ * rad-convert writes an array of scalars space-separated (core/format/checkpoint.cpp,
+ * flatten_json); commas, brackets and quotes also separate, for values written by hand. */
+template <class F>
+inline void for_each_token(const char* s, F&& fn) {
+    if (!s) return;
+    auto sep = [](char ch) { return ch == ' ' || ch == ',' || ch == '[' || ch == ']' || ch == '"'; };
+    for (const char* p = s; *p;) {
+        while (*p && sep(*p)) ++p;
+        if (!*p) return;
+        const char* t = p;
+        while (*p && !sep(*p)) ++p;
+        if (!fn(t, (size_t)(p - t))) return;
+    }
+}
+
+inline bool token_is(const char* t, size_t n, const char* word) {
+    return std::strlen(word) == n && std::strncmp(t, word, n) == 0;
+}
+
+/* "1 10 20 30 39" -> the trunk layers a drafter taps, at most `max`. Out-of-range entries are
+ * dropped, not clamped: a drafter naming a layer this model lacks belongs to another target, and
+ * clamping would hide that. Parsing stops at the first token that is not a number. */
+inline int parse_layer_ids(const char* s, int64_t n_layer, int* out, int max) {
+    int n = 0;
+    for_each_token(s, [&](const char* t, size_t) {
+        if (n >= max) return false;
+        char* e = nullptr;
+        const long v = std::strtol(t, &e, 10);
+        if (e == t) return false;
+        if (v >= 0 && v < n_layer) out[n++] = (int)v;
+        return true;
+    });
+    return n;
+}
+
+/* A `layer_types` array as one flag per entry: 1 for any name in `one`, 0 for `zero`. Any other
+ * name is refused, naming `arch`. */
+inline int parse_layer_kinds(const char* arch, const char* s, std::initializer_list<const char*> one,
+                             const char* zero, std::vector<int>* out) {
+    out->clear();
+    int rc = RAD_OK;
+    for_each_token(s, [&](const char* t, size_t n) {
+        int k = token_is(t, n, zero) ? 0 : -1;
+        for (const char* w : one) if (token_is(t, n, w)) k = 1;
+        if (k < 0) {
+            fprintf(stderr, "radiance: %s: layer_types[%zu] is '%.*s'; known kinds are %s and %s\n",
+                    arch, out->size(), (int)n, t, *one.begin(), zero);
+            rc = RAD_E_UNSUPPORTED;
+            return false;
+        }
+        out->push_back(k);
+        return true;
+    });
+    return rc;
+}
+
+/* The hybrid trunk's interval rule (llama.cpp's): every `interval`-th layer is full attention, so
+ * with interval 4 layers 3, 7, ... are full and the rest linear. */
+inline bool is_full_attention(int64_t l, int64_t interval) {
+    return interval > 0 && (l + 1) % interval == 0;
+}
+
+/* Checks a container's `layer_types` (`s`, null or empty when it states none, as a GGUF-converted
+ * container does) against is_full_attention. The interval rule is not a property of the family,
+ * and a model built with the wrong layers linear still generates fluent text, so a disagreement is
+ * fatal. `full` lists the names of a full layer; entries past the trunk (an MTP block) are not
+ * compared. */
+inline int check_layer_schedule(const char* arch, const char* s, int64_t n_layer, int64_t interval,
+                                std::initializer_list<const char*> full) {
+    if (!s || !*s) return RAD_OK;
+    std::vector<int> kind;
+    RAD_ARCH_TRY(parse_layer_kinds(arch, s, full, "linear_attention", &kind));
+    if ((int64_t)kind.size() < n_layer) {
+        fprintf(stderr, "radiance: %s: layer_types names %zu layers and the model has %lld\n",
+                arch, kind.size(), (long long)n_layer);
+        return RAD_E_UNSUPPORTED;
+    }
+    for (int64_t l = 0; l < n_layer; ++l) {
+        const bool rule = is_full_attention(l, interval);
+        if ((kind[(size_t)l] != 0) != rule) {
+            fprintf(stderr, "radiance: %s: layer_types makes layer %lld %s and "
+                            "full_attention_interval %lld makes it %s; the layers are built by the "
+                            "interval\n", arch, (long long)l, rule ? "linear" : "full",
+                    (long long)interval, rule ? "full" : "linear");
+            return RAD_E_UNSUPPORTED;
+        }
+    }
+    return RAD_OK;
+}
+
+/* A rank's place in the remainder-first order. Head-sized work that does not divide evenly (the
+ * extra delta-net head) goes first to attention-zero ranks, which pay only a fill for attention
+ * (rad_block_attn_gated_fp8.h) and keep no attention cache, so the slowest rank is not also given
+ * the extra head. An expert's extra block is not head-sized and stays on the rotation
+ * (qwen4exp_fp8.cpp). Attention-zero ranks take places 0..n-1 regardless of `parity`; attention
+ * ranks follow, rotated by `parity`. With no attention-zero rank the place is
+ * (rank - parity) mod world. */
 inline int64_t remainder_place(const Geom& g, int rank, int parity) {
     const int nz = g.world - g.attn_world;
     if (rank >= g.attn_world) return rank - g.attn_world;
@@ -747,23 +793,23 @@ inline int64_t remainder_place(const Geom& g, int rank, int parity) {
     return nz + ((rank - parity) % aw + aw) % aw;
 }
 
-/* `arch_splits_ff`: the plugin divides the feed-forward width across the ranks ITSELF (qwen4exp:
- * the routed experts' width is cut by whole fp8 blocks, by parity, at any world up to the block
- * count). With it set, a width the world does not divide is left whole in g.n_ff and the plugin
- * takes its slice from there; without it the refusal stands, because for every other plugin g.n_ff
- * IS the per-rank width. A width that does divide is unaffected either way. */
-/* `attn_world`: the plugin's attention block serves a SMALLER ATTENTION WORLD (Geom::attn_world)
- * -- it declares the attention-zero rank's fill and zero KV group and spans the attention
- * projections by `attn_rank`. Only rad_block_attn_gated_fp8.h does. Without it a world the KV head
- * count neither divides nor is a multiple of is refused here, by name, rather than declared with
- * an even shard the block would then cut wrongly. */
+/* Fills `g` from model metadata and the build context.
+ *
+ * `arch_splits_ff`: the plugin splits the feed-forward width itself (qwen4exp cuts routed expert
+ * width by whole fp8 blocks, by parity). A width world does not divide is then left whole in
+ * g.n_ff for the plugin to slice; otherwise it is refused, since g.n_ff is the per-rank width.
+ *
+ * `attn_world_ok`: the plugin's attention block supports a smaller attention world
+ * (Geom::attn_world): it declares the attention-zero fill and zero KV group and spans projections
+ * by `attn_rank`. Only rad_block_attn_gated_fp8.h does. Otherwise a world the KV head count
+ * neither divides nor is a multiple of is refused. */
 inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
                      const char* dtype, uint32_t act_dtype, bool arch_splits_ff = false,
                      bool attn_world_ok = false) {
     if (!m || !c) return RAD_E_INVAL;
     if (c->is_draft) {
-        /* A drafter declared into this plugin would need a second set of per-rank handles and a
-         * second name-map namespace. Nothing unimplemented returns success (spec §17). */
+        /* A draft scope would need a second set of per-rank handles and name-map namespace; an
+         * unimplemented path never returns success (spec §17). */
         fprintf(stderr, "radiance: this plugin has no draft scope\n");
         return RAD_E_UNSUPPORTED;
     }
@@ -782,8 +828,8 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
     g.max_spec  = c->max_spec;
     g.max_logit_rows = c->max_seqs * (c->max_spec > 0 ? c->max_spec + 1 : 1);
     if (g.max_logit_rows > c->max_tok) g.max_logit_rows = c->max_tok;
-    /* The engine's KL mode reads a row at every prompt position (RadBuildCtx::max_out_rows), which
-     * is more rows than tokens: the sampler's own rows come first and repeat a scored one. */
+    /* KL mode reads a row at every prompt position plus the sampler's own rows, which repeat a
+     * scored one (RadBuildCtx::max_out_rows), so it can exceed the token count. */
     if (c->max_out_rows > g.max_logit_rows) g.max_logit_rows = c->max_out_rows;
     g.rank      = c->rank;
     g.world     = c->world_size ? c->world_size : 1;
@@ -812,9 +858,7 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
     if (g.n_layer <= 0 || g.n_embd <= 0 || g.head_dim <= 0 || g.n_head_all <= 0 ||
         g.n_ff_all <= 0 || g.n_vocab_all <= 0 || g.max_tok <= 0)
         return RAD_E_INVAL;
-    /* eps and theta are read, not defaulted. A container that omits them and gets 1e-6 and 1e6
-     * anyway is a container that silently becomes a different model, and the symptom is fluent
-     * wrong text. */
+    /* eps and theta are required, not defaulted: a wrong default yields fluent wrong text. */
     if (!(g.eps > 0.0f) || !(g.theta > 0.0f)) {
         fprintf(stderr, "radiance: container gives rms_eps=%g rope_theta=%g; both are required\n",
                 (double)g.eps, (double)g.theta);
@@ -822,9 +866,9 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
     }
 
     int s;
-    /* THE ATTENTION WORLD (see the field). Below the KV head count, or a multiple of it, it is the
-     * world and the two rules that follow run on the world as before. Otherwise it is the largest
-     * multiple of the head count under the world, and the ranks past it carry zero attention. */
+    /* The attention world (see Geom::attn_world): the world itself when it is at most the KV head
+     * count or a multiple of it, else the largest multiple below it, with the ranks past it
+     * attention-zero. */
     g.attn_world = g.world;
     g.attn_rank  = g.rank;
     g.attn_zero  = false;
@@ -839,27 +883,14 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
     }
     const int aw = g.attn_world, ar = g.attn_rank;
     if ((s = divide_or_fail(g.n_head_all, aw, "n_head", &g.n_head)) < 0) return s;
-    /* THE KV HEADS ARE REPLICATED WHEN THERE ARE NOT ENOUGH TO SPLIT. There is one row-span per KV
-     * head and no way to hand four ranks half a head, so `divide_or_fail` on n_head_kv is the
-     * wrong verb once world exceeds the head count -- the question is not rounding, it is whether
-     * the declaration is allowed to say one KV head per rank. It is, when world is a multiple of
-     * the KV head count: query heads 0-11 belong to KV head 0 and 12-23 to KV head 1, so ranks
-     * {0,1} need only KV head 0 and ranks {2,3} only KV head 1. Each rank then declares
-     * n_head_kv 1 and reads its own head's row-span of k/v, which `kv_off` locates; the attention
-     * declaration comes out at gqa 6 over a page of 4 instead of gqa 12 over a page of 2, and
-     * kv_dim(), gqa() and every block that reads them need no new branch because from here down a
-     * replicated rank and a split rank look the same.
-     *
-     * THE COST IS HONEST AND IT IS MEMORY, NOT MATH: the replicating ranks hold BYTE-IDENTICAL KV
-     * weights, a replicated read that costs no extra VRAM per rank versus the TP2 split it
-     * replaces (Flash-Next: 2 KV heads x 5120 x 256 rows read twice instead of once). What it buys
-     * is that world 4 is declarable at all.
-     *
-     * When world <= n_head_kv_all the split below is untouched, so a world that divides the KV
-     * heads -- TP2 on this family -- declares exactly as it did before replication existed. */
+    /* KV heads are replicated when there are fewer than ranks, which requires world to be a
+     * multiple of the KV head count. With 24 query heads over 2 KV heads at world 4, ranks {0,1}
+     * need only KV head 0 and ranks {2,3} only KV head 1. Each rank declares n_head_kv 1 and reads
+     * its head's row-span of k/v at `kv_off`; kv_dim(), gqa() and the blocks then treat a
+     * replicated rank like a split one. The replicating ranks hold identical KV weights, at no
+     * extra VRAM per rank versus the TP2 split. */
     if (aw > g.n_head_kv_all) {
-        /* aw is a multiple of the head count by construction (the world itself, checked here, or
-         * the attention world, which is one). */
+        /* Holds for the attention world by construction; checked for the plain world. */
         if (aw % g.n_head_kv_all != 0) {
             fprintf(stderr, "radiance: world_size = %d cannot replicate n_head_kv = %lld; "
                             "replication needs world to be a multiple of the KV head count\n",
@@ -871,9 +902,9 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
     } else if ((s = divide_or_fail(g.n_head_kv_all, aw, "n_head_kv", &g.n_head_kv)) < 0) {
         return s;
     } else {
-        /* A split rank reads the rows the plain row-shard gives it -- when the attention world
-         * is the world. Under a smaller attention world the even shard over `world` is the wrong
-         * cut, and the block spans [kv_off, kv_off + kv_dim) instead. */
+        /* A split rank uses the plain row-shard, except under a smaller attention world, where
+         * the even shard over `world` is the wrong cut and the block spans
+         * [kv_off, kv_off + kv_dim) instead. */
         g.kv_off = aw == g.world ? 0 : ar * g.n_head_kv * g.head_dim;
     }
     if (arch_splits_ff && g.world > 1 && g.n_ff_all % g.world != 0) {
@@ -881,18 +912,9 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
     } else if ((s = divide_or_fail(g.n_ff_all, g.world, "n_ff", &g.n_ff)) < 0) {
         return s;
     }
-    /* THE VOCABULARY IS SPLIT. r4d_sample_topk_f32 takes a vocabulary offset and packs its
-     * candidates as (u32 GLOBAL id, f32 logit) pairs, and the all-gather places every rank's
-     * pairs for one sampled position side by side, which is the layout sample_merge_topk reads.
-     * lm_head is therefore ROW-SHARDED and a rank reads half of it: on Qwen3.8-27B that is
-     * 1.27 GiB of the 16.1 GiB a rank reads per decode step, which makes the logits GEMM a
-     * large single item in the decode budget.
-     *
-     * The last rank is SHORT rather than padded -- 248320 and 151669 divide by nothing convenient
-     * -- because the sampler merges candidate sets rather than gathering full logits, so a ragged
-     * shard costs it nothing and a padded one would cost a fake token id masked everywhere
-     * forever. core/engine.cpp restates this split and checks its restatement against the width
-     * the plugin declared. */
+    /* lm_head is row-sharded by vocabulary (see vocab_per_rank). r4d_sample_topk_f32 takes a
+     * vocabulary offset and packs candidates as (u32 global id, f32 logit) pairs; the all-gather
+     * places every rank's pairs side by side, the layout sample_merge_topk reads. */
     g.n_vocab   = shard_extent(g.n_vocab_all, g.world, g.rank);
     g.vocab_off = shard_begin (g.n_vocab_all, g.world, g.rank);
     if (g.n_vocab <= 0) return RAD_E_INVAL;
@@ -900,47 +922,38 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
 }
 
 /* ================================================================== a vocab-sharded draft head */
-/* WHETHER A DRAFTER'S OWN HEAD CAN BE VOCAB-SHARDED, and it lives here because both the block that
- * declares the op and the plugin that sizes the buffer under it have to give the SAME answer -- a
- * buffer that disagreed with the op declared over it is a read past its end. Every drafter asks
- * the identical question, so the test lives in one place: two copies of a rule this exact are two
- * things to keep in step.
+/* Whether a drafter's own head can be vocab-sharded. Shared so the block declaring the op and the
+ * plugin sizing its buffer agree; a disagreement is a read past the buffer's end.
  *
- * IT REFUSES A RAGGED OR UNALIGNED SHARD rather than working around it. The packed w2a8 layout is
- * TILE-MAJOR at 16 output rows a block, so a rank whose share is not a multiple of 16 has a block
- * spanning two ranks and there is no row shard of it at all; and the candidate merge's global ids
- * are `rank * n_vocab + local`, which is only true of a contiguous, equally-sized split. Either
- * one wrong is fluent text with the wrong tokens in it. */
+ * Requires an even split in multiples of 16: the packed w2a8 layout is tile-major at 16 output
+ * rows a block, so an unaligned share splits a block across ranks, and the candidate merge's
+ * global ids are `rank * n_vocab + local`, true only for a contiguous equal split. */
 inline bool vocab_head_sharded(const Geom& g) {
     return g.world > 1 && g.n_vocab > 0 && (g.n_vocab % 16) == 0 &&
            g.n_vocab * (int64_t)g.world == g.n_vocab_all &&
            g.vocab_off == (int64_t)g.rank * g.n_vocab;
 }
-/* Rows of such a head, and therefore the width of its logit plane, on THIS rank. */
+/* Rows of such a head on this rank, and so the width of its logit plane. */
 inline int64_t vocab_head_rows(const Geom& g) {
     return vocab_head_sharded(g) ? g.n_vocab : g.n_vocab_all;
 }
 
 /* ================================================================== the KV cache operand */
-/* attn_paged and kv_store take the group's cache as an operand. RadKVGroupBatch carries the slot
- * mapping, the block table and the sequence lengths, but the pool base belongs to the block
- * manager and not to the batch -- so the operand names the GROUP and the LAYER and the core
- * resolves it, the same way it resolves a weight handle. */
+/* The cache operand for attn_paged and kv_store. The pool base belongs to the block manager, not
+ * the batch, so the operand names the group and layer and the core resolves it like a weight
+ * handle. */
 inline RadOperand kv_cache(rad_kvgroup group, int layer) { return RAD_KV(group, layer); }
 
 /* ================================================================== step-sized operands */
-/* EVERY OPERAND A STEP ISSUES CARRIES THE STEP'S ROW COUNT, NOT THE BUFFER'S.
+/* Every operand a step issues carries the step's row count, not the buffer's.
  *
- * A ranged parameter is collapsed to a BAND when the instance is resolved (spec §2.2) and
- * `rad_issue` carries the actual value as an integer rather than by rewriting the parameter list,
- * so a kernel cannot read the row count out of `M`: it would get the band's upper bound.
- * libref therefore reads every extent off the operands (libref/ref_ops.h), and an
- * operand handed over at its declared extent means a single-row decode computed over all 8192 rows
- * of an arena buffer -- reading uninitialised memory and writing over the next op's input.
+ * A ranged parameter is collapsed to a band at resolve time (spec §2.2), so a kernel cannot read
+ * the row count from `M` (it would get the band's upper bound); kernels read extents from the
+ * operands (libref/ref_ops.h). An operand at its declared extent makes a one-row decode compute
+ * over the whole arena buffer, reading uninitialised memory and overwriting the next op's input.
  *
- * So the run phase narrows, and these three helpers are how. `rows` is dim 0, which is tokens for
- * every activation buffer in this library; the strides are products of the trailing dimensions, so
- * shortening the outermost one leaves all of them correct (core/runtime/issue.cpp says the same).
+ * `rows` is dim 0, tokens for every activation buffer here. Strides are products of the trailing
+ * dimensions, so shortening dim 0 keeps them correct (core/runtime/issue.cpp).
  */
 inline RadOperand brows(rad_buf h, int64_t rows) {
     RadOperand o = RAD_B(h);
@@ -948,22 +961,18 @@ inline RadOperand brows(rad_buf h, int64_t rows) {
     return o;
 }
 
-/* A column slice narrowed to this step's rows: the two together, because every strided view this
- * library takes is also row-narrowed and spelling it as two calls invites forgetting one. */
+/* A column slice narrowed to this step's rows. */
 inline RadOperand bcol(rad_buf h, int64_t first, int64_t width, int64_t rows) {
     RadOperand o = RAD_B_COL(h, first, width);
     o.rows = rows;
     return o;
 }
 
-
-/* A COLUMN SLICE OF A RANGE OF ROWS. `offset` is a flat element offset and `cols` narrows the last
- * dimension with the declared width kept as the stride, so the two compose: first_row * pitch
- * picks the row, first_col picks the column within it (core/runtime/issue.cpp says the same).
- *
- * The mixed step is what needs it. A block that issues the recurrent path over the decode rows and
- * the chunked path over the prefill ones is issuing each over a RANGE of tokens, and the operands
- * it hands them are already column views of a fused projection. */
+/* A column slice of a range of rows. `offset` is a flat element offset and `cols` narrows the last
+ * dimension keeping the declared width as stride, so first_row * pitch picks the row and
+ * first_col the column (core/runtime/issue.cpp). Used by mixed steps, which issue the recurrent
+ * path over the decode rows and the chunked path over the prefill rows, each over column views
+ * of a fused projection. */
 inline RadOperand bcol_at(rad_buf h, int64_t first_row, int64_t pitch,
                           int64_t first_col, int64_t width, int64_t rows) {
     RadOperand o = RAD_B(h);
@@ -973,15 +982,11 @@ inline RadOperand bcol_at(rad_buf h, int64_t first_row, int64_t pitch,
     return o;
 }
 
-/* A RANGE OF ROWS, offset and count. The element offset is `first * pitch` because a buffer's
- * rows are its declared width apart and RadOperand::offset is in elements; dim 0 is then narrowed
- * to `n`, which is what makes the slice a tensor the kernel sees as [n, pitch].
+/* Rows [first, first + n), seen by the kernel as [n, pitch]; RadOperand::offset is in elements.
  *
- * It exists because one op can cap the whole step. A libr4d kernel is constrained to a band, and
- * an op whose widest kernel stops at M=64 forces every op in the step down to 64 tokens -- on this
- * model that is the delta net's 96-column a|b projection, 0.5% of the layer's projection bytes,
- * holding the prefill chunk of a 27B model to 64. Issuing that one op in slices costs a launch per
- * 64 rows and lets everything else run at the chunk the scheduler wanted. */
+ * Lets one op be issued in slices: an op whose widest kernel stops at M=64 (the delta net's
+ * 96-column a|b projection) would otherwise cap every op in the step at 64 tokens. Slicing it
+ * costs a launch per 64 rows. */
 inline RadOperand brow_slice(rad_buf h, int64_t first, int64_t n, int64_t pitch) {
     RadOperand o = RAD_B(h);
     o.offset = first * pitch;
@@ -989,31 +994,29 @@ inline RadOperand brow_slice(rad_buf h, int64_t first, int64_t n, int64_t pitch)
     return o;
 }
 
-/* A batch field: a pointer the core did not allocate, so it has no declared shape and the row
- * count has to come from here. Without it the operand arrives rank 0 and a kernel that sizes its
- * loop by numel(positions) runs one token. */
-/* A dense two-dimensional batch field: [rows, cols], packed. The block table is the one that
- * needs it -- see RAD_P_T2 in rad_runtime.h for why a rank-1 spelling is not enough. */
+/* A dense two-dimensional batch field, [rows, cols] packed: the block table (RAD_P_T2 in
+ * rad_runtime.h says why rank 1 is not enough). */
 inline RadOperand praw2(const void* p, uint32_t dtype, int64_t rows, int64_t cols) {
     return RAD_P_T2(p, dtype, rows, cols);
 }
 
+/* A batch field. The core did not allocate it, so it has no declared shape and the row count
+ * comes from here; without it the operand is rank 0 and a kernel sizing its loop by
+ * numel(positions) runs one token. */
 inline RadOperand praw(const void* p, uint32_t dtype, int64_t rows) {
     RadOperand o = RAD_P_T(p, dtype);
     o.rows = rows;
     return o;
 }
 
-/* THE ROTARY POSITIONS OF A PASS, in the two forms its consumers take.
+/* Rotary positions of a pass, in the two forms consumers take.
  *
- * `rope_pos1` is one component a token: RadBatch::rope_pos's plane 0 when the batch carries the
- * planes, `positions` when it does not. It is what a cos/sin table is filled and read at, and it
- * is exact for every token of a pass whose components agree (RadBatch::rope_mixed 0) -- so a
- * fused path that reads it is taken only then.
+ * `rope_pos1`: one component per token, RadBatch::rope_pos's plane 0 if present, else
+ * `positions`. A cos/sin table is filled and read at it. It is exact only when every token's
+ * components agree (RadBatch::rope_mixed 0), so fused paths that read it are taken only then.
  *
- * `rope_posmc` is what a multi-component `rope` takes: the dense [3, T] planes for an M-RoPE model
- * with a batch that carries them, and the one-component form otherwise -- which every mode reads
- * as NeoX, so a model without M-RoPE and a text-only deployment rotate over `positions` alone. */
+ * `rope_posmc`: what a multi-component `rope` takes. The dense [3, T] planes for an M-RoPE model
+ * whose batch carries them, else the one-component form, which every mode reads as NeoX. */
 inline RadOperand rope_pos1(const RadBatch* b, int64_t T) {
     return praw(b->rope_pos ? b->rope_pos : b->positions, RAD_I32, T);
 }
@@ -1021,12 +1024,12 @@ inline RadOperand rope_posmc(const Geom& g, const RadBatch* b, int64_t T) {
     if (g.rope_mc && b->rope_pos) return praw2(b->rope_pos, RAD_I32, 3, T);
     return praw(b->positions, RAD_I32, T);
 }
-/* Does a pass have a token whose rotary components differ -- which a one-component fused path
- * cannot rotate. */
+/* True when some token's rotary components differ, which a one-component fused path cannot
+ * rotate. */
 inline bool rope_mixed(const RadBatch* b) { return b->rope_pos && b->rope_mixed; }
 
-/* A rotary op declared with the geometry's YaRN coefficients appended. A model without YaRN declares
- * exactly the parameters it was given, so its op identities and tune keys are unchanged. */
+/* A rotary op declared with the geometry's YaRN coefficients appended. Without YaRN the
+ * parameters are passed unchanged, so op identities and tune keys do not change. */
 inline rad_op decl_rotary(RadBuilder* b, const Geom& g, const char* name,
                           const RadParam* params, int n, const rad_weight* weights, int nw) {
     if (g.yarn.factor == 0.0f) return rad_decl_op(b, name, params, n, weights, nw);
@@ -1038,10 +1041,10 @@ inline rad_op decl_rotary(RadBuilder* b, const Geom& g, const char* name,
     return rad_decl_op(b, name, p.data(), (int)p.size(), weights, nw);
 }
 
-/* THE ONE READER OF A MODEL'S ROTARY SCALING. Every architecture calls it after geom_from, for the
- * target ("") and for a drafter with a config of its own ("draft."), and it sets `g.rope_scale` and
- * `g.yarn` from the free-form keys and from nothing else. RadModelMeta::rope_scale is not read: a
- * factor without its type would be a linear position divide for a scheme that is not one.
+/* Reads a model's rotary scaling into `g.rope_scale` and `g.yarn`. Every architecture calls it
+ * after geom_from, for the target ("") and for a drafter with its own config ("draft."). Only the
+ * free-form keys are read; RadModelMeta::rope_scale is not, since a factor without its type would
+ * be applied as a linear divide.
  *
  * The object read is the first of `text_config.rope_parameters.`, `rope_parameters.`,
  * `text_config.rope_scaling.`, `rope_scaling.` (a drafter: `draft.rope_parameters.`,
@@ -1103,8 +1106,7 @@ inline int yarn_from(Geom& g, const RadModelMeta* meta, const char* prefix, int6
                         "and yarn are\n", who, type, type_key.c_str());
         return RAD_E_UNSUPPORTED;
     }
-    /* `truncate` is a JSON boolean, which the converter writes as 1 or 0; true and false spelled
-     * out are the same answer. */
+    /* `truncate` is a JSON boolean; the converter writes 1 or 0, and true/false are accepted. */
     double truncate = 1.0;
     if (const char* t = rad_meta_gets(meta, (home + "truncate").c_str(), nullptr))
         truncate = !std::strcmp(t, "true") ? 1.0 : !std::strcmp(t, "false") ? 0.0 : get("truncate", 1.0);
@@ -1150,35 +1152,21 @@ inline int yarn_from(Geom& g, const RadModelMeta* meta, const char* prefix, int6
  * `mode` otherwise. */
 inline rad_op decl_rope(RadBuilder* b, const Geom& g, int64_t rows, int64_t head_dim,
                         int64_t n_head, int64_t n_head_kv, int64_t rot, const char* mode) {
-    if (g.rope_mc)
-        return decl_rotary(b, g, "rope",
-                      RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("head_dim", head_dim),
-                                 RAD_INT("n_head", n_head), RAD_INT("n_head_kv", n_head_kv),
-                                 RAD_F64("theta", g.theta), RAD_F64("scale", g.rope_scale),
-                                 RAD_STR("mode", g.rope_mode), RAD_INT("rotary_dim", rot),
-                                 RAD_STR("sections", g.rope_sections)),
-                      RAD_NOWEIGHTS);
-    return decl_rotary(b, g, "rope",
-                  RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("head_dim", head_dim),
-                             RAD_INT("n_head", n_head), RAD_INT("n_head_kv", n_head_kv),
-                             RAD_F64("theta", g.theta), RAD_F64("scale", g.rope_scale),
-                             RAD_STR("mode", mode), RAD_INT("rotary_dim", rot)),
-                  RAD_NOWEIGHTS);
+    const RadParam ps[] = { RAD_RANGE("M", 1, rows), RAD_INT("head_dim", head_dim),
+                            RAD_INT("n_head", n_head), RAD_INT("n_head_kv", n_head_kv),
+                            RAD_F64("theta", g.theta), RAD_F64("scale", g.rope_scale),
+                            RAD_STR("mode", g.rope_mc ? g.rope_mode : mode),
+                            RAD_INT("rotary_dim", rot), RAD_STR("sections", g.rope_sections) };
+    const int n = (int)(sizeof ps / sizeof ps[0]) - (g.rope_mc ? 0 : 1);
+    return decl_rotary(b, g, "rope", ps, n, nullptr, 0);
 }
 
-
-/* HOW MANY OF THIS STEP'S SEQUENCES ARE DECODE ROWS, AND WHERE THEIR TOKENS END.
+/* How many of this step's sequences are decode rows, and where their tokens end.
  *
- * A block that issues one path over the decode rows and another over the prefill chunks needs the
- * boundary, and for a MIXED step RadBatch::n_seq_decode is the only thing that carries it. For a
- * pure step it is not: PREFILL means none of them and DECODE means all of them, by definition of
- * the phase, and asking the phase first is what makes the two fields optional there. A batch that
- * sets phase and leaves them zero -- a test, a bench harness, an out-of-tree caller -- would
- * otherwise be handed the prefill path by a block that read them alone, with nothing to say so.
- * tests/arch_test.cpp covers exactly that case.
- *
- * The core sets both fields on every step including the pure ones, so this agrees with them; it
- * is the fallback that matters, not the answer. */
+ * A mixed step carries the boundary in RadBatch::n_seq_decode / n_tok_decode. For a pure step the
+ * phase decides (PREFILL: none, DECODE: all), so a caller that sets only the phase (a test, a
+ * bench, an out-of-tree caller) still gets the right path; tests/arch_test.cpp covers this. The
+ * core sets both fields on every step, so the two agree. */
 inline void batch_split(const RadBatch* b, int64_t* n_seq_dec, int64_t* n_tok_dec) {
     switch (b->phase) {
         case RAD_PHASE_PREFILL: *n_seq_dec = 0;              *n_tok_dec = 0;              break;
@@ -1187,22 +1175,80 @@ inline void batch_split(const RadBatch* b, int64_t* n_seq_dec, int64_t* n_tok_de
     }
 }
 
-/* The step batch's entry for one declared KV group. The batch is built once per step by the core
- * and shared by every layer and every group (spec §8); this is the lookup, not a computation. */
+/* The step batch's entry for one declared KV group (built once per step by the core, spec §8). */
 inline const RadKVGroupBatch* kv_batch(const RadBatch* b, rad_kvgroup group) {
     for (int i = 0; i < b->n_kv_groups; ++i)
         if (b->kv[i].group == group) return &b->kv[i];
     return nullptr;
 }
 
+/* ================================================================== a block drafter */
+/* A drafter's Geom: the target's (n_embd, vocabulary, deployment bounds, rank, wire) with the
+ * layer, head, feed-forward, norm and rotary geometry of the container's `draft.` config, split
+ * over the ranks, and a plain RMS norm. A drafter is a second model, so nothing is defaulted: a
+ * config that does not describe one is refused, naming `what` (spec §17). So is a vocabulary
+ * other than the target's, since a drafter reads the target's embedding and lm_head. */
+inline int drafter_geom(Geom& dg, const Geom& target, const RadModelMeta* meta, const char* what) {
+    dg = target;
+    dg.n_layer       = rad_meta_geti(meta, "draft.num_hidden_layers", 0);
+    dg.head_dim      = rad_meta_geti(meta, "draft.head_dim", 0);
+    dg.n_head_all    = rad_meta_geti(meta, "draft.num_attention_heads", 0);
+    dg.n_head_kv_all = rad_meta_geti(meta, "draft.num_key_value_heads", 0);
+    dg.n_ff_all      = rad_meta_geti(meta, "draft.intermediate_size", 0);
+    dg.eps           = (float)rad_meta_getf(meta, "draft.rms_norm_eps", 0.0);
+    dg.theta         = (float)rad_meta_getf(meta, "draft.rope_parameters.rope_theta",
+                                            rad_meta_getf(meta, "draft.rope_theta", 0.0));
+    dg.wadd = dg.wadd_qk = 0.0f;
+    if (dg.n_layer <= 0 || dg.head_dim <= 0 || dg.n_head_all <= 0 || dg.n_head_kv_all <= 0 ||
+        dg.n_ff_all <= 0 || !(dg.eps > 0.0f) || !(dg.theta > 0.0f)) {
+        fprintf(stderr, "radiance: the container's `draft.` config does not describe a %s "
+                        "drafter: layers %lld, heads %lld / kv %lld, head_dim %lld, ffn %lld, "
+                        "rms_eps %g, rope_theta %g\n", what,
+                (long long)dg.n_layer, (long long)dg.n_head_all, (long long)dg.n_head_kv_all,
+                (long long)dg.head_dim, (long long)dg.n_ff_all, (double)dg.eps, (double)dg.theta);
+        return RAD_E_INVAL;
+    }
+    RAD_ARCH_TRY(yarn_from(dg, meta, "draft.", dg.head_dim));
+    RAD_ARCH_TRY(divide_or_fail(dg.n_head_all,    dg.world, "draft num_attention_heads", &dg.n_head));
+    RAD_ARCH_TRY(divide_or_fail(dg.n_head_kv_all, dg.world, "draft num_key_value_heads", &dg.n_head_kv));
+    RAD_ARCH_TRY(divide_or_fail(dg.n_ff_all,      dg.world, "draft intermediate_size",   &dg.n_ff));
+    const long long dvocab = rad_meta_geti(meta, "draft.vocab_size", dg.n_vocab_all);
+    if (dvocab != dg.n_vocab_all) {
+        fprintf(stderr, "radiance: the %s drafter claims a %lld-token vocabulary and the target "
+                        "has %lld; it reads the target's embedding and lm_head\n",
+                what, dvocab, (long long)dg.n_vocab_all);
+        return RAD_E_UNSUPPORTED;
+    }
+    return RAD_OK;
+}
+
+/* The drafter's own KV group, bound to its layers from `base_layer`: it differs from the trunk's
+ * in layer count and head geometry. A `window` > 0 makes it RAD_KV_WINDOW, which recycles blocks
+ * below the window. Its dtype is --kv-cache-dtype, like every attention cache, and is written to
+ * dg.kv_dtype. */
+inline int drafter_kv_group(RadBuilder* b, Names& nm, const RadBuildCtx* ctx, Geom& dg,
+                            int64_t window, int base_layer, rad_kvgroup* out) {
+    RadKVGroupDecl d{};
+    d.kind      = window > 0 ? RAD_KV_WINDOW : RAD_KV_FULL;
+    d.dtype     = rad_kv_cache_dtype(ctx, RAD_BF16);
+    d.window    = window;
+    d.n_head_kv = dg.n_head_kv;
+    d.head_dim  = dg.head_dim;
+    *out = rad_decl_kv_group(b, nm.f("kv_draft"), &d);
+    for (int64_t l = 0; l < dg.n_layer; ++l)
+        RAD_ARCH_TRY(rad_bind_layer_kv(b, base_layer + (int)l, *out));
+    dg.kv_dtype = rad_dtype_name(d.dtype);
+    return RAD_OK;
+}
+
 /* ================================================================== the plugin exports */
-/* The four C symbols spec §2.4 names, wired to a namespace. Defining them through a macro keeps
- * the plugin source free of extern "C" boilerplate, and RAD_ARCH_NO_EXPORTS lets the unit test
- * include two plugin sources into one translation unit without the exports colliding -- which is
- * what makes the declared graph testable with no GPU and no model file. */
-/* QUANT is the container's quantisation descriptor this plugin serves, "" for an unquantised one.
- * It is the second half of the selection key (spec §2.4, rad_builder.h): qwen35_bf16 and
- * qwen35_fp8 both answer "qwen35" to rad_arch_id and differ only here. */
+/* The C symbols spec §2.4 names, wired to a namespace. RAD_ARCH_NO_EXPORTS lets the unit test
+ * include two plugin sources in one translation unit without the exports colliding, so the
+ * declared graph is testable with no GPU and no model file.
+ *
+ * QUANT is the quantisation descriptor this plugin serves, "" for unquantised: the second half of
+ * the selection key (spec §2.4, rad_builder.h). qwen35_bf16 and qwen35_fp8 both answer "qwen35"
+ * to rad_arch_id and differ only here. */
 #define RAD_ARCH_PLUGIN(NS, ID, QUANT, VERSION, DESC)                                          \
     extern "C" const char* rad_arch_id(void) { return ID; }                                    \
     extern "C" const char* rad_arch_quant(void) { return QUANT; }                              \
@@ -1213,33 +1259,34 @@ inline const RadKVGroupBatch* kv_batch(const RadBatch* b, rad_kvgroup group) {
     }                                                                                          \
     extern "C" uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }               \
     extern "C" const RadPluginInfo* rad_plugin_info(void) {                                    \
-        /* The PLUGIN's name, not the architecture id: rad_abi.h spells the convention out       \
-         * ("qwen3_dense_bf16"), the registry requires plugin names to be unique, and a family    \
-         * with one plugin per weight format has several plugins per architecture. Passing ID     \
-         * here would make qwen35_bf16 and qwen35_fp8 both "qwen35", and the second would be      \
-         * refused at load. */                                                                    \
+        /* The plugin's name (rad_abi.h: "qwen3_dense_bf16"), not the architecture id: plugin   \
+         * names must be unique and one architecture can have several plugins. */               \
         static const RadPluginInfo info = { RAD_PLUGIN_ARCH, #NS, VERSION, DESC, "" };         \
         return &info;                                                                          \
     }
 
-
-/* THE FIFTH EXPORT, AND IT IS OPT-IN. A plugin that has nothing to say before declare does not
- * define it; the core reads the absence as "no opinion" and every field of RadArchProbe keeps its
- * zero. Separate from RAD_ARCH_PLUGIN rather than folded into it so that adding a question to
- * RadArchProbe never makes an existing plugin fail to compile. */
+/* Optional pre-declare probe. Without it every RadArchProbe field stays zero. Kept out of
+ * RAD_ARCH_PLUGIN so adding a RadArchProbe field never breaks an existing plugin's build. */
 #define RAD_ARCH_PROBE(NS)                                                                     \
     extern "C" int rad_arch_probe(const RadModelMeta* m, RadArchProbe* out) {                  \
         return NS::probe(m, out);                                                              \
     }
 
-/* THE REPLY FORMAT, ALSO OPT-IN. A plugin whose model spells its reasoning and tool calls in a way
- * the chat template's analysis does not find -- or finds wrongly -- states it here once, and the
- * reply parser, the lazy call grammar and its trigger words all follow from it. NS::chat_format
- * returns a pointer to static storage with struct_size = sizeof(RadChatFormat), or null to let
- * the template decide for this particular model. */
+/* Optional reply format, for a model whose reasoning and tool-call syntax the chat template
+ * analysis misses or misreads. The reply parser, lazy call grammar and trigger words follow from
+ * it. NS::chat_format returns static storage with struct_size = sizeof(RadChatFormat), or null to
+ * let the template decide for this model. */
 #define RAD_ARCH_CHAT_FORMAT(NS)                                                               \
     extern "C" const RadChatFormat* rad_arch_chat_format(const RadModelMeta* m) {              \
         return NS::chat_format(m);                                                             \
+    }
+
+/* The audio format, also opt-in: a model with an audio encoder states how its prompt carries a
+ * clip and asks for a transcript (RadAudioFormat). NS::audio_format returns static storage with
+ * struct_size = sizeof(RadAudioFormat), or null for a model that serves no speech route. */
+#define RAD_ARCH_AUDIO_FORMAT(NS)                                                              \
+    extern "C" const RadAudioFormat* rad_arch_audio_format(const RadModelMeta* m) {            \
+        return NS::audio_format(m);                                                            \
     }
 
 }  /* namespace arch */

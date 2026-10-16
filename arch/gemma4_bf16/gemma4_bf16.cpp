@@ -1,14 +1,15 @@
-/* gemma4_bf16.cpp -- Gemma 4 dense, bf16, with its vision tower (gemma4_vision.h).
+/* gemma4_bf16.cpp -- Gemma 4 dense, bf16, with its vision tower (rad_block_gemma4_vision.h).
  *
- * Two attention classes over ONE residual stream, alternating by layer. A "sliding" layer is
+ * Two attention classes over one residual stream, alternating by layer. A "sliding" layer is
  * sliding-window attention over head_dim 256 with a v projection and standard RoPE; a "global"
  * layer is windowless attention over head_dim 512 with no v projection (k == v) and proportional
- * RoPE (the "head" ladder) over the partial rotary width. Every layer is GemmaRMSNorm -- x_hat *
- * (1 + w) -- with a SECOND norm on each projection's output before its residual, a weightless RMS
- * on the value, and a GELU (not SwiGLU) feed-forward. The final logits are soft-capped to
+ * RoPE (the "head" ladder) over the partial rotary width. Norms are plain RMSNorm, x_hat * w (see
+ * declare), with a second norm on each projection's output before its residual, a weightless RMS
+ * norm on the value, and a GELU (not SwiGLU) feed-forward. The final logits are soft-capped to
  * cap * tanh(x / cap).
  */
 #include <arch/rad_arch.h>
+#include <arch/rad_block_gemma4_vision.h>
 #include <arch/rad_gemma4_chat.h>
 
 #include <cstdio>
@@ -18,61 +19,35 @@
 #include <string>
 #include <vector>
 
-#include "gemma4_vision.h"
-
 namespace gemma4_bf16 {
 
 using namespace rad::arch;
 
-/* ---- container geometry RadModelMeta does not name. Both spellings are accepted: a .rad
- * converted from the HF safetensors carries the flat HuggingFace keys and one converted from a
- * GGUF carries llama.cpp's. */
-static long long g4_i(const RadModelMeta* m, const char* bare, long long dflt) {
-    long long v = rad_meta_geti(m, bare, dflt);
-    if (v == dflt) v = rad_meta_geti(m, (std::string("text_config.") + bare).c_str(), dflt);
-    return v;
-}
-static double g4_f(const RadModelMeta* m, const char* bare, double dflt) {
-    double v = rad_meta_getf(m, bare, dflt);
-    if (v == dflt) v = rad_meta_getf(m, (std::string("text_config.") + bare).c_str(), dflt);
-    return v;
-}
-
-/* THE RESIDUAL JUNCTIONS AS ONE OP EACH. A w4a8 block opens with rmsnorm -> quant_act_i8 and closes
+/* Residual junctions as one op each. A w4a8 block opens with rmsnorm -> quant_act_i8 and closes
  * with rmsnorm (post) -> add -> [scale], so between two blocks the stream runs five single-row
- * dispatches -- the previous block's post-norm, the add, the layer scalar, this block's norm and
- * its quantiser. libr4d's `rmsnorm_quant_i8` is that chain in one dispatch, byte-identical to it,
- * and q, k and v read one quantised pair instead of three; `qkv_norm_rope` does the same for the
- * attention prologue's five ops, `gelu_mul_quant_i8` for down's input, and at two ranks
- * `ar_rmsnorm_quant_i8` folds the all-reduce in front of each junction into it. A kernel set without
- * an op keeps that op's chain. */
+ * dispatches: the previous post-norm, the add, the layer scalar, this block's norm and its
+ * quantiser. libr4d's `rmsnorm_quant_i8` is that chain in one byte-identical dispatch, and q, k and
+ * v read one quantised pair instead of three. `qkv_norm_rope` does the same for the attention
+ * prologue's five ops, `gelu_mul_quant_i8` for down's input, and at two ranks
+ * `ar_rmsnorm_quant_i8` also folds in the all-reduce before each junction. A kernel set without an
+ * op keeps that op's chain. */
 
-/* layer_types is optional. When present it must name EVERY layer "full_attention" or
- * "sliding_attention"; when absent the (l + 1) % interval == 0 fallback is the model card. */
+/* layer_types is optional. When present it must name every layer "full_attention" or
+ * "sliding_attention"; when absent, layer l is global when (l + 1) % interval == 0. */
 static int g4_parse_types(const char* lt, int64_t n, std::vector<int>& is_global) {
-    is_global.assign((size_t)n, -1);
-    size_t got = 0;
-    const char* p = lt;
-    while (*p) {
-        if (!std::strncmp(p, "full_attention", 14)) {
-            if (got >= (size_t)n) return RAD_E_INVAL;
-            is_global[got++] = 1; p += 14;
-        } else if (!std::strncmp(p, "sliding_attention", 17)) {
-            if (got >= (size_t)n) return RAD_E_INVAL;
-            is_global[got++] = 0; p += 17;
-        } else {
-            ++p;   /* separators: whitespace, quotes, [ ] , and / */
-        }
+    RAD_ARCH_TRY(parse_layer_kinds("gemma4", lt, {"full_attention"}, "sliding_attention",
+                                   &is_global));
+    if ((int64_t)is_global.size() != n) {
+        fprintf(stderr, "radiance: gemma4: layer_types names %zu layers and the model has %lld\n",
+                is_global.size(), (long long)n);
+        return RAD_E_INVAL;
     }
-    if (got != (size_t)n) return RAD_E_INVAL;
-    for (size_t i = 0; i < is_global.size(); ++i) if (is_global[i] < 0) return RAD_E_INVAL;
     return RAD_OK;
 }
 
 static int g4_schedule(const RadModelMeta* m, int64_t n, int64_t interval,
                        std::vector<int>& is_global) {
-    const char* lt = rad_meta_gets(m, "layer_types", rad_meta_gets(m, "text_config.layer_types", nullptr));
-    is_global.assign((size_t)n, 0);
+    const char* lt = meta_text_gets(m, "layer_types", nullptr);
     if (lt && *lt) {
         RAD_ARCH_TRY(g4_parse_types(lt, n, is_global));
     } else {
@@ -81,14 +56,15 @@ static int g4_schedule(const RadModelMeta* m, int64_t n, int64_t interval,
                     (long long)interval);
             return RAD_E_INVAL;
         }
-        for (int64_t l = 0; l < n; ++l) is_global[(size_t)l] = ((l + 1) % interval == 0) ? 1 : 0;
+        is_global.resize((size_t)n);
+        for (int64_t l = 0; l < n; ++l) is_global[(size_t)l] = is_full_attention(l, interval);
     }
     return RAD_OK;
 }
 
-/* A LINEAR'S WEIGHT IS ITS CHECKPOINT'S `X.weight`. Google's bf16 release names it so; its CT-INT4
- * (QAT) release ships `X.weight_packed` and `X.weight_scale`, which the checkpoint reader imports
- * as `X.weight` (core/format/checkpoint.h, CT-INT4), so the name map is the same for both. */
+/* A linear's weight is its checkpoint's `X.weight`. Google's CT-INT4 (QAT) release ships
+ * `X.weight_packed` and `X.weight_scale`, which the checkpoint reader imports as `X.weight`
+ * (core/format/checkpoint.h), so one name map serves both releases. */
 
 /* The two attention classes share the residual stream and the FFN but differ in head geometry,
  * the value path and the RoPE. The main Geom (from geom_from) is the slider; the global class is
@@ -105,31 +81,23 @@ struct ClassGeom {
     int64_t gqa()    const { return n_head / n_head_kv; }
 };
 
-/* ---- one linear, plain bf16 or w4a8. The recipe re-quantises the GEMM weights to int4 codes
- * with an f16 scale per [1 x 128] (group 128); a weight no rule matches stays bf16. This probes
- * the weight's encoding and chooses the op by it: `gemm_nt` for a plain bf16 weight, `gemm_nt_q`
- * at dtype w4a8 for the codes + their scale. w4a8 is the int8-activation grid: it reads an int8
- * activation + an f32 per-row scale, which the model's bf16 activation has to be quantised into.
- * The quantiser is declared here (quant_act_i8) over the activation's bf16 plane and writes the
- * int8 pair (q8, s8) the GEMM reads -- in the GEMM's fragment byte order, with one scale per row.
- * quant_act_i8g (row-major, a per-(row,group) scale) is i8a8's producer, not this one's; pairing
- * it with w4a8 is the compounding-into-inf seed of the all-NaN logits (see the declare comment).
- * w4a16 was tried and is the WRONG grid: its row declares an f16 activation and
- * its launcher never checks the operand dtype, so feeding it the model's bf16 bits reinterprets
- * them as f16 -- a magnitude-compressed garbage stream (bf16 0.1 -> 1.45, 1.0 -> 1.875), finite
- * nonsense that propagates through the residual. The name map is made here, before the weight is
- * asked what it is (Builder::finish() needs the map entry before the declaration). */
+/* ---- one linear, plain bf16 or w4a8. The recipe quantises GEMM weights to int4 codes with an
+ * f16 scale per [1 x 128]; a weight no rule matches stays bf16. The weight's encoding picks the
+ * op: `gemm_nt` for plain bf16, `gemm_nt_q` at w4a8 for codes + scale. w4a8 reads an int8
+ * activation and an f32 per-row scale, written by a quant_act_i8 declared here over the bf16
+ * activation, in the GEMM's fragment byte order. Not quant_act_i8g (row-major, per-(row, group)
+ * scale; i8a8's producer), and not w4a16, whose row expects an f16 activation and does not check
+ * the operand dtype, so bf16 bits would be misread as f16. The name map is made before the weight
+ * is queried (Builder::finish() needs the map entry before the declaration). */
 struct G4Linear {
     rad_weight w = 0, ws = 0;   /* the codes + scale (w4a8), or the single bf16 weight */
     rad_op     op = 0, op_q = 0;   /* the quantised GEMM and, for w4a8, its activation quantiser */
     rad_buf    q8 = 0, s8 = 0;     /* the int8 pair (i8 codes + f32 row scale) the quantiser writes */
     int64_t    N = 0, K = 0;
     bool       quant = false;   /* true: w4a8 */
-    /* READS ANOTHER LINEAR'S INT8 PAIR. q, k and v quantise the same norm output into the same
-     * per-row grid (quant_act_i8 over [T, n_embd]), so three quantisers write three identical
-     * pairs. With `in_from` set at declare this linear reads that linear's pair and declares no
-     * quantiser of its own: the GEMM's input bytes are the same bytes, one dispatch instead of
-     * three. */
+    /* Reads another linear's int8 pair. q, k and v quantise the same norm output on the same
+     * per-row grid, so with `in_from` set at declare this linear reads that linear's pair and
+     * declares no quantiser of its own: one dispatch instead of three. */
     bool       shared_in = false;
 
     int  declare(RadBuilder* b, Names& nm, const Geom& g, const char* base,
@@ -156,8 +124,8 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
     else                RAD_ARCH_TRY(map_concat(b, wn, src, 0));
     RadEncoding enc{};
     const bool known = weight_enc(b, wn, &enc);
-    /* a builder with no model behind it (a test, a synthetic tool) answers RAD_E_NOTFOUND, and a
-     * weight declared there is read as plain in its declared dtype -- the bf16 path. */
+    /* A builder with no model behind it (a test, a synthetic tool) answers RAD_E_NOTFOUND, and
+     * the weight is read as plain bf16. */
     const bool plain = !known || (rad_enc_is(&enc, "plain") && enc.n_planes == 1 &&
                                   enc.plane[0].dtype == RAD_BF16);
     int64_t parts[RAD_MAX_ROW_PARTS] = {0};
@@ -174,17 +142,14 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
         return op ? RAD_OK : RAD_E_INVAL;
     }
 
-    /* a w4 weight: i4 codes + an f16 scale per [1 x 128]. The GEMM (gemm_nt_q at w4a8) reads an
-     * int8 activation + an f32 per-row scale, which the model's bf16 activation has to be quantised
-     * into, so the quantiser (quant_act_i8g) is declared over the activation's bf16 plane `a` and
-     * writes the int8 pair (q8, s8) the GEMM reads. The codes + scale layout is byte-for-byte the
-     * w4a16 one -- the container serves unchanged; only the op dtype and the activation producer
-     * differ. */
+    /* A w4 weight: i4 codes and an f16 scale per [1 x 128]. gemm_nt_q at w4a8 reads an int8
+     * activation and an f32 per-row scale, so a quantiser over the bf16 plane `a` writes the int8
+     * pair (q8, s8). The codes + scale layout is the same as w4a16's, so containers serve
+     * unchanged. */
     const RadEncPlane* sc = rad_enc_plane(&enc, "scale");
-    /* An 8-bit weight on the same grid -- i8 codes, an f16 scale per [1 x 128] -- is the same
-     * pair at twice the radix: gemm_nt_q at w8a8 reads the identical int8 activation + per-row
-     * scale the w4a8 GEMM reads, so the quantiser declaration is shared. It is how a recipe keeps
-     * a linear the int4 grid hurts (the attention, down_proj) closer to the checkpoint. */
+    /* An 8-bit weight on the same grid (i8 codes, f16 scale per [1 x 128]): gemm_nt_q at w8a8
+     * reads the same int8 activation and per-row scale as w4a8, so the quantiser is shared. A
+     * recipe uses it for linears int4 hurts (attention, down_proj). */
     const uint32_t cdt = known && enc.n_planes > 0 ? enc.plane[0].dtype : 0;
     const bool w4 = known && rad_enc_is(&enc, "affine") && enc.n_planes == 2 && !enc.transform[0] &&
                     (cdt == RAD_I4 || cdt == RAD_I8) && enc.plane[0].block[1] == 1 &&
@@ -209,23 +174,14 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
             s8 = decl_b(b, nm.f("%s.s8", base), RAD_F32, { g.max_tok, 1 });
         }
         if (!q8 || !s8) return RAD_E_INVAL;
-        /* quant_act_i8, NOT quant_act_i8g: the w4a8 GEMM's A fragment reads a byte-shuffled plane
-         * (r4d_gemm_w4a8_nt_m64.hip:46-52, "the quantiser writes it") and applies an f32 per-ROW
-         * scale at the store (:61-63), so the producer must be the fragment-order per-row quantiser
-         * (r4d_quant_act_i8.hip:1-2). quant_act_i8g writes PLAIN ROW-MAJOR codes with a
-         * per-(row,group) scale (r4d_rows.cpp:2043-2046, "what the int8 trunk GEMMs (i8a8) read")
-         * -- pairing it with this GEMM shuffles the dot and broadcasts the wrong scale grid, the
-         * compounding-into-inf seed of the all-NaN logits. */
-        /* group=K, NOT 128: the host quantisers (libref/libavx) are per-`group` -- one f32 scale
-         * per group of `group` elements -- while the device one (r4d_quant_act_i8) is per-ROW and
-         * ignores `group` in this 3-operand form (it only reads it in the asum form). group=K makes
-         * the host ngrp=1 (one scale per row, the [M,1] buffer the arch declares) and is a no-op on
-         * the device, so the same declaration is self-consistent on both backends. group=128 left
-         * the host quantiser refusing the [M,1] scale (it wants [M, K/128]). */
+        /* quant_act_i8, not quant_act_i8g: the w4a8 and w8a8 GEMMs read codes in the int8 WMMA's
+         * step order with one f32 scale a row (docs/OPS.md). quant_act_i8g writes row-major codes
+         * with a scale per (row, group) for i8a8; paired with these GEMMs it produces NaN logits.
+         * `group` only sizes the optional code sums, which this symmetric grid does not take. */
         if (!shared_in)
             op_q = rw(b, RAD_OP(b, "quant_act_i8",
                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", K),
-                                   RAD_INT("group", K), RAD_STR("dtype", "bf16")),
+                                   RAD_INT("group", 128), RAD_STR("dtype", "bf16")),
                         RAD_NOWEIGHTS),
                     { a }, { q8, s8 });
         op = rw(b, RAD_OP(b, "gemm_nt_q",
@@ -246,11 +202,9 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
 
 inline void G4Linear::step(RadCtx* c, rad_buf a, rad_buf y, int64_t T) const {
     if (quant) {
-        /* quantise the bf16 activation into the int8 pair (fragment order + a per-row scale), then
-         * read the pair. The scale plane is one f32 per row, browsed at T rows like the codes.
-         * quant_act_i8's schema is 4 operands -- x, q, scale, asum -- and `asum` (the per-group row
-         * sums the asymmetric grids subtract) is absent on this symmetric grid, so it is passed as
-         * a null tensor, not dropped: operands are positional (issue.cpp). */
+        /* Quantise the bf16 activation into the int8 pair, then run the GEMM. quant_act_i8 takes
+         * x, q, scale, asum; `asum` (the per-group row sums asymmetric grids subtract) is absent on
+         * this symmetric grid and passed as a null tensor, since operands are positional. */
         if (!shared_in)
             RAD_ISSUE_N(c, op_q, T, brows(a, T), brows(q8, T), brows(s8, T), RAD_NONE);
         gemm(c, y, T);
@@ -293,16 +247,13 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
     g = geom; cls = cgeo; layer = l; kv = group; w = wire;
     const int64_t qd = cls.q_dim(), kvd = cls.kv_dim();
 
-    /* the norms: always bf16 (no rule matches them), name map first. */
+    /* The norms: always bf16 (no rule matches them), name map first. */
     RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_norm.weight", l),      nm.ckpt("%s.%lld.input_layernorm.weight",   pre, (long long)l)));
     RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_q_norm.weight", l),    nm.ckpt("%s.%lld.self_attn.q_norm.weight",   pre, (long long)l)));
     RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_k_norm.weight", l),    nm.ckpt("%s.%lld.self_attn.k_norm.weight",   pre, (long long)l)));
     RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_post_norm.weight", l), nm.ckpt("%s.%lld.post_attention_layernorm.weight", pre, (long long)l)));
-    /* declared bf16, not f32: the checkpoint holds them bf16 and no rule re-quantises them, so an
-     * f32 declaration would widen them at load -- and a widened weight cannot be served from the
-     * mapped tier, which the whole layer group is pinned to because the w4a16 GEMM has no device
-     * kernel for the M > 64 prefill band. Reading the gain in its own (bf16) dtype is identical:
-     * the widening was a lossless upcast of the same bf16 value. */
+    /* Declared bf16, not f32: the checkpoint holds them bf16, and a widened weight cannot be
+     * served from the mapped tier. Reading the gain as bf16 gives the same values. */
     w_norm = decl_w(b, nm.f("blk.%d.attn_norm.weight", l), RAD_BF16, {g.n_embd},
                     RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
     w_qn = decl_w(b, nm.f("blk.%d.attn_q_norm.weight", l), RAD_BF16, {cls.head_dim},
@@ -312,7 +263,7 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
     w_post = decl_w(b, nm.f("blk.%d.attn_post_norm.weight", l), RAD_BF16, {g.n_embd},
                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
 
-    /* the GEMM weights: bf16 or w4a8, probed by G4Linear. */
+    /* The GEMM weights: bf16 or w4a8, probed by G4Linear. */
     RAD_ARCH_TRY(ln_q.declare(b, nm, g, nm.f("blk.%d.attn_q", l),
                               { nm.ckpt("%s.%lld.self_attn.q_proj.weight", pre, (long long)l) },
                               qd, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.q));
@@ -335,8 +286,8 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
                   RAD_WEIGHTS(w_norm)),
                  {w.x}, {w.h});
 
-    /* Gemma normalises the value with a WEIGHTLESS rms (the checkpoint has no v_norm gain). A
-     * sliding class normalises v in place; a k_eq_v class derives v from the RAW k into its own
+    /* Gemma normalises the value with a weightless RMS norm (the checkpoint has no v_norm gain).
+     * A sliding class normalises v in place; a k_eq_v class derives v from the raw k into its own
      * buffer, which must happen before k_norm rewrites k. */
     op_vn = rw(b, RAD_OP(b, "rmsnorm_p",
                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok * cls.n_head_kv), RAD_INT("n", cls.head_dim),
@@ -365,13 +316,10 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
                             RAD_STR("ladder", cls.head_ladder ? "head" : "rotary")),
                  RAD_NOWEIGHTS),
                 {w.q}, {w.q});
-    /* The rope kernel serves the fused QKV row and requires n_head > 0 (it rotates n_head +
-     * n_head_kv heads over a row of (n_head + 2*n_head_kv)*head_dim). The K heads are a separate
-     * buffer, so the K-only form is expressed as a Q-only form over the K heads: n_head is the
-     * count of heads to rotate (here n_head_kv) and n_head_kv is 0, so the row is
-     * n_head_kv*head_dim -- exactly the K buffer's width. RoPE is identical for Q and K (same
-     * theta, same positions), so this is the reference's separate K rope (llama.cpp ggml_rope_ext
-     * over the K buffer). */
+    /* The rope kernel rotates n_head + n_head_kv heads of a fused QKV row and requires
+     * n_head > 0. K is a separate buffer, so it is rotated as a Q-only form over the K heads:
+     * n_head = n_head_kv and n_head_kv = 0, a row of n_head_kv*head_dim, exactly K's width. Q and K
+     * share theta and positions, so this matches the reference's separate K rope. */
     op_rk = rw(b, RAD_OP(b, "rope",
                   RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", cls.head_dim),
                              RAD_INT("n_head", cls.n_head_kv), RAD_INT("n_head_kv", 0),
@@ -381,10 +329,9 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
                   RAD_NOWEIGHTS),
                  {w.k}, {w.k});
 
-    /* Gemma 4 scores Q.K WITHOUT the 1/sqrt(head_dim) factor: both the HF reference
-     * (Gemma4TextAttention: self.scaling = 1.0) and the vLLM oracle use scaling = 1.0 --
-     * the learnable q/k RMSNorm weights absorb the scaling, so no extra 1/sqrt(d) is applied.
-     * attn_paged's default is 1/sqrt(head_dim), so pass 1.0 explicitly to match the reference. */
+    /* Gemma 4 scores Q.K without the 1/sqrt(head_dim) factor (HF Gemma4TextAttention and vLLM
+     * use scaling = 1.0; the q/k norm gains absorb it). attn_paged defaults to 1/sqrt(head_dim),
+     * so 1.0 is passed explicitly. */
     op_attn = rw(b, RAD_OP(b, "attn_paged",
                    RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", cls.head_dim),
                               RAD_INT("gqa", cls.gqa()), RAD_INT("causal", 1), RAD_INT("window", cls.window),
@@ -395,12 +342,13 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
                    RAD_NOWEIGHTS),
                   {w.q}, {w.attn});
 
-    /* THE PROLOGUE AS ONE OP: libr4d's `qkv_norm_rope` is rmsnorm_p + rmsnorm + rmsnorm + rope +
-     * rope over the three separate projections, byte-identical to them, one workgroup a (token,
-     * head). Declared beside the unfused five and used only where it resolves; a multi-component
-     * or YaRN rotary keeps the five. */
-    if (!g.rope_mc && g.yarn.factor == 0.0f)
-        op_qnr = rw(b, RAD_OP(b, "qkv_norm_rope",
+    /* The prologue as one op: libr4d's `qkv_norm_rope` is rmsnorm_p + rmsnorm + rmsnorm + rope +
+     * rope over the three projections, byte-identical, one workgroup per (token, head). Declared
+     * beside the unfused five and used only where it resolves; a multi-component or YaRN rotary
+     * keeps the five, as does an engine whose libraries do not declare it (CPU-only), where asking
+     * for it would stop the declare. */
+    if (!g.rope_mc && g.yarn.factor == 0.0f && rad_op_declared(b, "qkv_norm_rope")) {
+        op_qnr = RAD_OP(b, "qkv_norm_rope",
                       RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", cls.head_dim),
                                  RAD_INT("n_head", cls.n_head), RAD_INT("n_head_kv", cls.n_head_kv),
                                  RAD_F64("theta", cls.theta), RAD_F64("eps", g.eps),
@@ -409,8 +357,11 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
                                  RAD_STR("ladder", cls.head_ladder ? "head" : "rotary"),
                                  RAD_F64("wadd", g.wadd_qk), RAD_INT("v_from_k", cls.has_v ? 0 : 1),
                                  RAD_STR("dtype", g.dtype)),
-                      RAD_WEIGHTS(w_qn, w_kn)),
-                    {w.q, w.k, w.v}, {w.q, w.k, w.v});
+                      RAD_WEIGHTS(w_qn, w_kn));
+        /* A k_eq_v class derives v from the raw k: v is written, never read. */
+        op_qnr = cls.has_v ? rw(b, op_qnr, {w.q, w.k, w.v}, {w.q, w.k, w.v})
+                           : rw(b, op_qnr, {w.q, w.k}, {w.q, w.k, w.v});
+    }
 
     op_kv = rw(b, RAD_OP(b, "kv_store",
                 RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", cls.head_dim),
@@ -420,7 +371,7 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
                 RAD_NOWEIGHTS),
                 {w.k, w.v}, {});
 
-    /* o_proj is column-sharded: the rank's partial sum is reduced FIRST, then normed. */
+    /* o_proj is column-sharded: the rank's partial sum is reduced first, then normed. */
     if (g.world > 1)
         op_ar = rw(b, RAD_OP(b, "all_reduce",
                    RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
@@ -429,7 +380,7 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
                    RAD_NOWEIGHTS),
                   {w.h}, {w.h});
 
-    /* the SECOND residual: the (reduced) attention output is itself normed before the add. */
+    /* The second norm: the reduced attention output is normed before the residual add. */
     op_post = rw(b, RAD_OP(b, "rmsnorm",
                  RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                             RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd), RAD_STR("dtype", g.dtype)),
@@ -466,7 +417,7 @@ void Gemma4Attn::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool ta
         RAD_ISSUE(c, op_qnr, brows(w.q, T), brows(w.k, T), brows(w.v, T), rope_posmc(g, batch, T),
                   RAD_W(w_qn), RAD_W(w_kn));
     } else {
-        /* normalise v FIRST: on a k_eq_v class v is derived from the raw k, before k_norm rewrites it. */
+        /* Normalise v first: on a k_eq_v class v derives from the raw k, before k_norm rewrites it. */
         RAD_ISSUE_N(c, op_vn, T * cls.n_head_kv, brows(cls.has_v ? w.v : w.k, T), brows(w.v, T));
         RAD_ISSUE_N(c, op_qn, T * cls.n_head,    brows(w.q, T), RAD_W(w_qn), brows(w.q, T));
         RAD_ISSUE_N(c, op_kn, T * cls.n_head_kv, brows(w.k, T), RAD_W(w_kn), brows(w.k, T));
@@ -486,9 +437,8 @@ void Gemma4Attn::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool ta
                 brows(w.attn, T));
 
     ln_o.step(c, w.attn, w.h, T);
-    /* THE ALL-REDUCE BEFORE THE POST-NORM. o_proj is column-sharded, so each rank holds a PARTIAL
-     * sum here; the norm is of the whole output (HF, and vLLM's RowParallelLinear, reduce first).
-     * Normed per rank and then summed is sum_r rmsnorm(p_r), not rmsnorm(sum_r p_r). */
+    /* The all-reduce comes before the post-norm: o_proj is column-sharded, so each rank holds a
+     * partial sum, and the norm is of the whole output (sum_r rmsnorm(p_r) != rmsnorm(sum_r p_r)). */
     if (op_ar && !(tail_fused && ar_fused)) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
     if (tail_fused) return;
     RAD_ISSUE_N(c, op_post, T, brows(w.h, T), RAD_W(w_post), brows(w.h, T));
@@ -516,17 +466,17 @@ struct Gemma4Mlp {
 int Gemma4Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire, const char* pre) {
     g = geom; layer = l; w = wire;
 
-    /* the norms: always bf16 (no rule matches them), name map first. */
+    /* The norms: always bf16 (no rule matches them), name map first. */
     RAD_ARCH_TRY(map_copy (b, nm.f("blk.%d.ffn_norm.weight", l), nm.ckpt("%s.%lld.pre_feedforward_layernorm.weight", pre, (long long)l)));
     RAD_ARCH_TRY(map_copy (b, nm.f("blk.%d.ffn_post_norm.weight", l), nm.ckpt("%s.%lld.post_feedforward_layernorm.weight", pre, (long long)l)));
-    /* bf16, not f32: same reason as the attention norms -- an f32 declaration widens them and a
-     * widened weight cannot be served from the mapped tier the whole layer group is pinned to. */
+    /* bf16, not f32, as for the attention norms: a widened weight cannot be served from the
+     * mapped tier. */
     w_norm = decl_w(b, nm.f("blk.%d.ffn_norm.weight", l), RAD_BF16, {g.n_embd},
                     RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
     w_post = decl_w(b, nm.f("blk.%d.ffn_post_norm.weight", l), RAD_BF16, {g.n_embd},
                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
 
-    /* the GEMM weights: bf16 or w4a8, probed by G4Linear. gate_up is the gate|up fusion. */
+    /* The GEMM weights: bf16 or w4a8, probed by G4Linear. gate_up is the gate|up fusion. */
     RAD_ARCH_TRY(ln_gu.declare(b, nm, g, nm.f("blk.%d.ffn_gate_up", l),
                                { nm.ckpt("%s.%lld.mlp.gate_proj.weight", pre, (long long)l),
                                  nm.ckpt("%s.%lld.mlp.up_proj.weight", pre, (long long)l) },
@@ -545,7 +495,7 @@ int Gemma4Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const 
                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_ff), RAD_STR("dtype", g.dtype)),
                RAD_NOWEIGHTS),
               {w.gu}, {w.ffn});
-    if (ln_down.quant && !ln_down.shared_in)
+    if (ln_down.quant && !ln_down.shared_in && rad_op_declared(b, "gelu_mul_quant_i8"))
         op_gq = rw(b, RAD_OP(b, "gelu_mul_quant_i8",
                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_ff), RAD_STR("dtype", g.dtype)),
                      RAD_NOWEIGHTS),
@@ -594,8 +544,8 @@ void Gemma4Mlp::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool tai
 }
 
 /* ---- one residual junction as one op: [post-norm of the branch `x`, the add into `res`, the
- * layer scalar,] the next block's norm and its int8 quantiser (libr4d `rmsnorm_quant_i8`). `res`
- * null is the plain form, the norm of `x` itself -- the first block's entry. */
+ * layer scalar,] the next block's norm and its int8 quantiser (libr4d `rmsnorm_quant_i8`). With
+ * `res` null it is the plain norm of `x`, the first block's entry. */
 struct G4Junction {
     rad_op     op = 0;
     rad_op     op_ar = 0;   /* the same with the two-rank exact all-reduce of `x` in front, or 0 */
@@ -612,16 +562,19 @@ struct G4Junction {
                                RAD_F64("wadd", g.wadd) };
         const rad_weight ws[3] = { w, wp, sc };
         const int nw = sc ? 3 : (wp ? 2 : 1);
-        op = rad_decl_op(b, "rmsnorm_quant_i8", p, (int)(sizeof p / sizeof p[0]), ws, nw);
-        if (!op) return RAD_OK;   /* not resolved: the caller keeps the unfused chain */
+        /* Not declared by any loaded library (CPU-only) or not resolved: the caller keeps the
+         * unfused chain. */
+        if (rad_op_declared(b, "rmsnorm_quant_i8"))
+            op = rad_decl_op(b, "rmsnorm_quant_i8", p, (int)(sizeof p / sizeof p[0]), ws, nw);
+        if (!op) return RAD_OK;
         const rad_buf rd[2] = { x, res };
         const rad_buf wr[3] = { q8, s8, res };
         rad_op_reads (b, op, rd, res ? 2 : 1);
         rad_op_writes(b, op, wr, res ? 3 : 2);
-        /* THE ALL-REDUCE IN FRONT, at two ranks on the exact wire: `x` is then a rank's partial sum
-         * of a column-sharded linear, the message as well as the input. A deployment that allows
-         * the lossy wire keeps the standalone all-reduce, which may pick it. */
-        if (res && g.world == 2 && g.wire_exact) {
+        /* With the all-reduce in front, at two ranks on the exact wire: `x` is then a rank's
+         * partial sum of a column-sharded linear. With the lossy wire allowed, the standalone
+         * all-reduce is kept, since it may choose that wire. */
+        if (res && g.world == 2 && g.wire_exact && rad_op_declared(b, "ar_rmsnorm_quant_i8")) {
             const RadParam pa[] = { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                     RAD_F64("eps", g.eps), RAD_INT("world_size", g.world),
                                     RAD_STR("dtype", g.dtype), RAD_F64("wadd", g.wadd) };
@@ -643,42 +596,39 @@ struct G4Junction {
 
 /* ==================================================================== the assistant head
  *
- * GEMMA 4'S DRAFT HEAD, the "assistant" (Gemma4AssistantForCausalLM), merged under `draft.` by
- * `rad-convert --draft-model <gemma-4-*-it-assistant>`. Read off the checkpoint and three reference
- * implementations -- transformers' modeling_gemma4_assistant.py with its candidate generator,
- * vLLM's gemma4_mtp.py with spec_decode/gemma4.py, and llama.cpp's gemma4-assistant.cpp:
+ * Gemma 4's draft head, the "assistant" (Gemma4AssistantForCausalLM), merged under `draft.` by
+ * `rad-convert --draft-model <gemma-4-*-it-assistant>`. From the checkpoint and three references:
+ * transformers' modeling_gemma4_assistant.py with its candidate generator, vLLM's gemma4_mtp.py
+ * with spec_decode/gemma4.py, and llama.cpp's gemma4-assistant.cpp:
  *
  *     x  = pre_projection( concat( E_trunk[tok] * sqrt(n_trunk), h_trunk ) )        2*n_trunk -> n
  *     x  = the head's layers over x (31B: sliding, sliding, sliding, full)
  *     hd = norm(x)
- *     logits = lm_head(hd)       the head's OWN table, tied to its embed_tokens; no soft-cap
+ *     logits = lm_head(hd)       the head's own table, tied to its embed_tokens; no soft-cap
  *     h' = post_projection(hd)                                                       n -> n_trunk
  *
- * `h_trunk` is the trunk's FINAL-NORMED hidden state -- the trunk lm_head's input -- and `E_trunk`
- * the trunk's embedding table, scaled the way the trunk scales it. The head's own embed_tokens is
- * its lm_head and nothing else (vLLM swaps the trunk's table in for the input side). The
- * concatenation is the embedding FIRST, then the hidden state; all three references agree.
+ * `h_trunk` is the trunk's final-normed hidden state (the trunk lm_head's input) and `E_trunk` the
+ * trunk's embedding table, scaled as the trunk scales it. The head's own embed_tokens serves only
+ * as its lm_head (vLLM uses the trunk's table on the input side). The concatenation is embedding
+ * first, then hidden state; all three references agree.
  *
- * A LAYER IS A TRUNK LAYER WITH THE KEY AND VALUE TAKEN AWAY: q_proj, the per-head q norm, the
- * rotary of its class, attention over the TRUNK'S cache at scale 1, o_proj, the same four
- * plain-gain norms, the GELU feed-forward and the per-layer scalar. Each layer reads the LAST trunk
- * layer of its own class -- the sliding ones the last sliding layer, the full one the last full
- * layer, 58 and 59 on the 31B (vLLM's _setup_gemma4_kv_sharing). So the head's q heads and the
- * trunk's kv heads must be the same geometry, and declare checks that they are.
+ * A head layer is a trunk layer without key and value: q_proj, the per-head q norm, its class's
+ * rotary, attention over the trunk's cache at scale 1, o_proj, the same four plain-gain norms, the
+ * GELU feed-forward and the per-layer scalar. Each layer reads the last trunk layer of its class
+ * (58 and 59 on the 31B; vLLM's _setup_gemma4_kv_sharing), so the head's q heads and the trunk's
+ * kv heads must share geometry, which declare checks.
  *
- * IT KEEPS NO CACHE OF ITS OWN, and that is what the core is told (rad_drafter_shared_kv): no
- * history pass, one row a drafting sequence, every round at the committed position over the
- * committed context. Round 1's row embeds the token the trunk chose and continues from the trunk's
- * hidden state; round r embeds round r-1's proposal and continues from its h'. What the head
- * proposed reaches the next round through those two and nothing else -- which is the whole design
- * of the head, not a shortcut taken here.
+ * The head keeps no cache of its own (rad_drafter_shared_kv): no history pass, one row per
+ * drafting sequence, every round at the committed position over the committed context. Round 1
+ * embeds the token the trunk chose and continues from the trunk's hidden state; round r embeds
+ * round r-1's proposal and continues from its h'. Those two are the only path from one round to
+ * the next, by design of the head.
  *
- * THE TENSOR-PARALLEL SPLIT IS THE TRUNK'S: q heads row-sharded over the ranks, so each rank's
- * queries meet its own share of the trunk's kv heads; o_proj and the feed-forward down projection
- * column-sharded, each followed by an all-reduce BEFORE its post-norm (the norm of a partial sum is
- * not the partial of a norm). The two projections and every norm are replicated: they read and
- * write the replicated stream, and a split would cost an all-reduce to save a few MiB. The lm_head
- * is vocab-sharded like the trunk's and goes through the same sampler chain, greedy. */
+ * Tensor-parallel split as the trunk's: q heads row-sharded, so each rank's queries meet its share
+ * of the trunk's kv heads; o_proj and the feed-forward down projection column-sharded, each
+ * followed by an all-reduce before its post-norm. The two projections and every norm are
+ * replicated, since they read and write the replicated stream. The lm_head is vocab-sharded like
+ * the trunk's and goes through the same sampler chain, greedy. */
 /* Where the head's rows sit for the rotary, relative to the committed position
  * (rad_drafter_shared_kv), and the depth `--num-speculative-tokens auto` takes. */
 static constexpr int kHeadPosOffset = 0;
@@ -702,7 +652,7 @@ struct Gemma4Head {
     int64_t n = 0;          /* the head's width (1024 on the 31B) */
     int64_t n_trunk = 0;    /* the trunk's width, which the two projections join */
     int64_t n_ff = 0;       /* this rank's share of the feed-forward */
-    int64_t rows = 0;       /* the most rows one pass carries: one a drafting sequence */
+    int64_t rows = 0;       /* the most rows one pass carries: one per drafting sequence */
     double  softcap = 0.0;  /* 0: none, which is what the 31B's head says */
     std::vector<HLayer> layers;
 
@@ -720,18 +670,6 @@ struct Gemma4Head {
                  rad_buf trunk_h, rad_buf trunk_logits);
     void step(RadCtx* c, const RadBatch* batch) const;
 };
-
-/* A `draft.` key under the head's text config, where Gemma4AssistantConfig nests every dimension,
- * or at the top of it. */
-static long long hd_i(const RadModelMeta* m, const char* k, long long d) {
-    long long v = rad_meta_geti(m, (std::string("draft.text_config.") + k).c_str(), -0x7FFFFFFFll);
-    return v != -0x7FFFFFFFll ? v : rad_meta_geti(m, (std::string("draft.") + k).c_str(), d);
-}
-static double hd_f(const RadModelMeta* m, const char* k, double d) {
-    const double nan = std::nan("");
-    double v = rad_meta_getf(m, (std::string("draft.text_config.") + k).c_str(), nan);
-    return std::isnan(v) ? rad_meta_getf(m, (std::string("draft.") + k).c_str(), d) : v;
-}
 
 /* Does the container carry an assistant head at all? */
 static bool has_assistant(const RadModelMeta* m) {
@@ -751,23 +689,23 @@ int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, cons
     w_tok = tok_embd;
 
     /* ---- the head's own geometry, and what it must share with the trunk's. */
-    n       = hd_i(meta, "hidden_size", 0);
+    n       = meta_text_geti(meta, "hidden_size", 0, "draft.");
     n_trunk = rad_meta_geti(meta, "draft.backbone_hidden_size", 0);
-    const long long n_l      = hd_i(meta, "num_hidden_layers", 0);
-    const long long n_h      = hd_i(meta, "num_attention_heads", 0);
-    const long long n_kv     = hd_i(meta, "num_key_value_heads", 0);
-    const long long n_kv_g   = hd_i(meta, "num_global_key_value_heads", n_kv);
-    const long long head_s   = hd_i(meta, "head_dim", 0);
-    const long long head_g   = hd_i(meta, "global_head_dim", head_s);
-    const long long ff       = hd_i(meta, "intermediate_size", 0);
-    const long long win      = hd_i(meta, "sliding_window", 0);
-    const long long vocab    = hd_i(meta, "vocab_size", 0);
+    const long long n_l      = meta_text_geti(meta, "num_hidden_layers", 0, "draft.");
+    const long long n_h      = meta_text_geti(meta, "num_attention_heads", 0, "draft.");
+    const long long n_kv     = meta_text_geti(meta, "num_key_value_heads", 0, "draft.");
+    const long long n_kv_g   = meta_text_geti(meta, "num_global_key_value_heads", n_kv, "draft.");
+    const long long head_s   = meta_text_geti(meta, "head_dim", 0, "draft.");
+    const long long head_g   = meta_text_geti(meta, "global_head_dim", head_s, "draft.");
+    const long long ff       = meta_text_geti(meta, "intermediate_size", 0, "draft.");
+    const long long win      = meta_text_geti(meta, "sliding_window", 0, "draft.");
+    const long long vocab    = meta_text_geti(meta, "vocab_size", 0, "draft.");
     const long long ordered  = rad_meta_geti(meta, "draft.use_ordered_embeddings", 0);
-    const double    eps      = hd_f(meta, "rms_norm_eps", 0.0);
-    const double    theta_s  = hd_f(meta, "rope_parameters.sliding_attention.rope_theta", 0.0);
-    const double    theta_g  = hd_f(meta, "rope_parameters.full_attention.rope_theta", 0.0);
-    double          prf      = hd_f(meta, "rope_parameters.full_attention.partial_rotary_factor", -1.0);
-    softcap = hd_f(meta, "final_logit_softcapping", 0.0);
+    const double    eps      = meta_text_getf(meta, "rms_norm_eps", 0.0, "draft.");
+    const double    theta_s  = meta_text_getf(meta, "rope_parameters.sliding_attention.rope_theta", 0.0, "draft.");
+    const double    theta_g  = meta_text_getf(meta, "rope_parameters.full_attention.rope_theta", 0.0, "draft.");
+    double          prf      = meta_text_getf(meta, "rope_parameters.full_attention.partial_rotary_factor", -1.0, "draft.");
+    softcap = meta_text_getf(meta, "final_logit_softcapping", 0.0, "draft.");
     if (!(prf > 0.0)) prf = 1.0;
 
     if (n <= 0 || n_l <= 0 || n_h <= 0 || ff <= 0 || !(eps > 0.0)) {
@@ -776,9 +714,9 @@ int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, cons
                 (long long)n, n_l, n_h, ff, eps);
         return RAD_E_INVAL;
     }
-    /* IT READS THE TRUNK'S CACHE, so everything the cache's shape depends on must agree: the two
-     * head widths, the two kv head counts and the window. A head that disagrees was trained beside
-     * another trunk, and its attention would read keys that are not the ones it learned against. */
+    /* The head reads the trunk's cache, so everything the cache's shape depends on must agree:
+     * the two head widths, the two kv head counts and the window. A head that disagrees was trained
+     * with another trunk. */
     if (n_trunk != trunk.n_embd || vocab != trunk.n_vocab_all || head_s != cs.head_dim ||
         head_g != cg.head_dim || n_kv != cs.n_head_kv * trunk.world ||
         n_kv_g != cg.n_head_kv * trunk.world || win != cs.window) {
@@ -792,7 +730,7 @@ int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, cons
                 (long long)trunk.n_embd, (long long)trunk.n_vocab_all);
         return RAD_E_INVAL;
     }
-    /* THE QUERIES MUST ROTATE AS THE TRUNK'S KEYS DID, or q.k measures the wrong distance. */
+    /* The queries must rotate as the trunk's keys did, or q.k measures the wrong distance. */
     const int64_t rot_g = (int64_t)(head_g * prf + 0.5);
     if (theta_s != cs.theta || theta_g != cg.theta || rot_g != cg.n_rot) {
         fprintf(stderr, "radiance: gemma4 assistant: its rotary (theta %g / %g, %lld of %lld global "
@@ -802,9 +740,8 @@ int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, cons
                 (long long)cg.n_rot);
         return RAD_E_INVAL;
     }
-    /* CENTROID MASKING (use_ordered_embeddings) scores a top-k of vocabulary clusters instead of
-     * the whole head. The 31B's head does not use it, and nothing here implements it; refusing is
-     * better than a head that scores every token while its checkpoint expects a mask. */
+    /* Centroid masking (use_ordered_embeddings) scores a top-k of vocabulary clusters instead of
+     * the whole head. The 31B's head does not use it and it is not implemented, so it is refused. */
     if (ordered) {
         fprintf(stderr, "radiance: gemma4 assistant: use_ordered_embeddings (centroid-masked logits) "
                         "is not implemented\n");
@@ -853,8 +790,8 @@ int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, cons
 
     /* ---- the entry: the trunk's hidden state into the right half of `c`, the trunk's scaled
      * embedding into the left. A history pass gathers the hidden state from the trunk's rows; a
-     * round copies the head's own h' from the round before. Both write the half in place: a
-     * gather and a cast read their destination's row pitch off the operand. */
+     * round copies the head's own h' from the previous round. Both write the half in place, since
+     * gather and cast take the destination's row pitch from the operand. */
     op_hsrc = rw(b, RAD_OP(b, "gather_rows",
                    RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n_trunk), RAD_STR("dtype", g.dtype)),
                    RAD_NOWEIGHTS),
@@ -885,11 +822,34 @@ int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, cons
                   {b_e}, {b_c});
     if (!op_hsrc || !op_hcopy || !op_embed || !op_ecopy) return RAD_E_INVAL;
 
-    /* pre_projection: the joined row to the head's width. Replicated: it reads and writes the
-     * replicated stream. */
+    /* pre_projection: the joined row to the head's width. Replicated, like the stream it reads
+     * and writes. */
     RAD_ARCH_TRY(ln_pre.declare(b, nm, g, nm.f("mtp.pre_proj"), { nm.ckpt("draft.pre_projection.weight") },
                                 n, 2 * n_trunk, RAD_SHARD_NONE, grp_layer((int)(base + n_l)),
                                 b_c, b_x));
+
+    /* The head's n-wide norm (plain gain), residual add and all-reduce. */
+    auto norm = [&](rad_weight w, rad_buf x, rad_buf y) {
+        return rw(b, RAD_OP(b, "rmsnorm",
+                     RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", eps),
+                                RAD_F64("wadd", 0.0), RAD_STR("dtype", g.dtype)),
+                     RAD_WEIGHTS(w)),
+                  {x}, {y});
+    };
+    auto add = [&]() {
+        return rw(b, RAD_OP(b, "add",
+                     RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_STR("dtype", g.dtype)),
+                     RAD_NOWEIGHTS),
+                  {b_x, b_h}, {b_x});
+    };
+    auto all_reduce = [&]() {
+        return rw(b, RAD_OP(b, "all_reduce",
+                     RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", n, rows * n),
+                                RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
+                                RAD_INT("min_bytes", g.wire_min_bytes)),
+                     RAD_NOWEIGHTS),
+                  {b_h}, {b_h});
+    };
 
     /* ---- the layers. */
     layers.resize((size_t)n_l);
@@ -948,11 +908,7 @@ int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, cons
                                        { nm.ckpt("%s.%lld.mlp.down_proj.weight", pre, (long long)l) },
                                        n, n_ff, RAD_SHARD_COL, grp_layer(gl), b_ffn, b_h));
 
-        L.op_norm = rw(b, RAD_OP(b, "rmsnorm",
-                         RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", eps),
-                                    RAD_F64("wadd", 0.0), RAD_STR("dtype", g.dtype)),
-                         RAD_WEIGHTS(L.w_norm)),
-                       {b_x}, {b_h});
+        L.op_norm = norm(L.w_norm, b_x, b_h);
         L.op_qn = rw(b, RAD_OP(b, "rmsnorm",
                        RAD_PARAMS(RAD_RANGE("M", 1, rows * L.cls.n_head), RAD_INT("n", L.cls.head_dim),
                                   RAD_F64("eps", eps), RAD_F64("wadd", 0.0), RAD_STR("dtype", g.dtype)),
@@ -966,9 +922,9 @@ int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, cons
                                   RAD_STR("ladder", L.cls.head_ladder ? "head" : "rotary")),
                        RAD_NOWEIGHTS),
                      {L.q}, {L.q});
-        /* ONE QUERY ROW A SEQUENCE over the trunk's cache, at scale 1 like the trunk's. The
-         * context is the committed positions (the core's doing: rad_drafter_shared_kv), so the
-         * decode band is the only band there is. */
+        /* One query row per sequence over the trunk's cache, at scale 1 like the trunk. The
+         * context is the committed positions (rad_drafter_shared_kv), so only the decode band
+         * exists. */
         L.op_attn = rw(b, RAD_OP(b, "attn_paged",
                          RAD_PARAMS(RAD_RANGE("q_len", 1, 1), RAD_INT("head_dim", L.cls.head_dim),
                                     RAD_INT("gqa", L.cls.gqa()), RAD_INT("causal", 1),
@@ -978,47 +934,17 @@ int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, cons
                                     RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
                          RAD_NOWEIGHTS),
                        {L.q}, {L.attn});
-        if (g.world > 1)
-            L.op_ar = rw(b, RAD_OP(b, "all_reduce",
-                            RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", n, rows * n),
-                                       RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
-                                       RAD_INT("min_bytes", g.wire_min_bytes)),
-                            RAD_NOWEIGHTS),
-                         {b_h}, {b_h});
-        L.op_post = rw(b, RAD_OP(b, "rmsnorm",
-                         RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", eps),
-                                    RAD_F64("wadd", 0.0), RAD_STR("dtype", g.dtype)),
-                         RAD_WEIGHTS(L.w_post)),
-                       {b_h}, {b_h});
-        L.op_add = rw(b, RAD_OP(b, "add",
-                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_STR("dtype", g.dtype)),
-                        RAD_NOWEIGHTS),
-                      {b_x, b_h}, {b_x});
-        L.op_fnorm = rw(b, RAD_OP(b, "rmsnorm",
-                          RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", eps),
-                                     RAD_F64("wadd", 0.0), RAD_STR("dtype", g.dtype)),
-                          RAD_WEIGHTS(L.w_fnorm)),
-                        {b_x}, {b_h});
+        if (g.world > 1) L.op_ar = all_reduce();
+        L.op_post  = norm(L.w_post, b_h, b_h);
+        L.op_add   = add();
+        L.op_fnorm = norm(L.w_fnorm, b_x, b_h);
         L.op_act = rw(b, RAD_OP(b, "gelu_mul",
                         RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n_ff), RAD_STR("dtype", g.dtype)),
                         RAD_NOWEIGHTS),
                       {b_gu}, {b_ffn});
-        if (g.world > 1)
-            L.op_far = rw(b, RAD_OP(b, "all_reduce",
-                             RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", n, rows * n),
-                                        RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
-                                        RAD_INT("min_bytes", g.wire_min_bytes)),
-                             RAD_NOWEIGHTS),
-                          {b_h}, {b_h});
-        L.op_fpost = rw(b, RAD_OP(b, "rmsnorm",
-                          RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", eps),
-                                     RAD_F64("wadd", 0.0), RAD_STR("dtype", g.dtype)),
-                          RAD_WEIGHTS(L.w_fpost)),
-                        {b_h}, {b_h});
-        L.op_fadd = rw(b, RAD_OP(b, "add",
-                         RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_STR("dtype", g.dtype)),
-                         RAD_NOWEIGHTS),
-                       {b_x, b_h}, {b_x});
+        if (g.world > 1) L.op_far = all_reduce();
+        L.op_fpost = norm(L.w_fpost, b_h, b_h);
+        L.op_fadd  = add();
         L.op_scale = rw(b, RAD_OP(b, "scale",
                           RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_STR("dtype", g.dtype)),
                           RAD_WEIGHTS(L.w_scalar)),
@@ -1034,18 +960,13 @@ int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, cons
     RAD_ARCH_TRY(map_copy(b, nm.f("mtp.output.weight"), nm.ckpt("draft.model.embed_tokens.weight")));
     w_norm = decl_w(b, nm.f("mtp.output_norm.weight"), RAD_BF16, {n}, RAD_ACCESS_PER_TOKEN,
                     RAD_SHARD_NONE, grp_layer((int)(base + n_l)));
-    /* VOCAB-SHARDED, LIKE THE TRUNK'S: the draft's logits go through the same sampler chain, which
-     * merges the ranks' candidate sets, so a rank holds its own slice of the vocabulary. Declared
-     * at its codes' dtype: bf16 as Google ships it, or int8 / block fp8 where a recipe makes it so,
-     * and the logits_gemm kernel that reads that encoding serves it. It is the largest read of a
-     * round, and a draft is only a proposal: the trunk verifies every token with its own head. */
+    /* Vocab-sharded like the trunk's: the draft's logits go through the same sampler chain, which
+     * merges the ranks' candidates. Declared at its codes' dtype (bf16 as shipped, or int8 / block
+     * fp8 where a recipe makes it so), selecting the matching logits_gemm kernel. It is a round's
+     * largest read, and quantising it only affects proposals, which the trunk verifies. */
     w_lm = decl_w(b, nm.f("mtp.output.weight"), weight_codes_dtype(b, nm.f("mtp.output.weight"), RAD_BF16),
                   {g.n_vocab, n}, RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_layer((int)(base + n_l)));
-    op_norm = rw(b, RAD_OP(b, "rmsnorm",
-                   RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", eps),
-                              RAD_F64("wadd", 0.0), RAD_STR("dtype", g.dtype)),
-                   RAD_WEIGHTS(w_norm)),
-                 {b_x}, {b_hd});
+    op_norm = norm(w_norm, b_x, b_hd);
     op_logits = rw(b, RAD_OP(b, "logits_gemm",
                      RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n_vocab", g.n_vocab),
                                 RAD_INT("n_embd", n), RAD_STR("dtype", g.dtype)),
@@ -1058,9 +979,9 @@ int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, cons
                       RAD_NOWEIGHTS),
                     {logits}, {logits});
     if (!op_norm || !op_logits || (softcap > 0.0 && !op_cap)) return RAD_E_INVAL;
-    /* post_projection LAST: h' is the next round's input, and the op that reads it (op_hcopy) is
-     * the head's first. Declared here, its life runs the whole head, so no op of a pass can be laid
-     * over it before the round after has read it. */
+    /* post_projection last: h' is the next round's input, read by the head's first op
+     * (op_hcopy). Declared here, its buffer lives across the whole head, so nothing in a pass can
+     * overwrite it before the next round reads it. */
     RAD_ARCH_TRY(ln_post.declare(b, nm, g, nm.f("mtp.post_proj"), { nm.ckpt("draft.post_projection.weight") },
                                  n_trunk, n, RAD_SHARD_NONE, grp_layer((int)(base + n_l)),
                                  b_hd, b_hn));
@@ -1073,14 +994,14 @@ int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, cons
     return RAD_OK;
 }
 
-/* One pass. The batch is the one the scheduler staged for a head with no cache of its own: one row
- * a drafting sequence, at the committed position, its context ending there. */
+/* One pass, over the batch staged for a head with no cache of its own: one row per drafting
+ * sequence, at the committed position, with the context ending there. */
 void Gemma4Head::step(RadCtx* c, const RadBatch* batch) const {
     const int64_t T = batch->n_tok;
     if (T <= 0) return;
     if (batch->draft_pass < 0) {
-        /* Every row of the pass is a drafting row: that is what rad_drafter_shared_kv asked the
-         * scheduler for. Anything else is a batch built for a head with a cache of its own. */
+        /* Every row must be a drafting row, as rad_drafter_shared_kv requested; anything else
+         * was built for a head with its own cache. */
         if (batch->n_draft_out != T || batch->n_out != T) {
             rad_step_fail(c, "the gemma4 assistant head was handed a history pass that is not one row "
                              "a drafting sequence; it keeps no cache of its own and drafts from that "
@@ -1138,9 +1059,10 @@ struct Layer {
     Gemma4Mlp  mlp{};
     rad_weight w_scalar = 0;   /* the per-layer [1] residual scalar, `cur = cur * scalar` */
     rad_op     op_scale = 0;
-    /* the fused junctions (see THE RESIDUAL JUNCTIONS above): attention -> this layer's feed-forward, and this layer's
-     * feed-forward -> the next layer's attention, scalar included. The last layer has no j_ma: its
-     * stream goes to the final norm, which feeds the lm_head and not a quantiser. */
+    /* The fused junctions (see "Residual junctions" above): attention -> this layer's
+     * feed-forward, and this layer's feed-forward -> the next layer's attention, scalar included.
+     * The last layer has no j_ma: its stream goes to the final norm, which feeds the lm_head, not
+     * a quantiser. */
     G4Junction j_am{}, j_ma{};
 };
 
@@ -1168,10 +1090,10 @@ struct Model {
     Gemma4Head head{};
     bool       have_head = false;
 
-    /* The vision tower (gemma4_vision.h), declared when the container carries one and the
-     * deployment serves media; `op_mm` writes its rows over the placeholders' embeddings. */
-    Vision     vis{};
-    rad_op     op_mm = 0;
+    /* The vision tower (rad_block_gemma4_vision.h), declared when the container carries one and
+     * the deployment serves media; `op_mm` writes its rows over the placeholders' embeddings. */
+    Gemma4Vision vis{};
+    rad_op       op_mm = 0;
 
     G4Junction j0{};       /* the first block's entry: norm + quantiser of the embedding stream */
     bool       fuse = false;
@@ -1199,24 +1121,23 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     Names& nm = m.nm;
 
     /* ---- geometry RadModelMeta does not name. */
-    const int64_t kv_g_all    = g4_i(meta, "num_global_key_value_heads", 0);
-    const int64_t head_g      = g4_i(meta, "global_head_dim", 0);
-    const int64_t sliding_win = g4_i(meta, "sliding_window", 0);
-    const int64_t kv_shared   = g4_i(meta, "num_kv_shared_layers", 0);
-    const int64_t interval    = g4_i(meta, "full_attention_interval", 0);
-    /* Whether the global layers read V from K: 31B's do (attention_k_eq_v), and then they have no
-     * v_proj. A checkpoint that does not say is refused rather than guessed at -- the wrong
-     * guess either asks for weights that are not there or ignores ones that are. */
-    const long long k_eq_v    = g4_i(meta, "attention_k_eq_v", -1);
+    const int64_t kv_g_all    = meta_text_geti(meta, "num_global_key_value_heads", 0);
+    const int64_t head_g      = meta_text_geti(meta, "global_head_dim", 0);
+    const int64_t sliding_win = meta_text_geti(meta, "sliding_window", 0);
+    const int64_t kv_shared   = meta_text_geti(meta, "num_kv_shared_layers", 0);
+    const int64_t interval    = meta_text_geti(meta, "full_attention_interval", 0);
+    /* Whether the global layers read V from K (attention_k_eq_v; the 31B's do, and have no
+     * v_proj). A checkpoint that does not say is refused rather than guessed. */
+    const long long k_eq_v    = meta_text_geti(meta, "attention_k_eq_v", -1);
     if (k_eq_v != 0 && k_eq_v != 1) {
         fprintf(stderr, "radiance: gemma4: the config does not say whether the global layers read "
                         "V from K (attention_k_eq_v)\n");
         return RAD_E_INVAL;
     }
-    const double  theta_s     = g4_f(meta, "rope_parameters.sliding_attention.rope_theta", 0.0);
-    const double  theta_g     = g4_f(meta, "rope_parameters.full_attention.rope_theta", 0.0);
-    const double  softcap     = g4_f(meta, "final_logit_softcapping", 0.0);
-    double        prf         = g4_f(meta, "rope_parameters.full_attention.partial_rotary_factor", -1.0);
+    const double  theta_s     = meta_text_getf(meta, "rope_parameters.sliding_attention.rope_theta", 0.0);
+    const double  theta_g     = meta_text_getf(meta, "rope_parameters.full_attention.rope_theta", 0.0);
+    const double  softcap     = meta_text_getf(meta, "final_logit_softcapping", 0.0);
+    double        prf         = meta_text_getf(meta, "rope_parameters.full_attention.partial_rotary_factor", -1.0);
 
     if (head_g <= 0 || kv_g_all <= 0) {
         fprintf(stderr, "radiance: gemma4: global_head_dim %lld / num_global_key_value_heads %lld; both required\n",
@@ -1247,11 +1168,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     int64_t kv_g = 0;
     if (divide_or_fail(kv_g_all, g.world, "num_global_key_value_heads", &kv_g) < 0) return RAD_E_INVAL;
 
-    /* Plain RMSNorm: x_hat * w, on every norm including the post-projection ones. Gemma 4
-     * (unlike Gemma 2/3) does NOT use the (1 + w) form: the vLLM 0.27.1 oracle (which serves
-     * this checkpoint correctly) uses the stock RMSNorm (weight init 1.0), HF transformers'
-     * Gemma4RMSNorm multiplies by the weight with no +1 (weight init 1.0), and llama.cpp's
-     * gemma4 uses LLM_NORM_RMS with no load-time offset. wadd=0.0 = the plain form. */
+    /* Plain RMSNorm, x_hat * w, on every norm including the post-projection ones. Unlike
+     * Gemma 2/3, Gemma 4 does not use the (1 + w) form: vLLM's stock RMSNorm, HF's Gemma4RMSNorm
+     * (weight init 1.0) and llama.cpp's LLM_NORM_RMS all multiply by the weight alone. */
     g.wadd    = 0.0f;
     g.wadd_qk = 0.0f;
     const float final_wadd = 0.0f;
@@ -1262,8 +1181,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     int n_global = 0;
     for (int v : is_global) n_global += v;
 
-    /* the slider comes off geom_from (head_dim 256, 16 kv heads, full rotation, theta_s); the global
-     * class is built from the container head. */
+    /* The sliding class comes from geom_from (head_dim 256, 16 kv heads, full rotation, theta_s);
+     * the global class is built from the container header. */
     m.cs.n_head = g.n_head;      m.cs.n_head_kv = g.n_head_kv; m.cs.head_dim = g.head_dim;
     m.cs.n_rot  = g.head_dim;    m.cs.window = sliding_win;    m.cs.theta = theta_s;
     m.cs.scale  = g.rope_scale;  m.cs.head_ladder = false;     m.cs.has_v = true;
@@ -1309,21 +1228,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.w_tok = decl_w(b, nm.f("token_embd.weight"), RAD_BF16, {g.n_vocab, g.n_embd},
                      RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
     /* bf16, not f32: the model group is pinned to the mapped tier (token_embd's embed_lookup is
-     * host-only), so an f32-declared output_norm would widen and fail to serve from the mapping. */
+     * host-only), and a widened output_norm could not be served from the mapping. */
     m.w_out = decl_w(b, nm.f("output_norm.weight"), RAD_BF16, {g.n_embd},
                       RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
-    /* DECLARED AT ITS CODES' DTYPE, as the assistant head's lm_head is: bf16 as the checkpoint ships
-     * it, or int8 / block fp8 where a recipe (`--quant output.weight=...`) makes it so, and the
-     * logits_gemm kernel for that encoding serves it. At a decode step it is the largest single read
-     * of the trunk (n_vocab x n_embd a rank), so its encoding is a direct share of the step. */
+    /* Declared at its codes' dtype, like the assistant head's lm_head: bf16 as shipped, or int8 /
+     * block fp8 where a recipe (`--quant output.weight=...`) makes it so, selecting the matching
+     * logits_gemm kernel. It is the trunk's largest single read at decode (n_vocab x n_embd per
+     * rank). */
     m.w_lm  = decl_w(b, nm.f("output.weight"), weight_codes_dtype(b, nm.f("output.weight"), RAD_BF16),
                      {g.n_vocab, g.n_embd}, RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
 
-    /* The embedding is scaled by sqrt(n_embd) at the LOOKUP, not baked into the table (the
-     * reference's build_inp_embd and HF's ScaledWordEmbedding both do it there), and the
-     * checkpoint's table is plain -- so the scale rides the op and the table stays tied to the
-     * head's. Absent it, the residual stream carries a 73x-too-small token signal and the first
-     * layer's scale-invariant norm hides nothing downstream. */
+    /* The embedding is scaled by sqrt(n_embd) at the lookup, not in the table (as in llama.cpp's
+     * build_inp_embd and HF's ScaledWordEmbedding), so the plain table stays tied to the head.
+     * Without it the token signal in the residual stream would be ~73x too small. */
     m.op_embed = rw(b, RAD_OP(b, "embed_lookup",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n_embd", g.n_embd),
                                RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
@@ -1338,17 +1255,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                           RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
                                RAD_NOWEIGHTS),
                           {m.b_x}, {m.b_x});
-    /* An image's rows over its placeholders' embeddings, after the (all-reduced) lookup and
-     * before the first block reads the stream: the reference scales the token embeddings by
-     * sqrt(n_embd) and scatters the image features in unscaled. */
-    if (Vision::present(meta) && ctx->max_enc_patches > 0)
+    /* An image's rows overwrite its placeholders' embeddings after the (all-reduced) lookup and
+     * before the first block: the reference scales token embeddings by sqrt(n_embd) and scatters
+     * the image features in unscaled. */
+    if (Gemma4Vision::present(meta) && ctx->max_enc_patches > 0)
         m.op_mm = rw(b, RAD_OP(b, "scatter_rows",
                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                           RAD_STR("dtype", "bf16")),
                                RAD_NOWEIGHTS),
                      {m.b_x}, {m.b_x});
 
-    /* ---- the layers. This loop is the model card. */
+    /* ---- the layers. */
     Gemma4Attn::Wire sw{}; sw.x = m.b_x; sw.h = m.b_h; sw.q = m.b_qs; sw.k = m.b_ks; sw.v = m.b_vs;        sw.attn = m.b_attns;
     Gemma4Attn::Wire gw{}; gw.x = m.b_x; gw.h = m.b_h; gw.q = m.b_qg; gw.k = m.b_kg; gw.v = m.b_vg;        gw.attn = m.b_atting;
     Gemma4Mlp::Wire  mw{}; mw.x = m.b_x; mw.h = m.b_h; mw.gu = m.b_gu; mw.ffn = m.b_ffn;
@@ -1364,7 +1281,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, cgeo, kg, aw, pre));
         RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, pre));
 
-        /* the per-layer scalar: `cur = cur * scalar`, a [1] bf16 over the residual stream. */
+        /* The per-layer scalar: `cur = cur * scalar`, a [1] bf16 over the residual stream. */
         RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.layer_scalar", (int)l),
                               nm.ckpt("%s.%lld.layer_scalar", pre, (long long)l)));
         lay.w_scalar = decl_w(b, nm.f("blk.%d.layer_scalar", (int)l), RAD_BF16, {1},
@@ -1376,11 +1293,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                            {mw.x}, {mw.x});
     }
 
-    /* ---- the junctions, declared once every layer exists (j_ma reads the next layer's gain). Used
-     * only when every one of them resolved and every linear a junction feeds reads its int8 pair:
-     * q, k and v (k and v through q's) and gate_up. A junction writes that pair and not the bf16
-     * norm output, so a bf16 k or v beside an int8 q would read a stale buffer. Otherwise the
-     * blocks keep their own norms, quantisers, post-norms and adds. */
+    /* ---- the junctions, declared once every layer exists (j_ma reads the next layer's gain).
+     * Used only when all resolved and every linear a junction feeds reads its int8 pair (q, k and
+     * v through q's, and gate_up): a junction writes that pair, not the bf16 norm output, so a bf16
+     * k or v beside an int8 q would read a stale buffer. Otherwise the blocks keep their own norms,
+     * quantisers, post-norms and adds. */
     if (m.n_main > 0) {
         bool ok = true;
         for (const Layer& lay : m.layers)
@@ -1433,8 +1350,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                      {m.b_logits}, {m.b_logits});
 
     /* ---- the assistant head, when the container carries one (`rad-convert --draft-model`) and
-     * the deployment speculates. A container converted without it, or a serve at max_spec 0,
-     * declares none of it: half a gigabyte of weights stays off the card. */
+     * the deployment speculates; otherwise its ~0.5 GB of weights stay off the card. */
     if (ctx->max_spec > 0 && has_assistant(meta)) {
         int last_s = -1, last_f = -1;
         for (int64_t l = 0; l < m.n_main; ++l) (is_global[(size_t)l] ? last_f : last_s) = (int)l;
@@ -1442,9 +1358,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                     m.n_main, m.w_tok, m.b_h, m.b_logits));
         m.have_head = true;
 
-        /* WHAT THE ENGINE DRIVES. Serial: `max_spec` dependent passes, each embedding what the
-         * last one proposed, through the ordinary sampler chain (proposal 0) -- and a head with no
-         * cache of its own, so the core stages every pass at the committed position. */
+        /* Serial drafter: `max_spec` dependent passes, each embedding the last one's proposal,
+         * through the ordinary sampler chain (proposal 0). The head has no cache of its own, so
+         * the core stages every pass at the committed position. */
         RadDrafterDecl dd{};
         dd.name           = "mtp";
         dd.kind           = RAD_DRAFT_SERIAL;
@@ -1456,11 +1372,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RAD_ARCH_TRY(rad_drafter_shared_kv(b, kHeadPosOffset));
     }
 
-    /* ---- the vision tower, its weight groups past the trunk's and the head's (whether or not
-     * this deployment declares the head, so the groups do not move with max_spec). */
+    /* ---- the vision tower, its weight groups past the trunk's and the head's (counted even when
+     * the head is not declared, so the groups do not move with max_spec). */
     {
-        const int64_t head_groups = has_assistant(meta) ? hd_i(meta, "num_hidden_layers", 0) + 1 : 0;
-        RAD_ARCH_TRY(m.vis.declare(b, meta, ctx, nm, g.n_embd, (int)(m.n_main + head_groups)));
+        const int64_t head_groups = has_assistant(meta) ? meta_text_geti(meta, "num_hidden_layers", 0, "draft.") + 1 : 0;
+        RAD_ARCH_TRY(m.vis.declare(b, meta, ctx, nm, g.n_embd, (int)(m.n_main + head_groups),
+                                   "model.", "gemma4_bf16"));
     }
 
     rad_note(b, "rank %d/%d: %lld layers (%lld global, %lld sliding), sliding window %lld, "
@@ -1474,13 +1391,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = g_model[rad_rank(c)];
 
-    /* AN ENCODER PASS RUNS THE TOWER AND NOTHING ELSE. */
+    /* An encoder pass runs only the tower. */
     if (batch->enc) {
         m.vis.step(c, batch);
         return;
     }
-    /* A DRAFT PASS RUNS THE HEAD AND NOTHING ELSE. The trunk already ran this step and left its
-     * final-normed hidden state in `h`, which the head's history pass gathers from. */
+    /* A draft pass runs only the head. The trunk already left its final-normed hidden state in
+     * `h`, which the head's history pass gathers from. */
     if (batch->draft_pass != 0) {
         if (!m.have_head) {
             rad_step_fail(c, "the batch asks for a drafter pass and no drafter is declared: the "
@@ -1510,17 +1427,13 @@ static void step(RadCtx* c, const RadBatch* batch) {
         if (m.fuse) l.j_am.step(c, T, m.fuse_ar);
         l.mlp.step(c, batch, m.fuse, m.fuse && !last, m.fuse_ar);
         if (m.fuse && !last) {
-            /* [all-reduce,] post-norm, add, the layer scalar, the next block's norm and quantiser: one op */
+            /* [all-reduce,] post-norm, add, layer scalar, next block's norm and quantiser: one op */
             l.j_ma.step(c, T, m.fuse_ar);
             continue;
         }
-        /* the per-layer scalar: `cur = cur * scalar`, the [1] bf16 over the residual stream,
-         * applied at the end of each layer (after the mlp add) -- exactly the vLLM oracle's
-         * `hidden_states = hidden_states * self.layer_scalar`. The checkpoint's values (0.03-0.99,
-         * the vLLM text-only loader remaps `model.language_model.` -> `model.` and loads the
-         * buffer, gemma4.py:1419/1644) are the trained weights: they rescale the residual toward
-         * O(1) (the RMSNorms normalise magnitude but keep direction, so the input signal survives
-         * through the branch, not the identity path). */
+        /* The per-layer scalar, `cur = cur * scalar` over the residual stream, applied after the
+         * mlp add, as vLLM's `hidden_states = hidden_states * self.layer_scalar`. The checkpoint's
+         * values (0.03-0.99) are trained weights that rescale the residual toward O(1). */
         RAD_ISSUE(c, l.op_scale, brows(m.b_x, batch->n_tok), RAD_W(l.w_scalar),
                   brows(m.b_x, batch->n_tok));
     }
@@ -1545,9 +1458,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
 /* The reply format: the model's, shared with arch/gemma4 (arch/rad_gemma4_chat.h). */
 const RadChatFormat* chat_format(const RadModelMeta*) { return gemma4_chat_format(); }
 
-/* WHAT THIS CONTAINER'S HEAD IS WORTH SPECULATING TO, for `--num-speculative-tokens auto`. A serial
- * head names an operating point, not a trained depth: one more round is one more pass of the head,
- * and every depth still runs. */
+/* The default draft depth for `--num-speculative-tokens auto`. A serial head's depth is an
+ * operating point, not a trained depth: every depth runs. */
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
     if (has_assistant(meta)) {
@@ -1555,7 +1467,7 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         out->draft_depth_fixed = 0;
     }
     /* The tower's pooling window, so a pass size the core picks itself is whole windows. */
-    if (Vision::present(meta)) {
+    if (Gemma4Vision::present(meta)) {
         const int64_t k = rad_meta_geti(meta, "vision_config.pooling_kernel_size", 0);
         if (k > 0) out->enc_merge = k * k;
     }
@@ -1565,7 +1477,7 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PLUGIN(gemma4_bf16, "gemma4", "compressed-tensors", "0.1.0",
                 "Gemma 4 dense (text and images), w4a8 from its bf16 or its CT-INT4 (QAT) release: "
-                "sliding-window and proportional-RoPE global attention over a GemmaRMSNorm stream "
+                "sliding-window and proportional-RoPE global attention over a plain RMSNorm stream "
                 "with GELU feed-forward, per-layer scalar scaling and soft-capped logits")
 RAD_ARCH_CHAT_FORMAT(gemma4_bf16)
 RAD_ARCH_PROBE(gemma4_bf16)

@@ -1,99 +1,94 @@
-# Radiance Inference Engine Specification
+# radiance engine specification
 
-C++, with no Python anywhere in the engine or its tooling. A monolithic core with `.so`-based
-plugins for the two things that actually change per model: the architecture, and the kernels.
+The engine is C++: a monolithic core with `.so` plugins for the two things that change per model,
+the architecture and the kernels. Python appears only in a few offline helpers
+(`tools/pad_tp.py`, `tests/mkgolden.py`); neither the engine nor its tools run it.
 
-Device code is a plugin's business and not the core's. `RAD_WITH_HIP` is tri-state — `ON | OFF |
-AUTO` — and a host-only build with no device kernels is a supported configuration rather than a
-degraded one: everything except the device kernels is exercised by it. Three kernel libraries are
-in the tree and only one of them is HIP — `libr4d` for AMD RDNA4, `libavx` in hand-written x86
-SIMD, `libref` in plain C++ — which is the reason that configuration is not a special case.
+Device code belongs to plugins, not to the core. `RAD_WITH_HIP` is `ON | OFF | AUTO`, and a
+host-only build with no device kernels is a supported configuration that exercises everything
+except the device kernels. Three kernel libraries are in the tree and only one is HIP: `libr4d` for
+AMD RDNA4, `libavx` in hand-written x86 SIMD, and `libref` in plain C++.
 
 ## Why
 
-vLLM has the right core design — continuous batching, paged KV, prefix caching — and an
-implementation that makes every one of those ideas expensive to reach. Everything is dynamic,
-nothing states what it will run before it runs, the hooking points are numerous and
-under-specified, and the Python tax is charged per step, per layer, per KV-cache group.
+vLLM's core design (continuous batching, paged KV, prefix caching) is the model this engine
+follows. Its implementation is dynamic throughout: nothing states what it will run before it runs,
+its extension points are many and loosely specified, and Python costs host time per step, per
+layer and per KV-cache group.
 
-The measure of that is a patch set over vLLM: twenty-four monkey-patches to serve four models on
-one card. Sorted by what they are fighting, they are the requirements list for this engine.
+Serving four models on one card with vLLM took twenty-four monkey-patches. Grouped by what they
+change, they are this engine's requirements:
 
-| what the patch class fights | count | radiance's answer |
+| patch class | count | requirement here |
 |---|---|---|
 | kernel substitution | 7 | kernel plugin hierarchy (§2.1) |
-| fusion coverage | 1 | fused ops are ops you can select on (§2.3) |
+| fusion coverage | 1 | fused ops are ops that selection can choose (§2.3) |
 | per-step host cost and metadata sharing | 4 | core-owned step batch, built once (§8) |
 | KV group sizing for hybrid models | 1 | hybrid KV groups are first-class (§7.2) |
 | speculative decode plumbing | 5 | a drafter is declared by the model's own plugin (§10) |
 | chat template and tool parsing | 2 | lifted and rewritten from llama.cpp (§12) |
-| platform detection | 2 | does not arise |
+| platform detection | 2 | not applicable |
 
-The goal is that none of those has an analogue here. Every one of them exists because vLLM's
-extension points did not reach where the work was, so the only remaining move was to edit its
-source. An engine you have to fork to change is not extensible; it just has a patch queue.
+Each class exists because no extension point reached the code that needed changing, so the only
+option was to patch the source. Here each has a designed extension point.
 
 ## Scope
 
-**In, v1:** continuous batching, paged KV, prefix caching, tensor parallel, speculative decoding,
-hybrid KV (full + sliding-window + linear-attention state in one model), weight placement across
-VRAM / RAM / SSD with runtime re-placement, a server for OpenAI, Anthropic and llama-server
-clients, a quantiser.
+**In:** continuous batching, paged KV, prefix caching, tensor parallelism, speculative decoding,
+hybrid KV (full, sliding-window and linear-attention state in one model), weight placement across
+VRAM, RAM and SSD with runtime re-placement, a server for OpenAI, Anthropic and llama-server
+clients, embeddings, image generation, and a quantiser.
 
-**Multimodal: pictures and video, on the Qwen plugins (§11).** The vision tower is declared by the
-language model's own architecture plugin, its embeddings travel in the step batch, and an image is
-a prefix-cache hit by content. Audio is not served.
+**Multimodal (§11).** Pictures and video on the Qwen and Gemma 4 plugins, pictures on LFM2-VL,
+and pictures, video and audio as EmbeddingGemma 2 input. The encoder is declared by the language
+model's own architecture plugin, its output travels in the step batch, and a picture is a
+prefix-cache hit by content.
 
-**Large MoE models.** The heat-driven expert placement path (§5.4) and the 4-bit expert formats
-carry Qwen3.8-Flash-Next (`docs/MOE-W4.md`). DeepSeek-V4-Flash is the next architecture they are
-meant for; it is not ported.
+**Large MoE models.** Heat-driven expert placement (§5.4) and the 4-bit expert formats
+(`docs/MOE-W4.md`) serve Qwen3.8-Flash-Next. DeepSeek-V4-Flash is not ported.
 
-**Out:** training, LoRA, pipeline parallelism, CUDA, disaggregated prefill. None are designed
-out; none are designed for either.
+**Out:** training, LoRA, pipeline parallelism, CUDA, disaggregated prefill. None is designed out
+and none is designed for.
 
-**Hardware:** no particular card. Everything above the device layer learns the machine at run time
--- architecture, compute units, wave width, LDS, VRAM -- and everything that cannot be written
-once is a kernel library, which is a plugin selected per op against declared constraints (§2.1).
-The device library shipped here, `libr4d`, covers AMD RDNA4 (`gfx12xx`); that is the hardware this
-engine has been measured on, and it is the part of the tree that would be written again for
-another card. Serving a card no installed library covers is a refusal that names the unserved ops
-(§17), not a crash and not a silent slow path.
+**Hardware.** Everything above the device layer learns the machine at run time (architecture,
+compute units, wave width, LDS, VRAM). Everything that must be written per card is a kernel
+library, a plugin selected per op against declared constraints (§2.1). The shipped device
+library, `libr4d`, covers AMD RDNA4 (`gfx12xx`), the hardware the engine is measured on. A card no
+installed library covers is refused at startup with the unserved ops named (§17).
 
 ---
 
 ## 1. Shape of the engine
 
-One process. One thread per tensor-parallel rank, each owning one device — no IPC, no
-shared-memory handshake, no serialisation between ranks, which is most of what a Python engine
-spends its multiprocessing budget on. HTTP threads feed a request queue; one scheduler thread
-produces one `RadBatch` per step (§8) and releases the rank threads against it at a barrier.
-Because the ranks share an address space, the batch is shared by pointer rather than broadcast.
+One process. One thread per tensor-parallel rank, each owning one device, so ranks need no IPC
+and no serialisation. HTTP threads feed a request queue; one scheduler thread produces one
+`RadBatch` per step (§8) and releases the rank threads against it at a barrier. The ranks share an
+address space, so the batch is shared by pointer.
 
 Startup, in order:
 
-1. Load kernel plugins from `$RADIANCE_HOME/kernels/`, in the configured hierarchy order.
-2. Load the model's metadata only — architecture id, dimensions, quantisation descriptor, vocab.
-3. Look up the architecture id in `$RADIANCE_HOME/architectures/`. No match, no model.
-4. **Declare.** The architecture plugin enumerates every weight, buffer and op it will ever issue.
-   The core resolves each op against the kernel hierarchy. This phase always completes; if
-   anything failed to resolve, the full list is reported at the end rather than the first failure
-   at the top.
-5. **Plan.** The placement planner assigns every weight a tier and an execution site, against
+1. Open the devices.
+2. Read the model's metadata: architecture id, dimensions, quantisation descriptor, vocabulary.
+3. Load the kernel plugins from `$RADIANCE_HOME/kernels/` in hierarchy order, and the architecture
+   plugin for the model's id from `$RADIANCE_HOME/architectures/`. No match, no model.
+4. **Declare.** The architecture plugin enumerates every weight, buffer and op it will issue, and
+   the core resolves each op against the kernel hierarchy. This phase always completes and
+   reports every unresolved op together.
+5. **Plan.** The placement planner assigns every weight a tier and an execution site against
    explicit pool budgets.
-6. **Load.** Weights are mapped and staged according to the plan.
+6. **Load.** Weights are read and staged according to the plan.
 7. Serve.
 
-Between 4 and 5 the whole model is known statically: every op, every kernel that will service it,
-every weight it touches, and the order. That is the property the rest of this document spends.
+After step 4 the whole model is known statically: every op, the kernel that serves it, every
+weight it touches, and the order. The rest of this document relies on that.
 
 ---
 
 ## 2. Plugins
 
-Three flavours, loaded from `$RADIANCE_HOME`: kernels (§2.1), architectures (§2.4) and
-quantisers (§4.5). All are C ABI only. C++ across an `.so` boundary is
-a standing invitation to a mismatch that manifests as corruption three frames later, and the
-boundary here is exactly where a user is expected to substitute their own build.
+Three kinds, loaded from `$RADIANCE_HOME`: kernels (§2.1), architectures (§2.4) and quantisers
+(§4.5). All are C ABI only: C++ across an `.so` boundary invites mismatches that surface as
+corruption far from their cause, and this boundary is where users substitute their own builds.
 
 Every plugin exports a version symbol and is refused on mismatch:
 
@@ -104,15 +99,12 @@ const RadPluginInfo* rad_plugin_info(void);
 
 ### 2.1 Kernel plugins
 
-`$RADIANCE_HOME/kernels/*.so`. Each provides any number of kernels as **rows**: the plugin
-exports `rad_kernel_count` / `rad_kernel_at` and the core reads the table, alongside the op
-schemas (§2.3) it exports the same way.
+`$RADIANCE_HOME/kernels/*.so`. Each provides any number of kernels as **rows**, exported through
+`rad_kernel_count` / `rad_kernel_at`, alongside the op schemas (§2.3) exported the same way.
 
-**A plugin does not supply a selector.** The constraint selector is core-owned
-(`core/plugin/select.cpp`), and that is the point rather than an economy: if every plugin brought
-its own, "which kernel ran, and why" would have one answer per plugin, and the hierarchy below
-could not be absolute because nothing above the plugins would be enforcing it. A plugin declares
-what it can do; the core decides what runs.
+A plugin does not supply a selector. The constraint selector is core-owned
+(`core/plugin/select.cpp`), so "which kernel ran, and why" has one answer and the hierarchy below
+is enforced above every plugin. A plugin declares what it can do; the core decides what runs.
 
 ```c
 enum { RAD_C_EQ, RAD_C_LE, RAD_C_GE, RAD_C_DIV, RAD_C_IN };
@@ -126,7 +118,7 @@ struct RadConstraint {
 
 enum { RAD_DOMAIN_DEVICE, RAD_DOMAIN_HOST };
 
-/* One AXIS of this kernel's instantiation space -- see §15. Null/0 means nothing to tune. */
+/* One axis of this kernel's instantiation space (§15). Null/0 means nothing to tune. */
 struct RadTunable {
     const char*    key;       /* the kernel's own name for the axis: "sk", "bm", "npw" */
     const int64_t* values;    /* legal values, ascending; the core tries exactly these */
@@ -153,58 +145,53 @@ struct RadKernelInfo {
     RadFiniFn      fini;
     RadLaunchFn    launch;     /* int (*)(const RadArgs*, RadStream) */
     RadScratchFn   scratch;    /* int64_t (*)(const RadArgs*), or null */
-    RadLayoutFn    layout;     /* what this kernel stores for a weight of a given encoding -- §4.3 */
+    RadLayoutFn    layout;     /* what this kernel stores for a weight of a given encoding (§4.3) */
     RadRelayoutFn  relayout;   /* host code producing it from the canonical planes, at load */
     RadShapeFn     opd_shape;  /* how to size and fill each operand, for a tool calling it cold */
     RadUnrelayoutFn unrelayout;/* the inverse, so a stored weight can be read back */
     RadFuseFn      replaces;   /* the chain of conventional ops this kernel does in one launch */
-    RadDescribeFn  describe;   /* the same dispatch, described rather than performed */
 };
 ```
 
-`init` and `fini` exist because some kernels have per-instance state that must be established
-once and not per launch — libr4d's all-reduce needs its peer signal buffers and IPC handles set up
-across ranks before the first call, and a kernel that JITs or loads a config table wants somewhere
-to do it that is not the hot path.
+`init` and `fini` hold per-instance state set up once, off the hot path: libr4d's all-reduce
+exchanges peer signal buffers and IPC handles there; a kernel may JIT or load a config table.
 
-**The six hooks below `scratch` are what make a kernel legible to everything that is not the
-step.** `layout` and `relayout` are what the loader calls to turn a weight's canonical planes into
-the bytes this kernel wants (§4.3), and `unrelayout` turns them back, so a stored weight can be
-compared against a dense oracle instead of being unfalsifiable. None of them quantises: a kernel
-states which encodings it reads by refusing the rest in `layout`, and producing an encoding is a
-quantiser's job (§4.5). `opd_shape` says how big each operand is and what may be in
-it, so a tool can call the kernel cold; a kernel that supplies none is skipped **by name** rather
-than guessed at, and a guessed extent tests the kernel's bounds handling and calls the result
-correctness. `replaces` is a fusion declaring the chain of conventional ops it computes in one
-launch, which is what turns "byte-identical to the two ops it replaces" from prose into something
-checkable (§2.3, §17). `describe` reports a dispatch instead of performing it (§3.2). All six are
-optional; `launch` is not.
+The hooks after `scratch` serve tools as well as the step. All are optional; `launch` is not.
 
-**There is no variant index.** A kernel declares tunable **axes** and the core picks a point in
-that space, appending the chosen values to `RadArgs::p` as ordinary parameters — so a kernel reads
-its tuning with the same call it reads its geometry with. §15 is the whole of the mechanism.
+- `layout` and `relayout` turn a weight's canonical planes into the bytes the kernel reads (§4.3);
+  `unrelayout` turns them back, so a stored weight can be checked against a dense oracle. None of
+  them quantises: a kernel refuses in `layout` the encodings it does not read (§4.5).
+- `opd_shape` gives each operand's size and value domain, so a tool can call the kernel cold. A
+  kernel without it is skipped by name, never called with guessed extents.
+- `replaces` declares the chain of conventional ops a fusion computes, so "byte-identical to the
+  ops it replaces" is checkable (§2.3, §17).
 
-**Constraints are a necessary condition, not a sufficient one.** They settle whether a kernel
-exists for a geometry. Strides, contiguity, alignment and buffer sizes are properties of a call
-rather than of a model; they stay in the entry point, which still rejects what it cannot run.
-libr4d's registry comments make this point at length.
+A kernel declares tunable axes, not variants; the core appends the chosen point to `RadArgs::p` as
+ordinary parameters (§15).
+
+**Constraints are necessary, not sufficient.** They decide whether a kernel exists for a geometry.
+Strides, contiguity, alignment and buffer sizes belong to a call, not a model; the entry point
+checks them and rejects what it cannot run.
 
 **Selection.** Plugins are queried in hierarchy order, and the hierarchy is absolute: the first
-plugin with any matching kernel supplies it, and a lower-priority plugin never outbids a higher
-one no matter how specialised its kernel. That is what makes a user override an override.
+plugin with any matching kernel supplies it, whatever a lower plugin offers. That is what makes a
+user override reliable.
 
-Within one plugin, the highest `priority` among matching rows wins, ties broken by declaration
-order. Specificity is **declared, not derived** — counting matched constraints gets it backwards,
-since `{head_dim<=1024, gqa>=1, block%16==0, causal in {0,1}}` matches four constraints and
-`{head_dim==256, gqa==6}` matches two, and the second is by far the more specialised. libr4d's
-all-reduce rows are the example: the two-shot rows must outrank the one-shot ones or nothing could
-ever reach them, and an integer states that intent instead of leaving it to the order of the rows.
+Within one plugin the highest `priority` among matching rows wins, ties broken by declaration
+order. Specificity is declared, not derived: counting matched constraints would rank
+`{head_dim<=1024, gqa>=1, block%16==0, causal in {0,1}}` (four) above the more specialised
+`{head_dim==256, gqa==6}` (two). libr4d's two-shot all-reduce rows must outrank its one-shot rows
+or nothing could reach them.
 
-**Domains.** A CPU kernel is an ordinary kernel with `domain = RAD_DOMAIN_HOST`, resolved through
-the same hierarchy and the same constraints. Declare resolves both domains where both exist, so
-the core can change execution site at runtime without re-resolving. Absence is reported
-asymmetrically: no device kernel is fatal; no host kernel is a warning naming the placement
-options it just removed.
+**Domains.** A CPU kernel is an ordinary kernel with `domain = RAD_DOMAIN_HOST`. Declare resolves
+both domains where both exist, so the core can change execution site at runtime without
+re-resolving. Misses are reported by class:
+
+- a device miss with no host kernel to stand in is a hole, and the engine refuses to start;
+- a device miss a host kernel covers runs that op on the host, with its weights in the
+  container's mapping (§5.1); an op with no weights has nothing to place, so its host kernel
+  cannot stand in;
+- a host miss only removes a placement option, and is reported on one line.
 
 **Arguments** are positional, per the op's schema:
 
@@ -229,18 +216,16 @@ struct RadArgs {
 };
 ```
 
-`instance` is why `init` is worth having at all: the state it established is handed back on every
-launch without a lookup. `rank` and `world_size` are here rather than as parameters because a
-collective needs them and nothing else does, and a kernel that asked its geometry for them would
-be reading a key the architecture plugin had to remember to write.
+`instance` returns `init`'s state on every launch without a lookup. `rank` and `world_size` are
+fields rather than parameters because only collectives need them, and as parameters every
+architecture plugin would have to write them.
 
 ### 2.2 Shape domains and the bucket table
 
-A parameter may be declared as a **range** rather than a value, because some of them are
-properties of the batch and not of the model. `M` is the obvious one: a GEMM sees one row at
-decode, sixty-four at a speculative verify, and thousands in a prefill chunk, and libr4d has a
-different kernel for each band. Resolving once at `M = max_tok` would pick the prefill kernel and
-then run it at `M = 1`, which is exactly the loss a skinny-GEMM patch to vLLM exists to recover.
+A parameter may be declared as a **range**, because some parameters belong to the batch, not the
+model. A GEMM's `M` is one row at decode, up to sixty-four at a speculative verify and thousands in
+a prefill chunk, and libr4d has a kernel for each band; resolving once at `M = max_tok` would run
+the prefill kernel at `M = 1`.
 
 ```c
 h = decl_op(b, "gemm_nt_q",
@@ -249,13 +234,9 @@ h = decl_op(b, "gemm_nt_q",
 ```
 
 The core resolves the range into a **bucket table**: one resolution per band, built at declare and
-indexed by the actual value at issue.
-
-**The bucket boundaries are the constraint values themselves.** Take the union of the `LE`, `GE`
-and `EQ` values that candidate kernels place on the ranged parameter, and those are the bands.
-Three kernels constraining `M<=16`, `M<=64` and nothing produce `(0,16]`, `(16,64]`, `(64,max]`
-and no policy was chosen by anyone. A kernel whose fast band sits at an odd boundary gets that
-boundary, because it said so.
+indexed by the actual value at issue. The band boundaries are the union of the `LE`, `GE` and `EQ`
+values the candidate kernels place on the parameter: kernels constraining `M<=16`, `M<=64` and
+nothing give `(0,16]`, `(16,64]` and `(64,max]`.
 
 `--debug-graph` prints the table:
 
@@ -266,15 +247,14 @@ gemm_nt_q  N=8192 K=5120 group=128 dtype=w4a8
     M <= 8192  ->  gemm_w4a8_prefill       (libr4d, prio 10)
 ```
 
-The missing-kernel report is per band. A range with a hole in it — a model whose prefill shape
-nothing serves — is reported as that band, not as the whole op.
+The missing-kernel report is per band: a range with a hole (a prefill shape nothing serves) is
+reported as that band, not as the whole op.
 
 ### 2.3 The op vocabulary
 
-Op names are free strings. Kernel plugins declare the ops they implement **and the schema for
-each** — a `RadOpSchema` table exported through `rad_kernel_schema_count` / `rad_kernel_schema_at`
-— and the core cross-checks an architecture plugin's declared parameters against the union of
-schemas.
+Op names are free strings. Kernel plugins declare the ops they implement and a schema for each, a
+`RadOpSchema` table exported through `rad_kernel_schema_count` / `rad_kernel_schema_at`, and the
+core checks an architecture plugin's declared parameters against the union of schemas. An excerpt:
 
 ```c
 static const RadParamSpec pGemmNtQ[] = {
@@ -289,31 +269,23 @@ static const RadOperandSpec oGemmNtQ[] = {
 SCHEMA("gemm_nt_q", pGemmNtQ, oGemmNtQ, "C[M,N] = A[M,K] @ dequant(Bq)[N,K]^T ...")
 ```
 
-**A schema names operands as well as parameters, and the roles are the part the core needs.** It
-has to know which operands are weights, so issue can resolve a handle and wait on the mover's
-event, and which are written, so the buffer planner can compute liveness. It needs nothing else
-about them — which is exactly what keeps a third party able to add an op.
+The core needs only the operand roles: which operands are weights (issue resolves a handle and
+waits on the mover's event) and which are written (the buffer planner computes liveness). Knowing
+nothing else is what lets a third party add an op without a core change. A misspelled op fails
+declare with the near miss named.
 
-Without the schema, a typo and an unimplemented op are the same diagnostic. With it, a misspelled
-op fails declare with the near-miss named. New ops need no core change, which is the requirement:
-the core must never be the thing you edit to add a kernel.
-
-**There are three requirednesses, not two.** A parameter is supplied by the caller
-(`RAD_REQUIRED`), may be (`RAD_OPTIONAL`), or is supplied by the **kernel** (`RAD_DERIVED`). The
-third exists because of a circularity §7.2 makes concrete: the paged block size comes from the
-resolved attention kernel and not from a core constant — but a constraint whose key the geometry
-does not carry does not hold, so a kernel constrained to `block_size == 16` could never be
-selected by the query that was going to read the answer off it. So constraints on a derived
-parameter are **skipped** during matching, and once a kernel wins, its `RAD_C_EQ` value for that
-key is written into the resolved geometry. A caller that supplies one anyway pins it and it
-matches normally, which is how an operator forces a block size and gets a refusal by name rather
-than a silent substitution.
+**Requiredness.** A parameter is supplied by the caller (`RAD_REQUIRED`), may be supplied
+(`RAD_OPTIONAL`), or is supplied by the kernel (`RAD_DERIVED`). The third breaks a circularity:
+the paged block size comes from the resolved attention kernel (§7.2), but a constraint on a key
+the geometry lacks does not hold, so a kernel constrained to `block_size == 16` could never be
+selected. Constraints on a derived parameter are skipped during matching, and the winner's
+`RAD_C_EQ` value is written into the resolved geometry. A caller that supplies the parameter pins
+it and it matches normally, so a forced block size is refused by name, not silently replaced.
 
 **Schemas are fixed by first declaration.** The first plugin in hierarchy order to declare an op
-fixes its schema; a later plugin declaring the same op name with a different schema is refused at
-load with both plugins named. Since arguments are positional, two disagreeing schemas would make
-the same call mean different things depending on which plugin won selection, and that is not a
-diagnosable failure — it is silent numerical garbage.
+fixes its schema; a later plugin declaring it differently is refused at load, both named.
+Arguments are positional, so disagreeing schemas would give one call different meanings depending
+on which plugin won selection.
 
 **Fusion is a selection, not a compiler pass.** A plugin asks for the fused op first and emits the
 unfused sequence when it does not resolve:
@@ -326,91 +298,72 @@ if (!h) {
 }
 ```
 
-`rad_op_resolved` is the shipped spelling of that test: a handle that did not resolve is
-`RAD_NULL_HANDLE`, and that is **not an error yet** — it becomes one only if the plugin issues it.
-Explicit, no pattern matcher, and the plugin author decides. A fusion rewriter is a compiler, and
-a compiler is the thing whose output nobody can predict — which is the complaint this engine
-exists to answer.
+`rad_op_resolved` is the shipped form of that test: an unresolved handle is `RAD_NULL_HANDLE`,
+an error only if issued. `rad_op_declared` asks whether any loaded library declares an op, for a
+fused op only an optional library defines. There is no pattern matcher; the plugin author decides.
 
-A kernel may also **declare** the chain it replaces (`RadFuseFn`, §2.1), and that is a
-declaration, not a rewriter: it makes the equivalence machine-readable so a fused kernel can be
-checked against the same plugin's own unfused rows — where the answer should be byte-identical,
-which is a stronger test than a tolerance against `libref` — and it is what `--debug-graph`'s
-fusion advisory reads. Nothing consumes it to transform the graph, and the declare phase keeps
-nothing a rewriter could work on in any case: the buffer planner collapses each buffer's whole
-use-set to a `first_def`/`last_use` pair, so "op A's output is op B's only input" is not
-recoverable afterwards.
+A kernel may also declare the chain it replaces (`RadFuseFn`, §2.1). That lets a fused kernel be
+checked against the same plugin's unfused rows, byte for byte, and feeds `--debug-graph`'s fusion
+advisory. Nothing uses it to rewrite the graph, and declare keeps nothing a rewriter could use: the
+buffer planner reduces each buffer's uses to a `first_def`/`last_use` pair, so "op A's output is op
+B's only input" is not recoverable.
 
 ### 2.4 Architecture plugins
 
 `$RADIANCE_HOME/architectures/*.so`. One plugin implements one architecture id for one
-quantisation scheme, and **the selection key is the pair**: `qwen35_bf16.so` and `qwen35_fp8.so`
-both answer `"qwen35"` from `rad_arch_id()` and are told apart by `rad_arch_quant()`, against the
-descriptor the container already carries. No two plugins may claim the same *pair* — the second
-is refused at load with both named — and one id at several quantisations is the normal case rather
-than a collision, so the uniqueness rule is on the pair and not on the id. The match is exact and
-there is no fallback: an unquantised container and an unquantised plugin both say `""`. Falling
-back from a quantised container to a plugin that declares dense weights would fail later, at the
-name map, with a far worse message than *"no plugin claims qwen35 at fp8_e4m3; qwen35 is served
-at: (unquantised)"*.
+quantisation scheme, and the selection key is the pair: `qwen35_bf16.so` and `qwen35_fp8.so` both
+answer `"qwen35"` from `rad_arch_id()` and are told apart by `rad_arch_quant()`, matched against the
+model's quantisation descriptor. Two plugins claiming one pair are refused at load, both named. The
+match is exact (unquantised is `""` on both sides), with no fallback: a dense plugin given a
+quantised model would fail later at the name map, with a worse message than *"no plugin claims
+qwen35 at fp8_e4m3; qwen35 is served at: (unquantised)"*.
 
-The combination is deliberate. Extreme fusion means the graph genuinely differs by quant: a w4a8
-model wants `rmsnorm_had_quant_i8` where a bf16 model wants a plain `rmsnorm`, and pretending
-otherwise means a plugin full of branches on a quant descriptor — which is how you get back to
-"unclear what actually runs". A declare function with no branches in it is a readable list of
-what this model does, in order, and that readability is the point of the project.
+The graph differs by quantisation (a w4a8 model wants `rmsnorm_had_quant_i8` where a bf16 model
+wants `rmsnorm`), and one plugin per quantisation keeps the declare function free of branches on
+it, so it reads as a list of what the model does, in order.
 
-Dimensions come from model metadata, so one plugin covers every size in a family: `qwen35_fp8.so`
-serves Qwen3.5 / 3.6 / 3.8 dense from 0.8B to 27B. The file-count mitigation for the quant axis is
-a header-only helper library of composable blocks (attention layer, MoE layer, GDN layer), so a
-plugin is composition rather than copy-paste.
+Dimensions come from metadata, so one plugin covers a family: `qwen35_fp8.so` serves Qwen3.5, 3.6
+and 3.8 dense models. Header-only composable blocks in `arch/common/` (attention, MoE, GDN and
+other layers) keep plugins from copying each other. Two `.so`s can share a source: `qwen35moe_fp8`
+is `qwen35_fp8` with a routed feed-forward, three macros and an include. They stay two plugins
+because the id is the selection key and a container reports `qwen35moe` or `qwen35`.
 
-The mitigation along the other axis is that two `.so`s can be built from one source.
-`qwen35moe_fp8` is `qwen35_fp8` with the feed-forward routed: three macros and an include, with
-the half-dozen places a routed FFN differs behind one `#if`. They stay two plugins because the id
-is the selection key — a container converted from the MoE checkpoint reports `qwen35moe` and the
-dense one reports `qwen35`, one `.so` cannot claim both, and an operator looking at what is
-installed should see two plugins for two architectures.
+The plugin owns the map from checkpoint tensor names to declared weight names, fusions included
+(q/k/v into one qkv, gate and up into gate_up, one expert out of a stacked tensor). Both readers of
+a checkpoint use it: `rad-convert` (§4.4) and the engine loading a checkpoint directly (§4.3).
 
-The plugin also owns **the map from checkpoint tensor names to declared weight names**, including
-the fusions — q/k/v into a single qkv, gate and up into gate_up, one expert out of a stacked
-tensor. It is the only component that knows both sides, and both readers of a checkpoint use it:
-`rad-convert` (§4.4) and the engine loading one directly (§4.3).
+**A plugin asks what a weight holds.** `rad_weight_encoding` returns the logical weight's encoding
+(§4.1), from the container entry, the checkpoint tensors the name map resolves, or, in
+`rad-convert`, the recipe. The plugin declares the ops that read it (fp8 codes and scale plane to
+`gemm_nt_q`, int4 rotated experts behind `had_quant_act_fp8`, bf16 to the bf16 GEMM) and refuses by
+name an encoding it has no path for. No container key exists only to say how a weight was packed.
 
-**It asks what a weight holds instead of being told by a key.** `rad_weight_encoding(b, name, &enc)`
-answers with the logical weight's encoding (§4.1) — from the container's entry, from the checkpoint
-tensors the name map resolves it to, or, inside `rad-convert`, from the recipe — and the plugin
-declares the ops that read it: fp8 codes and their scale plane to `gemm_nt_q`, int4 rotated
-experts behind `had_quant_act_fp8`, a bf16 weight to the bf16 GEMM, and a refusal by name for an
-encoding it has no path for. One plugin per (architecture, quantisation) still holds; what the
-encoding query removes is every container key that existed only to tell a plugin how some of its
-weights had been packed.
-
-Each plugin exports these, two of them optional:
+Each plugin exports these; `rad_arch_quant`, `rad_arch_probe` and `rad_arch_chat_format` are
+optional:
 
 ```c
 const char* rad_arch_id(void);
 const char* rad_arch_quant(void);     /* the other half of the selection key; "" if unquantised */
-int  rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);          /* optional */
-const RadChatFormat* rad_arch_chat_format(const RadModelMeta* meta);       /* optional, §12 */
+int  rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);
+const RadChatFormat* rad_arch_chat_format(const RadModelMeta* meta);       /* §12 */
 int  rad_arch_declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx);
 void rad_arch_step(RadCtx* c, const RadBatch* batch);
 ```
 
-`rad_arch_probe` is the one thing a plugin can say **before** it declares anything, and it exists
-for the one fact that is an *input* to declaration and a property of the model: the draft depth.
-`RadArchProbe{draft_depth, draft_depth_fixed}` is what resolves `--num-speculative-tokens auto`
-(§10), and it has to happen first because `RadBuildCtx::max_spec` sizes buffers, bands kernels and
-sets the scheduler's window. The alternative is a core that reads a drafter's own configuration
-keys itself, by name, with an architecture's prefix in the string. A plugin that does not export
-it answers zero to everything: no draft depth, so `auto` resolves to 0.
+`rad_arch_probe` reports the model properties that are inputs to declaration. The main one is the
+draft depth: `RadArchProbe{draft_depth, draft_depth_fixed}` resolves `--num-speculative-tokens
+auto` (§10) before declare, because `RadBuildCtx::max_spec` sizes buffers, bands kernels and sets
+the scheduler's window; otherwise the core would read the drafter's configuration keys itself. The
+probe also reports sizing-declare support (`shape_probe_ok`, §3.1), the encoder's merge, the audio
+encoder's longest clip and an image generator's pass sizes. Without the export every answer is
+zero, so `auto` resolves to 0.
 
-`RadBuildCtx` carries `rank` and `world_size`, so declare runs once per rank and the plugin
-declares dimensions already divided (§9). It also carries the bounds the deployment was
-configured for — `max_tok`, `max_seqs`, `max_ctx`, `max_spec` — so a plugin sizes its buffers
-against the worst step rather than guessing; the tensor-parallel wire choice `tp_wire_lossy` and
-its `tp_wire_min_bytes` cutover (§9); `kv_dtype`; and `is_draft` / `scope`, which say whether this
-builder scope is the model, a drafter, or an encoder.
+`RadBuildCtx` carries `rank` and `world_size` (declare runs per rank with dimensions already
+divided, §9); the deployment's bounds `max_tok`, `max_seqs`, `max_ctx`, `max_spec`,
+`max_enc_patches` and `max_audio_frames`, so buffers are sized for the worst step; the
+tensor-parallel wire choice `tp_wire_lossy` and its `tp_wire_min_bytes` cutover (§9); `kv_dtype`;
+`shape_probe` (§3.1); and `is_draft` / `scope`, which say whether this builder scope is the model,
+a drafter or an encoder.
 
 ---
 
@@ -418,11 +371,11 @@ builder scope is the model, a drafter, or an encoder.
 
 ### 3.1 Declare
 
-The plugin states everything it will ever do. Weights first:
+The plugin states everything it will do. Weights first:
 
 ```c
 RadWeightDecl wd = {};
-wd.dtype  = RAD_I4;                     /* the LOGICAL dtype; the kernel owns the stored layout */
+wd.dtype  = RAD_I4;                     /* the logical dtype; the kernel owns the stored layout */
 wd.rank   = 2;
 wd.shape[0] = 8192; wd.shape[1] = 5120;
 wd.access = RAD_ACCESS_CONDITIONAL;     /* see §5 */
@@ -431,7 +384,7 @@ wd.shard  = RAD_SHARD_ROW;
 rad_weight w = rad_decl_weight(b, "blk.12.ffn_gate.weight", &wd);
 ```
 
-Activations are declared too, or the buffer plan below has nothing to analyse:
+Activations are declared too, so the buffer plan has something to analyse:
 
 ```c
 RadBufDecl bd = {};
@@ -451,34 +404,33 @@ rad_op o = RAD_OP(b, "gemm_nt_q",
                   RAD_WEIGHTS(w));
 ```
 
-...and their **buffer** operands, which are a separate call and not optional if the paragraph
-above is to mean anything. `rad_decl_op` names weights, because weights are what placement moves;
-liveness is which ops read and write which buffers, and an undeclared transient has no declared
-use and must be assumed live for the whole program.
+Buffer operands are a separate call, since liveness needs which ops read and write which buffers;
+a transient with no declared use is assumed live for the whole program.
 
 ```c
 rad_op_reads (b, o, RAD_BUFS(tmp));
 rad_op_writes(b, o, RAD_BUFS(out));
 ```
 
-Every name above is the shipped spelling — `abi/rad_builder.h` is the authority, and
-`arch/common/rad_arch.h` wraps these five calls in the `decl_w`/`decl_b`/`rw` helpers that the
-in-tree plugins actually read like. An architecture plugin is C++ and uses designated
-initialisers where it likes; the field-at-a-time form is written out here only because
-`.shape = { 8192, 5120 }` hides that `rank` is a separate field and is not derived from it.
+`abi/rad_builder.h` is the authority for these names; `arch/common/rad_arch.h` wraps them in the
+`decl_w` / `decl_b` / `rw` helpers the in-tree plugins use. `rank` is a separate field, not derived
+from `shape`.
 
-Declare produces five things:
+Declare produces:
 
-- **the resolved op list** — every op with the kernel(s) that will service it, per band, per domain;
-- **the missing list** — every op and band that resolved to nothing, reported whole;
-- **the weight manifest** — every weight with bytes, alignment, access class and grouping keys;
-- **the buffer plan** — activation liveness over the op list, so scratch and intermediates come
+- **the resolved op list**: every op with the kernels that serve it, per band, per domain;
+- **the missing list**: every op and band that resolved to nothing, reported together;
+- **the weight manifest**: every weight with bytes, alignment, access class and grouping keys;
+- **the buffer plan**: activation liveness over the op list, so scratch and intermediates come
   from one arena sized once instead of an allocator called per step;
-- **the tuning requests** — every (kernel, shape) pair `rad-tune` would need to benchmark (§2.1, §15).
+- **the tuning requests**: every (kernel, shape) pair `rad-tune` would benchmark (§15).
 
-The arena is sized for `max_tok`, and liveness is computed over the declared list, which is a
-superset of what any given step issues. Both are conservative on purpose: a plan that is correct
-for the worst step is correct for every step, and the alternative is an allocator on the hot path.
+The arena is sized for `max_tok` and liveness is computed over the declared list, a superset of
+what any step issues: a plan correct for the worst step is correct for every step, with no
+allocator on the hot path. A plugin that sets `RadArchProbe::shape_probe_ok` is declared again at
+smaller `max_tok` values (`RadBuildCtx::shape_probe`). Each result is an arena level packing the
+same buffers for smaller steps; while steps are that small, the arena above the level is lent to
+the expert slab.
 
 ### 3.2 Run
 
@@ -491,38 +443,32 @@ void rad_arch_step(RadCtx* c, const RadBatch* batch) {
 ```
 
 The call underneath is `int rad_issue(RadCtx*, rad_op, const RadOperand*, int n_opd, int64_t n)`.
-`RAD_OPD` packs the operand array; `RAD_ISSUE` passes `RAD_N_BATCH` for the op's ranged parameter
-and `RAD_ISSUE_N` names a value instead. Operands are **positional, per the op's schema**, so
-there is no in/out tagging at the call site — the schema already carries the roles, and a second
-statement of them is a second place for them to disagree. `RAD_B` is a buffer, `RAD_W` a weight,
-`RAD_WTAB` a whole run of them.
+`RAD_OPD` packs the operands; `RAD_ISSUE` passes `RAD_N_BATCH` for the ranged parameter and
+`RAD_ISSUE_N` names a value. Operands are positional per the schema, which carries their roles.
+`RAD_B` is a buffer, `RAD_W` a weight, `RAD_WTAB` a run of weights.
 
-Note what the last line is *not*: a host-side loop over routed experts. Routing is resolved on
-device against the current residency table (§5.5), so the issue names the entire expert table and
-the kernel indexes it. A `for (int e : route(...))` here would be a device round-trip in the
-middle of the step, which is the thing §5.5 exists to avoid.
+The last line is not a host loop over routed experts: routing is resolved on device against the
+residency table (§5.5), so the issue names the whole expert table and the kernel indexes it. A host
+loop would put a device round-trip in the middle of the step.
 
-Ordinary C++, with one rule: **it may only issue handles obtained during declare.** Nothing else
-is constrained. There is no graph capture: every dispatch is submitted individually, and the
-accepted cost is the per-dispatch launch floor times the dispatch count — on the order of 1850
-dispatches in a decode step at a couple of microseconds apiece — against a Python engine paying
-that same floor with an interpreter on top of it.
+The step function is ordinary C++ with one rule: it may only issue handles obtained during
+declare.
 
-**The ABI already carries the hook capture would need, and it is not the same hook as `launch`.**
-`RadDescribeFn describe` reports the dispatch a call *would* perform instead of performing it: the
-same dispatch, described rather than performed, so a repeatedly issued sequence can be replayed as
-a graph. `launch` cannot support that, because it marshals its own arguments — so nothing above it
-knows which argument slot holds which operand, and a graph node update needs exactly that slot.
-`describe` is optional and `launch` remains required; a kernel that implements only `launch` never
-becomes a graph node and is submitted the ordinary way. The one trap is that the two must dispatch
-the same kernel with the same arguments and nothing can check that for you, so the shape
-arithmetic is written once and emitted into a sink that is either a stream or a descriptor.
+**Dispatch.** With a device present, the device backend (`core/device/aql.cpp`) owns its queues
+and writes each kernel launch as an AQL packet: about 6 ns of host time against 0.5-1.3 us for
+`hipLaunchKernel`. At about 1600 dispatches per rank per decode step, that is about 10 us a step
+instead of 1-2 ms. A decode pass repeats step after step, so the runtime records its packets once
+and replays them (recorded passes, `core/runtime/ctx.h`). The key covers every batch field and
+runtime state the pass's shape or arguments depend on. A key is recorded on its second sighting
+(first, for decode), recorded again and compared, and only then played; every 1024th play is
+checked against a fresh issue, and a difference fails the step naming the first differing
+dispatch. Per-op profiling and the in-engine
+oracle (§16, §17) turn recording off, since they must see every issue.
 
-**Handles, not pointers.** `rad_issue` takes weight handles. The core resolves the handle to a
-pointer at issue time, waits on the mover's event if the weight is in flight, and dispatches to
-the device or host implementation according to the current execution site. If an op received a
-`void*`, the weight's location would be fixed at declare and placement (§5) could not be a core
-feature at all. This is the single ABI decision the whole placement design rests on.
+**Handles, not pointers.** `rad_issue` takes weight handles. The core resolves each to a pointer at
+issue time, waits on the mover's event if the weight is in flight, and dispatches to the device or
+host implementation by the current execution site. With a `void*`, a weight's location would be
+fixed at declare and placement (§5) could not be a core feature.
 
 ---
 
@@ -530,60 +476,54 @@ feature at all. This is the single ABI decision the whole placement design rests
 
 ### 4.1 Encodings and layouts
 
-Two things decide the bytes a kernel reads, and they change for different reasons, so they are
-kept apart:
+Two things decide the bytes a kernel reads, and they change for different reasons:
 
-- An **encoding** is what the numbers are: the code type, how scales and zero points are grouped
-  over the weight, and whether the weight was rotated before it was quantised. It is a property of
-  the *model*. Choosing one is expensive and lossy — GPTQ on Qwen3.8-Flash-Next's experts needs
-  Hessians from a calibration run — and changing one means quantising again.
-- A **layout** is how a kernel wants those numbers arranged: WMMA fragment order, scales carried
-  in each row's tail, nibbles permuted to suit an unpack. It is a property of the *kernel*. It is a
-  lossless rearrangement and it is cheap.
+- An **encoding** is what the numbers are: the code type, how scales and zero points are grouped,
+  and whether the weight was rotated before quantisation. It belongs to the model; choosing one is
+  expensive and lossy (GPTQ on Qwen3.8-Flash-Next's experts needs calibration Hessians).
+- A **layout** is how a kernel wants the numbers arranged: WMMA fragment order, scales in each
+  row's tail, nibbles permuted for an unpack. It belongs to the kernel and is a cheap, lossless
+  rearrangement.
 
-The container stores encodings and only encodings, in one canonical arrangement, and the kernel
-library rearranges them when the model loads (§4.3). A kernel library may change every layout it
-has without touching a container; the only thing that ever requires converting again is a change
-in the numbers.
+The container stores encodings only, in one canonical arrangement, and the kernel library
+rearranges them at load (§4.3). A library may change every layout without touching a container;
+only a change in the numbers requires converting again. The kernel-specific part is small: in a
+Qwen3.8-Flash-Next container with int4 experts, 94% of the bytes (the experts and the fp8 n-gram
+table) are canonical as stored and about 3 GiB are kernel-permuted, while 82% of Qwen3.8-27B-FP8's
+bytes are fp8 the checkpoint holds row-major and its kernels read fragment-ordered.
 
-The split is not a matter of taste. In a Qwen3.8-Flash-Next container with int4 experts, 94% of
-the bytes (the experts and the fp8 n-gram table) are canonical as they stand and only ~3 GiB are
-kernel-permuted, while 82% of Qwen3.8-27B-FP8's bytes are fp8 that the checkpoint holds row-major
-and its kernels read fragment-ordered. What makes a container kernel-specific is a small fraction
-of its bytes; what makes it expensive is the quantisation, and that is the part worth storing.
-
-**An encoding is data, not a name in an enum** (`abi/rad_encoding.h`), so a quantiser can invent
-one without the core learning about it:
+**An encoding is data, not an enum value** (`abi/rad_encoding.h`), so a quantiser can define one
+without a core change:
 
 ```c
 typedef struct RadEncPlane {
-    char     role[24];        /* "codes", "scale", "scale.1", "zero", "min", "grid", "t.perm" */
-    uint32_t dtype;           /* a core dtype (rad_types.h), never a plugin-private one */
-    uint32_t kind;            /* TILED: covers the weight by blocks | TABLE: its own extents */
-    int64_t  block[2];        /* TILED: logical rows x cols one element covers; 0 = the whole */
-    int64_t  extent[2];       /* TABLE: rows x cols */
+    char     role[RAD_ENC_STR];   /* "codes", "scale", "scale.1", "zero", "min", "grid", "t.perm" */
+    uint32_t dtype;               /* a core dtype -- never a plugin-private one */
+    uint32_t kind;                /* RAD_PLANE_TILED | RAD_PLANE_TABLE */
+    int64_t  block[2];            /* TILED: logical rows x cols one element covers; 0 = whole */
+    int64_t  extent[2];           /* TABLE: the plane's own rows x cols */
 } RadEncPlane;
 
 typedef struct RadEncoding {
-    char        scheme[24];     /* "plain" | "affine" | a quantiser's own (§4.5) */
-    char        transform[24];  /* "" | "fwhtN" | "perm" | "givens" */
+    char        scheme[RAD_ENC_STR];      /* "plain" | "affine" | a quantiser's own (§4.5) */
+    char        transform[RAD_ENC_STR];   /* "" | "fwhtN" | "perm" | "givens" */
     int32_t     n_planes;
-    RadEncPlane plane[8];
+    int32_t     reserved;
+    RadEncPlane plane[RAD_ENC_MAX_PLANES];   /* 8 */
 } RadEncoding;
 ```
 
-Every plane is a dense row-major array. A TILED plane covers the weight seen as `[rows, cols]` —
-every leading axis a row, the last the column — so a block of `[1 x 32]` is a per-group scale, `[0 x
-0]` one per tensor and `[0 x 1]` one per column. A TABLE plane does not cover the weight: a codebook,
-a lattice grid, a transform's parameters, carried whole by every slice. Elements narrower than a
-byte or not a power of two wide are a bit stream along the row, lowest bits first, every row on a
-byte — the order a reference implementation and a hex dump assume. The dtypes are every float a
-model ships in (f32, bf16, f16, fp8 e4m3 and e5m2, fp6 e2m3 and e3m2, fp4 e2m1, e8m0), signed and
-unsigned integers of every width from one bit to eight plus 16 and 32, and 9- to 12-bit unsigned
-for lattice indices.
+Every plane is a dense row-major array. A TILED plane covers the weight seen as `[rows, cols]`
+(every leading axis a row, the last the column): a block of `[1 x 32]` is a per-group scale,
+`[0 x 0]` one per tensor and `[0 x 1]` one per column. A TABLE plane does not cover the weight: a
+codebook, a lattice grid or a transform's parameters, carried whole by every slice. Elements
+narrower than a byte or not a power of two wide are a bit stream along the row, lowest bits first,
+each row starting on a byte. The dtypes are f32, bf16, f16, fp8 e4m3 and e5m2, fp6 e2m3 and e3m2,
+fp4 e2m1, e8m0, signed and unsigned integers of every width from one bit to eight plus 16 and 32,
+and 9- to 12-bit unsigned for lattice indices.
 
-`plain` is a single `codes` plane whose value is the code. **`affine` is the scheme the core
-decodes, and it is wide enough for every format in common use**:
+`plain` is a single `codes` plane whose value is the code. `affine` is the scheme the core decodes,
+and it covers every format in common use:
 
 ```
 q = code                      one code a value, or one a V-vector of a `grid` (TABLE [entries x V])
@@ -595,10 +535,10 @@ v = v - min * min.1 ...       a minimum in the value's domain
 w = v . T^-1                  the transform, per row (a kernel transforms its activation instead)
 ```
 
-`fwhtN` is the block-diagonal unnormalised Hadamard with its 1/N in the stored scale (docs/MOE-W4.md),
-`perm` a column permutation, and `givens` stages of disjoint pair rotations under a channel scale,
-their tables beside the weight. Each encoding has a canonical spelling, which is what people, logs
-and `rad-info` read; kernels read the struct:
+`fwhtN` is the block-diagonal unnormalised Hadamard with its 1/N in the stored scale
+(`docs/MOE-W4.md`), `perm` a column permutation, and `givens` stages of disjoint pair rotations
+under a channel scale, their tables beside the weight. Each encoding has a canonical spelling,
+which people, logs and `rad-info` read; kernels read the struct:
 
 | encoding | what carries it |
 |---|---|
@@ -617,94 +557,97 @@ and `rad-info` read; kernels read the struct:
 | `perm` with `t.perm i32{1xK}` | GPTQ's act-order |
 | `givens` with `t.pairs`, `t.angle`, `t.scale` | ParoQuant's scaled pairwise rotation |
 
-So a GGUF file's K- and I-quants are as representable as anything else: reading one is a lossless
-rearrangement into planes, and the only thing such a file lacks is a kernel that reads it.
+A GGUF file's K- and I-quants are therefore a lossless rearrangement into planes; serving one needs
+only a kernel that reads it.
 
-**The core decodes every `plain` and `affine` encoding itself**, to f32: for the oracle, for
-`rad-convert`'s error report, and as the input to quantising something again. A quantiser that
-invents a scheme the core cannot decode supplies the decoder with it (§4.5), so nothing in the
-core has to learn a codebook to check a kernel that reads one.
+The core decodes every `plain` and `affine` encoding to f32 (for the oracle, `rad-convert`'s error
+report, and requantising). A quantiser whose scheme the core cannot decode supplies the decoder
+(§4.5).
 
 ### 4.2 `.rad`
 
 The engine loads `.rad` containers, safetensors checkpoints and GGUF files (§4.3). `.rad` is the
-one built for the load path:
+format built for the load path (`abi/rad_format.h`):
 
-- **canonical, not kernel-shaped.** An entry is a logical weight holding the planes of its
-  encoding, row-major. No kernel library is named anywhere in the file.
-- **grouped by movement unit.** An expert's entries are adjacent, because the unit of transfer is
-  an expert, not a tensor. Addressing within a layer is `base + id * stride`, O(1) arithmetic and
-  no table walk on the critical path, and the reader re-derives the stride at open and refuses a
-  file where it does not hold.
-- **aligned.** Pool 2 MiB (huge-page mappable), movement unit 4 KiB, which is `O_DIRECT`'s
-  alignment and so what lets the file tier read a unit with no bounce buffer; planes 256 B.
-- **self-describing.** Each entry carries its encoding, its logical shape and the quantiser and
-  options that made it, so `rad-info` can say exactly what a file holds and `--reuse` can tell
-  which weights another conversion would have written identically.
+- **Canonical, not kernel-shaped.** An entry is a logical weight holding the planes of its
+  encoding, row-major. No kernel library is named in the file.
+- **Grouped by movement unit.** An expert's entries are adjacent, because the unit of transfer is
+  an expert, not a tensor. Addressing within a layer is `base + id * stride`, with no table walk on
+  the critical path; the reader re-derives the stride at open and refuses a file where it does not
+  hold.
+- **Aligned.** Pool 2 MiB (huge-page mappable), movement unit 4 KiB (`O_DIRECT`'s alignment, so
+  the file tier reads a unit with no bounce buffer), planes 256 B.
+- **Self-describing.** Each entry carries its encoding, its logical shape and the quantiser and
+  options that made it, so `rad-info` can say what a file holds and `--reuse` can tell which
+  weights another conversion would write identically.
 
 Little-endian only. The container also carries the checkpoint's configuration as metadata, the
-vocab (§12), the recipe it was converted with, and the expert-popularity profile the placement
-planner warm-starts from. There is one version: a file in any other is refused with
-`RAD_E_FORMAT` and the instruction to convert again.
+vocabulary (§12), the recipe it was converted with, and the expert-popularity profile the
+placement planner starts from. There is one format version; a file in any other is refused with
+`RAD_E_FORMAT` and an instruction to convert again.
 
 ### 4.3 Loading
 
 The path is the same whatever the source:
 
-1. **Declare** (§3.1) names each weight and says which planes of which logical weight it takes —
-   `RadWeightDecl::source` and `::planes`, so a linear's codes and its scale plane can be two
+1. **Declare** (§3.1) names each weight and the planes of a logical weight it takes
+   (`RadWeightDecl::source` and `::planes`), so a linear's codes and scale plane can be two
    operands of one op, or one operand a kernel interleaves.
 2. **Slicing** for tensor parallelism happens on the canonical form, where it is always a
    rectangle: a ROW shard is rows of every plane and a COL shard is columns, each cut on the
    plane's own block boundary and refused where a block would be split.
 3. **Relayout.** The resolved kernel's `layout` hook says what it stores for the weight, given its
-   encoding; `relayout` produces that from the rank's slices of the planes. A hook that answers
+   encoding; `relayout` produces that from the rank's slices. A hook that answers
    `RAD_E_UNSUPPORTED` keeps the plane as it is, and those bytes go from the file to their
-   destination with nothing in between.
-4. **Agreement.** Every kernel that reads a weight — every band, both domains — must ask for the
-   same layout, or declare refuses and names both.
+   destination unchanged.
+4. **Agreement.** Every kernel that reads a weight (every band, both domains) must ask for the same
+   layout, or declare refuses and names both. Device rows decide first: a host row that reads a
+   weight differently from the device row claiming it is no error, only a reason its op cannot
+   move to the host. Where no device row reads a weight (the host backend), the host rows' hooks
+   decide, and a weight of several planes is joined into the form `abi/rad_planes.h` defines: a
+   header naming each plane, then the planes unchanged. libref and libavx both read it, so either
+   may serve any band.
 
 **Selection reads the encoding.** A kernel whose `layout` hook answers `RAD_E_DTYPE` for a weight
-an op takes — it does not read that encoding — is not a candidate for the op, and neither is a
-device kernel with no hook for a weight of several planes. So one declaration serves a bf16 head
-with the bf16 GEMM and an fp8 head with the fp8 one, and a checkpoint and the container quantised
-from it select by what each holds.
+an op takes is not a candidate for the op, and neither is a device kernel with no hook for a weight
+of several planes. So one declaration serves a bf16 head with the bf16 GEMM and an fp8 head with
+the fp8 one.
 
-Relayout is host code, run by a pool behind the load sweep, and it has to keep pace with the disk:
-Qwen3.8-27B-FP8 rearranges 23 GiB of its 29 at every load. The sweep only reads — `O_DIRECT`, into
-a ring of pinned windows — and the pool makes every host copy out of them as well as the relayouts,
-out of memory it reuses from one weight to the next.
+Relayout is host code on a thread pool behind the load sweep, and must keep pace with the disk
+(Qwen3.8-27B-FP8 rearranges about 24 GiB of its 29 at every load). The sweep only reads, with
+`O_DIRECT` into a ring of pinned windows; the pool makes the host copies out of the windows and the
+relayouts, in memory reused from weight to weight.
 
-**Two tiers read the file while serving and so cannot relayout.** The file tier stages a unit
-from the container with `O_DIRECT`, and the mapped tier reads the container's own mapping. A
-weight whose layout is not the identity is placed on neither; the planner keeps it in the host
-pools and says so by name when that is what fills them. The weight these tiers exist for — the
-n-gram table, which is mapped — is identity.
+**The file and mapped tiers cannot relayout**, because they read the container while serving. A
+weight whose layout is not the identity goes to neither; the planner keeps it in the host pools and
+says so by name. The n-gram table, the weight these tiers exist for, has the identity layout.
 
-**A checkpoint loads directly when its encoding is trivial.** A safetensors directory or a GGUF
-file is a source like a container: the architecture plugin's name map (§2.4) resolves each declared
-weight to checkpoint tensors, concatenations and expert slices included, the reader states their
-encodings, and the same path runs. Trivial means the checkpoint's numbers are served as they are:
+**A checkpoint loads directly when its encoding is trivial.** A safetensors directory or GGUF file
+is a source like a container: the name map (§2.4) resolves each declared weight to checkpoint
+tensors, concatenations and expert slices included, the reader states their encodings, and the
+same path runs. Trivial means served as stored:
 
 - `bf16`, `f16` and `f32`, and the exact widenings between them (a bf16 norm the plugin reads as
   f32);
 - block-scaled FP8 (`quantization_config.quant_method = fp8`), where `X.weight_scale_inv` is the
-  scale plane of `X.weight` — the encoding `fp8_e4m3*bf16[128x128]`, byte for byte;
+  scale plane of `X.weight`: the encoding `fp8_e4m3*bf16[128x128]`, byte for byte;
+- MXFP4 as AMD Quark ships it (`quant_method = quark`, fp4 per group of 32 with e8m0 scales
+  throughout), where `X.weight` holds the codes and `X.weight_scale` the exponents: the encoding
+  `fp4_e2m1*e8m0[1x32]`, byte for byte;
 - GGUF `F32`, `F16` and `BF16`.
 
-**Nothing is quantised at load.** A model whose served form needs quantisation work — Flash-Next's
-int4 experts, an fp8 `lm_head` made from a checkpoint's bf16 one — is converted ahead of time
-(§4.4), and a checkpoint loaded directly is served at its own precision. A direct load also has no
-file tier and no mapped tier (a checkpoint is neither grouped by movement unit nor aligned for
+**Nothing is quantised at load.** A served form that needs quantisation (Flash-Next's int4
+experts, an fp8 `lm_head` from a bf16 one) is converted ahead of time (§4.4). A direct load has no
+file tier, no mapped tier (a checkpoint is neither grouped by movement unit nor aligned for
 `O_DIRECT`) and no expert profile, so the planner keeps everything in VRAM and the host pools and
 says so.
 
 ### 4.4 `rad-convert`
 
 Reads safetensors or GGUF and writes `.rad`. It runs the architecture plugin's declare phase for
-the declared weights and the name map, and it quantises according to a **recipe**: ordered rules
-from a logical weight name to a quantiser and its options. The first rule whose pattern matches a
-weight decides it; a weight no rule matches keeps the checkpoint's encoding.
+the declared weights and the name map, and quantises by a **recipe**: ordered rules from a logical
+weight name to a quantiser and its options. The first matching rule decides; a weight no rule
+matches keeps the checkpoint's encoding.
 
 ```
 # data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe -- Qwen3.8-Flash-Next as it is served (excerpt)
@@ -719,37 +662,32 @@ mtp.draft_head.weight            rtn        codes=u2 zero=u8 group=128 scale=f16
 ...
 ```
 
-A rule names an **algorithm** (`rtn`, `gptq`, `cast`) and its options name the **grid** (`codes` or
-`table`, `group` or `block`, `scale`, a second level `scale2`, `zero`, `rule`) and the **transform**
-(`transform=fwht128`) (§4.5). The first match deciding is what lets a protected expert's `cast`
-rule sit above the rule every other expert takes. A quantiser that declines a weight -- `rtn`
-declines a rank-1 tensor -- leaves it to the checkpoint's encoding, so a broad pattern does not
-have to step around every norm.
+A rule names an algorithm (`rtn`, `gptq`, `cast`); its options name the grid (`codes` or `table`,
+`group` or `block`, `scale`, a second level `scale2`, `zero`, `rule`) and the transform
+(`transform=fwht128`) (§4.5). First match wins, so a protected expert's `cast` rule sits above the
+rule every other expert takes. A quantiser that declines a weight (`rtn` declines a rank-1 tensor)
+leaves it to the checkpoint's encoding, so a broad pattern need not exclude every norm.
 
 `--recipe FILE` names a file and `--quant 'PATTERN=QUANTISER:k=v,...'` adds rules ahead of it.
-`$NAME` in an option is the environment's, so one recipe serves every machine.
+`$NAME` in an option is read from the environment.
 
-**The architecture plugin learns a weight's encoding the same way at convert and at load** —
-`rad_weight_encoding` (§2.4) — and at convert the answer is the recipe's. So the declare that runs
-in the converter is the declare the engine will run, every op still has to resolve, and every
-resolved kernel's `layout` hook has to accept the planned encoding: a recipe nothing can serve is
-refused before a byte is written. The kernel plugins check the recipe and play no other part; the
-converter writes planes, and which library rearranges them later is not its concern.
+The plugin learns a weight's encoding the same way at convert and at load (`rad_weight_encoding`,
+§2.4); at convert the answer is the recipe's. So the converter runs the engine's declare: every op
+must resolve and every resolved `layout` hook must accept the planned encoding, and a recipe
+nothing can serve is refused before a byte is written. Kernel plugins only check the recipe; which
+library rearranges the planes later is not the converter's concern.
 
-It **reports the error of every weight it quantised** against the source — relative Frobenius
-norm, and imatrix-weighted when `--imatrix` is given, worst first — through the core's decoder, so
-a quantiser is measured the moment it exists. A format change that cannot be ranked is a format
-change nobody can argue about.
+It reports the error of every weight it quantised against the source (relative Frobenius norm,
+imatrix-weighted with `--imatrix`, worst first), through the core's decoder.
 
-`--reuse C` copies from an earlier container every weight this run would write identically — same
-encoding, same quantiser and options, same source shape — and `--in-place` extends `C` instead of
-copying it, so adding a vision tower to an existing container is about a gigabyte of I/O however
-large the container is (§11).
+`--reuse C` copies from an earlier container every weight this run would write identically (same
+encoding, quantiser, options and source shape), and `--in-place` extends `C` instead of copying
+it, so adding a vision tower is about a gigabyte of I/O however large the container (§11).
 
 ### 4.5 Quantiser plugins
 
-`$RADIANCE_HOME/quantizers/*.so`, the third plugin kind. A quantiser turns a weight in f32 into
-the planes of an encoding:
+`$RADIANCE_HOME/quantizers/*.so`, the third plugin kind (`abi/rad_quant.h`). A quantiser turns a
+weight in f32 into the planes of an encoding:
 
 ```c
 typedef struct RadQuantizerInfo {
@@ -761,28 +699,27 @@ typedef struct RadQuantizerInfo {
     /* Rows one call may take, so a 51 GB table streams; 0 is the whole weight at once. */
     int64_t (*row_block)(const RadParam* o, int n_o, const RadQuantWeight* w);
     int     (*quantize)(const RadParam* o, int n_o, const RadQuantWeight* w,
-                        const float* src, int64_t row0, int64_t rows, void* const* planes);
+                        float* src, int64_t row0, int64_t rows, void* const* planes);
     /* Only for a scheme the core does not decode. */
-    int     (*decode)(const RadEncoding* e, const RadTensor* planes, int n_planes, float* out);
+    int     (*decode)(const RadEncoding* e, const RadQuantWeight* w, const void* const* planes,
+                      int64_t row0, int64_t rows, float* out);
 } RadQuantizerInfo;
 ```
 
-`RadQuantWeight` names the weight, gives its logical shape and movement group, and hands over the
-weight's imatrix column importances when the converter has them. Calibration that is not an
-imatrix — GPTQ's Hessians — is an option the quantiser reads itself (`calib=DIR`): what a Hessian
-is, and how it is stored, is the quantiser's business, exactly as a layout is the kernel's.
+`RadQuantWeight` names the weight, gives its logical shape and movement group, and carries its
+imatrix column importances when the converter has them. Other calibration (GPTQ's Hessians) is an
+option the quantiser reads itself (`calib=DIR`), in its own format.
 
-**`libquant` is the built-in set**, and every quantised plane a served container holds is its
-work. It is organised by what is independent: a **grid** (the code type —
-any integer width, fp8, fp6, fp4, a non-linear table, a lattice — and the scale and zero
-structure over it, multilevel included, which is what makes MXFP4, NVFP4 and the K- and I-quants
-grids rather than algorithms), a **transform** applied first (FWHT, a GPTQ act-order permutation,
-ParoQuant's rotations; AWQ's column scales are a scale level of their own), and an **algorithm**
-that chooses the codes on that grid: round-to-nearest with absmax, MSE or imatrix-searched scales;
-GPTQ's error feedback; AutoRound's signed-gradient rounding; the lattice searches the I-quants
-need. Each pairs with any grid it makes sense for, and a recipe names the three.
+**libquant.** The built-in set, `libquant`, is organised by what is independent:
 
-What it ships:
+- a **grid**: the code type (any integer width, fp8, fp6, fp4, a non-linear table, a lattice) and
+  the scale and zero structure over it, multilevel included, which makes MXFP4, NVFP4 and the K-
+  and I-quants grids rather than algorithms;
+- a **transform** applied first: FWHT, GPTQ's act-order permutation, ParoQuant's rotations (AWQ's
+  column scales are a scale level of their own);
+- an **algorithm** that chooses the codes on that grid.
+
+Each algorithm pairs with any grid it makes sense for, and a recipe names all three:
 
 | quantiser | algorithm | grids | writes |
 |---|---|---|---|
@@ -792,424 +729,391 @@ What it ships:
 | `autoround` | sign-gradient descent on rounding offsets and block ranges against H | integer codes, row blocks, one level | the grid |
 | `paroquant` | Givens pair rotations and channel scales fitted against H, then AutoRound | every untransformed one | the grid and a `givens` transform |
 | `ggml` | llama.cpp's own searches, imatrix-weighted | its legacy, K- and I-quant types | each type's affine form |
-| `cast` | a float in another float dtype | — | `plain` |
+| `cast` | a float in another float dtype | none | `plain` |
 
 The grid is `codes` (integers to 32 bits, fp8/6/4) or `table` (a codebook: NF4, IQ4_NL's values,
-the `w4nl` table Flash-Next's experts are served in and its 32-level `w5nl` form, binary,
-ternary, or given), a scale block and dtype, an optional second scale level the first is relative
-to — an E4M3 or integer sub-scale under an f32 or f16, which is NVFP4's and the K-quants' shape —
-an optional integer zero and an optional Hadamard. The calibrated algorithms read the same
-H the engine's tap writes (below), in the domain the weight is quantised in.
+the `w4nl` table Flash-Next's experts are served in and its 32-level `w5nl` form, binary, ternary,
+or given), a scale block and dtype, an optional second scale level the first is relative to (an
+E4M3 or integer sub-scale under an f32 or f16, as in NVFP4 and the K-quants), an optional integer
+zero and an optional Hadamard.
 
-Adding a quant is a quantiser plugin and a kernel that accepts its encoding; the core does not
-change.
+Adding a quantisation format is a quantiser plugin plus a kernel that accepts its encoding; the
+core does not change.
 
 The Hessians come from the engine: `RADIANCE_CALIB_DIR` makes the architecture's calibration tap
-write each layer's Gram matrices while a container serves a corpus. docs/MOE-W4.md walks through
-both ways to get them: a bootstrap — convert with absmax, serve that and calibrate on it, convert
-again — or a calibration run on the unquantised model itself, which is where the served
-Flash-Next container's Hessians come from.
-The tap records the input as the kernel multiplies it, rotated where the container stores the
-weight rotated, so a Hessian lives in the domain the weight is quantised in. A layer-local
-algorithm's objective is then the quadratic form sum_r (w_hat_r - w_r) H (w_hat_r - w_r)^T, which
-decomposes over rows; AWQ, AutoRound and ParoQuant spend their time in D·H, and libquant sums every
-element of it in a fixed order so a weight converts to the same bytes on any machine and thread
-count.
+write each layer's Gram matrices while a container serves a corpus, either a bootstrap container
+(convert with absmax, calibrate, convert again) or the unquantised model, where the served
+Flash-Next container's Hessians come from (`docs/MOE-W4.md`). The tap records the input as the
+kernel multiplies it, rotated where the weight is stored rotated, so a Hessian is in the domain the
+weight is quantised in. A layer-local objective is sum_r (w_hat_r - w_r) H (w_hat_r - w_r)^T, which
+decomposes over rows. AWQ, AutoRound and ParoQuant spend their time in D·H, and libquant sums it in
+a fixed order, so a weight converts to the same bytes on any machine and thread count.
 
 ---
 
 ## 5. Placement
 
-All-in-VRAM, layer offload to RAM/SSD, and expert offload to RAM/SSD are one mechanism at three
-granularities. What separates them is not the tiering but whether the access is predictable:
+All-in-VRAM, layer offload to RAM/SSD and expert offload to RAM/SSD are one mechanism at three
+granularities. They differ in whether access is predictable:
 
-- **Layer offload is a scheduling problem.** Declare already enumerated every op with its weight
-  operands in order, so the core knows the entire future access sequence statically. Exact
-  prefetch, no policy, no predictor.
-- **Expert offload is a prediction problem.** Routing is data-dependent, so there is no schedule
-  to emit and the only thing left is a policy. This is why this engine needs a heat engine (§5.4)
-  and llama.cpp never did.
-- **All-in-VRAM is the degenerate case** where the planner assigns everything to tier 0 and the
-  mover never runs.
+- **Layer offload is a scheduling problem.** Declare enumerated every op and its weight operands
+  in order, so the core knows the whole access sequence statically: exact prefetch, no predictor.
+- **Expert offload is a prediction problem.** Routing is data-dependent, so there is no schedule,
+  only a policy: the heat engine (§5.4).
+- **All-in-VRAM is the degenerate case**: every weight on tier 0 and the mover never runs.
 
-### 5.1 Tier and site are independent axes
+### 5.1 Tier and site
 
-**Tier** is where the bytes live. **Site** is where the arithmetic happens.
+**Tier** is where the bytes live. **Site** is where the arithmetic happens. They are independent.
 
 | tier | site | what it is |
 |---|---|---|
-| `VRAM` | device | everything resident: vLLM's only mode |
+| `VRAM` | device | resident |
 | `HostPinned` / `SSD` | device, staged into a slab slot | the offload path: exact or predicted |
-| `HostPinned` | device, zero-copy over the link | read-once weights, no slab slot |
-| `HostPageable` | host | llama.cpp `-ngl`: the bytes and the arithmetic both stay off the card |
-| `Mapped` | host | the container's own mmap — no pool, no copy |
+| `HostPinned` | device, zero-copy over the link | a routed expert streamed by its GEMM, or a table read in place; no slab slot |
+| `HostPageable` | host | llama.cpp `-ngl`: bytes and arithmetic both off the card |
+| `Mapped` | host, or device zero-copy | the container's own mapping, no pool |
 
-All five are core behaviour. Host-site execution needs a `RAD_DOMAIN_HOST` kernel from a kernel
-plugin (§2.1); where none resolves, that site is unavailable for that op and the planner is told
-so at declare.
+All are core behaviour. Host-site execution needs a `RAD_DOMAIN_HOST` kernel (§2.1); where none
+resolves, that site is unavailable for that op and the planner is told so at declare.
 
-**`Mapped` is not "host memory", it is the container's own mapping, and that is the whole of the
-difference.** The other off-device tiers all copy: pinned and pageable allocate an arena and
-memcpy the weight in at load, and the file tier `pread`s it a slot at a time. A mapped weight is
-never copied and occupies no pool — the loader publishes a pointer into the mmap the container
-already holds, and the page cache decides what is resident. It exists for the one shape every
-copying tier is wrong for: a weight of tens of gigabytes read *a handful of rows a token*, which
-is what an n-gram embedding table is. Staging moves the whole table to use a few kilobytes of it,
-pinning forces all of it resident on a host whose RAM is the same order as the table, and an arena
-copy wants a second copy beside the mapping that already holds one; a sparse Zipfian gather of a
-dozen rows out of hundreds of millions is exactly what a page cache is good at. Only a host kernel
-can read one — the bytes are pageable and at no device address — so the planner assigns this tier
-where, and only where, no device kernel for the op exists at all. And only to a weight whose
-layout is the identity: the mapping holds the canonical planes (§4.2), so a weight a kernel
-rearranges at load has nowhere in the file that already looks the way the kernel reads it. The
-file tier has the same rule for the same reason (§4.3).
+**The mapped tier.** `Mapped` is the container's own mapping. The other off-device tiers copy
+(pinned and pageable memory at load, the file tier a slot at a time). A mapped weight occupies no
+pool: the loader publishes a pointer into the container's mapping and the page cache decides what is
+resident. It suits a weight of tens of gigabytes read a few rows a token, such as an n-gram
+embedding table, which staging, pinning or a pool copy would each move or duplicate whole. The
+planner maps:
+
+- a weight no device kernel can read, run on the host;
+- an n-gram table that `--ngram-placement` keeps off the card: `disk` gathers rows on the host from
+  the mapping; `ram` copies the table at load into locked or pinned memory that the host gather or
+  the card reads in place.
+
+Only an identity-layout weight can be mapped, since the mapping holds the canonical planes (§4.2);
+the file tier has the same rule (§4.3).
+
+`--embedding-placement ram` and `--vision-tower-placement ram` put the token embedding and the
+encoder towers in pinned host memory beside the host pool, read over the link in place.
 
 ### 5.2 Access classes
 
-Declared per weight, because it is information only the architecture plugin has:
+Declared per weight, because only the architecture plugin knows them:
 
 | class | meaning | prefetch |
 |---|---|---|
-| `PER_TOKEN` | read every forward pass — dense weights | exact, from the declared order |
-| `PER_REQUEST` | read once per request — an encoder tower, with an image | exact, on admission |
-| `CONDITIONAL` | read only if selected — routed experts | predicted (§5.4) |
+| `PER_TOKEN` | read every forward pass: dense weights | exact, from the declared order |
+| `PER_REQUEST` | read once per request: an encoder tower, with an image | exact, on admission |
+| `CONDITIONAL` | read only if selected: routed experts | predicted (§5.4) |
 | `RARE` | may not be read at all in a given deployment | on demand |
 | `VOCAB` | `lm_head` and the embedding table | exact, from the declared order |
 
-`VOCAB` earns its own row because neither of its neighbours describes it. It is read every token,
-like `PER_TOKEN`, but it is enormous at a large vocabulary and one of the two members is a gather
-rather than a GEMM — so what the planner wants to know about it is its size and its access
-*pattern*, and `PER_TOKEN`'s exact prefetch and `CONDITIONAL`'s prediction each answer only half
-of that.
+`VOCAB` has its own class because it is read every token like `PER_TOKEN` but is very large at a
+large vocabulary, and one of its members is a gather rather than a GEMM; neither `PER_TOKEN`'s
+prefetch nor `CONDITIONAL`'s prediction fits it.
 
 ### 5.3 The planner
 
-Runs once, after declare, before load. Takes the manifest plus explicit pool budgets and assigns
-each weight a tier and a site. Strategies: `all_vram`, `layer_offload`, `expert_tiered`, `auto`.
+Runs once, after declare and before load (`core/place/planner.h`), and assigns each weight a tier
+and a site against explicit pool budgets. Strategies (`--placement`): `all_vram`, `layer_offload`,
+`expert_tiered`, `auto`.
 
-Under tensor parallel the placement unit is a **shard** of a weight, not the whole weight — each
-rank holds its own half of every resident expert and plans against its own card's budget.
+The unit of placement is a weight group: an expert's gate, up and down move together, and the
+container stores them adjacently (§4.2). Under tensor parallelism it is this rank's shard, planned
+against this card's budget. The resident set must be identical on every rank, so the ranking uses
+only the container's profile and each unit's identity.
 
-Three objectives beyond fitting:
+Beyond fitting, the planner has three objectives:
 
 **Contiguous host runs.** A host-site op leaves its activation in host memory, so a host layer
-between two device layers costs two link crossings. A few hundred KB is nothing; alternating
-per-layer is not. llama.cpp gets this free because `-ngl` assigns a contiguous suffix. Here it is
-an explicit objective: host-site work is assigned in runs, so activations cross once per run
-boundary rather than once per layer.
+between device layers costs two link crossings. Host-site work is assigned in runs (layer offload
+spills a suffix of the execution order), so activations cross once per run boundary.
 
-**Prefill and decode want opposite plans.** A prefill chunk of a few thousand tokens touches
-essentially every expert, so residency buys nothing and streaming amortises across the chunk;
-decode touches eight per layer per token and residency is the whole game. The planner produces
-one plan; what reconciles it with whichever phase the server is actually spending its steps in is
-the heat engine (§5.4), which re-ranks from realised routing rather than from a declared intent.
+**Prefill and decode want opposite plans.** A prefill chunk touches nearly every expert, so
+residency gains little; decode touches a few experts per layer per token and residency decides its
+speed. The planner produces one plan; the heat engine re-ranks it from realised routing and the
+prefill stager covers prefill (§5.4).
 
-**Warm start from the profile.** The container's expert-popularity profile — derived from the
-imatrix's activation counts — ranks which experts begin resident. Worth about a point of hit rate
-against nothing, and honestly not more: imatrix popularity is not decode popularity, and the heat
-engine re-ranks from real routing within a few dispatches regardless. It is a warm start, not a
-policy.
+**Warm start from the profile.** The container's expert-popularity profile, derived from the
+imatrix's activation counts, ranks which experts begin resident. It is only a starting point:
+imatrix popularity is not decode popularity, and the heat engine re-ranks within a few steps.
 
 ### 5.4 Residency, the mover, and heat
 
 Fixed-stride VRAM slab slots per weight class, a pinned host pool, and a file tier read with
-`O_DIRECT` into pinned buffers. Predictable latency, no page-cache double-copy, and reads land
-where the mover can DMA from them without a bounce. `O_DIRECT` wants offsets, lengths and buffers
-all on the logical block size, so every slot and every sub-region is a multiple of it and there is
-no unaligned tail to handle anywhere.
+`O_DIRECT` into pinned buffers (`core/place/mover.h`). Slots within a class are interchangeable,
+so a promotion is an integer swap and the slab never fragments. The file tier has predictable
+latency and no page-cache copy, and lands reads where the mover can DMA them without a bounce;
+every slot and sub-region is a multiple of the logical block size `O_DIRECT` requires.
 
-The mover runs on a dedicated stream. The compute stream waits on its events. **No host
-synchronisation is involved in a transfer**, which is what lets placement be dynamic without
-serialising the step.
+The mover runs on its own stream; each dispatch's swap copies go to the card's DMA engine as one
+list, and the compute stream waits on the mover's events. No transfer involves a host
+synchronisation, so placement changes without serialising the step.
 
-**Dynamic re-placement is in v1.** Heat tracking on conditional weights, promotion and demotion
-against hysteresis and minimum-gain thresholds, decay per dispatch, shadow slab slots for
-in-flight promotions, and a bounded move budget per layer dispatch. This is the largest single
-piece of core complexity in the engine and it is also the part with no equivalent anywhere else:
-it is the difference between MoE offload being unusable and being fast.
+**Dynamic re-placement.** The heat engine (`core/place/heat.h`) accumulates heat on conditional
+weights from the routing histograms, decays each layer's heat once per step, and promotes and
+demotes against a hysteresis ratio and a minimum gain, up to 64 swaps per slab class per step
+(`RAD_PLACE_MOVES_PER_STEP`). A promotion copies into a shadow slot before publishing the new
+pointer, and a freed slot is quarantined until every launch that could name it has retired, so no
+slot is overwritten while a kernel may read it. Link traffic is U-shaped in the minimum gain: a
+declined promotion returns as a miss over the same link, so a higher threshold loses hit rate
+without saving bytes.
 
-Link traffic is U-shaped in the minimum-gain threshold. Raising it moves more bytes, not fewer.
-That is counterintuitive and it is measured, so it belongs in the spec rather than in a comment.
+**Prefill stager** (`core/place/stager.h`). A prefill chunk routes to nearly every expert, so
+pinned-pool experts would cross the link inside each layer's GEMMs. For large steps the stager
+copies them, for the layers ahead, into a VRAM ring at the top of the activation arena while
+earlier layers run, and points each layer's ops at the copies. Output is bit-identical.
+
+**Decode prefetch** (`core/runtime/xprefetch.h`). Under expert-tiered placement, each routed layer
+applies the next layer's router to its own router input, copies the likeliest pinned-pool experts
+onto the card by DMA, and redirects the next layer's weight tables to copies that have landed. A
+late copy goes unused; nothing waits for it. The prefetch pauses when too few copies are used.
 
 ### 5.5 The dispatch contract
 
-Routing is computed on device and **never blocks the compute stream.** Dispatch is resolved on
-device against the current residency table; the routing histogram is copied back asynchronously
-and the heat engine consumes it on the *next* step.
+Routing is computed on device and never blocks the compute stream. Dispatch is resolved on device
+against the current residency table; the routing histogram is copied back asynchronously and the
+heat engine consumes it on the next step.
 
-Placement decisions are therefore always one step stale, which for heat-based promotion is
-irrelevant — a hot expert is hot across many steps. The real cost is different and worth being
-honest about: **an expert that is not resident this step cannot be fetched in time, so it is
-served from wherever it is.** Hit rate is a property of the placement policy, not of a
-last-moment rescue. That is the trade, and it buys a run phase with no device round-trip in it.
+Placement decisions are one step stale, which does not hurt ranking: a hot expert stays hot across
+many steps. A non-resident expert is not fetched on demand, which would have to fit between the
+router's output and the expert GEMM's first block; it is read where it lies, streamed from the
+pinned pool or staged from the file tier. The stager and the decode prefetch copy ahead on a
+prediction, never on demand. Hit rate is a property of the placement policy, and the run phase has
+no device round-trip.
 
 ---
 
 ## 6. Memory and budgets
 
-Every pool is budgeted explicitly: the engine derives each budget **from the card and prints every
-term of it**, and the operator moves its inputs rather than stating a pool. There is no profiling
-pass, no utilisation fraction and no inference about what the workload will be:
+Every pool is budgeted explicitly. The engine derives each budget from the card and prints every
+term; the operator moves the inputs, never a pool size. There is no profiling pass and no
+utilisation fraction:
 
-| | |
+| flag | |
 |---|---|
 | `--gpu-headroom-mib` | VRAM left unclaimed on every card (default 96) |
-| `--host-pool-mib` | pinned host tier |
-| `--weights-disk-tier` | file tier for weights, read from the container; needs `O_DIRECT` |
+| `--host-pool-mib` | the pinned host tier |
+| `--weights-disk-tier` | the file tier for weights, read from the container; needs `O_DIRECT` |
+| `--max-model-len`, `--max-num-seqs` | the KV cache's bound |
 
-**Deriving is not inferring, and the distinction is the whole of why this is allowed.** What makes
-a derived budget unreproducible is deriving it from the *free VRAM at startup*: the same command
-on the same machine then measures differently depending on what else is open. Every term of this
-one is either a fixed property, a computed quantity, or a measurement printed on its own line —
-and what is left is spent in **two steps**, because only one of the two is a trade:
+Nothing is inferred from the free VRAM at startup, which would size pools differently depending on
+what else is open. Each term is a fixed property, a computed quantity, or a measurement printed on
+its own line (`core/mem/vram_budget.h`). The startup report lists them in the order spent (sizes
+omitted here):
 
-    card total          31.86 GiB   the part's totalGlobalMem
-    already held       442.84 MiB   MEASURED once, after every plugin's code object is resident
-    activation arena   144.47 MiB   computed from the buffer plan, by the call that allocates it
-    step staging        18.02 MiB   the step batch's block tables and media staging, the same walk
-    --gpu-headroom-mib  96.00 MiB   stated
-    ------------------------------
-    claimable           31.19 GiB
-    static weights       3.94 GiB   off the top: every rank's own shard, not a share of anything
-    ------------------------------
-    elastic             27.25 GiB   the experts keep what the host pool cannot hold; the cache takes the rest
-                                    and lends what no live request holds to the expert slab
-      experts           26.18 GiB
-      kv cache           1.08 GiB   a full cache for 8 sequences at 2048 tokens
-    ==============================
-    vram_weights        30.11 GiB   static + experts
-    vram_kv              1.08 GiB
+```
+VRAM budget, per card:
+  card total           the part's totalGlobalMem
+  already held         measured once, after every plugin's code objects are resident
+  driver drift         what that moves by after it is read: kept free
+  activation arena     computed from the buffer plan
+  step staging         block tables, media staging and the KV tiers' copy staging
+  hardware queues      the engine's streams, at a measured cost each
+  expert prefetch      the decode prefetch's ring and buffers
+  --gpu-headroom-mib   left unclaimed
+  ------------------------------
+  claimable
+  static weights       off the top: every rank's own shard
+  ------------------------------
+  elastic              what the experts and the KV cache share
+    experts
+    kv cache
+    prefill staging    the stager's region, out of the cache's share (or the experts')
+  ==============================
+  vram_weights         static + experts
+  vram_kv              the cache's share
+  unclaimed            the headroom, anything neither side could use, and MiB rounding
+```
 
-**The static weights are a floor, not a share.** Everything that is not an expert — the attention
-projections, the norms, the embedding, the head — has to be resident for the model to run at a
-sensible speed at all, and under tensor parallel each rank already holds its own even share of
-them (declare runs per rank with every dimension divided, §9). Dividing the weights *as a whole*
-would let the cache's side demote an attention projection to host memory to make room for blocks
-nothing will fill. So they come out whole first, and what remains is the one genuinely two-sided
-trade this engine has: the expert plane against the KV cache.
+**Static weights are a floor, not a share.** Every non-expert weight (attention projections,
+norms, embedding, head) must be resident for useful speed; under tensor parallelism each rank holds
+its own share (§9). If they were split against the cache, the cache could push an attention
+projection to host memory for blocks nothing fills. So they come out first (except a token
+embedding `--embedding-placement ram` puts in host memory), and what remains is one trade: the
+expert plane against the KV cache. Static weights that do not fit are refused with the shortfall
+named.
 
-**Where the cache lends, that trade has nothing to guess.** Under `--placement auto` or
-`expert_tiered`, without `--deterministic`, on a device with virtual memory management, the
-experts keep on the card exactly what the pinned host pool (`--host-pool-mib`) cannot hold, plus
-one expert unit of packing slack — they have nowhere else to be — and the cache takes the rest, up
-to what it could ever address. Every block no live request holds is lent back to the expert slab
-in place, so the cache is as large as the work needs at the moment and the experts have everything
-else, for a long-context server and a high-concurrency one alike. `--host-pool-mib` is what moves
-the split: a larger pool takes experts off the card and gives the cache more. The prefill staging
-region comes out of the cache's side. Without a lender a block the cache does not use would sit
-empty, so the experts come first and the cache keeps one max-length sequence. Either way the cache
-never gets less than that sequence.
+**When the cache lends.** Under `--placement auto` or `expert_tiered`, without `--deterministic`,
+on a device with virtual memory management, the cache lends every block no live request holds to
+the expert slab. The experts then keep on the card what the pinned host pool cannot hold plus the
+slab's spare slots (`expert_vram_floor`), and the cache takes the rest up to its ceiling, so it is
+as large as the work needs at any moment. `--host-pool-mib` moves the split: a larger pool takes
+experts off the card and gives the cache more. Without a lender an unused block would sit empty, so
+the experts come first and the cache keeps one `--max-model-len` sequence; the cache never gets
+less than that.
 
-**Both sides are then capped at what they could use, and the slack crosses over.** The ceilings
-are upper bounds and not targets. An expert plane that is entirely resident has no use for another
-byte. A paged cache cannot have more than `max-num-seqs` × `max-model-len` tokens live at one
-moment however large the pool is — but landing *under* that is the normal case, not a shortfall,
-and it is the difference between this design and a static one:
+The mover never takes a block a live request holds. When the cache needs lent memory back, the
+mover drops its coldest lent units, which keep host copies.
 
-> A sequence holds only the blocks its tokens actually occupy. `KVManager::ensure` grows it by
-> `ceil_div(n_tokens, block_size)` as it runs, drops them at completion, and returns `RAD_E_FULL`
-> for the scheduler to preempt rather than failing the request. Every sequence reaching the
-> context limit simultaneously is the worst case, not the workload; production runs well under
-> half backing routinely.
+**Ceilings.** Both sides are capped at what they can use, and the excess goes to the other. A fully
+resident expert plane needs no more bytes; a paged cache cannot have more than `max-num-seqs` x
+`max-model-len` tokens live. Landing under that ceiling is normal: a sequence holds only the blocks
+its tokens occupy, `KVManager::ensure` grows it as it runs and returns `RAD_E_FULL` for the
+scheduler to preempt rather than failing the request, and blocks are dropped at completion. So the
+engine reports the backing fraction without warning about it. The hard limit is one max-length
+sequence: a context no single request can complete is a configuration error, since the API would
+accept a request admission then refuses.
 
-So the engine **reports** the backing fraction and does not warn about it. Sizing for the worst
-case spends VRAM that, on a model whose experts do not fit, is about 1.4 ms a decode step per GiB.
+The split is computed once from printed numbers and nothing re-optimises it afterwards, so
+benchmarks reproduce.
 
-What *is* a hard limit, and is still checked: the pool must hold **one** max-length sequence. A
-context no single request can ever complete is a configuration error however much slack the pool
-has, because the API accepts that request and admission then refuses it.
-
-There is no flag that states either pool: the split is the resolver's, computed once from numbers
-that are all printed, and nothing re-optimises it afterwards. An engine that quietly re-optimises is
-an engine whose benchmarks do not reproduce.
-A fixed weight-slab budget also means dynamic re-placement (§5.4) never competes with the KV pool.
-The mover works inside its own slab and cannot evict a KV block to promote an expert.
-
-**What the budget cannot compute, it measures and reports.** `Engine::start` reads the card back
-once everything has allocated and says what settled there against what `--gpu-headroom-mib` asked
-to keep. The engine's own device allocations are ledgered (`rad_dev_alloc_totals`) and are, on a
-served model, exactly the two pools, the activation arena and the step staging; the difference between that and the
-card is the driver's context, its code objects, and any kernel plugin that calls `hipMalloc` for
-itself. That difference is the one thing the headroom exists to cover, and it is printed rather
-than assumed.
+**What the budget cannot compute, it measures.** At startup the engine reads the card back once
+everything has allocated and reports what settled there against what `--gpu-headroom-mib` asked to
+keep. The engine's own device allocations are ledgered (`rad_dev_alloc_totals`); the rest of the
+card is the driver's context, code objects, and any kernel plugin's own `hipMalloc`. That remainder
+is what the headroom covers, and it is printed.
 
 ---
 
 ## 7. Scheduling
 
-vLLM's core design, which is the part of vLLM that is right.
+The scheduling model follows vLLM's.
 
 ### 7.1 Batching
 
 Continuous batching, chunked prefill, priority queue, preemption by recompute. One scheduler
 decision per step, producing one `RadBatch` (§8).
 
-Chunk boundaries are the scheduler's, and it uses that: chunks split at linear-state checkpoint
-intervals (§7.3), and the chunk size reconciles GDN state geometry with the attention block size
-rather than being a free number. That reconciliation is what forces the vLLM patch set to require
-`--max-num-batched-tokens >= 2240` on the 35B-A3B; here it is computed from the resolved kernels
-instead of being a documented minimum the operator has to know.
+The scheduler owns chunk boundaries. Chunks split at linear-state checkpoint intervals (§7.3), and
+the chunk quantum is the least common multiple of the attention block size and the linear-state
+scan tile, both from the resolved kernels (`core/sched/geometry.h`, `RAD_PROLE_SEQ_CHUNK`). A
+`--max-num-batched-tokens` below what that requires is refused at startup with the minimum printed.
 
 ### 7.2 Paged KV and hybrid groups
 
-**Block size comes from the resolved attention kernel, not from a core constant.** libr4d's paged
-attention is compiled for block size 16 and rejects anything else; the block manager reads that
-off the resolved kernel's constraints at declare and sizes itself accordingly. A core that picked
-its own block size would be a core that has to be edited when a kernel changes.
+**Block size comes from the resolved attention kernel.** libr4d's paged attention is compiled for
+16; the block manager reads the size from the resolved kernel at declare (§2.3, `RAD_DERIVED`), so
+a kernel change needs no core edit.
 
-Hybrid models are the normal case, not an extension: Qwen3-Next is 48 linear-attention + 16 full
-layers, Gemma-4 is 50 sliding-window + 10 global. Each distinct state kind is a **KV group** with
-its own block geometry, its own pool, and its own slot mapping in the step batch. Group sizing
-minimises wasted memory rather than taking the smallest bundle — vLLM pads each bundle up to a
-multiple of the group size and allocates the padding, which is what the KV-group-sizing patch in
-the table at the top exists to stop.
+Hybrid models are the normal case: Qwen3.5-27B has 48 linear-attention and 16 full-attention
+layers, and Gemma 4 interleaves sliding-window and global layers. Each state kind is a **KV group**
+(`RAD_KV_FULL`, `RAD_KV_WINDOW`, `RAD_KV_LINEAR`, `RAD_KV_CONV`) with its own block geometry, pool
+and slot mapping in the step batch, so there is no common page size to pad layer bundles to (the
+padding vLLM's KV-group-sizing patch in the table at the top works around).
 
-Linear-attention state (GDN recurrent state, conv state) is a KV group too. It is not paged the
-same way — the state is per-sequence and fixed-size rather than per-token and growing — but it is
-allocated, mapped, and freed by the same manager, because otherwise two allocators disagree about
-what a sequence owns.
+Linear-attention state (GDN recurrent state, conv state) is per-sequence and fixed-size rather
+than per-token, but it is a KV group too, allocated, mapped and freed by the same manager, so one
+allocator decides what a sequence owns.
 
 ### 7.3 Prefix caching
 
 Full-attention layers: content-hashed blocks with a chained hash, so a block's identity includes
-its whole prefix; LRU eviction; copy-on-write on fork. Multimodal inputs hash by content, so an
-image is a cache hit.
+its whole prefix; LRU eviction; copy-on-write on fork. Multimodal inputs hash by content (§11).
 
-Linear-attention layers cannot work that way. A GDN layer's recurrent state at position N depends
-on all of 0..N and is one fixed-size object per sequence rather than one per token — 32 heads of
-128×128 fp32 is 2 MiB a layer, so roughly 96 MiB across the 48 linear layers of a Qwen3-Next.
-Snapshotting that per block is not affordable.
+A GDN layer's recurrent state at position N depends on all of 0..N and is one fixed-size object
+per sequence: on Qwen3.5-27B, 48 heads of 128x128 f32, 3 MiB a layer and 144 MiB across the 48
+linear layers. A snapshot per block is not affordable, so the state is checkpointed. vLLM does this
+at block boundaries (`--mamba-cache-mode align`), keeping the state of a scheduler step's last
+token when it sits at `i * block_size`. This engine changes two things:
 
-vLLM's answer is a state checkpoint at block boundaries: `--mamba-cache-mode align` keeps the
-state of the last token of a scheduler step when that token sits at `i * block_size`. We take the
-mechanism and change two things about it, both of which are forced or nearly free.
+- **Independent interval.** The checkpoint interval does not depend on the attention block size.
+  vLLM inflates the attention block to the mamba page size (528 tokens for Qwen3.5, 2240 for
+  Qwen3.6-35B-A3B), so every prompt shorter than that misses on attention too. Here attention caches
+  at the kernel's block size (16 in libr4d, §7.2), and the linear checkpoint interval is separate
+  (`--checkpoint-interval`, default 2048, rounded up to the chunk quantum). A hit between
+  checkpoints reuses the attention blocks and replays only the linear layers from the last
+  checkpoint.
+- **Deliberate checkpoints.** vLLM writes one only when a step happens to end on a boundary.
+  The scheduler here splits a chunk at the interval (§7.1) and always writes one, at the
+  cost of an occasional short chunk.
 
-**The checkpoint interval is decoupled from the attention block size.** vLLM inflates the
-attention block to match the mamba page — 528 tokens for Qwen3.5, 2240 for Qwen3.6-35B-A3B — and
-since prefix caching is block-granular, every prompt shorter than that gets a 0% hit rate on
-*attention* as well, which is a standing complaint. We cannot inflate the attention block even if
-we wanted to: §7.2 takes it from the resolved kernel and libr4d's paged attention is compiled for
-16. So attention caches at 16-token granularity and the linear checkpoint interval is a separate,
-much larger number. A hit landing between checkpoints reuses the attention blocks and replays
-only the linear layers forward from the last checkpoint.
+On a model with sliding-window attention and no linear state, a checkpoint snapshots the window
+behind a prompt's tail instead, and chunks are not split at the interval.
 
-**Checkpoints are taken deliberately, not opportunistically.** vLLM writes one only when a
-scheduler step happens to end on a boundary, which is why a checkpoint landing in request-unique
-tokens silently drops caching to zero. Our scheduler owns chunk boundaries (§7.1), so it splits a
-chunk at the interval and always writes one. The cost is an occasional short chunk; the benefit is
-that hit rate is a property of the workload rather than of scheduling luck.
+Snapshots are large (at a 2048-token interval a 128K session on Qwen3.5-27B is 64 checkpoints,
+about 9 GiB), so retention is budgeted. Retention keeps the session tip, which an appending agent
+transcript resumes from, and any snapshot a lookup resumed from since the tip was written, which a
+client rewriting its last message resumes from again. `--checkpoint-policy` chooses the rest: `geometric-backoff` (the
+default) keeps, at every scale S = interval x 2^k, the shallowest checkpoint in the tip's S-token
+bucket and in the bucket before it. Depths behind the tip grow geometrically, a session keeps about
+log2(n) + 2 snapshots, and a turn that diverges d tokens behind the tip resumes less than
+max(2d, two intervals) below the divergence. The buckets are fixed token ranges, so applying the
+rule again each time the store fills keeps the same ladder instead of thinning it towards the tip.
+`tip-only` and `keep-all` are the two ends of that trade, for comparison. Retention is a policy
+class (`core/mem/prefix.h`), so a new policy is a new class (§19.1).
 
-Retention is budgeted, since the snapshots are large — at a 2048-token interval a 128K session is
-64 checkpoints and about 6 GiB. The session tip is always kept, because that is what an appending
-agent transcript actually needs.
-
-**Beyond the tip, retention is geometric backoff and that is the default.** `--checkpoint-policy`
-names it: `geometric-backoff` keeps the tip and then checkpoints 1×, 2×, 4×, 8× back, which bounds
-the snapshot count at log(n) and the recompute at one interval-doubling — the two things keeping
-everything and keeping only the tip each get wrong in one direction. `tip-only` and `keep-all` are
-the two ends of that trade and ship beside it, because a default nobody can run an alternative
-against is a default nobody can falsify. Distances are counted in **checkpoints**, not tokens:
-the scheduler splits chunks at the interval so the spacing is uniform, and counting that way stays
-correct if it ever is not. Retention is a policy object rather than an if-statement, so replacing
-it is writing a class (§19.1).
-
-`--checkpoint-slots` bounds the snapshots **in total**, not per sequence: they come out of one
-global free list, so an operator reading it the other way and setting 2 gets two for the whole
-server rather than two per sequence.
+`--checkpoint-slots` (default 8) bounds the snapshots for the whole server, not per sequence: they
+come from one free list in pinned host memory. When retention leaves the store full, the least
+recently used snapshot goes, where a use is its reservation or a lookup resuming from it. A tip has
+no further protection: sessions are request ids, and a rewritten last message leaves one tip per
+turn that no later turn reaches, while the snapshot every turn resumes from is used every turn.
 
 ### Idle session tiers
 
-A finished turn leaves its prefix in the cache holding KV blocks, which is what makes the next turn
-cheap. Those blocks are the most valuable thing in the pool while the session is live and the least
-valuable thing in it once the session stops. So a finished entry is **copied** to host memory at
-once and keeps its VRAM copy; once the copy has landed, giving the VRAM up costs nothing, and it is
-given up the moment something wants it — the expert slab's loan, or a request the pool cannot
-otherwise serve. A restore keeps the host copy, so the next turn copies only what it added:
+A finished turn's prefix stays in the cache, which makes the next turn cheap; its blocks are dead
+weight once the session stops (`core/mem/kvtier.h`). A finished entry is copied to host memory at
+once and keeps its VRAM copy. Once the copy has landed, the VRAM is given up as soon as something
+wants it (the expert slab's loan, or a request the pool cannot otherwise serve). A restore keeps
+the host copy, so the next turn copies only what it added:
 
     published --(copy)--> clean in VRAM --(memory wanted)--> host
 
-Host memory is the last tier. `--prefix-cache-mib` sizes it, and defaults to zero: a tier of no
-bytes holds nothing, so the feature is off until an operator says how much memory it may have. A
-full host tier drops its least recently used entries, and the cache forgets them. A hit in host
-memory promotes straight back to the device. Nothing is written to a drive: a tier there wears it
-at the rate the server prefills -- every block and every snapshot a prompt produces -- to spare a
-re-prefill only for what outgrows VRAM and host memory together.
+Host memory is the last tier. `--prefix-cache-mib` sizes it (default 0, off), and a full tier
+drops its least recently used entries, for a copy worth more than they are. A chain is stamped
+with one clock, and among equals the deeper block is worth less, in VRAM and on the host, so a
+conversation larger than the tier loses its end and keeps its start, the part a lookup reaches.
+A host hit is restored to the device. Nothing is written to
+a drive: a disk tier would be written at the prefill rate to save re-prefills only for what
+outgrows VRAM and host memory together. Restoring a 200K-token prefix over PCIe takes a fraction of
+a second; re-prefilling it takes minutes.
 
-**Every entry expires.** One that no request has used for `--prefix-cache-ttl` seconds (an hour by
-default, `0` for never) leaves the cache from whichever tier holds it, and is not moved anywhere
-first. A hit or a publish stamps every block of the chain up to where it ends with one clock, so a
-conversation expires from its tip inwards and a system prompt several conversations share stays as
-long as any of them is used. A snapshot expires with the entry it is keyed by.
+**Every entry expires.** An entry unused for `--prefix-cache-ttl` seconds (default 3600, `0` for
+never) leaves whichever tier holds it. A hit or a publish stamps every block of its chain, so a
+conversation expires from its tip inwards and a shared system prompt lives as long as any user of
+it. A snapshot expires with the entry it is keyed by.
 
-The trade is worth making because the alternative is a re-prefill. Dropping a 200K-token prefix
-costs minutes; moving it costs a copy over PCIe.
+**The pool is layer-major.** A logical block is `n_layers` fragments of a few hundred bytes, so
+moving blocks one at a time would be all dispatch cost. Within a layer blocks are dense rows, so
+packing a set is `gather_rows` and restoring is `scatter_rows` (`docs/OPS.md`): one launch per
+(group, layer) for a whole batch.
 
-**The pool is layer-major, and that is what makes this affordable.** A logical block is `n_layers`
-fragments of a few hundred bytes, so moving one block at a time would be dispatch cost with the
-data as a rounding error. Turned around, *within* a layer the blocks are dense rows, which makes
-packing an arbitrary set of them exactly `gather_rows` and restoring them exactly `scatter_rows`
-(docs/OPS.md): one launch per (group, layer) for a whole batch, however many blocks are moving.
+**Recurrent state.** On a hybrid model a session is blocks plus recurrent state. The state lives in
+a slot of the snapshot store (pinned host memory, `--checkpoint-slots`), copied off the card after
+the step that produced it and back before the step that resumes from it, so it never holds VRAM.
 
-**On a hybrid model the blocks are only half of a session.** The other half is the recurrent state,
-which lives in a checkpoint slot of the snapshot store -- pinned host memory, `--checkpoint-slots`
-of them for the whole server. A snapshot is copied off the card after the step that produced it and
-back before the step that resumes from it, so it never holds VRAM and never moves between tiers.
+The snapshot decides whether there is a hit at all: the scheduler clamps a hybrid session's reuse
+to the last reachable linear checkpoint, because `RadBatch` carries one query length for every KV
+group. A session restored without a reachable snapshot re-prefills its transcript. The two halves
+are reported separately, since blocks restored without their snapshot lose the hit while every
+block counter looks healthy.
 
-In this implementation the snapshot is not the smaller half — it decides whether there is a hit at
-all. The scheduler clamps a hybrid session's reuse to the last linear checkpoint it can reach,
-because `RadBatch` carries one query length for every KV group and the linear layers cannot be
-replayed over a longer range than the attention ones, so a session restored without a reachable
-snapshot reuses ZERO tokens and re-prefills its whole transcript. The two halves are still reported
-separately, because a session whose blocks came back and whose snapshot did not costs the session
-everything while every block counter reads as working.
+**Testing.** Corrupt KV produces fluent, deterministic, plausible text that is not what the model
+would have produced. `scripts/tierident.sh` asks one prompt cold, again from VRAM, and again after
+the session has reached host memory, and compares output bytes. The VRAM repeat is the control,
+since a cache hit can legitimately diverge on a near-tie; a run whose session never left VRAM is a
+failure. A lost snapshot does not change the text (the linear layers replay from further back,
+slower), so the snapshot check is a counter of prompt tokens covered with restored state.
 
-**What can go wrong here is silent, so it is tested by byte comparison.** Corrupt KV does not read
-as babble — it reads as fluent, deterministic, plausible text that simply is not what the model
-would have produced. `scripts/tierident.sh` asks one prompt cold, again from VRAM, and again after the
-session has reached RAM, and compares output hashes. The VRAM
-repeat is the control: without it a differing hash proves nothing, because a cache hit could have
-been legitimately tie-divergent. A run in which the session never left VRAM is a failure, not a
-pass.
-
-**Half of that test cannot be a hash, and this is the part that is easy to get wrong.** A lost
-snapshot *is not visible in the text*: the engine replays the linear layers from further back and
-produces exactly the same answer, slower. So the snapshot check is a counter: how many prompt tokens
-a lookup *covered* with restored state.
-
-`/sessions` reports what is stored, where, and what the tiers have actually done — a session table that cannot say "it tried and failed" looks the same
-whether the tiers are working, off, or failing every pass.
+`/sessions` reports what is stored, where, and what the tiers have done, failures included.
 
 ---
 
 ## 8. The step batch
 
-`RadBatch` is built **once per step by the core** and shared by every layer and every KV group.
-Four of the vLLM patches in the table at the top exist because vLLM builds this per KV-cache group,
-per layer, in Python, where it made 13% of a decode step host time with the GPU idle.
+`RadBatch` (`abi/rad_runtime.h`) is built once per step by the core and shared by every layer and
+every KV group, rather than per group and per layer.
 
 It carries: token ids and positions; per-group slot mappings and block tables; sequence boundaries
-(`cu_seqlens`); query and context lengths with their upper bounds; the speculative window layout
-(§10); multimodal embedding spans (§11); the phase, which the run phase uses to index bucket tables
-(§2.2); and the DECODE/PREFILL SPLIT.
+(`cu_seqlens`); query and context lengths with their host-side upper bounds; the speculative window
+layout (§10); encoder rows and M-RoPE positions (§11); checkpoint destinations (§7.3); the phase,
+which the run phase uses to index bucket tables (§2.2); and the decode/prefill split.
 
 The split is `n_seq_decode` and `n_tok_decode`: the core orders every step so its decode rows come
-first, and those two say where they end. A block that has to treat the two kinds of row
-differently — a linear block must, see §10 — then issues over each as a contiguous sub-range
-rather than choosing one path for the whole step. `n_seq_decode` equals `n_seq` on a pure decode
-step and is 0 on a pure prefill one, so a block that does not care can ignore it and one that does
-needs no phase test.
+first, and those two say where they end. A block that treats the two kinds of row differently (a
+linear block must, §10) issues over each as a contiguous sub-range. `n_seq_decode` equals `n_seq`
+on a pure decode step and 0 on a pure prefill one, so a block that does not care can ignore it.
 
-An architecture plugin that needs derived per-step metadata — GDN chunk boundaries, conv-state
-indices — declares it at build time as a derived buffer, and the core computes it once per step
-into the arena. It is not recomputed per layer, and layers that share a geometry share the buffer.
+An architecture plugin that needs derived per-step metadata (GDN chunk boundaries, conv-state
+indices) declares it as a derived buffer (`RAD_BUF_DERIVED`), and the core computes it once per
+step into the arena. Layers that share a geometry share the buffer.
 
 ---
 
 ## 9. Tensor parallel
 
 Declare runs once per rank with `rank` and `world_size` in `RadBuildCtx`. The plugin declares
-dimensions already divided, and emits collectives as ordinary ops resolved through the same
-kernel hierarchy:
+dimensions already divided and emits collectives as ordinary ops, resolved through the same kernel
+hierarchy:
 
 ```c
 decl_op(b, "all_reduce", RAD_PARAMS({"world_size", ctx->world_size},
@@ -1217,31 +1121,35 @@ decl_op(b, "all_reduce", RAD_PARAMS({"world_size", ctx->world_size},
                                     {"exact", 1}), ...);
 ```
 
-The core does not reason about sharding propagation and does not insert collectives. That is
-deliberate: a sharding inference pass is a compiler pass, and its failure mode is a model that
-produces fluent wrong text on a rank count nobody tested. Here the graph dump shows every
-collective exactly where it runs, because the plugin put it there.
+The core neither infers sharding nor inserts collectives. A sharding inference pass is a compiler
+pass whose failure mode is fluent wrong text at a rank count nobody tested; here the graph dump
+shows every collective where the plugin put it.
 
-`lm_head` is vocab-sharded like any other column-parallel weight, so the sampler (§13) runs a
-distributed top-k: each rank reduces its own vocab shard, and only the candidate sets are
-combined. Full logits are never gathered anywhere.
+The residual stream is replicated: every rank holds the whole hidden state between blocks. Weights
+that act only on the stream, such as hyper-connection mixing (`arch/common/rad_block_hc.h`), are
+replicated too, since sharding them would add a collective at each use.
 
-libr4d supplies the all-reduce at 2, 4 and 8 ranks, in an exact form and a quantised-wire one.
-Which of the two a deployment accepts is `RadBuildCtx::tp_wire_lossy`, and the plugin inverts it
-into `all_reduce`'s `exact` parameter. **The polarity is that way round deliberately:** a zeroed
-context means exact, because the sum a rank receives over a lossy wire is not the sum it would
-have received, and a field that defaults to lossy when someone forgets to fill it is precisely the
-failure §17 exists to prevent. `tp_wire_min_bytes` is where the lossy wire starts paying — below
-it the exact kernel wins and the plugin must use it even when lossy is set, because compression
-only pays once the transfer is bandwidth-bound and a decode step's message is not.
+`lm_head` is vocabulary-sharded like any column-parallel weight, so the sampler (§13) runs a
+distributed top-k: each rank reduces its own shard and only the candidate sets are combined. Full
+logits are never gathered.
+
+libr4d supplies the exact all-reduce at 2, 3, 4 and 8 ranks, and a lossy wire (`--tp-wire`) at 2
+ranks (Walsh-Hadamard-rotated 6-bit) and at 3 and 4 (tiered int8). With `--p2p off` the
+collectives exchange through pinned host memory instead of peer access.
+
+`RadBuildCtx::tp_wire_lossy` says whether the deployment accepts the lossy wire, and the plugin
+inverts it into `all_reduce`'s `exact` parameter, so a zeroed context means exact.
+`tp_wire_min_bytes` (default 128 KiB) is where the lossy wire starts paying: below it the plugin
+must use the exact kernel, because compression pays only once the transfer is bandwidth-bound and
+a decode step's message is not.
 
 ---
 
 ## 10. Speculative decoding
 
-**A drafter is not a separate architecture plugin.** The target model's own plugin declares it,
-into the same builder under a draft scope, so its kernels resolve through the same hierarchy and
-its weights are placed by the same planner:
+**Declaration.** A drafter is declared by the target model's own plugin, into the same builder under
+a draft scope, so its kernels resolve through the same hierarchy and its weights are placed by the
+same planner:
 
 ```c
 RadDrafterDecl d = {};
@@ -1251,456 +1159,418 @@ d.mask_token = mask;  d.window = w;  d.block = n;   /* RAD_DRAFT_BLOCK only */
 rad_declare_drafter(b, &d);
 ```
 
-It replaces a weight-name match, and that is the whole argument for it. The alternative is an
-engine that decides whether a container drafts by scanning declared weights for names like
-`mtp.fc.weight`, and then re-reads the drafter's own configuration keys — block size, mask token,
-sliding window, predicted-layer count — every one of them a key the plugin has already read to
-build the thing. Two readers of one fact is two places for it to disagree, and the second reader
-would be the core, which is the one component that must not know.
+Otherwise the core would decide whether a container drafts by scanning weight names like
+`mtp.fc.weight` and read the drafter's configuration keys (block size, mask token, sliding window,
+predicted-layer count) that the plugin already reads: two readers of one fact, one of them the
+core.
 
 **Kind is a shape, not a model.** `RAD_DRAFT_SERIAL` runs `depth` dependent passes, each embedding
-what the last one proposed, so tokens arrive one at a time and a pass that declines ends the
-chain. `RAD_DRAFT_BLOCK` runs a context pass and then one pass that fills every drafted position
-at once. MTP, EAGLE and Medusa-serial are all serial; a block-diffusion drafter is block. A plugin
-picks the shape that describes it and needs no core change to do it.
+what the last proposed. `RAD_DRAFT_BLOCK` runs a context pass, then one pass that fills every
+drafted position. MTP and EAGLE-style heads are serial; block-diffusion drafters (DFlash2, DSpark)
+are block.
 
-Separate draft models would load as a second plugin, which is a design and not a feature. A
-drafter is part of the model's source instead: `rad-convert --draft-model` merges its checkpoint
-into the container under the `draft.` prefix, and an MTP head that ships inside the target
-checkpoint needs no flag at all. The server's `--draft-model` refuses, naming the conversion that
-does it — loudly, rather than quietly serving the container's own drafter instead.
+Separate draft models are not supported; a drafter is part of the model's source.
+`rad-convert --draft-model` merges a drafter that ships as its own repository into the container
+under the `draft.` prefix, and an MTP head inside the target checkpoint needs no flag. The server's
+`--draft-model` refuses and names the conversion.
 
-Verification is a declared op. Acceptance is core sampler logic. **Draft length is static** — it is
-`--num-speculative-tokens` and nothing moves it per step. There is no per-step controller, and its
-absence is a decision rather than an omission: the depth that wins is a constant, a controller
-that can only pick a worse one contributes nothing but the risk that it does, and the gate such a
-controller needs reads the drafter's own confidences AFTER the drafter has run — which is after
-the scheduler has had to choose. `core/sched/draft.h` carries the structural argument and the
-acceptance accounting.
+**Verification and acceptance.** Verification is a declared op. Acceptance is core sampler logic
+(`core/sample/accept.h`) by agreement: a drafted token is accepted when it equals the target's own
+token at that position (the argmax at temperature 0, the target's sampled draw above), so every
+emitted token is the target's.
 
-**The flag defaults to `auto`, and merging a drafter into a container is the statement of
-intent.** `auto` is `n_spec = -1`, resolved before declare from what `rad_arch_probe()` reports:
-a serial head names a measured throughput trade-off, a block drafter names the block length its
-checkpoint was trained at, and `draft_depth_fixed` says which of the two it is. A container with
-no draft head resolves to 0, which is the right answer to "speculate as deeply as this model can"
-on a model that cannot. Defaulting to off instead would leave a deployment that forgot the flag
-paying for a draft head at convert time, paying for it again in VRAM, and then running one token
-a step.
+**Draft length** is `--num-speculative-tokens`, fixed per step by default. With a draft head whose
+cost is nearly flat in depth, the best depth is a property of the model pair, and a gate on the
+drafter's confidences would need them before the drafter has run. `--draft-window adaptive`
+(serial drafters only) makes the number a ceiling: each sequence's stop follows its measured
+per-position acceptance, and the step's head depth maximises expected tokens per measured step time
+(`core/sched/draft.h`). It is off by default because it loses throughput on a busy server.
 
-**The scheduler carries a drafter of its own, underneath the declared one.** A prompt-lookup
-n-gram matcher — patterns of 2 to 4 tokens, longest match first, most recent occurrence first —
-fills any proposal the declared head left empty, and is the whole of speculation on a plugin that
-declares no drafter at all, which is not an error and is the normal case. It costs nothing to
-have: it is host string matching over tokens the scheduler is already holding, and because it only
-ever extends a pattern the sequence has already produced, it proposes nothing where there is
-nothing to repeat. It sits behind the same eligibility gate as the declared head — refusing a
-draft upstream and stopping there would hand the request a *different* draft rather than none.
+**Default depth.** `--num-speculative-tokens` defaults to `auto`, resolved before declare from
+`rad_arch_probe()`: a serial head's throughput operating point, or the block length a block drafter
+was trained at (`draft_depth_fixed` says which). A container with no draft head resolves to 0. A
+merged drafter is used without a flag, so a deployment does not pay for a draft head it never runs.
 
-The speculative window is part of `RadBatch`, which is why attention kernels take a query length
-rather than assuming one: libr4d's decode attention serves up to 64 query rows per KV head
-(`q_len * gqa <= 64`) precisely because a verify step falls in that band.
+**Prompt lookup.** Beneath the declared drafter, the scheduler runs an n-gram matcher that finds
+where the last few committed tokens last occurred in the sequence. It fills any proposal the
+declared head left empty, and is all of speculation for a plugin with no drafter (the normal case).
+It is host matching over tokens the scheduler already holds, and proposes nothing where there is
+nothing to repeat. It sits behind the declared head's eligibility gate, so a draft refused upstream
+is never replaced by a different one.
 
-**A MIXED STEP VERIFIES LIKE ANY OTHER, AND THAT IS A CONTRACT ON THE ARCHITECTURE PLUGIN.** A step
-carrying a prefill chunk beside decode rows is what continuous batching produces constantly — on an
-agentic load 28.5% of steps, and none of them prefill-only, because every chunk rides with decode
-rows. The obvious linear block issues one path for the whole step, and then its decode rows are on
-the chunked path, which commits the state directly and takes no `num_accepted`: a draft verified
-there cannot be rolled back, the rejected tokens stay folded into the recurrent state, and the
-model is conditioned on text it never emitted. The answer stays fluent and drifts.
+The speculative window is part of `RadBatch`, which is why attention kernels take a query length:
+libr4d's decode attention serves up to 64 query rows per KV head (`q_len * gqa <= 64`), the band a
+verify step falls in.
 
-So a linear block **must issue the recurrent path over the decode rows and the chunked path over
-the prefill ones**, as two issues against two ranges. `RadBatch` carries the boundary and the core
-orders every step decode-first so each half is a contiguous run of sequences (§8). It costs no
-kernel change: these kernels take `cu_seqlens`, derive their grid from its length and their rows
-from `cu[n]`, which is an absolute offset — so the prefill half is addressed by passing `cu + D`
-with the token operands left at their base, and the decode half by narrowing both. Only the ops
-that take no `cu_seqlens` — a per-token gate or quantiser — need a row slice.
+**Mixed steps.** A mixed step verifies like any other, and this is a contract on the architecture
+plugin. Continuous batching often puts a prefill chunk beside decode rows. A linear block issuing
+one path for the whole step would put its decode rows on the chunked path, which commits state
+directly and takes no `num_accepted`: rejected drafts stay folded into the recurrent state, and the
+output drifts while staying fluent.
 
-Refusing to draft on a mixed step is the other way to be correct, and it costs a quarter of all
-decode rows their draft.
+So a linear block issues the recurrent path over the decode rows and the chunked path over the
+prefill rows, as two issues over two ranges; the core orders every step decode-first so each half
+is contiguous (§8). These kernels take `cu_seqlens`, derive their grid from its length and their
+rows from `cu[n]`, an absolute offset, so the prefill half is addressed by passing `cu + D` with
+the token operands at their base and the decode half by narrowing both. Only ops without
+`cu_seqlens` (a per-token gate or quantiser) need a row slice. Refusing to draft on mixed steps
+would also be correct, but would cost many decode rows their draft.
 
-**Rejection rolls back state, and the two kinds roll back differently.** Paged KV is a slot-table
-edit — free the blocks past the accepted position. Linear state is not: the recurrent state and
-the conv window have already absorbed the rejected tokens. libr4d's conv update handles this by
-treating the state cache as a rolling window of `width-1 + num_spec` entries and reading at the
-slot the last accepted token left, so a rejection is a change of read offset rather than a
-recompute. The engine's contract is that a linear-attention kernel pair must support this, and it
-is part of the op's schema rather than an assumption.
+**Rejection rolls back state, differently per kind.** Paged KV is a slot-table edit: free the
+blocks past the accepted position. Linear state has already absorbed the rejected tokens: libr4d
+keeps the conv state as a rolling window of `conv_width - 1 + n_spec` entries read at the slot the
+last accepted token left, so a rejection changes a read offset. The recurrent state is kept either
+per candidate token or as one committed anchor with the accepted prefix replayed onto it, as the
+op's `state_form` parameter declares. Rollback support, with `num_accepted` as an operand, is part
+of a linear-attention kernel pair's schema (`docs/OPS.md`).
 
 ---
 
 ## 11. Multimodal
 
-**Pictures and video are served on every Qwen container that carries the tower** — Qwen3.8-27B
-(bf16, fp8), Qwen3.6-35B-A3B and Qwen3.8-Flash-Next — through the chat API's `image_url` /
-`video_url` parts (and the Responses spellings `input_image` / `input_video`), as `data:` URLs
-only: fetching a caller's URL would make the server an SSRF proxy. Audio is not served.
+**Coverage.** Pictures and video on every Qwen container that carries the vision tower
+(Qwen3.8-27B in bf16 and fp8, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next) and on Gemma 4 31B
+(`gemma4_bf16`); pictures on LFM2-VL; pictures, video and audio as EmbeddingGemma 2 input. Media
+arrive as `image_url` / `video_url` chat parts (`input_image` / `input_video` in the Responses
+API) and audio as `input_audio` / `audio_url`, as `data:` URLs only: fetching a caller's URL would
+make the server an SSRF proxy.
 
-**The processor is `core/mm/`, held to transformers number for number** (`tests/mm_test.cpp`, goldens
-generated by `tests/mkgolden.py` from transformers' own functions). ffmpeg decodes, with a format
-whitelist and no protocols, and converts at the frame's own colour matrix and range. `smart_resize`
-fits a picture to multiples of 32 in its pixel band, and Pillow's antialiased bicubic — transcribed
-bit for bit, 8-bit intermediate and all — resamples it; the patches go out normalised, in merge-block
-order, a picture repeated to the temporal depth. A video keeps `fps` 2 frames a second (4 to 768),
-chosen as numpy's rounded linspace, and each frame is capped the way qwen-vl-utils does it (and
-transformers will from 5.22): at most `max_video_tokens` rows and the budget's even share. Its
-expansion is a timestamp, `<T seconds>`, then the group's pads between vision_start and vision_end,
-standing for the template's whole vision triple as the model's own processor wrote it (transformers
-4.57); transformers 5.x keeps the outer pair and writes two tokens more. A media part reaches the chat
-template as a `media_marker`, which the part join leaves unpadded, so an image prompt tokenises to the
-reference's ids exactly.
+**The processor is `core/mm/`.** One decoder (libavformat/libavcodec) reads every image and video
+format from a memory buffer, with an empty protocol whitelist, and converts at the frame's own
+colour matrix and range. The family comes from the container (`core/mm/processor.h`):
 
-**The encoder is the language model's plugin.** The Qwen3-VL tower (`arch/common/rad_block_vit.h`) is
-declared last by `qwen35_bf16`, `qwen35_fp8`, `qwen35moe_fp8` and `qwen4exp_fp8` when the container
-carries its weights (`radiance.encoder`) and the deployment asks for an encoder (`--mm-max-patches`,
-16384 patches a pass by default — a 2048 × 2048 picture; a larger one is resized to fit, since a
-segment is never split): replicated weights at `RAD_ACCESS_PER_REQUEST` in groups past every text
-layer, one `rad_declare_encoder`, and a pass (`RadBatch::enc`) that issues the tower and nothing else.
-Its output matches transformers' at bf16 parity on every checkpoint's tower.
+- **Qwen-VL.** `smart_resize` fits a picture to multiples of patch x merge within its pixel band,
+  resampled with PIL's antialiased bicubic; patches are normalised, in merge-block order, a picture
+  repeated to the temporal depth. A video is sampled at `fps` (default 2, 4 to 768 frames), each
+  frame capped at `video_preprocessor.max_video_tokens` rows, and each temporal group is preceded by
+  `<T seconds>`, since the groups share one temporal rotary component.
+- **Gemma 4.** The largest size whose patch count fits the soft-token budget (70, 140, 280, 560 or
+  1120); a video is frames at `fps`, each its own segment at the per-frame budget.
+- **LFM2-VL.** A picture within its token budget is resized whole; a larger one is cut into tiles
+  followed by a thumbnail. Images only.
 
-**Encoding happens between steps, never inside one.** The scheduler holds a request back until its
-items are encoded (`Scheduler::media_ready`); the engine packs whole segments — a picture, or a
-video's temporal group — into passes, reads the rows back into host memory with the item, and the
-batch builder copies a chunk's rows in with the chunk that reaches them (`RadBatch::mm_rows` /
-`mm_embd`). Rank 0 gets the rows and every other rank zeros, and the plugin scatters them over the
-token embeddings BEFORE the vocab-sharded embedding's reduction, so the sum counts each once. The
-placeholders stay the model's own pad ids, which a hashed n-gram embedding (Flash-Next's PLE) reads
-like any other token.
+`tests/mm_test.cpp` checks the processor against goldens generated by `tests/mkgolden.py` from
+transformers' own functions. A media part reaches the chat template as a marker that the part join
+leaves unpadded, so an image prompt tokenises to the reference's ids.
 
-**Positions are M-RoPE.** `RadBatch::rope_pos` carries a pass's [3, T] (t, h, w) planes — the image
-grid at the run's base, the next text at base + max(rows), a video's groups each a run of their own
-— and `rope_mixed` says whether any token's components differ; the fused one-component rope path runs
-only when none do, so a text-only step is the graph it always was. Decode rows continue at their index
-plus the prompt's final shift, moved on device with the position. QSA block keys rotate at their
-first token's three components (`qsa_work`'s `rope` operand, a `[work, 3]` `bpos`).
+**The encoder is the language model's plugin.** The tower is declared last by the language model's
+plugin (for Qwen, `arch/common/rad_block_vit.h` in `qwen35_bf16`, `qwen35_fp8`, `qwen35moe_fp8` and
+`qwen4exp_fp8`) when the container carries its weights and the deployment asks for an encoder
+(`--mm-max-patches`; `auto` is 16384 patches a pass when the container has a tower, a 2048 x 2048
+picture at 16x16 patches; a larger picture is resized to fit, since a segment is never split). Its
+weights are `RAD_ACCESS_PER_REQUEST` in groups past every text layer, declared with one
+`rad_declare_encoder`, and an encoder pass (`RadBatch::enc`) issues only the tower. A program
+declares at most two encoders: one for images and video, one for audio.
 
-**The prefix cache keys a media run by its content** — a hash of the item's patches and the run's row
-offset — never by its placeholder ids, which are the same for every picture. Two pictures never alias;
-the same picture hits. Not done: a hit that covers a whole item still encodes it before admission, and
-the same picture in two requests is encoded twice — both correct, both encoder time a cache of the
-tower's output would save.
+**Encoding happens between steps, never inside one** (`core/engine_mm.cpp`). The scheduler holds a
+request back until its items are encoded (`Scheduler::media_ready`). The engine packs whole
+segments (a picture, or a video's temporal group) into passes, every rank running the whole tower,
+and reads the rows back into host memory. The batch builder copies them in with the chunk that
+reaches them (`RadBatch::mm_rows` / `mm_embd`). Rank 0 gets the rows and every other rank zeros,
+and the plugin writes them over the token embeddings before the vocab-sharded embedding's
+reduction, so the sum counts each once. The placeholders stay the model's own pad ids, which a
+hashed n-gram embedding (Flash-Next's PLE) reads like any other token.
 
-**Containers gain the tower in place.** `rad-convert --reuse C --in-place` writes only the new weights
-past the end of `C` with fresh tables and rewrites the header last (`<C>.pre-append` keeps the old
-header and length): about a gigabyte of I/O for a 120 GB Flash-Next container.
+**Positions are M-RoPE** on the Qwen family. `RadBatch::rope_pos` carries a pass's [3, T]
+(t, h, w) planes: the image grid at the run's base, the next text at base + max(rows), each video
+group a run of its own. The one-component rope path runs only when `rope_mixed` says no token's
+components differ, so a text-only step's graph is unchanged. Decode rows continue at their index
+plus the prompt's final shift. QSA block keys rotate at their first token's three components
+(`qsa_work`'s `rope` operand, a `[work, 3]` `bpos`).
+
+**The prefix cache keys a media run by its content** (a hash of the item's patches and the run's
+row offset), never by its placeholder ids, which are the same for every picture. A hit that covers
+a whole item still encodes it before admission, and the same picture in two requests is encoded
+twice; a cache of the tower's output would avoid both.
+
+**Containers gain the tower in place.** `rad-convert --reuse C --in-place` writes only the new
+weights past the end of `C` with fresh tables and rewrites the header last (`<C>.pre-append` keeps
+the old header and length): about a gigabyte of I/O for a 120 GB Flash-Next container.
 
 ---
 
 ## 12. Text frontend
 
-Written once, in the core, and mostly not written by us. llama.cpp is MIT, is already C++, and
-has solved every one of these problems in production. The line to draw is: **take the text
-frontend and the tooling, not the engine.**
+Written once, in the core, mostly from llama.cpp, which is MIT, C++ and handles these problems in
+production. The rule: take the text frontend and the tooling, not the engine.
 
-**A lift and a rewrite are different things, and the table says which.** A lift is upstream's file
-at upstream's path under `vendor/`, with local changes as a patch series. A rewrite is a file we
-would have had to modify so heavily that it belongs in `core/` under our own name instead, with a
-comment at its head naming what it was read from. `vendor/UPSTREAM` records the commit, the split,
-and the reason for every row here.
+A **lift** is upstream's file at upstream's path under `vendor/`, with local changes as a patch
+series. A **rewrite** is a file that would need such heavy modification that it lives in `core/`
+under its own name, with a comment at its head naming its source. `vendor/UPSTREAM` records the
+commit, the split and the reason for every row:
 
 | need | source | how |
 |---|---|---|
 | Jinja engine | `common/jinja/` | lifted, 5.0k |
 | template capability probe | `common/jinja/caps.cpp` | lifted, 0.5k |
 | reply format analysis | `chat.cpp`, `chat-auto-parser*.cpp`, `chat-diff-analyzer.cpp` | lifted, most of the patch series; the markers only |
-| reply parsing | `chat-peg-parser.cpp`, `peg-parser.cpp` | **rewritten** → `core/text/chatparse.{h,cpp}`, one streaming pass |
+| reply parsing | `chat-peg-parser.cpp`, `peg-parser.cpp` | rewritten → `core/text/chatparse.{h,cpp}`, one streaming pass |
 | JSON-schema → grammar | `json-schema-to-grammar.cpp` | lifted, 1.2k |
 | unicode and regex splitting | `common/unicode.cpp`, `src/unicode*` | lifted |
 | HTTP and JSON | `vendor/cpp-httplib`, `vendor/nlohmann` | lifted, unmodified |
-| GBNF grammar state machine | `src/llama-grammar.cpp` | **rewritten** → `core/sample/gbnf.{h,cpp}`, token masks in `gbnf_mask.cpp` |
-| tokenizer merge machinery | `src/llama-vocab.cpp` | **rewritten** → `core/text/tokenizer.{h,cpp}` |
-| GGUF reading | `ggml/src/gguf.cpp` | **rewritten** → `core/text/gguf.{h,cpp}` |
-| sampling chain | `src/llama-sampler.cpp` | **rewritten** → `core/sample/host_ref.{h,cpp}`; reference only, §13 |
-| `tokenizer.json` interpretation | `convert_hf_to_gguf.py` | Python, unliftable → `core/text/tokenizer_json.cpp` |
-| NFC/NFKC normalisation | — | no upstream to take: llama.cpp has none |
-| OAI schema translation | — | original: `core/server/oai.cpp` includes nothing of llama.cpp |
-| multimodal preprocessing | — | original: `core/mm/`, held to transformers (§11); nothing of `mtmd` is vendored |
+| GBNF grammar state machine | `src/llama-grammar.cpp` | rewritten → `core/sample/gbnf.{h,cpp}`, token masks in `gbnf_mask.cpp` |
+| tokenizer merge machinery | `src/llama-vocab.cpp` | rewritten → `core/text/tokenizer.{h,cpp}` |
+| GGUF reading | `ggml/src/gguf.cpp` | rewritten → `core/text/gguf.{h,cpp}` |
+| sampling chain | `src/llama-sampler.cpp` | rewritten → `core/sample/host_ref.{h,cpp}`; reference only, §13 |
+| `tokenizer.json` interpretation | `convert_hf_to_gguf.py` | Python, so rewritten → `core/text/tokenizer_json.cpp` |
+| NFC/NFKC normalisation | none | llama.cpp has none → `core/text/unicode_norm.{h,cpp}` |
+| OAI schema translation | none | original: `core/server/oai.cpp` |
+| multimodal preprocessing | none | original: `core/mm/`, checked against transformers (§11); nothing of `mtmd` is vendored |
 
-Not taken: ggml, their graph and scheduler, `llama-context` / `llama-batch`, the server's slot
-model. Those are what we are replacing.
+Not taken: ggml, its graph and scheduler, `llama-context` / `llama-batch`, the server's slot model.
+Those are what this engine replaces.
 
-The rewrites each have the same story behind them, and it is worth one example: `llama-vocab.cpp`
-is welded to `llama_model_loader`, `GGML_ASSERT` and the `llama_vocab` class, and organised around
-a pre-tokeniser identified by *hashing* `tokenizer.json` against a hardcoded enum — which is the
-behaviour the rest of this section exists to replace. Taking it whole would mean taking all of
-that; so the BPE bigram queue and the UGM Viterbi are re-expressed with attribution, and the enum
-is gone. The rule is mechanical: anything that cannot be expressed as a patch against upstream
-gets rewritten, so `vendor/` stays updatable.
+Anything that cannot be expressed as a patch against upstream is rewritten, so `vendor/` stays
+updatable. `llama-vocab.cpp`, for example, depends on `llama_model_loader`, `GGML_ASSERT` and the
+`llama_vocab` class; its BPE bigram queue and UGM Viterbi are re-expressed with attribution.
 
-**A reply is read by one streaming parser, driven by a description of the model's format.** How a
-model spells a turn — the reasoning tags, the call opener, the function and argument delimiters,
-how a value is encoded — is plain data (`core/text/chatfmt.h`), and everything that depends on the
-spelling is derived from it: the parser that reads the reply back, the lazy tool-call grammar and
-the literal words that trigger it, and the control tokens the decoder must render as text.
+**Reply parsing.** A reply is read by one streaming parser driven by a description of the model's
+format. How a model spells a turn (reasoning tags, call opener, function and argument delimiters,
+value encoding) is data (`core/text/chatfmt.h`), and everything that depends on the spelling is
+derived from it: the reply parser, the lazy tool-call grammar and its trigger words, and the control
+tokens the decoder must render as text.
 
-Two families of call syntax are described. In the tagged one each argument has its own tags
-(Qwen's `<parameter=NAME>`, MiniCPM's `<param name="NAME">`) and is typed by the tool's schema. In
-the object one a call is its name and ONE object holding the arguments — JSON, or a dialect of
-it with strings between declared delimiters and bare keys, as Gemma 4 writes
-`call:NAME{path:<|"|>/a<|"|>,limit:3}` — and the values carry their own types.
+There are two families of call syntax. In the tagged family each argument has its own tags (Qwen's
+`<parameter=NAME>`, MiniCPM's `<param name="NAME">`) and is typed by the tool's schema. In the
+object family a call is its name and one object holding the arguments: JSON, or a dialect with
+strings between declared delimiters and bare keys, as Gemma 4 writes
+`call:NAME{path:<|"|>/a<|"|>,limit:3}`; values carry their own types.
 
-There are two producers, in order of precedence. An architecture plugin may declare the format
-through the optional `rad_arch_chat_format` export (`abi/rad_builder.h`) — a new model whose
-template the analysis cannot read is supported by stating its format once. Otherwise the format
-comes from llama.cpp's differential analysis of the chat template — render with and without
-tools, with and without a call, diff the outputs to find the delimiters. Only the analyser's derived
-markers are used; the PEG parser it would generate is not. A format neither producer can describe
-is not guessed at: the model still chats, and a request that sends tools is refused, naming why.
+The format comes from the architecture plugin's optional `rad_arch_chat_format` export
+(`abi/rad_builder.h`) when it has one, which covers a template the analysis cannot read. Otherwise
+it comes from llama.cpp's differential analysis of the chat template: render with and without
+tools and calls, and diff the outputs to find the delimiters. Only the analyser's markers are used,
+not the PEG parser it would generate. A format neither source describes is not guessed: the model
+still chats, and a request with tools is refused with the reason.
 
-The parser (`core/text/chatparse.h`) reads each reply exactly once, as it streams: an Aho-Corasick
-automaton over the delimiters that can end the current region, skipping plain text with memchr; a
-transducer over the tag structure; an incremental scanner for JSON-typed arguments. A long reply
-costs its length, not its length squared, and nothing on that path is a regular expression. Where
-a reply is within the format's grammar it reads exactly as the grammar says — the derived grammar
-is lenient on purpose where models are: an argument the schema does not declare, a non-string
-argument written as Python, a reasoning block the model never closed, prose before, between and
-after calls. Where a reply leaves the grammar — a function that is not a tool, text inside a call —
-the parser recovers locally and says so, and the call still reaches the agent: an unknown name
-arriving as a proper error is a turn the model recovers from, and the same name echoed back as
-prose is a turn it loses.
+The parser (`core/text/chatparse.h`) reads each reply once as it streams: an Aho-Corasick automaton
+over the delimiters that can end the current region, skipping plain text with `memchr`; a
+transducer over the tag structure; an incremental scanner for JSON-typed arguments. Cost is linear
+in the reply, and nothing on that path is a regular expression. The grammar is lenient where models
+are: undeclared arguments, non-string arguments written as Python, an unclosed reasoning block,
+prose around calls. Where a reply leaves the grammar (a function that is not a tool, text inside a
+call) the parser recovers locally, says so, and still delivers the call, so the agent sees an
+unknown name as an error it can recover from rather than as prose.
 
-**What has been streamed is final.** A delta cannot be taken back, so the parser holds a byte only
-while its meaning is undecided — a possible delimiter prefix, a trailing whitespace run that may be
-trimmed, a JSON-typed value whose type its closing tag decides — and the deltas a client
-concatenates are the answer the buffered path returns, by construction.
+**What has been streamed is final.** The parser holds a byte only while its meaning is undecided (a
+possible delimiter prefix, trailing whitespace that may be trimmed, a JSON-typed value whose type
+its closing tag decides). The concatenated deltas equal the non-streaming answer.
 
-**The tokenizer is the one place llama.cpp's answer is Python.** Their vocab is GGUF-shaped and
-the `tokenizer.json` → vocab mapping lives in `convert_hf_to_gguf.py`; at runtime they identify
-the pre-tokenizer by *hashing tokenizer.json* against a hardcoded enum, which is why an
-unrecognised model gets a default split.
+**Tokenisation.** llama.cpp maps `tokenizer.json` in Python (`convert_hf_to_gguf.py`) and at
+runtime identifies the pre-tokeniser by hashing `tokenizer.json` against a hardcoded enum, so an
+unrecognised model gets a default split. `rad-convert` interprets `tokenizer.json` instead: the
+declared normalizer / pre-tokenizer / decoder chain (`Sequence`, `ByteLevel`, `Split` with its
+regex, `Metaspace`, `Replace`, NFC/NFKC) is resolved and stored in `.rad`, and a component it
+cannot express is refused by name. This removes a failure class whose symptom, plausible text with
+wrong token boundaries, is hard to notice.
 
-`rad-convert` interprets `tokenizer.json` properly instead: the normalizer / pre-tokenizer /
-decoder chain as declared — `Sequence`, `ByteLevel`, `Split` with its regex, `Metaspace`,
-`Replace`, NFC/NFKC — resolved and baked into `.rad`. llama-vocab's BPE and unigram merge
-machinery is lifted underneath. This is real work: the pre-tokenizer regexes need a correct
-engine and ByteLevel's alphabet mapping has to be exact. It removes a failure class whose symptom
-is plausible text with wrong token boundaries, which is the hardest kind to notice.
-
-Detokenisation is incremental and streaming-safe: byte-level BPE emits partial UTF-8 sequences,
-and a stop string may straddle a chunk boundary, so both are buffered until they resolve.
+Detokenisation is incremental and streaming-safe: byte-level BPE emits partial UTF-8 sequences and
+a stop string may straddle a chunk boundary, so both are buffered until they resolve.
 
 ---
 
 ## 13. Sampling and structured output
 
-**Sampling runs on device.** At a 151K vocab and batch 256, logits are ~77 MiB a step; moving that
-across the link to run a host chain costs both the bandwidth and a synchronisation, on the step
-path, at exactly the concurrency the engine exists to serve.
+**Sampling runs on device.** At a 151K vocabulary and batch 256 the f32 logits are about 148 MiB a
+step; a host chain would add that transfer and a synchronisation to the step path.
 
-The consequence is stated plainly: every sampler is a kernel, not a lift. Temperature, top-k,
-top-p, min-p, typical, repetition and presence penalties, DRY, XTC, seeds. llama.cpp's chain is
-kept as a **host reference implementation**, which is what `rad-kbench` compares the device
-samplers against — the same relationship §16 sets up for every other op.
+Every sampler is a kernel: temperature, top-k, top-p, min-p, typical, repetition, frequency and
+presence penalties, DRY, XTC, seeds. Sampler ops are declared and resolved like any other op
+(`core/sample/sampler.h`), with libref's rows as `rad-kbench`'s oracle (§17). llama.cpp's chain is
+ported to `core/sample/host_ref` as a host reference the test suite checks the chain against.
 
-Two things in that reference deviate from upstream on purpose, and both are load-bearing. The
-**chain order** is vLLM's and this spec's — penalties, temperature, grammar mask, top-k, then
-top-p / min-p / typical, then the pick — where llama.cpp puts temperature last; the difference is
-not cosmetic, since top-p, min-p and typical all cut on probabilities and whether temperature ran
-first decides which tokens survive. And the **RNG is stateless**: a counter-based function of
-(seed, position, stream) rather than upstream's per-sampler Mersenne twister, because a kernel has
-nowhere to keep 624 words of state per sequence and a stateful generator makes the answer depend
-on how many draws happened earlier — which makes a comparison irreproducible the moment the batch
-composition changes.
+Two deviations from upstream are deliberate:
 
-Structured output is GBNF, with JSON-schema compiled to a grammar. The grammar state machine stays
-on host, where it belongs; what crosses to the device is a token bitmask per sequence, which at
-151K tokens is 19 KiB — cheap enough to upload every step. A grammar backend is a small interface
-so an alternative can be dropped in, but GBNF is the shipped one and there is no reason to carry
-xgrammar for it: the masks are served from a plan precomputed when a grammar is compiled —
-xgrammar's adaptive token-mask cache, keyed on stack suffixes — so a mask costs the same whether
-its state was seen before or not, and compiling happens where the request is admitted.
+- **Chain order.** Penalties, temperature, the grammar mask, top-k, then top-p / min-p / typical,
+  then XTC, then the pick (vLLM's order). llama.cpp applies temperature last. Top-p, min-p and
+  typical cut on probabilities, so whether temperature ran first decides which tokens survive. A
+  request may ask for llama.cpp's order with `samplers`.
+- **The RNG is stateless**: a counter-based function of (seed, position, stream)
+  (`abi/rad_philox.h`) instead of upstream's per-sampler Mersenne twister. A kernel cannot keep 624
+  words of state per sequence, and a stateful generator makes the answer depend on how many draws
+  happened before, which changes with batch composition.
+
+Structured output is GBNF, with JSON schema compiled to a grammar. The grammar state machine runs on
+the host, and a token bitmask per sequence (19 KiB at 151K tokens) is uploaded every step. The
+backend is an interface (`GrammarBackend`); GBNF is the shipped one. Masks are assembled from a plan
+precomputed when the grammar is compiled at admission (`core/sample/gbnf_mask.cpp`; XGrammar's
+adaptive token-mask cache, keyed on stack suffixes), so a mask costs the same for new and seen
+states.
 
 ---
 
 ## 14. Server
 
-`/v1/chat/completions` (streaming and not), `/v1/completions`, `/v1/models` and `/v1/models/:id`,
-a real `/v1/embeddings`, tool calls in and out, logprobs, and a Prometheus `/metrics` endpoint with
-vLLM-compatible metric names so existing dashboards work unchanged.
+OpenAI's API: `/v1/chat/completions` (streaming and not), `/v1/completions`, `/v1/models` and
+`/v1/models/:id`, `/v1/embeddings`, `/v1/images/generations` and `/v1/images/edits`, with tool
+calls in and out and logprobs. `/v1/systemone` serves the decisions of LiquidAI's d1 when the
+container declares it. A Prometheus `/metrics` endpoint uses vLLM's metric names, so existing
+dashboards work.
 
-The other clients' own APIs are translated onto the same chat request rather than served by a
-second path: Anthropic's `/v1/messages`, OpenAI's `/v1/responses`, and llama-server's native
-`/completion` and `/infill`, with `/props` and `/apply-template` for the front-ends built against
-llama-server. A request field this server does not implement is ignored when it cannot change the
-output and refused by name when it would, unless it carries its off value (GUIDE §5.8).
+Other clients' APIs are translated onto the same chat request rather than served by a second path:
+Anthropic's `/v1/messages` (and `/v1/messages/count_tokens`), OpenAI's `/v1/responses`, and
+llama-server's native `/completion` and `/infill`, with `/props` and `/apply-template` for
+front-ends built against llama-server. Chat, embeddings, images, models and responses are also
+served without the `/v1` prefix, as llama-server does; `/completions` without it is llama-server's
+native endpoint. A request field this server does not implement is ignored when it cannot change
+the output and refused by name when it would, unless it carries its off value (GUIDE §5.8).
 
-Beside those, the operational set: `/health`, `/ping`, `/load`, `/version`, `/server_info`,
-`/tokenize`, `/detokenize`, `/get_tokenizer_info`, `/reset_prefix_cache`. Method spellings follow
-vLLM's, including the ones that look wrong — `/tokenize` and `/detokenize` are POST because their
-input is a body, `/reset_prefix_cache` is POST because it changes state, and `/ping` answers both
-GET and POST because different load balancers send different ones and neither is worth a 405 on a
-health probe.
-There is one route table and `/server_info` answers out of it rather than out of a copy, because a
-list kept beside the routes is a list that goes stale on the next route added.
+`/v1/messages` lowers Anthropic's request onto the chat request: `tool_use` to tool calls,
+`tool_result` to tool messages, thinking blocks to `reasoning_content`, the `system` field and the
+system messages at the head of the conversation to one system message, and the text of a later
+system message into the user message beside it, so the roles still alternate (templates read a
+system message only at the head, and some refuse two user turns in a row). The answer,
+its event stream and every refusal on the path, the transport's own included, are in Anthropic's
+shapes. Anthropic's API refuses a field it does not define, and so does this endpoint: its clients
+send beta fields that change what a request means (a `thread` continuation carries only the tail of
+the conversation), so a field is read, taken because it cannot change the answer here, or refused
+by name (GUIDE §5.11).
 
-An HTML dashboard is served at `/dashboard`, with `/stats`, `/graph` and `/sessions` (the idle
-session tiers, §7.3) beneath it — and at `/`,
-because a person holding the host and port of a running engine types exactly that, and answering
-it with a 404 answers "is this thing alive" with "no".
+The operational set: `/health`, `/ping`, `/load`, `/version`, `/server_info`, `/diagnostics`,
+`/tokenize`, `/detokenize`, `/get_tokenizer_info`, `/reset_prefix_cache`. Methods follow vLLM's:
+`/tokenize` and `/detokenize` are POST (their input is a body), `/reset_prefix_cache` is POST (it
+changes state), and `/ping` takes GET and POST because load balancers differ. `/server_info`
+answers from the one route table.
 
-Request cancellation propagates to the scheduler and frees blocks immediately rather than at
+An HTML dashboard is served at `/dashboard` and at `/`, with `/stats`, `/graph` and `/sessions`
+(the idle session tiers, §7.3) beneath it.
+
+Cancelling a request frees its blocks at once (or once no in-flight pass names them), not at
 completion.
 
 ---
 
 ## 15. Tuning
 
-Constraint matching finds a kernel that is *correct* for a geometry. Within one kernel there are
-usually many tile configurations, and the right one is a property of the shape and the machine —
-the vLLM patch set ships `moe-configs/` and `fp8-configs/` for exactly this, hand-tuned per shape.
+Constraint matching finds a kernel that is correct for a geometry. Within one kernel there are
+usually many tile configurations, and the best depends on the shape and the machine.
 
-**A kernel declares AXES, not a list of pre-named combinations.** `RadTunable` (§2.1) names one
-axis — `sk`, `bm`, `npw` — its legal values ascending, and a default; `tune_valid` answers whether
-a combination is legal at a given geometry, which is exactly what a product of independent lists
-cannot say (libr4d's skinny GEMM needs `wv * sk * 32` inside the block bound *and* `K % (sk *
-unit) == 0`, and neither is a property of `sk` alone). Hand-enumerating the interesting points of
-a multi-axis space — `wv1_sk8_mb3_npw4` and its twenty-odd siblings — leaves **holes**, and a hole
-costs step time silently: a ladder that skips a value runs the next tile up, so a shape with forty
-rows of work gets a sixty-four-row tile. A cross product has no holes. It also keeps the tuning
-*law* out of the launch adapter, where it would be C++ — ladders, caps, a hand-written picker —
-that an out-of-tree author cannot write.
+**A kernel declares axes, not named combinations.** `RadTunable` (§2.1) names one axis (`sk`,
+`bm`, `npw`), its legal values ascending, and a default. `tune_valid` says whether a combination is
+legal at a geometry, which independent lists cannot express (libr4d's skinny GEMM needs
+`wv * sk * 32` inside the block bound and `K % (sk * unit) == 0`). Hand-enumerated points in a
+multi-axis space leave holes that cost step time silently (a shape with forty rows of work runs a
+sixty-four-row tile); a cross product has none, and keeps the tuning policy out of the launch
+adapter, where an out-of-tree author could not write it.
 
-**The chosen values arrive as ordinary parameters.** There is no variant index: once the core has
-picked a point it appends the choices to `RadArgs::p`, and the kernel reads `sk` with the same
-`rad_args_geti()` it reads `M` with. One way in, for a value the caller supplied and a value the
-tuner chose.
+The chosen values are appended to `RadArgs::p`, and the kernel reads `sk` with the same
+`rad_args_geti()` it reads `M` with.
 
-Every axis carries an explicit `deflt` — what runs on a machine with no measurement for this
-instantiation, which is a fresh install, a shape nobody tuned, or a cache from another card. There
-is nothing beneath it, so the loader checks that the default appears in `values` and **refuses the
-plugin by name** if it does not. An untuned install is therefore fast rather than broken.
+Every axis has an explicit `deflt`, used where this machine has no measurement (a fresh install, an
+untuned shape, a cache from another card). The loader refuses a plugin by name if a default is not
+among its axis's `values`, so an untuned install always runs.
 
-The core owns the cache and the policy: `rad-tune` walks the declared graph's actual shapes,
-benchmarks each legal candidate on this machine, and writes **one file per machine** —
-`$RADIANCE_HOME/tune/<machine>.tune` — that the selector reads at declare. The lookup key is
-(kernel, plugin, geometry), not the op: two kernels can serve one op and they tune independently.
-Ranges are already collapsed to the band's upper bound, because a bucket table row is what was
-measured and so a bucket table row is what is keyed. The winning point is written as sorted
-`key=value` pairs — `mb=3,npw=4,sk=8` — rather than a name, since a name would tie the cache to a
-spelling the library happens to use this release: an axis the reader no longer declares is ignored
-on lookup, and one it declares that the row omits falls back to that axis's default, so a cache
-written before an axis existed still helps. It is UTF-8 text, because a human has to be able to
-read it, diff it, delete one line of it, and check it into a repo beside a deployment.
+The core owns the cache and the policy (`core/format/tunecache.h`). `rad-tune` benchmarks each
+legal candidate at the declared graph's actual shapes on this machine and writes one file per
+machine, `$RADIANCE_HOME/tune/<machine>.tune`, which the selector reads at declare. The key is
+(kernel, plugin, geometry), so kernels serving one op tune independently, with ranges collapsed to
+the band's upper bound (a bucket table row is what was measured). The winning point is stored as
+sorted `key=value` pairs (`mb=3,npw=4,sk=8`): an axis no longer declared is ignored on lookup, and
+a declared axis the row omits takes its default. The file is UTF-8 text, to be read, diffed, edited
+and versioned beside a deployment. `RADIANCE_TUNE=op:key=value,...` pins axes for debugging; an
+axis or value the kernel does not offer is an error.
 
-One mechanism and one cache format, which is the point — the alternative is every plugin
-inventing its own tuning tool and its own file, and the engine being unable to say why a shape is
-slow. `--debug-graph` names the chosen point and where it came from: the kernel's own defaults, or
-a cache row and when it was measured. The age of a measurement — taken before a driver or a
-library changed underneath it — answers a large share of the questions a slow shape produces.
+`--debug-graph` names each chosen point and its source: the kernel's defaults, or a cache row and
+when it was measured, since a measurement may predate a driver or library change.
 
 ---
 
 ## 16. Observability
 
-Normal operation is a few lines. Everything below is off by default.
+Normal operation prints a few lines. Everything below is off by default.
 
-- **`--debug-graph`** — the entire declared graph: every op, its bucket table, the kernel that
-  resolved each band and the tuned point it will run at, the constraints that matched, the weights
-  it touches, the buffer it writes. This is the answer to "it is unclear what even runs". It also
-  carries the fusion advisory: these N declared ops are a chain some kernel says it can do in one
-  launch (§2.1), and here is why it did not fire.
-- **The selection table** (`--debug-selection`) — every distinct question the selector was asked,
-  in the order first asked, with what it resolved to and, for a miss, the constraint that refused
-  it. Repeats are folded and counted, because a 64-layer model asks the same question 64 times and
-  "asked 64 times" is how much of the model resolved to that kernel. It is core-owned, like the
-  selector itself, and it is the record of why a fallback is running.
-- **The placement plan** — every weight's tier and site, the pool totals, and what did not fit.
-- **Per-op device timing**, opt-in, with a caveat that has to travel with the numbers: enabling
-  profiling restores synchronisations that change the mover's slot supply, so a profiled run is
-  not comparable against an unprofiled one.
-- **The live view** — per-card utilisation and VRAM, throughput, draft acceptance, the expert
-  plane coloured by tier, residency per tier in units and bytes, and the interconnect split
-  between the tensor-parallel all-reduce and the expert mover's promotions and demotions. Piped
-  or redirected it prints ordinary lines instead.
+- `--debug-graph`: every op, its bucket table, the kernel and tuned point for each band, the
+  constraints that matched, the weights it touches and the buffers it writes; and the fusion
+  advisory: declared ops some kernel could run in one launch (§2.1), and why it did not fire.
+- `--debug-selection`: every distinct question the selector was asked, in first-asked order,
+  with its answer and, for a miss, the refusing constraint. Repeats are folded and counted, so the
+  count shows how much of the model resolved to a kernel. This is the record of why a fallback is
+  running.
+- `--debug-placement`: every weight's tier and site, the pool totals, and what did not fit.
+- `--profile-ops`: per-op device timing. Profiling adds synchronisations that change the mover's
+  slot supply and turns off recorded passes (§3.2), so a profiled run is not comparable with an
+  unprofiled one.
+- `--live`: per-card utilisation and VRAM, throughput, draft acceptance, the expert plane
+  coloured by tier, residency per tier in units and bytes, and the interconnect split between the
+  tensor-parallel all-reduce and the expert mover's traffic. Redirected, it prints one greppable
+  `key=value` line instead.
 
 ---
 
 ## 17. Correctness and failure
 
-**`libref` is a kernel plugin that implements the conventional op vocabulary in plain C++** —
-correct, slow, generic over shape. It sits last in the hierarchy and does two jobs.
+`libref` is a kernel plugin that implements the conventional op vocabulary in plain C++:
+correct, slow, generic over shape. It declares itself a reference implementation
+(`rad_plugin_reference`), which places it below every other library, and it has two jobs.
 
-As an **oracle**, it is what `rad-kbench` runs the resolved kernels against, per op, on the real
-container, and what the in-engine oracle below runs beside every device issue.
+As an **oracle**, it is what `rad-kbench` checks the other libraries' kernels against, per op, on
+a real container or a recorded fixture, and what the in-engine oracle below runs beside a device
+issue. The other libraries are held to per-op tolerances, and ids exactly. libref is
+deterministic and machine-independent, so its replay of its own recording is held to tolerance
+zero: a difference is a change in libref or in the input draw, which a looser check would let
+into the next recording as the target. A recording needs no card: it reads only a container's
+tables and records libref's answer at every point, whichever library resolved it.
 
-As a **fallback**, it is opt-in and the engine refuses by default. An op that resolves to libref
-means the model runs orders of magnitude below the machine with nothing in the output to say so,
-so startup stops with `RAD_E_NOKERNEL`, naming every op that fell through;
-`--debug-accept-reference-kernels` accepts the cost deliberately and warns on every start. That is
-a deliberate reversal of the obvious policy: the point of a fallback is that it is *reachable*,
-not that it is automatic, and a silent slow path is the failure this section exists to prevent.
+As a **fallback**, it is opt-in. An op that resolves only to libref runs orders of magnitude below
+the machine with nothing in the output to say so, so by default startup stops with
+`RAD_E_NOKERNEL`, naming every such op; `--debug-accept-reference-kernels` accepts the cost and
+warns on every start. Because the fallback is also the oracle, it is tested.
 
-One artifact, both jobs, and the second is why the first is safe: a fallback you cannot test
-against is just an untested slow path.
+**Coverage is not total.** Some libr4d ops have no libref row (docs/KERNELS.md lists them), mostly
+fusions, which `replaces` (§2.1) checks against the conventional chain libref does implement.
+libref also has limits: `kv_store` and `attn_paged` carry a `block_size >= 1` constraint, and the
+entry points refuse with `RAD_E_UNSUPPORTED` what they cannot represent (a head dim above 2048, more
+than 8 ranks in a collective, a convolution history wider than 16) rather than compute something
+else.
 
-**Its coverage is honest rather than total, which is worth stating where a reader would assume
-otherwise.** Of the 79 ops libr4d serves, 19 have no libref row (docs/KERNELS.md has the current
-counts), and almost all of those are
-fusions — which is not a hole so much as the shape of the thing: a fused kernel's claim is that it
-equals a chain of conventional ops, and the chain is what ref implements, so `replaces` (§2.1) is
-what checks it. Nor is ref constraint-free. `kv_store` and `attn_paged` carry a `block_size >= 1`
-constraint, and the entry points refuse with `RAD_E_UNSUPPORTED` what they cannot represent: a
-head dim above 1024, more than 8 ranks in a collective, a convolution history wider than 16. A
-reference that quietly computed something else at those sizes would be worse than one that stops.
+Op names are free strings (§2.3), so the fallback and the oracle exist only for the conventional
+vocabulary: an architecture plugin that invents an op has neither for it.
 
-**The fallback guarantee has a boundary and it is worth naming.** Op names are free strings
-(§2.3), so `libref` cannot implement an op it has never heard of. Therefore **ref's op list
-is the conventional vocabulary**: an architecture plugin that stays inside it always has an
-implementation available — behind the opt-in above — and one that invents an op has nothing to
-fall back to and no oracle either. Free strings stay free; the guarantee is scoped, not silently
-absent.
+**In-engine oracle** (`core/runtime/oracle.cpp`). A second oracle runs inside the engine, on the
+engine's own shapes. `rad-kbench` tests ops with operands it invents (dense, rank-2, freshly
+filled); the engine's are row slices of a `max_tok` buffer, column slices of a fused projection,
+rank-3 views and weights read from a file. An op can be correct at every shape `rad-kbench` knows
+and wrong at the one the model issues.
 
-**A second oracle runs inside the engine, on the engine's own shapes, and it is the stronger of
-the two.** `rad-kbench` falsifies one op at a time against operands *it* invented: dense, rank-2,
-freshly filled. The engine's operands are row slices of a `max_tok` buffer, column slices of a
-fused projection, rank-3 views a scan kernel required, and weights that came off a file. That gap
-is structural rather than a gap in coverage — an op can be correct at every shape `rad-kbench`
-knows and wrong at the one shape the model issues, and then the build passes nearly everything
-while the engine answers the same token to every prompt.
+`RADIANCE_OP_ORACLE` names ops. For each matching issue the runtime copies every operand to the
+host before the launch, lets the device kernel run, copies the results back, and runs the reference
+library's (libref's) host row for the same (op, band) on the untouched copy, with the same shapes,
+strides and parameters. That is the band's host row when libref won it; when another host library
+did (libavx), the runtime resolves libref's row at the band's geometry instead. Each issue
+costs two device-to-host copies of every operand and a host synchronisation, so a step takes
+minutes; it is a debugging instrument, off unless asked.
 
-So `RADIANCE_OP_ORACLE` names ops, and for each matching issue the runtime copies every operand to
-the host before the launch, lets the device kernel run, copies the results back, and runs
-**libref's host row for the same (op, band)** on the untouched copy — same shapes, same strides,
-same parameters, only the pointers differ. That host row costs nothing to obtain: it is already
-sitting in the bucket table beside the device plan, resolved by the same selector and never used
-because the planner put the op on the device (§2.1's "declare resolves both domains" is what pays
-for this). What it costs to *run* is everything — two device-to-host copies of every operand, a
-host synchronisation per issue, a step that takes minutes — so it is a debugging instrument and it
-is off unless asked.
+`RADIANCE_OP_REPEAT` asks whether a kernel agrees with itself: it snapshots the operands, runs the
+kernel, restores them, runs it again and byte-compares. This catches what a single run per side
+cannot: an unordered reduction, a workgroup reading what another writes, a workspace assumed
+zeroed. There is no tolerance, since one mantissa bit becomes a different token a few hundred
+greedy steps later.
 
-`RADIANCE_OP_REPEAT` asks a different question with the same machinery: not "does this kernel
-agree with libref" but "does this kernel agree with **itself**". It snapshots the operands, runs
-the kernel, restores them exactly, runs the same kernel again, and byte-compares. That is the one
-fault class every other instrument here is structurally blind to — an unordered reduction, a
-workgroup reading what another is writing, a workspace assumed zeroed — because they all run an op
-once per side and so pass at exactly the rate the kernel happens to be right. Byte-exact, no
-tolerance: the same kernel on the same bytes has no licence to move, and one mantissa bit is a
-different token a few hundred greedy steps later.
+Without per-op oracles, an engine whose output turns fluent but wrong cannot be bisected: every
+component tests clean and the whole does not. Each kernel must be individually falsifiable.
 
-This section is small and it is the most important one in the document. A from-scratch engine
-whose kernels cannot be individually falsified is a project that ends with fluent wrong output and
-no way to bisect it: every component tests clean, the whole emits degenerate text, and the cause
-is never found. Refusing to serve a configuration beats shipping one whose output is fluent and
-wrong — but per-op oracles are how you avoid having to refuse.
+**Refusal.** What the engine cannot do correctly it refuses, naming the cause: an
+unimplemented path returns an error, never success, and a missing or unknown configuration (a
+drafter's `draft.` keys, say) is refused by name, never defaulted. A guess yields output that is
+fluent but wrong, or slower, and no error reports it. For the same reason, given a visible cost or
+silent corruption, the engine takes the cost: at shutdown it leaks memory a running step may still
+write rather than free it.
 
-**Failure model.** A kernel returning negative at issue is a bug in selection, not a runtime
-condition, and it aborts the step and fails the requests in it with the kernel and geometry named
-— it does not silently fall back, because a silent fallback is how you ship a slow path nobody
-knows about. KV pool exhaustion preempts by recompute, and if the smallest running request cannot
-fit it is failed rather than the engine deadlocking. A device fault is not recoverable in-process;
-the engine exits non-zero rather than serving from a wedged queue.
+**Failure model.** A kernel returning negative at issue is a selection bug, not a runtime
+condition: it aborts the step and fails its requests, naming the kernel and geometry, with no
+fallback. KV pool exhaustion preempts by recompute, and a smallest running request that cannot
+fit is failed rather than deadlocking. A device fault is not recoverable in-process; the engine
+reports it and exits non-zero.
 
-**Determinism.** Dynamic placement sets which experts are resident, and residency sets the
-summation order, so identical inputs do not give identical outputs. `--deterministic` pins
-**placement**: the plan is static, the heat engine does not run, and nothing moves underneath a
-comparison. It is the mode anything being compared across builds has to run in.
+**Determinism.** Residency decides the summation order, so with dynamic placement identical inputs
+need not give identical outputs. `--deterministic` pins placement: the plan is static, the heat
+engine does not run, and the cache does not lend. Run anything compared across builds in this mode.
 
-**It does not buy bit-exactness, and the remainder is named rather than quietly dropped.** The
-fp8 GEMM's split-K finisher sums its planes in index order, so a run repeats exactly — but the
-split *count* is chosen from `M`, so the same row computed at `M = 1` and at `M = 8` is not
-bit-identical. That is why a speculative decode diverges from a non-speculative one on a near-tie,
-and why the same request at a different batch position can take a different reduction order.
-Nothing pins it; §19.7 is where that sits.
+It does not give bit-exactness. The fp8 GEMM's split-K finisher sums in index order, so a run
+repeats, but the split count is chosen from `M`, so a row computed at `M = 1` and at `M = 8` can
+differ in the last bits. A speculative decode can therefore diverge from a non-speculative one on a
+near-tie, and a request at a different batch position can take a different reduction order. Nothing
+pins it (§19.7).
 
 ---
 
@@ -1716,103 +1586,77 @@ radiance/
   libavx/          the same vocabulary in x86 SIMD, dispatched by CPU feature: the production host
                    kernels, built on every x86-64 build
   libquant/        the built-in quantisers (§4.5), host C++, a plugin like any other
-  tools/           rad-convert, rad-kbench, rad-tune, rad-info, rad-schemas, rad-tokcheck
+  tools/           rad-convert, rad-kbench, rad-tune, rad-info, rad-schemas, rad-tokcheck,
+                   rad-chatparse, rad-gbnf-check
   tests/           the suite; runs in full on the host backend
   scripts/         shell harnesses for serving, tracing and profiling a running engine
   data/            the conversion recipes, and recorded kernel references rad-kbench replays with
                    no model present
   docs/            the user guide, the tools reference, the op vocabulary, the plugin contract,
                    the kernel report
+  deploy/          compose files and the Grafana dashboard
+  docker/          the container image's build files
   cmake/           the find_package config and rad_add_plugin, shared with out-of-tree plugins
   vendor/          llama.cpp lifts, tracked to an upstream commit, patched not edited
 ```
 
-CMake, C++20, hipcc for anything device-side — and `RAD_WITH_HIP` (`ON | OFF | AUTO`) decides
-whether there is any device side at all. It is a cache string rather than an `option()` for a
-reason worth knowing: `option()` is boolean-only, so a default of `AUTO` collapses to `OFF` and
-the detection never runs, which is how a build on a machine with two cards silently produces the
-host backend. `RAD_GPU_TARGETS` is the set of offload architectures device kernels are compiled
-for; left unset it is detected from the cards present, and with a toolchain but no card the device
-build is declined by name rather than guessed at, because emitting kernels for hardware nobody
-named is worse than saying so.
-The top-level build holds no opinion about which architectures are acceptable: a kernel library
-declares the ones it serves and removes itself from a build targeting anything else. So a card no
-library covers is a configure that succeeds and an engine that refuses to serve (§17), not a
-project that will not build. The core's own device code — the copies and fills of the device layer,
-the step's bookkeeping, the weight-table patches — is built for every AMD GPU family's generic target
-besides, so the engine starts on a card its build machine never saw, and serves it with whatever
-kernel library is installed for it. A library whose code objects hold nothing for the card is left
-out of that card's selection at load rather than failing at its first launch.
+CMake, C++20, hipcc for device code. `RAD_WITH_HIP` (`ON | OFF | AUTO`, default `AUTO`) decides
+whether there is any device code; it is a cache string because a boolean `option()` would collapse
+`AUTO` to `OFF`. `RAD_GPU_TARGETS` lists the offload architectures device kernels are compiled for.
+Unset, it is detected from the cards present; with a toolchain but no card, the device build is
+declined by name.
 
-`$RADIANCE_HOME` defaults to `share/radiance` under the install prefix, and is a search path of homes
-separated by `:`, the first winning; `architectures/`, `kernels/` and `quantizers/` under each are
-scanned at startup as one set. Kernel hierarchy is configured, not discovered — an ordered list
-(`--kernels`, or `RADIANCE_KERNELS`). A library named there takes that position, and one present but
-unnamed is not loaded: the list chooses the libraries as well as ordering them, because selection
-runs per domain and an order alone could not keep a library out of a domain the named ones leave
-empty. With no list every library found loads, and a library that declares itself a reference
-implementation (`rad_plugin_reference`) sits below every other, because it matches every op and
-would otherwise shadow whatever ranked behind it. So adding a kernel library is dropping an `.so`
-in a home, and substituting one for another is naming it ahead of the other.
+The top-level build has no opinion about architectures: a kernel library declares the ones it
+serves and leaves itself out of a build targeting anything else, so a card no library covers is a
+configure that succeeds and an engine that refuses to serve (§17). The core's own device code (the
+device layer's copies and fills, the step's bookkeeping, the weight-table patches) is also built for
+every AMD GPU family's generic target, so the engine starts on a card its build machine never saw
+and serves it with whatever kernel library is installed for it. A library whose code objects hold
+nothing for the card is left out of that card's selection at load.
 
-The plugins that ship are plugins like any other. Each directory builds inside the tree or on its
-own against an installed radiance through `find_package(radiance)` and the same `rad_add_plugin`, and
-nothing in the core names one: `ctest -L oot` installs the build, rebuilds every shipped plugin out
-of tree against it, and requires the same plugins, schemas and registration back.
+`$RADIANCE_HOME` (or `--radiance-home`) defaults to `share/radiance` under the install prefix and
+is a `:`-separated search path, the first home winning; `architectures/`, `kernels/` and
+`quantizers/` under each are scanned as one set. The kernel hierarchy is configured: `--kernels` (or
+`RADIANCE_KERNELS`) is an ordered list, and a library present but unnamed is not loaded, since
+selection runs per domain and an order alone could not keep a library out of a domain the named
+ones leave empty. With no list every library found loads, and a reference library
+(`rad_plugin_reference`) sits below every other, because it matches every op and would shadow the
+libraries behind it. Adding a kernel library is dropping an `.so` into a home; substituting one is
+naming it first.
+
+The shipped plugins are plugins like any other: each builds inside the tree or against an installed
+radiance through `find_package(radiance)` and `rad_add_plugin`, and nothing in the core names one.
+`ctest -L oot` installs the build, rebuilds every shipped plugin out of tree against it, and
+requires the same plugins, schemas and registration back.
 
 ---
 
 ## 19. Open questions
 
-**The numbering here is stable and answered questions keep their number.** Several of these are
-cited from the tree by number, and a citation that silently comes to point at a different question
-is worse than a list with answers in it.
+The numbers are stable because source comments cite them. A closed question keeps its number and
+points to its answer.
 
-1. **Linear checkpoint retention beyond the tip. ANSWERED IN CODE, NOT IN MEASUREMENT.** Geometric
-   backoff ships and is the default (§7.3), with `tip-only` and `keep-all` beside it — as policy
-   objects rather than an if-statement, which is the shape the answer has to keep until there is a
-   workload that says what the right curve is.
-2. **`RadWeightDecl.access` for `lm_head` and embeddings. ANSWERED:** they have their own class,
-   `RAD_ACCESS_VOCAB` (§5.2).
-3. **Zero-copy site selection.** Still open, and the shipped criterion is not the one this asks
-   for. The planner cuts over on the **declared access class** — `CONDITIONAL` streams over the
-   link out of the pinned pool, `PER_TOKEN` with no host kernel stages into a slab slot — rather
-   than on a measured read-count cutover. "Read once per step" remains the principle; where it
-   sits against staging is a measurement nobody has taken, and it will differ between prefill and
-   decode, which the single plan the planner produces (§5.3) does not distinguish at all.
-4. **Draft model placement. ANSWERED BY CONSTRUCTION:** there is no `vram`/`ram` choice to make.
-   The drafter is part of the model's source — merged into the container at convert time, or
-   shipped inside the checkpoint as an MTP head (§10) — and the planner places its weights like any
-   other weight, against the same budgets.
-5. **Prefix-cache and weight tier contention on one SSD.** Still open, and explicitly so. Both
-   want `O_DIRECT` bandwidth and under load they fight. `TokenBucket` bounds the fight with one
-   shared byte budget and per-consumer counters, and it is labelled a placeholder and off by
-   default — an unmeasured rate limit throttling a machine nobody profiled is worse than none. The
-   actual question is who should *win*: a weight-tier read blocks a layer that is about to
-   execute, a prefix-cache read only makes a prefill shorter, so a priority scheme is probably the
-   right shape of answer and a flat rate limit certainly is not.
-6. **Whether `RadTensor` needs a dtype the core understands. ANSWERED: it does** — `RAD_F32`
-   through `RAD_I64`, parsed by `rad_dtype_parse`, with `rad_load_f32` / `rad_store_f32` switching
-   on it. `libref` has to interpret a tensor to compute on it, `rad-kbench` has to compare two of
-   them elementwise, the buffer planner has to size a buffer from its shape, and `rad-convert` has
-   to write bytes; an opaque dtype pushes all four back into the plugin, which is the opposite of
-   the point. The enum stays open at the top — values at or above `RAD_DT_PLUGIN_BASE` are
-   plugin-private, sized by the plugin's own layout hook and never interpreted — but only for what
-   a kernel STORES. A container holds core dtypes and nothing else (§4.1), so a format invented for
-   one kernel is an encoding plus a relayout, and the file stays readable without that kernel.
-7. **Bit-exact reproducibility is not achieved.** `--deterministic` pins placement; it does not
-   pin the fp8 GEMM's split-K count, which is chosen from `M`, so the same request at a different
-   batch position can take a different reduction order (§17). Whether that should become a pinned
-   kernel axis — §15's mechanism already has the shape for one — or an accepted property of a
-   batched engine, is open. Pinning it is not free: the count varies with `M` because that is
-   where the speed is, and fixing it costs the narrow shapes their tuning.
-
-8. **`RadTransformFn` cannot see a source tensor's companion planes. ANSWERED by §4:** the hook
-   is gone, and `relayout` is handed every plane the declared weight takes. What follows is the
-   question as it stood. It is handed one `src`, so
-   a kernel whose stored layout has to be derived from a quantised weight AND its scale grid --
-   the two arrive as separate checkpoint tensors -- cannot compute it: the transform holds the
-   codes and not the scales. Every layout in the tree today is derivable from one plane, so
-   nothing is blocked, but the signature is the reason a future one could not be. The shape of the
-   answer is a `const RadTensor* const* src_aux` beside `src`, which is an ABI break and therefore
-   wants to ride with the next one rather than on its own.
+1. **Linear checkpoint retention beyond the tip.** Geometric backoff is the default (§7.3), with
+   `tip-only` and `keep-all` beside it as policy classes. No workload measurement has yet shown
+   which retention curve is right.
+2. Closed: `lm_head` and the embeddings have their own access class, `RAD_ACCESS_VOCAB` (§5.2).
+3. **Zero-copy site selection.** The planner chooses the site by declared access class:
+   `CONDITIONAL` streams over the link from the pinned pool, `PER_TOKEN` with no host kernel is
+   staged into a slab slot. The principle is "zero-copy for what is read once per step", but the
+   cutover against staging has not been measured, and it will differ between prefill and decode,
+   which the single plan (§5.3) does not distinguish.
+4. Closed: a drafter is part of the model's source and the planner places its weights like any
+   other (§10).
+5. Closed: the prefix cache writes nothing to a drive (§7.3), so it does not compete with the file
+   tier for `O_DIRECT` bandwidth.
+6. Closed: `RadTensor` carries a dtype the core understands (`abi/rad_types.h`): libref computes on
+   tensors, `rad-kbench` compares them elementwise, the buffer planner sizes buffers from shapes and
+   `rad-convert` writes bytes. Values at or above `RAD_DT_PLUGIN_BASE` are plugin-private, sized by
+   the plugin's layout hook and never interpreted, and only for what a kernel stores; a container
+   holds core dtypes only (§4.1).
+7. **Bit-exact reproducibility.** `--deterministic` pins placement but not the fp8 GEMM's split-K
+   count, which is chosen from `M` (§17). Whether that should become a pinned kernel axis (§15's
+   mechanism could express one) or remain an accepted property of a batched engine is open.
+   Pinning it costs the narrow shapes their tuning, since the count varies with `M` for speed.
+8. Closed: `relayout` receives every plane the declared weight takes (§4.3), so a stored layout can
+   be derived from a quantised weight and its scale grid together.

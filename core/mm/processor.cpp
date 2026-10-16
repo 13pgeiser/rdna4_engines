@@ -150,9 +150,8 @@ int VisionConfig::from_meta(const RadModelMeta& m, std::string* why) {
                         "vision_start_token_id, vision_end_token_id)";
         return RAD_E_NOTFOUND;
     }
-    /* THE PROCESSOR-ONLY KEYS DEFAULT TO THE FAMILY'S VALUES. They come from the checkpoint's
-     * preprocessor configs, which a container may not carry; the numbers below are what the
-     * Qwen3.x checkpoints ship. */
+    /* Processor-only keys come from the checkpoint's preprocessor configs, which a container may
+     * not carry; the defaults are what the Qwen3.x checkpoints ship. */
     image_min_pixels = rad_meta_geti(&m, "preprocessor.size.shortest_edge",
                                      rad_meta_geti(&m, "preprocessor.min_pixels", 65536));
     image_max_pixels = rad_meta_geti(&m, "preprocessor.size.longest_edge",
@@ -170,11 +169,6 @@ int VisionConfig::from_meta(const RadModelMeta& m, std::string* why) {
         if (why) *why = "the container's preprocessor configuration is inconsistent: " + bad;
         return RAD_E_INVAL;
     }
-    for (int c = 0; c < 3; ++c)
-        if (!(stdv[c] > 0.0f)) {
-            if (why) *why = "preprocessor.image_std must be positive";
-            return RAD_E_INVAL;
-        }
     return RAD_OK;
 }
 
@@ -193,6 +187,8 @@ int VisionConfig::check(std::string* why) const {
                   std::to_string(video_min_pixels));
     if (!(fps > 0.0)) return no("fps must be positive");
     if (min_frames < 1) return no("min_frames must be at least 1");
+    for (int c = 0; c < 3; ++c)
+        if (!(stdv[c] > 0.0f)) return no("image_std must be positive");
     if (max_frames < min_frames)
         return no("max_frames " + std::to_string(max_frames) + " is below min_frames " +
                   std::to_string(min_frames));
@@ -203,8 +199,6 @@ int VisionConfig::check(std::string* why) const {
                       ") is not a range of whole merged patches");
         if (!(max_pixels_tolerance > 0.0) || max_segment_patches <= 0)
             return no("max_pixels_tolerance and max_num_patches must be positive");
-        for (int c = 0; c < 3; ++c)
-            if (!(stdv[c] > 0.0f)) return no("image_std must be positive");
     }
     if (family == Family::Gemma4) {
         if (!soft_budget_ok(image_soft_tokens))
@@ -219,9 +213,26 @@ int VisionConfig::check(std::string* why) const {
 
 /* ================================================================== sizes and sampling */
 
-/* Python's round(), which is round-half-to-even on the double -- the reference computes these in
- * Python, and a size that lands on .5 rounds the way it does there. */
+/* Python's round(): half-to-even on the double, so a size landing on .5 rounds as the Python
+ * reference does. */
 static inline int64_t pyround(double x) { return (int64_t)std::nearbyint(x); }
+
+/* The step the references share after rounding each side to `factor`: a size past `max_px`
+ * shrinks by the area ratio and rounds down, one under `min_px` grows and rounds up. `t` frames
+ * (rounded to `tb`) count toward the area; a picture passes 1 and 1. */
+static void fit_pixels(int64_t t, int64_t tb, int64_t h, int64_t w, int32_t factor,
+                       int64_t min_px, int64_t max_px, int64_t* hb, int64_t* wb) {
+    const double f = factor;
+    if (tb * *hb * *wb > max_px) {
+        const double beta = std::sqrt((double)(t * h * w) / (double)max_px);
+        *hb = std::max<int64_t>(factor, (int64_t)std::floor((double)h / beta / f) * factor);
+        *wb = std::max<int64_t>(factor, (int64_t)std::floor((double)w / beta / f) * factor);
+    } else if (tb * *hb * *wb < min_px) {
+        const double beta = std::sqrt((double)min_px / (double)(t * h * w));
+        *hb = (int64_t)std::ceil((double)h * beta / f) * factor;
+        *wb = (int64_t)std::ceil((double)w * beta / f) * factor;
+    }
+}
 
 int smart_resize_image(int64_t h, int64_t w, int32_t factor, int64_t min_px, int64_t max_px,
                        int64_t* oh, int64_t* ow, std::string* why) {
@@ -233,15 +244,7 @@ int smart_resize_image(int64_t h, int64_t w, int32_t factor, int64_t min_px, int
     const double f = factor;
     int64_t hb = pyround((double)h / f) * factor;
     int64_t wb = pyround((double)w / f) * factor;
-    if (hb * wb > max_px) {
-        const double beta = std::sqrt((double)(h * w) / (double)max_px);
-        hb = std::max<int64_t>(factor, (int64_t)std::floor((double)h / beta / f) * factor);
-        wb = std::max<int64_t>(factor, (int64_t)std::floor((double)w / beta / f) * factor);
-    } else if (hb * wb < min_px) {
-        const double beta = std::sqrt((double)min_px / (double)(h * w));
-        hb = (int64_t)std::ceil((double)h * beta / f) * factor;
-        wb = (int64_t)std::ceil((double)w * beta / f) * factor;
-    }
+    fit_pixels(1, 1, h, w, factor, min_px, max_px, &hb, &wb);
     *oh = hb;
     *ow = wb;
     return RAD_OK;
@@ -264,23 +267,15 @@ int smart_resize_video(int64_t t, int64_t h, int64_t w, int32_t tfactor, int32_t
     int64_t hb = pyround((double)h / f) * factor;
     int64_t wb = pyround((double)w / f) * factor;
     const int64_t tb = pyround((double)t / (double)tfactor) * tfactor;
-    if (tb * hb * wb > max_px) {
-        const double beta = std::sqrt((double)(t * h * w) / (double)max_px);
-        hb = std::max<int64_t>(factor, (int64_t)std::floor((double)h / beta / f) * factor);
-        wb = std::max<int64_t>(factor, (int64_t)std::floor((double)w / beta / f) * factor);
-    } else if (tb * hb * wb < min_px) {
-        const double beta = std::sqrt((double)min_px / (double)(t * h * w));
-        hb = (int64_t)std::ceil((double)h * beta / f) * factor;
-        wb = (int64_t)std::ceil((double)w * beta / f) * factor;
-    }
+    fit_pixels(t, tb, h, w, factor, min_px, max_px, &hb, &wb);
     *oh = hb;
     *ow = wb;
     return RAD_OK;
 }
 
-/* THE REFERENCE'S FRAME CHOICE: as many frames as `fps` gives over the clip's duration, clamped to
- * [min_frames, max_frames] and to what the stream has, spread evenly over it -- numpy's linspace,
- * rounded half-to-even. A stream that states no rate is taken at 24, as the reference does. */
+/* The reference's frame choice: as many frames as `fps` gives over the clip's duration, clamped to
+ * [min_frames, max_frames] and to the stream's length, spread evenly (numpy's linspace, rounded
+ * half-to-even). A stream with no stated rate is taken at 24 fps, as the reference does. */
 std::vector<int64_t> sample_frames(const VideoInfo& info, double fps, int32_t min_frames,
                                    int32_t max_frames) {
     const int64_t total = info.n_frames;
@@ -358,11 +353,11 @@ std::vector<int64_t> sample_frames_gemma4(const VideoInfo& info, double fps, int
 
 /* ================================================================== the resample
  *
- * Pillow's ImagingResample for an 8-bit RGB image, transcribed: the coefficient table in double,
- * normalised per output pixel and rounded to 22-bit fixed point; a horizontal pass over only the
- * source rows the vertical pass will read, into an 8-bit intermediate; then the vertical pass. The
- * rounding at the intermediate is part of the function -- a single-pass float resample is a
- * different (and slightly better) function, and not the one the model was trained against. */
+ * Pillow's ImagingResample for 8-bit RGB: coefficients in double, normalised per output pixel and
+ * rounded to 22-bit fixed point; a horizontal pass over only the source rows the vertical pass
+ * reads, into an 8-bit intermediate; then the vertical pass. The intermediate rounding is part of
+ * the function: a single-pass float resample is a different function from the one the model was
+ * trained against. */
 namespace {
 
 constexpr int kPrec = 32 - 8 - 2;
@@ -380,9 +375,9 @@ inline uint8_t clip8(int32_t v, int prec) {
     return (uint8_t)(s < 0 ? 0 : (s > 255 ? 255 : s));
 }
 
-/* One axis: `bounds` gets (first, count) per output pixel and `kk` its fixed-point weights, `ksize`
- * a row, `*prec` their fraction bits: PIL's fixed 22, or -- `torch` -- ATen's per-axis choice, the
- * most bits at which the largest weight still fits an int16. */
+/* One axis: `bounds` gets (first, count) per output pixel and `kk` its fixed-point weights,
+ * `ksize` per row; `*prec` gets their fraction bits. PIL uses a fixed 22; with `torch`, ATen's
+ * per-axis choice: the most bits at which the largest weight still fits an int16. */
 int coeffs(int32_t in_size, int32_t out_size, std::vector<int32_t>* bounds,
            std::vector<int32_t>* kk, bool torch, int* prec) {
     const double scale = (double)in_size / (double)out_size;
@@ -521,15 +516,14 @@ inline uint64_t mix64(uint64_t x) {
 }
 
 /* Two independent 64-bit lanes over the patch bytes and the grid. The prefix cache folds the key
- * into a chained 128-bit block identity; a collision would serve one picture's cache for another,
- * so both lanes are carried. */
+ * into a chained 128-bit block identity, and a collision would serve one picture's cache for
+ * another, so both lanes are kept. */
 void content_key(const Item& it, uint64_t* hi, uint64_t* lo) {
     uint64_t a = 0x6a09e667f3bcc908ull ^ mix64((uint64_t)it.grid_t << 42 ^
                                                (uint64_t)it.grid_h << 21 ^ (uint64_t)it.grid_w);
     uint64_t b = 0xbb67ae8584caa73bull ^
                  mix64(it.kind == Kind::Image ? 1u : it.kind == Kind::Video ? 2u : 3u);
-    /* The tiling, when the segments have sizes of their own: the same patches cut differently
-     * are different encoder inputs. */
+    /* The tiling: the same patches cut into different segments are different encoder inputs. */
     for (const Item::Segment& sg : it.segments)
         a = mix64(a ^ ((uint64_t)(uint32_t)sg.h << 32 | (uint32_t)sg.w)) + (uint64_t)sg.patch0;
     const uint8_t* p = reinterpret_cast<const uint8_t*>(it.pixels.data());
@@ -547,17 +541,29 @@ void content_key(const Item& it, uint64_t* hi, uint64_t* lo) {
     *lo = mix64(b + (uint64_t)n);
 }
 
-/* THE PATCH ROWS, in merge-block order, from `frames` (temporal * grid_t of them, already resized
- * to grid_h * patch by grid_w * patch). Each row is (channel, frame, y, x), each value normalised
- * as the reference does -- (x - 255 mean) / (255 std) in f32 -- and rounded to bf16. */
+/* After its content key, the item's expansion as one run of `rows` copies of `tok` between the
+ * `start` and `end` markers. */
+static void one_run(Item* it, int32_t start, int64_t rows, int32_t tok, int32_t end) {
+    content_key(*it, &it->key_hi, &it->key_lo);
+    it->expand.reserve((size_t)rows + 2);
+    it->expand.push_back(start);
+    it->seg_at.push_back(1);
+    it->expand.insert(it->expand.end(), (size_t)rows, tok);
+    it->expand.push_back(end);
+}
+
+/* The patch rows, in merge-block order, from `frames` (temporal * grid_t of them, already resized
+ * to grid_h * patch by grid_w * patch). Each row is (channel, frame, y, x); each value is
+ * normalised as the reference does, (x - 255 mean) / (255 std) in f32, and rounded to bf16. */
 void patchify(const VisionConfig& c, const std::vector<const Frame*>& frames, Item* it) {
     const int P = c.patch, T = c.temporal, M = c.merge;
     const int gh = it->grid_h, gw = it->grid_w;
     float m255[3], s255[3];
     for (int ch = 0; ch < 3; ++ch) {
-        /* torch.tensor(mean) * (1 / rescale_factor), in f32: the fused rescale's own constants. */
-        m255[ch] = c.mean[ch] * (float)(1.0 / (1.0 / 255.0));
-        s255[ch] = c.stdv[ch] * (float)(1.0 / (1.0 / 255.0));
+        /* torch.tensor(mean) * (1 / rescale_factor), in f32: the fused rescale's own constants.
+         * 1 / (1 / 255) rounds to 255 in f32. */
+        m255[ch] = c.mean[ch] * 255.0f;
+        s255[ch] = c.stdv[ch] * 255.0f;
     }
     /* One lookup per (channel, byte): the normalisation is a function of the byte alone. */
     uint16_t lut[3][256];
@@ -586,17 +592,22 @@ void patchify(const VisionConfig& c, const std::vector<const Frame*>& frames, It
                     }
 }
 
-/* Gemma 4's patch rows: merge-block order like patchify's (each pooling window's patches are
- * consecutive, which is what lets the pooler be a mean of k^2 consecutive rows; attention and the
- * position terms read each patch's own coordinates, so the order is free), each row (y, x,
- * channel), each value 2 * (u * (1/255)) - 1 in f32 -- the processor's rescale and then the
- * model's own input scaling -- rounded to bf16. One frame a segment. */
-void patchify_gemma4(const VisionConfig& c, const std::vector<const Frame*>& frames, Item* it) {
+/* Gemma 4's patch rows, in merge-block order like patchify's: each pooling window's patches are
+ * consecutive, so the pooler is a mean of k^2 consecutive rows (attention and the position terms
+ * read each patch's own coordinates, so the order is otherwise free). Each row is (y, x, channel);
+ * each value is 2 * (p - 0.5) in f32 (the model's input scaling), rounded to bf16, where p is the
+ * processor's rescale u * (1/255). The processors AutoProcessor loads take that product in f32 for
+ * pictures (Gemma4ImageProcessor) and in double, rounded to f32, for video (Gemma 4's and
+ * EmbeddingGemma 2's video processors); `video` picks which, and the two differ for u = 127. One
+ * frame per segment. */
+void patchify_gemma4(const VisionConfig& c, const std::vector<const Frame*>& frames, bool video,
+                     Item* it) {
     const int P = c.patch, M = c.merge;
     const int gh = it->grid_h, gw = it->grid_w;
     uint16_t lut[256];
     for (int v = 0; v < 256; ++v) {
-        const float p = (float)v * (float)(1.0 / 255.0);
+        const float p = video ? (float)((double)v * (1.0 / 255.0))
+                              : (float)v * (float)(1.0 / 255.0);
         lut[v] = rad_f32_to_bf16(2.0f * (p - 0.5f));
     }
     const int64_t dim = it->patch_dim;
@@ -637,8 +648,8 @@ int Processor::init(const VisionConfig& cfg,
         return RAD_E_INVAL;
     cfg_ = cfg;
     if (cfg.family == Family::Lfm2) {
-        /* The markers are named, not numbered, in the config: resolved here, every one, so a
-         * vocabulary missing one is refused at startup rather than on the first large picture. */
+        /* The config names the markers rather than numbering them. Resolve all of them here so a
+         * vocabulary missing one is refused at startup, not on the first large picture. */
         if (!token_id) return RAD_E_INVAL;
         cfg_.tok_start = token_id("<|image_start|>");
         cfg_.tok_end   = token_id("<|image_end|>");
@@ -652,7 +663,7 @@ int Processor::init(const VisionConfig& cfg,
                 if (id < 0) return RAD_E_NOTFOUND;
                 tok_tiles_[(size_t)(r - 1) * cfg.max_tiles + (c - 1)] = id;
             }
-        /* A tile and the largest thumbnail are one segment each: of the tower and of a pass. */
+        /* A tile and the largest thumbnail are each one segment, of the tower and of a pass. */
         const int64_t seg = std::max<int64_t>((int64_t)(cfg.tile / cfg.patch) * (cfg.tile / cfg.patch),
                                               cfg.image_max_pixels / ((int64_t)cfg.patch * cfg.patch));
         if (seg > cfg.max_patches || seg > cfg.max_segment_patches) return RAD_E_INVAL;
@@ -667,8 +678,8 @@ int Processor::init(const VisionConfig& cfg,
         encode_text_ = std::move(encode_text);
         return RAD_OK;
     }
-    /* The largest image the encoder takes in one pass, in pixels: the band's ceiling comes down to
-     * it, so smart_resize itself keeps every image inside a pass. */
+    /* The largest image one encoder pass takes, in pixels. Lowering the band's ceiling to it makes
+     * smart_resize keep every image inside a pass. */
     const int64_t pass_px = cfg.max_patches * cfg.patch * cfg.patch;
     if (cfg_.image_max_pixels > pass_px) cfg_.image_max_pixels = pass_px;
     if (cfg_.image_min_pixels > cfg_.image_max_pixels) cfg_.image_min_pixels = cfg_.image_max_pixels;
@@ -683,15 +694,7 @@ void lfm2_size(int64_t h, int64_t w, int32_t factor, int64_t min_px, int64_t max
     const double f = factor;
     int64_t hb = std::max<int64_t>(factor, pyround((double)h / f) * factor);
     int64_t wb = std::max<int64_t>(factor, pyround((double)w / f) * factor);
-    if (hb * wb > max_px) {
-        const double beta = std::sqrt((double)(h * w) / (double)max_px);
-        hb = std::max<int64_t>(factor, (int64_t)std::floor((double)h / beta / f) * factor);
-        wb = std::max<int64_t>(factor, (int64_t)std::floor((double)w / beta / f) * factor);
-    } else if (hb * wb < min_px) {
-        const double beta = std::sqrt((double)min_px / (double)(h * w));
-        hb = (int64_t)std::ceil((double)h * beta / f) * factor;
-        wb = (int64_t)std::ceil((double)w * beta / f) * factor;
-    }
+    fit_pixels(1, 1, h, w, factor, min_px, max_px, &hb, &wb);
     *oh = hb;
     *ow = wb;
 }
@@ -703,9 +706,9 @@ bool lfm2_too_large(int64_t h, int64_t w, int32_t patch, int32_t factor, int64_t
     return (double)(hb * wb) > (double)max_px * tolerance;
 }
 
-/* The reference walks the ratios sorted by tile count; within one count it orders them as a
- * Python set happens to, which this walks by columns. The two can differ only on an exact tie
- * between two grids of one count, both nearest. */
+/* The reference walks the ratios sorted by tile count, and within one count in Python set order;
+ * this walks by columns. The two differ only on an exact tie between two nearest grids of one
+ * count. */
 void lfm2_grid(int64_t h, int64_t w, int32_t min_tiles, int32_t max_tiles, int32_t tile,
                int32_t* cols, int32_t* rows) {
     const double aspect = (double)w / (double)h;
@@ -725,9 +728,9 @@ void lfm2_grid(int64_t h, int64_t w, int32_t min_tiles, int32_t max_tiles, int32
 }
 
 /* LFM2-VL's image processor (transformers' Lfm2VlImageProcessor), segment by segment: the tiles
- * in row-major order, then the thumbnail; within one, patches in merge-block order (each
- * merge x merge block's patches consecutive, dy then dx -- which is how the projector's pixel
- * unshuffle reads them, so its merge is a view), each patch (y, x, channel). */
+ * in row-major order, then the thumbnail. Within a segment, patches are in merge-block order (each
+ * merge x merge block consecutive, dy then dx, as the projector's pixel unshuffle reads them, so
+ * its merge is a view); each patch is (y, x, channel). */
 int Processor::image_lfm2(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const {
     const VisionConfig& c = cfg_;
     const int32_t F = c.factor(), P = c.patch, M = c.merge;
@@ -823,13 +826,7 @@ int Processor::image_from(const Frame& f, std::shared_ptr<Item>* out, std::strin
     /* An image fills the temporal depth by repetition. */
     std::vector<const Frame*> frames((size_t)c.temporal, &r);
     patchify(c, frames, it.get());
-    content_key(*it, &it->key_hi, &it->key_lo);
-
-    it->expand.reserve((size_t)it->seg_rows + 2);
-    it->expand.push_back(c.tok_start);
-    it->seg_at.push_back(1);
-    it->expand.insert(it->expand.end(), (size_t)it->seg_rows, c.tok_image);
-    it->expand.push_back(c.tok_end);
+    one_run(it.get(), c.tok_start, it->seg_rows, c.tok_image, c.tok_end);
     *out = std::move(it);
     return RAD_OK;
 }
@@ -856,13 +853,8 @@ int Processor::image_gemma4(const Frame& f, int32_t soft, std::shared_ptr<Item>*
         if (why) *why = "the image's soft-token budget is more patches than one encoder pass holds";
         return RAD_E_INVAL;
     }
-    patchify_gemma4(c, { src }, it.get());
-    content_key(*it, &it->key_hi, &it->key_lo);
-    it->expand.reserve((size_t)it->seg_rows + 2);
-    it->expand.push_back(c.tok_start);
-    it->seg_at.push_back(1);
-    it->expand.insert(it->expand.end(), (size_t)it->seg_rows, c.tok_image);
-    it->expand.push_back(c.tok_end);
+    patchify_gemma4(c, { src }, /*video=*/false, it.get());
+    one_run(it.get(), c.tok_start, it->seg_rows, c.tok_image, c.tok_end);
     *out = std::move(it);
     return RAD_OK;
 }
@@ -891,9 +883,9 @@ int Processor::video_gemma4(const Video& v, std::shared_ptr<Item>* out, std::str
         resize_bicubic(v.frames[i], (int32_t)w, (int32_t)h, &resized[i]);
         rf.push_back(&resized[i]);
     }
-    patchify_gemma4(c, rf, it.get());
+    patchify_gemma4(c, rf, /*video=*/true, it.get());
     content_key(*it, &it->key_hi, &it->key_lo);
-    /* One <boi> placeholders <eoi> run a frame, back to back: the reference's visual-only form
+    /* One <boi> placeholders <eoi> run per frame, back to back: the reference's visual-only form
      * (add_timestamps off). */
     for (int32_t g = 0; g < it->grid_t; ++g) {
         it->expand.push_back(c.tok_start);
@@ -909,8 +901,8 @@ int Processor::video_from(const Video& v, std::shared_ptr<Item>* out, std::strin
     const VisionConfig& c = cfg_;
     if (c.family == Family::Gemma4) return video_gemma4(v, out, why);
     if (v.frames.empty()) { if (why) *why = "the video decoded to no frames"; return RAD_E_INVAL; }
-    /* The frames and their indices, padded to whole temporal groups by repeating the last. A clip
-     * shorter than one group is padded the same way, so a single-frame video is one group. */
+    /* Pad the frames and their indices to whole temporal groups by repeating the last; a clip
+     * shorter than one group becomes one group. */
     std::vector<const Frame*> frames;
     std::vector<int64_t> idx = v.index;
     for (const Frame& f : v.frames) frames.push_back(&f);
@@ -921,8 +913,8 @@ int Processor::video_from(const Video& v, std::shared_ptr<Item>* out, std::strin
     const int64_t nf = (int64_t)v.frames.size() < c.temporal ? c.temporal
                                                               : (int64_t)v.frames.size();
 
-    /* THE PER-FRAME CAP: at most `max_frame_rows` output rows' worth of pixels a frame, and the
-     * video budget's even share, but never under the band's floor. */
+    /* Per-frame cap: at most `max_frame_rows` output rows' worth of pixels per frame and at most
+     * the video budget's even share, but never under the band's floor. */
     int64_t max_px = c.video_max_pixels;
     if (c.max_frame_rows > 0) {
         const int64_t f2 = (int64_t)c.factor() * c.factor();
@@ -960,12 +952,11 @@ int Processor::video_from(const Video& v, std::shared_ptr<Item>* out, std::strin
     patchify(c, rframes, it.get());
     content_key(*it, &it->key_hi, &it->key_lo);
 
-    /* THE TIMESTAMPED EXPANSION: per temporal group, "<T seconds>" then a run of pads between
-     * vision_start and vision_end, T being the mean of the group's first and last frame times.
-     * It stands for the template's whole <|vision_start|><|video_pad|><|vision_end|>, as the
-     * model's own processor wrote it (transformers 4.57, qwen-vl-utils). transformers 5.x swaps
-     * only the pad and leaves that outer pair around the frames -- two tokens the model was not
-     * trained with. */
+    /* Timestamped expansion: per temporal group, "<T seconds>" then pads between vision_start and
+     * vision_end, T being the mean of the group's first and last frame times. It replaces the
+     * template's whole <|vision_start|><|video_pad|><|vision_end|>, as the model's own processor
+     * does (transformers 4.57, qwen-vl-utils). transformers 5.x replaces only the pad and leaves
+     * an outer start/end pair the model was not trained with. */
     const double vfps = v.info.fps > 0.0 ? v.info.fps : 24.0;
     for (int32_t g = 0; g < it->grid_t; ++g) {
         const double t0 = (double)idx[(size_t)g * c.temporal] / vfps;
@@ -1050,11 +1041,51 @@ static std::vector<double> read_list(const RadModelMeta& m, const char* key) {
     return v;
 }
 
+int64_t AudioConfig::chunk_rows(int64_t frames) {
+    for (int i = 0; i < 3; ++i) frames = frames > 0 ? (frames - 1) / 2 + 1 : 0;
+    return frames;
+}
+
+/* Qwen3ASRFeatureExtractor's framing, from processor_config.json's `feature_extractor` and the
+ * encoder's audio_config. The mel band (0 to 8000 Hz) is the extractor's own constant, not a
+ * key. */
+static int qwen3asr_from_meta(const RadModelMeta& m, AudioConfig* c, std::string* why) {
+    auto gi = [&](const char* k, int64_t d) {
+        char key[128];
+        std::snprintf(key, sizeof key, "processor.feature_extractor.%s", k);
+        return rad_meta_geti(&m, key, d);
+    };
+    c->family       = AudioFamily::Qwen3ASR;
+    c->rate         = (int32_t)gi("sampling_rate", 16000);
+    c->hop          = (int32_t)gi("hop_length", 160);
+    c->fft          = (int32_t)gi("n_fft", 400);
+    c->frame_length = c->fft;
+    c->n_mels       = (int32_t)gi("feature_size", rad_meta_geti(&m, "audio_config.num_mel_bins", 128));
+    c->min_samples  = gi("min_length", 8000);
+    c->chunk        = (int32_t)(2 * gi("n_window", rad_meta_geti(&m, "audio_config.n_window", 50)));
+    c->min_freq     = 0.0;
+    c->max_freq     = 8000.0;
+    c->tok_audio    = (int32_t)rad_meta_geti(&m, "audio_token_id", -1);
+    if (rad_meta_getf(&m, "processor.feature_extractor.dither", 0.0) != 0.0) {
+        if (why) *why = "the feature extractor dithers its input (feature_extractor.dither), which "
+                        "no deterministic front end reproduces";
+        return RAD_E_UNSUPPORTED;
+    }
+    if (c->rate <= 0 || c->hop <= 0 || c->fft < 2 || c->n_mels <= 0 || c->chunk <= 0 ||
+        c->min_samples < 0 || c->tok_audio < 0 || 2.0 * c->max_freq > (double)c->rate) {
+        if (why) *why = "the container's Qwen3-ASR feature configuration is incomplete or "
+                        "inconsistent (rate, hop, n_fft, mel bins, n_window, audio_token_id)";
+        return RAD_E_INVAL;
+    }
+    return RAD_OK;
+}
+
 int AudioConfig::from_meta(const RadModelMeta& m, std::string* why) {
     const char* mt = rad_meta_gets(&m, "audio_config.model_type", "");
+    if (mt && !std::strcmp(mt, "qwen3_asr_encoder")) return qwen3asr_from_meta(m, this, why);
     if (!mt || std::strcmp(mt, "gemma4_audio")) {
         if (why) *why = "the container states no audio tower this processor knows (audio_config."
-                        "model_type gemma4_audio)";
+                        "model_type gemma4_audio or qwen3_asr_encoder)";
         return RAD_E_NOTFOUND;
     }
     rate         = (int32_t)rad_meta_geti(&m, "preprocessor.sampling_rate", 16000);
@@ -1079,8 +1110,8 @@ int AudioConfig::from_meta(const RadModelMeta& m, std::string* why) {
     tok_audio = (int32_t)rad_meta_geti(&m, "audio_token_id", -1);
     tok_start = (int32_t)rad_meta_geti(&m, "boa_token_id", -1);
     tok_end   = (int32_t)rad_meta_geti(&m, "eoa_token_id", rad_meta_geti(&m, "eoa_token_index", -1));
-    /* DITHER IS NOISE: the reference adds Gaussian noise of this deviation to every sample, a
-     * different draw each call, and no fixed input reproduces it. */
+    /* Dither adds Gaussian noise of this deviation to every sample, a new draw each call, so no
+     * deterministic front end can reproduce it. */
     if (rad_meta_getf(&m, "preprocessor.dither", 0.0) != 0.0) {
         if (why) *why = "the feature extractor dithers its input (preprocessor.dither), which no "
                         "deterministic front end reproduces";
@@ -1130,6 +1161,40 @@ void fft_inplace(std::vector<double>& re, std::vector<double>& im,
     }
 }
 
+/* A mixed-radix complex FFT over any length (Whisper's 400 points are 2^4 * 5^2). Decimation in
+ * time over `radix` (the length's prime factors, smallest first): n points at stride s
+ * are p transforms of n / p points at stride s * p, combined by p-point DFTs with twiddles. `tw`
+ * is exp(-2 pi i k / N) for k < N, N the outermost length, read at stride N / n by a level of n
+ * points; `work` is scratch, 2n doubles a level, the levels below reusing what follows. */
+void fft_mixed(const double* in_re, const double* in_im, int64_t stride, int64_t n,
+               double* out_re, double* out_im, const int32_t* radix,
+               const std::vector<double>& tw_re, const std::vector<double>& tw_im, double* work) {
+    if (n == 1) { out_re[0] = in_re[0]; out_im[0] = in_im[0]; return; }
+    const int64_t p = radix[0], m = n / p;
+    for (int64_t q = 0; q < p; ++q)
+        fft_mixed(in_re + q * stride, in_im + q * stride, stride * p, m, out_re + q * m,
+                  out_im + q * m, radix + 1, tw_re, tw_im, work + 2 * n);
+    /* X[k + s m] = sum_q W_n^(q (k + s m)) Y_q[k]: Y_q is periodic in m. */
+    const int64_t step = (int64_t)tw_re.size() / n;
+    double* t_re = work;
+    double* t_im = work + n;
+    for (int64_t k = 0; k < m; ++k)
+        for (int64_t s = 0; s < p; ++s) {
+            const int64_t at = k + s * m;
+            double ar = 0.0, ai = 0.0;
+            for (int64_t q = 0; q < p; ++q) {
+                const int64_t e = (q * at) % n * step;
+                const double yr = out_re[q * m + k], yi = out_im[q * m + k];
+                ar += yr * tw_re[(size_t)e] - yi * tw_im[(size_t)e];
+                ai += yr * tw_im[(size_t)e] + yi * tw_re[(size_t)e];
+            }
+            t_re[at] = ar;
+            t_im[at] = ai;
+        }
+    std::memcpy(out_re, t_re, (size_t)n * sizeof(double));
+    std::memcpy(out_im, t_im, (size_t)n * sizeof(double));
+}
+
 /* numpy.linspace's values: start + i * step, the last exactly `stop`. */
 std::vector<double> linspace(double a, double b, int64_t n) {
     std::vector<double> v((size_t)n);
@@ -1141,52 +1206,102 @@ std::vector<double> linspace(double a, double b, int64_t n) {
 
 }  /* namespace */
 
-int Processor::init_audio(const AudioConfig& cfg) {
-    if (cfg.merge <= 0 || cfg.max_frames <= 0 || cfg.max_frames % cfg.merge) return RAD_E_INVAL;
+int Processor::init_audio(const AudioConfig& cfg, std::string* why) {
+    auto refuse = [&](int rc, std::string w) {
+        if (why) *why = std::move(w);
+        return rc;
+    };
+    if (cfg.merge <= 0 || cfg.max_frames <= 0 || cfg.max_frames % cfg.merge)
+        return refuse(RAD_E_INVAL, "the audio encoder's pass (" + std::to_string(cfg.max_frames) +
+                                       " frames) is not whole rows of " +
+                                       std::to_string(cfg.merge) + " frames");
+    const bool qwen = cfg.family == AudioFamily::Qwen3ASR;
+    /* Gemma 4's FFT is radix 2; Qwen3-ASR's runs mixed radix over any length. */
+    if (!qwen && (cfg.fft < 2 || (cfg.fft & (cfg.fft - 1)) != 0))
+        return refuse(RAD_E_UNSUPPORTED, "the feature extractor's " + std::to_string(cfg.fft) +
+                                             "-point FFT is not a power of two, which this "
+                                             "extractor's radix-2 transform needs");
     acfg_ = cfg;
-    /* np.hanning(frame_length + 1)[:-1], the periodic window, stored as float32. */
+    if (qwen) {
+        /* A whole chunk is staged as merge * chunk_rows(chunk) frames, which must hold it; a
+         * clip's longest is as many whole chunks as one pass takes. */
+        const int64_t staged = (int64_t)cfg.merge * AudioConfig::chunk_rows(cfg.chunk);
+        if (staged < cfg.chunk || cfg.max_frames < staged)
+            return refuse(RAD_E_INVAL, "a whole " + std::to_string(cfg.chunk) + "-frame chunk is "
+                                       "staged as " + std::to_string(staged) + " frames, which "
+                                       "does not hold it or does not fit one " +
+                                       std::to_string(cfg.max_frames) + "-frame encoder pass");
+        if (cfg.tok_start < 0 || cfg.tok_end < 0)
+            return refuse(RAD_E_INVAL, "the clip's opening or closing token is unresolved");
+        acfg_.max_samples = cfg.max_frames / staged * cfg.chunk * cfg.hop;
+    }
+    /* np.hanning(frame_length + 1)[:-1] -- torch.hann_window's periodic window -- stored as
+     * float32. */
     hann_.resize((size_t)cfg.frame_length);
     for (int32_t i = 0; i < cfg.frame_length; ++i)
         hann_[(size_t)i] = (float)(0.5 - 0.5 * std::cos(2.0 * M_PI * (double)i /
                                                         (double)cfg.frame_length));
-    /* transformers' mel_filter_bank(norm=None, mel_scale="htk"): triangles between consecutive
-     * mel points, in Hz, over the FFT bins' frequencies. */
+    /* transformers' mel_filter_bank: triangles between consecutive mel points, in Hz, over the
+     * FFT bins' frequencies -- Gemma 4's on the HTK scale with no area normalisation, Qwen3-ASR's
+     * (Whisper's) on the Slaney scale, each triangle scaled to unit area by 2 / (its width in
+     * Hz). */
     const int64_t nb = cfg.fft / 2 + 1, nm = cfg.n_mels;
-    auto hz2mel = [](double f) { return 2595.0 * std::log10(1.0 + f / 700.0); };
-    auto mel2hz = [](double m) { return 700.0 * (std::pow(10.0, m / 2595.0) - 1.0); };
+    auto htk2mel = [](double f) { return 2595.0 * std::log10(1.0 + f / 700.0); };
+    auto mel2htk = [](double m) { return 700.0 * (std::pow(10.0, m / 2595.0) - 1.0); };
+    const double slaney_step = 27.0 / std::log(6.4);
+    auto slaney2mel = [&](double f) {
+        return f >= 1000.0 ? 15.0 + std::log(f / 1000.0) * slaney_step : 3.0 * f / 200.0;
+    };
+    auto mel2slaney = [&](double m) {
+        return m >= 15.0 ? 1000.0 * std::exp((m - 15.0) / slaney_step) : 200.0 * m / 3.0;
+    };
     const std::vector<double> fft_f = linspace(0.0, (double)(cfg.rate / 2), nb);
-    std::vector<double> filt = linspace(hz2mel(cfg.min_freq), hz2mel(cfg.max_freq), nm + 2);
-    for (double& f : filt) f = mel2hz(f);
+    std::vector<double> filt = qwen ? linspace(slaney2mel(cfg.min_freq), slaney2mel(cfg.max_freq), nm + 2)
+                                    : linspace(htk2mel(cfg.min_freq), htk2mel(cfg.max_freq), nm + 2);
+    for (double& f : filt) f = qwen ? mel2slaney(f) : mel2htk(f);
     mel_.assign((size_t)(nb * nm), 0.0);
     mel_lo_.assign((size_t)nm, 0);
     mel_hi_.assign((size_t)nm, 0);
     for (int64_t i = 0; i < nm; ++i) {
+        const double enorm = qwen ? 2.0 / (filt[(size_t)i + 2] - filt[(size_t)i]) : 1.0;
         int32_t lo = -1, hi = 0;
         for (int64_t k = 0; k < nb; ++k) {
             const double down = -(filt[(size_t)i] - fft_f[(size_t)k]) /
                                 (filt[(size_t)i + 1] - filt[(size_t)i]);
             const double up = (filt[(size_t)i + 2] - fft_f[(size_t)k]) /
                               (filt[(size_t)i + 2] - filt[(size_t)i + 1]);
-            const double w = std::max(0.0, std::min(down, up));
+            const double w = std::max(0.0, std::min(down, up)) * enorm;
             mel_[(size_t)(i * nb + k)] = w;
             if (w != 0.0) { if (lo < 0) lo = (int32_t)k; hi = (int32_t)k + 1; }
         }
-        /* A triangle covers a few bins; the sum skips the zeros, which add nothing to it. */
+        /* A triangle covers a few bins; the sum skips the zeros. */
         mel_lo_[(size_t)i] = lo < 0 ? 0 : lo;
         mel_hi_[(size_t)i] = hi;
     }
-    /* The FFT's twiddles, once: a butterfly that evaluates its own sin and cos makes the
-     * transform cost a 30 s clip over 100 ms. */
-    brev_.assign((size_t)cfg.fft, 0);
-    for (int32_t i = 1, j = 0; i < cfg.fft; ++i) {
-        int32_t bit = cfg.fft >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        brev_[(size_t)i] = j;
+    /* Precomputed twiddles: evaluating sin and cos per butterfly costs over 100 ms on a 30 s
+     * clip. Gemma 4's power of two runs radix 2 over half a turn; Qwen3-ASR's FFT runs mixed
+     * radix over the length's prime factors (a power of two included) and a whole turn. */
+    radix_.clear();
+    brev_.clear();
+    const bool pow2 = !qwen;
+    if (pow2) {
+        brev_.assign((size_t)cfg.fft, 0);
+        for (int32_t i = 1, j = 0; i < cfg.fft; ++i) {
+            int32_t bit = cfg.fft >> 1;
+            for (; j & bit; bit >>= 1) j ^= bit;
+            j ^= bit;
+            brev_[(size_t)i] = j;
+        }
+    } else {
+        int32_t r = cfg.fft;
+        for (int32_t f = 2; f * f <= r; ++f)
+            while (r % f == 0) { radix_.push_back(f); r /= f; }
+        if (r > 1) radix_.push_back(r);
     }
-    tw_re_.resize((size_t)cfg.fft / 2);
-    tw_im_.resize((size_t)cfg.fft / 2);
-    for (int32_t k = 0; k < cfg.fft / 2; ++k) {
+    const int32_t n_tw = pow2 ? cfg.fft / 2 : cfg.fft;
+    tw_re_.resize((size_t)n_tw);
+    tw_im_.resize((size_t)n_tw);
+    for (int32_t k = 0; k < n_tw; ++k) {
         const double ang = -2.0 * M_PI * (double)k / (double)cfg.fft;
         tw_re_[(size_t)k] = std::cos(ang);
         tw_im_[(size_t)k] = std::sin(ang);
@@ -1195,10 +1310,124 @@ int Processor::init_audio(const AudioConfig& cfg) {
     return RAD_OK;
 }
 
+/* Qwen3-ASR's clip (AudioFamily::Qwen3ASR): Whisper's log-mel over the whole clip, then staged a
+ * chunk at a time. The spectrum is computed in double, two real frames a complex transform as the
+ * Gemma 4 path does; the reference computes in float32, and the difference is far below the bf16
+ * the features are staged in. */
+int Processor::audio_qwen3asr(const std::vector<float>& samples, std::shared_ptr<Item>* out,
+                              std::string* why) const {
+    const AudioConfig& c = acfg_;
+    if ((int64_t)samples.size() > c.max_samples) {
+        if (why) *why = "the clip is longer than one audio encoder pass holds (" +
+                        std::to_string(c.max_samples / c.rate) + " s)";
+        return RAD_E_INVAL;
+    }
+    /* A clip shorter than min_samples is zero-padded to it first; the reflected padding is of the
+     * padded clip. */
+    const int64_t n = std::max<int64_t>((int64_t)samples.size(), c.min_samples);
+    const int64_t pad = c.fft / 2;
+    if (n <= pad) {
+        if (why) *why = "the clip is too short to frame";
+        return RAD_E_INVAL;
+    }
+    /* torch.stft(center=True) makes 1 + n / hop frames and the extractor drops the last. */
+    const int64_t real = n / c.hop;
+    const int64_t full = real / c.chunk, rem = real % c.chunk;
+    const int64_t rows_full = AudioConfig::chunk_rows(c.chunk);
+    const int64_t rows_rem = AudioConfig::chunk_rows(rem);
+    const int64_t staged_full = (int64_t)c.merge * rows_full;
+    const int64_t rows = full * rows_full + rows_rem;
+    const int64_t frames = full * staged_full + (int64_t)c.merge * rows_rem;
+    if (frames > c.max_frames) {
+        if (why) *why = "the clip is more frames than one audio encoder pass holds";
+        return RAD_E_INVAL;
+    }
+
+    /* x[q] of the padded clip, reflected at both ends: torch's "reflect" leaves the edge sample
+     * out, so x[-1] is x[1] and x[n] is x[n - 2]. */
+    auto sample = [&](int64_t p) -> double {
+        int64_t q = p - pad;
+        if (q < 0) q = -q;
+        if (q >= n) q = 2 * (n - 1) - q;
+        return q < (int64_t)samples.size() ? (double)samples[(size_t)q] : 0.0;
+    };
+    const int64_t N = c.fft, nb = N / 2 + 1, nm = c.n_mels;
+    std::vector<double> re((size_t)N), im((size_t)N), ore((size_t)N), oim((size_t)N);
+    std::vector<double> work((size_t)(4 * N));
+    std::vector<double> pw((size_t)nb), pw2((size_t)nb);
+    auto window = [&](int64_t t, double* dst) {
+        for (int64_t j = 0; j < N; ++j)
+            dst[j] = (double)((float)sample(t * c.hop + j) * hann_[(size_t)j]);
+    };
+    std::vector<double> logmel((size_t)(real * nm));
+    double top = -INFINITY;
+    auto emit = [&](int64_t t, const double* p) {
+        double* dst = logmel.data() + t * nm;
+        for (int64_t b = 0; b < nm; ++b) {
+            double s = 0.0;
+            const double* w = mel_.data() + (size_t)b * nb;
+            for (int32_t k = mel_lo_[(size_t)b]; k < mel_hi_[(size_t)b]; ++k) s += p[k] * w[k];
+            const double v = std::log10(std::max(s, 1e-10));
+            dst[b] = v;
+            if (v > top) top = v;
+        }
+    };
+    for (int64_t t = 0; t < real; t += 2) {
+        const bool pair = t + 1 < real;
+        window(t, re.data());
+        if (pair) window(t + 1, im.data());
+        else std::fill(im.begin(), im.end(), 0.0);
+        fft_mixed(re.data(), im.data(), 1, N, ore.data(), oim.data(), radix_.data(), tw_re_,
+                  tw_im_, work.data());
+        for (int64_t k = 0; k < nb; ++k) {
+            const size_t a = (size_t)k, b = k ? (size_t)(N - k) : 0;
+            const double ar = 0.5 * (ore[a] + ore[b]), ai = 0.5 * (oim[a] - oim[b]);
+            const double br = 0.5 * (oim[a] + oim[b]), bi = -0.5 * (ore[a] - ore[b]);
+            pw[a]  = ar * ar + ai * ai;
+            pw2[a] = br * br + bi * bi;
+        }
+        emit(t, pw.data());
+        if (pair) emit(t + 1, pw2.data());
+    }
+
+    auto it = std::make_shared<Item>();
+    it->kind = Kind::Audio;
+    it->grid_t = 1;
+    it->grid_h = (int32_t)frames;
+    it->grid_w = 1;
+    it->patch_dim = nm;
+    it->n_patch = frames;
+    it->valid = (int32_t)real;
+    it->chunk_staged = (int32_t)staged_full;
+    it->chunk_read = c.chunk;
+    it->rows_h = (int32_t)rows;
+    it->rows_w = 1;
+    it->seg_rows = (int32_t)rows;
+    it->n_seg = rows > 0 ? 1 : 0;
+    /* Chunk k's real frames at row k * staged_full; everything else stays zero -- the reference's
+     * padding inside the last chunk, and the alignment past a whole one. */
+    it->pixels.assign((size_t)(frames * nm), 0);
+    const double floor_v = top - 8.0;
+    for (int64_t t = 0; t < real; ++t) {
+        uint16_t* dst = it->pixels.data() + ((t / c.chunk) * staged_full + t % c.chunk) * nm;
+        const double* src = logmel.data() + t * nm;
+        for (int64_t b = 0; b < nm; ++b)
+            dst[b] = rad_f32_to_bf16((float)((std::max(src[b], floor_v) + 4.0) / 4.0));
+    }
+    content_key(*it, &it->key_hi, &it->key_lo);
+    it->expand.push_back(c.tok_start);
+    it->seg_at.push_back(1);
+    it->expand.insert(it->expand.end(), (size_t)rows, c.tok_audio);
+    it->expand.push_back(c.tok_end);
+    *out = std::move(it);
+    return RAD_OK;
+}
+
 int Processor::audio_from(const std::vector<float>& samples, std::shared_ptr<Item>* out,
                           std::string* why) const {
     if (!audio_on_) { if (why) *why = "this program declares no audio encoder"; return RAD_E_UNSUPPORTED; }
     const AudioConfig& c = acfg_;
+    if (c.family == AudioFamily::Qwen3ASR) return audio_qwen3asr(samples, out, why);
     const int64_t n = std::min<int64_t>((int64_t)samples.size(), c.max_samples);
     const int64_t real = c.real_frames(n);
     const int64_t rows = (real + c.merge - 1) / c.merge;
@@ -1258,11 +1487,11 @@ int Processor::audio_from(const std::vector<float>& samples, std::shared_ptr<Ite
             dst[b] = rad_f32_to_bf16((float)v);
         }
     };
-    /* TWO REAL FRAMES A COMPLEX TRANSFORM: frame a in the real part, frame b in the imaginary,
-     * and the two spectra separate by symmetry -- A[k] = (Z[k] + conj Z[n-k]) / 2 and
-     * B[k] = (Z[k] - conj Z[n-k]) / 2i. Half the transforms; the magnitudes agree with one
-     * transform a frame to a few ulps of double. |X| is sqrt(re^2 + im^2), within an ulp of
-     * numpy's hypot and far below the float32 the features are rounded to. */
+    /* Two real frames per complex transform: frame a in the real part, frame b in the imaginary,
+     * separated by symmetry as A[k] = (Z[k] + conj Z[n-k]) / 2 and B[k] = (Z[k] - conj Z[n-k]) / 2i.
+     * This halves the transforms; magnitudes match one transform per frame to a few ulps of double.
+     * |X| is sqrt(re^2 + im^2), within an ulp of numpy's hypot and far below the float32 the
+     * features are rounded to. */
     std::vector<double> mag2((size_t)nb);
     const int64_t N = c.fft;
     for (int64_t i = 0; i < real; i += 2) {
@@ -1281,11 +1510,7 @@ int Processor::audio_from(const std::vector<float>& samples, std::shared_ptr<Ite
         emit(i, mag.data());
         if (pair) emit(i + 1, mag2.data());
     }
-    content_key(*it, &it->key_hi, &it->key_lo);
-    it->expand.push_back(c.tok_start);
-    it->seg_at.push_back(1);
-    it->expand.insert(it->expand.end(), (size_t)rows, c.tok_audio);
-    it->expand.push_back(c.tok_end);
+    one_run(it.get(), c.tok_start, rows, c.tok_audio, c.tok_end);
     /* A clip too short for one real frame is <boa><eoa> and nothing to encode. */
     if (rows == 0) it->encoded = true;
     *out = std::move(it);
@@ -1296,7 +1521,10 @@ int Processor::audio(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out,
                      std::string* why) const {
     if (!audio_on_) { if (why) *why = "this program declares no audio encoder"; return RAD_E_UNSUPPORTED; }
     std::vector<float> s;
-    RAD_TRY(decode_audio(bytes, n, acfg_.rate, acfg_.max_samples, &s, why));
+    /* Gemma 4's extractor truncates at max_samples; Qwen3-ASR's does not, so one sample more is
+     * decoded and a clip past a pass is refused rather than cut. */
+    const bool whole = acfg_.family == AudioFamily::Qwen3ASR;
+    RAD_TRY(decode_audio(bytes, n, acfg_.rate, acfg_.max_samples + (whole ? 1 : 0), &s, why));
     return audio_from(s, out, why);
 }
 

@@ -1,41 +1,37 @@
-/* r4d_fp8_layout.cpp -- what libr4d's FP8 kernels store for a weight, and the relayouts that
+/* r4d_fp8_layout.cpp -- the stored form of libr4d's FP8 and int8 weights, and the relayouts that
  * produce it from the weight's canonical planes (spec.md §4.3). Pure host C++: nothing here
- * includes r4d.h or <hip/hip_runtime.h>, so it compiles and can be exercised on a box with no
- * ROCm, which is where a packing bug is cheapest to find.
+ * includes r4d.h or <hip/hip_runtime.h>, so packing can be tested without ROCm.
  *
  * ================================================================= what they read
  *
  * The block-scaled linears read the encoding a block-FP8 checkpoint ships, `fp8_e4m3*bf16[128x128]`:
  *
- *   codes   F8_E4M3, [N][K]                       -- exactly as safetensors stores `X.weight`
- *   scale   BF16,    [ceil(N/128)][ceil(K/128)]   -- exactly `X.weight_scale_inv`
+ *   codes   F8_E4M3, [N][K]                       -- as safetensors stores `X.weight`
+ *   scale   BF16,    [ceil(N/128)][ceil(K/128)]   -- as `X.weight_scale_inv`
  *
- * In a Qwen3.8-27B-FP8 checkpoint, `mlp.gate_proj.weight` is F8_E4M3 [17408, 5120] with
- * `mlp.gate_proj.weight_scale_inv` BF16 [136, 40], and 17408/136 = 5120/40 = 128. The kernels
- * index `S[(row / 128) * sc_cols + (c / 128)]`, which is that grid, so the scale plane is stored as
- * it is and only the codes move: into WMMA fragment order for the fp8a8 GEMMs, which read a lane's
- * own bytes straight from a coalesced load, and nowhere at all for the fp8a16 matvec, which reads
- * sixteen consecutive k of one row. The two cannot share a stored form, so a weight is declared
- * for one or the other and the builder refuses the pair.
+ * E.g. Qwen3.8-27B-FP8 `mlp.gate_proj.weight` is F8_E4M3 [17408, 5120] with a BF16 [136, 40]
+ * scale. The kernels index `S[(row / 128) * sc_cols + (c / 128)]`, so the scale plane is stored
+ * unchanged and only the codes move: into WMMA fragment order for the fp8a8 GEMMs (a lane reads
+ * its own bytes from one coalesced load), and not at all for the fp8a16 matvec, which reads
+ * sixteen consecutive k of one row. The two forms differ, so a weight is declared for one or the
+ * other and the builder refuses the pair.
  *
- * The lm_head carries each row's block scales in the row's own tail, because it has one operand
- * and is ROW-sharded: [K codes][K/128 bf16 scales], the row padded to 16 bytes so a uint4 load of
- * the next row is aligned (r4d_fp8_lm.h). hc_read's mixing matrices and mtp_enter's fc are the
- * same with an f32 scale per group of the row (r4d_hc_fp8.h).
+ * The lm_head is a single row-sharded operand, so each row carries its block scales in its own
+ * tail: [K codes][K/128 bf16 scales], padded to 16 bytes so a uint4 load of the next row is
+ * aligned (r4d_fp8_lm.h). hc_read's mixing matrices and mtp_enter's fc use the same form with an
+ * f32 scale per group of the row (r4d_hc_fp8.h).
  *
  * ================================================================= BF16 scales, not UE8M0
  *
- * Some block-FP8 checkpoints carry a UE8M0 exponent BYTE per tile rather than a bf16. Converting
- * to it is not free: UE8M0 stores an exponent and nothing else, so rounding a bf16 scale into it
- * changes the tile's gain, and correcting for that means requantising every E4M3 byte against the
- * new power-of-two scale. And nothing is gained -- decoding either is one shift and one bitcast.
- * The bf16 plane is 0.02% of its weight.
+ * Some block-FP8 checkpoints carry a UE8M0 exponent byte per tile instead of a bf16. Converting to
+ * UE8M0 rounds each scale to a power of two, which changes the tile's gain and would mean
+ * requantising every E4M3 byte. Decoding either costs one shift and one bitcast, and the bf16
+ * plane is 0.02% of its weight.
  *
- * Choosing the numbers is not this file's job: a checkpoint's own planes are served as they are,
- * and anything quantised -- a bf16 lm_head made fp8 -- was quantised by a quantiser before the
- * container was written (libquant's `rtn` over `fp8_e4m3` with a 128x128 bf16 block, whose rule is
- * the one these kernels' activation quantiser uses: amax/448 rounded to bf16, a zero block scaled
- * by one).
+ * This file chooses no numbers: a checkpoint's planes are served as they are, and anything
+ * quantised (e.g. a bf16 lm_head made fp8) was quantised before the container was written, by
+ * libquant's `rtn` over `fp8_e4m3` with a 128x128 bf16 block. Its rule matches these kernels'
+ * activation quantiser: amax/448 rounded to bf16, a zero block scaled by one.
  */
 
 #include "r4d_plugin.h"
@@ -48,20 +44,19 @@
 #include <cstdint>
 #include <cstring>
 
-/* Operand indices for `gemm_nt_q`. Named rather than literal because the schema is positional and a
- * reorder in r4d_rows.cpp is otherwise a silent miscompile here. */
+/* Operand indices of `gemm_nt_q`. The schema is positional, so these must follow its order in
+ * r4d_rows.cpp. */
 enum { FL_A = 0, FL_ASCALE = 1, FL_B = 2, FL_BSCALE = 3, FL_Y = 4 };
 
-/* The k a fragment-order tile spans, which libr4d compiles in. */
+/* K span of one fragment-order tile, compiled into libr4d. */
 enum { R4D_FP8_SUPER_K = r4d_fp8::kSuperK };
 
 namespace {
 
-/* THE WALK BOTH DIRECTIONS SHARE: the fragment-order plane front to back, eight bytes at a time,
- * each with the row-major offset of the [N][K] weight it holds. A fragment is eight consecutive k
- * of one row -- r4d_fp8_frag.h's frag_src over j = 0..7 -- so it moves as one word, and the
- * stored side is written or read in order. A byte at a time, with the divisions that place it,
- * the same permutation is most of the CPU a block-FP8 model's load spends. */
+/* Walks the fragment-order plane front to back, eight bytes at a time, passing each word's
+ * row-major offset in the [N][K] weight; used in both directions. A fragment is eight consecutive
+ * k of one row (r4d_fp8_frag.h frag_src over j = 0..7), so it moves as one word. Placing each byte
+ * separately would dominate the CPU cost of loading a block-FP8 model. */
 template <typename Move>
 void frag_walk(long long N, long long K, Move move) {
     constexpr int kLanes = r4d_fp8::kTileBytes / r4d_fp8::kLaneBytes;
@@ -84,9 +79,8 @@ int fgeom(const RadParam* p, int n_p, FGeom* g) {
     g->N = r4d_pgeti_or(p, n_p, "N", 0);
     g->K = r4d_pgeti_or(p, n_p, "K", 0);
     if (g->N <= 0 || g->K <= 0) return RAD_E_SHAPE;
-    /* The block is compiled into the kernels as `>> 7`. A geometry that asks for another group is
-     * asking for a format nothing here reads; the constraint table already refused it, and this is
-     * the second line of defence for a tool calling the hook without going through selection. */
+    /* The block is compiled into the kernels as `>> 7`. The constraint table already refuses
+     * other groups; this catches a caller that invokes the hook without selection. */
     if (r4d_pgeti_or(p, n_p, "group", R4D_FP8_BLOCK) != R4D_FP8_BLOCK) return RAD_E_SHAPE;
     g->sn = (g->N + R4D_FP8_BLOCK - 1) / R4D_FP8_BLOCK;
     g->sk = (g->K + R4D_FP8_BLOCK - 1) / R4D_FP8_BLOCK;
@@ -152,12 +146,12 @@ int mgeom(const RadParam* p, int n_p, int operand, HGeom* g) {
 
 /* ==================================================================== the hooks
  *
- * Each checks the encoding its kernel reads and refuses any other with RAD_E_DTYPE, which is the
- * declare-time error a mis-converted container meets; then it moves bits and chooses none. */
+ * Each checks the encoding its kernel reads and refuses any other with RAD_E_DTYPE (the
+ * declare-time error for a mis-converted container). They move bits and choose none. */
 
 namespace {
 
-/* gemm_nt_q's weight and scale over block fp8: e4m3 codes with a bf16 scale a 128x128 block. */
+/* gemm_nt_q's block-fp8 weight: e4m3 codes with a bf16 scale per 128x128 block. */
 bool fp8_block_enc(const RadEncoding* e) {
     return r4d_enc::affine(e, RAD_F8E4M3, RAD_BF16, R4D_FP8_BLOCK, R4D_FP8_BLOCK);
 }
@@ -227,14 +221,14 @@ extern "C" int r4d_rad_unrelayout_fp8_block(const RadParam* p, int n_p, int oper
     return RAD_OK;
 }
 
-/* ---- the int8 twin: i8 codes in the same fragment order, with a bf16 scale per ROW per 128 K.
- * The codes move exactly as E4M3 codes do -- the permutation does not read them.
+/* ---- the int8 twin: i8 codes in the same fragment order as E4M3, with a bf16 scale per row per
+ * 128 K.
  *
- * THE SCALE PLANE IS TILE-MAJOR, [N/16][K/128][16]: the sixteen rows of a fragment tile side by side
- * for one 128-K block. On the narrow path a lane's eight accumulator rows are eight CONSECUTIVE
- * rows of one tile, so their scales are one 16-byte load in the fold where the row-major plane
- * would need eight scattered ones -- which, if-converted into every k step, cost the decode
- * kernel 70% at M = 4. The prefill tile reads one row's scale a lane, from either form. */
+ * The scale plane is tile-major, [N/16][K/128][16]: the sixteen rows of a fragment tile side by
+ * side for one 128-K block. On the narrow path a lane's eight accumulator rows are eight
+ * consecutive rows of one tile, so their scales are one 16-byte load. A row-major plane needs
+ * eight scattered loads, which if-converted into every k step cost the decode kernel 70% at
+ * M = 4. The prefill tile reads one row's scale per lane and works with either form. */
 namespace {
 int i8_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
                   const RadTensor* pl, int n, RadLayout* out) {
@@ -316,9 +310,8 @@ extern "C" int r4d_rad_unrelayout_i8_block(const RadParam* p, int n_p, int opera
 /* ---- the lm_head: codes and scales in one row, the scales of the row's 128-row block repeated
  * into its tail. */
 namespace {
-/* `i8`: the int8 head (logits_gemm_i8) -- i8 codes with a bf16 scale a row per 128 columns, the
- * same stored row with each row's OWN scales in its tail where the E4M3 head repeats its 128-row
- * block's. */
+/* `i8` selects the int8 head (logits_gemm_i8): i8 codes with a bf16 scale per row per 128
+ * columns. Same stored row, but each row's tail holds its own scales instead of its block's. */
 int lm_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
                   const RadTensor* pl, int n, RadLayout* out, FGeom* gout, bool i8 = false) {
     if (!out || !pl) return RAD_E_INVAL;
@@ -436,8 +429,8 @@ extern "C" int r4d_rad_unrelayout_i8_logits(const RadParam* p, int n_p, int oper
     return RAD_OK;
 }
 
-/* ---- hc_read's mixing matrices and mtp_enter's fc: e4m3 codes with an f32 scale a group of the
- * row, the scales in the row's tail and the row padded to 16 bytes. */
+/* ---- hc_read's mixing matrices and mtp_enter's fc: e4m3 codes with an f32 scale per group of
+ * the row, the scales in the row's tail and the row padded to 16 bytes. */
 namespace {
 int hcrows_enc_layout(const HGeom& g, const char* tag, const RadEncoding* enc, const int* sel,
                       const RadTensor* pl, int n, RadLayout* out) {
@@ -542,11 +535,10 @@ extern "C" int r4d_rad_unrelayout_mtp_e4m3(const RadParam* p, int n_p, int opera
 
 /* ================================================================= embed_lookup_q's table
  *
- * The gather reads the table AS IT IS, so this hook only answers whether it can: E4M3 codes with
- * ONE bf16 scale for the whole table (`fp8_e4m3*bf16[*x*]`, the n-gram table's recipe), or the
- * table as the checkpoint ships it, plain bf16 with no scale. The same two forms libavx's host
- * gather accepts (avx_layout_ngram), checked the same way, so a model whose table one of them
- * reads is never refused by the other at declare. */
+ * The gather reads the table as stored, so this hook only checks that it can: E4M3 codes with one
+ * bf16 scale for the whole table (`fp8_e4m3*bf16[*x*]`, the n-gram table's recipe), or plain bf16
+ * as the checkpoint ships it. libavx's host gather (avx_layout_ngram) accepts the same two forms
+ * with the same checks, so neither refuses at declare a table the other reads. */
 extern "C" int r4d_rad_layout_embed_q(const RadParam* p, int n_p, int operand,
                                       const RadEncoding* enc, const int* sel,
                                       const RadTensor* pl, int n, RadLayout* out) {

@@ -1,13 +1,12 @@
 /* lq_ggml.cpp -- the `ggml` quantiser: llama.cpp's formats, llama.cpp's codes, radiance's planes.
  *
  * A row is quantised by llama.cpp's own quantize_<type> (lq_ggml_port.h), with the imatrix's
- * column importances as its quant_weights, and the GGUF blocks it writes are then UNPACKED into
- * the affine planes of rad_encoding.h. The codes and scales are therefore exactly llama.cpp's --
- * a llama.cpp model and a radiance container quantised from the same weights and the same imatrix
- * hold the same numbers -- while the container holds an encoding every reader decodes, rather
- * than a block layout one kernel family was written against.
+ * column importances as quant_weights, and the resulting GGUF blocks are unpacked into the affine
+ * planes of rad_encoding.h. A llama.cpp model and a radiance container quantised from the same
+ * weights and imatrix therefore hold the same numbers, but the container stores a generic encoding
+ * instead of a block layout tied to one kernel family.
  *
- * ===================================================================== THE PLANES
+ * ===================================================================== The planes
  *
  * Each type's planes, in order. [R x C] is a TILED plane's block, {R x C} a TABLE's extents, * a
  * whole extent; d and dmin are the block's f16 super-scales, copied bit for bit.
@@ -40,32 +39,30 @@
  *   iq1_m    codes u11 [1x8]; grid i8 {2048x8}; scale u4 [1x16] = 2ls+1; scale.1 f16 [1x256] = d
  *            (assembled from the scale words' top nibbles); zero bf16 [1x8] = -delta
  *
- * Every line is llama.cpp's dequantize_row_<type> rewritten in the affine order, q = code |
- * grid | table, negated by its sign, less its zero, times every scale level, less every min level:
+ * Each line is llama.cpp's dequantize_row_<type> rewritten in the affine order (q = code | grid |
+ * table, negated by its sign, less its zero, times every scale level, less every min level):
  * q4_1's `q*d + m` is `q*d - (-m)`, iq1's `dl*(grid + delta)` is `(grid - (-delta))*scale*d`, and
- * the IQ2/IQ3 `d*(0.5 + ls)*0.25` is `(2ls+1)*d/8`. Nothing is rounded on the way: every plane
- * holds a value of the block exactly, so the planes go back to the same GGUF blocks.
+ * the IQ2/IQ3 `d*(0.5 + ls)*0.25` is `(2ls+1)*d/8`. Nothing is rounded: every plane holds a block
+ * value exactly, so the planes convert back to the same GGUF blocks.
  *
- * THE 1/8 AND 1/4 ARE A PER-TENSOR LEVEL OF THEIR OWN, NOT FOLDED INTO d. d/8 in f16 is exact only
- * while it stays normal, d >= 2^-11, and an IQ2 d is about a super-block's largest value over 155:
- * on Gaussian weights of standard deviation 0.02, a transformer linear's usual spread, 98-100% of
- * IQ2 and IQ3_XXS super-blocks have d/8 or d/4 below f16's normal range, and folded in they would
- * lose up to three bits of their scale. As an f32 [*x*] constant the factor costs four bytes a
- * weight and multiplies exactly.
+ * The 1/8 and 1/4 are a per-tensor level, not folded into d. d/8 in f16 is exact only while it
+ * stays normal (d >= 2^-11), and an IQ2 d is about a super-block's largest value over 155. On
+ * Gaussian weights with std 0.02, typical for transformer linears, 98-100% of IQ2 and IQ3_XXS
+ * super-blocks have d/8 or d/4 below f16's normal range and would lose up to three bits of scale.
+ * As an f32 [*x*] constant the factor costs four bytes per tensor and multiplies exactly.
  *
- * EVERY PRODUCT IN THE DECODE IS EXACT IN F32, so the affine order -- code times sub-scale times
- * d, where llama.cpp forms d times sub-scale first -- gives llama.cpp's dequantised values bit for
- * bit. d is an f16, eleven significant bits, and a code or grid value times its sub-scale has at
- * most twelve (q6_K's 31 x 127 and iq4_xs's 127 x 31 are the widest), so no product of the chain
- * rounds in either order; only the subtraction of a min -- q4_1, q5_1, q2_K, q4_K, q5_K -- rounds,
- * once, on the same two operands.
+ * Every product in the decode is exact in f32, so the affine order (code * sub-scale * d, where
+ * llama.cpp forms d * sub-scale first) reproduces llama.cpp's dequantised values bit for bit. d is
+ * an f16 with 11 significant bits and a code or grid value times its sub-scale has at most 12
+ * (q6_K's 31 x 127 and iq4_xs's 127 x 31 are the widest), so no product rounds in either order.
+ * Only the min subtraction (q4_1, q5_1, q2_K, q4_K, q5_K) rounds, once, on the same two operands.
  */
 #include "lq_ggml.h"
 #include "lq_ggml_port.h"
+#include "lq_quant.h"
 #include "rad_plugin.h"
 
 #include <cctype>
-#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -78,10 +75,9 @@ using namespace lq::ggml;
 
 /* ================================================================== writing a plane row */
 
-/* A plane row written front to back, `bits` an element, lowest bits first -- the bit stream
- * rad_encoding.h defines. Thirty-two bits go out at a time and the tail on flush(), so every byte
- * of the row is written exactly once and nothing is read back: the row arrives zeroed, but a
- * writer that ORs into it would be relying on that, and one that stores whole bytes is not. */
+/* Writes a plane row front to back, `bits` per element, lowest bits first (rad_encoding.h's bit
+ * stream). 32 bits go out at a time and the tail on flush(), so each byte is stored exactly once
+ * and never read back; this does not rely on the row arriving zeroed. */
 class Bits {
   public:
     explicit Bits(uint8_t* row) : p_(row) {}
@@ -115,7 +111,7 @@ inline void put16(uint8_t* row, int64_t i, uint16_t h) {
     row[2 * i + 1] = (uint8_t)(h >> 8);
 }
 
-/* Two 4-bit codes a byte, element 2k low: q[] holds a block's codes in value order. */
+/* Two 4-bit codes per byte, element 2k low; q[] holds a block's codes in value order. */
 inline void put_nibbles(uint8_t* row, const uint8_t* q, int n) {
     for (int k = 0; k < n / 2; ++k)
         row[k] = (uint8_t)((q[2 * k] & 15) | ((q[2 * k + 1] & 15) << 4));
@@ -131,9 +127,9 @@ inline uint16_t iq1_zero(bool negative_delta) { return negative_delta ? 0x3E00 :
 
 /* ================================================================== unpacking a row's blocks
  *
- * Each unpack_<type> reads `nb` blocks -- one row -- and writes plane i's row at row[i]; a TABLE
- * or per-tensor plane's slot is null and is written once a call, by write_shared. The index
- * arithmetic is the inverse of the type's dequantize_row_<type>, value by value. */
+ * Each unpack_<type> reads the `nb` blocks of one row and writes plane i's row at row[i]. A TABLE
+ * or per-tensor plane's slot is null; write_shared writes those once per call. The index
+ * arithmetic inverts the type's dequantize_row_<type>, value by value. */
 
 void unpack_q8_0(const void* v, int64_t nb, uint8_t* const* row) {
     const block_q8_0* b = (const block_q8_0*)v;
@@ -233,10 +229,10 @@ void unpack_q3_K(const void* v, int64_t nb, uint8_t* const* row) {
     Bits c(row[0]), s(row[1]);
     for (int64_t i = 0; i < nb; ++i) {
         const block_q3_K& x = b[i];
-        /* the high bit of value k is bit k/32 of hmask[k%32] */
+        /* The high bit of value k is bit k/32 of hmask[k%32]. */
         for (int k = 0; k < QK_K; ++k)
             c.put(k_low2(x.qs, k) + 4u * ((x.hmask[k % 32] >> (k / 32)) & 1u) - 4u, 3);
-        /* the sixteen 6-bit scales, unpacked as quantize_row_q3_K_ref re-reads them */
+        /* The sixteen 6-bit scales, unpacked as quantize_row_q3_K_ref re-reads them. */
         for (int j = 0; j < QK_K / 16; ++j) {
             const int lo = j < 8 ? x.scales[j] & 0xF : x.scales[j - 8] >> 4;
             const int sc = lo | (((x.scales[8 + j % 4] >> (2 * (j / 4))) & 3) << 4);
@@ -354,8 +350,8 @@ void unpack_iq4_xs(const void* v, int64_t nb, uint8_t* const* row) {
     s.flush();
 }
 
-/* The IQ2 and IQ3 types: a sign byte covers eight values, bit j value j, which is the u1 plane's
- * own order -- so a group of eight's signs are one byte of it. */
+/* IQ2 and IQ3: a sign byte covers eight values, bit j for value j. That is the u1 plane's own
+ * order, so a group of eight's signs is one byte of it. */
 void unpack_iq2_xxs(const void* v, int64_t nb, uint8_t* const* row) {
     const block_iq2_xxs* b = (const block_iq2_xxs*)v;
     Bits s(row[3]);
@@ -435,7 +431,7 @@ void unpack_iq3_s(const void* v, int64_t nb, uint8_t* const* row) {
     Bits c(row[0]), s(row[3]);
     for (int64_t i = 0; i < nb; ++i) {
         const block_iq3_s& x = b[i];
-        /* the ninth bit of the grid index of 4-group g is bit g%8 of qh[g/8] */
+        /* The ninth bit of 4-group g's grid index is bit g%8 of qh[g/8]. */
         for (int g = 0; g < QK_K / 4; ++g)
             c.put(x.qs[g] | (uint32_t)((x.qh[g / 8] >> (g % 8)) & 1) << 8, 9);
         std::memcpy(row[2] + (QK_K / 8) * i, x.signs, QK_K / 8);
@@ -529,7 +525,7 @@ const Kind kKinds[] = {
     { "iq1_m",   GGML_TYPE_IQ1_M,   QK_K,   quantize_iq1_m,   unpack_iq1_m },
 };
 
-/* The encoding a type writes; the mapping in the header comment, plane for plane. */
+/* The encoding a type writes, plane for plane as listed in the file header. */
 RadEncoding encoding_of(ggml_type t) {
     RadEncoding e;
     rad_enc_clear(&e);
@@ -634,8 +630,8 @@ void fill_grid(uint8_t* out, const W* grid, int n) {
             out[k * (int)sizeof(W) + j] = (uint8_t)(grid[k] >> (8 * j));
 }
 
-/* The planes every row shares -- a codebook, IQ4's levels, IQ2/IQ3's 1/8 or 1/4 -- written whole
- * by every call, because rad-convert decodes each call's rows as soon as they are written. */
+/* The planes all rows share (a codebook, IQ4's levels, IQ2/IQ3's 1/8 or 1/4). Every call writes
+ * them in full, because rad-convert decodes each call's rows as soon as they are written. */
 void write_shared(ggml_type t, const RadEncoding& e, void* const* planes) {
     for (int i = 0; i < e.n_planes; ++i) {
         const RadEncPlane& p = e.plane[i];
@@ -668,16 +664,11 @@ bool same_name(const char* a, const char* b) {
     return *a == *b;
 }
 
-const char* wname(const RadQuantWeight* w) { return w && w->name ? w->name : "?"; }
-
-/* The type the options name. RAD_E_INVAL, said with the weight's name, when there is none. */
+/* The type the options name, or RAD_E_INVAL with a message naming the weight. */
 int kind_of(const RadParam* o, int n_o, const RadQuantWeight* w, const Kind** out) {
     const char* t = rad_param_gets(o, n_o, "type", nullptr);
-    if (!t) {
-        std::fprintf(stderr, "libquant: %s: type= is required: the llama.cpp type to write, e.g. "
-                     "q4_K, q8_0, iq4_xs\n", wname(w));
-        return RAD_E_INVAL;
-    }
+    if (!t)
+        return refuse(w, "type= is required: the llama.cpp type to write, e.g. q4_K, q8_0, iq4_xs");
     for (const Kind& k : kKinds)
         if (same_name(t, k.name)) {
             *out = &k;
@@ -685,15 +676,14 @@ int kind_of(const RadParam* o, int n_o, const RadQuantWeight* w, const Kind** ou
         }
     std::string all;
     for (const Kind& k : kKinds) all += std::string(all.empty() ? "" : " ") + k.name;
-    std::fprintf(stderr, "libquant: %s: type=%s is not a llama.cpp type this quantiser writes "
-                 "(%s)\n", wname(w), t, all.c_str());
-    return RAD_E_INVAL;
+    return refuse(w, ("type=" + std::string(t) + " is not a llama.cpp type this quantiser writes (" +
+                      all + ")").c_str());
 }
 
-/* A rank-1 weight, and one whose rows do not divide into the type's blocks, is declined: the next
- * rule takes it -- a norm, or a 2880-wide projection that a q4_K pattern happened to match. */
+/* A rank-1 weight, or one whose rows do not divide into the type's blocks, is declined so the next
+ * rule takes it (a norm, or a 2880-wide projection a q4_K pattern happened to match). */
 int ggml_encoding(const RadParam* o, int n_o, const RadQuantWeight* w, RadEncoding* out) {
-    if (!w || w->rank < 2) return RAD_E_UNSUPPORTED;
+    if (declines(w)) return RAD_E_UNSUPPORTED;
     const Kind* k = nullptr;
     const int st = kind_of(o, n_o, w, &k);
     if (st != RAD_OK) return st;
@@ -703,7 +693,7 @@ int ggml_encoding(const RadParam* o, int n_o, const RadQuantWeight* w, RadEncodi
     return RAD_OK;
 }
 
-/* Rows are independent in every type: a block never spans two, and the imatrix is per column. */
+/* Rows are independent in every type: a block never spans rows, and the imatrix is per column. */
 int64_t ggml_row_block(const RadParam*, int, const RadQuantWeight*) { return 1; }
 
 int ggml_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* src, int64_t row0,
@@ -714,14 +704,12 @@ int ggml_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* sr
     if (!w || w->rank < 2 || w->cols <= 0 || w->rows <= 0 || w->cols % k->block || row0 < 0 ||
         rows < 0 || row0 + rows > w->rows)
         return RAD_E_SHAPE;
-    /* NO SEARCH WITHOUT ITS WEIGHTS. llama.cpp's iq2_xxs, iq2_xs and iq1_s assert the imatrix is
-     * there and have no other path; substituting one would write a format llama.cpp could not
-     * have written, under its name. */
-    if (!w->importance && ggml_quantize_requires_imatrix(k->type)) {
-        std::fprintf(stderr, "libquant: %s: type=%s needs an imatrix, and the converter has none "
-                     "for this weight (rad-convert --imatrix FILE)\n", wname(w), k->name);
-        return RAD_E_INVAL;
-    }
+    /* llama.cpp's iq2_xxs, iq2_xs and iq1_s require the imatrix and have no other path;
+     * substituting one would write, under llama.cpp's type name, data llama.cpp could not have
+     * produced. */
+    if (!w->importance && ggml_quantize_requires_imatrix(k->type))
+        return refuse(w, ("type=" + std::string(k->name) + " needs an imatrix, and the converter "
+                          "has none for this weight (rad-convert --imatrix FILE)").c_str());
     ggml_quantize_init(k->type);
 
     const RadEncoding e = encoding_of(k->type);

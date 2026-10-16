@@ -1,31 +1,39 @@
 /* text_test.cpp -- the text frontend.
  *
- * THE IMPORTANT TEST is `tokenize_against_llama_cpp`. Its expected token ids come from
- * llama.cpp's own tokeniser -- `llama_tokenize()` with add_special=false and parse_special=true
- * -- over two models with DIFFERENT pre-tokenisers (pre=qwen2 and pre=qwen35), and they are BAKED
- * IN, so the test needs llama.cpp only to regenerate them, never to run. Regenerating means
- * building llama-tokenize and running it over the same strings; the tables below are the record
- * of what it said.
+ * The key test is `tokenize_against_llama_cpp`. Its expected ids come from llama.cpp's
+ * `llama_tokenize()` (add_special=false, parse_special=true) over two models with different
+ * pre-tokenisers (pre=qwen2 and pre=qwen35). They are baked in, so llama.cpp is needed only to
+ * regenerate them (build llama-tokenize and run it over the same strings).
  *
- * Beyond the tables, the same comparison holds per model on random strings over Latin, Cyrillic,
- * CJK, Hangul, kana, emoji, ZWJ sequences, combining marks and arbitrary bytes, and on real C++
- * source, with one deliberate divergence, which `does_not_promote_control_looking_tokens` pins
- * and explains. Arbitrary-byte strings on which llama.cpp THROWS out of llama_tokenize are the
- * reason vendor/patches/0001 exists.
+ * The same comparison holds per model on random strings over Latin, Cyrillic, CJK, Hangul, kana,
+ * emoji, ZWJ sequences, combining marks and arbitrary bytes, and on real C++ source, with one
+ * deliberate divergence pinned by `does_not_promote_control_looking_tokens`. Arbitrary-byte
+ * strings on which llama.cpp throws out of llama_tokenize are why vendor/patches/0001 exists.
  *
- * The vocabs themselves are too large to bake -- 151,669 and 248,320 tokens -- so the vocab tests
- * read the GGUFs. If one is not there its tests are SKIPPED, loudly, and everything that needs no
- * vocab still runs. RAD_TEST_GGUF and RAD_TEST_GGUF_QWEN35 override the paths.
+ * The vocabs (151,669 and 248,320 tokens) are too large to bake, so the parity table reads the
+ * GGUFs; when one is missing it skips with a message. RAD_TEST_GGUF and RAD_TEST_GGUF_QWEN35 set
+ * the paths. The cases about special tokens, detokenisation and the byte-level alphabet run on a
+ * byte-level vocabulary trained in memory (tests/tokenizer_fixture.h) and, when the GGUF is
+ * there, on the real one too.
+ *
+ * The tokenizer.json cases compare decoders, pre-tokenisers and a Gemma-shaped encoder with
+ * HuggingFace `tokenizers`, whose answers tests/mk_tokenizer_goldens.py baked in below.
  */
 #include "rad_test.h"
 
 #include "text/gguf.h"
 #include "text/tokenizer.h"
+#include "text/tokenizer_nfc.h"
 #include "text/unicode_norm.h"
+#include "norm_vectors.h"
+#include "tokenizer_fixture.h"
+
+#include <functional>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -36,8 +44,8 @@ using namespace rad;
 
 /* ------------------------------------------------------------------ helpers */
 
-/* The table stores strings in an escaped form so a control character and a lone 0xFF byte are
- * both readable in source. Same escapes as the harness that produced the expectations. */
+/* The table stores strings escaped so a control character or a lone 0xFF byte is readable in
+ * source, using the same escapes as the tool that produced the expectations. */
 static std::string unescape(const std::string& in) {
     std::string u;
     for (size_t i = 0; i < in.size(); ++i) {
@@ -68,12 +76,11 @@ static std::string unescape(const std::string& in) {
  *   qwen3e  Qwen3-Embedding-0.6B, tokenizer.ggml.pre = "qwen2"
  *   qwen35  Qwen3.5-0.8B,         tokenizer.ggml.pre = "qwen35"
  *
- * The two differ in the letter-run rule (`[\p{L}\p{M}]+` versus `\p{L}+`), which is exactly the
- * difference that a hash-the-file pre-tokeniser gets wrong on a model it has not seen. Both are
- * pinned.
+ * They differ in the letter-run rule (`[\p{L}\p{M}]+` versus `\p{L}+`), the difference a
+ * hash-the-file pre-tokeniser gets wrong on a model it has not seen. Both are pinned.
  *
- * Both are checkpoint files and not in the repo: RAD_TEST_GGUF and RAD_TEST_GGUF_QWEN35 name
- * them. Unset, the cases that need a vocab skip and say which file they wanted. */
+ * Both are checkpoint files, not in the repo: RAD_TEST_GGUF and RAD_TEST_GGUF_QWEN35 name them.
+ * Unset, the cases that need a vocab skip and name the file they wanted. */
 static const char* gguf_path_qwen3e() {
     if (const char* p = std::getenv("RAD_TEST_GGUF")) return p;
     return "Qwen3-Embedding-0.6B-f16.gguf (set RAD_TEST_GGUF)";
@@ -83,7 +90,7 @@ static const char* gguf_path_qwen35() {
     return "Qwen3.5-0.8B-BF16.gguf (set RAD_TEST_GGUF_QWEN35)";
 }
 
-/* Loaded once each. Reading 150K-250K tokens is ~0.2 s and every test wants the same one. */
+/* Loaded once each: reading 150K-250K tokens takes ~0.2 s and every test wants the same one. */
 static std::shared_ptr<const Vocab> load_vocab(const char* path) {
     auto g = std::make_shared<GgufFile>();
     if (g->open(path) < 0) return nullptr;
@@ -103,22 +110,54 @@ static std::shared_ptr<const Vocab> qwen35_vocab() {
     return v;
 }
 
-/* The vocab the non-table tests use: Qwen3-Embedding-0.6B (qwen3e). */
-static std::shared_ptr<const Vocab> qwen_vocab() { return qwen3e_vocab(); }
 static const char* gguf_path() { return gguf_path_qwen3e(); }
 
-static bool need_vocab(const char* what) {
-    if (qwen_vocab()) return true;
-    fprintf(stderr, "  SKIP %s: no vocab at %s (set RAD_TEST_GGUF)\n", what, gguf_path());
-    return false;
+/* A byte-level BPE vocabulary trained in memory on text holding the words the cases use, with
+ * Qwen's chat markers as control tokens, its reasoning markers as user-defined ones (rendered, as
+ * Qwen3 declares them), and "</s>" as a NORMAL token that looks like a control one. Built once. */
+static std::shared_ptr<const Vocab> synthetic_vocab() {
+    static std::shared_ptr<const Vocab> v = [] {
+        tokfix::TextGen gen(5);
+        std::string corpus;
+        for (int i = 0; i < 24; ++i)
+            corpus += "the answer is 42 and this must never be seen. restating it, Q: what is two "
+                      "and two</think>The answer is 4. Q: next done </tool_call> Hello, world! " +
+                      gen.text(120) + "\n";
+        VocabBuild vb = tokfix::train_bytelevel(corpus, tokfix::k_qwen35, 400);
+        VocabStep dec;
+        dec.kind = RAD_DEC_BYTELEVEL;
+        vb.steps = { tokfix::split_step(tokfix::k_qwen35), tokfix::bytelevel_step(), dec };
+        tokfix::add_specials(vb, { { "<|im_start|>", RAD_TT_CONTROL },
+                                   { "<|im_end|>", RAD_TT_CONTROL },
+                                   { "<think>", RAD_TT_USER_DEFINED },
+                                   { "</think>", RAD_TT_USER_DEFINED },
+                                   { "</s>", RAD_TT_NORMAL } });
+        return tokfix::load(std::move(vb));
+    }();
+    return v;
+}
+
+/* The vocabularies the detokeniser and special-token cases run on: the synthetic one always, and
+ * Qwen3-Embedding's when RAD_TEST_GGUF names it. */
+struct NamedVocab {
+    std::string                  name;
+    std::shared_ptr<const Vocab> v;
+};
+static std::vector<NamedVocab> vocabs() {
+    std::vector<NamedVocab> out;
+    out.push_back({ "synthetic", synthetic_vocab() });
+    if (qwen3e_vocab()) out.push_back({ "qwen3e", qwen3e_vocab() });
+    else fprintf(stderr, "    (%s: no vocab at %s; the synthetic one only)\n",
+                 ::radtest::current(), gguf_path());
+    return out;
 }
 
 /* ------------------------------------------------------------------ the baked table */
 
-/* `detok` is what the round trip must produce. It is null wherever that is the input itself,
- * which is every case whose input is valid UTF-8. The three that are not are lossy on purpose:
- * an invalid byte becomes U+FFFD when the text is decoded to codepoints, so it cannot come back.
- * llama.cpp's detokenizer does exactly the same thing, and these expectations are its output. */
+/* `detok` is what the round trip must produce; null means the input itself, which holds for every
+ * valid UTF-8 input. The three invalid ones are lossy by design: an invalid byte becomes U+FFFD
+ * when decoded to codepoints and cannot come back. llama.cpp's detokenizer does the same, and
+ * these expectations are its output. */
 struct Case { const char* text; std::vector<int32_t> ids; const char* detok = nullptr; };
 
 static const std::vector<Case>& cases_qwen35() {
@@ -167,9 +206,9 @@ static const std::vector<Case>& cases_qwen35() {
     return k;
 }
 
-/* Qwen3-Embedding-0.6B, tokenizer.ggml.pre = "qwen2". Same strings, different vocab AND a
- * different letter-run rule, so the two tables disagree on nearly every line -- which is the
- * point: a tokeniser that quietly used one pre-tokeniser for both would pass one table.
+/* Qwen3-Embedding-0.6B, tokenizer.ggml.pre = "qwen2". Same strings, different vocab and a
+ * different letter-run rule, so the two tables disagree on nearly every line: a tokeniser that
+ * used one pre-tokeniser for both would pass only one table.
  */
 static const std::vector<Case>& cases_qwen3e() {
     static const std::vector<Case> k = {
@@ -217,7 +256,7 @@ static const std::vector<Case>& cases_qwen3e() {
     return k;
 }
 
-/* ================================================================== the important test */
+/* ================================================================== llama.cpp parity */
 
 static void check_table(const char* name, std::shared_ptr<const Vocab> v,
                         const std::vector<Case>& cases) {
@@ -246,246 +285,240 @@ TEST(tokenize_against_llama_cpp) {
     check_table("qwen35", qwen35_vocab(), cases_qwen35());
 }
 
-/* A DELIBERATE DIVERGENCE FROM llama.cpp, pinned so nobody "fixes" it by accident.
- *
- * llama.cpp carries a hardcoded list of control-LOOKING token texts -- "<|eot_id|>", "<eos>",
- * "</s>" and a dozen more -- and forces any of them to CONTROL even when the container says the
- * token is NORMAL. In Qwen3-Embedding's vocab "</s>" is id 128247 with token_type NORMAL: an
- * ordinary BPE merge learnt from web text, not an added token. llama.cpp's list promotes it, so
- * llama.cpp's special-token partitioner isolates "</s>" in the middle of a document and emits it
- * as one token.
- *
- * HuggingFace does not: only `added_tokens` are isolated, "</s>" is not one of them, and the
- * pre-tokeniser splits it at the letter, so the reference tokenisation is three tokens. We follow
- * the vocab as declared, which means we agree with HuggingFace and disagree with llama.cpp on
- * exactly this input. On C++ source containing "</s>" literals, and on fuzzed text, it is the
- * only difference between the two.
- *
- * If this test starts failing because we now match llama.cpp, someone has added a recognise-the-
- * token heuristic, and that is the thing spec §12 exists to remove. */
+/* A deliberate divergence from llama.cpp, pinned so nobody "fixes" it. llama.cpp forces a
+ * hardcoded list of control-looking texts ("<|eot_id|>", "<eos>", "</s>", ...) to CONTROL even when
+ * the container says NORMAL; in Qwen3-Embedding "</s>" is id 128247, NORMAL, an ordinary merge.
+ * HuggingFace isolates only `added_tokens`, so "</s>" splits into three tokens. We follow the
+ * vocab as declared, like HuggingFace; on C++ source and fuzzed text this is the only difference
+ * from llama.cpp. Matching llama.cpp here would mean a recognise-the-token heuristic had been
+ * added, which spec §12 exists to prevent. */
 TEST(does_not_promote_control_looking_tokens) {
-    if (!qwen3e_vocab()) {
-        fprintf(stderr, "  SKIP does_not_promote_control_looking_tokens: vocab not available\n");
-        return;
+    for (const NamedVocab& nv : vocabs()) {
+        REQUIRE(nv.v != nullptr);
+        const int32_t id = nv.v->find("</s>");
+        CHECK(id >= 0);
+        CHECK_EQ(nv.v->type(id), (uint8_t)RAD_TT_NORMAL);
+        Tokenizer t;
+        CHECK_OK(t.init(nv.v));
+        std::vector<int32_t> got;
+        CHECK_OK(t.encode("x </s> y", got, false, /*parse_special=*/true));
+        CHECK(std::find(got.begin(), got.end(), id) == got.end());
     }
-    const int32_t id = qwen3e_vocab()->find("</s>");
-    CHECK(id >= 0);
-    CHECK_EQ(qwen3e_vocab()->type(id), (uint8_t)RAD_TT_NORMAL);
-
-    Tokenizer t;
-    CHECK_OK(t.init(qwen3e_vocab()));
-    std::vector<int32_t> got;
-    CHECK_OK(t.encode("x </s> y", got, false, /*parse_special=*/true));
-    CHECK(std::find(got.begin(), got.end(), id) == got.end());
 }
 
-/* A control token typed by a user must NOT become a role switch. With parse_special off,
+/* A control token typed by a user must not become a role switch. With parse_special off,
  * "<|im_start|>" is ordinary text and tokenises into several ordinary tokens. */
 TEST(special_tokens_are_not_parsed_from_user_text) {
-    if (!need_vocab("special_tokens_are_not_parsed_from_user_text")) return;
-    Tokenizer t;
-    CHECK_OK(t.init(qwen_vocab()));
-
-    std::vector<int32_t> as_special, as_text;
-    CHECK_OK(t.encode("<|im_start|>", as_special, false, true));
-    CHECK_OK(t.encode("<|im_start|>", as_text,    false, false));
-    CHECK_EQ(as_special.size(), (size_t)1);
-    CHECK(as_text.size() > 1);
-    CHECK(as_text != as_special);
+    for (const NamedVocab& nv : vocabs()) {
+        Tokenizer t;
+        CHECK_OK(t.init(nv.v));
+        std::vector<int32_t> as_special, as_text;
+        CHECK_OK(t.encode("<|im_start|>", as_special, false, true));
+        CHECK_OK(t.encode("<|im_start|>", as_text,    false, false));
+        CHECK_EQ(as_special.size(), (size_t)1);
+        CHECK(as_text.size() > 1);
+        CHECK(as_text != as_special);
+    }
 }
 
 /* ================================================================== detokenisation */
 
+/* Streaming one token at a time, as the server drives it: the concatenation of every push() plus
+ * flush() equals the text. On Qwen3-Embedding the ids are llama.cpp's table, including invalid
+ * UTF-8 the byte-level alphabet carried through as bytes; on the synthetic vocabulary they are
+ * its own encoding of every well-formed text in the table. */
 TEST(detokenize_round_trip) {
-    if (!need_vocab("detokenize_round_trip")) return;
-    Tokenizer t;
-    CHECK_OK(t.init(qwen_vocab()));
-
-    for (const Case& c : cases_qwen3e()) {
-        const std::string want = unescape(c.detok ? c.detok : c.text);
-        /* Streaming, one token at a time -- the way the server drives it. The concatenation of
-         * every push() plus flush() must equal the input, byte for byte, including the invalid
-         * UTF-8 the byte-level alphabet carried through as bytes. */
-        Detokenizer d(qwen_vocab(), {}, /*render_special=*/true);
-        std::string got;
-        for (int32_t id : c.ids) got += d.push(id);
-        got += d.flush();
-        CHECK_EQ(got, want);
+    for (const NamedVocab& nv : vocabs()) {
+        Tokenizer t;
+        CHECK_OK(t.init(nv.v));
+        int checked = 0;
+        for (const Case& c : cases_qwen3e()) {
+            std::string want = unescape(c.detok ? c.detok : c.text);
+            std::vector<int32_t> ids = c.ids;
+            if (nv.name != "qwen3e") {
+                want = unescape(c.text);
+                if (utf8_valid_prefix(want) != want.size()) continue;
+                ids.clear();
+                CHECK_OK(t.encode(want, ids, false, true));
+            }
+            Detokenizer d(nv.v, {}, /*render_special=*/true);
+            std::string got;
+            for (int32_t id : ids) got += d.push(id);
+            got += d.flush();
+            CHECK_EQ(got, want);
+            ++checked;
+        }
+        CHECK(checked > 10);
     }
 }
 
-/* Every push() must return COMPLETE UTF-8. A three-byte codepoint that arrives as three separate
- * byte tokens must not appear until its last byte does. */
+/* Every push() must return complete UTF-8. A three-byte codepoint arriving as three byte tokens
+ * must not appear until its last byte does. */
 TEST(detokenize_holds_partial_utf8) {
-    if (!need_vocab("detokenize_holds_partial_utf8")) return;
-    Tokenizer t;
-    CHECK_OK(t.init(qwen_vocab()));
-
-    /* Build the worst case rather than hoping a string produces it: take a three-byte codepoint
-     * and hand the detokeniser its three byte-level tokens one at a time. Every byte-level vocab
-     * has all 256 of them, so this is the same test on any model. */
-    /* U+4EFF, whose three UTF-8 bytes are E4 BB BF -- all of them in the 0xAE..0xFF range the
-     * GPT-2 alphabet maps to ITSELF as a codepoint, so each token's text is that codepoint in
-     * UTF-8 and the test does not have to reimplement the remapping. */
-    const std::string cjk = "\xe4\xbb\xbf";
-    std::vector<int32_t> ids;
-    for (unsigned char b : cjk) {
-        /* Looking the token up rather than encoding the byte is deliberate: a lone continuation
-         * byte is not valid UTF-8 INPUT and encode() would replace it with U+FFFD long before it
-         * reached the vocab. The point of this test is what the DECODER does with such a token. */
-        CHECK(b >= 0xAE);
-        std::string enc;
-        enc += (char)(0xC0 | (b >> 6));
-        enc += (char)(0x80 | (b & 0x3F));
-        const int32_t id = qwen_vocab()->find(enc);
-        CHECK(id >= 0);
-        ids.push_back(id);
-    }
-    CHECK_EQ(ids.size(), (size_t)3);
-
-    Detokenizer d(qwen_vocab());
-    std::string all;
-    bool saw_partial_hold = false;
-    for (int32_t id : ids) {
-        const std::string out = d.push(id);
-        /* Whatever came out is complete UTF-8: no truncated trailing sequence. */
-        size_t i = out.size(), back = 0;
-        while (i > 0 && back < 4) {
-            --i; ++back;
-            const unsigned char ch = (unsigned char)out[i];
-            if ((ch & 0xC0) == 0x80) continue;
-            const size_t need = ch < 0x80 ? 1 : ch < 0xE0 ? 2 : ch < 0xF0 ? 3 : 4;
-            CHECK_EQ(need, out.size() - i);
-            break;
+    for (const NamedVocab& nv : vocabs()) {
+        /* The worst case directly: a three-byte codepoint's byte-level tokens one at a time.
+         * Every byte-level vocab has all 256, so this works on any model. U+4EFF is E4 BB BF,
+         * all in the 0xAE..0xFF range the GPT-2 alphabet maps to itself, so each token's text
+         * is that codepoint in UTF-8. */
+        const std::string cjk = "\xe4\xbb\xbf";
+        std::vector<int32_t> ids;
+        for (unsigned char b : cjk) {
+            /* Looked up rather than encoded: a lone continuation byte is invalid UTF-8 input
+             * and encode() would replace it with U+FFFD. This tests the decoder. */
+            CHECK(b >= 0xAE);
+            std::string enc;
+            enc += (char)(0xC0 | (b >> 6));
+            enc += (char)(0x80 | (b & 0x3F));
+            const int32_t id = nv.v->find(enc);
+            CHECK(id >= 0);
+            ids.push_back(id);
         }
-        if (out.empty()) saw_partial_hold = true;
-        all += out;
+        CHECK_EQ(ids.size(), (size_t)3);
+
+        Detokenizer d(nv.v);
+        std::string all;
+        bool saw_partial_hold = false;
+        for (int32_t id : ids) {
+            const std::string out = d.push(id);
+            CHECK_EQ(utf8_valid_prefix(out), out.size());
+            if (out.empty()) saw_partial_hold = true;
+            all += out;
+        }
+        all += d.flush();
+        CHECK_EQ(all, cjk);
+        CHECK(saw_partial_hold);   /* at least one push held everything back */
     }
-    all += d.flush();
-    CHECK_EQ(all, cjk);
-    CHECK(saw_partial_hold);   /* at least one push held everything back */
 }
 
 /* The straddle: a stop string arriving across several tokens must never be partially emitted. */
 TEST(detokenize_stop_string_straddle) {
-    if (!need_vocab("detokenize_stop_string_straddle")) return;
-    Tokenizer t;
-    CHECK_OK(t.init(qwen_vocab()));
+    for (const NamedVocab& nv : vocabs()) {
+        Tokenizer t;
+        CHECK_OK(t.init(nv.v));
+        const std::string body = "the answer is 42";
+        const std::string stop = "</tool_call>";
+        std::vector<int32_t> ids;
+        CHECK_OK(t.encode(body + stop + " and this must never be seen", ids, false, true));
 
-    const std::string body = "the answer is 42";
-    const std::string stop = "</tool_call>";
-    std::vector<int32_t> ids;
-    CHECK_OK(t.encode(body + stop + " and this must never be seen", ids, false, true));
-
-    Detokenizer d(qwen_vocab(), { stop });
-    std::string emitted;
-    for (int32_t id : ids) {
-        const std::string out = d.push(id);
-        emitted += out;
-        /* Nothing emitted so far may contain any part of the stop string as a suffix, which is
-         * the property that makes the emitted text safe to forward to a client immediately. */
-        for (size_t n = 1; n < stop.size(); ++n) {
-            if (emitted.size() >= n)
-                CHECK(emitted.compare(emitted.size() - n, n, stop, 0, n) != 0);
+        Detokenizer d(nv.v, { stop });
+        std::string emitted;
+        for (int32_t id : ids) {
+            emitted += d.push(id);
+            /* No emitted suffix may be a prefix of the stop string; that is what makes emitted
+             * text safe to forward to a client immediately. */
+            for (size_t n = 1; n < stop.size(); ++n)
+                if (emitted.size() >= n) CHECK(emitted.compare(emitted.size() - n, n, stop, 0, n) != 0);
         }
+        CHECK(d.stopped());
+        CHECK_EQ(d.stop_hit(), stop);
+        CHECK_EQ(emitted, body);
+        /* flush() after a stop yields nothing: the tail was discarded, not buffered. */
+        CHECK_EQ(d.flush(), std::string());
     }
-    CHECK(d.stopped());
-    CHECK_EQ(d.stop_hit(), stop);
-    CHECK_EQ(emitted, body);
-    /* flush() after a stop yields nothing: the tail was discarded, not buffered. */
-    CHECK_EQ(d.flush(), std::string());
 }
 
 /* A reply that starts inside its reasoning block: a stop string written while thinking is text,
  * not a stop, and the first one after the closer cuts as usual. */
 TEST(detokenize_stops_wait_for_the_reasoning_closer) {
-    if (!need_vocab("detokenize_stops_wait_for_the_reasoning_closer")) return;
-    Tokenizer t;
-    CHECK_OK(t.init(qwen_vocab()));
+    for (const NamedVocab& nv : vocabs()) {
+        Tokenizer t;
+        CHECK_OK(t.init(nv.v));
+        const std::string think = "restating it, Q: what is two and two</think>";
+        std::vector<int32_t> ids;
+        CHECK_OK(t.encode(think + "The answer is 4. Q: next", ids, false, true));
+        Detokenizer d(nv.v, { "Q:" });
+        d.defer_stops_until("</think>");
+        std::string s;
+        for (int32_t id : ids) {
+            s += d.push(id);
+            if (d.stopped()) break;
+        }
+        CHECK(d.stopped());
+        CHECK_EQ(d.stop_hit(), std::string("Q:"));
+        CHECK_EQ(s, think + "The answer is 4. ");
 
-    const std::string think = "restating it, Q: what is two and two</think>";
-    std::vector<int32_t> ids;
-    CHECK_OK(t.encode(think + "The answer is 4. Q: next", ids, false, true));
-    Detokenizer d(qwen_vocab(), { "Q:" });
-    d.defer_stops_until("</think>");
-    std::string s;
-    for (int32_t id : ids) {
-        s += d.push(id);
-        if (d.stopped()) break;
+        /* Without the deferral the same text stops inside the reasoning. */
+        Detokenizer plain(nv.v, { "Q:" });
+        std::string p;
+        for (int32_t id : ids) {
+            p += plain.push(id);
+            if (plain.stopped()) break;
+        }
+        CHECK_EQ(p, std::string("restating it, "));
     }
-    CHECK(d.stopped());
-    CHECK_EQ(d.stop_hit(), std::string("Q:"));
-    CHECK_EQ(s, think + "The answer is 4. ");
-
-    /* Without the deferral the same text stops inside the reasoning. */
-    Detokenizer plain(qwen_vocab(), { "Q:" });
-    std::string p;
-    for (int32_t id : ids) {
-        p += plain.push(id);
-        if (plain.stopped()) break;
-    }
-    CHECK_EQ(p, std::string("restating it, "));
 }
 
 /* A stop string that never completes must be released at flush() rather than swallowed. */
 TEST(detokenize_incomplete_stop_is_flushed) {
-    if (!need_vocab("detokenize_incomplete_stop_is_flushed")) return;
-    Tokenizer t;
-    CHECK_OK(t.init(qwen_vocab()));
-
-    std::vector<int32_t> ids;
-    CHECK_OK(t.encode("done </tool", ids, false, true));
-    Detokenizer d(qwen_vocab(), { "</tool_call>" });
-    std::string s;
-    for (int32_t id : ids) s += d.push(id);
-    CHECK(!d.stopped());
-    s += d.flush();
-    CHECK_EQ(s, std::string("done </tool"));
+    for (const NamedVocab& nv : vocabs()) {
+        Tokenizer t;
+        CHECK_OK(t.init(nv.v));
+        std::vector<int32_t> ids;
+        CHECK_OK(t.encode("done </tool", ids, false, true));
+        Detokenizer d(nv.v, { "</tool_call>" });
+        std::string s;
+        for (int32_t id : ids) s += d.push(id);
+        CHECK(!d.stopped());
+        s += d.flush();
+        CHECK_EQ(s, std::string("done </tool"));
+    }
 }
 
 /* ================================================================== byte level */
 
 /* The GPT-2 alphabet, spot-checked at every boundary of the three literal ranges plus the
- * remapped run. Getting one of these wrong costs 20% of the prompt length and nothing else,
- * which is why it is pinned rather than trusted. */
+ * remapped run. A wrong entry silently costs about 20% of the prompt length, so it is pinned. */
 TEST(bytelevel_alphabet_is_exact) {
-    if (!need_vocab("bytelevel_alphabet_is_exact")) return;
-    Tokenizer t;
-    CHECK_OK(t.init(qwen_vocab()));
+    for (const NamedVocab& nv : vocabs()) {
+        Tokenizer t;
+        CHECK_OK(t.init(nv.v));
+        /* Space (0x20) is not in a literal range, so it is remapped, to U+0120 'Ġ'; every
+         * byte-level vocab is built on that. */
+        const int32_t g = nv.v->find("\xc4\xa0");
+        CHECK(g >= 0);
+        std::vector<int32_t> ids;
+        CHECK_OK(t.encode(" ", ids, false, true));
+        CHECK_EQ(ids.size(), (size_t)1);
+        CHECK_EQ(ids[0], g);
 
-    /* Space is byte 0x20, which is NOT in a literal range, so it is the first remapped byte and
-     * maps to U+0100 'Ġ'. That single fact is the one every byte-level vocab is built on. */
-    const int32_t g = qwen_vocab()->find("\xc4\xa0");           /* U+0120 = 'Ġ' */
-    CHECK(g >= 0);
-    std::vector<int32_t> ids;
-    CHECK_OK(t.encode(" ", ids, false, true));
-    CHECK_EQ(ids.size(), (size_t)1);
-    CHECK_EQ(ids[0], g);
+        /* Newline (0x0A) is the eleventh remapped byte, U+010A 'Ċ'. */
+        const int32_t nl = nv.v->find("\xc4\x8a");
+        ids.clear();
+        CHECK_OK(t.encode("\n", ids, false, true));
+        CHECK_EQ(ids.size(), (size_t)1);
+        CHECK_EQ(ids[0], nl);
+        /* llama.cpp prints it as the LF token, id 198 in Qwen3-Embedding. */
+        if (nv.name == "qwen3e") CHECK_EQ(nl, 198);
 
-    /* Newline is 0x0A, the eleventh remapped byte, U+010A 'Ċ'. llama.cpp prints it as the LF
-     * token at id 198 for this vocab. */
-    ids.clear();
-    CHECK_OK(t.encode("\n", ids, false, true));
-    CHECK_EQ(ids.size(), (size_t)1);
-    CHECK_EQ(ids[0], 198);
-    CHECK_EQ(qwen_vocab()->text(198), std::string("\xc4\x8a"));  /* U+010A */
-
-    /* '!' is 0x21, the first byte of the first literal range, and stands for itself. */
-    CHECK(qwen_vocab()->find("!") >= 0);
-    /* 0x7E '~' is the last of it. */
-    CHECK(qwen_vocab()->find("~") >= 0);
+        /* '!' is 0x21, the first byte of the first literal range, and stands for itself; 0x7E
+         * '~' is its last. */
+        CHECK(nv.v->find("!") >= 0);
+        CHECK(nv.v->find("~") >= 0);
+        CHECK_EQ(t.piece(g), std::string(" "));
+        CHECK_EQ(t.piece(nl), std::string("\n"));
+    }
 }
 
 /* ================================================================== normalisation */
 
-/* Pinned vectors from UAX #15. The tables themselves are generated from ICU
- * (core/text/unicode_norm_data.cpp); these are the cases that would break first if the tables
- * were regenerated wrong. */
+/* Pinned vectors from UAX #15. The tables are generated from ICU
+ * (core/text/unicode_norm_data.cpp); these cases would break first if they were regenerated
+ * wrong. */
 TEST(unicode_normalisation) {
     auto cpts = [](std::initializer_list<uint32_t> v) { return std::vector<uint32_t>(v); };
+    /* The four forms, as the tokeniser composes them from the two steps. */
+    auto form = [](bool compat, bool compose) {
+        return [=](std::vector<uint32_t> v) {
+            unorm_decompose(v, compat);
+            if (compose) unorm_compose(v);
+            return v;
+        };
+    };
+    const auto unorm_nfd = form(false, false), unorm_nfkd = form(true, false);
+    const auto unorm_nfc = form(false, true), unorm_nfkc = form(true, true);
 
-    /* Composed vs decomposed Angstrom: U+00C5 decomposes to A + ring, and U+212B (the Angstrom
-     * SIGN) is a singleton that NFC folds onto U+00C5 rather than back onto itself. */
+    /* Composed vs decomposed Angstrom: U+00C5 decomposes to A + ring, and U+212B (ANGSTROM SIGN)
+     * is a singleton that NFC folds onto U+00C5, not back onto itself. */
     CHECK(unorm_nfd(cpts({0x00C5})) == cpts({0x0041, 0x030A}));
     CHECK(unorm_nfc(cpts({0x0041, 0x030A})) == cpts({0x00C5}));
     CHECK(unorm_nfc(cpts({0x212B})) == cpts({0x00C5}));
@@ -528,8 +561,8 @@ TEST(gguf_reader) {
     CHECK(!g.kv().empty());
     CHECK(!g.tensors().empty());
 
-    /* The architecture names its own metadata prefix, which is the one GGUF convention a reader
-     * has to know: `general.architecture` is "qwen3" and the dimensions are under "qwen3.*". */
+    /* The architecture names its own metadata prefix, the one GGUF convention a reader must know:
+     * `general.architecture` is "qwen3" and the dimensions are under "qwen3.*". */
     std::string arch;
     CHECK(g.get_str("general.architecture", &arch));
     CHECK(!arch.empty());
@@ -556,7 +589,7 @@ TEST(gguf_reader) {
     CHECK(g.tensor(first.name) == &first);
     CHECK(g.tensor("this tensor does not exist") == nullptr);
 
-    /* A missing key is a false return and not a fabricated default. */
+    /* A missing key returns false and leaves the output untouched. */
     int64_t v = 12345;
     CHECK(!g.get_i64("no.such.key", &v));
     CHECK_EQ(v, (int64_t)12345);
@@ -594,34 +627,51 @@ struct GgufBytes {
     }
     /* One tensor record, then the data section padded to the default alignment. */
     void tensor(const std::vector<int64_t>& ne, uint32_t type, size_t data_bytes) {
-        str("w");
+        info("w", ne, type, 0);
+        pad(32);
+        b.insert(b.end(), data_bytes, 0);
+    }
+    void kv_u32(const std::string& key, uint32_t v) {
+        str(key);
+        pod<uint32_t>(GGUF_U32);
+        pod<uint32_t>(v);
+    }
+    /* A tensor record alone, for files with several tensors or a chosen offset. */
+    void info(const std::string& name, const std::vector<int64_t>& ne, uint32_t type,
+              uint64_t offset) {
+        str(name);
         pod<uint32_t>((uint32_t)ne.size());
         for (int64_t n : ne) pod<int64_t>(n);
         pod<uint32_t>(type);
-        pod<uint64_t>(0);
-        while (b.size() % 32) b.push_back(0);
-        b.insert(b.end(), data_bytes, 0);
+        pod<uint64_t>(offset);
     }
+    void pad(size_t align) {
+        while (b.size() % align) b.push_back(0);
+    }
+    std::string path() const { return radtest::tmp_path("bytes.gguf"); }
+    bool write(const std::string& p) const {
+        FILE* f = fopen(p.c_str(), "wb");
+        if (!f) return false;
+        const bool ok = fwrite(b.data(), 1, b.size(), f) == b.size();
+        return fclose(f) == 0 && ok;
+    }
+    /* Unlinked once opened: `g` keeps its mapping, and the next write to the path makes a new
+     * file rather than truncating one still mapped. */
     int open(GgufFile* g) const {
-        const char* dir = std::getenv("TMPDIR");
-        const std::string path = std::string(dir && *dir ? dir : "/tmp") + "/radgguf_" +
-                                 std::to_string((long)::getpid()) + ".gguf";
-        FILE* f = fopen(path.c_str(), "wb");
-        if (!f) return RAD_E_IO;
-        fwrite(b.data(), 1, b.size(), f);
-        fclose(f);
-        const int st = g->open(path.c_str());
-        ::unlink(path.c_str());
+        const std::string p = path();
+        if (!write(p)) return RAD_E_IO;
+        const int st = g->open(p.c_str());
+        ::unlink(p.c_str());
         return st;
     }
 };
 
 }  /* namespace */
 
-/* COUNTS AND DIMENSIONS IN A GGUF ARE THE FILE'S CLAIMS, NOT FACTS. A string array's count that
- * sizes a reservation before a single string is read ends the converter at 2^60; the product of
- * a tensor's dimensions can wrap, to a tensor of zero bytes that passes the bounds check while its
- * dimensions say it is vast. Each is refused against what the file can hold. */
+/* Counts and dimensions in a GGUF are the file's claims, not facts. A string-array count that
+ * sizes a reservation before any string is read would end the converter at 2^60; a product of
+ * tensor dimensions can wrap to a zero-byte tensor that passes the bounds check while claiming to
+ * be vast. Each is checked against what the file can hold. */
 TEST(gguf_refuses_counts_and_sizes_its_file_cannot_hold) {
     {
         GgufBytes f;                    /* a string array of 2^60 */
@@ -662,7 +712,7 @@ TEST(gguf_refuses_counts_and_sizes_its_file_cannot_hold) {
         CHECK_EQ(f.open(&g), RAD_E_FORMAT);
     }
     {
-        /* And a well-formed file with each of those shapes at a sane size opens and reads. */
+        /* A well-formed file with each of those shapes at a sane size opens and reads. */
         GgufBytes f;
         f.header(1, 2);
         f.str("general.name"); f.pod<uint32_t>(GGUF_STR); f.str("t");
@@ -680,11 +730,133 @@ TEST(gguf_refuses_counts_and_sizes_its_file_cannot_hold) {
     }
 }
 
+namespace {
+
+/* A small well-formed GGUF holding every kind of entry the reader walks: a string, a u32, a
+ * bool, a string array and an f32 array as KVs, general.alignment 64, and two tensors whose data
+ * (bytes 1, 2, ... in the first, 101, 102, ... in the second) ends the file. */
+GgufBytes small_gguf() {
+    GgufBytes f;
+    f.header(2, 5);
+    f.str("general.name"); f.pod<uint32_t>(GGUF_STR); f.str("t");
+    f.kv_u32("general.alignment", 64);
+    f.str("x.flag"); f.pod<uint32_t>(GGUF_BOOL); f.pod<uint8_t>(1);
+    f.str("tokenizer.ggml.tokens");
+    f.pod<uint32_t>(GGUF_ARR); f.pod<uint32_t>(GGUF_STR); f.pod<uint64_t>(2);
+    f.str("a"); f.str("bc");
+    f.str("tokenizer.ggml.scores");
+    f.pod<uint32_t>(GGUF_ARR); f.pod<uint32_t>(GGUF_F32); f.pod<uint64_t>(2);
+    f.pod<float>(0.5f); f.pod<float>(-1.0f);
+    f.info("a", { 4, 2 }, 0, 0);     /* f32, 32 bytes */
+    f.info("b", { 8 }, 30, 64);      /* bf16, 16 bytes */
+    f.pad(64);
+    for (int i = 1; i <= 32; ++i) f.b.push_back((uint8_t)i);
+    f.pad(64);
+    for (int i = 101; i <= 116; ++i) f.b.push_back((uint8_t)i);
+    return f;
+}
+
+}  /* namespace */
+
+/* The reader hands out pointers into a mapping of the file, so a file cut short anywhere (a
+ * partial download, a full disk) must be refused, never read past its end. Every prefix of a
+ * well-formed file is one; under ASan an over-read in any of the reader's walks fails here. */
+TEST(every_truncation_of_a_gguf_is_refused) {
+    const GgufBytes f = small_gguf();
+    const std::string p = f.path();
+    REQUIRE(f.write(p));
+    {
+        GgufFile g;
+        CHECK_OK(g.open(p.c_str()));
+        CHECK_EQ(g.alignment(), (uint64_t)64);
+        CHECK_EQ(g.kv().size(), (size_t)5);
+        const GgufTensor* b = g.tensor("b");
+        REQUIRE(b != nullptr);
+        CHECK_EQ(g.data_off() % 64, (uint64_t)0);
+        CHECK_EQ(b->bytes, (uint64_t)16);
+        const uint8_t* d = static_cast<const uint8_t*>(g.tensor_data(*b));
+        REQUIRE(d != nullptr);
+        CHECK_EQ(d[0], 101);
+        CHECK_EQ(d[15], 116);
+    }
+    /* Each refusal logs a line; they are kept out of the test output. */
+    std::vector<std::string> wrong;
+    size_t opened = 0;
+    stderr_of([&] {
+        for (size_t n = f.b.size(); n-- > 0;) {
+            if (::truncate(p.c_str(), (off_t)n) != 0) {
+                wrong.push_back("truncate failed");
+                break;
+            }
+            GgufFile g;
+            const int st = g.open(p.c_str());
+            ++opened;
+            /* An empty file cannot be mapped: an I/O error, not a format error. */
+            if (st != (n == 0 ? RAD_E_IO : RAD_E_FORMAT) || g.is_open())
+                wrong.push_back("a " + std::to_string(n) + "-byte prefix: status " +
+                                std::to_string(st));
+        }
+    });
+    for (const std::string& w : wrong) ::radtest::fail(__FILE__, __LINE__, w);
+    CHECK_EQ(opened, f.b.size());
+}
+
+/* A tensor must start on the file's alignment, as ggml's reader requires: tensor_data() hands out
+ * pointers into the mapping, and a reader with aligned vector loads faults on one that is off it.
+ * A misplaced offset is also what a writer that disagrees about the alignment produces, so the
+ * tensor would be read from the wrong bytes. */
+TEST(a_gguf_tensor_off_the_files_alignment_is_refused) {
+    auto two_tensors = [](uint64_t second) {
+        GgufBytes f;
+        f.header(2, 0);
+        f.info("a", { 2 }, 0, 0);
+        f.info("b", { 2 }, 0, second);
+        f.pad(32);
+        f.b.insert(f.b.end(), (size_t)second + 8, 0);
+        return f;
+    };
+    GgufFile g;
+    CHECK_OK(two_tensors(32).open(&g));
+    GgufFile h;
+    CHECK_EQ(two_tensors(8).open(&h), RAD_E_FORMAT);
+    GgufFile k;
+    CHECK_EQ(two_tensors(16).open(&k), RAD_E_FORMAT);
+}
+
+/* general.alignment places the data section. A value ggml would refuse (not a power of two,
+ * zero, not an integer) is refused rather than replaced by the default, which would read every
+ * tensor from where no writer put it. */
+TEST(a_gguf_alignment_that_is_not_a_power_of_two_is_refused) {
+    /* One tensor, padded so that it lies inside the file wherever any of these alignments (the
+     * default 32 included) places the data: only the declared value is wrong. */
+    auto aligned = [](const std::function<void(GgufBytes&)>& alignment_kv) {
+        GgufBytes f;
+        f.header(1, 1);
+        alignment_kv(f);
+        f.info("w", { 2 }, 0, 0);
+        f.pad(96);
+        f.b.insert(f.b.end(), 8, 0);
+        return f;
+    };
+    GgufFile g;
+    CHECK_OK(aligned([](GgufBytes& f) { f.kv_u32("general.alignment", 32); }).open(&g));
+    CHECK_EQ(g.alignment(), (uint64_t)32);
+    for (uint32_t bad : { 48u, 0u, 96u }) {
+        GgufFile h;
+        CHECK_EQ(aligned([&](GgufBytes& f) { f.kv_u32("general.alignment", bad); }).open(&h),
+                 RAD_E_FORMAT);
+    }
+    GgufFile k;                        /* a string where the alignment belongs */
+    CHECK_EQ(aligned([](GgufBytes& f) {
+                 f.str("general.alignment"); f.pod<uint32_t>(GGUF_STR); f.str("32");
+             }).open(&k), RAD_E_FORMAT);
+}
+
 /* ================================================================== the vocab section */
 
 namespace {
-/* The minimum a StringSink has to be: rad-convert's real one dedupes; this one does not need to,
- * because the test is about the offsets being read back the way they were written. */
+/* A minimal StringSink: rad-convert's dedupes, this one need not, since the test is about offsets
+ * being read back as written. */
 struct TestStrings : StringSink {
     std::string blob{ '\0' };   /* offset 0 is the empty string, per rad_format.h */
     rad_stroff intern(std::string_view s) override {
@@ -715,10 +887,10 @@ TEST(vocab_section_round_trip) {
 
     TestStrings strings;
     std::vector<uint8_t> section;
-    /* Lay the file out the way rad-convert would: header, then the string blob, then the vocab
-     * section. The offsets the serialiser writes are absolute, so the section has to know where
-     * it lands before it is written -- and it lands 8-aligned, as the writer places it, because
-     * the reader takes the header as a typed pointer into the file. */
+    /* Lay the file out as rad-convert does: header, string blob, vocab section. The serialiser
+     * writes absolute offsets, so the section must know where it lands before it is written, and
+     * it lands 8-aligned, as the writer places it, because the reader takes the header as a typed
+     * pointer into the file. */
     const uint64_t str_off = sizeof(RadFileHeader);
     CHECK_OK(vocab_serialize(in, strings, 0, section));   /* pass 1: sizes only */
     const uint64_t sec_off = (str_off + strings.blob.size() + 7) & ~(uint64_t)7;
@@ -760,7 +932,7 @@ TEST(vocab_section_round_trip) {
         CHECK_EQ(out.steps[i].iarg, in.steps[i].iarg);
     }
 
-    /* And the round-tripped vocab actually tokenises. */
+    /* The round-tripped vocab tokenises. */
     auto v = std::make_shared<Vocab>();
     CHECK_OK(v->load(std::move(out)));
     Tokenizer t;
@@ -774,9 +946,9 @@ TEST(vocab_section_round_trip) {
 /* ================================================================== tokenizer.json */
 
 TEST(parse_tokenizer_json_chain) {
-    /* A miniature Qwen-shaped tokenizer.json: byte-level BPE with an explicit Split. The point
-     * of the test is the CHAIN, not the vocab -- that the declared steps come out in the
-     * declared order with the declared arguments. */
+    /* A miniature Qwen-shaped tokenizer.json: byte-level BPE with an explicit Split. The test is
+     * about the chain, not the vocab: the declared steps come out in declared order with the
+     * declared arguments. */
     const char* js = R"JSON({
       "added_tokens": [ {"id": 4, "content": "<|end|>", "special": true} ],
       "normalizer": { "type": "Sequence", "normalizers": [ {"type": "NFC"},
@@ -809,8 +981,8 @@ TEST(parse_tokenizer_json_chain) {
     CHECK_EQ(vb.steps[4].kind, (uint32_t)RAD_DEC_BYTELEVEL);
 }
 
-/* A component we cannot express must FAIL rather than be dropped. That refusal is the whole
- * point of interpreting tokenizer.json instead of hashing it. */
+/* A component we cannot express must fail, not be dropped; that refusal is why tokenizer.json is
+ * interpreted rather than hashed. */
 TEST(parse_tokenizer_json_refuses_unknown_components) {
     const char* js = R"JSON({
       "normalizer": { "type": "Precompiled", "precompiled_charsmap": "AAAA" },
@@ -821,6 +993,39 @@ TEST(parse_tokenizer_json_refuses_unknown_components) {
     CHECK_EQ(parse_tokenizer_json_buf(js, "test.json", vb), RAD_E_UNSUPPORTED);
 }
 
+/* A step the tokenizer does not run is refused at load, not passed over on every encode. */
+TEST(a_vocab_with_an_unknown_step_does_not_load) {
+    for (uint32_t kind : { 9u, 39u, 70u, 200u }) {
+        VocabBuild vb;
+        vb.kind = RAD_TOK_BPE;
+        vb.tokens = { "a" };
+        VocabStep s;
+        s.kind = kind;
+        vb.steps.push_back(s);
+        Vocab v;
+        CHECK_EQ(v.load(std::move(vb)), RAD_E_UNSUPPORTED);
+    }
+}
+
+/* A unigram piece is matched at any length, as SentencePiece's trie matches it: a 300-byte piece
+ * that scores best is one token, not 300 single bytes. */
+TEST(a_unigram_piece_longer_than_256_bytes_is_matched) {
+    const std::string longest(300, 'a');
+    VocabBuild vb;
+    vb.kind = RAD_TOK_UNIGRAM;
+    vb.tokens = { "<unk>", "a", longest };
+    vb.scores = { 0.0f, -10.0f, -1.0f };
+    vb.unk = 0;
+    auto v = std::make_shared<Vocab>();
+    CHECK_OK(v->load(std::move(vb)));
+    Tokenizer t;
+    CHECK_OK(t.init(v));
+    std::vector<int32_t> ids;
+    CHECK_OK(t.encode(longest, ids, /*add_special=*/false, /*parse_special=*/false));
+    CHECK_EQ(ids.size(), (size_t)1);
+    if (!ids.empty()) CHECK_EQ(ids[0], 2);
+}
+
 TEST(parse_tokenizer_json_rejects_bpe_without_pretokenizer) {
     const char* js = R"JSON({
       "model": { "type": "BPE", "vocab": {"a": 0}, "merges": [] }
@@ -829,10 +1034,10 @@ TEST(parse_tokenizer_json_rejects_bpe_without_pretokenizer) {
     CHECK_EQ(parse_tokenizer_json_buf(js, "test.json", vb), RAD_E_FORMAT);
 }
 
-/* AN ID IS AN INDEX THE MOMENT IT IS READ. The token table is sized from the largest id and then
+/* An id is an index as soon as it is read. The token table is sized from the largest id and
  * written at each one, so a negative id writes outside it, a huge one sizes it to tens of
- * gigabytes, and a value of the wrong JSON type throws out of the reader and ends the converter.
- * Every one of these is a malformed file and comes back as a refusal. */
+ * gigabytes, and a value of the wrong JSON type would throw out of the reader and end the
+ * converter. Each malformed file must come back as a refusal. */
 TEST(parse_tokenizer_json_refuses_ids_and_values_it_cannot_place) {
     const std::string pre =
         R"("pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "use_regex": true})";
@@ -871,7 +1076,7 @@ TEST(parse_tokenizer_json_refuses_ids_and_values_it_cannot_place) {
                     R"( "merges": [[1, 2], ["a", "b"]]}})", "test.json", vb));
     CHECK_EQ(vb.merges.size(), (size_t)1);
 
-    /* And a sparse but sane table still loads: the gap is empty text. */
+    /* A sparse but sane table still loads: the gap is empty text. */
     CHECK_OK(parse_tokenizer_json_buf(bpe(R"({"a": 0, "b": 5})", ""), "test.json", vb));
     CHECK_EQ(vb.tokens.size(), (size_t)6);
     CHECK_EQ(vb.tokens[5], std::string("b"));
@@ -903,13 +1108,19 @@ TEST(unigram_viterbi) {
     CHECK_EQ(ids.size(), (size_t)2);
     CHECK_EQ(ids[0], 2);
     CHECK_EQ(ids[1], 6);
-    CHECK_EQ(t.decode(ids), std::string(" hello"));
+    /* HuggingFace's Metaspace decoder drops the replacement the prepend added on the first
+     * token, so decode() and the streaming Detokenizer agree. */
+    CHECK_EQ(t.decode(ids), std::string("hello"));
+    Detokenizer d(v);
+    std::string streamed;
+    for (int32_t id : ids) streamed += d.push(id);
+    streamed += d.flush();
+    CHECK_EQ(streamed, std::string("hello"));
 }
 
-/* A UNIGRAM VOCABULARY WITH NO UNK TOKEN still routes text no piece covers through the unk
- * transition, and the id of that transition is then -1: a token id no vocabulary has, handed to
- * the model as input. It is spelled as byte tokens when the chain declares byte fallback, and
- * dropped otherwise -- what the BPE encoder does with a piece it cannot match. */
+/* A Unigram vocabulary with no unk token still routes uncovered text through the unk transition,
+ * whose id is then -1, an id no vocabulary has. It must be spelled as byte tokens when the chain
+ * declares byte fallback and dropped otherwise, as the BPE encoder does with an unmatched piece. */
 TEST(unigram_without_an_unk_token_never_emits_an_invalid_id) {
     auto encode = [](const char* js, const char* text) {
         std::vector<int32_t> ids;
@@ -941,8 +1152,8 @@ TEST(unigram_without_an_unk_token_never_emits_an_invalid_id) {
     CHECK(spelled == (std::vector<int32_t>{ 1, 6, 7, 8, 9, 4, 5 }));
 }
 
-/* A special id is emitted as it stands, so one naming no token -- which a GGUF or a container can
- * carry, since nothing else checks them -- is treated as absent rather than handed out. */
+/* A special id is emitted as is, so one naming no token (a GGUF or container can carry one;
+ * nothing else checks) is treated as absent. */
 TEST(vocab_treats_an_out_of_range_special_id_as_absent) {
     VocabBuild vb;
     vb.kind   = RAD_TOK_BPE;
@@ -957,10 +1168,10 @@ TEST(vocab_treats_an_out_of_range_special_id_as_absent) {
     CHECK_EQ(v->pad(), -1);
 }
 
-/* The checkpoint's own end-of-generation list -- generation_config.json's eos_token_id, which the
- * container carries as `generation.eos_token_id` -- ends a generation on every id it names: Gemma 4
- * names <|tool_response> there, where the model stops after its calls. An id naming no token is
- * no id. */
+/* The checkpoint's end-of-generation list (generation_config.json's eos_token_id, carried as
+ * `generation.eos_token_id`) ends a generation on every id it names; Gemma 4 names
+ * <|tool_response> there, where the model stops after its calls. An id naming no token is
+ * ignored. */
 TEST(vocab_ends_a_generation_on_every_id_the_checkpoint_names) {
     VocabBuild vb;
     vb.kind   = RAD_TOK_BPE;
@@ -977,9 +1188,9 @@ TEST(vocab_ends_a_generation_on_every_id_the_checkpoint_names) {
     CHECK_EQ(v->eog().size(), (size_t)2);
 }
 
-/* The names the loader completes the set from, for a container that declares one eos and no list:
- * Gemma 4's turn end and its tool-response opener end a generation; `</s>` does not where the
- * vocabulary has a turn marker of its own, and does where it has none. */
+/* For a container that declares one eos and no list, the loader completes the set from known
+ * names: Gemma 4's turn end and tool-response opener end a generation; `</s>` does not where the
+ * vocabulary has its own turn marker, and does where it has none. */
 TEST(vocab_completes_the_end_set_from_known_control_names_and_keeps_a_turn_vocabularys_s_tag_as_text) {
     VocabBuild vb;
     vb.kind   = RAD_TOK_BPE;
@@ -1006,9 +1217,8 @@ TEST(vocab_completes_the_end_set_from_known_control_names_and_keeps_a_turn_vocab
 /* ================================================================== chain steps */
 
 TEST(step_chain_units) {
-    /* A vocab whose tokens are single characters, so the test observes the SPLIT rather than the
-     * merges. Each case installs one step and checks what the pre-tokeniser produced by looking
-     * at how many tokens came out. */
+    /* A vocab of single-character tokens, so the test observes the split rather than the
+     * merges. Each case installs one step and counts the tokens that come out. */
     auto make = [](std::vector<VocabStep> steps) {
         VocabBuild vb;
         vb.kind = RAD_TOK_BPE;
@@ -1063,14 +1273,11 @@ TEST(step_chain_units) {
     }
 }
 
-RAD_TEST_MAIN()
-
 /* ================================================================== utf8_sanitize */
 
-/* A byte-fallback vocab can emit a byte that no continuation completes, and the completion goes
- * into a JSON string, where one bad byte costs the client the whole response rather than one
- * character. These are the WHATWG cases: one U+FFFD per maximal subpart, well-formed input
- * untouched. */
+/* A byte-fallback vocab can emit a byte no continuation completes, and the completion goes into a
+ * JSON string, where one bad byte costs the client the whole response. These are the WHATWG
+ * cases: one U+FFFD per maximal subpart, well-formed input untouched. */
 TEST(utf8_sanitize_repairs_only_what_is_broken) {
     const std::string fffd = "\xEF\xBF\xBD";
 
@@ -1080,8 +1287,8 @@ TEST(utf8_sanitize_repairs_only_what_is_broken) {
              std::string("caf\xC3\xA9 \xE6\x97\xA5 \xF0\x9F\x98\x80"));
     CHECK_EQ(utf8_sanitize(""), std::string(""));
 
-    /* 0xC1 is a lead for an encoding that would be overlong, so it is never legal however it
-     * continues -- and a single one of them reaching a JSON string is a 500 for the client. */
+    /* 0xC1 leads an overlong encoding, so it is never legal however it continues; one in a JSON
+     * string is a 500 for the client. */
     CHECK_EQ(utf8_sanitize("\xC1"), fffd);
     CHECK_EQ(utf8_sanitize("a\xC1\x61z"), "a" + fffd + "az");
 
@@ -1089,7 +1296,7 @@ TEST(utf8_sanitize_repairs_only_what_is_broken) {
     CHECK_EQ(utf8_sanitize("\x80"), fffd);
     CHECK_EQ(utf8_sanitize("\xFF"), fffd);
 
-    /* Truncated three-byte character: ONE replacement for the whole subpart, not two. */
+    /* Truncated three-byte character: one replacement for the whole subpart, not two. */
     CHECK_EQ(utf8_sanitize("\xE6\x97"), fffd);
     CHECK_EQ(utf8_sanitize("\xE6\x97 "), fffd + " ");
 
@@ -1102,10 +1309,9 @@ TEST(utf8_sanitize_repairs_only_what_is_broken) {
 
 /* ================================================================== the ggml dtype map
  *
- * THE BLOCK QUANTS ARE DELIBERATELY ABSENT, and that absence is the property under test.
- * Reinterpreting a q4_K block as RAD_I4 produces a tensor that loads, computes, and is wrong --
- * which is the failure class this project exists to remove -- so rad-convert has to be told
- * "no equivalent" and dequantise or refuse, rather than being handed a plausible code.
+ * The block quants are deliberately absent, and that absence is under test. Reinterpreting a
+ * q4_K block as RAD_I4 would give a tensor that loads, computes and is wrong, so rad-convert must
+ * be told "no equivalent" and dequantise or refuse.
  */
 TEST(the_ggml_dtype_map_carries_only_the_types_that_mean_the_same_thing) {
     CHECK_EQ(gguf_to_rad_dtype(0),  (uint32_t)RAD_F32);
@@ -1116,17 +1322,17 @@ TEST(the_ggml_dtype_map_carries_only_the_types_that_mean_the_same_thing) {
     CHECK_EQ(gguf_to_rad_dtype(27), (uint32_t)RAD_I64);
     CHECK_EQ(gguf_to_rad_dtype(30), (uint32_t)RAD_BF16);
 
-    /* q4_0, q8_0, q4_K, q6_K, and the iq family: every one of them is a BLOCK layout with its
-       own scales, and none has a RAD_* equivalent. */
+    /* q4_0, q8_0, q4_K, q6_K and the iq family are block layouts with their own scales; none has
+       a RAD_* equivalent. */
     for (uint32_t t : { 2u, 3u, 6u, 7u, 8u, 9u, 10u, 11u, 12u, 13u, 14u, 15u,
                         16u, 17u, 18u, 19u, 20u, 21u, 22u, 23u, 28u, 29u })
         CHECK_EQ(gguf_to_rad_dtype(t), (uint32_t)RAD_DT_INVALID);
 
-    /* And a type code from a newer ggml than this build knows is invalid, not a guess. */
+    /* A type code from a newer ggml than this build knows is invalid, not a guess. */
     CHECK_EQ(gguf_to_rad_dtype(9999), (uint32_t)RAD_DT_INVALID);
 
-    /* THE TABLE BESIDE IT IS BOUNDS CHECKED, because a truncated or hostile GGUF names its own
-       type codes and "SIGSEGV in the loader" is not a diagnosis. */
+    /* The table beside it is bounds-checked: a truncated or hostile GGUF names its own type
+       codes, and a loader segfault is not a diagnosis. */
     CHECK(gguf_dtype(0) != nullptr);
     CHECK(gguf_dtype(9999) == nullptr);
     const GgufDtype* f32 = gguf_dtype(0);
@@ -1135,7 +1341,7 @@ TEST(the_ggml_dtype_map_carries_only_the_types_that_mean_the_same_thing) {
         CHECK(f32->blck > 0);
         CHECK(f32->block_bytes > 0);
     }
-    /* Every type the table does carry describes a non-degenerate block, or the element count
+    /* Every type the table carries describes a non-degenerate block, or the element-count
        arithmetic that reads it divides by zero. */
     for (uint32_t t = 0; t < 64; ++t) {
         const GgufDtype* d = gguf_dtype(t);
@@ -1147,10 +1353,9 @@ TEST(the_ggml_dtype_map_carries_only_the_types_that_mean_the_same_thing) {
 
 /* ================================================================== the step chain's names
  *
- * WHAT A STEP PRINTS IS THE CONTRACT rad-convert WRITES AGAINST. A chain this build cannot
- * express must be refused by name rather than silently approximated (spec §12), and the name is
- * what the refusal carries -- so a step whose kind this build does not know has to say exactly
- * that, with the number, rather than falling through to a neighbouring step's description.
+ * What a step prints is the contract rad-convert writes against. A chain this build cannot
+ * express is refused by name (spec §12), so a step of unknown kind must say exactly that, with
+ * its number, rather than fall through to a neighbouring step's description.
  */
 TEST(every_step_kind_describes_itself_and_an_unknown_one_names_its_number) {
     VocabStep s;
@@ -1159,8 +1364,8 @@ TEST(every_step_kind_describes_itself_and_an_unknown_one_names_its_number) {
     s.kind = RAD_NORM_NFKD;
     CHECK_EQ(step_describe(s), std::string("NFKD"));
 
-    /* The arguments are in the description because they are what distinguishes two declarations
-       of the same step -- a Replace chain is several rows differing only in their strings. */
+    /* The arguments are in the description because they distinguish two declarations of the
+       same step: a Replace chain is several rows differing only in their strings. */
     s.kind = RAD_NORM_REPLACE;
     s.flags = 0;
     s.arg0 = " ";
@@ -1180,15 +1385,15 @@ TEST(every_step_kind_describes_itself_and_an_unknown_one_names_its_number) {
     CHECK(bl.find("add_prefix_space=1") != std::string::npos);
     CHECK(bl.find("use_regex=1") != std::string::npos);
 
-    /* A DECODER STEP SAYS SO. The three chains are one list in declared order, so a reader who
-       cannot tell a normaliser from a decoder cannot tell where the list turns over. */
+    /* A decoder step says so. The three chains are one list in declared order, so a reader must
+       be able to tell where the list turns over. */
     s = VocabStep{};
     s.kind = RAD_DEC_BYTELEVEL;
     CHECK(step_describe(s).rfind("decode", 0) == 0);
     s.kind = RAD_DEC_FUSE;
     CHECK(step_describe(s).rfind("decode", 0) == 0);
 
-    /* An unexpressible step names its number, which is what makes the refusal actionable. */
+    /* An unexpressible step names its number, which makes the refusal actionable. */
     s = VocabStep{};
     s.kind = 9999;
     const std::string unk = step_describe(s);
@@ -1196,9 +1401,9 @@ TEST(every_step_kind_describes_itself_and_an_unknown_one_names_its_number) {
     CHECK(unk.find("9999") != std::string::npos);
 }
 
-/* THE KIND RANGE IS WHICH OF THE THREE CHAINS A ROW BELONGS TO, and the three are stored as ONE
- * list in declared order so that no reader has to reassemble them. A boundary off by one puts a
- * pre-tokeniser in the normaliser chain, which changes token boundaries and nothing else. */
+/* The kind range decides which of the three chains a row belongs to; the three are stored as one
+ * list in declared order so no reader has to reassemble them. A boundary off by one would put a
+ * pre-tokeniser in the normaliser chain, silently changing token boundaries. */
 TEST(the_kind_ranges_partition_the_three_chains) {
     CHECK(step_is_norm(RAD_NORM_NFC));
     CHECK(step_is_norm(RAD_NORM_PREPEND));
@@ -1218,22 +1423,20 @@ TEST(the_kind_ranges_partition_the_three_chains) {
 
 /* ================================================================== the normalisation tables
  *
- * The four public forms are covered above; these are the two primitives under them, and they are
- * worth pinning on their own because the tables they read are GENERATED -- a table regenerated
- * from a newer Unicode is exactly the kind of change that alters token boundaries for one script
- * and nothing else, which no round-trip test over ASCII would notice.
+ * The four public forms are covered above; these are the two primitives under them, pinned
+ * separately because their tables are generated. A table regenerated from a newer Unicode can
+ * change token boundaries for one script only, which no round-trip test over ASCII would notice.
  */
 TEST(the_combining_class_table_holds_the_values_canonical_ordering_depends_on) {
     /* Starters are class 0; the canonical ordering algorithm only reorders non-starters. */
     CHECK_EQ(unorm_ccc('a'), 0u);
     CHECK_EQ(unorm_ccc(0x00E9), 0u);               /* precomposed e-acute is itself a starter */
-    /* Combining acute is 230 (above), cedilla is 202 (below) -- and the ORDER of those two
-       numbers is what makes "e + cedilla + acute" and "e + acute + cedilla" normalise to the
-       same string. */
+    /* Combining acute is 230 (above), cedilla 202 (below); their order is what makes
+       "e + cedilla + acute" and "e + acute + cedilla" normalise to the same string. */
     CHECK_EQ(unorm_ccc(0x0301), 230u);
     CHECK_EQ(unorm_ccc(0x0327), 202u);
     CHECK(unorm_ccc(0x0327) < unorm_ccc(0x0301));
-    /* A codepoint past everything the table covers is a starter rather than a read past it. */
+    /* A codepoint past the table's coverage is a starter, not a read past the table. */
     CHECK_EQ(unorm_ccc(0x10FFFF), 0u);
     CHECK_EQ(unorm_ccc(0), 0u);
 }
@@ -1249,8 +1452,8 @@ TEST(decompose_and_compose_are_inverses_over_the_canonical_forms) {
     CHECK_EQ(v.size(), 1u);
     CHECK_EQ(v[0], 0x00E9u);
 
-    /* CANONICAL ORDERING IS PART OF DECOMPOSITION. The two accents come back in ccc order
-       whichever order they went in, which is the whole reason NFD is a normal form. */
+    /* Canonical ordering is part of decomposition: the two accents come back in ccc order
+       whichever order they went in, which is what makes NFD a normal form. */
     std::vector<uint32_t> a = { 'e', 0x0301, 0x0327 };
     std::vector<uint32_t> b = { 'e', 0x0327, 0x0301 };
     unorm_decompose(a, false);
@@ -1258,38 +1461,677 @@ TEST(decompose_and_compose_are_inverses_over_the_canonical_forms) {
     CHECK(a == b);
     CHECK_EQ(a[1], 0x0327u);                       /* 202 before 230 */
 
-    /* COMPATIBILITY DECOMPOSITION IS NOT CANONICAL DECOMPOSITION, and a K form that behaved like
-       the plain one would silently stop folding the ligatures and full-width forms a tokeniser
-       declaring NFKC is counting on. */
+    /* Compatibility decomposition is not canonical decomposition; a K form behaving like the plain
+       one would silently stop folding the ligatures and full-width forms NFKC promises. */
     std::vector<uint32_t> lig = { 0xFB01 };        /* the fi ligature */
     unorm_decompose(lig, /*compat=*/false);
-    CHECK_EQ(lig.size(), 1u);                      /* it has no CANONICAL decomposition */
+    CHECK_EQ(lig.size(), 1u);                      /* it has no canonical decomposition */
     std::vector<uint32_t> ligk = { 0xFB01 };
     unorm_decompose(ligk, /*compat=*/true);
     CHECK_EQ(ligk.size(), 2u);
     CHECK_EQ(ligk[0], (uint32_t)'f');
     CHECK_EQ(ligk[1], (uint32_t)'i');
-    /* And composition does not put it back: NFKC is lossy by design. */
+    /* Composition does not put it back: NFKC is lossy by design. */
     unorm_compose(ligk);
     CHECK_EQ(ligk.size(), 2u);
 
-    /* Plain ASCII is untouched by either, which is the path almost every token takes. */
+    /* Plain ASCII is untouched by either, the path almost every token takes. */
     std::vector<uint32_t> ascii = { 'h', 'e', 'l', 'l', 'o' };
     const std::vector<uint32_t> before = ascii;
     unorm_decompose(ascii, false);
     unorm_compose(ascii);
     CHECK(ascii == before);
 
-    /* Empty input is empty output rather than a read of element zero. */
+    /* Empty input gives empty output, not a read of element zero. */
     std::vector<uint32_t> empty;
     unorm_decompose(empty, true);
     unorm_compose(empty);
     CHECK_EQ(empty.size(), 0u);
 
-    /* A LONE COMBINING MARK HAS NO STARTER TO ATTACH TO and must survive rather than being
-       dropped or folded into whatever precedes it in the buffer. */
+    /* A lone combining mark has no starter to attach to and must survive, not be dropped or
+       folded into whatever precedes it in the buffer. */
     std::vector<uint32_t> lone = { 0x0301 };
     unorm_compose(lone);
     CHECK_EQ(lone.size(), 1u);
     CHECK_EQ(lone[0], 0x0301u);
 }
+
+namespace {
+
+/* BEGIN generated by mk_tokenizer_goldens.py (tokenizers 0.23.2) */
+
+struct DecodeGolden { const char* fixture; std::vector<int32_t> ids; const char* text; };
+struct PretokGolden { const char* name; const char* json; std::vector<int32_t> ids; };
+struct EncodeGolden { const char* text; std::vector<int32_t> ids; std::vector<int32_t> with_special; };
+
+const std::vector<std::pair<const char*, const char*>>& decode_fixtures() {
+    static const std::vector<std::pair<const char*, const char*>> v = {
+        { "llama_like", R"JSON({"added_tokens": [{"id": 0, "content": "<unk>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 1, "content": "<s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 2, "content": "</s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}], "normalizer": null, "pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "first", "split": false}, "decoder": {"type": "Sequence", "decoders": [{"type": "Replace", "pattern": {"String": "▁"}, "content": " "}, {"type": "ByteFallback"}, {"type": "Fuse"}, {"type": "Strip", "content": " ", "start": 1, "stop": 0}]}, "model": {"type": "BPE", "byte_fallback": true, "unk_token": "<unk>", "vocab": {"<unk>": 0, "<s>": 1, "</s>": 2, "<0xE2>": 3, "<0x82>": 4, "<0xAC>": 5, "▁": 6, "▁▁": 7, "▁Hello": 8, "▁world": 9, "Hello": 10, "a▁b": 11, "x": 12, "▁x": 13, "!": 14}, "merges": []}})JSON" },
+        { "metaspace_always", R"JSON({"added_tokens": [{"id": 0, "content": "<unk>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 1, "content": "<s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 2, "content": "</s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}], "pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "always", "split": true}, "decoder": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "always", "split": true}, "model": {"type": "BPE", "byte_fallback": true, "unk_token": "<unk>", "vocab": {"<unk>": 0, "<s>": 1, "</s>": 2, "<0xE2>": 3, "<0x82>": 4, "<0xAC>": 5, "▁": 6, "▁▁": 7, "▁Hello": 8, "▁world": 9, "Hello": 10, "a▁b": 11, "x": 12, "▁x": 13, "!": 14}, "merges": []}})JSON" },
+        { "metaspace_first", R"JSON({"added_tokens": [{"id": 0, "content": "<unk>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 1, "content": "<s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 2, "content": "</s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}], "pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "first", "split": true}, "decoder": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "first", "split": true}, "model": {"type": "BPE", "byte_fallback": true, "unk_token": "<unk>", "vocab": {"<unk>": 0, "<s>": 1, "</s>": 2, "<0xE2>": 3, "<0x82>": 4, "<0xAC>": 5, "▁": 6, "▁▁": 7, "▁Hello": 8, "▁world": 9, "Hello": 10, "a▁b": 11, "x": 12, "▁x": 13, "!": 14}, "merges": []}})JSON" },
+        { "metaspace_never", R"JSON({"added_tokens": [{"id": 0, "content": "<unk>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 1, "content": "<s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 2, "content": "</s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}], "pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "never", "split": true}, "decoder": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "never", "split": true}, "model": {"type": "BPE", "byte_fallback": true, "unk_token": "<unk>", "vocab": {"<unk>": 0, "<s>": 1, "</s>": 2, "<0xE2>": 3, "<0x82>": 4, "<0xAC>": 5, "▁": 6, "▁▁": 7, "▁Hello": 8, "▁world": 9, "Hello": 10, "a▁b": 11, "x": 12, "▁x": 13, "!": 14}, "merges": []}})JSON" },
+        { "wordpiece_cleanup", R"JSON({"added_tokens": [{"id": 0, "content": "[PAD]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 1, "content": "[UNK]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 2, "content": "[CLS]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 3, "content": "[SEP]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}], "pre_tokenizer": {"type": "BertPreTokenizer"}, "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}, "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": {"[PAD]": 0, "[UNK]": 1, "[CLS]": 2, "[SEP]": 3, "hello": 4, "##world": 5, "!": 6, "a": 7, "'": 8, "s": 9, "do": 10, "n't": 11, ",": 12, "x": 13, "##y": 14, ".": 15, "##s": 16}}})JSON" },
+        { "wordpiece_raw", R"JSON({"added_tokens": [{"id": 0, "content": "[PAD]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 1, "content": "[UNK]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 2, "content": "[CLS]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 3, "content": "[SEP]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}], "pre_tokenizer": {"type": "BertPreTokenizer"}, "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}, "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": {"[PAD]": 0, "[UNK]": 1, "[CLS]": 2, "[SEP]": 3, "hello": 4, "##world": 5, "!": 6, "a": 7, "'": 8, "s": 9, "do": 10, "n't": 11, ",": 12, "x": 13, "##y": 14, ".": 15, "##s": 16}}})JSON" },
+        { "bpe_decoder", R"JSON({"pre_tokenizer": {"type": "WhitespaceSplit"}, "decoder": {"type": "BPEDecoder", "suffix": "</w>"}, "model": {"type": "BPE", "byte_fallback": false, "unk_token": "<unk>", "vocab": {"hel": 0, "lo</w>": 1, "wor": 2, "ld</w>": 3, "hi</w>": 4, "x": 5, "<unk>": 6}, "merges": []}})JSON" },
+        { "bytelevel", R"JSON({"pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true}, "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true}, "model": {"type": "BPE", "byte_fallback": false, "unk_token": null, "vocab": {"Ġhello": 0, "Ġworld": 1, "Ċ": 2, "x": 3, "Ã": 4, "©": 5}, "merges": []}})JSON" },
+    };
+    return v;
+}
+
+const std::vector<DecodeGolden>& decode_goldens() {
+    static const std::vector<DecodeGolden> v = {
+        { "llama_like", { 8, 9 }, "Hello world" },
+        { "llama_like", { 1, 8, 9 }, "Hello world" },
+        { "llama_like", { 6, 8 }, " Hello" },
+        { "llama_like", { 7, 8 }, "  Hello" },
+        { "llama_like", { 10, 9, 14 }, "Hello world!" },
+        { "llama_like", { 3, 4, 5, 13 }, "\xe2\x82\xac x" },
+        { "llama_like", { 9, 3, 4, 5 }, "world\xe2\x82\xac" },
+        { "llama_like", { 11, 9 }, "a b world" },
+        { "llama_like", { 1, 6, 9 }, " world" },
+        { "metaspace_always", { 8, 9 }, "Hello world" },
+        { "metaspace_always", { 7, 12 }, "x" },
+        { "metaspace_always", { 11, 13 }, "ab x" },
+        { "metaspace_always", { 10, 9 }, "Hello world" },
+        { "metaspace_always", { 1, 8 }, "Hello" },
+        { "metaspace_first", { 8, 9 }, "Hello world" },
+        { "metaspace_first", { 7, 12 }, "x" },
+        { "metaspace_first", { 11, 13 }, "ab x" },
+        { "metaspace_first", { 10, 9 }, "Hello world" },
+        { "metaspace_never", { 8, 9 }, " Hello world" },
+        { "metaspace_never", { 7, 12 }, "  x" },
+        { "metaspace_never", { 11, 13 }, "a b x" },
+        { "metaspace_never", { 10, 9 }, "Hello world" },
+        { "wordpiece_cleanup", { 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, "helloworld! a ' s don't, xy." },
+        { "wordpiece_cleanup", { 5, 4 }, "##world hello" },
+        { "wordpiece_cleanup", { 2, 4, 16, 3 }, "hellos" },
+        { "wordpiece_cleanup", { 7, 8, 9 }, "a ' s" },
+        { "wordpiece_raw", { 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, "helloworld ! a ' s do n't , xy ." },
+        { "wordpiece_raw", { 5, 4 }, "##world hello" },
+        { "bpe_decoder", { 0, 1, 2, 3 }, "hello world" },
+        { "bpe_decoder", { 4 }, "hi" },
+        { "bpe_decoder", { 4, 4 }, "hi hi" },
+        { "bpe_decoder", { 0, 1, 5 }, "hello x" },
+        { "bytelevel", { 0, 1, 2 }, " hello world\n" },
+        { "bytelevel", { 3, 0 }, "x hello" },
+        { "bytelevel", { 4, 5 }, "\xc3\xa9" },
+    };
+    return v;
+}
+
+const char* const kPretokText = "hello, world!! a,,b \xe2\x82\xac" "5 \xe2\x86\x92 x\xcc\x81y \xe2\x80\xbfz 12345 don't \xc2\xa9x_y \xd9\xa3\xd9\xa4 \xe2\x85\xab \xc2\xbd x\xc2\xb2 \xc2\xa0n\xe3\x80\x80m \xc2\xbfq?";
+
+const std::vector<PretokGolden>& pretok_goldens() {
+    static const std::vector<PretokGolden> v = {
+        /* hello | , | world | !! | a | ,, | b | \u20ac | 5 | \u2192 | x\u0301y | \u203fz | 12345 | don | ' | t | \xa9 | x_y | \u0663\u0664 | \u216b | \xbd | x | \xb2 | n | m | \xbf | q | ? */
+        { "Whitespace", R"JSON({"pre_tokenizer": {"type": "Whitespace"}, "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": {"[UNK]": 0, "hello": 1, ",": 2, "world": 3, "!!": 4, "a": 5, ",,": 6, "b": 7, "€": 8, "5": 9, "→": 10, "x́y": 11, "‿z": 12, "12345": 13, "don": 14, "'": 15, "t": 16, "©": 17, "x_y": 18, "٣٤": 19, "Ⅻ": 20, "½": 21, "x": 22, "²": 23, "n": 24, "m": 25, "¿": 26, "q": 27, "?": 28}}})JSON", { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28 } },
+        /* hello, | world!! | a,,b | \u20ac5 | \u2192 | x\u0301y | \u203fz | 12345 | don't | \xa9x_y | \u0663\u0664 | \u216b | \xbd | x\xb2 | n | m | \xbfq? */
+        { "WhitespaceSplit", R"JSON({"pre_tokenizer": {"type": "WhitespaceSplit"}, "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": {"[UNK]": 0, "hello,": 1, "world!!": 2, "a,,b": 3, "€5": 4, "→": 5, "x́y": 6, "‿z": 7, "12345": 8, "don't": 9, "©x_y": 10, "٣٤": 11, "Ⅻ": 12, "½": 13, "x²": 14, "n": 15, "m": 16, "¿q?": 17}}})JSON", { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17 } },
+        /* hello | , | world | ! | ! | a | , | , | b | \u20ac5 | \u2192 | x\u0301y | \u203f | z | 12345 | don | ' | t | \xa9x | _ | y | \u0663\u0664 | \u216b | \xbd | x\xb2 | n | m | \xbf | q | ? */
+        { "BertPreTokenizer", R"JSON({"pre_tokenizer": {"type": "BertPreTokenizer"}, "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": {"[UNK]": 0, "hello": 1, ",": 2, "world": 3, "!": 4, "a": 5, "b": 6, "€5": 7, "→": 8, "x́y": 9, "‿": 10, "z": 11, "12345": 12, "don": 13, "'": 14, "t": 15, "©x": 16, "_": 17, "y": 18, "٣٤": 19, "Ⅻ": 20, "½": 21, "x²": 22, "n": 23, "m": 24, "¿": 25, "q": 26, "?": 27}}})JSON", { 1, 2, 3, 4, 4, 5, 2, 2, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27 } },
+        /* hello |  world |  a | b \u20ac5 \u2192 x\u0301y  | z 12345 don | t \xa9x | y \u0663\u0664 \u216b \xbd x\xb2 \xa0n\u3000m  | q */
+        { "Punctuation_Removed", R"JSON({"pre_tokenizer": {"type": "Punctuation", "behavior": "Removed"}, "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": {"[UNK]": 0, "hello": 1, " world": 2, " a": 3, "b €5 → x́y ": 4, "z 12345 don": 5, "t ©x": 6, "y ٣٤ Ⅻ ½ x²  n　m ": 7, "q": 8}}})JSON", { 1, 2, 3, 4, 5, 6, 7, 8 } },
+        /* hello | , |  world | ! | ! |  a | , | , | b \u20ac5 \u2192 x\u0301y  | \u203f | z 12345 don | ' | t \xa9x | _ | y \u0663\u0664 \u216b \xbd x\xb2 \xa0n\u3000m  | \xbf | q | ? */
+        { "Punctuation_Isolated", R"JSON({"pre_tokenizer": {"type": "Punctuation", "behavior": "Isolated"}, "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": {"[UNK]": 0, "hello": 1, ",": 2, " world": 3, "!": 4, " a": 5, "b €5 → x́y ": 6, "‿": 7, "z 12345 don": 8, "'": 9, "t ©x": 10, "_": 11, "y ٣٤ Ⅻ ½ x²  n　m ": 12, "¿": 13, "q": 14, "?": 15}}})JSON", { 1, 2, 3, 4, 4, 5, 2, 2, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 } },
+        /* hello, |  world! | ! |  a, | , | b \u20ac5 \u2192 x\u0301y \u203f | z 12345 don' | t \xa9x_ | y \u0663\u0664 \u216b \xbd x\xb2 \xa0n\u3000m \xbf | q? */
+        { "Punctuation_MergedWithPrevious", R"JSON({"pre_tokenizer": {"type": "Punctuation", "behavior": "MergedWithPrevious"}, "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": {"[UNK]": 0, "hello,": 1, " world!": 2, "!": 3, " a,": 4, ",": 5, "b €5 → x́y ‿": 6, "z 12345 don'": 7, "t ©x_": 8, "y ٣٤ Ⅻ ½ x²  n　m ¿": 9, "q?": 10}}})JSON", { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 } },
+        /* hello | , world | ! | ! a | , | ,b \u20ac5 \u2192 x\u0301y  | \u203fz 12345 don | 't \xa9x | _y \u0663\u0664 \u216b \xbd x\xb2 \xa0n\u3000m  | \xbfq | ? */
+        { "Punctuation_MergedWithNext", R"JSON({"pre_tokenizer": {"type": "Punctuation", "behavior": "MergedWithNext"}, "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": {"[UNK]": 0, "hello": 1, ", world": 2, "!": 3, "! a": 4, ",": 5, ",b €5 → x́y ": 6, "‿z 12345 don": 7, "'t ©x": 8, "_y ٣٤ Ⅻ ½ x²  n　m ": 9, "¿q": 10, "?": 11}}})JSON", { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 } },
+        /* hello | , |  world | !! |  a | ,, | b \u20ac5 \u2192 x\u0301y  | \u203f | z 12345 don | ' | t \xa9x | _ | y \u0663\u0664 \u216b \xbd x\xb2 \xa0n\u3000m  | \xbf | q | ? */
+        { "Punctuation_Contiguous", R"JSON({"pre_tokenizer": {"type": "Punctuation", "behavior": "Contiguous"}, "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": {"[UNK]": 0, "hello": 1, ",": 2, " world": 3, "!!": 4, " a": 5, ",,": 6, "b €5 → x́y ": 7, "‿": 8, "z 12345 don": 9, "'": 10, "t ©x": 11, "_": 12, "y ٣٤ Ⅻ ½ x²  n　m ": 13, "¿": 14, "q": 15, "?": 16}}})JSON", { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 } },
+        /* hello, world!! a,,b \u20ac | 5 |  \u2192 x\u0301y \u203fz  | 1 | 2 | 3 | 4 | 5 |  don't \xa9x_y  | \u0663 | \u0664 |   | \u216b |   | \xbd |  x | \xb2 |  \xa0n\u3000m \xbfq? */
+        { "Digits_individual", R"JSON({"pre_tokenizer": {"type": "Digits", "individual_digits": true}, "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": {"[UNK]": 0, "hello, world!! a,,b €": 1, "5": 2, " → x́y ‿z ": 3, "1": 4, "2": 5, "3": 6, "4": 7, " don't ©x_y ": 8, "٣": 9, "٤": 10, " ": 11, "Ⅻ": 12, "½": 13, " x": 14, "²": 15, "  n　m ¿q?": 16}}})JSON", { 1, 2, 3, 4, 5, 6, 7, 2, 8, 9, 10, 11, 12, 11, 13, 14, 15, 16 } },
+        /* hello, world!! a,,b \u20ac | 5 |  \u2192 x\u0301y \u203fz  | 12345 |  don't \xa9x_y  | \u0663\u0664 |   | \u216b |   | \xbd |  x | \xb2 |  \xa0n\u3000m \xbfq? */
+        { "Digits_runs", R"JSON({"pre_tokenizer": {"type": "Digits", "individual_digits": false}, "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": {"[UNK]": 0, "hello, world!! a,,b €": 1, "5": 2, " → x́y ‿z ": 3, "12345": 4, " don't ©x_y ": 5, "٣٤": 6, " ": 7, "Ⅻ": 8, "½": 9, " x": 10, "²": 11, "  n　m ¿q?": 12}}})JSON", { 1, 2, 3, 4, 5, 6, 7, 8, 7, 9, 10, 11, 12 } },
+        /* \u2581hello, | \u2581world!! | \u2581a,,b | \u2581\u20ac5 | \u2581\u2192 | \u2581x\u0301y | \u2581\u203fz | \u258112345 | \u2581don't | \u2581\xa9x_y | \u2581\u0663\u0664 | \u2581\u216b | \u2581\xbd | \u2581x\xb2 | \u2581\xa0n\u3000m | \u2581\xbfq? */
+        { "Metaspace_split_always", R"JSON({"pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "always", "split": true}, "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": {"[UNK]": 0, "▁hello,": 1, "▁world!!": 2, "▁a,,b": 3, "▁€5": 4, "▁→": 5, "▁x́y": 6, "▁‿z": 7, "▁12345": 8, "▁don't": 9, "▁©x_y": 10, "▁٣٤": 11, "▁Ⅻ": 12, "▁½": 13, "▁x²": 14, "▁ n　m": 15, "▁¿q?": 16}}})JSON", { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 } },
+        /* hello, | \u2581world!! | \u2581a,,b | \u2581\u20ac5 | \u2581\u2192 | \u2581x\u0301y | \u2581\u203fz | \u258112345 | \u2581don't | \u2581\xa9x_y | \u2581\u0663\u0664 | \u2581\u216b | \u2581\xbd | \u2581x\xb2 | \u2581\xa0n\u3000m | \u2581\xbfq? */
+        { "Metaspace_split_never", R"JSON({"pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "never", "split": true}, "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": {"[UNK]": 0, "hello,": 1, "▁world!!": 2, "▁a,,b": 3, "▁€5": 4, "▁→": 5, "▁x́y": 6, "▁‿z": 7, "▁12345": 8, "▁don't": 9, "▁©x_y": 10, "▁٣٤": 11, "▁Ⅻ": 12, "▁½": 13, "▁x²": 14, "▁ n　m": 15, "▁¿q?": 16}}})JSON", { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 } },
+        /* \u2581hello,\u2581world!!\u2581a,,b\u2581\u20ac5\u2581\u2192\u2581x\u0301y\u2581\u203fz\u258112345\u2581don't\u2581\xa9x_y\u2581\u0663\u0664\u2581\u216b\u2581\xbd\u2581x\xb2\u2581\xa0n\u3000m\u2581\xbfq? */
+        { "Metaspace_whole_first", R"JSON({"pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "first", "split": false}, "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": {"[UNK]": 0, "▁hello,▁world!!▁a,,b▁€5▁→▁x́y▁‿z▁12345▁don't▁©x_y▁٣٤▁Ⅻ▁½▁x²▁ n　m▁¿q?": 1}}})JSON", { 1 } },
+        /* hello | , | world | ! | ! | a | , | , | b | \u20ac | 5 | \u2192 | x\u0301y | \u203f | z | 1 | 2 | 3 | 4 | 5 | don | ' | t | \xa9x | _ | y | \u0663 | \u0664 | \u216b | \xbd | x | \xb2 | n | m | \xbf | q | ? */
+        { "Sequence_Whitespace_Digits", R"JSON({"pre_tokenizer": {"type": "Sequence", "pretokenizers": [{"type": "WhitespaceSplit"}, {"type": "Digits", "individual_digits": true}, {"type": "Punctuation", "behavior": "Isolated"}]}, "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "vocab": {"[UNK]": 0, "hello": 1, ",": 2, "world": 3, "!": 4, "a": 5, "b": 6, "€": 7, "5": 8, "→": 9, "x́y": 10, "‿": 11, "z": 12, "1": 13, "2": 14, "3": 15, "4": 16, "don": 17, "'": 18, "t": 19, "©x": 20, "_": 21, "y": 22, "٣": 23, "٤": 24, "Ⅻ": 25, "½": 26, "x": 27, "²": 28, "n": 29, "m": 30, "¿": 31, "q": 32, "?": 33}}})JSON", { 1, 2, 3, 4, 4, 5, 2, 2, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 8, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33 } },
+    };
+    return v;
+}
+
+const char* const kGemmaLike = R"JSON({"added_tokens": [{"id": 0, "content": "<pad>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 1, "content": "<eos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 2, "content": "<bos>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 3, "content": "<unk>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 4, "content": "<mask>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": false}, {"id": 5, "content": "<start_of_turn>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 6, "content": "<end_of_turn>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}], "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "▁"}, "pre_tokenizer": {"type": "Split", "pattern": {"String": " "}, "behavior": "MergedWithPrevious", "invert": false}, "post_processor": {"type": "TemplateProcessing", "single": [{"SpecialToken": {"id": "<bos>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}}, {"SpecialToken": {"id": "<eos>", "type_id": 0}}], "pair": [{"SpecialToken": {"id": "<bos>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}}, {"SpecialToken": {"id": "<eos>", "type_id": 0}}, {"Sequence": {"id": "B", "type_id": 1}}, {"SpecialToken": {"id": "<eos>", "type_id": 1}}], "special_tokens": {"<bos>": {"id": "<bos>", "ids": [2], "tokens": ["<bos>"]}, "<eos>": {"id": "<eos>", "ids": [1], "tokens": ["<eos>"]}}}, "decoder": {"type": "Sequence", "decoders": [{"type": "Replace", "pattern": {"String": "▁"}, "content": " "}, {"type": "ByteFallback"}, {"type": "Fuse"}]}, "model": {"type": "BPE", "dropout": null, "unk_token": "<unk>", "continuing_subword_prefix": null, "end_of_word_suffix": null, "fuse_unk": true, "byte_fallback": true, "ignore_merges": false, "vocab": {"<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3, "<mask>": 4, "<start_of_turn>": 5, "<end_of_turn>": 6, "<0x00>": 7, "<0x01>": 8, "<0x02>": 9, "<0x03>": 10, "<0x04>": 11, "<0x05>": 12, "<0x06>": 13, "<0x07>": 14, "<0x08>": 15, "<0x09>": 16, "<0x0A>": 17, "<0x0B>": 18, "<0x0C>": 19, "<0x0D>": 20, "<0x0E>": 21, "<0x0F>": 22, "<0x10>": 23, "<0x11>": 24, "<0x12>": 25, "<0x13>": 26, "<0x14>": 27, "<0x15>": 28, "<0x16>": 29, "<0x17>": 30, "<0x18>": 31, "<0x19>": 32, "<0x1A>": 33, "<0x1B>": 34, "<0x1C>": 35, "<0x1D>": 36, "<0x1E>": 37, "<0x1F>": 38, "<0x20>": 39, "<0x21>": 40, "<0x22>": 41, "<0x23>": 42, "<0x24>": 43, "<0x25>": 44, "<0x26>": 45, "<0x27>": 46, "<0x28>": 47, "<0x29>": 48, "<0x2A>": 49, "<0x2B>": 50, "<0x2C>": 51, "<0x2D>": 52, "<0x2E>": 53, "<0x2F>": 54, "<0x30>": 55, "<0x31>": 56, "<0x32>": 57, "<0x33>": 58, "<0x34>": 59, "<0x35>": 60, "<0x36>": 61, "<0x37>": 62, "<0x38>": 63, "<0x39>": 64, "<0x3A>": 65, "<0x3B>": 66, "<0x3C>": 67, "<0x3D>": 68, "<0x3E>": 69, "<0x3F>": 70, "<0x40>": 71, "<0x41>": 72, "<0x42>": 73, "<0x43>": 74, "<0x44>": 75, "<0x45>": 76, "<0x46>": 77, "<0x47>": 78, "<0x48>": 79, "<0x49>": 80, "<0x4A>": 81, "<0x4B>": 82, "<0x4C>": 83, "<0x4D>": 84, "<0x4E>": 85, "<0x4F>": 86, "<0x50>": 87, "<0x51>": 88, "<0x52>": 89, "<0x53>": 90, "<0x54>": 91, "<0x55>": 92, "<0x56>": 93, "<0x57>": 94, "<0x58>": 95, "<0x59>": 96, "<0x5A>": 97, "<0x5B>": 98, "<0x5C>": 99, "<0x5D>": 100, "<0x5E>": 101, "<0x5F>": 102, "<0x60>": 103, "<0x61>": 104, "<0x62>": 105, "<0x63>": 106, "<0x64>": 107, "<0x65>": 108, "<0x66>": 109, "<0x67>": 110, "<0x68>": 111, "<0x69>": 112, "<0x6A>": 113, "<0x6B>": 114, "<0x6C>": 115, "<0x6D>": 116, "<0x6E>": 117, "<0x6F>": 118, "<0x70>": 119, "<0x71>": 120, "<0x72>": 121, "<0x73>": 122, "<0x74>": 123, "<0x75>": 124, "<0x76>": 125, "<0x77>": 126, "<0x78>": 127, "<0x79>": 128, "<0x7A>": 129, "<0x7B>": 130, "<0x7C>": 131, "<0x7D>": 132, "<0x7E>": 133, "<0x7F>": 134, "<0x80>": 135, "<0x81>": 136, "<0x82>": 137, "<0x83>": 138, "<0x84>": 139, "<0x85>": 140, "<0x86>": 141, "<0x87>": 142, "<0x88>": 143, "<0x89>": 144, "<0x8A>": 145, "<0x8B>": 146, "<0x8C>": 147, "<0x8D>": 148, "<0x8E>": 149, "<0x8F>": 150, "<0x90>": 151, "<0x91>": 152, "<0x92>": 153, "<0x93>": 154, "<0x94>": 155, "<0x95>": 156, "<0x96>": 157, "<0x97>": 158, "<0x98>": 159, "<0x99>": 160, "<0x9A>": 161, "<0x9B>": 162, "<0x9C>": 163, "<0x9D>": 164, "<0x9E>": 165, "<0x9F>": 166, "<0xA0>": 167, "<0xA1>": 168, "<0xA2>": 169, "<0xA3>": 170, "<0xA4>": 171, "<0xA5>": 172, "<0xA6>": 173, "<0xA7>": 174, "<0xA8>": 175, "<0xA9>": 176, "<0xAA>": 177, "<0xAB>": 178, "<0xAC>": 179, "<0xAD>": 180, "<0xAE>": 181, "<0xAF>": 182, "<0xB0>": 183, "<0xB1>": 184, "<0xB2>": 185, "<0xB3>": 186, "<0xB4>": 187, "<0xB5>": 188, "<0xB6>": 189, "<0xB7>": 190, "<0xB8>": 191, "<0xB9>": 192, "<0xBA>": 193, "<0xBB>": 194, "<0xBC>": 195, "<0xBD>": 196, "<0xBE>": 197, "<0xBF>": 198, "<0xC0>": 199, "<0xC1>": 200, "<0xC2>": 201, "<0xC3>": 202, "<0xC4>": 203, "<0xC5>": 204, "<0xC6>": 205, "<0xC7>": 206, "<0xC8>": 207, "<0xC9>": 208, "<0xCA>": 209, "<0xCB>": 210, "<0xCC>": 211, "<0xCD>": 212, "<0xCE>": 213, "<0xCF>": 214, "<0xD0>": 215, "<0xD1>": 216, "<0xD2>": 217, "<0xD3>": 218, "<0xD4>": 219, "<0xD5>": 220, "<0xD6>": 221, "<0xD7>": 222, "<0xD8>": 223, "<0xD9>": 224, "<0xDA>": 225, "<0xDB>": 226, "<0xDC>": 227, "<0xDD>": 228, "<0xDE>": 229, "<0xDF>": 230, "<0xE0>": 231, "<0xE1>": 232, "<0xE2>": 233, "<0xE3>": 234, "<0xE4>": 235, "<0xE5>": 236, "<0xE6>": 237, "<0xE7>": 238, "<0xE8>": 239, "<0xE9>": 240, "<0xEA>": 241, "<0xEB>": 242, "<0xEC>": 243, "<0xED>": 244, "<0xEE>": 245, "<0xEF>": 246, "<0xF0>": 247, "<0xF1>": 248, "<0xF2>": 249, "<0xF3>": 250, "<0xF4>": 251, "<0xF5>": 252, "<0xF6>": 253, "<0xF7>": 254, "<0xF8>": 255, "<0xF9>": 256, "<0xFA>": 257, "<0xFB>": 258, "<0xFC>": 259, "<0xFD>": 260, "<0xFE>": 261, "<0xFF>": 262, "a": 263, "b": 264, "c": 265, "d": 266, "e": 267, "f": 268, "g": 269, "h": 270, "i": 271, "j": 272, "k": 273, "l": 274, "m": 275, "n": 276, "o": 277, "p": 278, "q": 279, "r": 280, "s": 281, "t": 282, "u": 283, "v": 284, "w": 285, "x": 286, "y": 287, "z": 288, "▁": 289, "\n": 290, "\t": 291, "H": 292, "T": 293, ".": 294, ",": 295, "!": 296, "?": 297, "é": 298, "'": 299, "he": 300, "ll": 301, "hell": 302, "hello": 303, "▁w": 304, "or": 305, "▁wor": 306, "ld": 307, "▁world": 308, "▁t": 309, "▁th": 310, "▁the": 311, "▁c": 312, "▁ca": 313, "▁cat": 314, "▁▁": 315, "▁▁▁▁": 316, "\n\n": 317, "th": 318, "the": 319, "in": 320, "ing": 321, "ed": 322, "▁a": 323, "▁hello": 324, "He": 325, "Hell": 326, "Hello": 327, "ém": 328, "oj": 329, "oji": 330}, "merges": [["h", "e"], ["l", "l"], ["he", "ll"], ["hell", "o"], ["▁", "w"], ["o", "r"], ["▁w", "or"], ["l", "d"], ["▁wor", "ld"], ["▁", "t"], ["▁t", "h"], ["▁th", "e"], ["▁", "c"], ["▁c", "a"], ["▁ca", "t"], ["▁", "▁"], ["▁▁", "▁▁"], ["\n", "\n"], ["▁", "the"], ["t", "h"], ["th", "e"], ["i", "n"], ["in", "g"], ["e", "d"], ["▁", "a"], ["▁", "hello"], ["H", "e"], ["He", "ll"], ["Hell", "o"], ["é", "m"], ["o", "j"], ["oj", "i"]]}})JSON";
+
+const std::vector<EncodeGolden>& gemma_goldens() {
+    static const std::vector<EncodeGolden> v = {
+        { "hello", { 303 }, { 2, 303, 1 } },
+        { " hello", { 324 }, { 2, 324, 1 } },
+        { "hello world", { 303, 308 }, { 2, 303, 308, 1 } },
+        { "hello  world", { 303, 289, 308 }, { 2, 303, 289, 308, 1 } },
+        { "the cat", { 282, 300, 314 }, { 2, 282, 300, 314, 1 } },
+        { "\nthe\n\ncat", { 290, 282, 300, 317, 265, 263, 282 }, { 2, 290, 282, 300, 317, 265, 263, 282, 1 } },
+        { "  leading", { 315, 274, 267, 263, 266, 321 }, { 2, 315, 274, 267, 263, 266, 321, 1 } },
+        { "trailing  ", { 282, 280, 263, 271, 274, 321, 315 }, { 2, 282, 280, 263, 271, 274, 321, 315, 1 } },
+        { "a\tb", { 263, 291, 264 }, { 2, 263, 291, 264, 1 } },
+        { "\xc3\xa9moji \xf0\x9f\x98\x80", { 328, 330, 289, 247, 166, 159, 135 }, { 2, 328, 330, 289, 247, 166, 159, 135, 1 } },
+        { "x<eos>y", { 286, 1, 287 }, { 2, 286, 1, 287, 1 } },
+        { "<start_of_turn>user\nhello<end_of_turn>", { 5, 283, 281, 267, 280, 290, 303, 6 }, { 2, 5, 283, 281, 267, 280, 290, 303, 6, 1 } },
+        { "Hello, world!", { 327, 295, 308, 296 }, { 2, 327, 295, 308, 296, 1 } },
+        { "   ", { 315, 289 }, { 2, 315, 289, 1 } },
+        { "th the thee", { 318, 309, 300, 309, 300, 267 }, { 2, 318, 309, 300, 309, 300, 267, 1 } },
+        { "\xe6\x97\xa5\xe6\x9c\xac", { 237, 158, 172, 237, 163, 179 }, { 2, 237, 158, 172, 237, 163, 179, 1 } },
+        { "zz  zz   zz", { 288, 288, 315, 288, 288, 315, 289, 288, 288 }, { 2, 288, 288, 315, 288, 288, 315, 289, 288, 288, 1 } },
+        { "<mask> the", { 4, 309, 300 }, { 2, 4, 309, 300, 1 } },
+        { "<bos>hello", { 2, 303 }, { 2, 2, 303, 1 } },
+        { "", {  }, { 2, 1 } },
+    };
+    return v;
+}
+
+/* The decode of every Gemma golden with special tokens skipped, as HF reports it. */
+const std::vector<const char*>& gemma_decoded() {
+    static const std::vector<const char*> v = {
+        "hello",
+        " hello",
+        "hello world",
+        "hello  world",
+        "the cat",
+        "\nthe\n\ncat",
+        "  leading",
+        "trailing  ",
+        "a\tb",
+        "\xc3\xa9moji \xf0\x9f\x98\x80",
+        "xy",
+        "user\nhello",
+        "Hello, world!",
+        "   ",
+        "th the thee",
+        "\xe6\x97\xa5\xe6\x9c\xac",
+        "zz  zz   zz",
+        "<mask> the",
+        "hello",
+        "",
+    };
+    return v;
+}
+
+const std::vector<std::pair<const char*, const char*>>& metaspace_special_fixtures() {
+    static const std::vector<std::pair<const char*, const char*>> v = {
+        { "first", R"JSON({"added_tokens": [{"id": 0, "content": "<s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 1, "content": "[INST]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}], "pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "first", "split": false}, "model": {"type": "BPE", "dropout": null, "unk_token": "<unk>", "continuing_subword_prefix": null, "end_of_word_suffix": null, "fuse_unk": false, "byte_fallback": false, "ignore_merges": false, "vocab": {"<s>": 0, "[INST]": 1, "▁": 2, "H": 3, "i": 4, "▁H": 5, "Hi": 6, "▁Hi": 7, "<unk>": 8}, "merges": [["▁", "H"], ["H", "i"], ["▁H", "i"]]}})JSON" },
+        { "always", R"JSON({"added_tokens": [{"id": 0, "content": "<s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}, {"id": 1, "content": "[INST]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}], "pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "always", "split": false}, "model": {"type": "BPE", "dropout": null, "unk_token": "<unk>", "continuing_subword_prefix": null, "end_of_word_suffix": null, "fuse_unk": false, "byte_fallback": false, "ignore_merges": false, "vocab": {"<s>": 0, "[INST]": 1, "▁": 2, "H": 3, "i": 4, "▁H": 5, "Hi": 6, "▁Hi": 7, "<unk>": 8}, "merges": [["▁", "H"], ["H", "i"], ["▁H", "i"]]}})JSON" },
+    };
+    return v;
+}
+
+const std::vector<std::pair<const char*, EncodeGolden>>& metaspace_special_goldens() {
+    static const std::vector<std::pair<const char*, EncodeGolden>> v = {
+        { "first", { "Hi", { 7 }, {} } },
+        { "first", { "[INST]Hi", { 1, 6 }, {} } },
+        { "first", { "[INST] Hi", { 1, 7 }, {} } },
+        { "first", { "Hi[INST]Hi", { 7, 1, 6 }, {} } },
+        { "first", { "<s>Hi", { 0, 6 }, {} } },
+        { "first", { "Hi Hi[INST]Hi", { 7, 7, 1, 6 }, {} } },
+        { "always", { "Hi", { 7 }, {} } },
+        { "always", { "[INST]Hi", { 1, 7 }, {} } },
+        { "always", { "[INST] Hi", { 1, 7 }, {} } },
+        { "always", { "Hi[INST]Hi", { 7, 1, 7 }, {} } },
+        { "always", { "<s>Hi", { 0, 7 }, {} } },
+        { "always", { "Hi Hi[INST]Hi", { 7, 7, 1, 7 }, {} } },
+    };
+    return v;
+}
+
+/* END generated by mk_tokenizer_goldens.py */
+
+}  /* namespace */
+
+/* ================================================================== parity with HuggingFace */
+
+namespace {
+
+std::shared_ptr<const Vocab> vocab_from_json(const char* js, const char* origin) {
+    VocabBuild vb;
+    if (parse_tokenizer_json_buf(js, origin, vb) < 0) return nullptr;
+    auto v = std::make_shared<Vocab>();
+    if (v->load(std::move(vb)) < 0) return nullptr;
+    return v;
+}
+
+std::string streamed(const std::shared_ptr<const Vocab>& v, const std::vector<int32_t>& ids) {
+    Detokenizer d(v);
+    std::string s;
+    for (int32_t id : ids) s += d.push(id);
+    return s + d.flush();
+}
+
+}  /* namespace */
+
+/* Each decoder shape a tokenizer.json declares, against what HuggingFace's decode() returns for
+ * the same ids with special tokens skipped: a Llama-style Sequence ending in Strip after Fuse
+ * (one leading space off the whole text, not off every token), Metaspace under each prepend
+ * scheme (the first token's replacement characters dropped, not turned into spaces), WordPiece
+ * with and without cleanup (words joined with a space, the first left as it is), BPEDecoder (no
+ * space after the last word) and ByteLevel. decode() and the streaming Detokenizer must both give
+ * it. */
+TEST(decoders_match_huggingface) {
+    for (const auto& fx : decode_fixtures()) {
+        auto v = vocab_from_json(fx.second, fx.first);
+        REQUIRE(v != nullptr);
+        Tokenizer t;
+        CHECK_OK(t.init(v));
+        int n = 0;
+        for (const DecodeGolden& g : decode_goldens()) {
+            if (std::string(g.fixture) != fx.first) continue;
+            ++n;
+            const std::string got = t.decode(g.ids), stream = streamed(v, g.ids);
+            CHECK_EQ(got, std::string(g.text));
+            CHECK_EQ(stream, std::string(g.text));
+            if (got != g.text || stream != g.text)
+                fprintf(stderr, "    %s: decode \"%s\", stream \"%s\", HF \"%s\"\n", fx.first,
+                        got.c_str(), stream.c_str(), g.text);
+        }
+        CHECK(n >= 2);
+    }
+}
+
+/* Each pre-tokenizer variant over one line that exercises every class boundary (ASCII and
+ * Unicode punctuation, symbols that are not punctuation, combining marks, a connector punctuation,
+ * letter and other numbers, superscripts, non-ASCII whitespace). The vocabulary is a WordPiece one
+ * made of exactly the pieces HuggingFace cuts the line into, so the ids name the pieces one for
+ * one and a different cut shows as another id or [UNK]. */
+TEST(pre_tokenizers_split_as_huggingface) {
+    for (const PretokGolden& g : pretok_goldens()) {
+        auto v = vocab_from_json(g.json, g.name);
+        REQUIRE(v != nullptr);
+        Tokenizer t;
+        CHECK_OK(t.init(v));
+        t.set_segment_cache(false);
+        std::vector<int32_t> ids;
+        CHECK_OK(t.encode(kPretokText, ids, false, false));
+        CHECK(ids == g.ids);
+        if (ids != g.ids) {
+            std::string got;
+            for (int32_t id : ids) got += "|" + v->text(id);
+            fprintf(stderr, "    %s: %s\n", g.name, got.c_str());
+        }
+    }
+}
+
+/* The SentencePiece-converted shape Gemma ships: a Replace normaliser (space to U+2581), a Split
+ * on " " that is not Isolated, BPE with byte fallback, a Replace/ByteFallback/Fuse decoder and a
+ * TemplateProcessing post-processor `<bos> $A <eos>`, which is the model's add-BOS/EOS rule
+ * (EmbeddingGemma pools over that <eos>). Encoded with and without special tokens and decoded,
+ * against HuggingFace on spaces, newlines, tabs, byte fallback (an emoji, CJK), special tokens in
+ * the text and the empty string. */
+TEST(the_gemma_shaped_tokenizer_encodes_as_huggingface) {
+    VocabBuild vb;
+    REQUIRE(parse_tokenizer_json_buf(kGemmaLike, "gemma_like", vb) >= 0);
+    CHECK(vb.add_bos);
+    CHECK(vb.add_eos);
+    auto v = std::make_shared<Vocab>();
+    vb.bos = 2;
+    vb.eos = 1;
+    REQUIRE(v->load(std::move(vb)) >= 0);
+    Tokenizer t;
+    CHECK_OK(t.init(v));
+    size_t k = 0;
+    for (const EncodeGolden& g : gemma_goldens()) {
+        std::vector<int32_t> plain, special;
+        CHECK_OK(t.encode(g.text, plain, /*add_special=*/false, /*parse_special=*/true));
+        CHECK_OK(t.encode(g.text, special, /*add_special=*/true, /*parse_special=*/true));
+        CHECK(plain == g.ids);
+        /* Deliberate: a text that opens with <bos> gets no second one (Tokenizer::encode);
+         * HuggingFace adds it again. */
+        std::vector<int32_t> want = g.with_special;
+        if (std::string(g.text).rfind("<bos>", 0) == 0) want.erase(want.begin());
+        CHECK(special == want);
+        CHECK_EQ(std::count(special.begin(), special.end(), 1) -
+                     std::count(plain.begin(), plain.end(), 1), (ptrdiff_t)1);
+        if (plain != g.ids) {
+            std::string got;
+            for (int32_t id : plain) got += std::to_string(id) + ",";
+            fprintf(stderr, "    \"%s\": %s\n", g.text, got.c_str());
+        }
+        CHECK_EQ(t.decode(g.with_special), std::string(gemma_decoded()[k]));
+        CHECK_EQ(streamed(v, g.with_special), std::string(gemma_decoded()[k]));
+        ++k;
+    }
+    CHECK_EQ(k, gemma_decoded().size());
+}
+
+/* Metaspace's "first" scheme prepends the replacement only where the text starts: a segment after
+ * a special token ("[INST]Hi", "<s>Hi") has a non-zero original offset in HuggingFace and gets
+ * none, where "always" gives every segment one. Encoded through the segment cache both cold and
+ * warm, since the first segment's ids depend on its place and not only its bytes. */
+TEST(a_first_prepend_applies_only_where_the_text_starts) {
+    for (const auto& fx : metaspace_special_fixtures()) {
+        auto v = vocab_from_json(fx.second, fx.first);
+        REQUIRE(v != nullptr);
+        Tokenizer t;
+        CHECK_OK(t.init(v));
+        for (int pass = 0; pass < 2; ++pass)
+            for (const auto& g : metaspace_special_goldens()) {
+                if (std::string(g.first) != fx.first) continue;
+                /* Long enough to reach the segment cache. */
+                std::string text = g.second.text;
+                std::vector<int32_t> want = g.second.ids;
+                for (int k = 0; k < 40; ++k) {
+                    text += " Hi";
+                    want.push_back(7);
+                }
+                std::vector<int32_t> ids;
+                CHECK_OK(t.encode(text, ids, false, true));
+                CHECK(ids == want);
+                if (ids != want) fprintf(stderr, "    %s \"%s\"\n", fx.first, g.second.text);
+            }
+    }
+}
+
+/* ================================================================== refusals */
+
+/* A value the tokenizer has no encoding for is refused, never guessed: an unknown Split or
+ * Punctuation behaviour, an unknown Metaspace prepend scheme, a Strip after Fuse that strips the
+ * end of a streamed text, WordPiece or BPE model settings the encoder does not implement, and
+ * AddedToken flags at a value that changes what matches. A flag at its neutral value, which most
+ * files spell out, loads; lstrip/rstrip load with a warning naming the tokens, since refusing them
+ * would refuse released models and the container cannot carry them. */
+TEST(parse_tokenizer_json_refuses_values_it_cannot_honour) {
+    auto bpe = [](const std::string& pre, const std::string& extra, const std::string& model_extra = "") {
+        return "{\"pre_tokenizer\": " + pre + extra +
+               ", \"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 0, \"b\": 1, \"<unk>\": 2}" +
+               model_extra + ", \"merges\": []}}";
+    };
+    const std::string ws = R"({"type": "WhitespaceSplit"})";
+    auto added = [](const char* flags) {
+        return std::string(R"(, "added_tokens": [{"id": 3, "content": "X", "special": true, )") +
+               flags + "}]";
+    };
+    const std::string refused[] = {
+        bpe(R"({"type": "Split", "pattern": {"String": " "}, "behavior": "Bogus"})", ""),
+        bpe(R"({"type": "Punctuation", "behavior": "Bogus"})", ""),
+        bpe(R"({"type": "Metaspace", "replacement": "_", "prepend_scheme": "sometimes"})", ""),
+        bpe(ws, R"(, "decoder": {"type": "Metaspace", "replacement": "_", "prepend_scheme": "sometimes"})"),
+        bpe(ws, R"(, "decoder": {"type": "Sequence", "decoders": [{"type": "Fuse"},)"
+                R"( {"type": "Strip", "content": " ", "start": 0, "stop": 1}]})"),
+        bpe(ws, R"(, "decoder": {"type": "Sequence", "decoders": [{"type": "Fuse"},)"
+                R"( {"type": "Strip", "content": " ", "start": 1, "stop": 0},)"
+                R"( {"type": "Strip", "content": " ", "start": 1, "stop": 0}]})"),
+        bpe(ws, "", R"(, "end_of_word_suffix": "</w>")"),
+        bpe(ws, "", R"(, "continuing_subword_prefix": "##")"),
+        bpe(ws, "", R"(, "dropout": 0.1)"),
+        bpe(ws, added(R"("single_word": true, "lstrip": false, "rstrip": false, "normalized": false)")),
+        bpe(ws, R"(, "normalizer": {"type": "Lowercase"})" +
+                added(R"("single_word": false, "lstrip": false, "rstrip": false, "normalized": true)")),
+        R"({"pre_tokenizer": {"type": "WhitespaceSplit"}, "model": {"type": "WordPiece",)"
+        R"( "continuing_subword_prefix": "@@", "vocab": {"a": 0}}})",
+        R"({"pre_tokenizer": {"type": "WhitespaceSplit"}, "model": {"type": "WordPiece",)"
+        R"( "max_input_chars_per_word": 50, "vocab": {"a": 0}}})",
+    };
+    for (const std::string& js : refused) {
+        VocabBuild vb;
+        const std::string err = stderr_of([&] {
+            CHECK_EQ(parse_tokenizer_json_buf(js, "test.json", vb), RAD_E_UNSUPPORTED);
+        });
+        CHECK(!err.empty());
+    }
+
+    const std::string accepted[] = {
+        bpe(ws, added(R"("single_word": false, "lstrip": false, "rstrip": false, "normalized": false)")),
+        bpe(ws, added(R"("single_word": false, "lstrip": false, "rstrip": false, "normalized": true)")),
+        bpe(ws, R"(, "normalizer": {"type": "Lowercase"})" +
+                added(R"("single_word": false, "lstrip": false, "rstrip": false, "normalized": false)")),
+        bpe(ws, R"(, "decoder": {"type": "Sequence", "decoders": [{"type": "Fuse"},)"
+                R"( {"type": "Strip", "content": " ", "start": 1, "stop": 0}]})"),
+        bpe(ws, "", R"(, "dropout": null, "continuing_subword_prefix": null, "end_of_word_suffix": null)"),
+    };
+    for (const std::string& js : accepted) {
+        VocabBuild vb;
+        CHECK_OK(parse_tokenizer_json_buf(js, "test.json", vb));
+    }
+
+    VocabBuild vb;
+    const std::string warned = stderr_of([&] {
+        CHECK_OK(parse_tokenizer_json_buf(
+            bpe(ws, added(R"("single_word": false, "lstrip": true, "rstrip": false, "normalized": false)")),
+            "test.json", vb));
+    });
+    CHECK(warned.find("lstrip") != std::string::npos);
+    CHECK(warned.find("X") != std::string::npos);
+
+    /* The model's unk_token names the unknown token, as tokenizer_config.json would. */
+    CHECK_OK(parse_tokenizer_json_buf(bpe(ws, "", R"(, "unk_token": "<unk>")"), "test.json", vb));
+    CHECK_EQ(vb.unk, 2);
+}
+
+/* ================================================================== end of generation */
+
+/* A Qwen-shaped vocabulary: eos is <|im_end|> and <|endoftext|> sits in pad, a control token the
+ * header does not call terminal; a turn ending on it would otherwise run on. A control token with
+ * a near name (<|end_of_thinking|>) and a known name typed NORMAL (text a reply may write) never
+ * end a generation. */
+TEST(vocab_ends_a_qwen_turn_on_both_markers_and_nothing_else) {
+    VocabBuild vb;
+    vb.kind   = RAD_TOK_BPE;
+    vb.tokens = { "a", "<|im_end|>", "<|endoftext|>", "<|end_of_thinking|>", "<|eot_id|>" };
+    vb.types  = { RAD_TT_NORMAL, RAD_TT_CONTROL, RAD_TT_CONTROL, RAD_TT_CONTROL, RAD_TT_NORMAL };
+    vb.eos = 1;
+    vb.pad = 2;
+    auto v = std::make_shared<Vocab>();
+    CHECK_OK(v->load(std::move(vb)));
+    CHECK(v->is_eog(1));
+    CHECK(v->is_eog(2));
+    CHECK(!v->is_eog(3));
+    CHECK(!v->is_eog(4));
+    CHECK(!v->is_eog(0));
+}
+
+/* ================================================================== GGUF vocabularies */
+
+namespace {
+
+/* A GGUF holding only tokenizer metadata, for vocab_from_gguf. Each record writes itself once the
+ * count is known. */
+struct TokGguf {
+    std::vector<std::function<void(GgufBytes&)>> kvs;
+    void str(const char* k, const std::string& v) {
+        kvs.push_back([k, v](GgufBytes& f) { f.str(k); f.pod<uint32_t>(GGUF_STR); f.str(v); });
+    }
+    void strs(const char* k, const std::vector<std::string>& v) {
+        kvs.push_back([k, v](GgufBytes& f) {
+            f.str(k); f.pod<uint32_t>(GGUF_ARR); f.pod<uint32_t>(GGUF_STR); f.pod<uint64_t>(v.size());
+            for (const std::string& s : v) f.str(s);
+        });
+    }
+    void i32s(const char* k, const std::vector<int32_t>& v) {
+        kvs.push_back([k, v](GgufBytes& f) {
+            f.str(k); f.pod<uint32_t>(GGUF_ARR); f.pod<uint32_t>(GGUF_I32); f.pod<uint64_t>(v.size());
+            for (int32_t x : v) f.pod<int32_t>(x);
+        });
+    }
+    void f32s(const char* k, const std::vector<float>& v) {
+        kvs.push_back([k, v](GgufBytes& f) {
+            f.str(k); f.pod<uint32_t>(GGUF_ARR); f.pod<uint32_t>(GGUF_F32); f.pod<uint64_t>(v.size());
+            for (float x : v) f.pod<float>(x);
+        });
+    }
+    void u32(const char* k, uint32_t v) {
+        kvs.push_back([k, v](GgufBytes& f) { f.str(k); f.pod<uint32_t>(GGUF_U32); f.pod<uint32_t>(v); });
+    }
+    int build(VocabBuild* out) const {
+        GgufBytes f;
+        f.header(0, kvs.size());
+        for (const auto& kv : kvs) kv(f);
+        while (f.b.size() % 32) f.b.push_back(0);   /* the (empty) data section's alignment */
+        GgufFile g;
+        const int st = f.open(&g);
+        if (st < 0) return st;
+        return vocab_from_gguf(g, *out);
+    }
+};
+
+TokGguf tok_gguf(const char* model, const char* pre) {
+    TokGguf t;
+    t.str("tokenizer.ggml.model", model);
+    if (pre) t.str("tokenizer.ggml.pre", pre);
+    t.strs("tokenizer.ggml.tokens", { "a", "b", "ab", "<s>", "</s>" });
+    t.i32s("tokenizer.ggml.token_type", { 1, 1, 1, 3, 3 });
+    t.u32("tokenizer.ggml.bos_token_id", 3);
+    t.u32("tokenizer.ggml.eos_token_id", 4);
+    return t;
+}
+
+/* Every piece the reconstructed chain's Split cuts `text` into, over the text's own bytes. */
+std::vector<std::string> gguf_split(const VocabBuild& vb, const std::string& text) {
+    std::vector<std::string> pieces = { text };
+    for (const VocabStep& s : vb.steps) {
+        if (s.kind != RAD_PRE_SPLIT) continue;
+        std::unique_ptr<TokRegex> re;
+        std::string why;
+        if (TokRegex::compile(s.arg0, &re, &why) < 0) return {};
+        std::vector<std::string> next;
+        for (const std::string& p : pieces) {
+            std::vector<TokSpan> out, scratch;
+            tok_split(*re, p, (int)s.iarg, false, out, scratch);
+            for (const TokSpan& sp : out) next.push_back(p.substr(sp.begin, sp.end - sp.begin));
+        }
+        pieces.swap(next);
+    }
+    return pieces;
+}
+
+}  /* namespace */
+
+/* GGUF carries no chain, only `tokenizer.ggml.pre`, so the chain is rebuilt from a table of names:
+ * byte-level BPE with the named pattern, SentencePiece-shaped BPE, unigram and WordPiece, with the
+ * header's ids and merges. A name not in the table is refused rather than given a default split.
+ * The qwen2 and llama-bpe entries must split as the patterns those models' tokenizer.json files
+ * carry, apart from llama.cpp's rewrite of the case-insensitive contractions, which only "'"
+ * before U+017F tells apart. */
+TEST(gguf_vocabularies_are_rebuilt_from_the_pre_name) {
+    {
+        TokGguf t = tok_gguf("gpt2", "qwen2");
+        t.strs("tokenizer.ggml.merges", { "a b", "x y" });
+        VocabBuild vb;
+        CHECK_OK(t.build(&vb));
+        CHECK_EQ(vb.kind, (uint32_t)RAD_TOK_BPE);
+        CHECK_EQ(vb.tokens.size(), (size_t)5);
+        CHECK_EQ(vb.merges.size(), (size_t)1);       /* "x y" names no token */
+        CHECK_EQ(vb.bos, 3);
+        CHECK_EQ(vb.eos, 4);
+        CHECK_EQ(vb.eot, 4);
+        REQUIRE_EQ(vb.steps.size(), (size_t)3);
+        CHECK_EQ(vb.steps[0].kind, (uint32_t)RAD_PRE_SPLIT);
+        CHECK_EQ(vb.steps[1].kind, (uint32_t)RAD_PRE_BYTELEVEL);
+        CHECK_EQ(vb.steps[2].kind, (uint32_t)RAD_DEC_BYTELEVEL);
+        const char* hf_qwen2 =
+            "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+"
+            "[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+        tokfix::TextGen gen(17);
+        for (int i = 0; i < 40; ++i) {
+            std::string text = gen.text(60, false, [](uint32_t c) { return c == 0x17F; });
+            for (size_t q; (q = text.find("'\xc5\xbf")) != std::string::npos; ) text.replace(q, 1, "_");
+            VocabBuild hf;
+            hf.steps = { tokfix::split_step(hf_qwen2) };
+            const auto a = gguf_split(vb, text), b = gguf_split(hf, text);
+            CHECK(a == b);
+            if (a != b) {
+                std::string x, y;
+                for (const auto& p : a) x += "|" + p;
+                for (const auto& p : b) y += "|" + p;
+                fprintf(stderr, "    gguf %s\n    json %s\n", x.c_str(), y.c_str());
+            }
+        }
+    }
+    {
+        TokGguf t = tok_gguf("gpt2", "llama-bpe");
+        VocabBuild vb;
+        CHECK_OK(t.build(&vb));
+        tokfix::TextGen gen(19);
+        for (int i = 0; i < 40; ++i) {
+            std::string text = gen.text(60, false, [](uint32_t c) { return c == 0x17F; });
+            for (size_t q; (q = text.find("'\xc5\xbf")) != std::string::npos; ) text.replace(q, 1, "_");
+            VocabBuild hf;
+            hf.steps = { tokfix::split_step(tokfix::k_llama3) };
+            CHECK(gguf_split(vb, text) == gguf_split(hf, text));
+        }
+    }
+    {
+        TokGguf t = tok_gguf("gpt2", "no-such-pre");
+        VocabBuild vb;
+        const std::string err = stderr_of([&] { CHECK_EQ(t.build(&vb), RAD_E_UNSUPPORTED); });
+        CHECK(err.find("no-such-pre") != std::string::npos);
+    }
+    {
+        /* SentencePiece as BPE: Metaspace in and out, byte fallback. */
+        TokGguf t = tok_gguf("llama", nullptr);
+        VocabBuild vb;
+        CHECK_OK(t.build(&vb));
+        REQUIRE_EQ(vb.steps.size(), (size_t)3);
+        CHECK_EQ(vb.steps[0].kind, (uint32_t)RAD_PRE_METASPACE);
+        CHECK_EQ(vb.steps[1].kind, (uint32_t)RAD_PRE_BYTE_FALLBACK);
+        CHECK_EQ(vb.steps[2].kind, (uint32_t)RAD_DEC_METASPACE);
+        CHECK_EQ(vb.steps[0].arg0, std::string("\xe2\x96\x81"));
+        CHECK_EQ(vb.steps[0].iarg, (int64_t)2);
+    }
+    {
+        TokGguf t = tok_gguf("t5", nullptr);
+        t.f32s("tokenizer.ggml.scores", { -1.0f, -2.0f, -0.5f, 0.0f, 0.0f });
+        VocabBuild vb;
+        CHECK_OK(t.build(&vb));
+        CHECK_EQ(vb.kind, (uint32_t)RAD_TOK_UNIGRAM);
+        CHECK_EQ(vb.scores.size(), (size_t)5);
+        auto v = std::make_shared<Vocab>();
+        CHECK_OK(v->load(std::move(vb)));
+    }
+    {
+        /* BERT: lowercase, BertPreTokenizer, the WordPiece decoder. */
+        TokGguf t = tok_gguf("bert", nullptr);
+        VocabBuild vb;
+        CHECK_OK(t.build(&vb));
+        CHECK_EQ(vb.kind, (uint32_t)RAD_TOK_WORDPIECE);
+        REQUIRE_EQ(vb.steps.size(), (size_t)3);
+        CHECK_EQ(vb.steps[0].kind, (uint32_t)RAD_NORM_LOWERCASE);
+        CHECK_EQ(vb.steps[1].kind, (uint32_t)RAD_PRE_WHITESPACE);
+        CHECK_EQ(vb.steps[1].flags, (uint32_t)kPreBert);
+        CHECK_EQ(vb.steps[2].kind, (uint32_t)RAD_DEC_REPLACE);
+        CHECK((vb.steps[2].flags & kDecWordPiece) != 0);
+    }
+}
+
+/* ================================================================== normalisation, independently */
+
+/* The four normal forms against CPython's unicodedata, an implementation independent of the ICU
+ * the tables were generated from (tests/mk_norm_vectors.py): a third of the codepoints with a
+ * decomposition, every pair that composes, Hangul, and marks in shuffled canonical classes after
+ * a base. A regenerated table that is wrong but self-consistent passes the inverse checks above
+ * and fails here. The tokeniser's NFC shortcut must give the same text. */
+TEST(the_normal_forms_agree_with_an_independent_implementation) {
+    auto utf8_of = [](const std::string& hex) {
+        std::string out;
+        size_t i = 0;
+        while (i < hex.size()) {
+            size_t j = hex.find(' ', i);
+            if (j == std::string::npos) j = hex.size();
+            out += tokfix::cp_utf8((uint32_t)std::stoul(hex.substr(i, j - i), nullptr, 16));
+            i = j + 1;
+        }
+        return out;
+    };
+    int rows = 0, bad = 0;
+    for (const char* row : kNormVectors) {
+        std::vector<std::string> f;
+        std::string r = row;
+        for (size_t i = 0, j; i <= r.size(); i = j + 1) {
+            j = r.find(';', i);
+            if (j == std::string::npos) j = r.size();
+            f.push_back(utf8_of(r.substr(i, j - i)));
+        }
+        REQUIRE_EQ(f.size(), (size_t)5);
+        std::string nfc = f[0];
+        tok_nfc(nfc);
+        const bool ok = unorm_utf8(f[0], false, true) == f[1] && unorm_utf8(f[0], false, false) == f[2] &&
+                        unorm_utf8(f[0], true, true) == f[3] && unorm_utf8(f[0], true, false) == f[4] &&
+                        nfc == f[1];
+        CHECK(ok);
+        if (!ok && ++bad <= 5) fprintf(stderr, "    %s\n", row);
+        ++rows;
+    }
+    CHECK(rows > 2500);
+}
+
+RAD_TEST_MAIN()

@@ -1,5 +1,5 @@
-/* main.cpp -- the entry point. Everything it does is in engine.h's comment; this file only turns
- * a command line into that sequence and a status into an exit code.
+/* main.cpp -- the entry point: turns a command line into engine.h's startup sequence and a status
+ * into an exit code.
  */
 #include "engine.h"
 #include "hf_model.h"
@@ -15,24 +15,23 @@ int main(int argc, char** argv) {
 
     rad::Engine engine(std::move(cfg));
 
-    {
-        /* A startup that stops printing says where it waits (util/stallwatch.h). Two minutes:
-         * the slowest normal step, a container read from a slow disk, logs well inside that. */
-        rad::StallWatch watch("startup", 120000);
-        s = engine.start();
-    }
+    /* A startup that stops logging reports where it waits (util/stallwatch.h). Two minutes
+     * comfortably covers the slowest normal step, such as a container read from a slow disk. The
+     * watch goes on into serve() and ends when the server listens. */
+    auto watch = std::make_unique<rad::StallWatch>("startup", 120000);
+    s = engine.start();
+    if (s < 0 || engine.config().debug_graph) watch.reset();
     if (s < 0) {
-        /* start() already said what and why; the report adds what it was running on and what it
-         * had decided by then, which is what a log of a server that never came up is read for. */
+        /* start() logged the error; the report adds the machine and the decisions made so far. */
         engine.print_startup_report(s);
         return 1;
     }
 
     if (engine.config().debug_graph) return engine.dump();
-    s = engine.serve();
+    s = engine.serve(std::move(watch));
     if (s < 0) {
-        /* A refusal between start() and listening (a chat template the defaults cannot render, a
-         * thinking budget the model cannot hold) also ends a server that never came up. */
+        /* serve() can also refuse before listening (e.g. a template default the template
+         * rejects, an unholdable thinking budget). */
         if (!engine.startup_report_printed()) engine.print_startup_report(s);
         return 1;
     }

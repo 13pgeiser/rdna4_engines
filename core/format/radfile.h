@@ -1,23 +1,17 @@
-/* radfile.h -- the .rad reader and writer.
+/* radfile.h -- the .rad reader and writer, implementing exactly the format frozen in
+ * abi/rad_format.h. The writer and reader live together so they cannot disagree.
  *
- * The container is frozen in abi/rad_format.h; this file implements exactly it and adds
- * nothing to the on-disk shape. What lives here is the two halves that must never disagree: the
- * writer that produces a layout and the reader that maps it.
- *
- * The reader is an mmap and an index build, and then it is done. Every invariant a reader relies
- * on is CHECKED AT OPEN rather than asserted at use:
+ * The reader mmaps and builds an index. Every invariant is checked at open, not at use:
  *
  *   - every offset and count is bounds-checked against the mapped length, so a truncated or
- *     corrupt file is RAD_E_FORMAT with a message and not a SIGSEGV three components later;
- *   - every rad_stroff lands inside a string blob whose last byte is NUL, so str() is a plain
- *     pointer and never a scan;
- *   - the expert directory's fixed stride is RE-DERIVED and verified, so
- *     `base + id * stride` on the critical path is arithmetic somebody already proved.
+ *     corrupt file is RAD_E_FORMAT with a message, not a later SIGSEGV;
+ *   - every rad_stroff lands inside a NUL-terminated string blob, so str() is a plain pointer;
+ *   - the expert directory's fixed stride is re-derived and verified, so `base + id * stride` on
+ *     the critical path is safe.
  *
- * The cost of the last one, stated plainly: a container whose experts within a layer are not all
- * the same shape and format is REFUSED, not read slowly. Addressing by arithmetic is the format's
- * reason to exist; a file that cannot be addressed that way is not a .rad, and reading it with a
- * table walk would silently give back the property the whole design was paying for.
+ * Consequently a container whose experts within a layer differ in shape or format is refused:
+ * addressing by arithmetic is the format's purpose. So is one that names a weight twice, since
+ * find() could return only one of them.
  */
 #pragma once
 #include "../rad_internal.h"
@@ -26,31 +20,24 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace rad {
 
 /* ================================================================== vocab */
-/* The MUTABLE side of the vocab -- VocabBuild, the tokenizer.json interpreter and the serialiser
- * that turns one into a RadVocabHeader -- belongs to core/text, because interpreting a declared
- * normaliser chain is that component's whole job (spec §12). What belongs here is the container's
- * half of the contract, and it is two things:
+/* The vocab's mutable side (VocabBuild, the tokenizer.json interpreter, the serialiser) belongs to
+ * core/text (spec §12). The container's half of the contract:
  *
- *   RadWriter::intern_string()   so the vocab section's strings go into the .rad's ONE string
- *                                blob rather than a second one nobody else can read;
- *   RadWriter::set_vocab_section() so the serialised bytes are placed and rebased by the writer
- *                                that owns every other offset in the file.
+ *   RadWriter::intern_string()     the vocab's strings go into the .rad's single string blob;
+ *   RadWriter::set_vocab_section() the writer places and rebases the serialised bytes like every
+ *                                  other offset.
  *
- * core/text's `StringSink` is the interface that joins them, and rad-convert supplies the two-line
- * adapter. Keeping VocabBuild out of this header is what stops two definitions of it existing.
+ * core/text's `StringSink` joins them; rad-convert supplies the adapter.
  *
- * The read-back view below is the container's own: pointers into the mapping, already
- * bounds-checked at open. core/text's vocab_deserialize() copies out of it. */
-/* NOT named VocabView: core/sample/vocab_view.h declares an ABSTRACT CLASS of that name in this
- * same namespace, and two definitions of one name are an ODR violation the moment one translation
- * unit includes both -- which core/engine.cpp does, because it loads the container and drives the
- * sampler. This one is the container's read-back view of the vocab SECTION; the other is what the
- * sampler needs to know about a vocabulary. Different things, deliberately different names. */
+ * The read-back view below holds pointers into the mapping, bounds-checked at open;
+ * vocab_deserialize() copies out of it. Not named VocabView, which core/sample/vocab_view.h
+ * declares in this namespace (an ODR clash in any unit including both). */
 struct VocabSection {
     const RadVocabHeader* h        = nullptr;
     const rad_stroff*     tok_text = nullptr;   /* [n_tokens] */
@@ -69,8 +56,7 @@ public:
     RadFile(const RadFile&) = delete;
     RadFile& operator=(const RadFile&) = delete;
 
-    /* mmap, validate, index. Returns RAD_OK, or RAD_E_IO / RAD_E_FORMAT with the reason logged at
-     * Error naming the field that failed -- a bad container is diagnosed here or nowhere. */
+    /* mmap, validate, index. RAD_OK, or RAD_E_IO / RAD_E_FORMAT with the failing field logged. */
     int  open(const char* path);
     void close();
     bool is_open() const { return base_ != nullptr; }
@@ -80,44 +66,22 @@ public:
     const uint8_t*       base()   const { return base_; }
     int64_t              size()   const { return size_; }
 
-    /* Drop the blob from the page cache and from this process's page tables.
-     *
-     * A container larger than RAM cannot be traversed twice without this. When the weight load
-     * walks the whole file once per rank, the second walk meets a page cache that is entirely the
-     * first walk's pages: nothing it needs is resident, and the readahead it triggers evicts the
-     * pages it is about to want. The load then makes no forward progress while the device sits
-     * idle behind a stream of NVMe reads that are immediately thrown away.
-     *
-     * Only the blob: the tables are small, read constantly, and wanted resident for the life of
-     * the process. Advisory in both directions -- if the kernel declines, the load is exactly as
-     * it was. */
+    /* Drop the blob from the page cache and this process's page tables, so a container larger
+     * than RAM does not leave the cache full of pages nothing will read. Only the blob: the tables
+     * are small and read constantly. Advisory; the kernel may decline. */
     void drop_blob_cache() const;
 
-    /* Drop one range of the blob behind a cursor that will not come back for it.
-     *
-     * The weight load reads the container once, front to back, and nothing re-reads a window it
-     * has finished with -- but buffered reads leave every one of those bytes in the page cache,
-     * and on a container larger than RAM that turns into reclaim pressure the read itself then
-     * waits on, so the sweep rate decays as it advances. Dropping each window as it is consumed
-     * holds the rate flat.
-     *
-     * THE PRECONDITION IS ONE CURSOR. Drop-behind is wrong with several cursors over one file,
-     * because what one discards is what another is about to want -- the same reason a sequential
-     * access hint is worse than silence in that arrangement. This call is correct only for a
-     * single cursor moving in one direction with no revisits, where the pages are genuinely
-     * dead. */
+    /* Drop one range of the blob behind a single forward cursor. A buffered front-to-back read of
+     * a container larger than RAM otherwise builds reclaim pressure that slows the read itself.
+     * Correct only for one cursor moving in one direction with no revisits; with several, one
+     * would drop what another is about to read. */
     void drop_range(int64_t off, int64_t bytes) const;
 
-    /* Read `bytes` at `off` into `dst` with pread, bypassing the mapping entirely.
-     *
-     * The load phase wants this and not the mapping. An async copy whose source is pageable
-     * memory is staged by the HIP runtime through its own pinned buffer, and that path degrades
-     * without bound as a load proceeds: even with the source pages already resident, a single
-     * small hipMemcpyAsync can block for seconds. Reading into a pinned buffer the loader owns
-     * makes the device copy a real DMA from pinned memory, which has none of that behaviour.
-     *
-     * Returns RAD_OK, or RAD_E_IO with the reason logged. Short reads are retried; EINTR is not
-     * an error. */
+    /* pread `bytes` at `off` into `dst`, bypassing the mapping. For loads: an async copy from
+     * pageable memory goes through the HIP runtime's own staging, which degrades as a load
+     * proceeds (a small hipMemcpyAsync can block for seconds even with resident pages); reading
+     * into the loader's pinned buffer makes the copy a real DMA. RAD_OK, or RAD_E_IO with the
+     * reason logged; short reads and EINTR are retried. */
     int read_at(void* dst, int64_t bytes, int64_t off) const;
 
     /* Strings. Offset 0 is the empty string; every offset was bounds-checked at open. */
@@ -138,8 +102,8 @@ public:
     const RadFileEntry* find(std::string_view name) const;
     const uint8_t*      data(const RadFileEntry& e) const { return base_ + e.offset; }
 
-    /* An entry's encoding and its planes, in the encoding's order. Every plane was checked at open
-     * to be exactly the size its encoding and the entry's shape say. */
+    /* An entry's encoding and its planes in encoding order; each plane's size was checked at
+     * open. */
     const RadEncoding&  encoding(const RadFileEntry& e) const { return encs_[e.enc]; }
     const RadFilePlane& plane(const RadFileEntry& e, int k) const {
         return planes_[e.plane_first + (uint64_t)k];
@@ -149,9 +113,8 @@ public:
     const RadEncoding&  encoding_at(int64_t i) const { return encs_[i]; }
 
     /* ------------------------------------------------------------ fixed-stride addressing */
-    /* One layer's experts. All of them share a shape and a format, which is what makes
-     *     addr = base + id * stride
-     * O(1) arithmetic with no table walk on the critical path (spec §4.1). Verified at open. */
+    /* One layer's experts, all of one shape and format, so addr = base + id * stride with no table
+     * walk on the critical path (spec §4.2). Verified at open. */
     struct ExpertGroup {
         int32_t  layer      = -1;
         int32_t  n_expert   = 0;
@@ -160,7 +123,7 @@ public:
         uint64_t base       = 0;      /* file offset of expert 0's first byte */
         uint64_t stride     = 0;      /* bytes between consecutive experts, aligned */
         uint64_t unit_bytes = 0;      /* payload of one expert: every slot's every plane */
-        /* Per-slot displacement from an expert's base. Fixed across experts by construction. */
+        /* Per-slot offset from an expert's base, the same for every expert. */
         uint64_t slot_off[8] = {0};
         uint64_t slot_bytes[8] = {0};
     };
@@ -168,8 +131,7 @@ public:
     int64_t            group_count() const { return (int64_t)groups_.size(); }
     const ExpertGroup* group_for_layer(int32_t layer) const;
 
-    /* The whole point of the format, in one line each. No bounds check on the hot path: the
-     * caller has the group and therefore has n_expert and n_slot. */
+    /* No bounds check on the hot path: the caller has the group's n_expert and n_slot. */
     const uint8_t* expert_ptr(const ExpertGroup& g, int32_t expert, int32_t slot) const {
         return base_ + g.base + (uint64_t)expert * g.stride + g.slot_off[slot];
     }
@@ -205,21 +167,18 @@ private:
 };
 
 /* ================================================================== writer */
-/* Streaming, because the blob is the model: a 100 GB checkpoint cannot be staged in RAM to be
- * re-sorted at the end. The tables (strings, directory, planes, encodings, vocab, profile) ARE held
- * in memory -- a 512-expert 48-layer model is ~50k directory rows, which is megabytes.
+/* Streaming writer: the blob is never held in RAM (a checkpoint may be 100 GB). The tables
+ * (strings, directory, planes, encodings, vocab, profile) are in memory; ~50k directory rows for a
+ * 512-expert 48-layer model is megabytes.
  *
- * A WEIGHT IS RESERVED, THEN WRITTEN. add_weight() places the entry and every plane of its
- * encoding in the blob and returns its index; write_plane() fills any part of any plane, in any
- * order, at its position. That is what a quantiser needs -- it produces a block of rows of EVERY
- * plane at once -- and what a 51 GB table needs, whose codes are produced a block at a time
- * without the whole ever existing anywhere. finish() refuses a plane left short.
+ * A weight is reserved, then written: add_weight() places the entry and every plane and returns
+ * its index; write_plane() fills any part of any plane in any order. A quantiser produces rows of
+ * every plane at once, and a 51 GB table is produced block by block. finish() refuses a plane left
+ * short.
  *
- * The consequence, and it is a real constraint on callers: WEIGHTS MUST BE ADDED IN MOVEMENT-UNIT
- * ORDER. An expert's slots must be added consecutively, and a layer's experts must be added
- * consecutively and identically shaped. The writer verifies it and refuses with RAD_E_INVAL naming
- * the offending pair, rather than producing a file whose stride is a lie. rad-convert sorts its
- * manifest before it starts writing; that sort is over the manifest, not over the bytes.
+ * Callers must add weights in movement-unit order: an expert's slots consecutively, and a layer's
+ * experts consecutively with identical shapes. The writer verifies this and refuses with
+ * RAD_E_INVAL naming the offending pair. rad-convert sorts its manifest before writing.
  */
 class RadWriter {
 public:
@@ -252,23 +211,16 @@ public:
         int32_t     layer = -1, expert = -1, slot = 0;
     };
 
-    /* APPEND IN PLACE: extend the container `old` (opened at `path`) with new weights, without
-     * copying the ones it already holds.
+    /* Append in place: extend container `old` (opened at `path`) with new weights without copying
+     * the existing ones. Offsets are absolute, so new bytes go past the end, followed by fresh
+     * tables naming both the old weights (at their offsets, via add_existing()) and the new; the
+     * header is rewritten last. Until then the file is its old self with an unreachable tail;
+     * afterwards the old tables are dead bytes. finish() leaves `<path>.pre-append` (the old
+     * header and length) to restore it.
      *
-     * A container is a header, its tables, and the blob, and every offset in them is absolute, so
-     * nothing forces a new weight to live anywhere but past the end. The new weights' bytes are
-     * written there, then a fresh set of tables that names both the old weights -- at the offsets
-     * they already have, through add_existing() -- and the new ones, and the header is rewritten
-     * last. Until that one write the file is its old self with a tail the old header does not
-     * reach; after it, the old tables are dead bytes in front of the blob. finish() also leaves
-     * `<path>.pre-append`: the old header and length, which is all it takes to put the file back.
-     *
-     * It is what makes adding a component to a 120 GB container a gigabyte of I/O instead of a
-     * 120 GB copy the disk may not have room for. A new EXPERT weight is refused: a layer's experts
-     * are written consecutively at a fixed stride, and an appended one cannot join its layer.
-     *
-     * The caller must be the file's only user. A process that has it mapped reads the header
-     * through its mapping, and a header that changes under it names tables it never validated. */
+     * New expert weights are refused: a layer's experts sit at a fixed stride and cannot be
+     * extended. The caller must be the file's only user, since a process mapping it would see the
+     * header change under it. */
     int  begin_append(const char* path, const RadFile& old);
     /* A weight `old` already holds, recorded at the offsets it has there. Its encoding and planes
      * are the old entry's; its name, provenance and movement group are `w`'s. */
@@ -276,7 +228,7 @@ public:
 
     /* Reserve the weight and every plane of its encoding. Returns the directory index, or a
      * negative status: an invalid encoding, a shape it cannot cover, a movement-unit order the
-     * stride cannot hold. */
+     * stride cannot hold, a name the container already holds. */
     int64_t add_weight(const Weight& w);
     /* Reserve and write in one call: `planes[k]` is plane k's whole bytes. */
     int64_t add_weight(const Weight& w, const void* const* planes);
@@ -285,26 +237,23 @@ public:
     int write_plane(int64_t idx, int k, int64_t off, const void* data, int64_t bytes);
     int64_t plane_bytes(int64_t idx, int k) const;
 
-    /* Intern into the .rad's single string blob. Public because the vocab section's writer lives
-     * in core/text and has to put its token text somewhere the reader can find it; core/text's
-     * StringSink is the one-method interface rad-convert adapts onto this. */
+    /* Intern into the .rad's single string blob. Public for core/text's vocab writer (via
+     * StringSink). */
     rad_stroff intern_string(std::string_view s) { return intern(s); }
 
-    /* The serialised vocab section. Its internal offsets must be SECTION-RELATIVE (serialise with
-     * a section_file_off of 0); finish() rebases them once it knows where the section lands, the
-     * same way it rebases the directory. */
+    /* The serialised vocab section. Its internal offsets must be section-relative (serialise with
+     * section_file_off 0); finish() rebases them, as it does the directory. */
     int  set_vocab_section(const void* blob, int64_t bytes);
 
     void add_profile(int32_t layer, int32_t expert, float share);
 
-    /* FIX THE LAYOUT AND WRITE THE BLOB WHERE IT STAYS. Once every weight, the metadata, the vocab
-     * section and the profile are in, the tables' sizes -- and so the blob's offset -- are known:
-     * after seal() a plane write lands in the target itself and finish() writes the tables in
-     * front of it, with no spill and no 100 GB copy. A table changed after it fails finish(). A
-     * writer that is not sealed spills the blob and splices it in at finish(). */
+    /* Fix the layout once every weight, the metadata, the vocab section and the profile are in, so
+     * the blob's offset is known: afterwards plane writes land in the target directly and
+     * finish() writes the tables in front, with no spill and no copy. Changing a table afterwards
+     * fails finish(). An unsealed writer spills the blob and splices it in at finish(). */
     int  seal();
 
-    /* Writes the header and every table, then -- unsealed -- splices the spilled blob in at a
+    /* Writes the header and every table, then (if unsealed) splices the spilled blob in at a
      * 2 MiB boundary. */
     int  finish();
 
@@ -326,8 +275,8 @@ private:
     RadFileHeader hdr_{};           /* the sealed layout */
 
     /* Append mode (begin_append). New bytes go at `append_base_`, the old length rounded up to a
-     * pool boundary; an entry recorded by add_existing() is already absolute and is flagged so
-     * finish() does not rebase it. */
+     * pool boundary; add_existing() entries are already absolute and flagged so finish() does not
+     * rebase them. */
     int  finish_append();
     int  check_complete() const;
     bool     append_ = false;
@@ -346,6 +295,8 @@ private:
     std::vector<int64_t>                          written_;   /* parallel to planes_ */
     std::vector<RadEncoding>                      encs_;
     std::vector<RadFileProfile>                   prof_;
+    /* Every weight name added, since a name is looked up and must find one entry. */
+    std::unordered_set<std::string>               names_;
 
     /* The vocab section, assembled in memory and appended verbatim. */
     std::vector<uint8_t> vocab_blob_;
@@ -353,21 +304,19 @@ private:
 
     int64_t blob_bytes_ = 0;    /* the blob's reserved length */
 
-    /* Movement-unit bookkeeping, so the fixed stride is a property the writer PROVES. */
+    /* Movement-unit bookkeeping, so the writer verifies the fixed stride. */
     int32_t  cur_layer_ = -2, cur_expert_ = -2;
     int32_t  grp_layer_ = -2;
     int32_t  grp_n_slot_ = 0, grp_slot_seen_ = 0, grp_n_expert_ = 0;
     uint64_t grp_first_off_ = 0, grp_expert_off_ = 0, grp_stride_ = 0;
-    /* Expert 0's per-slot payload. ExpertGroup promises slot_off[] and slot_bytes[] are fixed
-     * across the experts of a layer "by construction", and this is where that is constructed:
-     * an expert whose slot differs in size is refused at ITS OWN add_weight, not at the next
-     * one's. The offset check alone cannot see it -- an oversized LAST expert lands at the right
-     * base and simply overruns past base + n*stride. */
+    /* Expert 0's per-slot payload, which enforces ExpertGroup's fixed slot_off[]/slot_bytes[]: an
+     * expert whose slot differs in size is refused at its own add_weight. The offset check alone
+     * misses an oversized last expert, which starts at the right base and overruns. */
     std::vector<uint64_t> grp_slot_bytes_;
 };
 
 /* ================================================================== helpers for the tools */
-/* "layer 12 / expert 7" and friends, so rad-info and every diagnostic name a unit the same way. */
+/* "layer 12 / expert 7" etc., so every diagnostic names a unit the same way. */
 std::string rad_unit_name(int32_t layer, int32_t expert);
 
 }  /* namespace rad */

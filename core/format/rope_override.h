@@ -1,19 +1,17 @@
-/* --rope-scaling, over a container's free-form metadata.
+/* rope_override.h -- --rope-scaling, applied to a container's free-form metadata at load.
  *
- * Static YaRN is read by the architecture (arch/common/rad_arch.h, yarn_from) out of the model's
- * own keys: `text_config.rope_parameters.`, `rope_parameters.`, `text_config.rope_scaling.`,
- * `rope_scaling.`, in that order, the FIRST of them that names a rotary type being the one that
- * counts; a DFlash2 drafter reads `draft.rope_parameters.` / `draft.rope_scaling.` on its own. A
- * container converted without YaRN therefore needs a reconvert to get it -- or these keys rewritten
- * when it is loaded, which is all this does. The architecture then resolves the result exactly as
- * it would a converted container, so there is one reader and one set of checks.
+ * The architecture reads static YaRN (arch/common/rad_arch.h, yarn_from) from the first of
+ * `text_config.rope_parameters.`, `rope_parameters.`, `text_config.rope_scaling.`, `rope_scaling.`
+ * that names a rotary type; a DFlash2 drafter reads `draft.rope_parameters.` /
+ * `draft.rope_scaling.`. These functions rewrite those keys so a container gains YaRN without
+ * reconversion, and the architecture's one reader and checks apply.
  *
- * The rewrite goes into the object the reader would take, not beside it. A Qwen3.8 container says
- * `text_config.rope_parameters.rope_type = default`; a YaRN written under `rope_parameters.` would
- * sit behind that and never be read.
+ * The rewrite targets the object the reader takes: a Qwen3.8 container says
+ * `text_config.rope_parameters.rope_type = default`, so YaRN under `rope_parameters.` would be
+ * ignored.
  *
- * Pure functions over two parallel string vectors, so they are tested without an engine
- * (tests/yarn_test.cpp holds them to yarn_from). */
+ * Pure functions over parallel string vectors, tested without an engine (tests/yarn_test.cpp
+ * checks them against yarn_from). */
 #pragma once
 
 #include <algorithm>
@@ -32,8 +30,7 @@ struct RopeSpec {
     int64_t orig = 0;   /* 0: the container's own trained length */
 };
 
-/* "yarn:FACTOR[:ORIG]" with FACTOR > 1 and ORIG > 0, or "none"; empty is Keep. False for anything
- * else, so a typo is refused where it was typed. */
+/* "yarn:FACTOR[:ORIG]" with FACTOR > 1 and ORIG > 0, or "none"; empty is Keep. False otherwise. */
 inline bool rope_spec_parse(const char* s, RopeSpec* out) {
     RopeSpec r;
     if (!s || !*s) { *out = r; return true; }
@@ -88,7 +85,7 @@ struct RopeKeys {
     }
 };
 
-/* The reader's order -- yarn_from's, kept in step with it. */
+/* The reader's search order; must match yarn_from's. */
 inline std::vector<std::string> rope_homes(const char* group) {
     if (!*group)
         return { "text_config.rope_parameters.", "rope_parameters.", "text_config.rope_scaling.",
@@ -96,8 +93,8 @@ inline std::vector<std::string> rope_homes(const char* group) {
     return { std::string(group) + "rope_parameters.", std::string(group) + "rope_scaling." };
 }
 
-/* The object the reader takes and the key that names its type, or empty strings when no object
- * names one (the model's rotary is then the default). */
+/* The object the reader takes and the key naming its type; empty when none names one (the default
+ * rotary). */
 inline void rope_authoritative(const RopeKeys& kv, const char* group, std::string* home,
                                std::string* type_key) {
     home->clear();
@@ -127,9 +124,9 @@ inline RopeResolved rope_resolve(std::vector<std::string>& k, std::vector<std::s
     return r;
 }
 
-/* Apply SPEC to one rotary group ("" the target, "draft." a DFlash2 drafter). `trained` is the
- * group's own trained length, the default ORIG. Returns false, with *why set, when the group's
- * rotary is one this flag does not stack YaRN over (linear position interpolation, say). */
+/* Apply `spec` to one rotary group ("" the target, "draft." a DFlash2 drafter). `trained` is the
+ * group's trained length, the default ORIG. False, with *why, when the group's rotary type is one
+ * YaRN is not stacked over (e.g. linear interpolation). */
 inline bool rope_override_group(std::vector<std::string>& k, std::vector<std::string>& v,
                                 const RopeSpec& spec, const char* group, int64_t trained,
                                 std::string* why) {
@@ -154,8 +151,8 @@ inline bool rope_override_group(std::vector<std::string>& k, std::vector<std::st
                                              : "rope_parameters.";
         tk = home + "rope_type";
     }
-    /* A checkpoint's own YaRN keeps its trained length unless one is given; anything that was
-     * tied to its old factor goes, so the reader derives it for the new one. */
+    /* An existing YaRN keeps its trained length unless one is given; keys tied to the old factor
+     * are erased so the reader derives them for the new one. */
     int64_t orig = spec.orig;
     if (!orig && type == "yarn")
         if (const std::string* o = kv.get(home + "original_max_position_embeddings"))
@@ -176,13 +173,12 @@ inline bool rope_override_group(std::vector<std::string>& k, std::vector<std::st
     return true;
 }
 
-/* THE ROTARY AS A CACHED KEY DEPENDS ON IT: every key with a path component naming `rope` or
- * `rotary` -- rope_parameters.*, rope_scaling.*, rope_theta, partial_rotary_factor, their
- * text_config. and draft. forms, a GGUF's <arch>.rope.* -- as key=value, sorted, after
- * --rope-scaling has been applied. A persisted prefix store is fingerprinted with it: a container
- * converted from the same checkpoint with YaRN has the same name and the same shapes, and its
- * stock-rotated keys (and QSA block keys) read back under YaRN would be attended to at the wrong
- * angles. Key order and unrelated keys do not change it. */
+/* The rotary's identity: every key with a path component containing `rope` or `rotary`
+ * (rope_parameters.*, rope_scaling.*, rope_theta, partial_rotary_factor, their text_config. and
+ * draft. forms, a GGUF's <arch>.rope.*) as sorted key=value, after --rope-scaling. A persisted
+ * prefix store is fingerprinted with it, since the same container with YaRN has identical names and
+ * shapes but cached keys would be at the wrong angles. Key order and unrelated keys do not
+ * matter. */
 inline std::string rope_identity(const std::vector<std::string>& k,
                                  const std::vector<std::string>& v) {
     auto names_rotary = [](const std::string& key) {

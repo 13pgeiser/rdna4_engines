@@ -1,11 +1,13 @@
-/* tunecache.cpp -- read and write the tuning cache. The format is documented in tunecache.h and
- * that comment is the specification; this file must not drift from it.
+/* tunecache.cpp -- read and write the tuning cache. tunecache.h's format description is the
+ * specification.
  */
 #include "tunecache.h"
 
 #include <cstdlib>
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <sys/stat.h>
@@ -15,8 +17,7 @@
 namespace rad {
 
 namespace {
-/* Whitespace only. See the note at its caller: rad_util.cpp's split_ws also splits on commas,
- * which is right for a constraint set and wrong for every line of this file. */
+/* Split on spaces and tabs only; split_ws also splits on commas (see the caller). */
 std::vector<std::string_view> split_ws_only(std::string_view s) {
     std::vector<std::string_view> out;
     size_t i = 0;
@@ -49,17 +50,15 @@ std::string TuneCache::now_iso8601() {
 }
 
 std::string TuneCache::canon_geometry(const Geometry& g) {
-    /* Sorted by key so the same shape spells the same however the plugin ordered its params.
-     * Geometry::str() is for humans and preserves declaration order; this one is a key. */
+    /* Sorted by key, so the spelling is independent of parameter order (unlike Geometry::str()). */
     std::vector<std::string> kv;
     const RadParam* p = g.params();
     for (int i = 0; i < g.n_params(); ++i) {
         if (p[i].kind == RAD_P_STR)
             kv.push_back(fmt("%s=%s", p[i].key, p[i].sval ? p[i].sval : ""));
         else if (p[i].kind == RAD_P_F64)
-            /* %.17g so the key round-trips a double exactly. A float parameter is eps or a rope
-             * theta; two shapes that differ only in eps are the same shape to a tuner, but they
-             * are still different keys and a lossy spelling would silently merge them. */
+            /* %.17g round-trips a double exactly, so keys differing only in eps or rope theta
+             * stay distinct. */
             kv.push_back(fmt("%s=%.17g", p[i].key, p[i].dval));
         else
             kv.push_back(fmt("%s=%lld", p[i].key, p[i].ival));
@@ -92,8 +91,7 @@ std::vector<std::pair<std::string, int64_t>> TuneCache::parse_choice(std::string
         if (eq != std::string_view::npos && eq > 0) {
             const std::string key(tok.substr(0, eq));
             const std::string val(tok.substr(eq + 1));
-            /* strtoll rather than stoll: a malformed value is a dropped pair, not an exception on
-             * a path whose whole contract is that a bad cache cannot stop a server. */
+            /* strtoll, not stoll: a malformed value drops the pair instead of throwing. */
             char* end = nullptr;
             const long long v = std::strtoll(val.c_str(), &end, 10);
             if (end && *end == '\0' && !val.empty()) out.emplace_back(key, (int64_t)v);
@@ -133,41 +131,43 @@ int TuneCache::load(const std::string& home, const std::string& machine) {
     const std::string path = path_for(home, machine);
     FILE* f = ::fopen(path.c_str(), "rb");
     if (!f) {
-        /* No cache is the normal state of a fresh install and not a failure: a plugin's first
-         * axis carries its own default, so nothing is broken, only untuned. */
+        /* No cache is normal on a fresh install: every axis has a default. */
         if (errno == ENOENT) return RAD_OK;
         RAD_WARN("%s: %s", path.c_str(), std::strerror(errno));
         return RAD_E_IO;
     }
 
-    char line[4096];
+    /* getline, not a fixed buffer: a row longer than any buffer would otherwise be split, and its
+     * tail read as a row of its own with a truncated geometry. */
+    char* line = nullptr;
+    size_t cap = 0;
+    ssize_t got = 0;
     int lineno = 0, bad = 0;
     bool saw_magic = false;
 
-    while (::fgets(line, sizeof line, f)) {
+    while ((got = ::getline(&line, &cap, f)) >= 0) {
         ++lineno;
-        std::string_view s(line);
+        std::string_view s(line, (size_t)got);
         while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.remove_suffix(1);
         if (s.empty() || s[0] == '#') continue;
 
-        /* SPLIT ON WHITESPACE ONLY, NOT ON COMMAS. `split_ws` treats a comma as a separator too --
-         * it is shared with the constraint parser, where "bf16 fp16,fp32" is one set -- and a
-         * tuned choice is comma-separated by construction ("mb=2,npw=4,sk=8"). Splitting on commas
-         * here turns one field into three and shifts `us` onto a timestamp, which parses as zero
-         * and is then dropped as malformed, so every row with more than one axis disappears. It
-         * disappears SILENTLY, because a cache that cannot be read is by design survivable. */
+        /* Split on whitespace only: `split_ws` also splits on commas (for constraint sets), but a
+         * choice is comma-separated ("mb=2,npw=4,sk=8"), and splitting it would shift the fields
+         * and silently drop every multi-axis row. */
         auto tok = split_ws_only(s);
-        /* A line of blanks is a blank line, and every branch below reads tok[0]. */
+        /* A whitespace-only line; every branch below reads tok[0]. */
         if (tok.empty()) continue;
         if (!saw_magic) {
             if (tok.size() != 2 || tok[0] != "radtune") {
                 RAD_WARN("%s:%d: not a rad-tune cache (expected 'radtune 2')", path.c_str(), lineno);
+                std::free(line);
                 ::fclose(f);
                 return RAD_E_FORMAT;
             }
             if (tok[1] != "2") {
                 RAD_WARN("%s: cache format version %.*s, this build reads 2 -- ignoring the cache",
                          path.c_str(), (int)tok[1].size(), tok[1].data());
+                std::free(line);
                 ::fclose(f);
                 return RAD_E_FORMAT;
             }
@@ -188,14 +188,18 @@ int TuneCache::load(const std::string& home, const std::string& machine) {
         r.plugin   = std::string(tok[1]);
         r.choice   = std::string(tok[2]) == "-" ? std::string() : std::string(tok[2]);
         r.us       = std::strtod(std::string(tok[3]).c_str(), nullptr);
-        r.measured = std::string(tok[4]);
+        /* save() writes an empty date as "-", as it does an empty choice. */
+        r.measured = tok[4] == "-" ? std::string() : std::string(tok[4]);
         for (size_t i = 5; i < tok.size(); ++i) {
             if (i > 5) r.geom += ' ';
             r.geom.append(tok[i]);
         }
-        if (r.us <= 0.0) { ++bad; continue; }
+        /* Not `r.us <= 0`: that holds for neither nan nor inf, and a row timed as either would
+         * win or lose every comparison. */
+        if (!(r.us > 0.0) || !std::isfinite(r.us)) { ++bad; continue; }
         put(r);
     }
+    std::free(line);
     ::fclose(f);
 
     if (!saw_magic) {
@@ -218,8 +222,7 @@ int TuneCache::save(const std::string& home) const {
         return RAD_E_IO;
     }
 
-    /* Write-then-rename, so an interrupted rad-tune leaves the previous cache intact rather than
-     * a half-file the selector will warn about on every start. */
+    /* Write then rename, so an interrupted rad-tune leaves the previous cache intact. */
     const std::string tmp = path + ".tmp";
     FILE* f = ::fopen(tmp.c_str(), "wb");
     if (!f) { RAD_ERR("%s: %s", tmp.c_str(), std::strerror(errno)); return RAD_E_IO; }
@@ -228,7 +231,7 @@ int TuneCache::save(const std::string& home) const {
     ::fprintf(f, "machine %s\n", machine_.c_str());
     ::fprintf(f, "# kernel plugin choice us measured geometry\n");
 
-    /* Sorted, so the file is stable across runs and a diff shows what actually moved. */
+    /* Sorted, so the file is stable across runs and diffs show real changes. */
     std::vector<const TuneRow*> v;
     v.reserve(rows_.size());
     for (const auto& r : rows_) v.push_back(&r);

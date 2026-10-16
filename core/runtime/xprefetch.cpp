@@ -30,21 +30,18 @@ namespace {
 
 /* A pool class wider than this holds whole tables (the token embedding read in place), not experts. */
 constexpr uint64_t kXpMaxUnit = (uint64_t)64 << 20;
-/* Lists the queue may be behind before a request is dropped. Nothing waits for these lists, so
- * nothing slows a queue that falls behind but this: its copies could not land in time anyway, and a
- * queue that only grows would end up polling marks that have long gone back to the pool. */
+/* Lists the queue may be behind before a request is dropped. Nothing else throttles a lagging
+ * queue: its copies would land too late anyway, and an ever-growing queue would end up polling
+ * marks already returned to the pool. */
 constexpr int64_t kXpBehind = 3;
-/* Dispatches past a dropped request's mark before the signal can be made again: far more than the
+/* Dispatches after a dropped request's mark before its signal may be reused; far more than the
  * pass that completes it. */
 constexpr int64_t kXpMarkHold = 4096;
-/* WHETHER IT PAYS. A copy the step uses saves the link time of reading that expert under the GEMM;
- * one it does not use costs link time the GEMMs wanted, and the prediction costs a little whatever
- * comes of it. Measured on Qwen3.8-Flash-Next, the two balance near a quarter of the copies used: at
- * --tp 1 the steps used half of them and the decode step was 3.6% faster, at --tp 2 -- where each card
- * keeps most experts and its pool holds the ones the steps rarely route -- a sixth, and it was 4-6%
- * slower. So every kXpWindow predictions the prefetch looks at the share of its copies used over the
- * last window, and under kXpMinUse it rests for kXpRest passes -- no prediction, no copy -- and then
- * measures again. */
+/* Payoff. A used copy saves link time under the GEMM; an unused one costs link time the GEMMs
+ * wanted, and the prediction always costs a little. On Qwen3.8-Flash-Next break-even is near a
+ * quarter of copies used (--tp 1 used half and decode was 3.6% faster; --tp 2, where the pool holds
+ * rarely routed experts, used a sixth and was 4-6% slower). Every kXpWindow predictions the share
+ * used over the last window is judged; below kXpMinUse the prefetch rests for kXpRest passes. */
 constexpr int64_t  kXpWindow    = 2048;
 constexpr double   kXpMinUse    = 0.30;
 constexpr uint32_t kXpMinJudged = 512;
@@ -65,8 +62,8 @@ void Ctx::xp_free(XpState& x) {
     if (x.stream) rad_stream_destroy(x.stream);
 }
 
-/* At bringup, once the placement has made its pinned pools: everything the prefetch needs, or nothing
- * and a line saying why it is off. */
+/* At bringup, after placement has made its pinned pools: allocates everything, or nothing and logs
+ * why the prefetch is off. */
 void Ctx::xp_open(const uint64_t* lo, const uint64_t* hi, const uint64_t* stride, int n) {
     if (xp_ || device_is_host() || route_.empty()) return;
     if (!rad_xp_supported(device_)) {
@@ -122,8 +119,8 @@ void Ctx::xp_open(const uint64_t* lo, const uint64_t* hi, const uint64_t* stride
 void Ctx::xp_close() {
     if (!xp_) return;
     XpState& x = *xp_;
-    /* NOTHING MAY READ OR WRITE THE RING WHEN IT GOES: the compute work issued so far can read it
-     * through entries still pointed at it, and the queue's lists write it until they finish. */
+    /* Nothing may touch the ring when it is freed: issued compute work can read it through entries
+     * still pointing at it, and queued DMA lists write it until they finish. */
     if (stream_) rad_stream_sync(stream_);
     if (lane1_) rad_stream_sync(lane1_);
     {
@@ -141,7 +138,7 @@ void Ctx::xp_close() {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    /* What it came to: copies planned, and of the restored ones how many the step routed. */
+    /* Summary: copies planned, and how many restored copies the step routed. */
     if (x.stream && rad_memcpy_async(x.stats_h, x.stats, sizeof(XpStats), x.stream) >= 0 &&
         rad_stream_sync(x.stream) >= 0 && x.stats_h->planned)
         RAD_INFO("rank %d: expert prefetch: %u copies planned, %u of %u looked back on routed (%.1f%%), %lld "
@@ -152,7 +149,7 @@ void Ctx::xp_close() {
     xp_.reset();
 }
 
-/* The host thread: each request's mailbox, once the plan has written it, to the DMA queue. */
+/* Host thread: hands each request's mailbox to the DMA queue once the plan has written it. */
 void Ctx::xp_serve(XpState& x) {
     for (;;) {
         XpReq r;
@@ -163,14 +160,14 @@ void Ctx::xp_serve(XpState& x) {
             r = x.q.front();
             x.q.pop_front();
         }
-        /* The marks of finished lists go back to the pool. */
+        /* Return the marks of finished lists to the pool. */
         const int64_t behind = rad_xp_behind(x.device);
         while (!x.marks.empty() && x.marks.front().second <= x.lists - behind) {
             rad_ride_release(x.marks.front().first, nullptr, 0);
             x.marks.pop_front();
         }
-        /* The mailbox reaches the request's number once the plan has run; a number past it means it
-         * was written over by a later request and this one is stale. */
+        /* The mailbox reaches the request number once the plan has run; a higher number means a
+         * later request overwrote it and this one is stale. */
         volatile XpBox* b = x.box + r.g;
         const auto t0 = std::chrono::steady_clock::now();
         bool got = true;
@@ -215,8 +212,8 @@ void Ctx::xp_serve(XpState& x) {
     }
 }
 
-/* The layer's map from expert to table entries, once all its tables are bound; false until then. An
- * expert whose weights are not each in exactly one table stays out of the map. */
+/* Builds the layer's expert -> table-entry map; false until all its tables are bound. An expert
+ * whose weights are not each in exactly one table is left out. */
 bool Ctx::xp_bind(XpLayer& L, int layer) {
     const RadPrefetchNext& nx = L.next;
     std::vector<void**> hm((size_t)kXpMaxNe * kXpParts, nullptr);
@@ -241,7 +238,7 @@ bool Ctx::xp_bind(XpLayer& L, int layer) {
     XpState& x = *xp_;
     void** map = x.maps + (size_t)layer * kXpMaxNe * kXpParts;
     int32_t* place = x.places + (size_t)layer * kXpMaxNe;
-    /* Once a layer, at its first issue: the one host wait here is not on the step path. */
+    /* Runs once per layer at first issue, so this host wait is off the step path. */
     if (rad_memcpy_async(map, hm.data(), (int64_t)hm.size() * (int64_t)sizeof(void*), stream_) < 0 ||
         rad_memcpy_async(place, hp.data(), (int64_t)hp.size() * 4, stream_) < 0 || rad_stream_sync(stream_) < 0)
         return false;
@@ -251,9 +248,9 @@ bool Ctx::xp_bind(XpLayer& L, int layer) {
     return true;
 }
 
-/* The counters the last judgement sent to the host are a window old: the share of copies used is
- * judged from them, then the next window's are sent. A window that follows a rest is not judged --
- * its counters left before the rest -- so a rest is followed by one full window measured afresh. */
+/* Judges the share of copies used from the counters sent to the host one window ago, then sends the
+ * next window's. The first window after a rest is not judged (its counters predate the rest), so
+ * each rest is followed by one full fresh window. */
 void Ctx::xp_judge(XpState& x) {
     if (x.have_snap) {
         const volatile XpStats* h = x.stats_h;
@@ -275,14 +272,12 @@ void Ctx::xp_judge(XpState& x) {
     if (rad_memcpy_async(x.stats_h, x.stats, sizeof(XpStats), x.stream) >= 0) x.have_snap = true;
 }
 
-/* A pass being recorded keeps each of the three calls as a step of its own, run again where the tape
- * plays it: what a call issues -- on its own stream, or a ride on the next played dispatch -- is
- * issued again at every play rather than recorded. */
+/* When recording, each of the three calls becomes its own tape step and is re-run at every play:
+ * its stream work and rides are issued afresh, not recorded. */
 int Ctx::xp_predict(const RadPrefetchNext* nx, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd) {
-    /* A pass this wide predicts nothing, and its tape is better without a step that does nothing. */
+    /* Too wide to predict; keep the tape free of an empty step. */
     if (!xp_ || !nx || rows <= 0 || rows > kXpMaxRows) return RAD_OK;
     if (!rec_) return xp_predict_run(*nx, h, r0, rows, n_embd);
-    tape_cut();
     TapeXp p;
     p.next = *nx;
     p.h = h;
@@ -291,43 +286,26 @@ int Ctx::xp_predict(const RadPrefetchNext* nx, rad_buf h, int64_t r0, int64_t ro
     p.n_embd = n_embd;
     TapeStep st;
     st.kind = kTapeXp;
-    st.lane = (uint8_t)lane_;
     st.a = (int32_t)rec_->xp.size();
     rec_->xp.push_back(p);
-    rec_->steps.push_back(st);
-    tape_pause(true);
-    const int rc = xp_predict_run(*nx, h, r0, rows, n_embd);
-    tape_pause(false);
-    return rc;
+    return tape_host(st, [&] { return xp_predict_run(*nx, h, r0, rows, n_embd); });
 }
 
 int Ctx::xp_mark() {
     if (!xp_) return RAD_OK;
     if (!rec_) return xp_mark_run();
-    tape_cut();
     TapeStep st;
     st.kind = kTapeXpMark;
-    st.lane = (uint8_t)lane_;
-    rec_->steps.push_back(st);
-    tape_pause(true);
-    const int rc = xp_mark_run();
-    tape_pause(false);
-    return rc;
+    return tape_host(st, [&] { return xp_mark_run(); });
 }
 
 int Ctx::xp_step(int layer) {
     if (!xp_) return RAD_OK;
     if (!rec_) return xp_step_run(layer);
-    tape_cut();
     TapeStep st;
     st.kind = kTapeXpStep;
-    st.lane = (uint8_t)lane_;
     st.a = layer;
-    rec_->steps.push_back(st);
-    tape_pause(true);
-    const int rc = xp_step_run(layer);
-    tape_pause(false);
-    return rc;
+    return tape_host(st, [&] { return xp_step_run(layer); });
 }
 
 int Ctx::xp_predict_run(const RadPrefetchNext& nx, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd) {
@@ -346,8 +324,8 @@ int Ctx::xp_predict_run(const RadPrefetchNext& nx, rad_buf h, int64_t r0, int64_
     const char* hb = (const char*)buf_ptr(h);
     if (!w || !hb) return RAD_OK;
     const RadStream cs = cur_stream();
-    /* A NEW PASS waits for the prefetch stream's work of the last one, so that stream is never a pass
-     * behind the compute stream: the records and mailboxes a request reuses are three layers old. */
+    /* A new pass waits for the prefetch stream's work from the last pass, so that stream is never a
+     * pass behind: the records and mailboxes a request reuses are three layers old. */
     if (layer <= x.last_layer) {
         if (x.tail_live) {
             RAD_TRY(rad_event_record(x.tail, x.stream));
@@ -358,8 +336,8 @@ int Ctx::xp_predict_run(const RadPrefetchNext& nx, rad_buf h, int64_t r0, int64_
     }
     x.last_layer = layer;
     if (x.passes < x.rest_until) return RAD_OK;
-    /* THE ROUTER INPUT IS READ IN PLACE, behind the next dispatch on the compute stream -- the router,
-     * which reads it -- by a ride rather than a barrier packet between two kernels. */
+    /* The router input is read in place, riding behind the next compute dispatch (the router, which
+     * reads it) rather than via a barrier packet between two kernels. */
     void* rt = nullptr;
     if (rad_ride(cs, &rt) == RAD_OK) {
         RAD_TRY(rad_ride_wait(x.stream, rt));
@@ -367,7 +345,7 @@ int Ctx::xp_predict_run(const RadPrefetchNext& nx, rad_buf h, int64_t r0, int64_
         RAD_TRY(rad_event_record(x.sync, cs));
         RAD_TRY(rad_event_wait(x.stream, x.sync));
     }
-    /* An earlier request still waiting for its mark goes now, unmarked. */
+    /* An earlier request still waiting for its mark is sent now, unmarked. */
     if (x.pend.valid) {
         {
             std::lock_guard<std::mutex> lk(x.mu);
@@ -405,7 +383,7 @@ int Ctx::xp_predict_run(const RadPrefetchNext& nx, rad_buf h, int64_t r0, int64_
 int Ctx::xp_mark_run() {
     XpState& x = *xp_;
     if (!x.pend.valid) return RAD_OK;
-    /* Refused only while another ride waits on the stream: the list then starts without one. */
+    /* Refused only while another ride waits on the stream; the list then starts unmarked. */
     void* mark = nullptr;
     if (rad_ride(cur_stream(), &mark) == RAD_OK) {
         x.pend.mark = mark;

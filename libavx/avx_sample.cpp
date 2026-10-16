@@ -1,45 +1,27 @@
 /* avx_sample.cpp -- the sampler ops.
  *
- * ============================== THESE ARE NOT WHERE THE TIME GOES, EXCEPT WHERE THEY ARE ==============================
+ * Most of these work over a candidate set of at most about a thousand entries, where the cost is
+ * control flow; they widen candidate values to f32 once and otherwise keep libref's structure. The
+ * three that touch the whole vocabulary (a megabyte per row at 248K) are vectorised:
  *
- * Eleven of these twelve ops work over a CANDIDATE SET of a thousand entries at most, and their
- * cost is control flow rather than arithmetic. Vectorising them would be work spent where no time
- * is; what they get here is the one thing that does matter -- the candidate values widened once
- * into f32 so the per-element dtype switch is gone -- and otherwise the reference's structure,
- * which is legible and provably right.
+ *   sample_temp     a row multiply.
+ *   sample_argmax   maximum, lowest index on a tie, through the same `topk_next_f32` the routers
+ *                   use, so greedy and top-1 agree on ties (a greedy request is staged at
+ *                   top_k = 1 when lm_head is vocab-sharded).
+ *   sample_mask     a vocabulary bitmask. At AVX-512 a grammar half-word is a `__mmask16`, so 16
+ *                   tokens take one masked store of -inf; lower levels shift and test per token.
  *
- * The exceptions are the three that touch the WHOLE VOCABULARY, and at a 248K vocabulary that is a
- * megabyte a row:
+ * Per-request settings (`rep`, `freq`, `pres`, `k`, `p`, seed, position) are fields of a params row
+ * (abi/rad_sample.h), not op parameters: parameters are geometry fixed at declare, so they could
+ * not differ between requests in one batch.
  *
- *   sample_temp     a row multiply. Pure vector work, and the trivial one.
- *   sample_argmax   a maximum with the LOWEST index on a tie. Vectorised through the same
- *                   `topk_next_f32` the routers use, so the greedy path and a top-1 path cannot
- *                   disagree about a tie -- which they must not, because a greedy request is
- *                   staged at top_k = 1 when lm_head is vocab-sharded.
- *   sample_mask     a bitmask over the vocabulary. This one has an AVX-512 form that is not
- *                   available below it and is worth the `#if`: the mask word IS a `__mmask16`,
- *                   so applying 16 tokens of grammar is one masked store of -inf and no shifts at
- *                   all. Below AVX-512 it is a shift and a test per token.
+ * Candidate set: `sample_topk` writes a fixed-width set and the narrowing stages edit it in place.
+ * A dropped candidate is index -1, value -infinity; kept candidates stay in place, in descending
+ * order. `cand_val` holds logits, and each stage takes its own softmax over the set (as llama.cpp
+ * does), so stages compose in any order.
  *
- * ============================== EVERY SCALAR IS PER ROW ==============================
- *
- * `rep`, `freq`, `pres`, `k`, `p`, the seed and the position are FIELDS OF A ROW (abi/rad_sample.h),
- * not parameters. A parameter is geometry -- frozen at declare, matched on by the selector -- so
- * two requests in one batch with different top_p would be two resolutions of one op and a
- * deployment would have exactly one top_p, which is not a sampler.
- *
- * ============================== THE CANDIDATE SET ==============================
- *
- * `sample_topk` produces a FIXED-WIDTH set and the narrowing stages work IN PLACE. The tensors do
- * not shrink, so a dropped candidate needs a spelling: index -1, value -infinity. Kept candidates
- * stay where they are, in descending order.
- *
- * `cand_val` carries LOGITS, not probabilities, and each narrowing stage takes its own softmax over
- * the set -- which is what llama.cpp does and what keeps the stages composable in any order.
- *
- * A GREEDY ROW (RAD_SP_GREEDY) HAS NO CANDIDATES: its token is sample_argmax's, top-k and the
- * merge write it an empty set, the narrowing stages leave it alone and the pick does not touch its
- * token -- libref's contract, for the reason given there.
+ * A greedy row (RAD_SP_GREEDY) has no candidates: its token comes from sample_argmax, top-k and the
+ * merge write it an empty set, and the narrowing stages and the pick skip it (libref's contract).
  */
 #include "avx_vec.h"
 #include "avx_common.h"
@@ -50,15 +32,10 @@
 
 using namespace avx;
 
-/* The params operand, checked once. A sampler op with no rows to act on is not an error -- it is a
- * step in which nothing asked for that stage.
- *
- * The row array is a BYTE BLOB viewed through a 32-bit dtype: the sampler declares it
- * [rows, sizeof(RadSampleParams)/4] u32, which is the only way the builder can express "this many
- * bytes a row". The dtype is REQUIRED to be a 32-bit one rather than run through
- * rad_dtype_bytes -- "any width as long as the arithmetic works out" is the wrong contract, since
- * the blob is addressed as 32-bit words and a 16-bit view would pass a byte count and then misread
- * every row. */
+/* Validates the params operand. A row array is a byte blob declared as
+ * [rows, sizeof(RadSampleParams)/4] u32 (the builder's only way to say "this many bytes a row"), so
+ * the dtype must be a 32-bit one; a 16-bit view would pass a byte-count check and misread every
+ * row. */
 struct Rows { const RadSampleParams* p; int64_t n; };
 
 static inline int rows_of_params(const RadTensor* t, int64_t M, Rows* out) {
@@ -72,10 +49,10 @@ static inline int rows_of_params(const RadTensor* t, int64_t M, Rows* out) {
 
 #define AVX_TRY(expr) do { const int _s = (expr); if (_s < 0) return _s; } while (0)
 
-/* The history window both history stages read, libref's reading (ref_sample.cpp): `hist_off` and
- * `hist_len` address the row's own row of the history plane, clamped to it, and `last_n` keeps
- * the TAIL of that span. last_n 0 turns the stage off for the row, a negative one keeps the whole
- * span -- llama.cpp's meaning for repeat_last_n and dry_penalty_last_n. */
+/* History window for the penalty and DRY stages, as in libref (ref_sample.cpp): `hist_off` and
+ * `hist_len` address this row of the history plane, clamped to it, and `last_n` keeps the tail of
+ * that span. last_n 0 disables the stage for the row; negative keeps the whole span (llama.cpp's
+ * repeat_last_n / dry_penalty_last_n). */
 static inline bool hist_window(const RadSampleParams& sp, int32_t last_n, int64_t hmax,
                                int64_t* ho_out, int64_t* hl_out) {
     if (last_n == 0) return false;
@@ -95,20 +72,17 @@ static inline bool hist_window(const RadSampleParams& sp, int32_t last_n, int64_
 /* ------------------------------------------------------------------ sample_penalties */
 /* llama.cpp's ordering, in one pass over the row's history:
  *
- *     repetition   logit = logit > 0 ? logit / rep : logit * rep       (once per DISTINCT token)
+ *     repetition   logit = logit > 0 ? logit / rep : logit * rep       (once per distinct token)
  *     frequency    logit -= count * freq
  *     presence     logit -= pres                                       (once per distinct token)
  *
- * The repetition penalty being multiplicative and SIGN-DEPENDENT is the part everyone gets wrong:
- * dividing a negative logit would make it larger, so it is multiplied instead.
+ * The repetition penalty is sign-dependent: dividing a negative logit would raise it.
  *
- * The history is pulled into a small int array once. libref reads it back through ld_int inside
- * the O(hl^2) first-occurrence test, which is a dtype switch per comparison on a loop that runs
- * hl^2 times; the array makes the inner test an integer compare. The ORDER and the answer are
- * unchanged -- this is the same quadratic scan, over the same values.
+ * The history is copied into an int array once, so libref's O(hl^2) first-occurrence scan
+ * compares integers instead of switching on dtype; same scan, same result.
  *
- * History ids are GLOBAL and the logits row is this rank's shard, so a token's column is its id
- * less `vocab_off`, and a token outside the shard is another rank's to penalise. */
+ * History ids are global and the logits row is this rank's shard: a token's column is its id minus
+ * `vocab_off`, and tokens outside the shard belong to another rank. */
 AVX_KERNEL(sample_penalties) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const RadTensor *lg = &a->t[0], *pr = &a->t[1], *hist = &a->t[2];
@@ -142,8 +116,7 @@ AVX_KERNEL(sample_penalties) {
             const int32_t tok = h[i];
             const int64_t col = (int64_t)tok - voff;
             if (tok < 0 || col < 0 || col >= n_vocab) continue;
-            /* First occurrence only: the penalties are per distinct token, and the count is what
-             * carries the multiplicity. */
+            /* First occurrence only; `count` carries the multiplicity. */
             bool first = true;
             int64_t count = 0;
             for (int64_t j = 0; j < hl; ++j) {
@@ -163,18 +136,15 @@ AVX_KERNEL(sample_penalties) {
 }
 
 /* ------------------------------------------------------------------ sample_dry */
-/* DRY -- "don't repeat yourself". libref's definition (ref_sample.cpp), which is llama.cpp's:
- * each token that would EXTEND a suffix of the window that has occurred before is penalised ONCE,
- * by multiplier * base^(L - allowed_length) for the LONGEST repeat L it would extend, repeats
- * capped at the row's `dry_rep_limit`. A position the optional `breakers` plane marks holds a
- * whole sequence breaker, which is never penalised. The penalty is formed by repeated
- * multiplication stopping short of overflow, the way every implementation of this op forms it,
- * so they agree to the bit.
+/* DRY ("don't repeat yourself"), as in libref (ref_sample.cpp) and llama.cpp: each token that
+ * would extend a previously seen suffix of the window is penalised once, by
+ * multiplier * base^(L - allowed_length) for the longest repeat L it extends, with repeats capped at
+ * the row's `dry_rep_limit`. Positions marked in the optional `breakers` plane hold sequence
+ * breakers and are never penalised. The penalty is built by repeated multiplication that stops
+ * short of overflow, as other implementations do, so results agree to the bit.
  *
- * The window is pulled into an int array once, as the penalties do, and the per-position repeat
- * lengths go into a second one; the longest per token is then found by scanning those lengths for
- * each qualifying position, which needs no map and keeps the quadratic scan's memory access
- * inside two small arrays. */
+ * The window and the per-position repeat lengths are kept in two int arrays; the longest repeat
+ * per token is found by scanning them, with no map. */
 static inline float dry_penalty(float multiplier, float base, int64_t e) {
     float pen = multiplier;
     if (base == 1.0f) return pen;
@@ -222,9 +192,8 @@ AVX_KERNEL(sample_dry) {
         int32_t* len = (int32_t*)scratch_f32_b((size_t)hl);
         for (int64_t i = 0; i < hl; ++i) h[i] = (int32_t)ldi(hist, hb + i * hs);
 
-        /* len[j]: how long a suffix of the window also ends at position j, capped; 0 where the
-         * continuation after j is exempt or outside this rank's shard, since such a j is never
-         * penalised and never the longest for a token that is. */
+        /* len[j]: length of the window suffix that also ends at j, capped; 0 when the token
+         * after j is a breaker or outside this rank's shard. */
         for (int64_t j = 0; j + 1 < hl; ++j) {
             const int64_t lim = j + 1 < cap ? j + 1 : cap;
             int64_t n = 0;
@@ -238,9 +207,7 @@ AVX_KERNEL(sample_dry) {
         const float base = sp.dry_base > 0.0f ? sp.dry_base : 1.75f;
         for (int64_t j = 0; j + 1 < hl; ++j) {
             if (len[j] < allowed) continue;
-            /* The representative of this continuation token: its longest repeat, the earliest
-             * position on a tie. Every other position of the same token defers to it, so the
-             * token is penalised once. */
+            /* Penalise each token once, at its longest repeat (earliest position on a tie). */
             const int32_t next = h[j + 1];
             bool rep = true;
             for (int64_t j2 = 0; j2 + 1 < hl && rep; ++j2) {
@@ -256,8 +223,7 @@ AVX_KERNEL(sample_dry) {
 }
 
 /* ------------------------------------------------------------------ sample_temp */
-/* temp <= 0 leaves the row untouched: greedy decoding is `sample_argmax`, and a temperature of
- * zero silently meaning something else is how a sampler chain becomes unreadable. */
+/* temp <= 0 leaves the row untouched; greedy decoding is `sample_argmax`. */
 AVX_KERNEL(sample_temp) {
     if (!rad_args_have(a, 2)) return RAD_E_INVAL;
     const RadTensor *lg = &a->t[0], *pr = &a->t[1];
@@ -300,24 +266,21 @@ AVX_KERNEL(sample_topk) {
     if (M <= 0) return RAD_E_SHAPE;
     Rows R;
     AVX_TRY(rows_of_params(pr, M, &R));
-    /* The candidate WIDTH is the buffer's, not the request's: it is the deployment bound the arena
-     * was sized for, and every later stage reads it. */
+    /* The candidate width is the buffer's (the deployment bound), not the request's top_k. */
     const int64_t n_cand = ci->rank >= 2 ? ci->shape[ci->rank - 1] : numel(ci) / M;
     if (n_cand <= 0 || numel(cv) < M * n_cand) return RAD_E_SHAPE;
 
-    /* THE VOCAB-PARALLEL PAIR PLANE, optional. cand_idx stays LOCAL -- it indexes this rank's
-     * logits row and every stage after top-k reads it that way -- and `pairs` carries the same
-     * candidates with `vocab_off` added, as (u32 GLOBAL id, f32 logit), which is what the
-     * all-gather moves and what sample_merge_topk reads. */
+    /* Optional vocab-parallel pair plane. cand_idx stays local (it indexes this rank's logits);
+     * `pairs` holds the same candidates as (u32 global id = local + vocab_off, f32 logit bits),
+     * which the all-gather moves and sample_merge_topk reads. */
     const RadTensor* pp = a->n_t > 4 && a->t[4].data ? &a->t[4] : nullptr;
     const int64_t voff = p_int(a, "vocab_off", 0);
     if (pp && numel(pp) < M * 2 * n_cand) return RAD_E_SHAPE;
 
     AVX_PARALLEL_FOR_IF(M * n_vocab >= AVX_PAR_MIN)
     for (int64_t m = 0; m < M; ++m) {
-        /* A row's own top_k, clamped to the buffer. 0 or negative means "the whole candidate
-         * width", which is what a request that set no top_k asks for. A greedy row takes none,
-         * and its row of logits is not even read. */
+        /* The row's top_k, clamped to the buffer; <= 0 means the full width. A greedy row takes
+         * none and its logits are not read. */
         int64_t k = R.p[m].top_k;
         if (k <= 0 || k > n_cand) k = n_cand;
         if (R.p[m].flags & RAD_SP_GREEDY) k = 0;
@@ -335,8 +298,7 @@ AVX_KERNEL(sample_topk) {
             st_int_dt(ci->dtype, ci->data, ib + r * is, ok ? pi : -1);
             stt(cv, vb + r * vs, ok ? pv : -INFINITY);
             if (!pp) continue;
-            /* 0xffffffff is the hole, which the merge tests as a negative signed id -- the same
-             * convention cand_idx carries as -1. */
+            /* 0xffffffff marks a hole; the merge reads it as a negative id (cand_idx's -1). */
             uint32_t bits;
             const float val = ok ? pv : -INFINITY;
             std::memcpy(&bits, &val, 4);
@@ -350,17 +312,12 @@ AVX_KERNEL(sample_topk) {
 
 /* ================================================================== the narrowing stages
  *
- * All four widen the candidate values into f32 ONCE and then work on that array, which is the only
- * change from libref's structure: it reads `cand_val` back through `ldt` inside loops that are
- * O(n_cand) (top-p, min-p, XTC) and O(n_cand^2) (typical), so the dtype switch runs up to a
- * million times on a thousand-wide set for one row.
+ * Unlike libref, which reads `cand_val` through `ldt` inside O(n_cand) and O(n_cand^2) loops, all
+ * four widen the candidate values to f32 once. Otherwise libref's structure is kept.
  *
- * The typical stage additionally precomputes the probability and the surprisal distance per
- * candidate, because libref recomputes `exp` and `log` inside its threshold search -- three libm
- * calls per (candidate, candidate) pair. The search itself stays O(n_cand^2) and stays exactly the
- * scan libref performs, because the answer is a threshold chosen among the distances that actually
- * occur and any faster search would have to sort, which changes which of two equal distances is
- * found first. */
+ * The typical stage also precomputes each candidate's probability and surprisal distance (libref
+ * recomputes exp and log inside the threshold search). The search stays libref's O(n_cand^2) scan:
+ * a faster one would sort, which could change which of two equal distances is found first. */
 enum Narrow { NR_TOPP, NR_MINP, NR_TYPICAL, NR_XTC };
 
 static int narrow(const RadArgs* a, Narrow which) {
@@ -400,39 +357,34 @@ static int narrow(const RadArgs* a, Narrow which) {
         if (which == NR_MINP) {
             const float p = sp.min_p;
             if (!(p > 0.0f)) continue;
-            /* Keep everything within a factor p of the most likely candidate. Comparing
-             * exp(v - max) against p is the same test as prob >= p * max_prob without forming the
-             * normaliser -- one fewer pass and one fewer rounding. */
+            /* Keep candidates within a factor p of the most likely. exp(v - max) >= p is
+             * prob >= p * max_prob without the normaliser. */
             for (int64_t i = 0; i < n_cand; ++i) {
                 if (!alive[i]) continue;
                 if (val[i] == mx) continue;                  /* the max always survives */
-                if (std::exp(val[i] - mx) < p) drop(i);
+                if (sc_exp(val[i] - mx) < p) drop(i);
             }
             continue;
         }
 
         float sum = 0.0f;
-        for (int64_t i = 0; i < n_cand; ++i) if (alive[i]) sum += std::exp(val[i] - mx);
+        for (int64_t i = 0; i < n_cand; ++i) if (alive[i]) sum += sc_exp(val[i] - mx);
         const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
         for (int64_t i = 0; i < n_cand; ++i)
-            prob[i] = alive[i] ? std::exp(val[i] - mx) * inv : 0.0f;
+            prob[i] = alive[i] ? sc_exp(val[i] - mx) * inv : 0.0f;
 
         if (which == NR_TOPP) {
             const float p = sp.top_p;
             if (!(p < 1.0f) || !(p > 0.0f)) continue;
-            /* The candidates arrive in DESCENDING order from sample_topk and this op does not
-             * re-sort them. Keep the shortest prefix whose cumulative probability reaches p, and
-             * always keep at least one -- a p small enough to select nothing still has to produce
-             * a token. */
+            /* Candidates arrive in descending order from sample_topk and are not re-sorted. Keep
+             * the shortest prefix whose cumulative probability reaches p, at least one. */
             float cum = 0.0f;
             bool done = false;
-            int64_t kept = 0;
             for (int64_t i = 0; i < n_cand; ++i) {
                 if (!alive[i]) continue;
                 if (done) { drop(i); continue; }
                 cum += prob[i];
-                ++kept;
-                if (cum >= p && kept >= 1) done = true;
+                if (cum >= p) done = true;
             }
             continue;
         }
@@ -441,17 +393,16 @@ static int narrow(const RadArgs* a, Narrow which) {
             const float p = sp.typical_p;
             if (!(p < 1.0f) || !(p > 0.0f)) continue;
             /* Locally typical sampling: keep the candidates whose surprisal -log(prob) is closest
-             * to the distribution's entropy, until their mass reaches p. The candidate order is by
-             * probability and this order is by |surprisal - H|, so the two disagree and the
-             * selection is a threshold on the distance rather than a prefix. Ties are kept, which
-             * can overshoot p slightly -- the alternative is an order that depends on the
+             * to the entropy H until their mass reaches p. This orders by |surprisal - H|, not by
+             * probability, so the selection is a distance threshold rather than a prefix. Ties at
+             * the threshold are all kept (may overshoot p), so the result does not depend on
              * candidate index. */
             float H = 0.0f;
             for (int64_t i = 0; i < n_cand; ++i)
-                if (alive[i] && prob[i] > 0.0f) H -= prob[i] * std::log(prob[i]);
-            float* dist = val;    /* `val` is dead from here: the distances reuse its storage. */
+                if (alive[i] && prob[i] > 0.0f) H -= prob[i] * sc_log(prob[i]);
+            float* dist = val;    /* `val` is dead here; reuse its storage. */
             for (int64_t i = 0; i < n_cand; ++i)
-                dist[i] = (alive[i] && prob[i] > 0.0f) ? std::fabs(-std::log(prob[i]) - H) : 0.0f;
+                dist[i] = (alive[i] && prob[i] > 0.0f) ? std::fabs(-sc_log(prob[i]) - H) : 0.0f;
 
             float cut = 0.0f;
             bool have_cut = false;
@@ -473,11 +424,9 @@ static int narrow(const RadArgs* a, Narrow which) {
             continue;
         }
 
-        /* XTC -- "exclude top choices". With probability `xtc_probability`, DROP every candidate
-         * above `xtc_threshold` except the LEAST likely of them, which is the opposite of every
-         * other stage here and is the point: it removes the obvious continuations and leaves the
-         * interesting one. The draw is per row and comes from the row's own stream, so it
-         * reproduces. */
+        /* XTC ("exclude top choices"): with probability `xtc_probability`, drop every candidate
+         * above `xtc_threshold` except the least likely of them. The draw comes from the row's
+         * own random stream, so it is reproducible. */
         {
             if (!(sp.xtc_probability > 0.0f) || !(sp.xtc_threshold > 0.0f)) continue;
             if (rad_sample_uniform01(sp.seed ^ RAD_SAMPLE_KEY_XTC, sp.pos) >= sp.xtc_probability)
@@ -487,8 +436,7 @@ static int narrow(const RadArgs* a, Narrow which) {
                 if (!alive[i]) continue;
                 if (prob[i] >= sp.xtc_threshold) { last_above = i; ++n_above; }
             }
-            /* Nothing to do unless at least two candidates clear the threshold: dropping the only
-             * one would leave the row without its own choice. */
+            /* Needs at least two candidates above the threshold. */
             if (n_above < 2) continue;
             for (int64_t i = 0; i < n_cand; ++i) {
                 if (!alive[i] || i == last_above) continue;
@@ -505,18 +453,13 @@ AVX_KERNEL(sample_typical) { return narrow(a, NR_TYPICAL); }
 AVX_KERNEL(sample_xtc)     { return narrow(a, NR_XTC); }
 
 /* ------------------------------------------------------------------ sample_mask */
-/* Where a GBNF grammar lands. The state machine stays on host and what crosses is a token bitmask
- * per sequence -- 19 KiB at a 151K vocab, cheap enough to upload every step.
+/* Applies a GBNF grammar's token bitmask (the state machine runs on the host; the mask is 19 KiB
+ * per sequence at a 151K vocab). A set bit means allowed. Word w bit b covers token 32*w + b, LSB
+ * first.
  *
- * A SET BIT MEANS ALLOWED. That polarity has to be stated: a grammar produces a set of admissible
- * tokens, and the mask is that set rather than its complement. Word w bit b covers token 32*w + b,
- * least significant bit first.
- *
- * THE AVX-512 FORM IS DIFFERENT IN KIND, not just in width, and that is why it gets an `#if`. A
- * `__mmask16` IS sixteen bits of the grammar word, so applying sixteen tokens is one masked store
- * of -inf with the mask inverted -- no shift, no test, no branch per token. Below AVX-512 the mask
- * has to be materialised as a vector of 0/-1 and blended, which costs more than the shift-and-test
- * it replaces at these widths, so those levels keep the scalar loop and say so. */
+ * At AVX-512 sixteen bits of a mask word are a `__mmask16`, so sixteen tokens take one masked store
+ * of -inf with the mask inverted. Below AVX-512 the mask would have to be expanded to a 0/-1 vector
+ * and blended, which costs more than the scalar shift-and-test. */
 AVX_KERNEL(sample_mask) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const RadTensor *lg = &a->t[0], *pr = &a->t[1], *bm = &a->t[2];
@@ -548,8 +491,7 @@ AVX_KERNEL(sample_mask) {
             int64_t i = 0;
             for (; i + 32 <= n_vocab; i += 32) {
                 const uint32_t bits = w[i / 32];
-                /* The mask is the COMPLEMENT: a set grammar bit is allowed and must be left
-                 * alone, so -inf is stored where the bit is clear. */
+                /* Store -inf where the grammar bit is clear. */
                 _mm512_mask_storeu_ps(p + i, (__mmask16)(~(uint16_t)(bits & 0xffffu)), neg);
                 _mm512_mask_storeu_ps(p + i + 16, (__mmask16)(~(uint16_t)(bits >> 16)), neg);
             }
@@ -567,15 +509,12 @@ AVX_KERNEL(sample_mask) {
 }
 
 /* ------------------------------------------------------------------ sample_pick */
-/* The inverse CDF, walked in candidate order, accumulating in f32. The fallback is the LAST
- * CANDIDATE ABOVE -INFINITY: `u` is strictly below 1 and the probabilities sum to 1 in exact
- * arithmetic, but they do not in f32, and a draw that falls through the last comparison must still
- * produce a token the distribution allows -- not one of the grammar-masked candidates that top-k
- * leaves at -infinity at the tail of the set. A greedy row is skipped: its token is the argmax's.
+/* Inverse CDF in candidate order, accumulated in f32. If rounding lets `u` (< 1) fall through,
+ * the fallback is the last candidate above -infinity, never a grammar-masked one top-k left at
+ * -infinity at the tail. Greedy rows are skipped (their token is the argmax's).
  *
- * THE DRAW IS SPECIFIED rather than left to a library (abi/rad_sample.h): splitmix64 over
- * (seed * golden ratio + pos), 24 bits as a float in [0, 1). The same stream has to come out of a
- * host reference, a device kernel and a rerun. */
+ * The draw is specified (abi/rad_sample.h): splitmix64 over (seed * golden ratio + pos), 24 bits as
+ * a float in [0, 1), so host, device and reruns produce the same stream. */
 AVX_KERNEL(sample_pick) {
     if (!rad_args_have(a, 4)) return RAD_E_INVAL;
     const RadTensor *ci = &a->t[0], *cv = &a->t[1], *pr = &a->t[2], *tok = &a->t[3];
@@ -603,7 +542,7 @@ AVX_KERNEL(sample_pick) {
         float sum = 0.0f;
         for (int64_t i = 0; i < n_cand; ++i) {
             if (ldi(ci, ib + i * is) < 0) continue;
-            sum += std::exp(ldt(cv, vb + i * vs) - mx);
+            sum += sc_exp(ldt(cv, vb + i * vs) - mx);
         }
         const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
         const float u = rad_sample_uniform01(R.p[m].seed ^ RAD_SAMPLE_KEY_PICK, R.p[m].pos);
@@ -615,7 +554,7 @@ AVX_KERNEL(sample_pick) {
             if (id < 0) continue;
             const float v = ldt(cv, vb + i * vs);
             if (v > -INFINITY) last = id;
-            cum += std::exp(v - mx) * inv;
+            cum += sc_exp(v - mx) * inv;
             if (u < cum) { chosen = id; break; }
         }
         st_int_dt(tok->dtype, tok->data, offlin(tok, m), chosen >= 0 ? chosen : last);
@@ -624,12 +563,9 @@ AVX_KERNEL(sample_pick) {
 }
 
 /* ------------------------------------------------------------------ sample_argmax */
-/* Greedy, ties to the LOWER token id -- the same tie rule the top-k selection uses, so a greedy
- * step and a top-1 step cannot disagree. That is not decoration: when lm_head is vocab-sharded,
- * `sample_argmax` is unusable (its answer is a LOCAL column) and a greedy request is staged at
- * top_k = 1 through the chain instead, so the two paths must select the same token.
- *
- * Run through the same `topk_next_f32` the routers use, for exactly that reason. */
+/* Greedy, ties to the lower token id, through the same `topk_next_f32` as top-k. When lm_head is
+ * vocab-sharded this op is unusable (its answer is a local column) and greedy requests run at
+ * top_k = 1 instead, so both paths must pick the same token. */
 AVX_KERNEL(sample_argmax) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const RadTensor *lg = &a->t[0], *tok = &a->t[2];
@@ -651,20 +587,18 @@ AVX_KERNEL(sample_argmax) {
 }
 
 /* ------------------------------------------------------------------ sample_logprobs */
-/* The raw distribution's summary for a row with RAD_SP_LOGPROBS -- max, sum of exp(l - max), and
- * the k largest as (id, logit) pairs, descending, ties to the lower id -- libref's contract
- * (ref_sample.cpp). A row without the flag is not written.
+/* For rows with RAD_SP_LOGPROBS: max, sum of exp(l - max), and the k largest as (id, logit)
+ * pairs, descending, ties to the lower id (libref's contract, ref_sample.cpp). Other rows are not
+ * written.
  *
- * ONE PASS FOR THE k LARGEST, not k passes of topk_next_f32: `k` is the deployment's width (the
- * largest top_logprobs any request may ask for), and k full sweeps of a 248K row would cost k times
- * the argmax. The set is seeded with the row's first k columns, kept sorted, and the rest of the
- * row is compared a vector at a time against its smallest value; a lane strictly above it is
- * inserted. Strictly, because the scan runs in increasing id, and an equal value further along has
- * the higher id and loses the tie. After the first few thousand columns almost no vector has such
- * a lane, so the pass costs what the maximum does.
+ * One pass for the k largest instead of k passes of topk_next_f32 (`k` is the deployment's maximum
+ * top_logprobs). A sorted set is seeded with the first k columns; the rest of the row is compared
+ * a vector at a time against the set's smallest value, and lanes strictly above it are inserted.
+ * Strictly, because ids increase along the scan and an equal later value loses the tie. Few vectors
+ * pass the test after the first few thousand columns.
  *
- * The sum is f32 in four vector accumulators. Its terms are all in (0, 1] and the relative error
- * of the sum is what a logprob carries (log of it), so f32 is ample next to libref's double. */
+ * The sum is f32 in four accumulators. Its terms are in (0, 1] and a logprob carries only its
+ * relative error, so f32 suffices (libref uses double). */
 AVX_KERNEL(sample_logprobs) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const RadTensor *lg = &a->t[0], *pr = &a->t[1], *st = &a->t[2];
@@ -700,7 +634,7 @@ AVX_KERNEL(sample_logprobs) {
             }
             for (; i + VF_N <= n_vocab; i += VF_N) s0 = vf_add(s0, vf_exp(vf_sub(vf_loadu(v + i), vmx)));
             sum = vf_hsum(vf_add(vf_add(s0, s1), vf_add(s2, s3)));
-            for (; i < n_vocab; ++i) sum += std::exp(v[i] - mx);
+            for (; i < n_vocab; ++i) sum += sc_exp(v[i] - mx);
         }
 
         /* Insert (x, id) into the sorted set of n entries, the set at most k long. */
@@ -745,22 +679,17 @@ AVX_KERNEL(sample_logprobs) {
 }
 
 /* ------------------------------------------------------------------ sample_merge_topk */
-/* THE VOCAB-PARALLEL MERGE. lm_head is vocab-sharded, so each rank runs top-k over ITS OWN shard
- * and the candidate sets are all-gathered -- k * world_size pairs, 2 KiB at k=64 and world_size=4,
- * against the ~77 MiB a full-logits gather would move.
+/* Vocab-parallel merge. With lm_head vocab-sharded, each rank runs top-k over its own shard and the
+ * candidate sets are all-gathered: k * world_size pairs (2 KiB at k=64, world_size=4) instead of
+ * the full logits.
  *
- * `gathered` is [M, world_size * n_cand] pairs of (token id, logit) as raw u32 words. The token id
- * is already GLOBAL, because each rank adds its own vocab offset before the gather -- a merge that
- * had to know the offsets would need the shard layout, which is the caller's business. THE LOGIT
- * IS READ BY BIT PATTERN: the buffer's dtype can only be one of the two halves' types, it is u32,
- * and a float read through it would turn 0x40800000 into 1.08e9 instead of 4.0.
+ * `gathered` is [M, world_size * n_cand] (token id, logit) pairs as raw u32 words. Ids are already
+ * global (each rank adds its vocab offset before the gather). The logit is read by bit pattern,
+ * since the buffer's dtype is u32.
  *
- * THE ROW'S OWN top_k IS RE-APPLIED, and that is why this takes `params`. Every rank ran top-k over
- * its own shard before the gather, so the merged set holds up to world_size * k candidates where
- * the request asked for k, and no stage after this one narrows again. At k = 1 that is not a
- * slightly wider support, it is a different ANSWER: a greedy row is staged at top_k = 1 exactly so
- * this chain returns the argmax, and with world_size candidates alive `sample_pick` draws among
- * them against the request's seed. */
+ * The row's top_k is re-applied (hence `params`): the merged set holds up to world_size * k
+ * candidates and no later stage narrows it. At k = 1 this matters: greedy rows are staged at
+ * top_k = 1, and with world_size candidates left sample_pick would draw among them. */
 AVX_KERNEL(sample_merge_topk) {
     if (!rad_args_have(a, 4)) return RAD_E_INVAL;
     const RadTensor *gt = &a->t[0], *pr = &a->t[1], *ci = &a->t[2], *cv = &a->t[3];
@@ -790,10 +719,8 @@ AVX_KERNEL(sample_merge_topk) {
         const int64_t keep = (R.p[m].flags & RAD_SP_GREEDY) ? 0
                            : (tk > 0 && (int64_t)tk < n_cand) ? (int64_t)tk : n_cand;
 
-        /* The pairs are unpacked ONCE into two arrays. libref reads both halves back through
-         * ld_int inside the O(n_cand * n_in) selection, which is two dtype switches per comparison.
-         * The selection itself stays a selection sort over n_in entries, ties to the lower token
-         * id -- the tie rule every other selection in this vocabulary uses. */
+        /* Unpack the pairs once (libref reads them inside the O(n_cand * n_in) selection). The
+         * selection sort is libref's, ties to the lower token id. */
         float* gv = scratch_f32((size_t)n_in);
         int32_t* gi = (int32_t*)scratch_f32_b((size_t)n_in);
         for (int64_t j = 0; j < n_in; ++j) {
@@ -834,18 +761,17 @@ AVX_KERNEL(sample_merge_topk) {
 
 /* ================================================================== dflash_select
  *
- * Not a sampler, and here because it is the other op that picks TOKENS: DFlash2's greedy walk over
- * a candidate lattice. A block-diffusion drafter proposes every position of a block in one pass, so
- * it cannot condition position l+1 on its pick at l; this puts that dependence back.
+ * Not a sampler, but it also picks tokens: DFlash2's greedy walk over a candidate lattice. A
+ * block-diffusion drafter proposes all positions of a block in one pass, so it cannot condition
+ * position l+1 on its pick at l; this walk restores that dependence.
  *
  *   score[l, c] = unary[l, c] + sum_r pred[pid(l)][r] * hp[l][r] * succ[cand[l, c]][r]
  *   pid(0) = anchor[s * anchor_stride],   pid(l) = cand[l - 1, chosen(l - 1)]
  *
- * `hp` ABSENT IS A PLANE OF ONES -- a plain low-rank bigram. The walk is SERIAL IN l, since the
- * predecessor is not known until the previous step is decided, so the parallel axis is the
- * sequence and the vector work is the rank-R dot a candidate costs. A predecessor or a candidate
- * outside the vocabulary contributes nothing rather than reading past a codebook; the highest
- * score wins and a tie goes to the lower candidate, libref's rule. */
+ * An absent `hp` is a plane of ones (a plain low-rank bigram). The walk is serial in l, so the
+ * parallel axis is the sequence and the vector work is each candidate's rank-R dot. A predecessor
+ * or candidate outside the vocabulary contributes nothing. Highest score wins, ties to the lower
+ * candidate (libref's rule). */
 static inline float dot_r(const float* a, const float* b, int64_t n) {
     vf acc = vf_zero();
     int64_t i = 0;
@@ -865,7 +791,8 @@ AVX_KERNEL(dflash_select) {
 
     const int64_t steps = p_int(a, "steps", 0);
     const int64_t K     = p_int(a, "top_k", 0);
-    /* `cand` is [M * steps, K] and it is the call; `M` is the band (avx_common.h, band_rows). */
+    /* Rows come from `cand` ([M * steps, K]); the `M` parameter is the band (avx_common.h:
+     * band_rows). */
     const int64_t M     = steps > 0 && K > 0
                         ? band_rows(numel(cand) / (steps * K), p_int(a, "M", 0)) : 0;
     const int64_t R     = p_int(a, "rank", pred->rank >= 2 ? pred->shape[pred->rank - 1] : 0);
@@ -888,7 +815,7 @@ AVX_KERNEL(dflash_select) {
         for (int64_t l = 0; l < steps; ++l) {
             const int64_t r  = m * steps + l;
             const int64_t cb = rowoff(cand, r, K), ub = rowoff(un, r, K);
-            /* The half of the form that does not depend on the candidate, once a step. */
+            /* The candidate-independent factor, once per step. */
             const bool ok = pid >= 0 && pid < nv;
             const float* pv = ok ? in_row(pred, rowoff(pred, pid, R), R, rv) : nullptr;
             const float* hw = hp ? in_row(hp, rowoff(hp, r, R), R, hv) : nullptr;

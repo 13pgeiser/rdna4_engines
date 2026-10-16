@@ -1,25 +1,23 @@
 /* gen_tokenizer_ucd -- writes core/text/tokenizer_ucd.cpp, the Unicode tables the pre-tokeniser
  * regex compiler reads.
  *
- * The tables are READ OUT OF ONIGURUMA rather than derived from the UCD text files, because the
- * reference a tokenizer.json pattern is judged against is HuggingFace `tokenizers`, and that
- * library runs every Split pattern through Oniguruma. Whatever Oniguruma answers for `\p{L}`,
- * `\s`, `\w` or `(?i:s)` is by definition what the pattern means, including where its Unicode
- * version or its definition of a property differs from another engine's. So each table is the
- * literal answer of `onig_match` for that property, codepoint by codepoint, and the case-folding
- * orbits are Oniguruma's own case-fold enumeration.
+ * The tables are read out of Oniguruma rather than derived from the UCD files: HuggingFace
+ * `tokenizers` runs every Split pattern through Oniguruma, so its answer for `\p{L}`, `\s`, `\w`
+ * or `(?i:s)` defines what a pattern means, Unicode version and property quirks included. Each
+ * table is `onig_match` per codepoint; the case-folding orbits are Oniguruma's own enumeration.
  *
- * Not built by CMake, because it links the system Oniguruma and nothing else in the tree does:
+ * Not built by CMake, since nothing else links the system Oniguruma:
  *
  *   g++ -O2 -std=c++20 tools/gen_tokenizer_ucd.cpp -lonig -o gen_tokenizer_ucd
  *   ./gen_tokenizer_ucd > core/text/tokenizer_ucd.cpp
  *
- * The Oniguruma it ran against is recorded in the output. Regenerate when the reference moves to a
- * later Unicode version; tokenizer_regex_test's property and (?i) cases and tokenizer_test's
- * Unicode-version case say what changed.
+ * The output records the Oniguruma version. Regenerate when the reference moves to a later
+ * Unicode version; tokenizer_regex_test's property and (?i) cases and tokenizer_test's
+ * Unicode-version case show what changed.
  */
 #include <oniguruma.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -153,11 +151,10 @@ int main() {
     }
     std::printf("\n};\nconst size_t k_gc_runs_n = sizeof(k_gc_runs) / sizeof(k_gc_runs[0]);\n\n");
 
-    /* `\w` has two definitions in Oniguruma. As an atom (and for `\b`) it asks the codepoint's
-     * ctype, which below U+0100 reads a Latin-1 table that counts the superscript digits and the
-     * vulgar fractions as word characters; inside a bracket class it adds the Unicode Word range
-     * table, which does not. Both are carried. The other shorthands agree in and out of a class,
-     * and the generator checks that rather than assuming it. */
+    /* `\w` has two definitions in Oniguruma. As an atom (and for `\b`) it uses the codepoint's
+     * ctype, whose Latin-1 table below U+0100 counts superscript digits and vulgar fractions as
+     * word characters; inside a bracket class it uses the Unicode Word ranges, which do not. Both
+     * are emitted. The other shorthands must agree in and out of a class, which is checked. */
     for (const char* e : { "\\s", "\\d", "\\h" }) {
         if (ranges_of(e) != ranges_of(std::string("[") + e + "]")) {
             std::fprintf(stderr, "%s differs inside a class; the compiler assumes it does not\n", e);
@@ -169,8 +166,8 @@ int main() {
     emit_ranges("k_word", ranges_of("\\w"));
     emit_ranges("k_word_class", ranges_of("[\\w]"));
 
-    /* Scripts a pre-tokeniser is known to name, plus the neighbours a model for the same
-     * languages would. Anything else is refused by name at load. */
+    /* Scripts known pre-tokenisers name, plus likely neighbours. Others are refused by name at
+     * load. */
     static const char* kScripts[] = {
         "Han", "Hiragana", "Katakana", "Hangul", "Bopomofo", "Latin", "Greek", "Cyrillic",
         "Armenian", "Hebrew", "Arabic", "Thai", "Lao", "Khmer", "Myanmar", "Tibetan",
@@ -189,10 +186,10 @@ int main() {
                     script_tables[i].c_str());
     std::printf("};\nconst size_t k_scripts_n = sizeof(k_scripts) / sizeof(k_scripts[0]);\n\n");
 
-    /* Case folding, as Oniguruma enumerates it for a single codepoint under the default fold
-     * flags: every other codepoint the pattern character matches under (?i), and whether it also
-     * matches a MULTI-codepoint sequence (U+00DF against "ss"). The single-codepoint relation is
-     * closed into orbits; the multi-codepoint ones are listed so the compiler can refuse them. */
+    /* Case folding per codepoint under the default fold flags: the codepoints it matches under
+     * (?i), and whether it also matches a multi-codepoint sequence (U+00DF against "ss"). The
+     * single-codepoint relation is closed into orbits; multi-codepoint folds are listed so the
+     * compiler can refuse them. */
     std::vector<uint32_t> parent(kMax);
     std::iota(parent.begin(), parent.end(), 0u);
     auto find = [&](uint32_t x) {

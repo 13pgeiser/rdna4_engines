@@ -1,31 +1,20 @@
-/* avx_common.h -- what every kernel in this plugin needs and the ABI does not give it.
+/* avx_common.h -- helpers every kernel in this plugin needs that the ABI does not provide.
  *
- * Deliberately thin. rad_plugin.h already carries the parameter readers, the absent-operand rule,
- * the row-pitch helper and every narrowing conversion, and its header explains at length why those
- * belong in the ABI rather than once per plugin. This plugin calls them. What is here is the three
- * things that are genuinely this plugin's:
+ * rad_plugin.h already has the parameter readers, the absent-operand rule, the row-pitch helper
+ * and the narrowing conversions. This header adds three things:
  *
- *   THE SCRATCH ARENA. Every kernel converts a row to f32 before it computes (avx_vec.h), so every
- *   kernel needs a row of scratch. RadArgs::scratch would be the ABI's answer and it is the wrong
- *   one here: it is sized once at declare from the band's upper bound, it is one buffer, and this
- *   plugin runs its outer loop under OpenMP -- so every thread needs its own, and the number of
- *   threads is not known at declare. A thread_local arena that grows to a high-water
- *   mark and is then reused is allocation-free on the hot path, which is what the ABI's "must not
- *   allocate" is protecting, and it is what libref does too (it holds std::vector in its kernels).
- *   The growth is logged under AVX_TRACE so a kernel that reallocates per call is visible.
+ *   Scratch arena. Every kernel converts rows to f32 before computing (avx_vec.h), so it needs row
+ *   scratch. RadArgs::scratch does not fit: it is one buffer sized at declare, while the outer loop
+ *   runs under OpenMP with a thread count unknown at declare. A thread_local arena grows to a
+ *   high-water mark and is reused, so the hot path does not allocate (libref does the same).
  *
- *   THE OPERAND PREAMBLE. Sixty-eight launches open by fetching n operands, refusing if a required
- *   one is absent, and reading the extents off the tensors rather than off the parameters --
- *   libref/ref_ops.h explains why that rule exists and it is the same rule here: a ranged parameter
- *   is collapsed to a BAND, so a loop bounded by `M` runs to the band's upper bound and walks off
- *   the arena. Every extent in this plugin comes from a RadTensor.
+ *   Operand addressing. Every extent comes from a RadTensor, never from a parameter: a ranged
+ *   parameter is collapsed to a band, so a loop bounded by `M` would run to the band's upper bound
+ *   and walk off the arena (libref/ref_ops.h).
  *
- *   THE THREADING DECISION, in one place. OpenMP over the OUTER dimension only, one thread owning
- *   whole output rows, no reduction() clause anywhere -- the same rule libref states, for a
- *   different reason. libref wants bit-identical answers across thread counts because it is the
- *   oracle. This plugin wants them because a kernel whose answer moves with the machine's load is
- *   a kernel no measurement can rank: two runs of the same binary would differ, and the difference
- *   would be read as whatever change was under test.
+ *   Threading. OpenMP over the outer dimension only, one thread owning whole output rows, no
+ *   reduction() clause. Results are bit-identical across thread counts, so two runs of the same
+ *   binary agree regardless of machine load and measurements stay comparable.
  */
 #ifndef RAD_AVX_COMMON_H
 #define RAD_AVX_COMMON_H
@@ -38,24 +27,44 @@
 #include <cstring>
 #include <cmath>
 
+/* Scalar transcendentals as libref evaluates them: in double, rounded once to float. glibc's float
+ * routines differ between releases (2.41 made log1pf, tanhf and erff correctly rounded), so a float
+ * call would agree with libref on one host and not on another; the double routines are stable,
+ * and the rounded float is the same everywhere. The vector paths (avx_vec.h) are checked to a
+ * tolerance and do not use these. */
+static inline float sc_exp(float x)   { return (float)std::exp((double)x); }
+static inline float sc_log(float x)   { return (float)std::log((double)x); }
+static inline float sc_log1p(float x) { return (float)std::log1p((double)x); }
+static inline float sc_tanh(float x)  { return (float)std::tanh((double)x); }
+static inline float sc_erf(float x)   { return (float)std::erf((double)x); }
+static inline float sc_sin(float x)   { return (float)std::sin((double)x); }
+static inline float sc_cos(float x)   { return (float)std::cos((double)x); }
+static inline float sc_pow(float b, float e) { return (float)std::pow((double)b, (double)e); }
+
 #ifdef _OPENMP
 #include <omp.h>
 #include <sched.h>
+#include <atomic>
 #include <cstdio>
-#include <cstdlib>
-/* THE TEAM IS ONE THREAD A PHYSICAL CORE, not one a logical CPU. These kernels are FMA- or
- * bandwidth-bound, so an SMT sibling adds next to nothing to them -- and the engine runs threads
- * of its own beside the team (a worker per stream, the scheduler, the HTTP server). A team as
- * wide as the logical CPU count leaves those nowhere to run but on a core a team thread is
- * spinning on, and a team barrier then waits for a descheduled thread: measured on a 16-core,
- * 32-thread part, an encoder step of 576 tokens took 0.75 s at 32 threads and 0.09 s at 16.
- * Counted over the process's affinity mask, so a pinned or containerised engine sizes its team to
- * what it was given; OMP_NUM_THREADS, when set, is the operator's and wins, and a thread that
- * asked OpenMP for fewer (omp_set_num_threads) gets fewer. */
+/* The checker's override, set through avx_par_force (avx_isa.h): 0, or the team size every
+ * parallel region takes whatever its work threshold. Defined in avx_dispatch.cpp; one relaxed load
+ * per region. */
+extern std::atomic<int> avx_par_threads;
+static inline bool avx_par_forced() {
+    return avx_par_threads.load(std::memory_order_relaxed) > 0;
+}
+/* One team thread per physical core, not per logical CPU. These kernels are FMA- or
+ * bandwidth-bound, so an SMT sibling adds little, and the engine runs its own threads (stream
+ * workers, scheduler, HTTP server) beside the team. A team as wide as the logical CPU count makes
+ * team barriers wait on descheduled threads: on a 16-core, 32-thread part a 576-token encoder
+ * step takes 0.75 s at 32 threads and 0.09 s at 16. Cores are counted over the process affinity
+ * mask, so a pinned or containerised engine uses what it was given. OMP_NUM_THREADS, when set,
+ * wins, and a thread that asked for fewer (omp_set_num_threads) gets fewer. */
 static inline int avx_team_size() {
-    /* The physical core count is a property of the process and counted once; the OpenMP request
-     * is the calling thread's and read every time, so a caller that asks for fewer threads
-     * (omp_set_num_threads, as the benchmark does for its single-thread figures) gets them. */
+    if (const int forced = avx_par_threads.load(std::memory_order_relaxed); forced > 0)
+        return forced;
+    /* The core count is per process and computed once; the OpenMP request is per calling thread
+     * and read on every call (the benchmark lowers it for single-thread figures). */
     static const int cores = [] {
         if (const char* e = std::getenv("OMP_NUM_THREADS"); e && *e) return 0;
         cpu_set_t set;
@@ -83,15 +92,13 @@ static inline int avx_team_size() {
 }
 #define AVX_PRAGMA(x) _Pragma(#x)
 #define AVX_PARALLEL_FOR AVX_PRAGMA(omp parallel for schedule(static) num_threads(avx_team_size()))
-/* THE OUTER LOOP IS WORTH A TEAM ONLY WHEN THERE IS ENOUGH WORK TO PAY FOR STARTING ONE, and the
- * `if` clause is how that is said without writing the serial loop twice. A fork/join costs a few
- * microseconds; an op below the threshold spends more time in the barrier than in the arithmetic,
- * which is the same shape of problem a small device dispatch has, one level down. The crossover is
- * measured by `rad-avx-bench --threads`.
- *
- * `cond` is pasted into the pragma text, so it must contain no comma. */
+/* Parallelise the outer loop only when the work pays for a fork/join, which costs a few
+ * microseconds; `rad-avx-bench --threads` measures the crossover. `cond` is pasted into the
+ * pragma text, so it must contain no comma. avx_par_force overrides it, so the checker runs every
+ * parallel body with several threads at its small geometries. */
 #define AVX_PARALLEL_FOR_IF(cond) \
-    AVX_PRAGMA(omp parallel for schedule(static) if(cond) num_threads(avx_team_size()))
+    AVX_PRAGMA(omp parallel for schedule(static) if((cond) || avx_par_forced()) \
+               num_threads(avx_team_size()))
 #else
 #define AVX_PARALLEL_FOR
 #define AVX_PARALLEL_FOR_IF(cond)
@@ -107,58 +114,20 @@ namespace avx {
  * Aligned to 64 so a 512-bit aligned load is legal off it at every level. Returns a buffer of at
  * least `n` floats, valid until the next call on this thread that asks for more. */
 float*   scratch_f32(size_t n);
-/* A second and third independent buffer, for kernels that need two rows live at once (every gated
- * op: gate and up, a and b, x and residual). Separate functions rather than an index so the call
- * site says which buffer it means. */
+/* Independent second and third buffers, for kernels with several rows live at once (gate and up,
+ * a and b, x and residual). */
 float*   scratch_f32_b(size_t n);
 float*   scratch_f32_c(size_t n);
 void*    scratch_raw(size_t bytes);
 
-/* ================================================================== operand preamble */
-/* Fetch the first `n` operands into `out`, returning 0 if any is absent. The array is indexed
- * positionally and an absent OPTIONAL operand past `n` is fetched with rad_arg_in directly. */
-static inline int take(const RadArgs* a, int n, const RadTensor** out) {
-    for (int i = 0; i < n; ++i) {
-        out[i] = rad_arg_in(a, i);
-        if (!out[i]) return 0;
-    }
-    return 1;
-}
-
-/* The (rows, lastdim) reading of a tensor, and the pitch between rows. Three lines every kernel
- * would otherwise write. */
-struct Plane {
-    void*   p;
-    uint32_t dt;
-    int64_t rows, n, pitch;
-};
-
-static inline Plane plane(const RadTensor* t) {
-    Plane s;
-    s.p     = t->data;
-    s.dt    = t->dtype;
-    s.rows  = rad_tensor_rows(t);
-    s.n     = rad_tensor_lastdim(t);
-    s.pitch = rad_tensor_row_pitch(t);
-    return s;
-}
-
-/* Element offset of row r. Strides are in ELEMENTS (rad_types.h), so this is what a caller adds to
- * a typed pointer -- never a byte count, which is what makes it safe for W4/W2 where a byte count
- * would be fractional. */
-static inline int64_t row_off(const Plane& s, int64_t r) { return r * s.pitch; }
-
 /* ================================================================== libref's addressing, exactly
  *
- * THESE ARE COPIED FROM libref/ref_common.h AND THEY HAVE TO BE. They are not conveniences, they
- * are the ADDRESSING CONTRACT: which bytes an operand's element (r, i) lives at, how a rank-3
- * tensor is read as [rows, cols], and what a strided view means. A plugin that computed the right
- * arithmetic over the wrong bytes would be checked against the oracle and would fail in a way that
- * looks like a numerical bug, which is the most expensive kind to chase.
+ * Copied from libref/ref_common.h and must stay identical. They are the addressing contract:
+ * where element (r, i) lives, how a rank-3 tensor reads as [rows, cols], and what a strided view
+ * means. Diverging here fails the oracle check in a way that looks like a numerical bug.
  *
- * `numel` returning 0 for a null-data tensor is part of it: that is how libref's shape checks
- * refuse an absent required operand, and a copy that returned the product of the shape instead
- * would accept the call and fault. */
+ * `numel` returns 0 for a null-data tensor; libref's shape checks rely on that to refuse an absent
+ * required operand. */
 static inline int64_t numel(const RadTensor* t) {
     if (!t || !t->data || t->rank == 0) return 0;
     int64_t n = 1;
@@ -188,9 +157,9 @@ static inline int64_t offlin(const RadTensor* t, int64_t lin) {
     return off;
 }
 
-/* The element offset of logical row `r` read as [rows, cols]. The leading axes are walked with
- * their OWN strides, so a [T, H, V] tensor read as [T*H, V] lands correctly even when H's stride
- * is not V -- which is exactly the fused-projection column slice docs/OPS.md warns about. */
+/* Element offset of logical row `r` read as [rows, cols]. Leading axes use their own strides, so
+ * a [T, H, V] tensor read as [T*H, V] is correct even when H's stride is not V (the
+ * fused-projection column slice in docs/OPS.md). */
 static inline int64_t rowoff(const RadTensor* t, int64_t r, int64_t cols) {
     if (t->rank >= 2 && t->shape[t->rank - 1] == cols) {
         int64_t off = 0;
@@ -207,17 +176,17 @@ static inline int64_t rowoff(const RadTensor* t, int64_t r, int64_t cols) {
 
 static inline int64_t rows_of(const RadTensor* t, int64_t n) { return n > 0 ? numel(t) / n : 0; }
 
-/* THE OPERAND'S EXTENT, WITH THE RANGED PARAMETER AS A CEILING. libref/ref_common.h's band_rows,
- * copied for the reason the header gives: `M`, `numel` and `q_len` arrive as the band's upper
- * bound, so the call's row count is the operand's and a count above the band is a caller bug. */
+/* The operand's row count, with the ranged parameter as a ceiling (libref/ref_common.h:
+ * band_rows). `M`, `numel` and `q_len` arrive as the band's upper bound, so the count comes from
+ * the operand; a count above the band is a caller bug and yields 0. */
 static inline int64_t band_rows(int64_t from_operand, int64_t band) {
     if (from_operand <= 0) return 0;
     return (band > 0 && from_operand > band) ? 0 : from_operand;
 }
 
-/* THE BLOCK A SCALE GRID OF `blocks` PIECES IMPLIES OVER `ext` ELEMENTS -- libref/ref_gemm.h's
- * grid_block, which says why it is the power of two whose ceiling division gives `blocks` and not
- * the quotient ext / blocks: a grid's last block may be partial. */
+/* Block size implied by a scale grid of `blocks` pieces over `ext` elements (libref/ref_gemm.h:
+ * grid_block): the power of two whose ceiling division gives `blocks`, not ext / blocks, because
+ * the last block may be partial. */
 static inline int64_t grid_block(int64_t ext, int64_t blocks) {
     if (ext <= 0) return 1;
     if (blocks <= 1) return ext;
@@ -227,11 +196,10 @@ static inline int64_t grid_block(int64_t ext, int64_t blocks) {
     return (ext + b - 1) / b == blocks ? b : lo;
 }
 
-/* `row_stride`: which axis carries a row of `cols` elements, at whatever rank the operand arrived
- * in -- libref/ref_gemm.h's rule, copied for the header's reason. A rank-2 operand is not dense
- * because it is rank 2: the engine hands attention a COLUMN SLICE of the fused QKV plane,
- * [tokens, kv_heads * head_dim] with the whole projection's width as its row stride, and deriving
- * the stride from the shape reads every token after the first out of the previous token's row. */
+/* Stride between rows of `cols` elements, at any rank (libref/ref_gemm.h's rule). Rank 2 does not
+ * imply dense: attention receives a column slice of the fused QKV plane, [tokens, kv_heads *
+ * head_dim] with the full projection width as row stride, so the stride must not be derived from
+ * the shape. */
 static inline int64_t row_stride(const RadTensor* t, int64_t cols) {
     if (!t || t->rank < 2) return cols;
     int64_t span = 1;
@@ -243,15 +211,13 @@ static inline int64_t row_stride(const RadTensor* t, int64_t cols) {
     return t->stride[t->rank - 2];
 }
 
-/* ONE ELEMENT, AS f32 AND BACK, with the two things the ABI's accessors do not do.
- *
- * THE PACKED CODES. rad_load_f32 returns 0 for W4, W2 and MXFP4 -- its contract says a dtype it
- * cannot read is a refusal and not a value -- so every strided or odd-offset read of a packed
- * weight that falls off the row converter would decode as zeros. The codes are libref's
- * (ref_common.h: w4_code, w2_code, mxfp4_code), the same ones row_to_f32 unpacks in bulk.
- *
- * THE INTEGER STORE ROUNDS TO NEAREST-EVEN AND SATURATES, as libref's st_dt does, where
- * rad_store_f32 truncates and converts out-of-range values with a plain cast. A NaN stores 0. */
+/* One element as f32 and back:
+ *  - Packed codes. rad_load_f32 returns 0 for W4, W2 and MXFP4 (an unreadable dtype is a
+ *    refusal), so strided or odd-offset reads of packed weights decode here, with libref's codes
+ *    (ref_common.h: w4_code, w2_code, mxfp4_code), the same ones row_to_f32 unpacks in bulk.
+ *  - Integer and packed-code stores to the dtypes listed in st_elem round to the nearest code and
+ *    saturate, NaN storing 0, as libref's st_dt does; every other dtype (u16, bool, the floats)
+ *    is rad_store_f32's. */
 static inline float ld_elem(const void* p, uint32_t dt, int64_t i) {
     switch (dt) {
         case RAD_I4: {
@@ -282,16 +248,46 @@ static inline double round_sat(float v, double lo, double hi) {
     return r < lo ? lo : (r > hi ? hi : r);
 }
 
+/* A packed code's low `bits` into element `i` of a bit stream, lowest bits first. The atomics
+ * touch only this element's bits, so rows written by different threads may share a byte. */
+static inline void st_packed(void* p, int64_t i, int bits, unsigned c) {
+    const int per = 8 / bits;
+    uint8_t* b = (uint8_t*)p + i / per;
+    const int sh = (int)(i % per) * bits;
+    const uint8_t mask = (uint8_t)(((1u << bits) - 1u) << sh);
+    __atomic_fetch_and(b, (uint8_t)~mask, __ATOMIC_RELAXED);
+    __atomic_fetch_or(b, (uint8_t)((c << sh) & mask), __ATOMIC_RELAXED);
+}
+
+/* The e2m1 code nearest `v`, ties to the even code, saturating at 6; NaN is +0 (libref's). */
+static inline unsigned e2m1_code(float v) {
+    static const float kMag[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    if (v != v) return 0u;
+    const unsigned sign = std::signbit(v) ? 8u : 0u;
+    const float a = std::fabs(v);
+    unsigned best = 0;
+    for (unsigned c = 1; c < 8; ++c) {
+        const float d = std::fabs(kMag[c] - a), db = std::fabs(kMag[best] - a);
+        if (d < db || (d == db && (c & 1u) == 0u)) best = c;
+    }
+    return sign | best;
+}
+
 static inline void st_elem(void* p, uint32_t dt, int64_t i, float v) {
     switch (dt) {
+        /* Packed codes: the nearest code, saturated, so a code ld_elem read stores back as itself
+         * (a gather or scatter of packed rows moves them exactly). */
+        case RAD_I4: st_packed(p, i, 4, (unsigned)(int)round_sat(v, -8.0, 7.0) & 0xFu); break;
+        case RAD_I2: st_packed(p, i, 2, (unsigned)(int)round_sat(v, -2.0, 1.0) & 0x3u); break;
+        case RAD_FP4E2M1: st_packed(p, i, 4, e2m1_code(v)); break;
         case RAD_I8:  ((int8_t*)p)[i]   = (int8_t)round_sat(v, -128.0, 127.0); break;
         case RAD_U8:  ((uint8_t*)p)[i]  = (uint8_t)round_sat(v, 0.0, 255.0); break;
         case RAD_I16: ((int16_t*)p)[i]  = (int16_t)round_sat(v, -32768.0, 32767.0); break;
         case RAD_I32: ((int32_t*)p)[i]  = (int32_t)round_sat(v, -2147483648.0, 2147483647.0); break;
         case RAD_U32: ((uint32_t*)p)[i] = (uint32_t)round_sat(v, 0.0, 4294967295.0); break;
         case RAD_I64: {
-            /* 2^63 is the first float past the range, so the bound is a comparison, not a clamp
-             * value a double could hold. */
+            /* 2^63 is the first float past the int64 range, so it is tested by comparison
+             * rather than used as a clamp value. */
             const double r = round_sat(v, -9223372036854775808.0, 9223372036854775808.0);
             ((int64_t*)p)[i] = r >= 9223372036854775808.0 ? INT64_MAX : (int64_t)r;
             break;
@@ -305,18 +301,31 @@ static inline void  stt(const RadTensor* t, int64_t off, float v) {
     st_elem(t->data, t->dtype, off, v);
 }
 
-/* IS THIS OPERAND'S ROW DENSE? The whole vectorised path is predicated on it: a row whose elements
- * are one apart can be converted with one call and then read as a flat f32 array, and a row whose
- * elements are not has to go through the strided gather. Almost every operand in a real step is
- * dense; the exceptions are named in docs/OPS.md and are a handful of sites. */
+/* `v` rounded through a store and load of dtype `dt` (libref's round_dt). */
+static inline float narrow1(uint32_t dt, float v) {
+    uint32_t buf[2] = { 0, 0 };
+    rad_store_f32(buf, dt, 0, v);
+    return rad_load_f32(buf, dt, 0);
+}
+
+/* True when the row's elements are contiguous. A dense row converts with one call and is read as
+ * a flat f32 array; any other row goes through the strided gather. Nearly every operand is dense;
+ * docs/OPS.md names the exceptions. */
 static inline bool dense_row(const RadTensor* t) { return laststride(t) == 1; }
 
+/* The gemm_nt_q dtypes whose activation is quant_act_i8's, codes in the int8 WMMA's step order
+ * (libref/ref_common.h). */
+static inline bool i8_steps_dtype(const char* dt) {
+    static const char* const kDtypes[] = { "w4a8", "w4a8_asym", "w8a8", "w2a8" };
+    for (const char* d : kDtypes)
+        if (dt && std::strcmp(dt, d) == 0) return true;
+    return false;
+}
+
 /* ================================================================== parameters
- * Deliberately LAXER than rad_param_geti, and for libref's reason rather than a different one: a
- * tool or a test may call a launch directly with no declare in front of it to enforce the type, so
- * a range and a string spelling of an integer are both read rather than refused. The ABI's own
- * reader is right for a kernel reached through declare and wrong for one reached through a
- * checker, and this plugin is reached through both. */
+ * Laxer than rad_param_geti, as in libref: a tool or test may call a launch directly with no
+ * declare to enforce the type, so a range or a string spelling of an integer is read rather than
+ * refused. */
 static inline const RadParam* p_find(const RadArgs* a, const char* k) {
     return a ? rad_param_find(a->p, a->n_p, k) : nullptr;
 }
@@ -347,6 +356,8 @@ static inline float p_f32(const RadArgs* a, const char* k, float dflt) {
     return dflt;
 }
 
+/* An enumerated parameter spelled as a name or libr4d's integer; an unknown name is -1, for the
+ * caller to refuse (as libref). */
 static inline int p_enum(const RadArgs* a, const char* k, const char* const* names, int n,
                          int dflt) {
     const RadParam* p = p_find(a, k);
@@ -354,7 +365,7 @@ static inline int p_enum(const RadArgs* a, const char* k, const char* const* nam
     if (p->kind == RAD_P_STR && p->sval) {
         for (int i = 0; i < n; ++i)
             if (names[i] && std::strcmp(names[i], p->sval) == 0) return i;
-        return dflt;
+        return -1;
     }
     if (p->kind == RAD_P_INT) return (int)p->ival;
     return dflt;
@@ -388,8 +399,8 @@ static inline void st_int_dt(uint32_t dt, void* p, int64_t i, int64_t v) {
 
 static inline int64_t ldi(const RadTensor* t, int64_t off) { return ld_int_dt(t->dtype, t->data, off); }
 
-/* Bytes of element i for a dtype whose element is not a whole byte. Only the packed weight codes
- * need it and they are always read through row_to_f32, but `dequant` addresses a group start. */
+/* Address of the byte holding element i, for dtypes whose element is not a whole byte. Packed
+ * codes are otherwise read through row_to_f32; `dequant` uses this to address a group start. */
 static inline const void* byte_at(const void* base, uint32_t dt, int64_t i) {
     const uint8_t* b = (const uint8_t*)base;
     switch (dt) {

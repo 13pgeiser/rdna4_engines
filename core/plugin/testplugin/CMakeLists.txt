@@ -1,10 +1,8 @@
-# Test plugins from one source, so that plugin_test has a hierarchy to load, a schema conflict to
-# refuse and a stale ABI to reject. They go under $RADIANCE_HOME/testkernels rather than kernels/,
-# because the engine scans kernels/ at startup and these rows implement nothing: a test plugin that
-# a real run could select is a fallback nobody knows about (spec.md §17).
-#
-# The two that must be refused live one directory down, so that loading testkernels/ is a clean
-# load and the refusals are asked for explicitly by path.
+# Test plugins built from one source: a hierarchy for plugin_test to load, a schema conflict to
+# refuse and a stale ABI to reject. They go under $RADIANCE_HOME/testkernels, not kernels/, because
+# the engine scans kernels/ at startup and must never select a row that implements nothing
+# (spec.md §17). The two that must be refused live in testkernels/bad, so loading testkernels/ is
+# clean and the refusals are requested by path.
 rad_add_plugin(radtest_base testkernels SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/testplugin.cc)
 target_compile_definitions(radtest_base PRIVATE RADTEST_BASE=1)
 
@@ -17,22 +15,18 @@ target_compile_definitions(radtest_conflict PRIVATE RADTEST_CONFLICT=1)
 rad_add_plugin(radtest_badabi testkernels/bad SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/testplugin.cc)
 target_compile_definitions(radtest_badabi PRIVATE RADTEST_BADABI=1)
 
-# Two architecture plugins claiming one architecture id, in their own directory so that loading it
-# is the whole test: the first is identified, the second is refused.
+# Two architecture plugins claiming one architecture id: the first is identified, the second
+# refused.
 rad_add_plugin(radtest_arch testarch SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/testplugin.cc)
 target_compile_definitions(radtest_arch PRIVATE RADTEST_ARCH=1)
 
 rad_add_plugin(radtest_arch2 testarch SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/testplugin.cc)
 target_compile_definitions(radtest_arch2 PRIVATE RADTEST_ARCH2=1)
 
-# Two more from the same source, in a directory of their own, so that a load with NO hierarchy has
-# something to be observed on. One of them declares itself a reference implementation.
-#
-# THE FILE NAMES ARE THE POINT. load_dir reads a directory in sorted order, so `..._a` (the
-# reference) is staged first; if the loader did not pin a reference library below every other
-# kernel plugin, it would keep that position and answer for every op, and the library that actually
-# serves the card would never be selected. Naming them the other way round would make the test pass
-# on alphabetical order alone. Its name is nobody's in particular: the rule is the declaration's.
+# Two plugins for a load with no hierarchy; one declares itself a reference implementation.
+# Do not rename: load_dir reads in sorted order, so the reference (`..._a`) is staged first, and
+# the test checks that the loader still ranks it below every other kernel plugin. The reverse
+# naming would pass on alphabetical order alone.
 rad_add_plugin(radtest_ord_a testkernels/order SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/testplugin.cc)
 target_compile_definitions(radtest_ord_a PRIVATE RADTEST_BASE=1 RADTEST_REFERENCE=1
                                                  RADTEST_BASE_NAME=\"radtest_reference\")
@@ -40,12 +34,54 @@ target_compile_definitions(radtest_ord_a PRIVATE RADTEST_BASE=1 RADTEST_REFERENC
 rad_add_plugin(radtest_ord_b testkernels/order SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/testplugin.cc)
 target_compile_definitions(radtest_ord_b PRIVATE RADTEST_BASE=1)
 
-# The KV tiers' transfer test. Unlike everything above it COMPUTES -- byte-row gather and scatter
-# registered in the device domain, running on the host backend's memory -- so it lives in a
-# directory of its own that only tests/mem_test.cpp loads, by path. It calls back into the device
-# API for stream order, which the test executable exports.
+# Rows for rules the base plugin does not reach (a non-interval ranged constraint, a cross-axis
+# tune test, a layout hook, a capacity parameter), in their own directory so loading testkernels/
+# is unchanged.
+rad_add_plugin(radtest_extra testkernels/extra SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/testplugin.cc)
+target_compile_definitions(radtest_extra PRIVATE RADTEST_EXTRA=1)
+
+# Two tunable axes the loader must refuse, loaded by path, and a library that declines the machine.
+rad_add_plugin(radtest_badtune_default testkernels/bad
+               SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/testplugin.cc)
+target_compile_definitions(radtest_badtune_default PRIVATE RADTEST_BADTUNE=1)
+rad_add_plugin(radtest_badtune_twice testkernels/bad SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/testplugin.cc)
+target_compile_definitions(radtest_badtune_twice PRIVATE RADTEST_BADTUNE=2)
+rad_add_plugin(radtest_decline testkernels/decline SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/testplugin.cc)
+target_compile_definitions(radtest_decline PRIVATE RADTEST_DECLINE=1)
+
+# One architecture family at three quantisations, for the (id, quantisation) selection key.
+foreach(q plain fp8 w4)
+  set(_rad_q "${q}")
+  if(q STREQUAL "plain")
+    set(_rad_q "")
+  endif()
+  rad_add_plugin(radtest_archq_${q} testarchq SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/testplugin.cc)
+  target_compile_definitions(radtest_archq_${q} PRIVATE RADTEST_ARCHQ=1
+                             RADTEST_ARCHQ_NAME="radtest_archq_${q}"
+                             RADTEST_ARCHQ_QUANT="${_rad_q}")
+endforeach()
+
+# KV tier transfer test plugin. Unlike the others it computes (byte-row gather and scatter in the
+# device domain, on host backend memory), so only tests/mem_test.cpp loads it, by path. It calls
+# the device API for stream order, which the test executable exports.
 rad_add_plugin(radtest_rows testrows SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/tierrows.cc)
 
-# A quantiser with a scheme of its own, which only its decode hook reads: tests/quant_test.cpp
-# loads it by path to show a weight it wrote decodes through the core's decoder all the same.
+# A quantiser with its own scheme, read only by its decode hook. tests/quant_test.cpp loads it by
+# path to check that its weights decode through the core's decoder.
 rad_add_plugin(radtest_quant testquant SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/testquant.cc)
+
+# Deliberately defective kernel libraries, one per defect, for tests/kbench_mutant_test.cpp: a
+# replay must fail each of them (or, for kbm_ok, pass it). One source, as above; KBM_MUTANT picks
+# the defect. Under testkernels/kbmut, loaded only by name.
+set(RAD_KBM_MUTANTS ok scale nan half overrun refuse shape argmax inwrite enc
+    CACHE INTERNAL "the kbmutant.cc builds, read by tests/CMakeLists.txt")
+set(i 0)
+foreach(m ${RAD_KBM_MUTANTS})
+  rad_add_plugin(kbm_${m} testkernels/kbmut SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/kbmutant.cc)
+  target_compile_definitions(kbm_${m} PRIVATE KBM_MUTANT=${i} KBM_NAME=\"kbm_${m}\")
+  math(EXPR i "${i} + 1")
+endforeach()
+
+# An architecture that declares a norm, a projection and an add from a synthetic container, so
+# tests/kbench_mutant_test.cpp can record a fixture on the host with libref alone.
+rad_add_plugin(radtest_kbarch testarch/kbench SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/kbarch.cc)

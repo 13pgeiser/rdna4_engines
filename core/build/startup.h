@@ -1,14 +1,13 @@
-/* startup.h -- steps 1 through 4 of spec §1's startup sequence, shared by the engine and by every
- * tool that needs them.
+/* startup.h -- steps 1 through 4 of spec §1's startup sequence, shared by the engine and the
+ * tools.
  *
  *   1. Load kernel plugins from $RADIANCE_HOME/kernels/, in the configured hierarchy order.
  *   3. Look up the architecture id in $RADIANCE_HOME/architectures/.
  *   4. Declare.
  *
- * These live in core rather than in tools/ because rad-convert, rad-check and rad-tune are all
- * the engine's startup with a different last step (spec §4.2, §15, §17). Two implementations of
- * "load the plugins and run declare" would eventually disagree about hierarchy order, and the
- * hierarchy order is what decides which layout got baked into the container.
+ * In core because rad-convert, rad-check and rad-tune are the engine's startup with a different
+ * last step (spec §4.4, §15, §17). A second implementation could disagree on hierarchy order,
+ * which decides the layout baked into a container.
  */
 #pragma once
 #include "rad_core.h"
@@ -29,17 +28,16 @@ namespace rad {
 struct PluginId { std::string name, version; };
 
 struct LoadedPlugins {
-    /* Kernel plugins in HIERARCHY ORDER, which is what decides selection, so a report of what ran
-     * names them in it. */
+    /* Kernel plugins in hierarchy order, which decides selection. */
     std::vector<PluginId>       kernels;
     std::string                 arch_plugin;
     std::string                 arch_version;
     std::string                 arch_id;
-    /* The other half of the key that selected it, "" for an unquantised container. */
+    /* The quantisation half of the selection key, "" for an unquantised container. */
     std::string                 arch_quant;
 
-    /* `name@version`, space separated, in hierarchy order: what a benchmark records as the
-     * libraries it measured. */
+    /* `name@version`, space separated, in hierarchy order; what a benchmark records as the
+     * libraries measured. */
     std::string libraries() const {
         std::string s;
         for (const auto& p : kernels) {
@@ -50,29 +48,27 @@ struct LoadedPlugins {
     }
 };
 
-/* $RADIANCE_HOME AS A SEARCH PATH: one or more homes separated by ':', the first taking precedence
- * -- a directory of one's own plugins ahead of an installation's, without copying the installation.
- * Each home holds kernels/, architectures/ and quantizers/, any of which it may lack; a plugin a
- * home earlier on the path supplies shadows one of the same file name later on it. Files that are
- * not plugins -- the tuning cache, rad-kbench's fixtures -- are read from the first home that has
- * them and written to the first home. */
+/* $RADIANCE_HOME is a ':'-separated search path, first home first, so a directory of one's own
+ * plugins can precede an installation. Each home may hold kernels/, architectures/ and
+ * quantizers/; a plugin earlier on the path shadows one with the same file name later. Non-plugin
+ * files (the tuning cache, rad-kbench fixtures) are read from the first home that has them and
+ * written to the first home. */
 std::vector<std::string> rad_home_dirs(const std::string& home);
 /* `<home>/<rel>` for the first home on the path that has it; the first home's when none does. */
 std::string rad_home_file(const std::string& home, const std::string& rel);
 
-/* The Registry loaded into is process-lifetime, because a Resolved, a Band and a KernelRow all
- * point into a plugin's static tables and the Program outlives this call. */
-/* `arch_id` and `quant` are BOTH halves of the selection key (spec §2.4, rad_builder.h): a family
- * has one plugin per weight format and they all answer the same architecture id. `quant` is the
- * container's own descriptor -- RadModelMeta::quant, RadFileHeader::quant -- and "" is the
- * unquantised case, which matches a plugin that says "" and nothing else. */
-/*
- * `imported` is a checkpoint whose quantisation is imported weight by weight
- * (Checkpoint::imports): its descriptor names the tool that made it and no plugin claims it, so
- * the plugin is the architecture's QUANTISED one -- the one plugin of the family claiming a
- * descriptor, or the family's only plugin when that claims none. Two quantised plugins are a
- * choice this cannot make, and are refused by name. `out->arch_quant` is the descriptor chosen,
- * which is what a container converted from it records. */
+/* Loads into the process-lifetime registry (rad_tools_registry).
+ *
+ * `arch_id` and `quant` together are the selection key (spec §2.4, rad_builder.h): a family has
+ * one plugin per weight format, all answering the same architecture id. `quant` is the container's
+ * descriptor (RadModelMeta::quant, RadFileHeader::quant); "" is unquantised and matches only a
+ * plugin that says "".
+ *
+ * `imported`: the checkpoint's quantisation is imported weight by weight (Checkpoint::imports), so
+ * its descriptor names the producing tool and no plugin claims it. The family's quantised plugin
+ * serves it: the one plugin claiming a descriptor, or the only plugin if none does. Two quantised
+ * plugins are refused by name. `out->arch_quant` is the chosen descriptor, which a container
+ * converted from it records. */
 int rad_tools_load_plugins(const std::string& radiance_home,
                            const std::vector<std::string>& hierarchy,
                            const std::string& arch_id,
@@ -80,24 +76,34 @@ int rad_tools_load_plugins(const std::string& radiance_home,
                            LoadedPlugins* out,
                            bool imported = false);
 
-/* `also` declares into the SAME builder after the architecture plugin has. That is what puts the
- * sampler chain in the same Program: its ops resolve through the same hierarchy at the same
- * time as the plugin's, so a missing sampler kernel is in the same miss list rather than
- * discovered at the first request that asks for it (spec §3.1, §13). Empty for the tools --
- * rad-convert cares about the weight layout and has no sampler. */
+/* The architecture plugin's rad_arch_probe answers, given before declare. */
 int rad_tools_probe(const LoadedPlugins& plugins, const RadModelMeta& meta, RadArchProbe* out);
 
 /* The architecture plugin's declared reply format (rad_arch_chat_format), or null when it
  * declares none and the format is to be derived from the chat template. */
 const RadChatFormat* rad_tools_chat_format(const LoadedPlugins& plugins, const RadModelMeta& meta);
 
-/* `ref`, when given, makes this a SIZING declare (RadBuildCtx::shape_probe, Builder::
- * set_reference): the plugin declares against the bands `ref` resolved and nothing is selected
- * or initialised. The Program that comes back is for its buffers and nothing else. */
-/* `sources` answers rad_weight_encoding (Builder::set_sources): a container's entries, a
- * checkpoint's tensors, or a recipe. Empty, every weight is read as plain in its declared dtype. */
-/* `instances` false selects every kernel and initialises none (Builder::set_instances): for a
- * caller that launches nothing, such as rad-convert planning a container's stored form. */
+/* The architecture plugin's declared audio format (rad_arch_audio_format), or null when it
+ * declares none -- a model the speech routes do not serve. A format whose struct_size is too
+ * small to hold a field reads that field as null. */
+const RadAudioFormat* rad_tools_audio_format(const LoadedPlugins& plugins, const RadModelMeta& meta);
+
+/* Run declare.
+ *
+ * `also` declares into the same builder after the architecture plugin, which is how the sampler
+ * chain joins the Program: its ops resolve through the same hierarchy, so a missing sampler kernel
+ * is in the same miss list rather than found at the first request (spec §3.1, §13). Empty for the
+ * tools, which have no sampler.
+ *
+ * `ref` makes this a sizing declare (RadBuildCtx::shape_probe, Builder::set_reference): the plugin
+ * declares against `ref`'s bands, nothing is selected or initialised, and the result is used only
+ * for its buffers.
+ *
+ * `sources` answers rad_weight_encoding (Builder::set_sources): container entries, checkpoint
+ * tensors, or a recipe. Empty: every weight is plain in its declared dtype.
+ *
+ * `instances` false selects every kernel and initialises none (Builder::set_instances), for
+ * callers that launch nothing, such as rad-convert. */
 int rad_tools_declare(const LoadedPlugins& plugins, const RadModelMeta& meta,
                       const RadBuildCtx& ctx, Program* out,
                       const std::function<int(RadBuilder*, int64_t logits_width)>& also = {},
@@ -108,14 +114,13 @@ int rad_tools_declare(const LoadedPlugins& plugins, const RadModelMeta& meta,
  * declare. */
 WeightSourceFn rad_container_sources(const RadFile& f);
 
-/* A CHECKPOINT AS THE SOURCE, served directly (spec §4.3): each declared weight resolved through
- * the name map once, and kept for the loader, which reads the same tensors the answer was made
- * from. Every rank declares at once, so it is locked.
+/* A checkpoint served directly as the source (spec §4.3). Each declared weight is resolved
+ * through the name map once and kept for the loader, which reads the same tensors. Locked, since
+ * every rank declares concurrently.
  *
- * Only a TRIVIAL encoding is answered -- bf16, f16, f32, block-scaled FP8 -- because nothing is
- * quantised at load. A weight whose checkpoint form is anything else is recorded with the reason
- * and answered RAD_E_UNSUPPORTED; refused() names them after declare, and the remedy is a
- * container. */
+ * Only trivial encodings are answered (bf16, f16, f32, block-scaled FP8) because nothing is
+ * quantised at load. Anything else is recorded with its reason and answered RAD_E_UNSUPPORTED;
+ * refused() lists them after declare, and the remedy is a container. */
 class CheckpointSources {
 public:
     explicit CheckpointSources(Checkpoint& ck) : ck_(ck) {}
@@ -136,22 +141,16 @@ private:
     std::map<std::string, std::string> missing_;
 };
 
-
 /* ------------------------------------------------------------------ the reference-kernel gate */
-/* A reference library -- one that declares itself so, RadPluginReferenceFn -- is BOTH the fallback
- * that makes an unsupported model run at reduced speed and the oracle rad-kbench measures against
- * (spec §17). The first of those is a hazard in production and
- * the second is not, so which one is happening has to be a decision and not a discovery: a model
- * that silently fell back to the reference implementation for its GEMMs is a model running orders
- * of magnitude below what the machine can do, and nothing in the output says so.
- *
- * So: resolving to a reference library is FATAL unless --debug-accept-reference-kernels was
- * passed. The flag is spelled with `debug` in it because that is what it is for. */
+/* A reference library (RadPluginReferenceFn) is both the slow fallback for an unsupported model
+ * and the oracle rad-kbench measures against (spec §17). As a silent fallback it runs orders of
+ * magnitude below the machine with no visible sign, so resolving to one is fatal unless
+ * --debug-accept-reference-kernels is passed. */
 
 int rad_reference_ops(const Program& p, std::vector<std::string>* out);
 
 /* Report and refuse, or report and continue when `allow`. `what` names the caller ("serve",
- * "the container's layout") so the message says what the consequence actually is. */
+ * "the container's layout") so the message states the consequence. */
 int rad_gate_reference_kernels(const Program& p, bool allow, const char* what);
 
 Registry& rad_tools_registry();

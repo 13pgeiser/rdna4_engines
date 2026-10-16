@@ -1,8 +1,8 @@
 #!/bin/sh
-# HOW OFTEN DOES THE DRAFTER ACTUALLY PROPOSE? draft_tokens_total/depth is the number of draft
-# BLOCKS; over decode steps that is the fraction of steps that speculated at all. accept% is
-# conditional on having drafted, so a high accept% with tok/step ~1.2 can only mean most steps
-# never drafted. The server log says the drafter may DECLINE ("prompt lookup fills in").
+# How often the drafter proposes, by context length. draft_tokens_total/depth is the number of
+# draft blocks; divided by decode steps it is the fraction of steps that speculated. accept% is
+# conditional on drafting, so a high accept% with tok/step ~1.2 means most steps never drafted.
+# The drafter may decline (the server log says "prompt lookup fills in").
 P=8112; U="http://127.0.0.1:$P"
 pad() { i=0; W=""; while [ $i -lt "$1" ]; do
   W="$W static int eval_piece_$1_$i(const Board *b, int sq) { return b->squares[sq] * 100 + $i; }"
