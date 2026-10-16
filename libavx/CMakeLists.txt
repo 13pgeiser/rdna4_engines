@@ -41,6 +41,7 @@ set(AVX_KERNEL_SRC
   avx_gemm.cpp
   avx_gemm_tile.cpp
   avx_planes.cpp
+  avx_lora.cpp
   avx_attn.cpp
   avx_qsa.cpp
   avx_moe.cpp

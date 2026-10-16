@@ -133,6 +133,7 @@ static const Tol kTol[] = {
     { "moe_gemm",     "f32",      2e-5 },
     { "moe_gemm",     "bf16",     8e-3 },
     { "moe_gemm",     "*",        3e-2 },
+    { "lora_shrink",  "*",        2e-5 },
     { "attn_",        "bf16",     2e-2 },
     { "attn_",        "f32",      1e-4 },
     { "attn_",        "*",        3e-2 },

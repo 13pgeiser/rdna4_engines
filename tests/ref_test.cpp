@@ -271,6 +271,8 @@ TEST(op_vocabulary) {
         "gated_had_quant_i8",
         "dequant",
         "gemm_nt", "gemm_nt_bias", "gemm_nt_q", "gemm_nt_q_bias", "grid_embed",
+        /* Runtime LoRA's two halves, issued by the core beside a trunk GEMM. */
+        "lora_shrink", "lora_expand",
         "grid_embed_aa",
         "attn_paged", "attn_dense", "kv_store", "rope", "rope_table", "qk_norm_rope", "qsa_block_key",
         /* The rest of the QSA indexer and DFlash2's convolution: not fusions, so a model that
@@ -1680,6 +1682,86 @@ TEST(op_gemm_nt) {
     CHECK_OK(run("gemm_nt", c));
     CHECK_EQ(yb.at(3), 6.0f);
     CHECK_EQ(yb.at(7), 15.0f);
+}
+
+/* RUNTIME LoRA, by hand. Every value is exact in its dtype, so the answers are equalities. The
+ * contract under test is as much WHICH ROWS are touched as what lands in them: a row whose slot is
+ * -1 or S is a base row, its `t` row keeps the sentinel shrink found there and its `y` row keeps
+ * its bits -- a -0 included, which `y + 0` would have turned into +0. */
+TEST(op_lora_shrink) {
+    /* `a` is a COLUMN SLICE: columns 1..4 of a [3, 6] buffer, row stride 6. */
+    T aw(RAD_BF16, {3, 6});
+    aw.f({9, 1, 2, 3, 4, 9,   9, 5, 6, 7, 8, 9,   9, 1, 1, 1, 1, 9});
+    T a_ = aw;                                   /* the slice shares aw's bytes */
+    a_.t.data = (uint16_t*)aw.mem.data() + 1;
+    a_.t.shape[1] = 4;
+    T sl(RAD_I32, {3}); sl.n({1, -1, 0});
+    T la(RAD_BF16, {2, 2, 4});
+    la.f({1, 0, 0, 0,   0, 1, 0, 0,               /* slot 0: j0, j1 */
+          1, 1, 1, 1,   1, -1, 0, 0.5f});         /* slot 1 */
+    T t(RAD_F32, {3, 2}); t.f({99, 99, 99, 99, 99, 99});
+    A a; a.t(a_).tnull().t(sl).t(la).t(t)
+          .i("M", 3).i("K", 4).i("R", 2).i("S", 2).i("group", 0).s("dtype", "bf16");
+    CHECK_OK(run("lora_shrink", a));
+    CHECK_EQ(t.at(0), 10.0f);                    /* 1+2+3+4 */
+    CHECK_EQ(t.at(1), 1.0f);                     /* 1-2+0+4*0.5 */
+    CHECK_EQ(t.at(2), 99.0f);                    /* base row: not written */
+    CHECK_EQ(t.at(3), 99.0f);
+    CHECK_EQ(t.at(4), 1.0f);                     /* slot 0 picks a[2][0], a[2][1] */
+    CHECK_EQ(t.at(5), 1.0f);
+
+    /* An E4M3 activation with an f32 scale every two columns: x = code * its group's scale. */
+    T q(RAD_F8E4M3, {1, 4}); q.f({1, 2, 0.5f, -1});
+    T qs(RAD_F32, {1, 2});   qs.f({2.0f, 0.25f});
+    T sq(RAD_I32, {1});      sq.n({0});
+    T lq(RAD_BF16, {1, 1, 4}); lq.f({1, 1, 1, 1});
+    T tq(RAD_F32, {1, 1});
+    A b; b.t(q).t(qs).t(sq).t(lq).t(tq)
+          .i("M", 1).i("K", 4).i("R", 1).i("S", 1).i("group", 2).s("dtype", "fp8_e4m3");
+    CHECK_OK(run("lora_shrink", b));
+    CHECK_EQ(tq.at(0), 5.875f);                  /* 2 + 4 + 0.125 - 0.25 */
+
+    /* A code with no scale has no value: refused, never read as scale one. */
+    A c; c.t(q).tnull().t(sq).t(lq).t(tq)
+          .i("M", 1).i("K", 4).i("R", 1).i("S", 1).i("group", 0).s("dtype", "fp8_e4m3");
+    CHECK_EQ(run("lora_shrink", c), RAD_E_INVAL);
+    /* A `group` the stream does not state is a caller describing other bytes. */
+    A d; d.t(q).t(qs).t(sq).t(lq).t(tq)
+          .i("M", 1).i("K", 4).i("R", 1).i("S", 1).i("group", 4).s("dtype", "fp8_e4m3");
+    CHECK_EQ(run("lora_shrink", d), RAD_E_SHAPE);
+}
+
+TEST(op_lora_expand) {
+    T t(RAD_F32, {4, 2}); t.f({10, 1,   5, 5,   1, 1,   7, 7});
+    T sl(RAD_I32, {4});   sl.n({1, -1, 0, 2});   /* 2 == S: a base row like -1 */
+    T lb(RAD_BF16, {2, 3, 2});
+    lb.f({1, 0,   0, 1,   1, 1,                   /* slot 0: n0, n1, n2 */
+          2, 0,   0, 0.5f, 1, -1});               /* slot 1 */
+    T sc(RAD_F32, {2, 3}); sc.f({1, 1, 1,   0.5f, 2, 1});
+    /* `y` is a COLUMN SLICE too: columns 0..2 of a [4, 5] buffer. */
+    T yw(RAD_BF16, {4, 5});
+    yw.f({1, 1, 1, 9, 9,   -0.0f, 3, 7, 9, 9,   0, 0, 0, 9, 9,   -0.0f, -0.0f, 5, 9, 9});
+    T y = yw;
+    y.t.shape[1] = 3;
+    A a; a.t(t).t(sl).t(lb).t(sc).t(y).i("M", 4).i("N", 3).i("R", 2).i("S", 2).s("dtype", "bf16");
+    CHECK_OK(run("lora_expand", a));
+    const uint16_t* yr = (const uint16_t*)yw.mem.data();
+    CHECK_EQ(yw.at(0), 11.0f);                   /* 1 + 0.5 * (10*2 + 1*0) */
+    CHECK_EQ(yw.at(1), 2.0f);                    /* 1 + 2 * (1*0.5) */
+    CHECK_EQ(yw.at(2), 10.0f);                   /* 1 + 1 * (10 - 1) */
+    CHECK_EQ((long long)yr[5], 0x8000LL);        /* base row: -0 keeps its sign bit */
+    CHECK_EQ(yw.at(6), 3.0f);
+    CHECK_EQ(yw.at(7), 7.0f);
+    CHECK_EQ(yw.at(10), 1.0f);                   /* slot 0 over t[2] = (1, 1) */
+    CHECK_EQ(yw.at(11), 1.0f);
+    CHECK_EQ(yw.at(12), 2.0f);
+    CHECK_EQ((long long)yr[15], 0x8000LL);       /* slot S: a base row */
+    CHECK_EQ((long long)yr[16], 0x8000LL);
+    CHECK_EQ(yw.at(17), 5.0f);
+    for (int r = 0; r < 4; ++r) {                /* the slice's neighbours are not touched */
+        CHECK_EQ(yw.at(r * 5 + 3), 9.0f);
+        CHECK_EQ(yw.at(r * 5 + 4), 9.0f);
+    }
 }
 
 TEST(op_gemm_nt_q) {
@@ -5587,6 +5669,8 @@ std::vector<Geo> geometries() {
         G("gemm_nt_q", "M", 3, a.i("M", R).i("N", 20).i("K", 256).i("group", 128).s("dtype", "fp8a8")),
         G("gemm_nt_q_bias", "M", 3, a.i("M", R).i("N", 20).i("K", 256).i("group", 128)
                                     .s("dtype", "fp8a8")),
+        G("lora_shrink", "M", 3, a.i("M", R).i("K", 40).i("R", 8).i("S", 2).s("dtype", "f32")),
+        G("lora_expand", "M", 3, a.i("M", R).i("N", 20).i("R", 8).i("S", 2).s("dtype", "f32")),
         G("attn_paged", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2).i("block_size", 4)
                                     .i("causal", 1).i("window", 0).s("q_dtype", "f32")
                                     .s("kv_dtype", "f32").i("n_head", 4).i("ctx", 9)),

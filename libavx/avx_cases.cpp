@@ -254,6 +254,22 @@ std::vector<Case> build_cases() {
                 2.0 * M * 192 * 256);
     add("gemm_nt_q_gated", { HI("M", 7), HI("N", 512), HI("K", 256), HI("group", 128),
                              HS("dtype", "fp8a8"), HS("act", "silu") }, 0, 2.0 * 7 * 512 * 256);
+    /* Runtime LoRA. libref's description draws `slot` in [0, S], so S itself -- a base row --
+     * comes up in every case of more than one row and the comparison covers rows neither op may
+     * touch (a single row draws an adapter, or the case would compare nothing). M = 1 takes the
+     * shrink's team-over-columns arm and 9 and 65 its team-over-rows one; K = 1000
+     * leaves a partial scale group and a vector tail at every level; R = 48 is not a power of two.
+     * The dtype is `a`'s for shrink -- the coded ones with their scale stream -- and `y`'s for
+     * expand. */
+    for (int M : { 1, 9, 65 }) {
+        for (const char* dt : { "f32", "bf16", "f16", "fp8_e4m3", "i8" })
+            for (int K : { 256, 1000 })
+                add("lora_shrink", { HI("M", M), HI("K", K), HI("R", 48), HI("S", 4),
+                                     HI("group", 128), HS("dtype", dt) }, 0, 2.0 * M * 48 * K);
+        for (const char* dt : { "f32", "bf16", "f16" })
+            add("lora_expand", { HI("M", M), HI("N", 645), HI("R", 48), HI("S", 4),
+                                 HS("dtype", dt) }, 0, 2.0 * M * 645 * 48);
+    }
     for (const char* dt : { "f32", "bf16" }) {
         add("embed_lookup",   { HI("M", 9), HI("n_embd", 128), HI("n_vocab", 64), HS("dtype", dt),
                                 HI("vocab_offset", 0), HF("mult", 1) });

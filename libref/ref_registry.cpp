@@ -285,6 +285,22 @@ static const RadOperandSpec oGemmQ[]     = { OPD("a"), OPD_O("a_scale"), WGT("b"
 static const RadOperandSpec oGemmQBias[] = { OPD("a"), OPD("a_scale"), WGT("b"), WGT("b_scale"),
                                              WGT("bias"), OUT("y") };
 
+/* RUNTIME LoRA, the two halves of y += scale * (B . (A . x)) at a trunk GEMM, per row: `slot` names
+ * each row's adapter and a row outside [0, S) is a base row neither op touches. `a`/`a_scale` are
+ * the GEMM's own first two operands, read as gemm_nt_q reads them, and `y` is its output. The pools
+ * (`lora_a` [S, R, K], `lora_b` [S, N, R], `scale` [S, N]) are ordinary inputs and not weights: the
+ * engine owns them as program buffers and copies an adapter into a slot between steps, so there is
+ * no declared weight for an issue to name. `group` is OPTIONAL and 0 means no scale stream; `dtype`
+ * is the tensor dtype name (rad_dtype_name) of `a` for shrink and of `y` for expand. */
+static const RadParamSpec pLoraShrink[] = { P_INT("M"), P_INT("K"), P_INT("R"), P_INT("S"),
+                                            P_INTO("group"), P_STR("dtype") };
+static const RadOperandSpec oLoraShrink[] = { OPD("a"), OPD_O("a_scale"), OPD("slot"),
+                                              OPD("lora_a"), OUT("t") };
+static const RadParamSpec pLoraExpand[] = { P_INT("M"), P_INT("N"), P_INT("R"), P_INT("S"),
+                                            P_STR("dtype") };
+static const RadOperandSpec oLoraExpand[] = { OPD("t"), OPD("slot"), OPD("lora_b"), OPD("scale"),
+                                              INOUT("y") };
+
 /* ---- attention ---------------------------------------------------------------------------- */
 static const RadParamSpec pAttnPaged[] = {
     P_INT("q_len"), P_INT("head_dim"), P_INT("gqa"), P_INTD("block_size"), P_INT("causal"),
@@ -928,6 +944,16 @@ static const RadOpSchema kSchemas[] = {
   "scaled once per group, which is what an int8 or fp8 WMMA kernel does. Scale streams are "
   "[rows, groups] or [rows]; an mxfp4 weight's u8 scale stream is read as OCP e8m0." },
 { "gemm_nt_q_bias", ARR(pGemmQBias), ARR(oGemmQBias), "gemm_nt_q with a per-column bias." },
+{ "lora_shrink", ARR(pLoraShrink), ARR(oLoraShrink),
+  "t[m, j] = sum_k x(m, k) * lora_a[s, j, k] for each row m whose s = slot[m] is in [0, S), f32 "
+  "accumulate, k ascending; x(m, k) is the value gemm_nt_q uses for that element of `a` (a code "
+  "times its group's scale from `a_scale`, a float as it is). A row outside [0, S) is a base row "
+  "and its `t` row is NOT WRITTEN. A row's bytes do not depend on M or on any other row." },
+{ "lora_expand", ARR(pLoraExpand), ARR(oLoraExpand),
+  "y[m, n] = y[m, n] + scale[s, n] * sum_j t[m, j] * lora_b[s, n, j] for each row m whose s = "
+  "slot[m] is in [0, S), f32 accumulate, j ascending, one rounding to y's dtype. A base row's `y` "
+  "is neither read nor written, so it stays bit for bit what the GEMM wrote (not y + 0: that "
+  "turns -0 into +0)." },
 
 { "attn_paged", ARR(pAttnPaged), ARR(oAttnPaged),
   "Paged attention over kv_cache[num_blocks, kv_heads, block_size, 2*head_dim] (K then V per "
@@ -1487,6 +1513,12 @@ ROWL("ref_gemm_nt_q", "gemm_nt_q", "gemm", "C = A B^T with group-scaled quantise
      ref_check_gemm_q, ref_gemm_nt_q, ref::ref_layout_gemm_q),
 SIMPLE("ref_gemm_nt_q_bias", "gemm_nt_q_bias", "gemm", "quantised C = A B^T + bias",
        "i8 / fp8 / float A; w4, w2, mxfp4, i8 or float B; f32 accumulate", ref_gemm_nt_q_bias),
+SIMPLE("ref_lora_shrink", "lora_shrink", "gemm", "t = x A[slot]^T per row, base rows untouched",
+       "bf16 / f16 / f32 a, or fp8_e4m3 / fp8_e5m2 / i8 a with its f32 scale stream; bf16 lora_a; "
+       "i32 slot; f32 t", ref_lora_shrink),
+SIMPLE("ref_lora_expand", "lora_expand", "gemm",
+       "y += scale * (t B[slot]^T) per row, base rows untouched",
+       "f32 t and scale; bf16 lora_b; i32 slot; bf16 / f16 / f32 y", ref_lora_expand),
 
 ROW("ref_attn_paged", "attn_paged", "attn",
     "paged causal / sliding-window attention, any query length",

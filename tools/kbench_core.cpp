@@ -71,6 +71,10 @@ const std::vector<TolRow> g_tol = {
     /* A dot product per candidate against the bf16 head: a GEMM's error. */
     { "logit_rerank", "*",        8e-3 },
     { "moe_gemm",     "*",        3e-2 },
+    /* Runtime LoRA's shrink is a K-long reduction into an f32 `t` whatever `a` is -- the codes are
+     * decoded the same way on both sides, so only the summation order differs, and that is what
+     * gemm_nt's f32 row allows. Expand's R-long sum lands in `y` and takes the dtype rows below. */
+    { "lora_shrink",  "*",        2e-5 },
     /* Attention: a softmax over a long context plus a second reduction. */
     { "attn_",        "bf16",     2e-2 },
     { "attn_",        "f32",      1e-4 },

@@ -1009,6 +1009,45 @@ int ref_gemm_nt_q_bias_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
     return gemm_q_shape(p, n_p, operand, true, out);
 }
 
+/* RUNTIME LoRA. `slot` is drawn in [0, S] -- S ITSELF IS A BASE ROW, one past the pool -- so a cold
+ * draw exercises the rows neither op may touch as well as the adapter rows; a draw never yields
+ * -1, which is the other spelling of a base row, so that one is a hand case (tests/lora_test.cpp,
+ * ref_test). A single row is drawn in [0, S): a one-row call whose row drew S would write nothing,
+ * and a comparison of nothing proves nothing (rad-avx-check refuses it as vacuous). The scale stream exists only beside a coded activation: a bf16, f16 or f32 `a` is
+ * read as it stands, the way gemm_nt_q's fp8a16 form reads it, and an fp8 or i8 one without its
+ * scale is refused by the launch. `group` defaults to the 128 every block-scaled checkpoint and
+ * quantiser in this project uses when the geometry does not state one. */
+int ref_lora_shrink_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), K = gi(p, n_p, "K", 0);
+    const int64_t R = gi(p, n_p, "R", 0), S = gi(p, n_p, "S", 0);
+    int64_t group = gi(p, n_p, "group", 0);
+    const bool coded = D == (uint32_t)RAD_F8E4M3 || D == (uint32_t)RAD_F8E5M2 ||
+                       D == (uint32_t)RAD_I8;
+    if (coded && group <= 0) group = 128;
+    Opd o;
+    o.t(D, { M, K });                                           /* a */
+    if (coded) o.t((uint32_t)RAD_F32, { M, (K + group - 1) / group });   /* a_scale */
+    else o.skip();                                              /* a_scale */
+    o.t_idx({ M }, M > 1 ? S + 1 : S, -1, 0);                   /* slot, S = base */
+    o.t((uint32_t)RAD_BF16, { S, R, K });                       /* lora_a */
+    o.t((uint32_t)RAD_F32, { M, R });                           /* t */
+    return o.finish("lora_shrink", operand, out);
+}
+
+int ref_lora_expand_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), N = gi(p, n_p, "N", 0);
+    const int64_t R = gi(p, n_p, "R", 0), S = gi(p, n_p, "S", 0);
+    Opd o;
+    o.t((uint32_t)RAD_F32, { M, R });                           /* t */
+    o.t_idx({ M }, M > 1 ? S + 1 : S, -1, 0);                   /* slot, S = base */
+    o.t((uint32_t)RAD_BF16, { S, N, R });                       /* lora_b */
+    o.t((uint32_t)RAD_F32, { S, N });                           /* scale */
+    o.t(D, { M, N });                                           /* y */
+    return o.finish("lora_expand", operand, out);
+}
+
 /* ================================================================== attention
  *
  * The paged layout (ref_ops.h):
