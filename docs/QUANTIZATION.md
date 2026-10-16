@@ -368,10 +368,12 @@ Source of truth: [`quant-formats/qt-register.txt`](quant-formats/qt-register.txt
 | 52 | MQ4G256V2L | **MQ4 V2 + per-tensor Lloyd codebook** — 136 B group + `lloyd_levels` F32[16] sidecar; product tiers `mq4l-xt` / `mq4l` / `mq4l-pro` |
 | 53 | MQ4G128V2 | Row-local MQ4 V2, per-128 groups of 68 B (4.25 bpw) — passthrough; Qwen4 routed-expert `down_proj` |
 | 54 | QwenI64 | **Reserved in the register; not a quantized weight and no `QuantType` variant.** Raw signed-I64 metadata record (the three PLE hash arrays: multipliers, vocab sizes, prefix offsets) written by the Qwen4 producer |
-| 131 | MQ3I4G128R256 | MQ3-I4 gate/up — planar `[M·K·3/8 B codes][M·K/128 f16 scales]`, R256 FWHT (seeds 42/1042); **typed-qwen4 expert-slab only, no GPU kernels yet (loader refuses)** |
-| 132 | MQ3I4G128R128 | MQ3-I4 down — same planar W3 layout, R128 FWHT (seeds 43/1043); **typed-qwen4 expert-slab only, no GPU kernels yet (loader refuses)** |
-| 133 | MQ2I4G128R256 | MQ2-I4 gate/up — planar `[M·K/4 B codes][M·K/128 f16 scales]`, R256 FWHT; **typed-qwen4 expert-slab only, no GPU kernels yet (loader refuses)** |
-| 134 | MQ2I4G128R128 | MQ2-I4 down — same planar W2 layout, R128 FWHT; **typed-qwen4 expert-slab only, no GPU kernels yet (loader refuses)** |
+| 131 | MQ3I4G128R256 | MQ3-I4 gate/up — planar `[M·K·3/8 B codes][M·K/128 f16 scales]`, R256 FWHT (seeds 42/1042); **typed-qwen4 expert-slab only, gfx1151/gfx1201** |
+| 132 | MQ3I4G128R128 | MQ3-I4 down — same planar W3 layout, R128 FWHT (seeds 43/1043); **typed-qwen4 expert-slab only, gfx1151/gfx1201** |
+| 133 | MQ2I4G128R256 | MQ2-I4 gate/up — planar `[M·K/4 B codes][M·K/128 f16 scales]`, R256 FWHT; **typed-qwen4 expert-slab only, serving refused on every arch** |
+| 134 | MQ2I4G128R128 | MQ2-I4 down — same planar W2 layout, R128 FWHT; **typed-qwen4 expert-slab only, serving refused on every arch** |
+| 135 | E8PI4G128R256 | E8P-I4 gate/up — `[M·K/8 LE u16 words][M·K/128 f16 scales]`, R256 FWHT; **typed-qwen4 expert-slab only, gfx1100/gfx1201** |
+| 136 | E8PI4G128R128 | E8P-I4 down — same planar E8P layout, R128 FWHT; **typed-qwen4 expert-slab only, gfx1100/gfx1201** |
 
 **Never-reuse reserved wire IDs:** 23 and 25–27 (deliberately unassigned). qt 54 is
 held in the register with disposition `reserved` for the Qwen4 I64 metadata
@@ -385,11 +387,11 @@ IDs **131–134** (MQ3-I4 / MQ2-I4) are fresh allocations above qt130 (compact
 Hessian records, not a `QuantType`). They are planar (codes plane, then f16
 scale plane; codec in `crates/hipfire-runtime/src/mq_i4.rs`), valid only as
 per-expert entries of a Qwen4 artifact declaring `qwen4.expert_slabs` v1
-(`crates/hipfire-arch-qwen4/src/expert_slabs.rs`), and have no GPU kernels yet.
+(`crates/hipfire-arch-qwen4/src/expert_slabs.rs`).
 The CPU byte/arithmetic oracles in `hipfire_runtime::mq_i4_reference` define
 signed A4 unpacking, ascending-K128 fused IU4 folds, the frozen wave32 F4
 decode tree and original-slot scatter. Their module documentation is the
-rounding/order contract for future PeaceMaker kernels, not GPU admission.
+rounding/order contract for the corresponding PeaceMaker kernels.
 
 **Producing the artifact.** `qwen4_i4_slabs` (`crates/hipfire-quantize/src/bin/qwen4_i4_slabs.rs`, writer
 `hipfire_quantize::i4_slabs::write_i4_expert_slabs`) packs the pinned MQ4-XTS Flash-Next HFQ plus R1
@@ -407,14 +409,31 @@ pack. `--receipt` writes the JSON receipt. An existing `--out` is never overwrit
 The CPU loader builds an O(index entries) `expert_slab_table::ExpertSlabTable`
 from the actual spans: 48 × 512 gate/up-down pairs first, canonical names and
 order, frozen shapes/qtype pairs/group sizes/byte sizes, contiguous aligned
-slabs, no trunk aggregates or stray I4 entries. A valid table receives the
-typed `ExpertSlabKernelsUnavailable` refusal (including W3/W2/MQ4 counts)
-before config/manifest admission or model GPU allocation; pointer-addressed
-MQ4 slabs are also unavailable. Missing or malformed v1 metadata fails closed.
+slabs, no trunk aggregates or stray I4 entries. The sealed slab route admits
+MQ4 (codec 0) with E8P (codec 3) on exact gfx1100, MQ4 with W3 (codec 1) on
+exact gfx1151, and MQ4 with W3 or E8P on exact gfx1201. Each layer has at most
+one cold codec; W3 and E8P cannot share its cold bucket. W2 is refused
+everywhere, as are W3 on gfx1100, E8P on gfx1151 and all other slab
+architectures. Missing or malformed v1 metadata fails closed.
 `validate_expert_slab_scales` separately checks W3/W2 payloads through the shared
 codec, including finite non-negative f16 scales, rejection of -0, and canonical
 midpoint codes for zero-scale groups; it is not run on the default load path.
 Legacy aggregate artifacts retain their existing admission checks and ordering.
+
+The two execution buckets remain cold codec then MQ4. The planner's u8
+table is a cold-membership flag (W3/E8P = 1, MQ4 = 0), not a codec ID;
+the real codec IDs remain available for the prefill tile masks. Kernel
+entries are selected by architecture and the layer's cold codec. gfx1100
+uses its own K1/K2/K3 objects and tile-mask image, with AR only (MTP off).
+Existing gfx1201 W3/MQ4 kernel bytes, the gfx1201-only EP long-prefill staging
+default, and VMM/MTP refusals are unchanged. gfx1151 (Strix Halo) keeps its
+beta MQ4/W3 route (W3 K2 NT4 launcher, hipcc tile mask, E8P refused). Its slab
+kernel preload is unconditional (planner, mask and all four K1 handles, even
+for an MQ4-only layer), the one exception to the no-cold-kernel-preload rule
+that gfx1100 and gfx1201 keep; it is not a W3 bucket launch.
+
+The gfx1100 E8P K2 wiring is CPU-prepared; promotion remains gated on its
+XTX K2 G1. This admission description is not a GPU qualification claim.
 
 ### PARO4G128 probe payload
 

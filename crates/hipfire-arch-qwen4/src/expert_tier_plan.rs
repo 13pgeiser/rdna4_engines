@@ -78,17 +78,17 @@ pub enum ExpertTierError {
     SlabCount { got: usize },
     /// An aggregate (legacy) artifact projection is malformed
     /// ([`crate::expert_slab_aggregate`]).
-    Aggregate {
-        layer: usize,
-        reason: &'static str,
-    },
+    Aggregate { layer: usize, reason: &'static str },
 }
 
 impl fmt::Display for ExpertTierError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RankIdOutOfRange { id } => {
-                write!(f, "rank id {id} is out of range (model ids are < {TOTAL_EXPERTS})")
+                write!(
+                    f,
+                    "rank id {id} is out of range (model ids are < {TOTAL_EXPERTS})"
+                )
             }
             Self::RankDuplicate { id } => write!(f, "rank id {id} appears more than once"),
             Self::SourceSpan { layer, expert } => write!(
@@ -97,7 +97,10 @@ impl fmt::Display for ExpertTierError {
             ),
             Self::Overflow => write!(f, "expert tier plan arithmetic overflowed u64"),
             Self::UnsupportedFormat { format, arch } => {
-                write!(f, "expert format {format:?} has no kernels on arch {arch:?}")
+                write!(
+                    f,
+                    "expert format {format:?} has no kernels on arch {arch:?}"
+                )
             }
             Self::SlabCount { got } => write!(
                 f,
@@ -260,15 +263,16 @@ impl ExpertTierPlan {
         &self.host_windows
     }
 
-    /// Refuse expert formats that have no kernel on `arch`: W2 everywhere,
-    /// W3 anywhere but `gfx1201`; MQ4 is always accepted. Route/arch admission
-    /// of the tier route as a whole belongs to C2 admission, not here.
+    /// Refuse expert formats that have no kernel on `arch`: W2 and E8P-I4
+    /// everywhere, W3 anywhere but `gfx1201`; MQ4 is always accepted. Route/arch
+    /// admission of the tier route as a whole belongs to C2 admission, not here.
     pub fn check_executable(&self, arch: &str) -> Result<(), ExpertTierError> {
         for entry in &self.entries {
             let ok = match entry.format {
                 ExpertFormat::Mq4Xts => true,
                 ExpertFormat::Mq3I4 => arch == "gfx1201",
                 ExpertFormat::Mq2I4 => false,
+                ExpertFormat::E8pI4 => false,
             };
             if !ok {
                 return Err(ExpertTierError::UnsupportedFormat {
@@ -405,7 +409,11 @@ pub fn plan_expert_tiers_from_slabs(
         }
         let gu_pad = align_up(gu.len as u64).ok_or(ExpertTierError::Overflow)?;
         let dn_pad = align_up(dn.len as u64).ok_or(ExpertTierError::Overflow)?;
-        padded.push(gu_pad.checked_add(dn_pad).ok_or(ExpertTierError::Overflow)?);
+        padded.push(
+            gu_pad
+                .checked_add(dn_pad)
+                .ok_or(ExpertTierError::Overflow)?,
+        );
     }
 
     // 2. Validate rank.
@@ -581,7 +589,9 @@ mod tests {
         let all_host = plan_expert_tiers_from_slabs(&uniform(), &[], 0).unwrap();
         assert_eq!(expert_tier_stage_bytes(&all_host), 2 * (512 * PADDED + pad));
         // Experts 0..256 of every layer resident: each buffer holds 256 host experts.
-        let rank: Vec<u32> = (0..48u32).flat_map(|layer| (0..256).map(move |e| layer * 512 + e)).collect();
+        let rank: Vec<u32> = (0..48u32)
+            .flat_map(|layer| (0..256).map(move |e| layer * 512 + e))
+            .collect();
         let half = plan_expert_tiers_from_slabs(&uniform(), &rank, u64::MAX).unwrap();
         assert_eq!(expert_tier_stage_bytes(&half), 2 * (256 * PADDED + pad));
         // Layer 1 additionally all resident: layer 3 still sizes the odd buffer.
@@ -708,7 +718,9 @@ mod tests {
         slabs.push(slabs[0]);
         assert_eq!(
             plan_expert_tiers_from_slabs(&slabs, &[], 0),
-            Err(ExpertTierError::SlabCount { got: TOTAL_EXPERTS + 1 })
+            Err(ExpertTierError::SlabCount {
+                got: TOTAL_EXPERTS + 1
+            })
         );
         slabs.pop();
 
@@ -716,21 +728,30 @@ mod tests {
         empty[513].down.len = 0;
         assert_eq!(
             plan_expert_tiers_from_slabs(&empty, &[], 0),
-            Err(ExpertTierError::SourceSpan { layer: 1, expert: 1 })
+            Err(ExpertTierError::SourceSpan {
+                layer: 1,
+                expert: 1
+            })
         );
 
         let mut overlap = slabs.clone();
         overlap[7].down.offset = overlap[7].gate_up.offset + 1;
         assert_eq!(
             plan_expert_tiers_from_slabs(&overlap, &[], 0),
-            Err(ExpertTierError::SourceSpan { layer: 0, expert: 7 })
+            Err(ExpertTierError::SourceSpan {
+                layer: 0,
+                expert: 7
+            })
         );
 
         let mut wrap = slabs.clone();
         wrap[3].gate_up.offset = usize::MAX - 5;
         assert_eq!(
             plan_expert_tiers_from_slabs(&wrap, &[], 0),
-            Err(ExpertTierError::SourceSpan { layer: 0, expert: 3 })
+            Err(ExpertTierError::SourceSpan {
+                layer: 0,
+                expert: 3
+            })
         );
     }
 
@@ -811,12 +832,20 @@ mod tests {
         assert_ne!(d0, sha.logical_digest());
         assert_ne!(
             sha.logical_digest(),
-            base.clone().with_artifact_sha256([8u8; 32]).logical_digest()
+            base.clone()
+                .with_artifact_sha256([8u8; 32])
+                .logical_digest()
         );
 
         let win = base
             .clone()
-            .with_host_window("mtp", &[ExpertSlabSpan { offset: 1 << 40, len: 100 }])
+            .with_host_window(
+                "mtp",
+                &[ExpertSlabSpan {
+                    offset: 1 << 40,
+                    len: 100,
+                }],
+            )
             .unwrap();
         assert_ne!(d0, win.logical_digest());
     }
@@ -832,8 +861,14 @@ mod tests {
         for (i, slab) in slabs.iter().enumerate() {
             let e = plan.entry(i / 512, i % 512).unwrap();
             assert_eq!(e.format, slab.format);
-            assert_eq!((e.gate_up_len, e.down_len), (slab.gate_up.len as u64, slab.down.len as u64));
-            assert_eq!(plan.source(i / 512, i % 512), Some((slab.gate_up, slab.down)));
+            assert_eq!(
+                (e.gate_up_len, e.down_len),
+                (slab.gate_up.len as u64, slab.down.len as u64)
+            );
+            assert_eq!(
+                plan.source(i / 512, i % 512),
+                Some((slab.gate_up, slab.down))
+            );
         }
         for arch in ["gfx1201", "gfx1100", "gfx1151"] {
             assert!(matches!(
@@ -928,8 +963,14 @@ mod tests {
         let host_before = base.owner_bytes(Placement::HostMapped);
         let host_end = host_before - tail();
         let spans = [
-            ExpertSlabSpan { offset: 5_000_000_000, len: 1000 },
-            ExpertSlabSpan { offset: 6_000_000_000, len: 513 },
+            ExpertSlabSpan {
+                offset: 5_000_000_000,
+                len: 1000,
+            },
+            ExpertSlabSpan {
+                offset: 6_000_000_000,
+                len: 513,
+            },
         ];
         let plan = base.clone().with_host_window("mtp", &spans).unwrap();
         let w = &plan.host_windows()[0];
@@ -946,8 +987,9 @@ mod tests {
         );
 
         // Window into an otherwise empty host tier allocates it, tail once.
-        let all_dev = plan_expert_tiers_from_slabs(&uniform(), &(0..24_576).collect::<Vec<_>>(), u64::MAX)
-            .unwrap();
+        let all_dev =
+            plan_expert_tiers_from_slabs(&uniform(), &(0..24_576).collect::<Vec<_>>(), u64::MAX)
+                .unwrap();
         assert_eq!(all_dev.owner_bytes(Placement::HostMapped), 0);
         let w = all_dev.with_host_window("mtp", &spans[..1]).unwrap();
         assert_eq!(w.owner_bytes(Placement::HostMapped), 1024 + tail());
@@ -959,7 +1001,13 @@ mod tests {
             Err(ExpertTierError::Overflow)
         );
         assert_eq!(
-            base.with_host_window("x", &[ExpertSlabSpan { offset: usize::MAX, len: 2 }]),
+            base.with_host_window(
+                "x",
+                &[ExpertSlabSpan {
+                    offset: usize::MAX,
+                    len: 2
+                }]
+            ),
             Err(ExpertTierError::Overflow)
         );
     }
@@ -968,10 +1016,7 @@ mod tests {
     fn rank_from_counts_breaks_ties_by_id_and_filters() {
         let counts = [5u64, 9, 5, 0, 9, 5];
         assert_eq!(rank_from_counts(&counts, |_| true), vec![1, 4, 0, 2, 5, 3]);
-        assert_eq!(
-            rank_from_counts(&counts, |id| id % 2 == 0),
-            vec![4, 0, 2]
-        );
+        assert_eq!(rank_from_counts(&counts, |id| id % 2 == 0), vec![4, 0, 2]);
         assert!(rank_from_counts(&counts, |_| false).is_empty());
         assert!(rank_from_counts(&[], |_| true).is_empty());
     }

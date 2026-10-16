@@ -63,6 +63,10 @@ type Wg<'b, T> = Workgroup<'b, T, Builder>;
 #[path = "qwen4_moe_sym_w3.rs"]
 pub mod w3;
 
+/// E8P-I4 NT1 entries (own generator; existing MQ4/W3 modules are unchanged).
+#[path = "qwen4_moe_sym_e8p.rs"]
+pub mod e8p;
+
 /// A `K`-derived trip counter: workgroup-uniform.
 fn trips_cmp<T: Target>(wg: &mut Wg<T>, cmp: &str, trips: u8) -> Result<WgUniform<Scc>, String> {
     wg.scmp_wg_uniform(Instruction::new(
@@ -145,6 +149,7 @@ impl std::str::FromStr for Kind {
 pub enum WeightCodec {
     Mq4Sym,
     Mq3I4,
+    E8pI4,
 }
 
 /// One entry: arch, GEMM kind, expert-run tile width `nt` (16-slot tiles
@@ -188,8 +193,12 @@ pub fn module_specs(arch: Arch) -> Vec<Spec> {
 /// [`module_specs`] for one weight codec. The MQ3-I4 module (gfx1151, gfx1201) holds the
 /// NT1 gate/up and down entries; the MQ4 module is the shipped one.
 pub fn module_specs_codec(arch: Arch, codec: WeightCodec) -> Vec<Spec> {
-    if codec == WeightCodec::Mq3I4 {
-        return if matches!(arch, Arch::Gfx1151 | Arch::Gfx1201) {
+    if matches!(codec, WeightCodec::Mq3I4 | WeightCodec::E8pI4) {
+        let admitted = match codec {
+            WeightCodec::Mq3I4 => matches!(arch, Arch::Gfx1151 | Arch::Gfx1201),
+            _ => arch == Arch::Gfx1201,
+        };
+        return if admitted {
             Kind::ALL
                 .into_iter()
                 .map(|kind| Spec {
@@ -227,10 +236,10 @@ pub fn module_specs_codec(arch: Arch, codec: WeightCodec) -> Vec<Spec> {
 
 impl Spec {
     pub fn symbol(self) -> String {
-        let infix = if self.codec == WeightCodec::Mq3I4 {
-            "_w3"
-        } else {
-            ""
+        let infix = match self.codec {
+            WeightCodec::Mq4Sym => "",
+            WeightCodec::Mq3I4 => "_w3",
+            WeightCodec::E8pI4 => "_e8p",
         };
         let base = match self.kind {
             Kind::GateUp => format!(
@@ -257,10 +266,10 @@ impl Spec {
         } else {
             format!("{}_nt{}r{}", self.kind.tag(), self.nt, self.rr)
         };
-        if self.codec == WeightCodec::Mq3I4 {
-            format!("{tag}_w3")
-        } else {
-            tag
+        match self.codec {
+            WeightCodec::Mq4Sym => tag,
+            WeightCodec::Mq3I4 => format!("{tag}_w3"),
+            WeightCodec::E8pI4 => format!("{tag}_e8p"),
         }
     }
     /// The committed MQ4 module (`WeightCodec::Mq4Sym`).
@@ -271,6 +280,7 @@ impl Spec {
         match codec {
             WeightCodec::Mq4Sym => format!("qwen4_moe_iu4_sym_pm_{}", arch.name()),
             WeightCodec::Mq3I4 => format!("qwen4_moe_iu4_sym_w3_pm_{}", arch.name()),
+            WeightCodec::E8pI4 => format!("qwen4_moe_iu4_sym_e8p_pm_{}", arch.name()),
         }
     }
     pub fn validate(self) -> Result<(), String> {
@@ -300,6 +310,13 @@ impl Spec {
         {
             return Err("qwen4_moe_sym: the MQ3-I4 codec is built for the gfx1151 and gfx1201 NT1 entries only".into());
         }
+        if self.codec == WeightCodec::E8pI4
+            && !(self.arch == Arch::Gfx1201 && self.nt == 1 && self.rr == 1)
+        {
+            return Err(
+                "qwen4_moe_sym: the E8P-I4 codec is built for the gfx1201 NT1 entries only".into(),
+            );
+        }
         Ok(())
     }
     /// Waves per CTA: the 16-slot gate/up pairs gate and up rows in one wave
@@ -316,7 +333,9 @@ impl Spec {
     }
     /// LDS bytes: the expert-run gate/up hands RNE(gate) rows to the up waves.
     pub fn lds_bytes(self) -> u32 {
-        if self.kind == Kind::GateUp && self.nt > 1 {
+        if self.codec == WeightCodec::E8pI4 {
+            1536
+        } else if self.kind == Kind::GateUp && self.nt > 1 {
             u32::from(self.nt) * NT_GATE_BYTES
         } else {
             0
@@ -450,8 +469,10 @@ impl Gen {
     fn label(&self, name: &str) -> String {
         let entry = match (self.spec.codec, self.acc) {
             (WeightCodec::Mq4Sym, _) => "",
-            (_, false) => "_w3",
-            (_, true) => "_w3acc",
+            (WeightCodec::Mq3I4, false) => "_w3",
+            (WeightCodec::Mq3I4, true) => "_w3acc",
+            (WeightCodec::E8pI4, false) => "_e8p",
+            (WeightCodec::E8pI4, true) => "_e8pacc",
         };
         format!(".Lq4s_{}{entry}_{name}", self.spec.kind.tag())
     }
@@ -1239,6 +1260,9 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     if spec.codec == WeightCodec::Mq3I4 {
         return w3::emit(spec);
     }
+    if spec.codec == WeightCodec::E8pI4 {
+        return e8p::emit(spec);
+    }
     if spec.nt > 1 {
         return nt::emit(spec);
     }
@@ -1298,6 +1322,11 @@ pub fn emit_module_codec(
         // The qualification entry follows the shipped one in the module.
         for spec in module_specs_codec(arch, codec) {
             emitted.push(w3::emit_acc(spec)?);
+        }
+    }
+    if codec == WeightCodec::E8pI4 {
+        for spec in module_specs_codec(arch, codec) {
+            emitted.push(e8p::emit_acc(spec)?);
         }
     }
     let (text, proof) = super::iu4_gemm::module(&emitted, &Spec::module_codec(arch, codec))?;

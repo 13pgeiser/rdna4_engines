@@ -74,6 +74,8 @@ pub struct ExpertSlabCounts {
     pub w3: usize,
     /// `(133, 134)` experts.
     pub w2: usize,
+    /// `(135, 136)` E8P-I4 experts.
+    pub e8p: usize,
     /// `(44, 53)` copied symmetric MQ4-XTS experts.
     pub mq4: usize,
 }
@@ -83,6 +85,7 @@ impl ExpertSlabCounts {
         match format {
             ExpertFormat::Mq3I4 => self.w3 += 1,
             ExpertFormat::Mq2I4 => self.w2 += 1,
+            ExpertFormat::E8pI4 => self.e8p += 1,
             ExpertFormat::Mq4Xts => self.mq4 += 1,
         }
     }
@@ -181,7 +184,10 @@ pub enum ExpertSlabTableError {
     },
     /// The entry expected at `index` is absent (a later entry, or the end of
     /// the index, was found instead).
-    MissingEntry { index: usize, expected: ExpertEntryId },
+    MissingEntry {
+        index: usize,
+        expected: ExpertEntryId,
+    },
     /// The entry at `index` repeats an entry that already occurred.
     DuplicateEntry { index: usize, found: ExpertEntryId },
     /// The entry at `index` is present but out of canonical order (for
@@ -458,12 +464,13 @@ fn check_shape(entry: ExpertEntryId, info: &HfqTensorInfo) -> Result<(), ExpertS
 }
 
 /// Per-format projection sizes: `[gate_up, down]` for `Mq3I4`, `Mq2I4`,
-/// `Mq4Xts`.
-fn format_sizes() -> [[usize; 2]; 3] {
+/// `Mq4Xts`, `E8pI4`.
+fn format_sizes() -> [[usize; 2]; 4] {
     [
         ExpertFormat::Mq3I4,
         ExpertFormat::Mq2I4,
         ExpertFormat::Mq4Xts,
+        ExpertFormat::E8pI4,
     ]
     .map(|f| [f.gate_up_bytes(), f.down_bytes()])
 }
@@ -473,6 +480,7 @@ fn format_slot(format: ExpertFormat) -> usize {
         ExpertFormat::Mq3I4 => 0,
         ExpertFormat::Mq2I4 => 1,
         ExpertFormat::Mq4Xts => 2,
+        ExpertFormat::E8pI4 => 3,
     }
 }
 
@@ -696,12 +704,12 @@ impl std::error::Error for ExpertSlabScaleError {
     }
 }
 
-/// `(gate_up, down)` MQ-I4 profiles of `format`; `None` for copied MQ4-XTS.
+/// Scalar MQ-I4 profiles; E8P records are guarded by their dedicated provider.
 fn mq_i4_profiles(format: ExpertFormat) -> Option<(MqI4Profile, MqI4Profile)> {
     match format {
         ExpertFormat::Mq3I4 => Some((MqI4Profile::MQ3_R256, MqI4Profile::MQ3_R128)),
         ExpertFormat::Mq2I4 => Some((MqI4Profile::MQ2_R256, MqI4Profile::MQ2_R128)),
-        ExpertFormat::Mq4Xts => None,
+        ExpertFormat::Mq4Xts | ExpertFormat::E8pI4 => None,
     }
 }
 
@@ -780,8 +788,16 @@ pub(crate) fn full_fn_headers(
     }
     for (name, qt, shape) in [
         ("model.embed_tokens.weight", 1u8, vec![16u32, 16]),
-        ("mtp.layers.0.mlp.experts.gate_up_proj", 44, vec![512, 1280, 2560]),
-        ("mtp.layers.0.mlp.experts.down_proj", 53, vec![512, 2560, 640]),
+        (
+            "mtp.layers.0.mlp.experts.gate_up_proj",
+            44,
+            vec![512, 1280, 2560],
+        ),
+        (
+            "mtp.layers.0.mlp.experts.down_proj",
+            53,
+            vec![512, 2560, 640],
+        ),
     ] {
         out.push(HfqTensorInfo {
             name: name.to_string(),
@@ -856,13 +872,26 @@ mod tests {
             ExpertSlabCounts {
                 w3: SLAB_COUNT,
                 w2: 0,
+                e8p: 0,
                 mq4: 0
             }
         );
         let first = table.slabs()[0];
         assert_eq!(first.format, ExpertFormat::Mq3I4);
-        assert_eq!(first.gate_up, ExpertSlabSpan { offset: 4096, len: 1_280_000 });
-        assert_eq!(first.down, ExpertSlabSpan { offset: 4096 + 1_280_000, len: 640_000 });
+        assert_eq!(
+            first.gate_up,
+            ExpertSlabSpan {
+                offset: 4096,
+                len: 1_280_000
+            }
+        );
+        assert_eq!(
+            first.down,
+            ExpertSlabSpan {
+                offset: 4096 + 1_280_000,
+                len: 640_000
+            }
+        );
         let mut cursor = 4096;
         for (i, slab) in table.slabs().iter().enumerate() {
             assert_eq!(slab.gate_up.offset, cursor, "slab {i}");
@@ -918,7 +947,14 @@ mod tests {
         counts.w3 = 0;
         assert_eq!(counts.w3, 0);
         assert_eq!(table.counts().w3, SLAB_COUNT);
-        assert_eq!(ExpertSlabSpan { offset: usize::MAX, len: 1 }.end(), None);
+        assert_eq!(
+            ExpertSlabSpan {
+                offset: usize::MAX,
+                len: 1
+            }
+            .end(),
+            None
+        );
     }
 
     #[test]
@@ -935,7 +971,10 @@ mod tests {
     fn empty_and_truncated_indexes_report_the_missing_entry() {
         assert_eq!(
             err(&[]),
-            ExpertSlabTableError::MissingEntry { index: 0, expected: id(0, 0, G) }
+            ExpertSlabTableError::MissingEntry {
+                index: 0,
+                expected: id(0, 0, G)
+            }
         );
         let mut tensors = all_w3();
         tensors.truncate(ENTRY_COUNT - 1);
@@ -955,7 +994,10 @@ mod tests {
         tensors.drain(at..at + 2);
         assert_eq!(
             err(&tensors),
-            ExpertSlabTableError::MissingEntry { index: at, expected: id(3, 7, G) }
+            ExpertSlabTableError::MissingEntry {
+                index: at,
+                expected: id(3, 7, G)
+            }
         );
     }
 
@@ -965,7 +1007,10 @@ mod tests {
         tensors.remove(ix(0, 9, D));
         assert_eq!(
             err(&tensors),
-            ExpertSlabTableError::MissingEntry { index: ix(0, 9, D), expected: id(0, 9, D) }
+            ExpertSlabTableError::MissingEntry {
+                index: ix(0, 9, D),
+                expected: id(0, 9, D)
+            }
         );
     }
 
@@ -977,7 +1022,10 @@ mod tests {
         tensors.splice(at + 2..at + 2, copy);
         assert_eq!(
             err(&tensors),
-            ExpertSlabTableError::DuplicateEntry { index: at + 2, found: id(3, 7, G) }
+            ExpertSlabTableError::DuplicateEntry {
+                index: at + 2,
+                found: id(3, 7, G)
+            }
         );
     }
 
@@ -989,7 +1037,10 @@ mod tests {
         tensors.push(dup);
         assert_eq!(
             err(&tensors),
-            ExpertSlabTableError::DuplicateEntry { index: tensors.len() - 1, found: id(5, 5, D) }
+            ExpertSlabTableError::DuplicateEntry {
+                index: tensors.len() - 1,
+                found: id(5, 5, D)
+            }
         );
         let mut tensors = all_w3();
         let mut oob = tensors[0].clone();
@@ -997,7 +1048,11 @@ mod tests {
         tensors.push(oob);
         assert_eq!(
             err(&tensors),
-            ExpertSlabTableError::IndexOutOfRange { index: tensors.len() - 1, layer: 60, expert: 3 }
+            ExpertSlabTableError::IndexOutOfRange {
+                index: tensors.len() - 1,
+                layer: 60,
+                expert: 3
+            }
         );
     }
 
@@ -1065,14 +1120,21 @@ mod tests {
     fn invalid_and_out_of_range_names() {
         let mut tensors = all_w3();
         tensors[0].name = "model.language_model.layers.01.mlp.experts.0.gate_up_proj".into();
-        assert_eq!(err(&tensors), ExpertSlabTableError::InvalidName { index: 0 });
+        assert_eq!(
+            err(&tensors),
+            ExpertSlabTableError::InvalidName { index: 0 }
+        );
 
         let mut tensors = all_w3();
         let at = ix(47, 511, D);
         tensors[at].name = expert_entry_name(48, 511, D);
         assert_eq!(
             err(&tensors),
-            ExpertSlabTableError::IndexOutOfRange { index: at, layer: 48, expert: 511 }
+            ExpertSlabTableError::IndexOutOfRange {
+                index: at,
+                layer: 48,
+                expert: 511
+            }
         );
 
         let mut tensors = all_w3();
@@ -1080,7 +1142,11 @@ mod tests {
         tensors[at].name = expert_entry_name(0, 512, G);
         assert_eq!(
             err(&tensors),
-            ExpertSlabTableError::IndexOutOfRange { index: at, layer: 0, expert: 512 }
+            ExpertSlabTableError::IndexOutOfRange {
+                index: at,
+                layer: 0,
+                expert: 512
+            }
         );
     }
 
@@ -1113,7 +1179,14 @@ mod tests {
     #[test]
     fn invalid_qtype_pairs_are_rejected() {
         // gate_up W3-R256 with a W2-R128 down (131/134) and the reverse.
-        for (g, d) in [(131u8, 134u8), (133, 132), (132, 131), (44, 132), (131, 53), (0, 0)] {
+        for (g, d) in [
+            (131u8, 134u8),
+            (133, 132),
+            (132, 131),
+            (44, 132),
+            (131, 53),
+            (0, 0),
+        ] {
             let mut tensors = all_w3();
             tensors[ix(0, 0, G)].quant_type = g;
             tensors[ix(0, 0, D)].quant_type = d;
@@ -1230,7 +1303,11 @@ mod tests {
         tensors[ix(2, 3, D)].data_offset -= 256;
         assert!(matches!(
             err(&tensors),
-            ExpertSlabTableError::NoncontiguousGateDown { layer: 2, expert: 3, .. }
+            ExpertSlabTableError::NoncontiguousGateDown {
+                layer: 2,
+                expert: 3,
+                ..
+            }
         ));
     }
 
@@ -1245,7 +1322,12 @@ mod tests {
         let offset = tensors[ix(0, 5, G)].data_offset;
         assert_eq!(
             err(&tensors),
-            ExpertSlabTableError::SlabGap { layer: 0, expert: 5, previous_end, offset }
+            ExpertSlabTableError::SlabGap {
+                layer: 0,
+                expert: 5,
+                previous_end,
+                offset
+            }
         );
 
         let mut tensors = all_w3();
@@ -1256,7 +1338,12 @@ mod tests {
         let offset = tensors[ix(1, 0, G)].data_offset;
         assert_eq!(
             err(&tensors),
-            ExpertSlabTableError::SlabOverlap { layer: 1, expert: 0, previous_end, offset }
+            ExpertSlabTableError::SlabOverlap {
+                layer: 1,
+                expert: 0,
+                previous_end,
+                offset
+            }
         );
     }
 
@@ -1268,7 +1355,10 @@ mod tests {
         }
         assert_eq!(
             err(&tensors),
-            ExpertSlabTableError::FirstSlabUnaligned { offset: 4097, alignment: 256 }
+            ExpertSlabTableError::FirstSlabUnaligned {
+                offset: 4097,
+                alignment: 256
+            }
         );
         // 256-aligned but not 4096-aligned is fine.
         let mut tensors = all_w3();
@@ -1281,10 +1371,16 @@ mod tests {
     #[test]
     fn trunk_aggregates_are_rejected_but_mtp_is_allowed() {
         // Base entries already carry legacy MTP aggregates and build fine.
-        assert!(all_w3().iter().any(|t| t.name.starts_with("mtp.layers.0.mlp.experts.")));
+        assert!(all_w3()
+            .iter()
+            .any(|t| t.name.starts_with("mtp.layers.0.mlp.experts.")));
         assert!(build(&all_w3()).is_ok());
 
-        for (layer, proj) in [(7usize, "gate_up_proj"), (47, "down_proj"), (0, "down_proj")] {
+        for (layer, proj) in [
+            (7usize, "gate_up_proj"),
+            (47, "down_proj"),
+            (0, "down_proj"),
+        ] {
             let mut tensors = all_w3();
             let mut agg = tensors[0].clone();
             agg.name = format!("model.language_model.layers.{layer}.mlp.experts.{proj}");
@@ -1293,7 +1389,10 @@ mod tests {
             tensors.push(agg);
             assert_eq!(
                 err(&tensors),
-                ExpertSlabTableError::AggregateTrunkExperts { index: tensors.len() - 1, layer }
+                ExpertSlabTableError::AggregateTrunkExperts {
+                    index: tensors.len() - 1,
+                    layer
+                }
             );
         }
         // Aggregate in place of the first expert entry.
@@ -1315,7 +1414,10 @@ mod tests {
             tensors.push(stray);
             assert_eq!(
                 err(&tensors),
-                ExpertSlabTableError::StrayI4Qtype { index: tensors.len() - 1, quant_type: qt }
+                ExpertSlabTableError::StrayI4Qtype {
+                    index: tensors.len() - 1,
+                    quant_type: qt
+                }
             );
         }
     }
@@ -1325,7 +1427,9 @@ mod tests {
     fn good_tensor(profile: MqI4Profile, m: usize, k: usize) -> Vec<u8> {
         let levels = usize::from(profile.codec.levels()) + 1;
         let mid = profile.codec.midpoint();
-        let mut codes: Vec<u8> = (0..m * k).map(|i| ((i * 5 + i / 128) % levels) as u8).collect();
+        let mut codes: Vec<u8> = (0..m * k)
+            .map(|i| ((i * 5 + i / 128) % levels) as u8)
+            .collect();
         let mut scales: Vec<u16> = (0..mq_i4::scale_count(m, k))
             .map(|g| 0x3C00 + (g % 64) as u16)
             .collect();
@@ -1359,12 +1463,22 @@ mod tests {
         }
 
         fn validate(&self, arena: &[u8]) -> Result<(), ExpertSlabScaleError> {
-            validate_expert_slab_scales(&self.table, |span| arena.get(span.offset..span.offset + span.len))
+            validate_expert_slab_scales(&self.table, |span| {
+                arena.get(span.offset..span.offset + span.len)
+            })
         }
 
         /// Set the scale bits of scale `index` in the projection starting at
         /// `base` (`profile`, shape `m x k`).
-        fn with_scale(&self, base: usize, codec: MqI4Codec, m: usize, k: usize, index: usize, bits: u16) -> Vec<u8> {
+        fn with_scale(
+            &self,
+            base: usize,
+            codec: MqI4Codec,
+            m: usize,
+            k: usize,
+            index: usize,
+            bits: u16,
+        ) -> Vec<u8> {
             let mut arena = self.arena.clone();
             let at = base + mq_i4::codes_bytes(codec, m, k) + 2 * index;
             arena[at..at + 2].copy_from_slice(&bits.to_le_bytes());
@@ -1375,8 +1489,14 @@ mod tests {
     fn slab_at(format: ExpertFormat, offset: usize) -> ExpertSlab {
         ExpertSlab {
             format,
-            gate_up: ExpertSlabSpan { offset, len: format.gate_up_bytes() },
-            down: ExpertSlabSpan { offset: offset + format.gate_up_bytes(), len: format.down_bytes() },
+            gate_up: ExpertSlabSpan {
+                offset,
+                len: format.gate_up_bytes(),
+            },
+            down: ExpertSlabSpan {
+                offset: offset + format.gate_up_bytes(),
+                len: format.down_bytes(),
+            },
         }
     }
 
@@ -1424,11 +1544,41 @@ mod tests {
             (D, case.gate_len, dp.codec, dm, dk),
         ] {
             let cases: [(u16, MqI4Error); 6] = [
-                (0x7E00, MqI4Error::ScaleNotFinite { index, bits: 0x7E00 }),
-                (0x7C00, MqI4Error::ScaleNotFinite { index, bits: 0x7C00 }),
-                (0x8000, MqI4Error::ScaleNegative { index, bits: 0x8000 }),
-                (0xBC00, MqI4Error::ScaleNegative { index, bits: 0xBC00 }),
-                (0xFFFF, MqI4Error::ScaleNegative { index, bits: 0xFFFF }),
+                (
+                    0x7E00,
+                    MqI4Error::ScaleNotFinite {
+                        index,
+                        bits: 0x7E00,
+                    },
+                ),
+                (
+                    0x7C00,
+                    MqI4Error::ScaleNotFinite {
+                        index,
+                        bits: 0x7C00,
+                    },
+                ),
+                (
+                    0x8000,
+                    MqI4Error::ScaleNegative {
+                        index,
+                        bits: 0x8000,
+                    },
+                ),
+                (
+                    0xBC00,
+                    MqI4Error::ScaleNegative {
+                        index,
+                        bits: 0xBC00,
+                    },
+                ),
+                (
+                    0xFFFF,
+                    MqI4Error::ScaleNegative {
+                        index,
+                        bits: 0xFFFF,
+                    },
+                ),
                 (0x0000, zero_scale_error(codec, k, index)),
             ];
             for (bits, expected) in cases {
@@ -1467,7 +1617,10 @@ mod tests {
                 layer: 0,
                 expert: 0,
                 projection: G,
-                source: MqI4Error::ScaleNegative { index: 3, bits: 0x8000 }
+                source: MqI4Error::ScaleNegative {
+                    index: 3,
+                    bits: 0x8000
+                }
             })
         );
     }
@@ -1521,7 +1674,15 @@ mod tests {
         let mut slabs = vec![slab_at(ExpertFormat::Mq4Xts, 0); 515];
         slabs.push(slab_at(ExpertFormat::Mq3I4, 0));
         let table = table_of(slabs);
-        assert_eq!(table.counts(), ExpertSlabCounts { w3: 1, w2: 0, mq4: 515 });
+        assert_eq!(
+            table.counts(),
+            ExpertSlabCounts {
+                w3: 1,
+                w2: 0,
+                e8p: 0,
+                mq4: 515
+            }
+        );
 
         let mut queried = Vec::new();
         let gate_span = table.slabs()[515].gate_up;
@@ -1537,7 +1698,10 @@ mod tests {
                 layer: 1,
                 expert: 3,
                 projection: G,
-                source: MqI4Error::ScaleNegative { index: 11, bits: 0x8000 }
+                source: MqI4Error::ScaleNegative {
+                    index: 11,
+                    bits: 0x8000
+                }
             })
         );
         let mut queried = Vec::new();
@@ -1548,7 +1712,10 @@ mod tests {
             }),
             Ok(())
         );
-        assert_eq!(queried, vec![table.slabs()[515].gate_up, table.slabs()[515].down]);
+        assert_eq!(
+            queried,
+            vec![table.slabs()[515].gate_up, table.slabs()[515].down]
+        );
     }
 
     #[test]

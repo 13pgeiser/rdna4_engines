@@ -82,6 +82,12 @@ required-features = ["lab"]
 name = "fn_sampled_plumbing_oracle"
 required-features = ["lab"]
 
+# R8 / K-E1 real-layer E8P G1 + Gp driver. Raw PM module launches only; helper modules live in examples/e8p_gp/.
+[[example]]
+name = "qwen4_e8p_gp"
+path = "examples/qwen4_e8p_gp.rs"
+required-features = ["lab"]
+
 [[test]]
 name = "mtp_takeover_fill_hw"
 required-features = ["reference-parity"]

@@ -42,6 +42,8 @@ pub mod dflash_generic;
 pub mod dflash_online;
 pub mod dspark_block_controller;
 pub mod dspark_core;
+/// CPU arithmetic oracles for the E8P-on-IU4 route (decode, SWAR unpack, `2C+s` fold, epoch, writer guard).
+pub mod e8p_i4_reference;
 pub mod ep;
 pub mod ep_row_gather;
 pub mod ep_tile_exchange;
@@ -106,14 +108,14 @@ pub mod spec_ngram;
 pub mod spec_sampling;
 pub mod swap;
 pub mod tp_shard;
-pub mod trunk_overlay;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
-pub mod weight_manifest;
+pub mod trunk_overlay;
 /// Shared-weight host protocol v1 (`HIPFIRE_WEIGHT_HOST`): identities, typed
 /// manifest, source certificates and the `SCM_RIGHTS` handshake. Linux only.
 #[cfg(target_os = "linux")]
 pub mod weight_host;
+pub mod weight_manifest;
 #[cfg(feature = "deltanet")]
 pub mod weight_pager;
 pub mod weight_store;

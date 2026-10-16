@@ -30,9 +30,12 @@ pub const ARENA_SUFFIX: &str = hipfire_runtime::weight_store::SLAB_ARENA_SUFFIX;
 pub const ARENA_TAIL_PAD_BYTES: usize = hipfire_runtime::weight_store::SLAB_ARENA_TAIL_PAD_BYTES;
 
 /// Codec id of an MQ4 symmetric (qt44/qt53) expert in the per-layer codec table.
-pub const CODEC_MQ4: u8 = 0;
+pub const CODEC_MQ4: u8 = rdna_compute::slab_admission::SLAB_CODEC_MQ4;
 /// Codec id of an MQ3-I4 (qt131/qt132) expert in the per-layer codec table.
-pub const CODEC_W3: u8 = 1;
+pub const CODEC_W3: u8 = rdna_compute::slab_admission::SLAB_CODEC_W3;
+/// Codec id of an E8P-I4 (qt135/qt136) expert in the per-layer codec table.
+/// (Codec id `2`, MQ2-I4, has no route anywhere and no constant.)
+pub const CODEC_E8P: u8 = rdna_compute::slab_admission::SLAB_CODEC_E8P;
 
 /// One expert inside its layer's arena. Offsets are relative to the arena base.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +51,7 @@ impl ArenaExpert {
         match self.format {
             ExpertFormat::Mq4Xts => Ok(CODEC_MQ4),
             ExpertFormat::Mq3I4 => Ok(CODEC_W3),
+            ExpertFormat::E8pI4 => Ok(CODEC_E8P),
             ExpertFormat::Mq2I4 => Err(ExpertArenaError::UnsupportedFormat(ExpertFormat::Mq2I4)),
         }
     }
@@ -64,19 +68,51 @@ pub struct ExpertArenaLayer {
 }
 
 impl ExpertArenaLayer {
-    /// Per-expert codec bytes (`0` = MQ4, `1` = W3). Fails closed on a W2 expert.
+    /// Per-expert codec bytes (`0` = MQ4, `1` = W3, `3` = E8P). Fails closed on
+    /// a W2 expert, which has no kernels on any architecture; which codecs an
+    /// architecture serves is [`rdna_compute::qwen4_slab_codec_admitted`].
     pub fn codec_table(&self) -> Result<Vec<u8>, ExpertArenaError> {
         self.experts.iter().map(|expert| expert.codec()).collect()
     }
 
-    /// `(mq4, w3)` expert counts.
-    pub fn codec_counts(&self) -> (usize, usize) {
-        let w3 = self
-            .experts
-            .iter()
-            .filter(|expert| expert.format == ExpertFormat::Mq3I4)
-            .count();
-        (self.experts.len() - w3, w3)
+    /// The layer's single cold codec on `arch` (the codec of its W3/E8P experts,
+    /// or the arch default for an MQ4-only layer), refusing a W2 expert, a codec
+    /// `arch` does not serve and a layer holding two different cold codecs.
+    pub fn cold_codec(&self, arch: &str) -> Result<u8, ExpertArenaError> {
+        let codecs = self.codec_table()?;
+        for expert in &self.experts {
+            if !rdna_compute::qwen4_slab_codec_admitted(arch, expert.codec()?) {
+                return Err(ExpertArenaError::ArchRefused {
+                    format: expert.format,
+                    arch: arch.to_string(),
+                });
+            }
+        }
+        rdna_compute::qwen4_slab_layer_cold_codec(arch, &codecs).map_err(|error| match error {
+            rdna_compute::SlabLayerCodecError::MixedCold { first, second } => {
+                ExpertArenaError::MixedCold { first, second }
+            }
+            // Every expert was admitted above: only an unknown architecture
+            // with no experts reaches here.
+            rdna_compute::SlabLayerCodecError::NotAdmitted { .. } => {
+                ExpertArenaError::ArchRefused {
+                    format: ExpertFormat::Mq4Xts,
+                    arch: arch.to_string(),
+                }
+            }
+        })
+    }
+
+    /// `(mq4, w3, e8p)` expert counts.
+    pub fn codec_counts(&self) -> (usize, usize, usize) {
+        let count = |format| {
+            self.experts
+                .iter()
+                .filter(|expert| expert.format == format)
+                .count()
+        };
+        let (w3, e8p) = (count(ExpertFormat::Mq3I4), count(ExpertFormat::E8pI4));
+        (self.experts.len() - w3 - e8p, w3, e8p)
     }
 }
 
@@ -88,8 +124,14 @@ pub struct ExpertArenaPlan {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExpertArenaError {
-    /// Only MQ4 symmetric and MQ3-I4 experts have kernels.
+    /// The expert's format has no kernels on any architecture (MQ2-I4).
     UnsupportedFormat(ExpertFormat),
+    /// The expert's codec has no sealed-route kernels on `arch` (gfx1100 serves
+    /// MQ4 + E8P, gfx1151 MQ4 + W3, gfx1201 MQ4 + W3 + E8P, everything else nothing).
+    ArchRefused { format: ExpertFormat, arch: String },
+    /// One layer holds two different cold codecs (W3 and E8P); the route has
+    /// one cold bucket per layer.
+    MixedCold { first: u8, second: u8 },
     /// The span table is not contiguous at `(layer, expert)`.
     Noncontiguous { layer: usize, expert: usize },
     /// A layer arena is larger than the 32-bit offsets of the device tables.
@@ -101,7 +143,15 @@ impl std::fmt::Display for ExpertArenaError {
         match self {
             Self::UnsupportedFormat(format) => write!(
                 f,
-                "expert format {format:?} has no gfx1201 kernels; only MQ4-XTS (44,53) and MQ3-I4 (131,132) experts are admitted"
+                "expert format {format:?} has no kernels on any architecture; only MQ4-XTS (44,53), MQ3-I4 (131,132) and E8P-I4 (135,136) experts are admitted"
+            ),
+            Self::ArchRefused { format, arch } => write!(
+                f,
+                "expert format {format:?} has no sealed-route kernels on {arch}; gfx1100 admits MQ4-XTS and E8P-I4, gfx1151 MQ4-XTS and MQ3-I4, gfx1201 MQ4-XTS, MQ3-I4 and E8P-I4"
+            ),
+            Self::MixedCold { first, second } => write!(
+                f,
+                "a layer holds two cold codecs ({first} and {second}); the sealed route has one cold bucket per layer"
             ),
             Self::Noncontiguous { layer, expert } => write!(
                 f,
@@ -133,9 +183,7 @@ impl ExpertArenaPlan {
                 let slab = table
                     .slab(layer, expert)
                     .ok_or(ExpertArenaError::Noncontiguous { layer, expert })?;
-                if slab.gate_up.offset != cursor
-                    || slab.gate_up.end() != Some(slab.down.offset)
-                {
+                if slab.gate_up.offset != cursor || slab.gate_up.end() != Some(slab.down.offset) {
                     return Err(ExpertArenaError::Noncontiguous { layer, expert });
                 }
                 experts.push(ArenaExpert {
@@ -180,10 +228,13 @@ impl ExpertArenaPlan {
         format!("{layer_prefix}{ARENA_SUFFIX}")
     }
 
-    /// Refuse anything the gfx1201 sealed route cannot execute.
-    pub fn check_executable(&self) -> Result<(), ExpertArenaError> {
+    /// Refuse every layer the sealed route cannot execute on `arch`: a W2
+    /// expert (no kernels anywhere), a codec `arch` does not serve
+    /// ([`rdna_compute::qwen4_slab_codec_admitted`]), or one layer holding two
+    /// different cold codecs (W3 and E8P share a layer's single cold bucket).
+    pub fn check_executable(&self, arch: &str) -> Result<(), ExpertArenaError> {
         for layer in &self.layers {
-            layer.codec_table()?;
+            layer.cold_codec(arch)?;
         }
         Ok(())
     }
@@ -317,15 +368,157 @@ mod tests {
 
     #[test]
     fn codec_table_is_per_expert_and_refuses_w2() {
-        let mixed = layer(0, &[ExpertFormat::Mq4Xts, ExpertFormat::Mq3I4, ExpertFormat::Mq3I4]);
+        let mixed = layer(
+            0,
+            &[
+                ExpertFormat::Mq4Xts,
+                ExpertFormat::Mq3I4,
+                ExpertFormat::Mq3I4,
+            ],
+        );
         let table = mixed.codec_table().unwrap();
         assert_eq!(table.len(), 512);
         assert_eq!(&table[..4], &[CODEC_MQ4, CODEC_W3, CODEC_W3, CODEC_MQ4]);
+        assert_eq!(mixed.codec_counts(), (171, 341, 0));
+        let e8p = layer(
+            0,
+            &[
+                ExpertFormat::Mq4Xts,
+                ExpertFormat::E8pI4,
+                ExpertFormat::E8pI4,
+            ],
+        );
+        assert_eq!(CODEC_E8P, 3);
+        assert_eq!(
+            &e8p.codec_table().unwrap()[..4],
+            &[CODEC_MQ4, CODEC_E8P, CODEC_E8P, CODEC_MQ4]
+        );
+        assert_eq!(e8p.codec_counts(), (171, 0, 341));
         let w2 = layer(0, &[ExpertFormat::Mq3I4, ExpertFormat::Mq2I4]);
         assert_eq!(
             w2.codec_table(),
             Err(ExpertArenaError::UnsupportedFormat(ExpertFormat::Mq2I4))
         );
+    }
+
+    /// The matrix keyed by (arch, cold codec): gfx1100 MQ4 + E8P, gfx1151 MQ4 + W3, gfx1201
+    /// MQ4 + W3 + E8P, W2 nowhere; a layer's cold codec is one codec.
+    #[test]
+    fn check_executable_is_keyed_by_arch_and_cold_codec() {
+        let plan = |formats: &[ExpertFormat]| ExpertArenaPlan {
+            layers: vec![layer(0, formats)],
+        };
+        let w3 = plan(&[ExpertFormat::Mq4Xts, ExpertFormat::Mq3I4]);
+        let e8p = plan(&[ExpertFormat::Mq4Xts, ExpertFormat::E8pI4]);
+        let w2 = plan(&[ExpertFormat::Mq4Xts, ExpertFormat::Mq2I4]);
+        let mq4 = plan(&[ExpertFormat::Mq4Xts]);
+        for arch in ["gfx1201", "gfx1100", "gfx1151"] {
+            assert_eq!(mq4.check_executable(arch), Ok(()), "{arch}");
+            assert_eq!(
+                w2.check_executable(arch),
+                Err(ExpertArenaError::UnsupportedFormat(ExpertFormat::Mq2I4)),
+                "{arch}"
+            );
+        }
+        assert_eq!(w3.check_executable("gfx1201"), Ok(()));
+        assert_eq!(e8p.check_executable("gfx1201"), Ok(()));
+        // gfx1100 serves E8P next to MQ4 but no W3: W3 is an arch refusal.
+        assert_eq!(e8p.check_executable("gfx1100"), Ok(()));
+        assert_eq!(
+            w3.check_executable("gfx1100"),
+            Err(ExpertArenaError::ArchRefused {
+                format: ExpertFormat::Mq3I4,
+                arch: "gfx1100".into()
+            })
+        );
+        // gfx1151 serves W3 next to MQ4 but no E8P: E8P is an arch refusal.
+        assert_eq!(w3.check_executable("gfx1151"), Ok(()));
+        assert_eq!(
+            e8p.check_executable("gfx1151"),
+            Err(ExpertArenaError::ArchRefused {
+                format: ExpertFormat::E8pI4,
+                arch: "gfx1151".into()
+            })
+        );
+        for arch in ["gfx1101", "gfx942", ""] {
+            for p in [&w3, &e8p, &mq4] {
+                assert!(p.check_executable(arch).is_err(), "{arch}");
+            }
+        }
+        // The cold codec a layer binds to; an MQ4-only layer has no cold bucket (0).
+        let cold = |p: &ExpertArenaPlan, arch| p.layers()[0].cold_codec(arch);
+        assert_eq!(cold(&w3, "gfx1201"), Ok(CODEC_W3));
+        assert_eq!(cold(&e8p, "gfx1201"), Ok(CODEC_E8P));
+        assert_eq!(cold(&mq4, "gfx1201"), Ok(CODEC_MQ4));
+        assert_eq!(cold(&mq4, "gfx1100"), Ok(CODEC_MQ4));
+        assert_eq!(cold(&e8p, "gfx1100"), Ok(CODEC_E8P));
+        assert_eq!(
+            cold(&w3, "gfx1100"),
+            Err(ExpertArenaError::ArchRefused {
+                format: ExpertFormat::Mq3I4,
+                arch: "gfx1100".into()
+            })
+        );
+        assert_eq!(cold(&mq4, "gfx1151"), Ok(CODEC_MQ4));
+        assert_eq!(cold(&w3, "gfx1151"), Ok(CODEC_W3));
+        assert_eq!(
+            cold(&e8p, "gfx1151"),
+            Err(ExpertArenaError::ArchRefused {
+                format: ExpertFormat::E8pI4,
+                arch: "gfx1151".into()
+            })
+        );
+    }
+
+    /// One layer holding both W3 and E8P has two cold codecs for its one cold
+    /// bucket: refused fail-closed on every arch that serves both. Different
+    /// layers may choose different cold codecs.
+    #[test]
+    fn a_layer_with_w3_and_e8p_is_refused_but_layers_may_differ() {
+        let both = layer(
+            0,
+            &[
+                ExpertFormat::Mq4Xts,
+                ExpertFormat::Mq3I4,
+                ExpertFormat::E8pI4,
+            ],
+        );
+        let refused = ExpertArenaError::MixedCold {
+            first: CODEC_W3,
+            second: CODEC_E8P,
+        };
+        assert_eq!(both.cold_codec("gfx1201"), Err(refused.clone()));
+        assert_eq!(
+            ExpertArenaPlan {
+                layers: vec![both.clone()]
+            }
+            .check_executable("gfx1201"),
+            Err(refused)
+        );
+        // gfx1100 serves no W3 at all: refused as an arch refusal (W3 first, E8P never reached).
+        assert_eq!(
+            both.cold_codec("gfx1100"),
+            Err(ExpertArenaError::ArchRefused {
+                format: ExpertFormat::Mq3I4,
+                arch: "gfx1100".into()
+            })
+        );
+        // gfx1151 serves no E8P: the W3 expert is admitted, the E8P expert is the arch refusal.
+        assert_eq!(
+            both.cold_codec("gfx1151"),
+            Err(ExpertArenaError::ArchRefused {
+                format: ExpertFormat::E8pI4,
+                arch: "gfx1151".into()
+            })
+        );
+        let w3 = layer(0, &[ExpertFormat::Mq4Xts, ExpertFormat::Mq3I4]);
+        let e8p = layer(0, &[ExpertFormat::Mq4Xts, ExpertFormat::E8pI4]);
+        let plan = ExpertArenaPlan {
+            layers: vec![w3, e8p],
+        };
+        assert_eq!(plan.check_executable("gfx1201"), Ok(()));
+        assert_eq!(plan.layers()[0].cold_codec("gfx1201"), Ok(CODEC_W3));
+        assert_eq!(plan.layers()[1].cold_codec("gfx1201"), Ok(CODEC_E8P));
     }
 
     #[test]
@@ -348,7 +541,12 @@ mod tests {
         for formats in [
             vec![ExpertFormat::Mq3I4],
             vec![ExpertFormat::Mq4Xts, ExpertFormat::Mq3I4],
-            vec![ExpertFormat::Mq3I4, ExpertFormat::Mq4Xts, ExpertFormat::Mq4Xts, ExpertFormat::Mq3I4],
+            vec![
+                ExpertFormat::Mq3I4,
+                ExpertFormat::Mq4Xts,
+                ExpertFormat::Mq4Xts,
+                ExpertFormat::Mq3I4,
+            ],
         ] {
             let layer = layer(0, &formats);
             let last = layer.experts.last().unwrap();
@@ -367,12 +565,29 @@ mod tests {
         }
     }
 
+    /// E8P tensors are `[words m*k/8 u16][scales m*k/128 f16]` and both gfx1201
+    /// E8P kernels read nothing past the last scale (K1/K2 module docs: the
+    /// last byte read is the tensor's last byte), so the last expert needs no
+    /// tail pad beyond the standing arena pad.
+    #[test]
+    fn e8p_extents_are_the_planar_tensor_and_need_no_extra_pad() {
+        let e8p = ExpertFormat::E8pI4;
+        for (m, k, bytes) in [
+            (1280usize, 2560usize, e8p.gate_up_bytes()),
+            (2560, 640, e8p.down_bytes()),
+        ] {
+            assert_eq!(bytes, m * k / 8 * 2 + m * (k / 128) * 2);
+        }
+        assert_eq!((e8p.gate_up_bytes(), e8p.down_bytes()), (870_400, 435_200));
+        assert!(ARENA_TAIL_PAD_BYTES >= 256);
+    }
+
     #[test]
     fn arenas_of_different_sizes_keep_their_own_extents() {
         let small = layer(0, &[ExpertFormat::Mq3I4]);
         let large = layer(small.bytes, &[ExpertFormat::Mq4Xts]);
         assert_ne!(small.bytes, large.bytes);
-        assert_eq!(small.codec_counts(), (0, 512));
-        assert_eq!(large.codec_counts(), (512, 0));
+        assert_eq!(small.codec_counts(), (0, 512, 0));
+        assert_eq!(large.codec_counts(), (512, 0, 0));
     }
 }

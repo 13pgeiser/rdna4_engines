@@ -722,10 +722,16 @@ pub(crate) fn dense_ref<'a>(
 /// expert headers were verified symmetric, which the opt-in IU4 arm
 /// requires), or the gfx942 qt=55 [`MoeRouteCapability::Fp8B128Grouped`]
 /// route, whose routed gate_up and down formats are both `FP8E4M3B128`.
+///
+/// `slab_cold_codec` is a sealed expert-slab layer's cold codec id (W3 = 1,
+/// E8P = 3), read from the layer's load-time slab metadata
+/// ([`Qwen4MoeLayerRuntime::slab_cold_codec`], no table scan); `None` for an
+/// MQ4-only slab layer and for every non-slab route.
 fn qwen4_route_policy(
     config: &Qwen4Config,
     shared: &MoeSharedWeights<'_>,
     capability: MoeRouteCapability,
+    slab_cold_codec: Option<u8>,
 ) -> MoeRoutePolicy {
     let (routed_gate_up, routed_down) = if capability.is_fp8_grouped() {
         (DType::FP8E4M3B128, DType::FP8E4M3B128)
@@ -750,6 +756,7 @@ fn qwen4_route_policy(
             routed_gate_up,
             routed_down,
         },
+        slab_cold_codec,
     }
 }
 pub(crate) fn program_dims(config: &Qwen4Config) -> Qwen4ProgramDims {
@@ -986,7 +993,12 @@ pub(crate) fn layer_desc<'a>(
                 down: copy(6, &moe.shared_down),
             };
             Qwen4FfnBinding::Moe(Qwen4MoeBinding {
-                route_policy: qwen4_route_policy(config, &shared, moe.route_capability(rows)),
+                route_policy: qwen4_route_policy(
+                    config,
+                    &shared,
+                    moe.route_capability(rows),
+                    moe.slab_cold_codec(),
+                ),
                 table: &moe.table,
                 cache: &moe.cache,
                 routed_experts: moe,
@@ -1133,14 +1145,22 @@ pub(crate) struct Qwen4MoeLayerRuntime {
 
 /// Per-layer state of a sealed expert-slab layer ([`crate::expert_arena`]).
 pub(crate) struct Qwen4SlabLayer {
-    /// Codec byte of every expert (`0` = MQ4, `1` = W3), from the validated
-    /// span table; never inferred from any single expert.
+    /// The layer's cold codec id on this device (W3 = 1, E8P = 3; `0` = MQ4,
+    /// no cold bucket, for an MQ4-only layer): decided once at load from the
+    /// validated span table ([`crate::expert_arena::ExpertArenaLayer::cold_codec`]),
+    /// what every K1 / tile-mask launch of the layer binds to.
+    cold_codec: u8,
+    /// Real codec byte of every expert (`0` = MQ4, `1` = W3, `3` = E8P), from
+    /// the validated span table; never inferred from any single expert. The
+    /// device planner table is NOT this: it is membership only
+    /// ([`slab_codec_tag_bytes`]).
     codecs: Vec<u8>,
     /// Per-expert gate/up and down dtypes (parallel to `codecs`).
     gate_up_dtypes: Vec<DType>,
     down_dtypes: Vec<DType>,
-    /// Mixed layers only: the layer's dtype-tag tensor, `[512]` u8 codec bytes
-    /// followed by `[512]` i32 (`hipfire_dispatch::pipeline::slab_route`).
+    /// Mixed layers only: the layer's dtype-tag tensor ([`slab_codec_tag_bytes`]):
+    /// `[512]` u8 planner membership (cold = 1, MQ4 = 0) followed by `[512]`
+    /// i32 real codecs (`hipfire_dispatch::pipeline::slab_route`).
     codec_tags: Option<GpuTensor>,
     /// Base device address of the layer's arena and its byte length: part of the
     /// layer's arena generation (replay keys).
@@ -1152,6 +1172,25 @@ impl Qwen4SlabLayer {
     pub(crate) fn mixed(&self) -> bool {
         self.codec_tags.is_some()
     }
+}
+
+/// Host bytes of a mixed slab layer's tag tensor from its real per-expert
+/// codecs. The K1 union planner reads the leading `[512]` u8 table as
+/// bucket membership only (bucket 0 = cold, 1 = MQ4: byte `1` selects the
+/// cold bucket, `0` MQ4), so the layer's cold codec (W3 or E8P) is written as
+/// `1` and MQ4 as `0`; the table-driven tile mask reads the trailing `[512]`
+/// i32 table, which keeps the real codec of each expert (0 / 1 / 3).
+/// A layer holds MQ4 plus one cold codec ([`rdna_compute::qwen4_slab_layer_cold_codec`]),
+/// so membership is unambiguous.
+fn slab_codec_tag_bytes(codecs: &[u8]) -> Vec<u8> {
+    use crate::expert_arena::CODEC_MQ4;
+    let mut bytes =
+        Vec::with_capacity(hipfire_dispatch::pipeline::slab_route::CODEC_TAG_ALLOC_BYTES);
+    bytes.extend(codecs.iter().map(|codec| u8::from(*codec != CODEC_MQ4)));
+    for codec in codecs {
+        bytes.extend_from_slice(&i32::from(*codec).to_le_bytes());
+    }
+    bytes
 }
 
 impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
@@ -2138,6 +2177,17 @@ impl Qwen4MoeLayerRuntime {
         }
     }
 
+    /// The sealed expert-slab layer's cold codec for its route policy
+    /// ([`MoeRoutePolicy::slab_cold_codec`]): W3 (1) or E8P (3), `None` for an
+    /// MQ4-only slab layer and for every non-slab layer. Read from the layer's
+    /// load-time metadata, never from a table scan.
+    pub(crate) fn slab_cold_codec(&self) -> Option<u8> {
+        self.slab
+            .as_ref()
+            .map(|slab| slab.cold_codec)
+            .filter(|codec| *codec != crate::expert_arena::CODEC_MQ4)
+    }
+
     /// Single-device runtime: the layer's resident tensors hold every expert.
     pub(crate) fn from_moe(
         gpu: &mut Gpu,
@@ -2737,16 +2787,16 @@ impl Qwen4MoeLayerRuntime {
         layout: &Qwen4ExpertTableLayout<'_>,
         [router, shared_scalar, shared_gate, shared_up, shared_down]: [ProjectionView; 5],
     ) -> Result<Self, Qwen4GpuForwardError> {
-        use crate::expert_arena::{ARENA_TAIL_PAD_BYTES, CODEC_MQ4, CODEC_W3};
+        use crate::expert_arena::{ARENA_TAIL_PAD_BYTES, CODEC_MQ4};
         use crate::expert_slabs::ExpertFormat;
         if !matches!(layout, Qwen4ExpertTableLayout::Single) {
             return Err(invalid(format!(
                 "layer {layer_label}: slab arenas are single-device only (no EP route)"
             )));
         }
-        if !gpu.qwen4_slab_arch() {
+        if !rdna_compute::qwen4_slab_codec_admitted(&gpu.arch, CODEC_MQ4) {
             return Err(invalid(format!(
-                "layer {layer_label}: the expert-slab route is gfx1151/gfx1201-only, device is {}",
+                "layer {layer_label}: the expert-slab route is gfx1100/gfx1151/gfx1201-only, device is {}",
                 gpu.arch
             )));
         }
@@ -2791,11 +2841,19 @@ impl Qwen4MoeLayerRuntime {
         let codecs = plan
             .codec_table()
             .map_err(|error| invalid(format!("layer {layer_label}: {error}")))?;
+        // The layer's single cold codec (its W3 or E8P experts', or MQ4 = no cold
+        // bucket for an MQ4-only layer): refuses a codec this arch does not serve
+        // and a layer holding both W3 and E8P. The planner table below is
+        // membership (cold vs MQ4) and relies on it; the kernels bind to it.
+        let cold_codec = plan
+            .cold_codec(&gpu.arch)
+            .map_err(|error| invalid(format!("layer {layer_label}: {error}")))?;
         let formats: Vec<ExpertFormat> = plan.experts.iter().map(|expert| expert.format).collect();
         let dtypes_of = |format: ExpertFormat| match format {
-            ExpertFormat::Mq4Xts => (DType::MQ4G256V2, DType::MQ4G128V2),
-            ExpertFormat::Mq3I4 => (DType::MQ3I4G128R256, DType::MQ3I4G128R128),
-            ExpertFormat::Mq2I4 => (DType::MQ2I4G128R256, DType::MQ2I4G128R128),
+            ExpertFormat::Mq4Xts => Ok((DType::MQ4G256V2, DType::MQ4G128V2)),
+            ExpertFormat::Mq3I4 => Ok((DType::MQ3I4G128R256, DType::MQ3I4G128R128)),
+            ExpertFormat::E8pI4 => Ok((DType::E8PI4G128R256, DType::E8PI4G128R128)),
+            ExpertFormat::Mq2I4 => Err(invalid("MQ2-I4 has no expert-slab route")),
         };
         let (gate_up_source_name, down_source_name) = match &weights
             .layer(layer_label)
@@ -2816,7 +2874,7 @@ impl Qwen4MoeLayerRuntime {
         let mut gate_up_dtypes = Vec::with_capacity(config.num_experts);
         let mut down_dtypes = Vec::with_capacity(config.num_experts);
         for (expert, (entry, format)) in plan.experts.iter().zip(&formats).enumerate() {
-            let (gate_up_dtype, down_dtype) = dtypes_of(*format);
+            let (gate_up_dtype, down_dtype) = dtypes_of(*format)?;
             let (gate_up_bytes, down_bytes) = (format.gate_up_bytes(), format.down_bytes());
             if entry.gate_up_offset + gate_up_bytes != entry.down_offset
                 || entry.down_offset + down_bytes > plan.bytes
@@ -2841,10 +2899,11 @@ impl Qwen4MoeLayerRuntime {
                 hidden,
                 mi,
             );
-            // Planar MQ3-I4 has no per-row stride in the dtype; its resource
-            // header takes the codes row (k * 3 / 8), the strided MQ4 its group rows.
+            // Planar W3/E8P dtypes have no row stride: resource headers take
+            // their code-row bytes (3*k/8 and k/4); MQ4 uses its group-row stride.
             let stride = |dtype: DType, k: usize| match dtype {
                 DType::MQ3I4G128R256 | DType::MQ3I4G128R128 => k * 3 / 8,
+                DType::E8PI4G128R256 | DType::E8PI4G128R128 => k / 4,
                 other => row_stride(other, k),
             };
             let resource = |name: &str, shape: Vec<usize>, dtype: DType, bytes: usize, k: usize| {
@@ -2908,19 +2967,11 @@ impl Qwen4MoeLayerRuntime {
             .map(|expert| expert.down.tensor.buf.as_ptr() as usize)
             .collect::<Vec<_>>();
         let mixed = codecs.iter().any(|codec| *codec != codecs[0]);
-        // The tag tensor of a mixed layer: u8 codec bytes then the same codes
-        // as i32 (the table-driven tile mask's owner table); its logical shape
-        // is the u8 table the sealed validator sizes.
+        // The tag tensor of a mixed layer ([`slab_codec_tag_bytes`]): u8 planner
+        // membership, then the real codecs as i32 (the table-driven tile mask's
+        // owner table); its logical shape is the u8 table the sealed validator sizes.
         let codec_tags = if mixed {
-            let mut bytes =
-                Vec::with_capacity(hipfire_dispatch::pipeline::slab_route::CODEC_TAG_ALLOC_BYTES);
-            bytes.extend_from_slice(&codecs);
-            for codec in &codecs {
-                bytes.extend_from_slice(&i32::from(*codec).to_le_bytes());
-            }
-            debug_assert!(codecs
-                .iter()
-                .all(|codec| matches!(*codec, CODEC_MQ4 | CODEC_W3)));
+            let bytes = slab_codec_tag_bytes(&codecs);
             let mut tags = gpu.upload_raw(&bytes, &[bytes.len()])?;
             tags.shape = vec![codecs.len()];
             Some(tags)
@@ -2985,7 +3036,7 @@ impl Qwen4MoeLayerRuntime {
             )));
         }
         // The K1 planner and entries load before any capture.
-        gpu.ensure_qwen4_slab_kernels()?;
+        gpu.ensure_qwen4_slab_kernels(cold_codec)?;
         gpu.reserve_qwen4_slab(0)?;
         Ok(Self {
             table,
@@ -3012,6 +3063,7 @@ impl Qwen4MoeLayerRuntime {
             label: layer_label,
             retained_identities: Vec::new(),
             slab: Some(Qwen4SlabLayer {
+                cold_codec,
                 codecs,
                 gate_up_dtypes,
                 down_dtypes,
@@ -3899,6 +3951,7 @@ pub(crate) fn seal_moe_decode<'a>(
             config,
             &shared,
             MoeRouteCapability::Qt44Qt53Grouped,
+            None,
         )),
         normalization: MoeNormalization::Provided,
         batch_size: 1,
@@ -5752,6 +5805,23 @@ fn prepare_trunk_iu4(
     Ok((folds, layer_bits))
 }
 
+/// Populate absolute runtime slots from the assembled, rank-local layer refs.
+/// Keep each successful runtime in its slot immediately so the caller's error
+/// cleanup also owns runtimes built before a later layer fails. The pure
+/// selection seam lets CPU tests exercise PP ownership without GPU tensors.
+fn populate_moe_runtimes<T, E>(
+    runtimes: &mut [Option<T>],
+    layers: &[Qwen4LayerWeights],
+    mut build: impl FnMut(usize, &MoeWeights) -> Result<T, E>,
+) -> Result<(), E> {
+    for layer in layers {
+        if let Some(weights) = layer.ffn.moe() {
+            runtimes[layer.layer] = Some(build(layer.layer, weights)?);
+        }
+    }
+    Ok(())
+}
+
 impl Qwen4GpuForward {
     /// Refuse, before any allocation, a profile this forward cannot run: a
     /// full-attention layer needs the QSA RoPE kernels' hard-coded base.  PLE
@@ -5827,31 +5897,27 @@ impl Qwen4GpuForward {
         let result = (|| {
             if let Some(placement) = bundle.weights.ep_placement() {
                 let state = ep.insert(Qwen4ForwardEp::new(gpu, &bundle.config, placement)?);
-                for layer in &bundle.weights.layer_refs {
-                    if let Some(weights) = layer.ffn.moe() {
-                        moe[layer.layer] = Some(Qwen4MoeLayerRuntime::from_moe_ep(
-                            gpu,
-                            &bundle.weights,
-                            weights,
-                            layer.layer,
-                            &bundle.config,
-                            placement,
-                            &state.dummy,
-                        )?);
-                    }
-                }
+                populate_moe_runtimes(&mut moe, &bundle.weights.layer_refs, |layer, weights| {
+                    Qwen4MoeLayerRuntime::from_moe_ep(
+                        gpu,
+                        &bundle.weights,
+                        weights,
+                        layer,
+                        &bundle.config,
+                        placement,
+                        &state.dummy,
+                    )
+                })?;
             } else {
-                for layer in &bundle.weights.layer_refs {
-                    if let Some(weights) = layer.ffn.moe() {
-                        moe[layer.layer] = Some(Qwen4MoeLayerRuntime::from_moe(
-                            gpu,
-                            &bundle.weights,
-                            weights,
-                            layer.layer,
-                            &bundle.config,
-                        )?);
-                    }
-                }
+                populate_moe_runtimes(&mut moe, &bundle.weights.layer_refs, |layer, weights| {
+                    Qwen4MoeLayerRuntime::from_moe(
+                        gpu,
+                        &bundle.weights,
+                        weights,
+                        layer,
+                        &bundle.config,
+                    )
+                })?;
             }
             let moe_count = moe.iter().flatten().count();
             if !single_scope
@@ -5958,6 +6024,24 @@ impl Qwen4GpuForward {
                         bundle.config.moe_intermediate_size,
                     )?;
                 }
+            }
+            // Sealed expert-slab layers on gfx1100: the symmetric IU4 block above never runs
+            // there (`qwen4_moe_sym_iu4_requested` is gfx1151/gfx1201-only), yet the slab K2
+            // prefill reuses its grouping scratch, down sidecar and shared gate/up scratch.
+            // Reserve them here, before any capture, through the slab-only entry (the
+            // unsuffixed reserve keeps refusing gfx1100). gfx1201 slab loads are unchanged.
+            if !stock_fp8
+                && ep.is_none()
+                && gpu.arch == "gfx1100"
+                && moe.iter().flatten().any(|layer| layer.slab.is_some())
+            {
+                gpu.reserve_qwen4_moe_sym_slab(
+                    max_chunk,
+                    bundle.config.num_experts_per_tok,
+                    bundle.config.num_experts,
+                    bundle.config.hidden_size,
+                    bundle.config.moe_intermediate_size,
+                )?;
             }
             if flash_next {
                 (trunk_zba, trunk_a4) = prepare_trunk_iu4(gpu, bundle)?;
@@ -6145,7 +6229,9 @@ impl Qwen4GpuForward {
     /// Latched faults and diagnostic GPU-only requests take exactly the `off` scheduling.
     pub(crate) fn npu_trunk_planned(&self) -> bool {
         #[cfg(target_os = "linux")]
-        { self.npu_trunk.as_ref().is_some_and(|n| !n.route_off()) }
+        {
+            self.npu_trunk.as_ref().is_some_and(|n| !n.route_off())
+        }
         #[cfg(not(target_os = "linux"))]
         {
             false
@@ -10000,13 +10086,20 @@ mod tests {
             prefill_chunk_requested_from, resolve_expert_stage_min_rows as resolve,
             StageMinRowsSource::{Default, Env},
         };
-        let chunk = |arch: &str, env: Option<&str>| prefill_chunk_requested_from(arch, env, usize::MAX);
+        let chunk =
+            |arch: &str, env: Option<&str>| prefill_chunk_requested_from(arch, env, usize::MAX);
         // gfx1100: the 1536-row chunk is the threshold, so a full chunk stages.
         assert_eq!(chunk("gfx1100", None), 1536);
-        assert_eq!(resolve("gfx1100", chunk("gfx1100", None), None), (1536, Default));
+        assert_eq!(
+            resolve("gfx1100", chunk("gfx1100", None), None),
+            (1536, Default)
+        );
         // gfx1201: chunk 4096 (>= 2048) keeps 2048, even if admission picks 1536.
         assert_eq!(chunk("gfx1201", None), 4096);
-        assert_eq!(resolve("gfx1201", chunk("gfx1201", None), None), (2048, Default));
+        assert_eq!(
+            resolve("gfx1201", chunk("gfx1201", None), None),
+            (2048, Default)
+        );
         assert_eq!(resolve("gfx1201", 1536, None), (2048, Default));
         // An explicit threshold wins on every arch and chunk.
         assert_eq!(resolve("gfx1100", 1536, Some("512")), (512, Env));
@@ -10016,10 +10109,16 @@ mod tests {
         assert_eq!(resolve("gfx1100", 1536, Some("x")), (1536, Default));
         // A larger chunk request caps at the 2048 ceiling.
         assert_eq!(chunk("gfx1100", Some("8192")), 8192);
-        assert_eq!(resolve("gfx1100", chunk("gfx1100", Some("8192")), None), (2048, Default));
+        assert_eq!(
+            resolve("gfx1100", chunk("gfx1100", Some("8192")), None),
+            (2048, Default)
+        );
         // A smaller chunk request lowers it; rounding to 256-row tiles applies.
         assert_eq!(chunk("gfx1100", Some("1100")), 1024);
-        assert_eq!(resolve("gfx1100", chunk("gfx1100", Some("1100")), None), (1024, Default));
+        assert_eq!(
+            resolve("gfx1100", chunk("gfx1100", Some("1100")), None),
+            (1024, Default)
+        );
     }
 
     #[test]
@@ -10048,9 +10147,10 @@ mod tests {
     }
 
     use super::{
-        owner_pitch_extent, qwen4_forward_device_bytes, qwen4_spec_logit_rows, uploaded_ids_range,
-        CompactScratchTerms, Qwen4ForwardScratchMode as Mode, Qwen4GpuForwardScratch as Scratch,
-        ScratchField as F, ScratchSlot, QWEN4_COMPACT_FALLBACK_ROWS,
+        owner_pitch_extent, qwen4_forward_device_bytes, qwen4_spec_logit_rows,
+        slab_codec_tag_bytes, uploaded_ids_range, CompactScratchTerms,
+        Qwen4ForwardScratchMode as Mode, Qwen4GpuForwardScratch as Scratch, ScratchField as F,
+        ScratchSlot, QWEN4_COMPACT_FALLBACK_ROWS,
     };
     use crate::config::{compact_test_config, Qwen4Config};
 
@@ -10493,6 +10593,29 @@ mod tests {
         ] {
             assert!(!CompactScratchTerms::is_exact_gfx1201(arch), "{arch}");
         }
+    }
+
+    /// The host-built tag tensor: the u8 planner table is membership (cold = 1,
+    /// MQ4 = 0) for W3 and E8P alike; the i32 table keeps the real codec.
+    #[test]
+    fn slab_codec_tag_bytes_are_membership_then_real_codecs() {
+        use crate::expert_arena::{CODEC_E8P, CODEC_MQ4, CODEC_W3};
+        for (cold, planner_real) in [(CODEC_W3, 1i32), (CODEC_E8P, 3i32)] {
+            let codecs = [CODEC_MQ4, cold, cold, CODEC_MQ4];
+            let bytes = slab_codec_tag_bytes(&codecs);
+            assert_eq!(bytes.len(), 4 + 4 * 4);
+            assert_eq!(&bytes[..4], &[0, 1, 1, 0]);
+            let owners: Vec<i32> = bytes[4..]
+                .chunks_exact(4)
+                .map(|word| i32::from_le_bytes(word.try_into().unwrap()))
+                .collect();
+            assert_eq!(owners, [0, planner_real, planner_real, 0]);
+        }
+        let full = slab_codec_tag_bytes(&vec![CODEC_E8P; 512]);
+        assert_eq!(
+            full.len(),
+            hipfire_dispatch::pipeline::slab_route::CODEC_TAG_ALLOC_BYTES
+        );
     }
 
     #[test]
@@ -10980,6 +11103,110 @@ mod mesh_range_tests {
     use crate::config::compact_test_config;
     use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
     use hipfire_runtime::mesh_placement::BandPlacement;
+
+    #[test]
+    fn pp1_moe_runtime_slots_visit_every_layer_and_find_each_slab() {
+        use crate::weights::{Qwen4Manifest, Qwen4TierRecipe};
+        use hipfire_runtime::weight_store::{
+            WeightLoadTransaction, WeightProjection, WeightProjectionKind, WeightStore,
+        };
+
+        let config = compact_test_config();
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 1)]).unwrap();
+        let placement = BandPlacement::from_counts(
+            &mesh,
+            config.num_hidden_layers,
+            &[config.num_hidden_layers],
+        )
+        .unwrap();
+        let scope = Qwen4BandScope::from_placement(&config, &placement, 0).unwrap();
+        assert_eq!(scope, Qwen4BandScope::single(&config));
+        let manifest = Qwen4Manifest::build_with_recipe(
+            &config,
+            Qwen4TierRecipe::FlashNextPacked {
+                trunk_tier: DType::Q8_0,
+                mtp_source: false,
+            },
+        )
+        .unwrap()
+        .with_band_scope(&config, &scope)
+        .unwrap();
+        let placements = manifest.placements_for_scope(&config, &scope, 0).unwrap();
+        // Use the real CPU symbolic-ownership assembly seam, as in the
+        // weights tests: no GPU allocation or fabricated runtime/tensor.
+        let mut store = WeightStore::default();
+        for entry in manifest
+            .weights
+            .iter()
+            .filter(|entry| !entry.residency.is_external())
+        {
+            store
+                .stage_alias(
+                    &entry.name,
+                    entry.layer,
+                    0,
+                    "test-source",
+                    WeightProjection {
+                        kind: WeightProjectionKind::Static,
+                        axis: None,
+                        rank: 0,
+                        world_size: 1,
+                        logical_shape: entry.logical_shape.clone(),
+                        dtype: entry.dtype,
+                    },
+                )
+                .unwrap();
+        }
+        let mut tx = WeightLoadTransaction::new(store);
+        let weights = Qwen4Weights::assemble(
+            &mut tx,
+            &config,
+            &manifest.identity.recipe,
+            &placements,
+            &scope,
+        )
+        .unwrap();
+        assert!(tx.is_empty());
+        assert!(weights.ep_placement().is_none());
+        let moe_layers = weights
+            .layer_refs
+            .iter()
+            .filter(|layer| layer.ffn.moe().is_some())
+            .count();
+        assert_eq!(moe_layers, config.num_hidden_layers);
+        let mut slots = vec![None; config.num_hidden_layers];
+        let mut visited = Vec::new();
+        populate_moe_runtimes(&mut slots, &weights.layer_refs, |layer, _| {
+            visited.push(layer);
+            Ok::<_, std::convert::Infallible>(layer)
+        })
+        .unwrap();
+        let expected: Vec<_> = (0..config.num_hidden_layers).collect();
+        assert_eq!(
+            visited, expected,
+            "the actual PP1 builder selects every MoE layer"
+        );
+        assert!(slots.iter().all(Option::is_some));
+        assert_eq!(slots.iter().flatten().count(), moe_layers);
+        assert_eq!(
+            slots.iter().flatten().copied().collect::<Vec<_>>(),
+            expected
+        );
+        // Put the only slab at each actual layer in turn. In particular a
+        // slab at the last layer must still trigger the reserve's any walk.
+        for slab_layer in expected {
+            assert!(
+                slots.iter().flatten().any(|&layer| layer == slab_layer),
+                "reserve skipped sole slab layer {slab_layer}"
+            );
+        }
+        let absent = [None::<usize>; 3];
+        let empty: [Option<usize>; 0] = [];
+        for slots in [&absent[..], &empty[..]] {
+            assert_eq!(slots.iter().flatten().count(), 0);
+            assert!(!slots.iter().flatten().any(|_| true));
+        }
+    }
 
     #[test]
     fn trunk_op_ranges_tile_the_graph_and_the_head_trails_the_output_band() {

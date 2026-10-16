@@ -68,8 +68,14 @@ pub fn run_q8_projection_fresh(
 /// projection callers retain the incumbent dispatcher-entry behavior.
 #[allow(clippy::too_many_arguments)]
 pub fn run_mtp_fill_mq4(
-    gpu: &mut Gpu, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
-    m: usize, k: usize, n: usize, use_pm: bool,
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    n: usize,
+    use_pm: bool,
 ) -> hip_bridge::HipResult<()> {
     if use_pm && gpu.supports_gemm_hfq4g256_rows_pm(m, k, n) {
         gpu.gemm_hfq4g256_rows_pm(w, x, y, m, k, n)
@@ -240,7 +246,9 @@ impl GemmFamily {
             DType::MQ3I4G128R256
             | DType::MQ3I4G128R128
             | DType::MQ2I4G128R256
-            | DType::MQ2I4G128R128 => {
+            | DType::MQ2I4G128R128
+            | DType::E8PI4G128R256
+            | DType::E8PI4G128R128 => {
                 return Err(reject_mq_i4(dtype, "gemm"));
             }
             DType::MQ6G256V2 => KernelKey::GemmMq6G256V2,

@@ -51,18 +51,32 @@
 //!
 //! Flags: `--old-ref REF` (default `f1a457b`), `--old-dir DIR`,
 //! `--only SUBSTR` (repeatable), `--list`, `--device N`, `--expect-arch ARCH`,
-//! `--budget-s N` (total, default 600), `--case-timeout-s N` (default 150).
+//! `--budget-s N` (total, default 600), `--case-timeout-s N` (default 150),
+//! `--out-dir DIR` (default `.`: where `e8p_nan_containment` publishes its JSON and f32le files).
 //!
-//! Memory: about 150 MiB of device memory per child (16 real Q8_0 experts of
-//! 2560x640 = 28 MiB, 16 real MQ4G128V2 experts = 14 MiB, 512-entry pointer
+//! `e8p_nan_containment` (gfx1201 + gfx1100, sibling module `moe_nan_guard_regress/e8p_containment.rs`)
+//! compares the rc4b E8P (and gfx1100 hot MQ4) K1/K2 images against the new guarded launchers and
+//! needs a flat `--old-dir` holding those `.hxaco` images and the pinned beta router sources.
+//!
+//! Memory (every case but `e8p_nan_containment`): about 150 MiB of device memory per child (16 real
+//! Q8_0 experts of 2560x640 = 28 MiB, 16 real MQ4G128V2 experts = 14 MiB, 512-entry pointer
 //! tables, activations / grouped rows for <= 300 tokens, router logits); host
 //! memory is a few MiB. Wall time on a warm kernel cache is well under 120 s; a
 //! cold hipcc cache adds the old-kernel JIT (about 20 small modules).
+//!
+//! Memory of `e8p_nan_containment` (derived, see the `resources` object of its JSON): gfx1201 peak
+//! device 55,224,160 B (52.67 MiB: 16 real E8P experts per projection 20,897,792 B including the
+//! two 512-entry pointer tables, plus the 33-row K2 live set 34,318,680 B and the 7,688 B slab union
+//! scratch); gfx1100 adds a hot-MQ4 phase (tables freed first) with peak 76,113,760 B (72.59 MiB).
+//! Host peak 84,992,000 B (gfx1201) / 98,918,400 B (gfx1100). Flash-Next is never loaded.
 
 #![allow(clippy::too_many_arguments, dead_code)]
 
 #[path = "qwen4_tierc/common.rs"]
 mod common;
+
+#[path = "moe_nan_guard_regress/e8p_containment.rs"]
+mod e8p_containment;
 
 use common::*;
 use hip_bridge::KernargBlob;
@@ -171,6 +185,13 @@ const CASES: &[Case] = &[
         covers: "PM grouped IU4 sym gate/up + down images (60 -> 64 B kernarg): OLD image vs NEW launcher, corrupt tile ids",
         run: pm_iu4_case,
     },
+    Case {
+        name: e8p_containment::CASE_NAME,
+        covers: "expert-slab E8P K1/K2 (gfx1201, gfx1100; gfx1100 also hot MQ4): rc4b images vs new guarded launchers bitwise \
+                 on finite inputs, raw ids -1/n_experts/INT_MAX/INT_MIN skip with finite canary, shortened-n_experts teeth, \
+                 all-NaN/+Inf/-Inf router rows -> consumer chain; publishes JSON + f32le",
+        run: e8p_containment::run,
+    },
 ];
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -191,6 +212,8 @@ struct Args {
     repo: Option<PathBuf>,
     /// Required prefix of the old ref's commit (the baseline receipt); `any` disables the check.
     expect_old_sha: String,
+    /// Directory `e8p_nan_containment` writes its report and finite output file to.
+    out_dir: PathBuf,
 }
 
 fn parse_args(argv: impl IntoIterator<Item = String>) -> R<Args> {
@@ -207,6 +230,7 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> R<Args> {
         case_timeout_s: 150,
         repo: None,
         expect_old_sha: "f1a457b".into(),
+        out_dir: PathBuf::from("."),
     };
     let mut it = argv.into_iter();
     while let Some(arg) = it.next() {
@@ -217,6 +241,7 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> R<Args> {
             "--old-dir" => a.old_dir = Some(PathBuf::from(val("--old-dir")?)),
             "--repo" => a.repo = Some(PathBuf::from(val("--repo")?)),
             "--expect-old-sha" => a.expect_old_sha = val("--expect-old-sha")?,
+            "--out-dir" => a.out_dir = PathBuf::from(val("--out-dir")?),
             "--only" => a.only.push(val("--only")?),
             "--list" => a.list = true,
             "--inproc" => a.inproc = true,
@@ -314,6 +339,7 @@ struct Ctx {
     old_ref: String,
     old_dir: Option<PathBuf>,
     repo: PathBuf,
+    out_dir: PathBuf,
     loaded: HashSet<&'static str>,
     /// Notes the case summary appends (provenance, informational counters).
     notes: Vec<String>,
@@ -2709,8 +2735,20 @@ fn k1_dims(down: bool, lanes: usize) -> (usize, usize, usize, usize, usize) {
     }
 }
 
-/// OLD planner (`qwen4_slab_union_plan.hip` on origin/beta), uniform MQ4 bucket.
-fn run_old_plan(cx: &mut Ctx, topk: &[i32], lanes: usize) -> R<GpuTensor> {
+/// One K1 bucket the harness launches: the union bucket (cold = 0, MQ4 = 1), the cold codec the
+/// production launcher is told (`0` = an MQ4-only layer), the `[gate_up, down]` K1 symbols and the
+/// f32 bit pattern the output buffers are pre-filled with (the NaN poison here; a finite canary in
+/// `e8p_nan_containment`).
+#[derive(Clone, Copy)]
+struct K1Target {
+    bucket: usize,
+    cold_codec: u8,
+    symbols: [&'static str; 2],
+    canary: u32,
+}
+
+/// OLD planner (`qwen4_slab_union_plan.hip` on origin/beta, gfx1151/gfx1201 only), uniform `bucket`.
+fn run_old_plan(cx: &mut Ctx, topk: &[i32], lanes: usize, bucket: usize) -> R<GpuTensor> {
     cx.load_old(&OLD_SLAB_PLAN)?;
     let s = K * lanes;
     let t_top = up_i32(&mut cx.gpu, topk)?;
@@ -2720,20 +2758,62 @@ fn run_old_plan(cx: &mut Ctx, topk: &[i32], lanes: usize) -> R<GpuTensor> {
     b.push_ptr(std::ptr::null());
     b.push_ptr(ptr(&out));
     b.push_i32(s as i32);
-    b.push_i32(1);
+    b.push_i32(bucket as i32);
     cx.launch_old("qwen4_slab_union_plan", [1, 1, 1], [128, 1, 1], 0, b)?;
     sync(&cx.gpu)?;
     free_all(&mut cx.gpu, vec![t_top])?;
     Ok(out)
 }
 
-/// Union pointers of bucket 1 (MQ4) inside the planner's output words.
-fn k1_union_ptrs(union: &GpuTensor, s: usize) -> (*const c_void, *const c_void, *const c_void) {
-    let base = union.buf.as_ptr() as usize;
+/// The production planner's (`Gpu::qwen4_slab_union_plan`, every slab arch) union of `topk` for the
+/// uniform `bucket`, copied out of the slab scratch into its own tensor so a raw launch can read (or
+/// have planted into) a stable descriptor. `6 * S + 2` words.
+fn prod_union(cx: &mut Ctx, topk: &[i32], lanes: usize, bucket: usize) -> R<GpuTensor> {
+    use rdna_compute::slab_moe::SlabBuckets;
+    let s = K * lanes;
+    let t_top = up_i32(&mut cx.gpu, topk)?;
+    cx.gpu
+        .qwen4_slab_union_plan(&t_top, SlabBuckets::Uniform(bucket), lanes)
+        .map_err(e)?;
+    sync(&cx.gpu)?;
+    let words = 6 * s + 2;
+    let base = cx
+        .gpu
+        .scratch
+        .qwen4_slab_union_scratch
+        .as_ref()
+        .ok_or("the slab union scratch is not reserved")?;
+    let view = GpuTensor {
+        buf: base.byte_view(0, words * 4),
+        shape: vec![words],
+        dtype: rdna_compute::DType::F32,
+    };
+    let copy = down_u32(&cx.gpu, &view)?;
+    free_all(&mut cx.gpu, vec![t_top])?;
+    up_u32(&mut cx.gpu, &copy)
+}
+
+/// Word offsets `(ids, offsets, slot ids)` of bucket `bucket` inside the planner's `6 * S + 2` words.
+fn k1_union_words(s: usize, bucket: usize) -> (usize, usize, usize) {
     (
-        (base + s * 4) as *const c_void,
-        (base + (2 * s + (s + 1)) * 4) as *const c_void,
-        (base + (2 * s + 2 * (s + 1) + s) * 4) as *const c_void,
+        bucket * s,
+        2 * s + bucket * (s + 1),
+        2 * s + 2 * (s + 1) + bucket * s,
+    )
+}
+
+/// Union pointers of bucket `bucket` inside the planner's output words.
+fn k1_union_ptrs(
+    union: &GpuTensor,
+    s: usize,
+    bucket: usize,
+) -> (*const c_void, *const c_void, *const c_void) {
+    let base = union.buf.as_ptr() as usize;
+    let (ids, offs, slots) = k1_union_words(s, bucket);
+    (
+        (base + ids * 4) as *const c_void,
+        (base + offs * 4) as *const c_void,
+        (base + slots * 4) as *const c_void,
     )
 }
 
@@ -2741,6 +2821,7 @@ fn k1_union_ptrs(union: &GpuTensor, s: usize) -> (*const c_void, *const c_void, 
 fn k1_blob(
     down: bool,
     lanes: usize,
+    bucket: usize,
     union: &GpuTensor,
     wtab: &GpuTensor,
     x: &GpuTensor,
@@ -2750,7 +2831,7 @@ fn k1_blob(
 ) -> KernargBlob {
     let s = K * lanes;
     let (m, k, div, srows, ys) = k1_dims(down, lanes);
-    let (ids, offs, slots) = k1_union_ptrs(union, s);
+    let (ids, offs, slots) = k1_union_ptrs(union, s, bucket);
     let mut b = KernargBlob::new();
     b.push_ptr(ptr(wtab));
     b.push_ptr(ids);
@@ -2769,18 +2850,23 @@ fn k1_blob(
     b
 }
 
-/// One K1 projection through: the OLD image + OLD planner (`old`), the NEW production
-/// launcher + NEW planner (`new`), or the NEW image launched raw over a caller union (`raw`).
+/// One K1 projection through: the OLD image + OLD planner (`Old`, gfx1151/gfx1201), the OLD image
+/// over the production planner's union (`OldImage`, every slab arch), the NEW production launcher +
+/// NEW planner (`New`), the NEW launcher fed router ids that stay on the device (`NewDev`), or the
+/// NEW image symbol launched raw over a caller union with a declared `n_experts` (`Raw`; the union
+/// may carry out-of-range expert ids).
 enum K1Path<'a> {
     Old(&'a hip_bridge::Function),
+    OldImage(&'a hip_bridge::Function),
     New,
-    /// NEW image symbol launched raw over `union` (may carry out-of-range expert ids).
-    Raw(&'a GpuTensor),
+    NewDev(&'a GpuTensor),
+    Raw(&'a GpuTensor, u32),
 }
 
 fn k1_run(
     cx: &mut Ctx,
     path: K1Path,
+    tgt: K1Target,
     down: bool,
     topk: &[i32],
     lanes: usize,
@@ -2790,20 +2876,38 @@ fn k1_run(
     use rdna_compute::slab_moe::SlabBuckets;
     let s = K * lanes;
     let (m, _, _, _, ys) = k1_dims(down, lanes);
+    let canary = vec![f32::from_bits(tgt.canary); s * ys];
     let t_x = up_f32(&mut cx.gpu, x)?;
-    let y0 = sentinel_f32(&mut cx.gpu, s * ys)?;
+    let y0 = up_f32(&mut cx.gpu, &canary)?;
     let y1 = if down {
         None
     } else {
-        Some(sentinel_f32(&mut cx.gpu, s * ys)?)
+        Some(up_f32(&mut cx.gpu, &canary)?)
     };
     let mut extra = Vec::new();
     match path {
         K1Path::Old(f) => {
-            let union = run_old_plan(cx, topk, lanes)?;
+            let union = run_old_plan(cx, topk, lanes, tgt.bucket)?;
             let b = k1_blob(
                 down,
                 lanes,
+                tgt.bucket,
+                &union,
+                &wtab.table,
+                &t_x,
+                &y0,
+                y1.as_ref(),
+                None,
+            );
+            cx.launch_raw(f, [m as u32, s as u32, 1], [32, 1, 1], b)?;
+            extra.push(union);
+        }
+        K1Path::OldImage(f) => {
+            let union = prod_union(cx, topk, lanes, tgt.bucket)?;
+            let b = k1_blob(
+                down,
+                lanes,
+                tgt.bucket,
                 &union,
                 &wtab.table,
                 &t_x,
@@ -2817,32 +2921,51 @@ fn k1_run(
         K1Path::New => {
             let t_top = up_i32(&mut cx.gpu, topk)?;
             cx.gpu
-                .qwen4_slab_union_plan(&t_top, SlabBuckets::Uniform(1), lanes)
+                .qwen4_slab_union_plan(&t_top, SlabBuckets::Uniform(tgt.bucket), lanes)
                 .map_err(e)?;
             cx.gpu
                 .mq_i4_moe_gemv_slab(
                     down,
-                    SlabBuckets::Uniform(1),
+                    SlabBuckets::Uniform(tgt.bucket),
                     &wtab.table,
                     &t_x,
                     &y0,
                     y1.as_ref(),
                     lanes,
+                    tgt.cold_codec,
                 )
                 .map_err(e)?;
             extra.push(t_top);
         }
-        K1Path::Raw(union) => {
-            let sym = rdna_compute::slab_moe::MQ_I4_MOE_GEMV_SYMBOLS[1][usize::from(down)];
+        K1Path::NewDev(t_top) => {
+            cx.gpu
+                .qwen4_slab_union_plan(t_top, SlabBuckets::Uniform(tgt.bucket), lanes)
+                .map_err(e)?;
+            cx.gpu
+                .mq_i4_moe_gemv_slab(
+                    down,
+                    SlabBuckets::Uniform(tgt.bucket),
+                    &wtab.table,
+                    &t_x,
+                    &y0,
+                    y1.as_ref(),
+                    lanes,
+                    tgt.cold_codec,
+                )
+                .map_err(e)?;
+        }
+        K1Path::Raw(union, n_experts) => {
+            let sym = tgt.symbols[usize::from(down)];
             let blob = k1_blob(
                 down,
                 lanes,
+                tgt.bucket,
                 union,
                 &wtab.table,
                 &t_x,
                 &y0,
                 y1.as_ref(),
-                Some(E as u32),
+                Some(n_experts),
             );
             let mut bytes = blob.into_vec();
             cx.gpu
@@ -2865,27 +2988,39 @@ fn k1_run(
     Ok(o)
 }
 
-/// Slot rows of `y` (stride `ys`) that are all the NaN sentinel.
-fn rows_untouched(y: &[u32], ys: usize, slot: usize) -> bool {
-    y[slot * ys..(slot + 1) * ys]
-        .iter()
-        .all(|&v| v == nan_poison().to_bits())
+/// Slot rows of `y` (stride `ys`) that are all the `canary` word.
+fn rows_untouched(y: &[u32], ys: usize, slot: usize, canary: u32) -> bool {
+    y[slot * ys..(slot + 1) * ys].iter().all(|&v| v == canary)
 }
 
 fn pm_k1_case(cx: &mut Ctx) -> R<Outcome> {
-    if !cx.gpu.qwen4_slab_arch() {
+    use rdna_compute::slab_admission::SLAB_CODEC_MQ4;
+    // The OLD image and planner are beta's, which exist at the pinned ref for gfx1151/gfx1201 only;
+    // gfx1100's hot MQ4 K1 (and every E8P K1/K2) is compared against the rc4b images by
+    // `e8p_nan_containment`.
+    let beta_arch = matches!(cx.arch.as_str(), "gfx1151" | "gfx1201");
+    let slab = rdna_compute::slab_moe::slab_arch_kernels(&cx.arch)
+        .filter(|_| beta_arch && rdna_compute::qwen4_slab_codec_admitted(&cx.arch, SLAB_CODEC_MQ4));
+    let Some(slab) = slab else {
         return Ok(Outcome::Skip(format!(
-            "sealed expert-slab K1 is gfx1151/gfx1201-only, device is {}",
+            "the beta-pinned expert-slab K1 comparison is gfx1151/gfx1201-only, device is {}",
             cx.arch
         )));
-    }
+    };
+    let tgt = K1Target {
+        bucket: 1,
+        cold_codec: SLAB_CODEC_MQ4,
+        symbols: slab.mq4_k1.symbols,
+        canary: nan_poison().to_bits(),
+    };
     let mut rng = Rng::new(0x4E41_4E80);
     let mut results = Vec::new();
-    cx.gpu.ensure_qwen4_slab_kernels().map_err(e)?;
+    cx.gpu
+        .ensure_qwen4_slab_kernels(SLAB_CODEC_MQ4)
+        .map_err(e)?;
     cx.gpu.reserve_qwen4_slab(0).map_err(e)?;
-    let rel = format!("kernels/mq_i4_moe_gemv_pm_{}.hxaco", cx.arch);
-    let syms = rdna_compute::slab_moe::MQ_I4_MOE_GEMV_SYMBOLS[1];
-    let (_module, fns) = cx.load_old_image(&rel, &syms)?;
+    let rel = format!("kernels/{}.hxaco", slab.mq4_k1.module);
+    let (_module, fns) = cx.load_old_image(&rel, &tgt.symbols)?;
     let gate = build_experts_with(cx, &mut rng, mq4_gate_expert, 1280, 2560)?;
     let down = build_experts_with(cx, &mut rng, mq4_down_expert, 2560, 640)?;
     for &lanes in &[1usize, 3, 8] {
@@ -2898,8 +3033,8 @@ fn pm_k1_case(cx: &mut Ctx) -> R<Outcome> {
             let x = extreme_vec(&mut rng, srows * k, -2.0, 2.0);
             let tag = format!("{} lanes={lanes}", if is_down { "down" } else { "gate_up" });
             // 1. finite identity: NEW image + NEW planner vs OLD image + OLD planner.
-            let old = k1_run(cx, K1Path::Old(f), is_down, &topk, lanes, wtab, &x)?;
-            let new = k1_run(cx, K1Path::New, is_down, &topk, lanes, wtab, &x)?;
+            let old = k1_run(cx, K1Path::Old(f), tgt, is_down, &topk, lanes, wtab, &x)?;
+            let new = k1_run(cx, K1Path::New, tgt, is_down, &topk, lanes, wtab, &x)?;
             results.push(exact_bits(
                 &format!("PM K1 {tag} y0 new-vs-old"),
                 &new.y0,
@@ -2914,7 +3049,7 @@ fn pm_k1_case(cx: &mut Ctx) -> R<Outcome> {
             //    valid twin (the old planner remapped bad ids to expert 0; those slots are excluded).
             for phase in 0..4 {
                 let (bad_ids, bad) = poison_topk(&topk, phase);
-                let new_bad = k1_run(cx, K1Path::New, is_down, &bad_ids, lanes, wtab, &x)?;
+                let new_bad = k1_run(cx, K1Path::New, tgt, is_down, &bad_ids, lanes, wtab, &x)?;
                 let mut diff = None;
                 for slot in 0..s {
                     let (a, b) = (
@@ -2922,7 +3057,7 @@ fn pm_k1_case(cx: &mut Ctx) -> R<Outcome> {
                         &old.y0[slot * ys..(slot + 1) * ys],
                     );
                     if bad[slot] {
-                        if !rows_untouched(&new_bad.y0, ys, slot) {
+                        if !rows_untouched(&new_bad.y0, ys, slot, tgt.canary) {
                             diff = Some(format!("unrouted slot {slot} was written"));
                             break;
                         }
@@ -2939,7 +3074,7 @@ fn pm_k1_case(cx: &mut Ctx) -> R<Outcome> {
             // 3. raw bad ids planted in the union itself (NEW image, 96-byte kernarg): the image must
             //    exit before indexing the expert table. Experts of the first slot get each bad id.
             for &bad_id in &BAD_IDS {
-                let union = run_old_plan(cx, &topk, lanes)?;
+                let union = run_old_plan(cx, &topk, lanes, tgt.bucket)?;
                 let mut words = down_u32(&cx.gpu, &union)?;
                 // ids[b=1][e=0] (word S + 0) is the first MQ4 expert; its slot run is offs[1][0..1].
                 words[s] = bad_id as u32;
@@ -2948,11 +3083,20 @@ fn pm_k1_case(cx: &mut Ctx) -> R<Outcome> {
                     .map(|p| words[2 * s + 2 * (s + 1) + s + p] as usize)
                     .collect();
                 let t_union = up_u32(&mut cx.gpu, &words)?;
-                let raw = k1_run(cx, K1Path::Raw(&t_union), is_down, &topk, lanes, wtab, &x)?;
+                let raw = k1_run(
+                    cx,
+                    K1Path::Raw(&t_union, E as u32),
+                    tgt,
+                    is_down,
+                    &topk,
+                    lanes,
+                    wtab,
+                    &x,
+                )?;
                 let mut diff = None;
                 for slot in 0..s {
                     if planted.contains(&slot) {
-                        if !rows_untouched(&raw.y0, ys, slot) {
+                        if !rows_untouched(&raw.y0, ys, slot, tgt.canary) {
                             diff = Some(format!("slot {slot} of the bad-id expert was written"));
                             break;
                         }
@@ -3215,6 +3359,7 @@ fn make_ctx(args: &Args) -> R<Ctx> {
         old_ref: args.old_ref.clone(),
         old_dir: args.old_dir.clone(),
         repo,
+        out_dir: args.out_dir.clone(),
         loaded: HashSet::new(),
         notes: Vec::new(),
     })
@@ -3307,6 +3452,7 @@ fn supervise(args: &Args, cases: &[&Case]) -> i32 {
         if let Some(r) = &args.repo {
             cmd.arg("--repo").arg(r);
         }
+        cmd.arg("--out-dir").arg(&args.out_dir);
         if let Some(d) = args.device {
             cmd.args(["--device", d.to_string().as_str()]);
         }
@@ -3444,6 +3590,7 @@ mod tests {
             "combine_grouped",
             "pm_k1_gemv",
             "pm_iu4_sym_grouped",
+            "e8p_nan_containment",
         ] {
             assert!(CASES.iter().any(|c| c.name == need), "missing case {need}");
         }
@@ -3473,6 +3620,9 @@ mod tests {
             ),
             (Some(1), true, "f1a457b", "f1a457b")
         );
+        assert_eq!(a.out_dir, PathBuf::from("."));
+        let o = parse_args(["--out-dir", "x/y"].map(String::from)).unwrap();
+        assert_eq!(o.out_dir, PathBuf::from("x/y"));
         assert!(parse_args(["--nope"].map(String::from)).is_err());
         assert!(parse_args(["--device"].map(String::from)).is_err());
     }

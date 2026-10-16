@@ -4275,6 +4275,25 @@ pub const QWEN4_MOE_IU4_SYM_PM_GFX1201: &[u8] =
 /// trailing `n_experts` and the `expert id >= n_experts` unsigned exit).
 pub const QWEN4_MOE_IU4_SYM_W3_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_w3_pm_gfx1201.hxaco");
+/// Certified builder module of the gfx1100 NT1 grouped symmetric IU4 MoE GEMMs over MQ4 experts
+/// `qwen4_moe_iu4_sym_pm_gfx1100` (64-byte ABI of the gfx1201 NT1 entries, trailing `n_experts@60`; serving entries
+/// `qwen4_moe_{gate_up_silu,down}_iu4_sym_pm_gfx1100`). A workgroup whose routing expert id is not `< n_experts`
+/// (unsigned compare, so negative ids too) exits uniformly before the pointer-table index, any weight prefetch and the
+/// first barrier, storing nothing. The `_acc` qualification twins are never loaded by the serving route; the cold
+/// (E8P) K2 module is [`QWEN4_MOE_IU4_SYM_E8P_PM_GFX1100`].
+pub const QWEN4_MOE_IU4_SYM_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/qwen4_moe_iu4_sym_pm_gfx1100.hxaco");
+/// Certified builder module of the gfx1100 NT1 grouped symmetric IU4 MoE GEMMs over E8P-I4
+/// experts (`qwen4_moe_iu4_sym_e8p_pm_gfx1100`; the K-E0 planar `[M*K/8 u16 words][M*K/128 f16
+/// scales]` wire): serving entries `qwen4_moe_{gate_up_silu,down}_iu4_sym_e8p_pm_gfx1100`
+/// (64-byte kernarg ABI, trailing `n_experts@60` with the same uniform invalid-expert skip, block 64 / 128, 1,536 B
+/// static LDS, no dynamic LDS; contracts
+/// `peacemaker-isa/kernels/qwen4_moe_sym.gfx1100.{gate_up_e8p,down_e8p}.contract.json`). The
+/// `_acc` F32 qualification twins live in the image but are never served.
+/// SHA-256 1312ad13de6f123654d8174622bdc14826c2222544b1a833fbd812c6ddcb7e81 is the pre-rc5 image (60-byte ABI),
+/// superseded by the regenerated 64-byte image.
+pub const QWEN4_MOE_IU4_SYM_E8P_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/qwen4_moe_iu4_sym_e8p_pm_gfx1100.hxaco");
 /// Certified builder module of the gathered QSA prefill attention
 /// (`peacemaker-isa emit --kernel qsa_gather --arch ARCH`, M7 obligation-free):
 /// the F16 K / block-transposed V producer and the gathered F16 WMMA
@@ -4462,6 +4481,36 @@ pub const QWEN4_MOE_SYM_CHECK_GFX1201_SRC: &str =
 /// the same six outputs as [`MOE_SCATTER_FUSED_TOP10_SRC`].
 pub const QWEN4_MOE_SCATTER_STABLE_TOP10_SRC: &str =
     include_str!("../../../kernels/src/qwen4_moe_scatter_stable_top10.hip");
+/// Removes exactly one occurrence of the arch guard text `guard` from `src` and nothing else (the
+/// assembler of the gfx1100 slab sources; panics when the guard text drifted from the source).
+fn strip_exact_arch_guard(src: &str, guard: &str) -> String {
+    assert_eq!(
+        src.matches(guard).count(),
+        1,
+        "the arch guard text drifted from the source"
+    );
+    src.replacen(guard, "", 1)
+}
+/// Exact arch-guard text of the stable-grouping source (`#if`/`#error`/`#endif`).
+pub const QWEN4_MOE_SCATTER_STABLE_TOP10_ARCH_GUARD: &str = concat!(
+    "#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1100__) && !defined(__gfx1151__) && !defined(__gfx1201__) && !defined(__gfx942__)\n",
+    "#error \"qwen4_moe_scatter_stable_top10.hip is gfx1100/gfx1151/gfx1201/gfx942-only\"\n",
+    "#endif\n",
+);
+/// The stable grouping assembled for the gfx1100 sealed expert-slab:
+/// [`QWEN4_MOE_SCATTER_STABLE_TOP10_SRC`] with ONLY its arch guard removed. The body is
+/// wave-size neutral by construction (its header says so: no shuffles, ballots or wave masks,
+/// every exchange through LDS behind `__syncthreads`, block sizes in threads not waves) and the
+/// compiler's own gfx1100 macros stay intact.
+pub fn qwen4_moe_scatter_stable_top10_gfx1100_src() -> &'static str {
+    static SRC: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        strip_exact_arch_guard(
+            QWEN4_MOE_SCATTER_STABLE_TOP10_SRC,
+            QWEN4_MOE_SCATTER_STABLE_TOP10_ARCH_GUARD,
+        )
+    });
+    &SRC
+}
 /// Sealed expert-slab decode lane-union planner (gfx1201, gfx1151): routed ids ->
 /// fixed-capacity per-codec-bucket K1 descriptors, no host readback.
 pub const QWEN4_SLAB_UNION_PLAN_SRC: &str =
@@ -4499,6 +4548,51 @@ pub const QWEN4_MOE_IU4_SYM_W3_PM_GFX1151: &[u8] =
 /// `..._w3_pm_gfx1151_nt4`, `_nt4r2`, `_nt4r4` (row repeats 1, 2, 4), each bitwise the NT1 entry.
 pub const QWEN4_MOE_IU4_SYM_W3_NT4_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151.hxaco");
+/// E8P-I4 F4 lane-pair MoE decode, 96-byte pointer-table ABI (the 88-byte frozen F4 layout plus trailing `n_experts@88`
+/// and a zero `reserved@92`, like the shared MQ4/W3 K1 images): a workgroup whose expert id is not `< n_experts`
+/// (unsigned) exits before the pointer-table index, weight prefetch and first barrier, with no store.
+pub const E8P_I4_MOE_GEMV_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/e8p_i4_moe_gemv_pm_gfx1201.hxaco");
+/// K2 (`qwen4_moe_iu4_sym_e8p`) certified builder module, gfx1201: the E8P-I4 NT1 grouped
+/// symmetric IU4 GEMMs (64-byte ABI of the W3 NT1 entries, trailing `n_experts@60`), serving symbols
+/// `qwen4_moe_{gate_up_silu,down}_iu4_sym_e8p_pm_gfx1201` (the `_acc` twins are never served).
+pub const QWEN4_MOE_IU4_SYM_E8P_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/qwen4_moe_iu4_sym_e8p_pm_gfx1201.hxaco");
+/// Exact arch-guard text of the planner source (`#if`/`#error`/`#endif`, newline-terminated).
+pub const QWEN4_SLAB_UNION_PLAN_ARCH_GUARD: &str = concat!(
+    "#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1201__) && !defined(__gfx1151__)\n",
+    "#error \"qwen4_slab_union_plan.hip is gfx1201/gfx1151-only\"\n",
+    "#endif\n",
+);
+/// The lane-union planner assembled for gfx1100: [`QWEN4_SLAB_UNION_PLAN_SRC`] with ONLY
+/// [`QWEN4_SLAB_UNION_PLAN_ARCH_GUARD`] removed ([`strip_exact_arch_guard`]); the body is
+/// wave-size neutral (one 512-thread workgroup, `__syncthreads` plus static LDS, no shuffle,
+/// ballot, wave mask or arch macro) and the compiler's own gfx1100 macros stay intact. The
+/// registry entry and the launcher both use this one expression; the module key is arch-aware.
+pub fn qwen4_slab_union_plan_gfx1100_src() -> &'static str {
+    static SRC: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        strip_exact_arch_guard(QWEN4_SLAB_UNION_PLAN_SRC, QWEN4_SLAB_UNION_PLAN_ARCH_GUARD)
+    });
+    &SRC
+}
+/// K1 (`mq_i4_moe_gemv`) MQ4-only certified builder module for gfx1100
+/// (`mq_i4_moe_gemv_mq4only_pm_gfx1100`): the slab's hot MQ4 bucket reads its
+/// `mq_i4_moe_gemv_mq4sym_{r256_gate_up,r128_down}_pm_gfx1100` entries (F4 read-once C8
+/// decode GEMVs over pointer-addressed MQ4 expert tensors; 96-byte kernarg ABI, trailing `n_experts@88` and zero
+/// `reserved@92`, the shared K1 guard). The image carries no W2 (`mq2i4`)
+/// entry; the retired mixed image `mq_i4_moe_gemv_pm_gfx1100.hxaco` is not embedded.
+pub const MQ_I4_MOE_GEMV_MQ4ONLY_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/mq_i4_moe_gemv_mq4only_pm_gfx1100.hxaco");
+/// K1 `e8p_i4_moe_gemv_pm_gfx1100` certified builder module for gfx1100: the slab's cold E8P-I4
+/// entries `e8p_i4_moe_gemv_{r256_gate_up,r128_down}_pm_gfx1100` (96-byte kernarg ABI: the frozen
+/// 88-byte F4 layout plus trailing `n_experts@88` and zero `reserved@92`, with the uniform invalid-expert skip before
+/// the pointer-table index, 1,536 B static LDS). Served for codec 3 on gfx1100 (cold bucket of E8P layers) through
+/// the admission-gated `slab_cold_kernels`; presence of the image is not permission.
+pub const E8P_I4_MOE_GEMV_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/e8p_i4_moe_gemv_pm_gfx1100.hxaco");
+/// K3 (`mq_i4_a4`) certified builder module for gfx1100: the row-local R128/K640
+/// `block_i4_128` down-sidecar producer `mq_i4_a4_r128_k640_gfx1100`.
+pub const MQ_I4_A4_PM_GFX1100: &[u8] = include_bytes!("../../../kernels/mq_i4_a4_pm_gfx1100.hxaco");
 /// Down A4 producer: grouped BF16 SwiGLU rows -> FWHT128 -> the shared
 /// `quantize_block_i4_128_wave<true>` (candidate set from the host flags,
 /// C2 by default) into a compact flat-slot `block_i4_128` sidecar.
@@ -9995,9 +10089,9 @@ pub const QWEN4_EP_OWNER_ASSIGN_PM_GFX1201: &[u8] =
 /// ids with every tile of a non-owned expert set to the -1 sentinel.
 pub const EP_TILE_MASK_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/ep_tile_mask_pm_gfx1201.hxaco");
-
-/// gfx1100 build of [`EP_TILE_MASK_PM_GFX1201`] (`peacemaker-isa emit --kernel ep_tile_mask_pm
-/// --arch gfx1100`).
+/// Certified builder module of the same tile mask for gfx1100 (`peacemaker-isa emit --kernel
+/// ep_tile_mask_pm --arch gfx1100`). Used only by the sealed expert-slab codec split
+/// ([`crate::Gpu::qwen4_slab_tile_masks`]); the owner-routed EP exchange stays gfx1201-only.
 pub const EP_TILE_MASK_PM_GFX1100: &[u8] =
     include_bytes!("../../../kernels/ep_tile_mask_pm_gfx1100.hxaco");
 

@@ -176,6 +176,7 @@ fn select_grouped_route(
     dtype_tags: Option<&GpuTensor>,
     has_sidecars: bool,
     route_policy: Option<crate::families::moe::MoeRoutePolicy>,
+    arch: &str,
 ) -> Option<crate::families::moe::MoeRouteCapability> {
     let policy = route_policy?;
     let shared = dtypes.shared?;
@@ -233,6 +234,7 @@ fn select_grouped_route(
         MoeRouteCapability::SlabCodecGrouped
             if policy.capability.admitted_on()
                 && crate::families::moe::slab_route_geometry_supported(
+                    Some(arch),
                     &policy,
                     n_exp,
                     k_top,
@@ -401,6 +403,7 @@ mod qwen4_route_tests {
                 routed_gate_up: DType::MQ4G256V2,
                 routed_down: DType::MQ4G128V2,
             },
+            slab_cold_codec: None,
         }
     }
 
@@ -429,6 +432,7 @@ mod qwen4_route_tests {
             Some(policy(
                 dtypes.shared.map_or(DType::MQ4G128V2, |shared| shared.down),
             )),
+            "gfx1201",
         )
         .is_some()
     }
@@ -505,6 +509,7 @@ mod qwen4_route_tests {
                 None,
                 false,
                 Some(declared),
+                "gfx1201",
             )
             .is_some()
         };
@@ -537,6 +542,7 @@ mod qwen4_route_tests {
                 None,
                 false,
                 Some(policy(DType::MQ4G128V2)),
+                "gfx1201",
             ),
             cfg!(feature = "deltanet").then_some(MoeRouteCapability::Qt44Qt53Grouped),
         );
@@ -554,6 +560,7 @@ mod qwen4_route_tests {
                 None,
                 true,
                 Some(policy(DType::MQ4G128V2)),
+                "gfx1201",
             ),
             None,
         );
@@ -571,6 +578,7 @@ mod qwen4_route_tests {
                 None,
                 false,
                 Some(policy(DType::MQ4G128V2)),
+                "gfx1201",
             ),
             None,
         );
@@ -593,6 +601,7 @@ mod qwen4_route_tests {
                 None,
                 false,
                 Some(declared),
+                "gfx1201",
             )
             .is_some()
         };
@@ -661,6 +670,177 @@ mod qwen4_route_tests {
         dtypes.routed_gate_up = DType::MQ4G256;
         assert_rejected(&dtypes);
     }
+
+    /// The sealed slab route admits gfx1201 MQ4 / W3 / E8P, gfx1151 MQ4 / W3 and gfx1100
+    /// MQ4 / E8P; every other arch, a crossed pair and W2 (everywhere) refuse,
+    /// and a declared cold codec must be the one the dtypes name.
+    #[test]
+    fn slab_route_follows_the_arch_codec_matrix() {
+        let pairs = [
+            (DType::MQ4G256V2, DType::MQ4G128V2),
+            (DType::MQ3I4G128R256, DType::MQ3I4G128R128),
+            (DType::E8PI4G128R256, DType::E8PI4G128R128),
+            (DType::E8PI4G128R256, DType::MQ3I4G128R128),
+            (DType::MQ2I4G128R256, DType::MQ2I4G128R128),
+            (DType::MQ3I4G128R256, DType::MQ4G128V2),
+        ];
+        let declared_cold = [None, Some(1), Some(3), None, None, None];
+        let route = |arch: &str, (gate_up, down): (DType, DType), cold: Option<u8>| {
+            let mut dtypes = canonical_dtypes();
+            (dtypes.routed_gate_up, dtypes.routed_down) = (gate_up, down);
+            let mut declared = policy(DType::MQ4G128V2);
+            declared.capability = MoeRouteCapability::SlabCodecGrouped;
+            declared.slab_cold_codec = cold;
+            select_grouped_route(
+                &dtypes,
+                512,
+                10,
+                2560,
+                640,
+                640,
+                2560,
+                2560,
+                640,
+                None,
+                false,
+                Some(declared),
+                arch,
+            )
+            .is_some()
+        };
+        let deltanet = cfg!(feature = "deltanet");
+        for (arch, admitted) in [
+            ("gfx1201", [true, true, true, false, false, false]),
+            ("gfx1100", [true, false, true, false, false, false]),
+            ("gfx1151", [true, true, false, false, false, false]),
+            ("gfx1200", [false; 6]),
+            ("gfx942", [false; 6]),
+        ] {
+            for ((pair, cold), admitted) in pairs.into_iter().zip(declared_cold).zip(admitted) {
+                assert_eq!(
+                    route(arch, pair, cold),
+                    admitted && deltanet,
+                    "{arch} {pair:?}"
+                );
+            }
+        }
+        // A declaration that disagrees with the dtypes refuses.
+        for arch in ["gfx1201", "gfx1100"] {
+            assert!(!route(arch, pairs[2], Some(1)), "{arch}");
+            assert!(!route(arch, pairs[2], None), "{arch}");
+            assert!(!route(arch, pairs[0], Some(3)), "{arch}");
+        }
+        assert!(!route("gfx1201", pairs[1], Some(3)));
+        assert!(!route("gfx1201", pairs[1], None));
+        assert!(!route("gfx1201", pairs[0], Some(1)));
+        assert!(!route("gfx1151", pairs[1], Some(3)));
+        assert!(!route("gfx1151", pairs[1], None));
+        assert!(!route("gfx1151", pairs[0], Some(1)));
+        // W2 is refused everywhere, whatever it is declared as.
+        for arch in ["gfx1201", "gfx1100", "gfx1151"] {
+            for cold in [None, Some(0), Some(1), Some(2), Some(3)] {
+                assert!(!route(arch, pairs[4], cold), "{arch} {cold:?}");
+            }
+        }
+        // Cold codec = bucket 0, MQ4 = bucket 1.
+        use crate::families::moe::slab_bucket_of_pair;
+        for arch in ["gfx1201", "gfx1100"] {
+            assert_eq!(slab_bucket_of_pair(arch, pairs[0].0, pairs[0].1), Some(1));
+            assert_eq!(slab_bucket_of_pair(arch, pairs[2].0, pairs[2].1), Some(0));
+            assert_eq!(slab_bucket_of_pair(arch, pairs[4].0, pairs[4].1), None);
+        }
+        assert_eq!(
+            slab_bucket_of_pair("gfx1201", pairs[1].0, pairs[1].1),
+            Some(0)
+        );
+        assert_eq!(slab_bucket_of_pair("gfx1100", pairs[1].0, pairs[1].1), None);
+        // gfx1151: MQ4 = bucket 1, W3 = bucket 0; E8P and W2 have none.
+        assert_eq!(
+            slab_bucket_of_pair("gfx1151", pairs[0].0, pairs[0].1),
+            Some(1)
+        );
+        assert_eq!(
+            slab_bucket_of_pair("gfx1151", pairs[1].0, pairs[1].1),
+            Some(0)
+        );
+        assert_eq!(slab_bucket_of_pair("gfx1151", pairs[2].0, pairs[2].1), None);
+        assert_eq!(slab_bucket_of_pair("gfx1151", pairs[4].0, pairs[4].1), None);
+    }
+
+    /// A mixed slab layer (per-expert pairs plus a codec table) is MQ4 plus
+    /// exactly one admitted cold codec the policy declares: gfx1100 serves an
+    /// E8P layer (MQ4 first or cold first) and refuses W3, gfx1151 serves a W3 layer and refuses
+    /// E8P, and every arch refuses W3 + E8P in one
+    /// layer, W2 anywhere, and a declaration that disagrees with the table.
+    #[test]
+    fn slab_route_mixed_layers_follow_the_arch_codec_matrix() {
+        const MQ4: (DType, DType) = (DType::MQ4G256V2, DType::MQ4G128V2);
+        const W3: (DType, DType) = (DType::MQ3I4G128R256, DType::MQ3I4G128R128);
+        const E8P: (DType, DType) = (DType::E8PI4G128R256, DType::E8PI4G128R128);
+        const W2: (DType, DType) = (DType::MQ2I4G128R256, DType::MQ2I4G128R128);
+        let tags = GpuTensor::null_for_test();
+        let route =
+            |arch: &str, first: (DType, DType), tail: &[(DType, DType)], cold: Option<u8>| {
+                let mut pairs = vec![first; 512];
+                pairs[512 - tail.len()..].copy_from_slice(tail);
+                let gate_up: Vec<DType> = pairs.iter().map(|pair| pair.0).collect();
+                let down: Vec<DType> = pairs.iter().map(|pair| pair.1).collect();
+                let mut dtypes = canonical_dtypes();
+                dtypes.routed_has_mixed_experts = true;
+                (dtypes.routed_gate_up, dtypes.routed_down) = first;
+                dtypes.per_expert_gate_up = Some(&gate_up);
+                dtypes.per_expert_down = Some(&down);
+                let mut declared = policy(DType::MQ4G128V2);
+                declared.capability = MoeRouteCapability::SlabCodecGrouped;
+                declared.slab_cold_codec = cold;
+                select_grouped_route(
+                    &dtypes,
+                    512,
+                    10,
+                    2560,
+                    640,
+                    640,
+                    2560,
+                    2560,
+                    640,
+                    Some(&tags),
+                    false,
+                    Some(declared),
+                    arch,
+                )
+                .is_some()
+            };
+        let deltanet = cfg!(feature = "deltanet");
+        // MQ4-first E8P layer and an E8P-first one.
+        assert_eq!(route("gfx1100", MQ4, &[E8P], Some(3)), deltanet);
+        assert_eq!(route("gfx1100", E8P, &[MQ4], Some(3)), deltanet);
+        assert_eq!(route("gfx1201", MQ4, &[E8P], Some(3)), deltanet);
+        assert_eq!(route("gfx1201", MQ4, &[W3], Some(1)), deltanet);
+        // W3 is not served on gfx1100.
+        assert!(!route("gfx1100", MQ4, &[W3], Some(1)));
+        // W3 + E8P in one layer, W2 anywhere, a mismatched declaration.
+        for arch in ["gfx1201", "gfx1100"] {
+            for cold in [None, Some(1), Some(3)] {
+                assert!(!route(arch, MQ4, &[W3, E8P], cold), "{arch} {cold:?}");
+                assert!(!route(arch, MQ4, &[E8P, W2], cold), "{arch} {cold:?}");
+                assert!(!route(arch, W2, &[MQ4, E8P], cold), "{arch} {cold:?}");
+            }
+            assert!(!route(arch, MQ4, &[E8P], Some(1)), "{arch}");
+            assert!(!route(arch, MQ4, &[E8P], None), "{arch}");
+        }
+        // gfx1151 serves W3 next to MQ4 (either order) and refuses a W3 + E8P layer and W2.
+        assert_eq!(route("gfx1151", MQ4, &[W3], Some(1)), deltanet);
+        assert_eq!(route("gfx1151", W3, &[MQ4], Some(1)), deltanet);
+        for cold in [None, Some(1), Some(3)] {
+            assert!(!route("gfx1151", MQ4, &[W3, E8P], cold), "{cold:?}");
+            assert!(!route("gfx1151", MQ4, &[W3, W2], cold), "{cold:?}");
+        }
+        assert!(!route("gfx1151", MQ4, &[W3], Some(3)));
+        assert!(!route("gfx1151", MQ4, &[W3], None));
+        for arch in ["gfx1200", "gfx942", "gfx1030"] {
+            assert!(!route(arch, MQ4, &[E8P], Some(3)), "{arch}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -709,6 +889,7 @@ mod fp8_route_tests {
                 routed_gate_up: DType::FP8E4M3B128,
                 routed_down: DType::FP8E4M3B128,
             },
+            slab_cold_codec: None,
         }
     }
 
@@ -4039,10 +4220,15 @@ fn decode_gate_up_stage(
         if route.is_some_and(MoeRouteCapability::is_slab) {
             // Sealed expert-slab C1 decode: the K1 lane-union GEMV over codec
             // buckets (per-expert codecs, pointer-addressed).
-            let buckets = slab_route::buckets(&p.dtypes, p.expert_dtype_tags)?;
+            let layer = slab_route::layer(
+                &gpu.arch,
+                p.route_policy.as_ref(),
+                &p.dtypes,
+                p.expert_dtype_tags,
+            )?;
             slab_route::k1_gate_up(
                 gpu,
-                buckets,
+                layer,
                 p.expert_gate_up_ptrs,
                 p.topk_indices,
                 xr,
@@ -4409,10 +4595,15 @@ fn decode_down_stage(
         if route.is_some_and(MoeRouteCapability::is_slab) {
             // Over the union this call's gate/up planned (same stream, no
             // other slab launch between the two stages).
-            let buckets = slab_route::buckets(&p.dtypes, p.expert_dtype_tags)?;
+            let layer = slab_route::layer(
+                &gpu.arch,
+                p.route_policy.as_ref(),
+                &p.dtypes,
+                p.expert_dtype_tags,
+            )?;
             slab_route::k1_down(
                 gpu,
-                buckets,
+                layer,
                 p.topk_indices,
                 p.expert_down_ptrs,
                 &rot_batch,

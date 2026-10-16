@@ -5,6 +5,22 @@
 //! a JSON receipt. Verification is built in and cannot be disabled; see
 //! `hipfire_quantize::i4_slabs`.
 //!
+//! Experts can also be carried as E8P-I4 (qt135 gate_up R256 / qt136 down R128,
+//! wire codec 3) from the existing solved `vq-e8p` records:
+//!
+//! ```text
+//! qwen4_i4_slabs --source qwen3.8-flash-next-gptq3.mq4 \
+//!     --alloc alloc.c24.json --point c24 --cold-e8p \
+//!     --records-e8p arms/vq-e8p --manifest-e8p arms/vq-e8p/manifest.json \
+//!     --manifest-e8p-sha256 a664a9e8509aa1e98a4d25f3057b95f0a71b54c3c3b9cb505bc98d7f558b8f3b \
+//!     --out c24.hfq --receipt c24.receipt.json --threads 8
+//! ```
+//!
+//! `--cold-e8p` reads allocation index 0 (cold) as E8P-I4 and index 2 (hot) as
+//! the copied MQ4-XTS slice. Experts whose scale trips the writer guard
+//! (`d < 2^-14` or non-finite) or that the solver left MQ4 are written as
+//! MQ4-XTS and counted in the receipt's `e8p_i4` block; never reinterpreted.
+//!
 //! ```text
 //! qwen4_i4_slabs --source qwen3.8-flash-next-gptq3.mq4 \
 //!     --alloc alloc.ep2.json --point free-1GiB-per-rank \
@@ -21,21 +37,23 @@ use clap::{Parser, ValueEnum};
 use hipfire_arch_qwen4::expert_slabs::ExpertFormat;
 use hipfire_quantize::i4_records::I4RecordShapes;
 use hipfire_quantize::i4_slabs::{
-    load_allocation, uniform_formats, write_i4_expert_slabs, AllocationSource, ExpertRecordProvider,
-    NpzDirProvider, SlabGeometry, SlabWriteConfig,
+    load_allocation, load_allocation_cold_e8p, uniform_formats, write_i4_expert_slabs,
+    AllocationSource, E8pRecordProvider, E8pVqDirProvider, ExpertRecordProvider, NpzDirProvider,
+    SlabGeometry, SlabWriteConfig,
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Uniform {
     W3,
     W2,
+    E8p,
     Mq4,
 }
 
 #[derive(Parser, Debug)]
 #[command(
     name = "qwen4_i4_slabs",
-    about = "Pack MQ3-I4/MQ2-I4 final-code records into a Flash-Next expert-slab HFQ"
+    about = "Pack MQ3-I4/MQ2-I4 final-code records and E8P-I4 solved records into a Flash-Next expert-slab HFQ"
 )]
 struct Args {
     /// Pinned MQ4-XTS source HFQ.
@@ -47,6 +65,9 @@ struct Args {
     /// Allocation name, e.g. `free-1GiB-per-rank`.
     #[arg(long, requires = "alloc")]
     point: Option<String>,
+    /// With --alloc: read profile index 0 as E8P-I4 and 2 as MQ4-XTS (index 1 is an error).
+    #[arg(long, requires = "alloc")]
+    cold_e8p: bool,
     /// Use one format for every expert instead of --alloc/--point.
     #[arg(long, value_enum)]
     uniform: Option<Uniform>,
@@ -56,6 +77,15 @@ struct Args {
     /// Directory with `L{L}/E{e}.npz` MQ2-I4 records.
     #[arg(long)]
     records_w2: Option<PathBuf>,
+    /// Directory with the solved E8P records `L{L}.gate_up_proj.bin` / `L{L}.down_proj.bin`.
+    #[arg(long, requires_all = ["manifest_e8p", "manifest_e8p_sha256"])]
+    records_e8p: Option<PathBuf>,
+    /// The `vq-e8p` `manifest.json` that describes --records-e8p.
+    #[arg(long, requires = "records_e8p")]
+    manifest_e8p: Option<PathBuf>,
+    /// Pinned sha256 (hex) of --manifest-e8p.
+    #[arg(long, requires = "records_e8p")]
+    manifest_e8p_sha256: Option<String>,
     /// Directory with `L{L}/manifest.json` (npz_sha256 per expert), W3.
     #[arg(long, requires = "records_w3")]
     manifests_w3: Option<PathBuf>,
@@ -101,25 +131,41 @@ fn provider(
 fn run(args: Args) -> Result<(), String> {
     for (what, path) in [("--out", &args.out), ("--receipt", &args.receipt)] {
         if path.symlink_metadata().is_ok() {
-            return Err(format!("refusing to overwrite existing {what} {}", path.display()));
+            return Err(format!(
+                "refusing to overwrite existing {what} {}",
+                path.display()
+            ));
         }
     }
     let geometry = SlabGeometry::FN;
     let (formats, allocation) = match (&args.alloc, &args.point, args.uniform) {
         (Some(alloc), Some(point), None) => {
-            let a = load_allocation(alloc, point, geometry).map_err(|e| e.to_string())?;
-            (
-                a.formats,
-                AllocationSource::File {
-                    file_sha256: a.file_sha256,
-                    point: a.point,
-                },
-            )
+            if args.cold_e8p {
+                let a =
+                    load_allocation_cold_e8p(alloc, point, geometry).map_err(|e| e.to_string())?;
+                (
+                    a.formats,
+                    AllocationSource::ColdE8p {
+                        file_sha256: a.file_sha256,
+                        point: a.point,
+                    },
+                )
+            } else {
+                let a = load_allocation(alloc, point, geometry).map_err(|e| e.to_string())?;
+                (
+                    a.formats,
+                    AllocationSource::File {
+                        file_sha256: a.file_sha256,
+                        point: a.point,
+                    },
+                )
+            }
         }
         (None, None, Some(u)) => {
             let f = match u {
                 Uniform::W3 => ExpertFormat::Mq3I4,
                 Uniform::W2 => ExpertFormat::Mq2I4,
+                Uniform::E8p => ExpertFormat::E8pI4,
                 Uniform::Mq4 => ExpertFormat::Mq4Xts,
             };
             (uniform_formats(geometry, f), AllocationSource::Uniform(f))
@@ -138,6 +184,17 @@ fn run(args: Args) -> Result<(), String> {
         args.cross_check_packs_w2.clone(),
         ExpertFormat::Mq2I4,
     );
+    let e8p = match (
+        &args.records_e8p,
+        &args.manifest_e8p,
+        &args.manifest_e8p_sha256,
+    ) {
+        (Some(dir), Some(manifest), Some(sha)) => Some(
+            E8pVqDirProvider::open(dir.clone(), manifest.clone(), sha, I4RecordShapes::FN)
+                .map_err(|e| e.to_string())?,
+        ),
+        _ => None,
+    };
     let receipt = write_i4_expert_slabs(&SlabWriteConfig {
         geometry,
         source: &args.source,
@@ -146,6 +203,7 @@ fn run(args: Args) -> Result<(), String> {
         allocation,
         w3: w3.as_ref().map(|p| p as &dyn ExpertRecordProvider),
         w2: w2.as_ref().map(|p| p as &dyn ExpertRecordProvider),
+        e8p: e8p.as_ref().map(|p| p as &dyn E8pRecordProvider),
         threads: args.threads,
         expected_source_sha256: args.source_sha256.as_deref(),
         progress: true,

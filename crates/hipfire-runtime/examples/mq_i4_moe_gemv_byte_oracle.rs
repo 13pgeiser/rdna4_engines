@@ -1262,6 +1262,11 @@ fn load_records(cfg: &Cfg) -> Result<Real> {
             ExpertFormat::Mq3I4 => cold.push(e as u32),
             ExpertFormat::Mq4Xts => hot.push(e as u32),
             ExpertFormat::Mq2I4 => w2 += 1,
+            ExpertFormat::E8pI4 => {
+                return Err(
+                    "this oracle certifies W3/MQ4; use e8p_i4_moe_gemv_oracle for E8P".into(),
+                )
+            }
         }
     }
     if cold.is_empty() || hot.is_empty() {

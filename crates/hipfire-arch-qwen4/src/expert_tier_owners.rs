@@ -34,12 +34,24 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 pub enum ExpertTierOwnerError {
     Runtime(String),
     Source(String),
-    SourceLength { expected: u64, got: usize },
+    SourceLength {
+        expected: u64,
+        got: usize,
+    },
     MissingBase(Placement),
     Overflow,
-    Extent { tier: Placement, offset: u64, len: u64, owner_bytes: u64 },
-    Alignment { address: u64 },
-    TailPad { tier: Placement },
+    Extent {
+        tier: Placement,
+        offset: u64,
+        len: u64,
+        owner_bytes: u64,
+    },
+    Alignment {
+        address: u64,
+    },
+    TailPad {
+        tier: Placement,
+    },
     GenerationExhausted,
 }
 
@@ -48,12 +60,27 @@ impl fmt::Display for ExpertTierOwnerError {
         match self {
             Self::Runtime(message) => write!(f, "expert tier HIP operation: {message}"),
             Self::Source(message) => write!(f, "expert tier source: {message}"),
-            Self::SourceLength { expected, got } => write!(f, "expert tier source returned {got} bytes, expected {expected}"),
+            Self::SourceLength { expected, got } => write!(
+                f,
+                "expert tier source returned {got} bytes, expected {expected}"
+            ),
             Self::MissingBase(tier) => write!(f, "missing {tier:?} owner base"),
             Self::Overflow => write!(f, "expert tier address or extent overflow"),
-            Self::Extent { tier, offset, len, owner_bytes } => write!(f, "{tier:?} extent {offset}+{len} exceeds owner size {owner_bytes}"),
-            Self::Alignment { address } => write!(f, "expert tier address {address:#x} is not 256-aligned"),
-            Self::TailPad { tier } => write!(f, "{tier:?} owner has insufficient readable tail padding"),
+            Self::Extent {
+                tier,
+                offset,
+                len,
+                owner_bytes,
+            } => write!(
+                f,
+                "{tier:?} extent {offset}+{len} exceeds owner size {owner_bytes}"
+            ),
+            Self::Alignment { address } => {
+                write!(f, "expert tier address {address:#x} is not 256-aligned")
+            }
+            Self::TailPad { tier } => {
+                write!(f, "{tier:?} owner has insufficient readable tail padding")
+            }
             Self::GenerationExhausted => write!(f, "expert tier generation exhausted"),
         }
     }
@@ -63,7 +90,9 @@ impl std::error::Error for ExpertTierOwnerError {}
 
 fn issue_generation(counter: &AtomicU64) -> Result<u64, ExpertTierOwnerError> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| last.checked_add(1))
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+            last.checked_add(1)
+        })
         .map(|last| last + 1)
         .map_err(|_| ExpertTierOwnerError::GenerationExhausted)
 }
@@ -82,16 +111,30 @@ fn tier_index(tier: Placement) -> usize {
     }
 }
 
-fn checked_extent(tier: Placement, offset: u64, len: u64, owner_bytes: u64) -> Result<(), ExpertTierOwnerError> {
-    let end = offset.checked_add(len).ok_or(ExpertTierOwnerError::Overflow)?;
+fn checked_extent(
+    tier: Placement,
+    offset: u64,
+    len: u64,
+    owner_bytes: u64,
+) -> Result<(), ExpertTierOwnerError> {
+    let end = offset
+        .checked_add(len)
+        .ok_or(ExpertTierOwnerError::Overflow)?;
     if len == 0 || end > owner_bytes {
-        return Err(ExpertTierOwnerError::Extent { tier, offset, len, owner_bytes });
+        return Err(ExpertTierOwnerError::Extent {
+            tier,
+            offset,
+            len,
+            owner_bytes,
+        });
     }
     Ok(())
 }
 
 fn checked_address(base: u64, offset: u64) -> Result<usize, ExpertTierOwnerError> {
-    let address = base.checked_add(offset).ok_or(ExpertTierOwnerError::Overflow)?;
+    let address = base
+        .checked_add(offset)
+        .ok_or(ExpertTierOwnerError::Overflow)?;
     if address % ExpertTierPlan::PAYLOAD_ALIGN != 0 {
         return Err(ExpertTierOwnerError::Alignment { address });
     }
@@ -104,7 +147,11 @@ fn tail_pad_bytes() -> u64 {
 }
 
 /// Pure construction of the exact CPU mirrors uploaded to the device tables.
-fn build_tables(plan: &ExpertTierPlan, device_base: Option<u64>, host_device_alias: Option<u64>) -> Result<Tables, ExpertTierOwnerError> {
+fn build_tables(
+    plan: &ExpertTierPlan,
+    device_base: Option<u64>,
+    host_device_alias: Option<u64>,
+) -> Result<Tables, ExpertTierOwnerError> {
     // The HIP pointer-table ABI is 64-bit, not a dtype/quantization tag table.
     if std::mem::size_of::<usize>() != 8 {
         return Err(ExpertTierOwnerError::Overflow);
@@ -115,7 +162,9 @@ fn build_tables(plan: &ExpertTierPlan, device_base: Option<u64>, host_device_ali
         if bytes != 0 {
             let base = bases[tier_index(tier)].ok_or(ExpertTierOwnerError::MissingBase(tier))?;
             checked_address(base, 0)?;
-            let end = base.checked_add(bytes).ok_or(ExpertTierOwnerError::Overflow)?;
+            let end = base
+                .checked_add(bytes)
+                .ok_or(ExpertTierOwnerError::Overflow)?;
             usize::try_from(end).map_err(|_| ExpertTierOwnerError::Overflow)?;
         }
     }
@@ -127,20 +176,28 @@ fn build_tables(plan: &ExpertTierPlan, device_base: Option<u64>, host_device_ali
     let mut used = [0u64; 2];
     for layer in 0..TRUNK_LAYERS as usize {
         for eid in 0..EXPERTS {
-            let entry = plan.entry(layer, eid).ok_or(ExpertTierOwnerError::Overflow)?;
+            let entry = plan
+                .entry(layer, eid)
+                .ok_or(ExpertTierOwnerError::Overflow)?;
             let t = tier_index(entry.tier);
             let bytes = plan.owner_bytes(entry.tier);
             let base = bases[t].ok_or(ExpertTierOwnerError::MissingBase(entry.tier))?;
-            for (offset, len) in [(entry.gate_up_offset, entry.gate_up_len), (entry.down_offset, entry.down_len)] {
+            for (offset, len) in [
+                (entry.gate_up_offset, entry.gate_up_len),
+                (entry.down_offset, entry.down_len),
+            ] {
                 checked_extent(entry.tier, offset, len, bytes)?;
                 used[t] = used[t].max(offset + len);
             }
-            tables.gate_up.push(checked_address(base, entry.gate_up_offset)?);
+            tables
+                .gate_up
+                .push(checked_address(base, entry.gate_up_offset)?);
             tables.down.push(checked_address(base, entry.down_offset)?);
             tables.codecs.push(match entry.format {
                 ExpertFormat::Mq4Xts => 0,
                 ExpertFormat::Mq3I4 => 1,
                 ExpertFormat::Mq2I4 => 2,
+                ExpertFormat::E8pI4 => 3,
             });
         }
     }
@@ -303,8 +360,12 @@ impl<'a> LayerExpertTierView<'a> {
     }
 
     pub fn codec_table_device(&self) -> GpuTensor {
-        borrowed_table(self.lease.binding.codec_table_base, TOTAL_EXPERTS, DType::Raw)
-            .sub_offset(self.layer * EXPERTS, EXPERTS)
+        borrowed_table(
+            self.lease.binding.codec_table_base,
+            TOTAL_EXPERTS,
+            DType::Raw,
+        )
+        .sub_offset(self.layer * EXPERTS, EXPERTS)
     }
 
     pub fn lease(&self) -> ExpertTierLease {
@@ -333,7 +394,9 @@ fn borrowed_table(base: usize, elements: usize, dtype: DType) -> GpuTensor {
     GpuTensor {
         // SAFETY: only frozen table addresses from a live lease reach here.
         // The returned descriptor is borrowed and must not outlive the lease.
-        buf: unsafe { DeviceBuffer::from_raw(base as *mut std::ffi::c_void, elements * dtype.size()) },
+        buf: unsafe {
+            DeviceBuffer::from_raw(base as *mut std::ffi::c_void, elements * dtype.size())
+        },
         shape: vec![elements],
         dtype,
     }
@@ -346,7 +409,12 @@ fn runtime_error(error: hip_bridge::HipError) -> ExpertTierOwnerError {
 fn pointer_bytes(entries: &[usize]) -> &[u8] {
     // SAFETY: usize has no padding or uninitialized bytes. build_tables rejects
     // non-64-bit platforms; the HIP host/device pointer ABI is native-endian.
-    unsafe { std::slice::from_raw_parts(entries.as_ptr().cast::<u8>(), std::mem::size_of_val(entries)) }
+    unsafe {
+        std::slice::from_raw_parts(
+            entries.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(entries),
+        )
+    }
 }
 
 fn copy_span<'src>(
@@ -356,14 +424,21 @@ fn copy_span<'src>(
     dst_offset: u64,
     mut write_chunk: impl FnMut(u64, &[u8]) -> Result<(), ExpertTierOwnerError>,
 ) -> Result<(), ExpertTierOwnerError> {
-    source_offset.checked_add(len).ok_or(ExpertTierOwnerError::Overflow)?;
-    dst_offset.checked_add(len).ok_or(ExpertTierOwnerError::Overflow)?;
+    source_offset
+        .checked_add(len)
+        .ok_or(ExpertTierOwnerError::Overflow)?;
+    dst_offset
+        .checked_add(len)
+        .ok_or(ExpertTierOwnerError::Overflow)?;
     let mut copied = 0;
     while copied < len {
         let n = (len - copied).min(COPY_CHUNK_BYTES);
         let bytes = src(source_offset + copied, n).map_err(ExpertTierOwnerError::Source)?;
         if bytes.len() as u64 != n {
-            return Err(ExpertTierOwnerError::SourceLength { expected: n, got: bytes.len() });
+            return Err(ExpertTierOwnerError::SourceLength {
+                expected: n,
+                got: bytes.len(),
+            });
         }
         write_chunk(dst_offset + copied, bytes)?;
         copied += n;
@@ -385,14 +460,29 @@ impl ExpertTierOwners {
             return Ok(());
         }
         let bytes = usize::try_from(bytes).map_err(|_| ExpertTierOwnerError::Overflow)?;
-        let cpu = self.hip.host_malloc(bytes, HIP_HOST_MALLOC_MAPPED).map_err(runtime_error)?;
+        let cpu = self
+            .hip
+            .host_malloc(bytes, HIP_HOST_MALLOC_MAPPED)
+            .map_err(runtime_error)?;
         // Record the owner immediately, so alias lookup failure also frees it.
-        self.host = Some(HostPayload { cpu_address: cpu as usize, device_alias: 0, bytes });
-        let alias = self.hip.host_get_device_pointer(cpu, 0).map_err(runtime_error)?;
+        self.host = Some(HostPayload {
+            cpu_address: cpu as usize,
+            device_alias: 0,
+            bytes,
+        });
+        let alias = self
+            .hip
+            .host_get_device_pointer(cpu, 0)
+            .map_err(runtime_error)?;
         if alias.is_null() {
-            return Err(ExpertTierOwnerError::Runtime("hipHostGetDevicePointer returned null".into()));
+            return Err(ExpertTierOwnerError::Runtime(
+                "hipHostGetDevicePointer returned null".into(),
+            ));
         }
-        self.host.as_mut().expect("host allocated above").device_alias = alias as usize as u64;
+        self.host
+            .as_mut()
+            .expect("host allocated above")
+            .device_alias = alias as usize as u64;
         Ok(())
     }
 
@@ -409,11 +499,19 @@ impl ExpertTierOwners {
             let offset = usize::try_from(offset).map_err(|_| ExpertTierOwnerError::Overflow)?;
             match tier {
                 Placement::Device => {
-                    let owner = self.device.as_ref().ok_or(ExpertTierOwnerError::MissingBase(tier))?;
-                    self.hip.memcpy_htod_offset(owner, offset, chunk).map_err(runtime_error)
+                    let owner = self
+                        .device
+                        .as_ref()
+                        .ok_or(ExpertTierOwnerError::MissingBase(tier))?;
+                    self.hip
+                        .memcpy_htod_offset(owner, offset, chunk)
+                        .map_err(runtime_error)
                 }
                 Placement::HostMapped => {
-                    let owner = self.host.as_ref().ok_or(ExpertTierOwnerError::MissingBase(tier))?;
+                    let owner = self
+                        .host
+                        .as_ref()
+                        .ok_or(ExpertTierOwnerError::MissingBase(tier))?;
                     // SAFETY: the entire span was checked against the owner;
                     // chunk offsets are inside it and the allocation is private
                     // until all payloads and frozen tables have been published.
@@ -436,20 +534,32 @@ impl ExpertTierOwners {
             return Ok(());
         }
         let tail = tail_pad_bytes();
-        let offset = bytes.checked_sub(tail).ok_or(ExpertTierOwnerError::TailPad { tier })?;
+        let offset = bytes
+            .checked_sub(tail)
+            .ok_or(ExpertTierOwnerError::TailPad { tier })?;
         let offset = usize::try_from(offset).map_err(|_| ExpertTierOwnerError::Overflow)?;
         let tail = usize::try_from(tail).map_err(|_| ExpertTierOwnerError::Overflow)?;
         match tier {
             Placement::Device => {
-                let owner = self.device.as_ref().ok_or(ExpertTierOwnerError::MissingBase(tier))?;
-                self.hip.memset(&owner.byte_view(offset, tail), 0, tail).map_err(runtime_error)
+                let owner = self
+                    .device
+                    .as_ref()
+                    .ok_or(ExpertTierOwnerError::MissingBase(tier))?;
+                self.hip
+                    .memset(&owner.byte_view(offset, tail), 0, tail)
+                    .map_err(runtime_error)
             }
             Placement::HostMapped => {
-                let owner = self.host.as_ref().ok_or(ExpertTierOwnerError::MissingBase(tier))?;
+                let owner = self
+                    .host
+                    .as_ref()
+                    .ok_or(ExpertTierOwnerError::MissingBase(tier))?;
                 debug_assert_eq!(offset + tail, owner.bytes);
                 // SAFETY: the checked tail range is inside the sole pinned
                 // allocation and no consumer has access during materialization.
-                unsafe { std::ptr::write_bytes((owner.cpu_address as *mut u8).add(offset), 0, tail) };
+                unsafe {
+                    std::ptr::write_bytes((owner.cpu_address as *mut u8).add(offset), 0, tail)
+                };
                 Ok(())
             }
         }
@@ -467,7 +577,11 @@ impl Drop for ExpertTierOwners {
         if self.hip.set_device(self.device_id).is_err() {
             return;
         }
-        for table in [&mut self.gate_up_table, &mut self.down_table, &mut self.codec_table] {
+        for table in [
+            &mut self.gate_up_table,
+            &mut self.down_table,
+            &mut self.codec_table,
+        ] {
             if let Some(table) = table.take() {
                 let _ = self.hip.free(table.buf);
             }
@@ -476,7 +590,9 @@ impl Drop for ExpertTierOwners {
             let _ = self.hip.free(owner);
         }
         if let Some(owner) = self.host.take() {
-            let _ = self.hip.host_free(owner.cpu_address as *mut std::ffi::c_void);
+            let _ = self
+                .hip
+                .host_free(owner.cpu_address as *mut std::ffi::c_void);
         }
         // Do not invalidate rdna-compute's thread-local device-binding cache.
         if previous_device != self.device_id {
@@ -515,44 +631,92 @@ pub fn materialize<'src>(
     owners.allocate_host(owners.plan.owner_bytes(Placement::HostMapped))?;
     let tables = build_tables(
         &owners.plan,
-        owners.device.as_ref().map(|owner| owner.as_ptr() as usize as u64),
+        owners
+            .device
+            .as_ref()
+            .map(|owner| owner.as_ptr() as usize as u64),
         owners.host.as_ref().map(|owner| owner.device_alias),
     )?;
     for tier in [Placement::Device, Placement::HostMapped] {
         owners.zero_tail(tier)?;
         for copy in owners.plan.copies(tier) {
-            owners.copy_payload(tier, copy.src.offset as u64, copy.src.len as u64, copy.dst_offset, src)?;
+            owners.copy_payload(
+                tier,
+                copy.src.offset as u64,
+                copy.src.len as u64,
+                copy.dst_offset,
+                src,
+            )?;
         }
     }
     for window in owners.plan.host_windows() {
         for (span, offset) in &window.spans {
-            owners.copy_payload(Placement::HostMapped, span.offset as u64, span.len as u64, *offset, src)?;
+            owners.copy_payload(
+                Placement::HostMapped,
+                span.offset as u64,
+                span.len as u64,
+                *offset,
+                src,
+            )?;
         }
     }
     // Install each allocation in the RAII owner before its upload can fail.
     owners.gate_up_table = Some(GpuTensor {
-        buf: owners.hip.malloc(TOTAL_EXPERTS * 8).map_err(runtime_error)?,
+        buf: owners
+            .hip
+            .malloc(TOTAL_EXPERTS * 8)
+            .map_err(runtime_error)?,
         shape: vec![2 * TOTAL_EXPERTS],
         dtype: DType::F32,
     });
-    owners.hip.memcpy_htod(&owners.gate_up_table.as_ref().expect("allocated above").buf, pointer_bytes(&tables.gate_up)).map_err(runtime_error)?;
+    owners
+        .hip
+        .memcpy_htod(
+            &owners.gate_up_table.as_ref().expect("allocated above").buf,
+            pointer_bytes(&tables.gate_up),
+        )
+        .map_err(runtime_error)?;
     owners.down_table = Some(GpuTensor {
-        buf: owners.hip.malloc(TOTAL_EXPERTS * 8).map_err(runtime_error)?,
+        buf: owners
+            .hip
+            .malloc(TOTAL_EXPERTS * 8)
+            .map_err(runtime_error)?,
         shape: vec![2 * TOTAL_EXPERTS],
         dtype: DType::F32,
     });
-    owners.hip.memcpy_htod(&owners.down_table.as_ref().expect("allocated above").buf, pointer_bytes(&tables.down)).map_err(runtime_error)?;
+    owners
+        .hip
+        .memcpy_htod(
+            &owners.down_table.as_ref().expect("allocated above").buf,
+            pointer_bytes(&tables.down),
+        )
+        .map_err(runtime_error)?;
     owners.codec_table = Some(GpuTensor {
         buf: owners.hip.malloc(TOTAL_EXPERTS).map_err(runtime_error)?,
         shape: vec![TOTAL_EXPERTS],
         dtype: DType::Raw,
     });
-    owners.hip.memcpy_htod(&owners.codec_table.as_ref().expect("allocated above").buf, &tables.codecs).map_err(runtime_error)?;
+    owners
+        .hip
+        .memcpy_htod(
+            &owners.codec_table.as_ref().expect("allocated above").buf,
+            &tables.codecs,
+        )
+        .map_err(runtime_error)?;
     owners.hip.device_synchronize().map_err(runtime_error)?;
     let mut owner_ranges = [None; 2];
     for (tier, base) in [
-        (Placement::Device, owners.device.as_ref().map(|owner| owner.as_ptr() as usize as u64)),
-        (Placement::HostMapped, owners.host.as_ref().map(|owner| owner.device_alias)),
+        (
+            Placement::Device,
+            owners
+                .device
+                .as_ref()
+                .map(|owner| owner.as_ptr() as usize as u64),
+        ),
+        (
+            Placement::HostMapped,
+            owners.host.as_ref().map(|owner| owner.device_alias),
+        ),
     ] {
         let bytes = owners.plan.owner_bytes(tier);
         if bytes != 0 {
@@ -565,17 +729,38 @@ pub fn materialize<'src>(
     }
     let binding = Arc::new(ExpertTierBinding {
         owner_ranges,
-        host_cpu_range: owners.host.as_ref().map(|host| (host.cpu_address, host.bytes)),
+        host_cpu_range: owners
+            .host
+            .as_ref()
+            .map(|host| (host.cpu_address, host.bytes)),
         logical_digest: owners.plan.logical_digest(),
         plan: owners.plan.clone(),
         tables,
-        gate_up_table_base: owners.gate_up_table.as_ref().expect("allocated above").buf.as_ptr() as usize,
-        down_table_base: owners.down_table.as_ref().expect("allocated above").buf.as_ptr() as usize,
-        codec_table_base: owners.codec_table.as_ref().expect("allocated above").buf.as_ptr() as usize,
+        gate_up_table_base: owners
+            .gate_up_table
+            .as_ref()
+            .expect("allocated above")
+            .buf
+            .as_ptr() as usize,
+        down_table_base: owners
+            .down_table
+            .as_ref()
+            .expect("allocated above")
+            .buf
+            .as_ptr() as usize,
+        codec_table_base: owners
+            .codec_table
+            .as_ref()
+            .expect("allocated above")
+            .buf
+            .as_ptr() as usize,
         generation: owners.generation,
     });
     owners.binding = Some(binding.clone());
-    Ok(ExpertTierLease { binding, owners: Arc::new(Mutex::new(owners)) })
+    Ok(ExpertTierLease {
+        binding,
+        owners: Arc::new(Mutex::new(owners)),
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -684,7 +869,9 @@ mod tests {
                 let i = layer * 512 + expert;
                 let e = plan.entry(layer, expert).unwrap();
                 let (base, owner) = match e.tier {
-                    Placement::Device => (device_base.unwrap(), plan.owner_bytes(Placement::Device)),
+                    Placement::Device => {
+                        (device_base.unwrap(), plan.owner_bytes(Placement::Device))
+                    }
                     Placement::HostMapped => {
                         (host_alias.unwrap(), plan.owner_bytes(Placement::HostMapped))
                     }
@@ -704,6 +891,7 @@ mod tests {
                     ExpertFormat::Mq4Xts => 0u8,
                     ExpertFormat::Mq3I4 => 1u8,
                     ExpertFormat::Mq2I4 => 2u8,
+                    ExpertFormat::E8pI4 => 3u8,
                 };
                 assert_eq!(t.codecs[i], want, "codec {layer}/{expert}");
             }
@@ -1005,7 +1193,12 @@ mod tests {
             ExpertTierOwnerError::Overflow
         ));
         assert!(matches!(
-            err(checked_extent(Placement::HostMapped, u64::MAX, u64::MAX, u64::MAX)),
+            err(checked_extent(
+                Placement::HostMapped,
+                u64::MAX,
+                u64::MAX,
+                u64::MAX
+            )),
             ExpertTierOwnerError::Overflow
         ));
     }
@@ -1142,13 +1335,34 @@ mod tests {
             Ok(&chunk[..len as usize])
         };
         let mut writes = Vec::new();
-        copy_span(&source, 123, COPY_CHUNK_BYTES * 2 + 17, 256, |offset, bytes| {
-            assert!(bytes.iter().all(|byte| *byte == 0xa5));
-            writes.push((offset, bytes.len() as u64));
-            Ok(())
-        }).unwrap();
-        assert_eq!(*requests.borrow(), vec![(123, COPY_CHUNK_BYTES), (123 + COPY_CHUNK_BYTES, COPY_CHUNK_BYTES), (123 + 2 * COPY_CHUNK_BYTES, 17)]);
-        assert_eq!(writes, vec![(256, COPY_CHUNK_BYTES), (256 + COPY_CHUNK_BYTES, COPY_CHUNK_BYTES), (256 + 2 * COPY_CHUNK_BYTES, 17)]);
+        copy_span(
+            &source,
+            123,
+            COPY_CHUNK_BYTES * 2 + 17,
+            256,
+            |offset, bytes| {
+                assert!(bytes.iter().all(|byte| *byte == 0xa5));
+                writes.push((offset, bytes.len() as u64));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *requests.borrow(),
+            vec![
+                (123, COPY_CHUNK_BYTES),
+                (123 + COPY_CHUNK_BYTES, COPY_CHUNK_BYTES),
+                (123 + 2 * COPY_CHUNK_BYTES, 17)
+            ]
+        );
+        assert_eq!(
+            writes,
+            vec![
+                (256, COPY_CHUNK_BYTES),
+                (256 + COPY_CHUNK_BYTES, COPY_CHUNK_BYTES),
+                (256 + 2 * COPY_CHUNK_BYTES, 17)
+            ]
+        );
     }
 
     #[test]

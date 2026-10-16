@@ -1196,7 +1196,7 @@ pub struct RetainedRouteInputs<'a> {
     /// The live binding's pointer-level mapping fingerprint.
     pub mapping_fingerprint: &'a str,
     /// `Some` on an expert-slab layer: the codec byte of every expert
-    /// (`0` = MQ4, `1` = W3, `2` = W2 reserved, `255` = unknown).
+    /// (`0` = MQ4, `1` = W3, `3` = E8P-I4, `255` = unknown; W2 is never a slab codec).
     pub codecs: Option<&'a [u8]>,
     /// `(device address, bytes)` of the gate/up and down pointer tables and of
     /// the layer's codec-tag tensor, when it has one.
@@ -1304,13 +1304,13 @@ fn tier_identity_suffix(tier: &ExpertTierIdentity) -> String {
     )
 }
 
-/// Codec byte of an expert's down dtype: `0` = MQ4, `1` = W3, `2` = W2
-/// reserved, `255` = unknown.
+/// Codec byte of an expert's down dtype: `0` = MQ4, `1` = W3, `3` = E8P-I4,
+/// `255` = unknown.
 fn expert_codec_byte(down: DType) -> u8 {
     match down {
         DType::MQ4G128V2 => 0,
         DType::MQ3I4G128R128 => 1,
-        DType::MQ2I4G128R128 => 2,
+        DType::E8PI4G128R128 => 3,
         _ => 255,
     }
 }
@@ -4465,7 +4465,12 @@ fn dtype_tag_tail_bytes(table: &ExpertTable) -> Result<usize, DispatchError> {
         resources
             .gate_up()
             .or_else(|| resources.gate())
-            .is_some_and(|resource| resource.dtype() == DType::MQ3I4G128R256)
+            .is_some_and(|resource| {
+                matches!(
+                    resource.dtype(),
+                    DType::MQ3I4G128R256 | DType::E8PI4G128R256
+                )
+            })
     });
     Ok(if slab { 4 * table.n_experts() } else { 0 })
 }
@@ -5655,6 +5660,12 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(dtype_tag_tail_bytes(&slab).unwrap(), 4 * 2);
+        let e8p_slab = ExpertTable::new(vec![
+            expert(0, DType::MQ4G256V2, DType::MQ4G128V2),
+            expert(1, DType::E8PI4G128R256, DType::E8PI4G128R128),
+        ])
+        .unwrap();
+        assert_eq!(dtype_tag_tail_bytes(&e8p_slab).unwrap(), 4 * 2);
         // A uniform slab layer (no tag table) and a legacy mixed layer have no tail.
         let uniform = ExpertTable::new(vec![
             expert(0, DType::MQ3I4G128R256, DType::MQ3I4G128R128),

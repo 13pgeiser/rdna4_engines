@@ -111,7 +111,9 @@ impl ExpertTierIdentity {
             ));
         }
         if let Some(index) = (0..n).find(|&i| gate_up_entries[i] == 0 || down_entries[i] == 0) {
-            return Err(format!("expert tier identity has a null pointer entry for expert {index}"));
+            return Err(format!(
+                "expert tier identity has a null pointer entry for expert {index}"
+            ));
         }
         if let Some(index) = placement
             .iter()
@@ -209,9 +211,10 @@ impl std::fmt::Debug for ExpertTierIdentity {
 /// An explicit tier binding wins over every adapter override: its answer is
 /// the layer's `any_host`, never a representative expert's residency.
 pub fn routed_host_mapped_projections(experts: &dyn RoutedExpertWeights) -> (bool, bool) {
-    experts
-        .tier_identity()
-        .map_or_else(|| experts.host_mapped_projections(), ExpertTierIdentity::host_projections)
+    experts.tier_identity().map_or_else(
+        || experts.host_mapped_projections(),
+        ExpertTierIdentity::host_projections,
+    )
 }
 
 /// Layer-wide host-mapped bit of a layer's routed experts; tier-first like
@@ -263,6 +266,13 @@ pub struct MoeRoutePolicy {
     pub capability: MoeRouteCapability,
     pub geometry: MoeRouteGeometry,
     pub formats: MoeRouteFormats,
+    /// Sealed expert-slab layers only: the raw codec id of the layer's cold
+    /// bucket (W3 = 1, E8P = 3), declared by the architecture from the
+    /// layer's immutable slab metadata; `None` for a layer without cold
+    /// experts (all MQ4) and for every other route. Selection validates it
+    /// against the live dtype tables in its one pass, so lowering never
+    /// rescans a table.
+    pub slab_cold_codec: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,13 +314,17 @@ pub enum MoeRouteCapability {
     /// FP8 stages; admitted by `pipeline::select_fp8_grouped_route` and
     /// never by generic resolution.
     Fp8B128Grouped,
-    /// gfx1201 / gfx1151 sealed expert-slab route (ctl3-hot): the same fixed
-    /// 512/10/2560/640/640 geometry over experts whose codec is per expert
-    /// (MQ4 symmetric QT44/QT53 or MQ3-I4 planar qt131/qt132), addressed
-    /// through the layer's pointer tables. Decode rows (`route_rows <= 8`)
-    /// run the K1 lane-union GEMV over codec buckets; longer prefill runs the
-    /// K2 grouped IU4 kernels over codec-masked tile ids. Declared from the
-    /// slab artifact's per-expert table only, never from a dtype.
+    /// Sealed expert-slab route (ctl3-hot): the same fixed
+    /// 512/10/2560/640/640 geometry over experts whose codec is per expert,
+    /// addressed through the layer's pointer tables. gfx1201 admits MQ4
+    /// symmetric QT44/QT53, MQ3-I4 planar qt131/qt132 (W3) and E8P-I4
+    /// planar qt135/qt136; gfx1151 admits MQ4 and W3 (not E8P); gfx1100 admits MQ4 and E8P-I4 (not W3); W2 is
+    /// refused on every arch. A layer carries at most one cold codec (W3 or E8P); see
+    /// `rdna_compute::qwen4_slab_codec_admitted`. Decode rows
+    /// (`route_rows <= 8`) run the K1 lane-union GEMV over the two codec
+    /// buckets (cold = 0, MQ4 = 1); longer prefill runs the K2 grouped IU4
+    /// kernels over codec-masked tile ids. Declared from the slab artifact's
+    /// per-expert table only, never from a dtype.
     SlabCodecGrouped,
 }
 
@@ -333,12 +347,14 @@ impl MoeRouteCapability {
     pub(crate) fn admitted_on_arch(self, arch: &rdna_compute::arch_caps::ArchCaps) -> bool {
         match self {
             Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric => self.admitted_on(),
-            Self::SlabCodecGrouped => self.admitted_on() && (arch.is_gfx1201() || arch.is_gfx1151()),
+            Self::SlabCodecGrouped => {
+                self.admitted_on() && rdna_compute::qwen4_slab_codec_admitted(arch.arch(), 0)
+            }
             Self::Fp8B128Grouped => arch.is_gfx942(),
         }
     }
 
-    /// The gfx1201 / gfx1151 sealed expert-slab declaration.
+    /// The sealed expert-slab declaration (MQ4 plus the arch's cold codec: W3 or E8P-I4).
     pub fn is_slab(self) -> bool {
         matches!(self, Self::SlabCodecGrouped)
     }
@@ -406,31 +422,104 @@ pub(crate) fn grouped_route_geometry_supported(
         && down == formats.routed_down
 }
 
-/// Whether `dtype` is a routed gate/up format of the sealed expert-slab route.
+/// Whether `dtype` is a routed gate/up format of the sealed expert-slab route
+/// on some arch (MQ4, W3 qt131, E8P-I4 qt135); per-arch membership is
+/// [`slab_codec_pair`].
 pub fn slab_gate_up_dtype(dtype: DType) -> bool {
-    matches!(dtype, DType::MQ4G256V2 | DType::MQ3I4G128R256)
-}
-
-/// Whether `dtype` is a routed down format of the sealed expert-slab route.
-pub fn slab_down_dtype(dtype: DType) -> bool {
-    matches!(dtype, DType::MQ4G128V2 | DType::MQ3I4G128R128)
-}
-
-/// Whether a routed `(gate_up, down)` pair is one slab codec: MQ4 symmetric
-/// (QT44, QT53) or MQ3-I4 (qt131, qt132), never crossed.
-pub fn slab_codec_pair(gate_up: DType, down: DType) -> bool {
     matches!(
-        (gate_up, down),
-        (DType::MQ4G256V2, DType::MQ4G128V2) | (DType::MQ3I4G128R256, DType::MQ3I4G128R128)
+        dtype,
+        DType::MQ4G256V2 | DType::MQ3I4G128R256 | DType::E8PI4G128R256
     )
 }
 
+/// Whether `dtype` is a routed down format of the sealed expert-slab route on
+/// some arch (MQ4, W3 qt132, E8P-I4 qt136).
+pub fn slab_down_dtype(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::MQ4G128V2 | DType::MQ3I4G128R128 | DType::E8PI4G128R128
+    )
+}
+
+/// Slab codec byte of a routed `(gate_up, down)` pair (`0` = MQ4 symmetric
+/// QT44/QT53, `1` = W3 qt131/qt132, `3` = E8P-I4 qt135/qt136), never crossed.
+/// W2 has no codec byte: it is refused everywhere.
+pub fn slab_codec_of_pair(gate_up: DType, down: DType) -> Option<u8> {
+    match (gate_up, down) {
+        (DType::MQ4G256V2, DType::MQ4G128V2) => Some(0),
+        (DType::MQ3I4G128R256, DType::MQ3I4G128R128) => Some(1),
+        (DType::E8PI4G128R256, DType::E8PI4G128R128) => Some(3),
+        _ => None,
+    }
+}
+
+/// Whether a routed `(gate_up, down)` pair is one slab codec that `arch`
+/// admits (`rdna_compute::qwen4_slab_codec_admitted`).
+pub fn slab_codec_pair(arch: &str, gate_up: DType, down: DType) -> bool {
+    slab_codec_of_pair(gate_up, down)
+        .is_some_and(|codec| rdna_compute::qwen4_slab_codec_admitted(arch, codec))
+}
+
+/// The K1/K2 codec bucket of an admitted slab dtype pair: the cold codec (W3
+/// or E8P) is bucket 0, MQ4 bucket 1.
+pub fn slab_bucket_of_pair(arch: &str, gate_up: DType, down: DType) -> Option<usize> {
+    let codec = slab_codec_of_pair(gate_up, down)?;
+    rdna_compute::qwen4_slab_codec_admitted(arch, codec).then_some(usize::from(codec == 0))
+}
+
+/// The cold codec a layer's dtype metadata names, in one pass over a mixed
+/// layer's per-expert pairs: `Some(Some(codec))` for a layer holding cold
+/// experts of one codec, `Some(None)` for a uniform MQ4 layer, `None` when it
+/// is not a slab layer (an unknown or crossed pair, a codec `admits` refuses,
+/// W3 and E8P in one layer, or a mixed layer without both MQ4 and cold
+/// experts).
+fn layer_cold_codec(dtypes: &MoeDtypes<'_>, admits: &dyn Fn(u8) -> bool) -> Option<Option<u8>> {
+    if dtypes.routed_has_mixed_experts {
+        let (gate_up, down) = (dtypes.per_expert_gate_up?, dtypes.per_expert_down?);
+        let (mut cold, mut mq4) = (None, false);
+        for (g, d) in gate_up.iter().zip(down) {
+            let codec = slab_codec_of_pair(*g, *d).filter(|codec| admits(*codec))?;
+            if codec == 0 {
+                mq4 = true;
+            } else if cold.map_or(true, |seen| seen == codec) {
+                cold = Some(codec);
+            } else {
+                return None;
+            }
+        }
+        (mq4 && cold.is_some()).then_some(cold)
+    } else {
+        let codec = slab_codec_of_pair(dtypes.routed_gate_up, dtypes.routed_down)
+            .filter(|codec| admits(*codec))?;
+        Some((codec != 0).then_some(codec))
+    }
+}
+
+/// Raw `cold_codec` the runtime's K1 / tile-mask entries take for a layer that
+/// declared `declared` ([`MoeRoutePolicy::slab_cold_codec`]): the declared
+/// cold codec when `arch` admits it, or, for a layer without cold experts,
+/// the arch's default cold codec
+/// (`rdna_compute::qwen4_slab_default_cold_codec`; that bucket is never
+/// launched). `None` when `arch` is not a slab arch or refuses the declared
+/// codec.
+pub fn slab_launch_cold_codec(arch: &str, declared: Option<u8>) -> Option<u8> {
+    match declared {
+        Some(codec) => rdna_compute::qwen4_slab_codec_admitted(arch, codec).then_some(codec),
+        None => rdna_compute::qwen4_slab_default_cold_codec(arch),
+    }
+}
+
 /// Exact geometry and operand contract of the sealed expert-slab route: the
-/// fixed geometry, and routed experts that are either all one slab codec
-/// (no per-expert tables) or a per-expert table of slab codec pairs, one entry
-/// per expert, that really varies.
+/// fixed geometry, and routed experts that are either all one codec `arch`
+/// admits (no per-expert tables) or a per-expert table of admitted codec
+/// pairs, one entry per expert, holding MQ4 and one cold codec. The
+/// policy's declared cold codec must be the one the dtypes name. `arch:
+/// Some` is selection's one validating pass over the dtype tables; `None` is
+/// the lowering-time shape check, which trusts that pass and never rescans
+/// them (the stage that launches the kernels enforces the device).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn slab_route_geometry_supported(
+    arch: Option<&str>,
     policy: &MoeRoutePolicy,
     experts: usize,
     top_k: usize,
@@ -455,20 +544,20 @@ pub(crate) fn slab_route_geometry_supported(
     if !shape {
         return false;
     }
+    if let Some(arch) = arch {
+        let admits = |codec: u8| rdna_compute::qwen4_slab_codec_admitted(arch, codec);
+        if layer_cold_codec(dtypes, &admits) != Some(policy.slab_cold_codec) {
+            return false;
+        }
+    }
     if dtypes.routed_has_mixed_experts {
-        let (Some(gate_up), Some(down)) = (dtypes.per_expert_gate_up, dtypes.per_expert_down) else {
+        let (Some(gate_up), Some(down)) = (dtypes.per_expert_gate_up, dtypes.per_expert_down)
+        else {
             return false;
         };
-        has_codec_table
-            && gate_up.len() == experts
-            && down.len() == experts
-            && gate_up.iter().zip(down).all(|(g, d)| slab_codec_pair(*g, *d))
-            && gate_up.iter().any(|g| *g != gate_up[0])
+        has_codec_table && gate_up.len() == experts && down.len() == experts
     } else {
-        !has_codec_table
-            && dtypes.per_expert_gate_up.is_none()
-            && dtypes.per_expert_down.is_none()
-            && slab_codec_pair(dtypes.routed_gate_up, dtypes.routed_down)
+        !has_codec_table && dtypes.per_expert_gate_up.is_none() && dtypes.per_expert_down.is_none()
     }
 }
 
@@ -1190,7 +1279,8 @@ pub trait RoutedExpertWeights {
     /// layer's experts share one residency. `false` by default; an explicit
     /// tier binding answers `any_host`.
     fn host_mapped(&self) -> bool {
-        self.tier_identity().is_some_and(ExpertTierIdentity::any_host)
+        self.tier_identity()
+            .is_some_and(ExpertTierIdentity::any_host)
     }
 
     /// Explicit per-expert tier placement of this layer (`None` for every
@@ -2139,7 +2229,9 @@ impl MoePrefillResolution {
             && !d.routed_has_mixed_experts
             && matches!(d.routed_gate_up, DType::MQ4G256 | DType::MQ4G256V2)
             && matches!(d.routed_down, DType::MQ4G256 | DType::MQ4G256V2);
-        let use_path2 = flags.moe_grouped_gemm && arch.has_wmma() && (!narrow_verify || offloaded_uniform_verify);
+        let use_path2 = flags.moe_grouped_gemm
+            && arch.has_wmma()
+            && (!narrow_verify || offloaded_uniform_verify);
         // MQ6 / MQ6V2 grouped-WMMA: gfx11 `_k2` kernel now exists (alongside the
         // gfx12 `_gfx12` / `mq6g256v2` sisters). Only suppress Path 2 on archs
         // that have NEITHER (gfx9*, gfx1010/1030, CDNA) — i.e. no wmma_w32 and
@@ -2593,7 +2685,9 @@ mod tests {
     }
 
     fn assert_resident_verify_matches_legacy(d: &MoeDtypes<'_>) {
-        for arch_name in ["gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx1030", "gfx942"] {
+        for arch_name in [
+            "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx1030", "gfx942",
+        ] {
             for flag_case in 0..4 {
                 let mut flags = rdna_compute::feature_flags::FeatureFlags::for_test(arch_name);
                 match flag_case {
@@ -2618,7 +2712,9 @@ mod tests {
                         prefill_resolution_fields(&resident),
                         prefill_resolution_fields(&legacy),
                         "{arch_name}, {:?}/{:?}, mixed={}, flags={flag_case}, batch={batch}",
-                        d.routed_gate_up, d.routed_down, d.routed_has_mixed_experts,
+                        d.routed_gate_up,
+                        d.routed_down,
+                        d.routed_has_mixed_experts,
                     );
                 }
             }
@@ -2644,7 +2740,12 @@ mod tests {
 
     #[test]
     fn prefill_resident_verify_mixed_experts_matches_legacy_all_fields() {
-        for representative in [DType::MQ4G256, DType::MQ6G256, DType::MQ6G256V2, DType::MQ5G256] {
+        for representative in [
+            DType::MQ4G256,
+            DType::MQ6G256,
+            DType::MQ6G256V2,
+            DType::MQ5G256,
+        ] {
             let mut d = uniform_prefill_dtypes(representative);
             d.routed_has_mixed_experts = true;
             d.experts_all_gate_up_mq4 = false;
@@ -2675,7 +2776,10 @@ mod tests {
             let decode = MoePrefillResolution::resolve_with_batch_ctx(
                 &d, &ctx.arch, &ctx.flags, 1, true, true,
             );
-            assert!(!decode.use_path2, "one row must not take the Path 2 re-admit");
+            assert!(
+                !decode.use_path2,
+                "one row must not take the Path 2 re-admit"
+            );
 
             let mut flags = rdna_compute::feature_flags::FeatureFlags::for_test("gfx1201");
             flags.moe_grouped_gemm = false;
@@ -2683,7 +2787,10 @@ mod tests {
                 let disabled = MoePrefillResolution::resolve_with_batch_ctx(
                     &d, &ctx.arch, &flags, batch, true, true,
                 );
-                assert!(!disabled.use_path2, "re-admit must respect grouped-GEMM opt-out");
+                assert!(
+                    !disabled.use_path2,
+                    "re-admit must respect grouped-GEMM opt-out"
+                );
             }
         }
     }
@@ -2717,7 +2824,15 @@ mod tests {
                     );
                     assert_eq!(
                         prefill_resolution_fields(&host),
-                        [false, false, false, false, dtype == DType::ParoQ4G128, false, false],
+                        [
+                            false,
+                            false,
+                            false,
+                            false,
+                            dtype == DType::ParoQ4G128,
+                            false,
+                            false
+                        ],
                         "{arch_name}, {dtype:?}, batch={batch}",
                     );
                 }
@@ -2783,7 +2898,10 @@ mod tests {
         assert!(!(2..=NARROW_VERIFY_MAX_ROWS).contains(&1));
         assert!(!(2..=NARROW_VERIFY_MAX_ROWS).contains(&0));
         for n in 2..=NARROW_VERIFY_MAX_ROWS {
-            assert!((2..=NARROW_VERIFY_MAX_ROWS).contains(&n), "verify range must admit {n}");
+            assert!(
+                (2..=NARROW_VERIFY_MAX_ROWS).contains(&n),
+                "verify range must admit {n}"
+            );
         }
         assert!(!(2..=NARROW_VERIFY_MAX_ROWS).contains(&(NARROW_VERIFY_MAX_ROWS + 1)));
     }
@@ -2866,9 +2984,12 @@ mod tests {
         for arch_name in ["gfx942", "gfx1151", "gfx1201", "gfx1100"] {
             let ctx = crate::context::DispatchCtx::for_test(arch_name);
             for d in fp8_b128_operand_cases() {
-                for (batch, verify, host) in
-                    [(0, false, false), (1, false, false), (2, true, true), (4, true, false)]
-                {
+                for (batch, verify, host) in [
+                    (0, false, false),
+                    (1, false, false),
+                    (2, true, true),
+                    (4, true, false),
+                ] {
                     let r = MoePrefillResolution::resolve_with_batch_ctx(
                         &d, &ctx.arch, &ctx.flags, batch, verify, host,
                     );
@@ -2900,5 +3021,59 @@ mod tests {
         let prefill = MoePrefillResolution::resolve(&d, &ctx.arch, &ctx.flags);
         assert!(!prefill.fp8_b128_refused);
         prefill.check_generic_route(None).unwrap();
+    }
+
+    /// The cold codec comes from the layer's whole per-expert metadata, never
+    /// from the first expert or the arch alone.
+    #[test]
+    fn slab_cold_codec_is_read_from_every_expert_pair() {
+        const MQ4: (DType, DType) = (DType::MQ4G256V2, DType::MQ4G128V2);
+        const W3: (DType, DType) = (DType::MQ3I4G128R256, DType::MQ3I4G128R128);
+        const E8P: (DType, DType) = (DType::E8PI4G128R256, DType::E8PI4G128R128);
+        const W2: (DType, DType) = (DType::MQ2I4G128R256, DType::MQ2I4G128R128);
+        let layer = |pairs: &[(DType, DType)], admits: &dyn Fn(u8) -> bool| {
+            let gate_up: Vec<DType> = pairs.iter().map(|pair| pair.0).collect();
+            let down: Vec<DType> = pairs.iter().map(|pair| pair.1).collect();
+            let mut dtypes = uniform_mq4();
+            dtypes.routed_has_mixed_experts = true;
+            dtypes.routed_gate_up = gate_up[0];
+            dtypes.routed_down = down[0];
+            layer_cold_codec(
+                &MoeDtypes {
+                    per_expert_gate_up: Some(&gate_up),
+                    per_expert_down: Some(&down),
+                    ..dtypes
+                },
+                admits,
+            )
+        };
+        let all = |_: u8| true;
+        // MQ4 first, one cold expert far behind it.
+        assert_eq!(layer(&[MQ4, MQ4, MQ4, E8P], &all), Some(Some(3)));
+        assert_eq!(layer(&[MQ4, W3, MQ4], &all), Some(Some(1)));
+        assert_eq!(layer(&[E8P, MQ4], &all), Some(Some(3)));
+        // Two cold codecs in one layer, W2 anywhere, an MQ4-only or cold-only
+        // mixed table all fail closed.
+        assert_eq!(layer(&[MQ4, W3, E8P], &all), None);
+        assert_eq!(layer(&[MQ4, MQ4, W2], &all), None);
+        assert_eq!(layer(&[MQ4, MQ4], &all), None);
+        assert_eq!(layer(&[W3, W3], &all), None);
+        // An arch that refuses the cold codec refuses the layer, even when
+        // the first expert is MQ4.
+        assert_eq!(layer(&[MQ4, MQ4, E8P], &|codec| codec == 0), None);
+        assert_eq!(layer(&[MQ4, E8P], &|codec| codec != 3), None);
+        // Uniform layers: MQ4 has no cold codec, W3 / E8P are their own.
+        let uniform = |pair: (DType, DType)| {
+            let dtypes = MoeDtypes {
+                routed_gate_up: pair.0,
+                routed_down: pair.1,
+                ..uniform_mq4()
+            };
+            layer_cold_codec(&dtypes, &all)
+        };
+        assert_eq!(uniform(MQ4), Some(None));
+        assert_eq!(uniform(W3), Some(Some(1)));
+        assert_eq!(uniform(E8P), Some(Some(3)));
+        assert_eq!(uniform(W2), None);
     }
 }

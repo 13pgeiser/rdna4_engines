@@ -20,6 +20,7 @@ pub mod dflash_state_copy;
 mod dispatch;
 pub mod draft_lane_conv;
 pub mod draft_lane_rows;
+pub mod e8p_moe_decode;
 pub mod embedding;
 pub mod emu;
 pub mod emu_validate;
@@ -49,6 +50,11 @@ pub mod lane_gdn;
 pub mod lane_rows_pm;
 mod loaded_code_check;
 pub mod moe;
+pub mod slab_admission;
+pub use slab_admission::{
+    qwen4_slab_codec_admitted, qwen4_slab_default_cold_codec, qwen4_slab_layer_cold_codec,
+    SlabLayerCodecError,
+};
 pub mod mq_f16_producers;
 pub mod mq_f16_residual_producers;
 pub mod norm;

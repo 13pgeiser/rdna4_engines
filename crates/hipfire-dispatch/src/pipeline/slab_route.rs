@@ -5,22 +5,24 @@
 //! Sealed expert-slab route (`MoeRouteCapability::SlabCodecGrouped`) stage
 //! helpers shared by the decode and prefill lowerings.
 //!
-//! The layer's experts live in one slab arena and carry a codec each (MQ4
-//! symmetric or MQ3-I4). Two kernel families serve them:
+//! The layer's experts live in one slab arena and carry a codec each: MQ4
+//! symmetric plus at most one cold codec per layer (MQ3-I4 W3 on gfx1201 and gfx1151,
+//! or E8P-I4 on gfx1201 and gfx1100; W2 nowhere). Two kernel families serve them:
 //!
 //! * `route_rows <= Gpu::few_row_limit()` (decode, MTP verify, a one-row forward): the K1 lane-union
 //!   GEMV over codec buckets ([`rdna_compute::slab_moe`]). The layer sits in the
 //!   path-1 stage shape (gate/up F32 rows, SwiGLU activation + 128-wide
 //!   rotation, unweighted F32 down rows, top-10 combine); only the two GEMVs
 //!   are K1 launches.
-//! * longer prefill: the K2 grouped IU4 kernels, MQ4 and W3, over the same
-//!   grouped buffers with codec-masked tile ids (disjoint tiles).
+//! * longer prefill: the K2 grouped IU4 kernels, MQ4 and the cold codec, over
+//!   the same grouped buffers with codec-masked tile ids (disjoint tiles).
 //!
 //! A layer whose experts all share one codec carries no codec table; a mixed
 //! layer's table is the layer's dtype-tag tensor: `[512]` u8 codec bytes
-//! (`0` = MQ4, `1` = W3) followed by the same codes as `[512]` i32 (the
-//! table-driven tile mask's owner table). The tensor's logical shape is the u8
-//! table; its allocation is [`CODEC_TAG_ALLOC_BYTES`].
+//! (cold-codec membership only: `0` = MQ4, `1` = cold) followed by the same
+//! codes as `[512]` i32 (the table-driven tile mask's owner table). The
+//! tensor's logical shape is the u8 table; its allocation is
+//! [`CODEC_TAG_ALLOC_BYTES`]. Buckets: cold = 0, MQ4 = 1.
 
 use super::layer_ops::hip;
 use crate::families::moe::MoeDtypes;
@@ -40,32 +42,75 @@ fn refuse(what: &str) -> DispatchError {
     DispatchError::Hip(format!("sealed expert-slab route: {what}"))
 }
 
-/// The K1 bucket layout of a layer: its codec table when mixed, else the one
-/// codec its (uniform) routed dtype names.
-pub(crate) fn buckets<'a>(
+/// Whether `arch` hosts the sealed expert-slab route (the arch admits MQ4).
+pub(crate) fn arch_supported(arch: &str) -> bool {
+    rdna_compute::qwen4_slab_codec_admitted(arch, 0)
+}
+
+/// A layer's K1 / K2 codec layout: the bucket map and the raw codec id of its
+/// cold bucket (the `cold_codec` the runtime entries take).
+#[derive(Clone, Copy)]
+pub(crate) struct SlabLayer<'a> {
+    pub buckets: SlabBuckets<'a>,
+    pub cold_codec: u8,
+}
+
+/// The codec layout of a layer on `arch`: its codec table when mixed, else the
+/// one codec its (uniform) routed dtype names, which `arch` must admit. Two
+/// buckets: cold = 0, MQ4 = 1. The cold codec is the policy's declaration,
+/// validated against the dtype tables by route selection; nothing here scans
+/// a table.
+pub(crate) fn layer<'a>(
+    arch: &str,
+    policy: Option<&crate::families::moe::MoeRoutePolicy>,
     dtypes: &MoeDtypes<'_>,
     tags: Option<&'a GpuTensor>,
-) -> Result<SlabBuckets<'a>, DispatchError> {
-    match tags {
+) -> Result<SlabLayer<'a>, DispatchError> {
+    let policy = policy
+        .filter(|policy| policy.capability.is_slab())
+        .ok_or_else(|| refuse("the layer declares no slab route"))?;
+    let cold_codec = crate::families::moe::slab_launch_cold_codec(arch, policy.slab_cold_codec)
+        .ok_or_else(|| {
+            refuse(&format!(
+                "{arch} does not admit the layer's cold codec {:?}",
+                policy.slab_cold_codec
+            ))
+        })?;
+    let buckets = match tags {
         Some(table) => {
             if table.buf.size() < CODEC_TAG_ALLOC_BYTES {
-                return Err(refuse("codec tag allocation is smaller than the u8 + i32 tables"));
+                return Err(refuse(
+                    "codec tag allocation is smaller than the u8 + i32 tables",
+                ));
             }
-            Ok(SlabBuckets::Table(table))
+            SlabBuckets::Table(table)
         }
-        None => match dtypes.routed_gate_up {
-            DType::MQ3I4G128R256 => Ok(SlabBuckets::Uniform(0)),
-            DType::MQ4G256V2 => Ok(SlabBuckets::Uniform(1)),
-            other => Err(refuse(&format!("uniform layer dtype {other:?} is not a slab codec"))),
-        },
-    }
+        None => crate::families::moe::slab_bucket_of_pair(
+            arch,
+            dtypes.routed_gate_up,
+            dtypes.routed_down,
+        )
+        .map(SlabBuckets::Uniform)
+        .ok_or_else(|| {
+            refuse(&format!(
+                "uniform layer dtypes {:?}/{:?} are not a slab codec of {arch}",
+                dtypes.routed_gate_up, dtypes.routed_down
+            ))
+        })?,
+    };
+    Ok(SlabLayer {
+        buckets,
+        cold_codec,
+    })
 }
 
 /// The `[512]` i32 codec table of a mixed layer's tag tensor (the table-driven
 /// tile mask's owner table).
 pub(crate) fn codec_i32(tags: &GpuTensor) -> Result<GpuTensor, DispatchError> {
     if tags.buf.size() < CODEC_TAG_ALLOC_BYTES {
-        return Err(refuse("codec tag allocation is smaller than the u8 + i32 tables"));
+        return Err(refuse(
+            "codec tag allocation is smaller than the u8 + i32 tables",
+        ));
     }
     Ok(GpuTensor {
         buf: tags.buf.byte_view(CODEC_U8_BYTES, 4 * SLAB_EXPERTS),
@@ -94,7 +139,9 @@ fn k1_check_lanes(gpu: &Gpu, what: &str, lanes: usize) -> Result<(), DispatchErr
 /// + rank, i32 words).
 fn topk_group(topk: &GpuTensor, first: usize, n: usize) -> GpuTensor {
     GpuTensor {
-        buf: topk.buf.byte_view(first * SLAB_TOP_K * 4, n * SLAB_TOP_K * 4),
+        buf: topk
+            .buf
+            .byte_view(first * SLAB_TOP_K * 4, n * SLAB_TOP_K * 4),
         shape: vec![n * SLAB_TOP_K],
         dtype: topk.dtype,
     }
@@ -111,7 +158,7 @@ fn topk_group(topk: &GpuTensor, first: usize, n: usize) -> GpuTensor {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn k1_gate_up(
     gpu: &mut Gpu,
-    buckets: SlabBuckets<'_>,
+    layer: SlabLayer<'_>,
     gate_up_ptrs: &GpuTensor,
     topk: &GpuTensor,
     xr: &GpuTensor,
@@ -120,16 +167,17 @@ pub(crate) fn k1_gate_up(
     lanes: usize,
 ) -> Result<(), DispatchError> {
     k1_check_lanes(gpu, "k1_gate_up", lanes)?;
-    if lanes <= K1_MAX_ROWS || gpu.qwen4_slab_wide_twin(lanes) {
-        hip(gpu.qwen4_slab_union_plan(topk, buckets, lanes))?;
+    if lanes <= K1_MAX_ROWS || gpu.qwen4_slab_wide_twin(lanes, layer.cold_codec) {
+        hip(gpu.qwen4_slab_union_plan(topk, layer.buckets, lanes))?;
         return hip(gpu.mq_i4_moe_gemv_slab(
             false,
-            buckets,
+            layer.buckets,
             gate_up_ptrs,
             xr,
             gate_out,
             Some(up_out),
             lanes,
+            layer.cold_codec,
         ));
     }
     const GATE_UP_K: usize = rdna_compute::slab_moe::SLAB_GATE_UP_K;
@@ -140,8 +188,17 @@ pub(crate) fn k1_gate_up(
         let x = xr.sub_offset(first * GATE_UP_K, n * GATE_UP_K);
         let gate = gate_out.sub_offset(slots.0 * GATE_UP_HALF, slots.1 * GATE_UP_HALF);
         let up = up_out.sub_offset(slots.0 * GATE_UP_HALF, slots.1 * GATE_UP_HALF);
-        hip(gpu.qwen4_slab_union_plan(&ids, buckets, n))?;
-        hip(gpu.mq_i4_moe_gemv_slab(false, buckets, gate_up_ptrs, &x, &gate, Some(&up), n))?;
+        hip(gpu.qwen4_slab_union_plan(&ids, layer.buckets, n))?;
+        hip(gpu.mq_i4_moe_gemv_slab(
+            false,
+            layer.buckets,
+            gate_up_ptrs,
+            &x,
+            &gate,
+            Some(&up),
+            n,
+            layer.cold_codec,
+        ))?;
     }
     Ok(())
 }
@@ -158,7 +215,7 @@ pub(crate) fn k1_gate_up(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn k1_down(
     gpu: &mut Gpu,
-    buckets: SlabBuckets<'_>,
+    layer: SlabLayer<'_>,
     topk: &GpuTensor,
     down_ptrs: &GpuTensor,
     xrot: &GpuTensor,
@@ -166,8 +223,17 @@ pub(crate) fn k1_down(
     lanes: usize,
 ) -> Result<(), DispatchError> {
     k1_check_lanes(gpu, "k1_down", lanes)?;
-    if lanes <= K1_MAX_ROWS || gpu.qwen4_slab_wide_twin(lanes) {
-        return hip(gpu.mq_i4_moe_gemv_slab(true, buckets, down_ptrs, xrot, y0, None, lanes));
+    if lanes <= K1_MAX_ROWS || gpu.qwen4_slab_wide_twin(lanes, layer.cold_codec) {
+        return hip(gpu.mq_i4_moe_gemv_slab(
+            true,
+            layer.buckets,
+            down_ptrs,
+            xrot,
+            y0,
+            None,
+            lanes,
+            layer.cold_codec,
+        ));
     }
     const DOWN_K: usize = rdna_compute::slab_moe::SLAB_DOWN_K;
     const DOWN_M: usize = rdna_compute::slab_moe::SLAB_DOWN_M;
@@ -176,8 +242,17 @@ pub(crate) fn k1_down(
         let (slot0, slots) = (first * SLAB_TOP_K, n * SLAB_TOP_K);
         let x = xrot.sub_offset(slot0 * DOWN_K, slots * DOWN_K);
         let y = y0.sub_offset(slot0 * DOWN_M, slots * DOWN_M);
-        hip(gpu.qwen4_slab_union_plan(&ids, buckets, n))?;
-        hip(gpu.mq_i4_moe_gemv_slab(true, buckets, down_ptrs, &x, &y, None, n))?;
+        hip(gpu.qwen4_slab_union_plan(&ids, layer.buckets, n))?;
+        hip(gpu.mq_i4_moe_gemv_slab(
+            true,
+            layer.buckets,
+            down_ptrs,
+            &x,
+            &y,
+            None,
+            n,
+            layer.cold_codec,
+        ))?;
     }
     Ok(())
 }
@@ -185,8 +260,8 @@ pub(crate) fn k1_down(
 #[cfg(test)]
 mod tests {
     use super::super::slab_moe_decode::{self as k1, BucketKey, Codec, Kind};
-    use rdna_compute::slab_moe as gpu;
     use super::{k1_groups, K1_MAX_ROWS};
+    use rdna_compute::slab_moe as gpu;
 
     #[test]
     fn capacity_does_not_widen_narrow_fallback_groups() {
@@ -229,8 +304,14 @@ mod tests {
         assert_eq!(gpu::SLAB_MAX_LANES, k1::MAX_LANES);
         assert_eq!(gpu::SLAB_TOP_K, k1::TOP_K);
         assert_eq!(gpu::SLAB_EXPERTS, k1::MAX_EXPERTS);
-        assert_eq!((gpu::SLAB_GATE_UP_M, gpu::SLAB_GATE_UP_K), (k1::GATE_UP_M, k1::GATE_UP_K));
-        assert_eq!((gpu::SLAB_DOWN_M, gpu::SLAB_DOWN_K), (k1::DOWN_M, k1::DOWN_K));
+        assert_eq!(
+            (gpu::SLAB_GATE_UP_M, gpu::SLAB_GATE_UP_K),
+            (k1::GATE_UP_M, k1::GATE_UP_K)
+        );
+        assert_eq!(
+            (gpu::SLAB_DOWN_M, gpu::SLAB_DOWN_K),
+            (k1::DOWN_M, k1::DOWN_K)
+        );
         // Codec bytes of the per-layer table: 1 = W3 -> bucket 0, 0 = MQ4 -> bucket 1.
         assert_eq!(gpu::slab_bucket_of_codec(1), Codec::Mq3I4.order_index());
         assert_eq!(gpu::slab_bucket_of_codec(0), Codec::Mq4Sym.order_index());
@@ -241,7 +322,10 @@ mod tests {
     fn union_scratch_words_match_the_descriptor_layout() {
         for lanes in 1..=gpu::SLAB_MAX_LANES {
             let s = 10 * lanes;
-            assert_eq!(rdna_compute::scratch::qwen4_slab_union_words(lanes), 2 * s + 2 * (s + 1) + 2 * s);
+            assert_eq!(
+                rdna_compute::scratch::qwen4_slab_union_words(lanes),
+                2 * s + 2 * (s + 1) + 2 * s
+            );
         }
     }
 }

@@ -940,6 +940,12 @@ pub enum DType {
     MQ2I4G128R256,
     /// MQ2-I4 down (qt=134): W2 codec, R128 FWHT. Planar like qt=131.
     MQ2I4G128R128,
+    /// E8P-I4 gate/up (qt=135): E8P codebook words (`u16` = `idx | sign7 << 8 | shift << 15`
+    /// per eight weights) with FP16 per-128 scales, R256 FWHT. PLANAR like qt=131
+    /// (`[M*K/8 u16 words][M*K/128 f16 scales]`): no per-row stride, typed-qwen4 only.
+    E8PI4G128R256,
+    /// E8P-I4 down (qt=136): E8P codec, R128 FWHT. Planar like qt=135.
+    E8PI4G128R128,
 }
 
 impl DType {
@@ -999,7 +1005,9 @@ impl DType {
             | DType::MQ3I4G128R256
             | DType::MQ3I4G128R128
             | DType::MQ2I4G128R256
-            | DType::MQ2I4G128R128 => 1, // byte-level
+            | DType::MQ2I4G128R128
+            | DType::E8PI4G128R256
+            | DType::E8PI4G128R128 => 1, // byte-level
         }
     }
 
@@ -1047,13 +1055,15 @@ impl DType {
             DType::MQ3I4G128R256
             | DType::MQ3I4G128R128
             | DType::MQ2I4G128R256
-            | DType::MQ2I4G128R128 => None,
+            | DType::MQ2I4G128R128
+            | DType::E8PI4G128R256
+            | DType::E8PI4G128R128 => None,
             _ => None,
         }
     }
 
-    /// Canonical name of the typed-qwen4-only planar MQ3-I4 / MQ2-I4 formats
-    /// (qt=131..=134); `None` for every other dtype. Generic consumers use
+    /// Canonical name of the typed-qwen4-only planar MQ3-I4 / MQ2-I4 / E8P-I4 formats
+    /// (qt=131..=136); `None` for every other dtype. Generic consumers use
     /// this to refuse them with a named error instead of a generic fallback.
     pub fn mq_i4_name(self) -> Option<&'static str> {
         match self {
@@ -1061,6 +1071,8 @@ impl DType {
             DType::MQ3I4G128R128 => Some("MQ3I4G128R128"),
             DType::MQ2I4G128R256 => Some("MQ2I4G128R256"),
             DType::MQ2I4G128R128 => Some("MQ2I4G128R128"),
+            DType::E8PI4G128R256 => Some("E8PI4G128R256"),
+            DType::E8PI4G128R128 => Some("E8PI4G128R128"),
             _ => None,
         }
     }
@@ -8552,6 +8564,8 @@ mod tests {
             (DType::MQ3I4G128R128, "MQ3I4G128R128"),
             (DType::MQ2I4G128R256, "MQ2I4G128R256"),
             (DType::MQ2I4G128R128, "MQ2I4G128R128"),
+            (DType::E8PI4G128R256, "E8PI4G128R256"),
+            (DType::E8PI4G128R128, "E8PI4G128R128"),
         ] {
             assert_eq!(dt.size(), 1);
             assert_eq!(dt.row_bytes(128), None);

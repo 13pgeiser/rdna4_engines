@@ -76,10 +76,16 @@ impl fmt::Display for ExpertSlabsError {
             Self::MetadataNotObject => write!(f, "HFQM metadata JSON is not an object"),
             Self::NotAnObject => write!(f, "`{EXPERT_SLABS_METADATA_KEY}` is not a JSON object"),
             Self::MissingField(field) => {
-                write!(f, "`{EXPERT_SLABS_METADATA_KEY}` is missing field `{field}`")
+                write!(
+                    f,
+                    "`{EXPERT_SLABS_METADATA_KEY}` is missing field `{field}`"
+                )
             }
             Self::UnknownField(field) => {
-                write!(f, "`{EXPERT_SLABS_METADATA_KEY}` has unknown field `{field}`")
+                write!(
+                    f,
+                    "`{EXPERT_SLABS_METADATA_KEY}` has unknown field `{field}`"
+                )
             }
             Self::WrongType { field, expected } => write!(
                 f,
@@ -151,7 +157,9 @@ fn expect_u64(
     field: &'static str,
     want: u64,
 ) -> Result<u32, ExpertSlabsError> {
-    let value = obj.get(field).ok_or(ExpertSlabsError::MissingField(field))?;
+    let value = obj
+        .get(field)
+        .ok_or(ExpertSlabsError::MissingField(field))?;
     let found = value.as_u64().ok_or(ExpertSlabsError::WrongType {
         field,
         expected: "a non-negative integer",
@@ -171,7 +179,9 @@ fn expect_str(
     field: &'static str,
     want: &'static str,
 ) -> Result<String, ExpertSlabsError> {
-    let value = obj.get(field).ok_or(ExpertSlabsError::MissingField(field))?;
+    let value = obj
+        .get(field)
+        .ok_or(ExpertSlabsError::MissingField(field))?;
     let found = value.as_str().ok_or(ExpertSlabsError::WrongType {
         field,
         expected: "a string",
@@ -193,7 +203,9 @@ fn expect_str(
 pub fn parse(metadata_json: &str) -> Result<Option<ExpertSlabsV1>, ExpertSlabsError> {
     let root: serde_json::Value = serde_json::from_str(metadata_json)
         .map_err(|e| ExpertSlabsError::InvalidJson(e.to_string()))?;
-    let root = root.as_object().ok_or(ExpertSlabsError::MetadataNotObject)?;
+    let root = root
+        .as_object()
+        .ok_or(ExpertSlabsError::MetadataNotObject)?;
     let Some(slabs) = root.get(EXPERT_SLABS_METADATA_KEY) else {
         return Ok(None);
     };
@@ -214,13 +226,15 @@ pub fn parse(metadata_json: &str) -> Result<Option<ExpertSlabsV1>, ExpertSlabsEr
     }))
 }
 
-/// The three legal per-expert qtype pairs `(gate_up_qt, down_qt)`.
+/// The four legal per-expert qtype pairs `(gate_up_qt, down_qt)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ExpertFormat {
     /// `(131, 132)`: W3 planar, `MQ3I4G128R256` gate_up + `MQ3I4G128R128` down.
     Mq3I4,
     /// `(133, 134)`: W2 planar, `MQ2I4G128R256` gate_up + `MQ2I4G128R128` down.
     Mq2I4,
+    /// `(135, 136)`: E8P-I4 planar, R256 gate_up + R128 down (codec byte 3).
+    E8pI4,
     /// `(44, 53)`: copied symmetric MQ4-XTS, `MQ4G256V2` gate_up + `MQ4G128V2` down.
     Mq4Xts,
 }
@@ -231,6 +245,7 @@ impl ExpertFormat {
         match self {
             Self::Mq3I4 => (131, 132),
             Self::Mq2I4 => (133, 134),
+            Self::E8pI4 => (135, 136),
             Self::Mq4Xts => (44, 53),
         }
     }
@@ -240,6 +255,7 @@ impl ExpertFormat {
         match (gate_up_qt, down_qt) {
             (131, 132) => Some(Self::Mq3I4),
             (133, 134) => Some(Self::Mq2I4),
+            (135, 136) => Some(Self::E8pI4),
             (44, 53) => Some(Self::Mq4Xts),
             _ => None,
         }
@@ -251,6 +267,7 @@ impl ExpertFormat {
         match self {
             Self::Mq3I4 => mq_i4_bytes(MqI4Profile::MQ3_R256, m, k),
             Self::Mq2I4 => mq_i4_bytes(MqI4Profile::MQ2_R256, m, k),
+            Self::E8pI4 => m * k / 4 + m * (k / 128) * 2,
             // MQ4G256V2: 136 B per 256-wide group per row.
             Self::Mq4Xts => m * (k / 256) * 136,
         }
@@ -262,6 +279,7 @@ impl ExpertFormat {
         match self {
             Self::Mq3I4 => mq_i4_bytes(MqI4Profile::MQ3_R128, m, k),
             Self::Mq2I4 => mq_i4_bytes(MqI4Profile::MQ2_R128, m, k),
+            Self::E8pI4 => m * k / 4 + m * (k / 128) * 2,
             // MQ4G128V2: 68 B per 128-wide group per row.
             Self::Mq4Xts => m * (k / 128) * 68,
         }
@@ -393,7 +411,10 @@ mod tests {
     #[test]
     fn parse_is_none_without_the_key() {
         assert_eq!(parse("{}").unwrap(), None);
-        assert_eq!(parse(r#"{"arch":"qwen4","qwen4.expert_slab":{}}"#).unwrap(), None);
+        assert_eq!(
+            parse(r#"{"arch":"qwen4","qwen4.expert_slab":{}}"#).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -473,7 +494,11 @@ mod tests {
             let mut v = v1_json();
             v.as_object_mut().unwrap().remove(field);
             let err = parse(&metadata_with(v)).unwrap_err();
-            assert_eq!(err, ExpertSlabsError::MissingField(field), "missing {field}");
+            assert_eq!(
+                err,
+                ExpertSlabsError::MissingField(field),
+                "missing {field}"
+            );
         }
         // Empty object: nothing from v1 is present.
         assert_eq!(
@@ -523,8 +548,14 @@ mod tests {
             ))
         };
         // Range is the loader's job: out-of-range indices still parse.
-        assert_eq!(p("48", "512", "gate_up_proj"), Some((48, 512, ExpertProj::GateUp)));
-        assert_eq!(p("0", "1000000", "down_proj"), Some((0, 1_000_000, ExpertProj::Down)));
+        assert_eq!(
+            p("48", "512", "gate_up_proj"),
+            Some((48, 512, ExpertProj::GateUp))
+        );
+        assert_eq!(
+            p("0", "1000000", "down_proj"),
+            Some((0, 1_000_000, ExpertProj::Down))
+        );
         // Leading zeros, signs, padding, empties and non-digits are not canonical.
         for (l, e) in [
             ("01", "0"),
@@ -575,6 +606,7 @@ mod tests {
         for (fmt, pair) in [
             (ExpertFormat::Mq3I4, (131u8, 132u8)),
             (ExpertFormat::Mq2I4, (133, 134)),
+            (ExpertFormat::E8pI4, (135, 136)),
             (ExpertFormat::Mq4Xts, (44, 53)),
         ] {
             assert_eq!(fmt.pair(), pair);
@@ -604,10 +636,18 @@ mod tests {
         assert_eq!(ExpertFormat::Mq2I4.gate_up_bytes(), 870_400);
         assert_eq!(ExpertFormat::Mq2I4.down_bytes(), 435_200);
         assert_eq!(ExpertFormat::Mq2I4.slab_bytes(), 1_305_600);
+        assert_eq!(ExpertFormat::E8pI4.gate_up_bytes(), 870_400);
+        assert_eq!(ExpertFormat::E8pI4.down_bytes(), 435_200);
+        assert_eq!(ExpertFormat::E8pI4.slab_bytes(), 1_305_600);
         assert_eq!(ExpertFormat::Mq4Xts.gate_up_bytes(), 1_740_800);
         assert_eq!(ExpertFormat::Mq4Xts.down_bytes(), 870_400);
         assert_eq!(ExpertFormat::Mq4Xts.slab_bytes(), 2_611_200);
-        for fmt in [ExpertFormat::Mq3I4, ExpertFormat::Mq2I4, ExpertFormat::Mq4Xts] {
+        for fmt in [
+            ExpertFormat::Mq3I4,
+            ExpertFormat::Mq2I4,
+            ExpertFormat::E8pI4,
+            ExpertFormat::Mq4Xts,
+        ] {
             assert_eq!(fmt.slab_bytes() % 256, 0, "{fmt:?}");
             assert_eq!(fmt.gate_up_bytes() % 256, 0, "{fmt:?}");
             assert_eq!(fmt.down_bytes() % 256, 0, "{fmt:?}");

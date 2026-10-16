@@ -790,7 +790,7 @@ fn reject_mq4g128v2(dtype: DType) -> HipResult<()> {
         Err(hip_bridge::HipError::new(
             0,
             &format!(
-                "generic llama GPU decode does not consume {name}; MQ-I4 (qt=131..=134) is a typed-qwen4 expert-slab format with no GPU kernel yet"
+                "generic llama GPU decode does not consume {name}; MQ-I4 / E8P-I4 (qt=131..=136) is a typed-qwen4 expert-slab format with no generic GPU kernel"
             ),
         ))
     } else {

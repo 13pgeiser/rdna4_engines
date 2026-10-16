@@ -61,6 +61,7 @@ fn grouped_geometry(p: &MoePrefillParams<'_>) -> bool {
     if policy.capability.is_slab() {
         return p.batch_size > 0
             && crate::families::moe::slab_route_geometry_supported(
+                None,
                 &policy,
                 p.n_exp,
                 p.k_top,
@@ -109,7 +110,7 @@ fn is_fp8(p: &MoePrefillParams<'_>) -> bool {
         .is_some_and(|policy| policy.capability.is_fp8_grouped())
 }
 
-/// The declared route is the sealed expert-slab route (gfx1201, gfx1151).
+/// The declared route is the sealed expert-slab route (gfx1100, gfx1151, gfx1201).
 #[inline]
 fn is_slab(p: &MoePrefillParams<'_>) -> bool {
     p.route_policy
@@ -121,7 +122,7 @@ fn is_slab(p: &MoePrefillParams<'_>) -> bool {
 /// other slab calls run the K1 lane-union GEMV in the path-1 stage shape.
 fn slab_k2(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
     is_slab(p)
-        && gpu.qwen4_slab_arch()
+        && super::slab_route::arch_supported(&gpu.arch)
         && p.recipe.bf16_round_trip()
         && p.x_norm_batch.dtype == DType::F32
         && p.down_k == p.mi
@@ -1250,6 +1251,21 @@ pub(crate) fn scatter(
     require_geometry(p)?;
     let total_slots = p.batch_size * p.k_top;
     if sym_iu4(gpu, p, true) || (p.ep_tile_exchange.is_some() && wmma_tile_route(gpu, p, true)) {
+        if is_slab(p) {
+            // Sealed expert-slab: the arch-neutral entry (gfx1201 delegates to
+            // the unchanged scatter, gfx1100 runs its own).
+            return hip(gpu.moe_scatter_stable_top10_slab(
+                p.topk_indices,
+                p.expert_token_counts,
+                p.expert_offsets,
+                p.sorted_slot_index,
+                p.expert_tile_ids,
+                p.inverse_perm,
+                total_slots,
+                p.n_exp,
+                grouped_rows,
+            ));
+        }
         return hip(gpu.moe_scatter_stable_top10(
             p.topk_indices,
             p.expert_token_counts,
@@ -1918,9 +1934,10 @@ fn combine_stage(
     Ok(())
 }
 
-// ──────────────── sealed expert-slab (gfx1201, gfx1151) ────────────────
+// ─────────────── sealed expert-slab (MQ4 + cold W3 / E8P) ───────────────
 
-/// Slab gate/up. K2: rotate256 A4 once, then the W3 and MQ4 NT1 kernels over
+/// Slab gate/up. K2: rotate256 A4 once, then the layer's cold-codec (W3 or
+/// E8P) and MQ4 NT1 kernels over
 /// the same grouped Y rows, each on its own codec-masked tile ids (a uniform
 /// layer launches its one kernel on the scatter's ids). K1: the lane-union GEMV
 /// over the rotated F32 activation, BF16-rounded gate/up rows in path-1 shape.
@@ -1930,12 +1947,17 @@ fn slab_gate_up(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     use rdna_compute::slab_moe::SlabBuckets;
-    if !gpu.qwen4_slab_arch() {
+    if !super::slab_route::arch_supported(&gpu.arch) {
         return Err(DispatchError::Hip(
-            "sealed expert-slab route is gfx1151/gfx1201-only".into(),
+            "sealed expert-slab route is gfx1100/gfx1151/gfx1201-only".into(),
         ));
     }
-    let buckets = super::slab_route::buckets(&p.dtypes, p.expert_dtype_tags)?;
+    let layer = super::slab_route::layer(
+        &gpu.arch,
+        p.route_policy.as_ref(),
+        &p.dtypes,
+        p.expert_dtype_tags,
+    )?;
     if !slab_k2(gpu, p) {
         // The activation basis the path-1 shape reads. Idempotent: the same
         // bytes the input-basis stage produced.
@@ -1947,7 +1969,7 @@ fn slab_gate_up(
             .ok_or_else(|| DispatchError::Hip("slab gate/up extent overflows".into()))?;
         super::slab_route::k1_gate_up(
             gpu,
-            buckets,
+            layer,
             p.expert_gate_up_ptrs,
             p.topk_indices,
             p.x_rot_batch,
@@ -1961,25 +1983,22 @@ fn slab_gate_up(
         }
         return Ok(());
     }
-    let xq = hip(gpu.qwen4_moe_rotate256_i4(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
+    let xq = hip(gpu.qwen4_moe_rotate256_i4_slab(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
     let host_mapped = experts_host_mapped(p);
     let gate_up_ptrs = p
         .expert_stage_ptrs
         .map_or(p.expert_gate_up_ptrs, |stage| stage.gate_up);
     let (m, k) = (2 * p.mi, p.gate_up_k);
-    match buckets {
-        SlabBuckets::Uniform(0) => hip(gpu.gemm_qwen4_moe_w3_gate_up_silu_iu4_sym(
+    match layer.buckets {
+        SlabBuckets::Uniform(0) => cold_gate_up(
+            gpu,
+            p,
+            layer.cold_codec,
             gate_up_ptrs,
             p.expert_tile_ids,
-            p.sorted_slot_index,
             &xq,
-            p.y_gate_up_grouped,
-            m,
-            k,
-            p.k_top,
             grouped_rows,
-            p.batch_size,
-        )),
+        ),
         SlabBuckets::Uniform(_) => hip(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
             gate_up_ptrs,
             p.expert_tile_ids,
@@ -1995,23 +2014,21 @@ fn slab_gate_up(
         )),
         SlabBuckets::Table(tags) => {
             let owner = super::slab_route::codec_i32(tags)?;
-            let [w3, mq4] = hip(gpu.qwen4_slab_tile_masks(
+            let [cold, mq4] = hip(gpu.qwen4_slab_tile_masks(
                 p.expert_tile_ids,
                 &owner,
                 grouped_tiles(grouped_rows),
+                layer.cold_codec,
             ))?;
-            hip(gpu.gemm_qwen4_moe_w3_gate_up_silu_iu4_sym(
+            cold_gate_up(
+                gpu,
+                p,
+                layer.cold_codec,
                 gate_up_ptrs,
-                &w3,
-                p.sorted_slot_index,
+                &cold,
                 &xq,
-                p.y_gate_up_grouped,
-                m,
-                k,
-                p.k_top,
                 grouped_rows,
-                p.batch_size,
-            ))?;
+            )?;
             hip(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
                 gate_up_ptrs,
                 &mq4,
@@ -2048,8 +2065,8 @@ fn slab_activation(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), Dispat
     hip(gpu.rotate_x_mq_128_v2(p.rot_batch, p.rot_batch, p.mi, total_slots))
 }
 
-/// Slab down. K2: rotate128 A4 (the hipcc producer, byte-identical to K3), then
-/// the W3 and MQ4 down kernels over the grouped BF16 rows on codec-masked
+/// Slab down. K2: rotate128 A4 (the hipcc producer on gfx1201, K3 on gfx1100),
+/// then the cold-codec and MQ4 down kernels over the grouped BF16 rows on codec-masked
 /// tiles. K1: the lane-union GEMV over the rotated activation, unweighted F32
 /// rows in slot order for the top-10 combine.
 fn slab_down(
@@ -2058,14 +2075,24 @@ fn slab_down(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     use rdna_compute::slab_moe::SlabBuckets;
-    let buckets = super::slab_route::buckets(&p.dtypes, p.expert_dtype_tags)?;
+    if !super::slab_route::arch_supported(&gpu.arch) {
+        return Err(DispatchError::Hip(
+            "sealed expert-slab route is gfx1100/gfx1151/gfx1201-only".into(),
+        ));
+    }
+    let layer = super::slab_route::layer(
+        &gpu.arch,
+        p.route_policy.as_ref(),
+        &p.dtypes,
+        p.expert_dtype_tags,
+    )?;
     let total_slots = p.batch_size * p.k_top;
     if !slab_k2(gpu, p) {
         let rot = f32_view(p.rot_batch, 0, total_slots * p.mi);
         let y0 = f32_view(p.down_expanded, 0, total_slots * p.down_m);
         return super::slab_route::k1_down(
             gpu,
-            buckets,
+            layer,
             p.topk_indices,
             p.expert_down_ptrs,
             &rot,
@@ -2073,7 +2100,7 @@ fn slab_down(
             p.batch_size,
         );
     }
-    let xq = hip(gpu.qwen4_moe_rotate128_i4(
+    let xq = hip(gpu.qwen4_moe_rotate128_i4_slab(
         p.y_gate_up_grouped,
         p.sorted_slot_index,
         p.down_k,
@@ -2086,19 +2113,16 @@ fn slab_down(
         .expert_stage_ptrs
         .map_or(p.expert_down_ptrs, |stage| stage.down);
     let host_mapped = experts_host_mapped(p);
-    match buckets {
-        SlabBuckets::Uniform(0) => hip(gpu.gemm_qwen4_moe_w3_down_iu4_sym(
+    match layer.buckets {
+        SlabBuckets::Uniform(0) => cold_down(
+            gpu,
+            p,
+            layer.cold_codec,
             down_ptrs,
             p.expert_tile_ids,
-            p.sorted_slot_index,
             &xq,
-            p.y_down_grouped,
-            p.down_m,
-            p.down_k,
-            1,
             grouped_rows,
-            total_slots,
-        )),
+        ),
         SlabBuckets::Uniform(_) => hip(gpu.gemm_qwen4_moe_down_iu4_sym(
             down_ptrs,
             p.expert_tile_ids,
@@ -2114,23 +2138,21 @@ fn slab_down(
         )),
         SlabBuckets::Table(tags) => {
             let owner = super::slab_route::codec_i32(tags)?;
-            let [w3, mq4] = hip(gpu.qwen4_slab_tile_masks(
+            let [cold, mq4] = hip(gpu.qwen4_slab_tile_masks(
                 p.expert_tile_ids,
                 &owner,
                 grouped_tiles(grouped_rows),
+                layer.cold_codec,
             ))?;
-            hip(gpu.gemm_qwen4_moe_w3_down_iu4_sym(
+            cold_down(
+                gpu,
+                p,
+                layer.cold_codec,
                 down_ptrs,
-                &w3,
-                p.sorted_slot_index,
+                &cold,
                 &xq,
-                p.y_down_grouped,
-                p.down_m,
-                p.down_k,
-                1,
                 grouped_rows,
-                total_slots,
-            ))?;
+            )?;
             hip(gpu.gemm_qwen4_moe_down_iu4_sym(
                 down_ptrs,
                 &mq4,
@@ -2146,6 +2168,96 @@ fn slab_down(
             ))
         }
     }
+}
+
+/// K2 gate/up of the layer's cold codec: E8P-I4 (codec 3) or W3 (codec 1).
+#[allow(clippy::too_many_arguments)]
+fn cold_gate_up(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    cold_codec: u8,
+    ptrs: &GpuTensor,
+    tiles: &GpuTensor,
+    xq: &rdna_compute::scratch::Int4MmqPrepared,
+    grouped_rows: usize,
+) -> Result<(), DispatchError> {
+    let (m, k) = (2 * p.mi, p.gate_up_k);
+    hip(match cold_codec {
+        3 => gpu.gemm_qwen4_moe_e8p_gate_up_silu_iu4_sym(
+            ptrs,
+            tiles,
+            p.sorted_slot_index,
+            xq,
+            p.y_gate_up_grouped,
+            m,
+            k,
+            p.k_top,
+            grouped_rows,
+            p.batch_size,
+        ),
+        1 => gpu.gemm_qwen4_moe_w3_gate_up_silu_iu4_sym(
+            ptrs,
+            tiles,
+            p.sorted_slot_index,
+            xq,
+            p.y_gate_up_grouped,
+            m,
+            k,
+            p.k_top,
+            grouped_rows,
+            p.batch_size,
+        ),
+        other => {
+            return Err(DispatchError::Hip(format!(
+                "sealed expert-slab route: cold codec {other} has no K2 gate/up kernel"
+            )))
+        }
+    })
+}
+
+/// K2 down of the layer's cold codec: E8P-I4 (codec 3) or W3 (codec 1).
+#[allow(clippy::too_many_arguments)]
+fn cold_down(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    cold_codec: u8,
+    ptrs: &GpuTensor,
+    tiles: &GpuTensor,
+    xq: &rdna_compute::scratch::Int4MmqPrepared,
+    grouped_rows: usize,
+) -> Result<(), DispatchError> {
+    let total_slots = p.batch_size * p.k_top;
+    hip(match cold_codec {
+        3 => gpu.gemm_qwen4_moe_e8p_down_iu4_sym(
+            ptrs,
+            tiles,
+            p.sorted_slot_index,
+            xq,
+            p.y_down_grouped,
+            p.down_m,
+            p.down_k,
+            1,
+            grouped_rows,
+            total_slots,
+        ),
+        1 => gpu.gemm_qwen4_moe_w3_down_iu4_sym(
+            ptrs,
+            tiles,
+            p.sorted_slot_index,
+            xq,
+            p.y_down_grouped,
+            p.down_m,
+            p.down_k,
+            1,
+            grouped_rows,
+            total_slots,
+        ),
+        other => {
+            return Err(DispatchError::Hip(format!(
+                "sealed expert-slab route: cold codec {other} has no K2 down kernel"
+            )))
+        }
+    })
 }
 
 // ───────────────────────── qt=55 FP8E4M3B128 (gfx942) ─────────────────────────

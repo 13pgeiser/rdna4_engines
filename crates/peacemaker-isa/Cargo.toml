@@ -27,6 +27,48 @@ required-features = ["toolchain"]
 name = "cdna_card_tierc"
 required-features = ["lab"]
 
+# Native gfx1100 emitters that also run the ROCm oracle/certify path (M7, radiowave): need `--features toolchain`.
+[[example]]
+name = "e8p_i4_moe_gemv_gfx1100_emit"
+required-features = ["toolchain"]
+
+[[example]]
+name = "emit_qwen4_moe_sym_gfx1100"
+required-features = ["toolchain"]
+
+[[example]]
+name = "mq_i4_a4_gfx1100_emit"
+required-features = ["toolchain"]
+
+[[example]]
+name = "mq_i4_moe_gemv_gfx1100_emit"
+required-features = ["toolchain"]
+
+[[example]]
+name = "mq_i4_moe_gemv_mq4only_gfx1100_emit"
+required-features = ["toolchain"]
+
+# gfx1100 research probes / fixture emitters (native writer only, no ROCm tools): opt-in `--features lab`.
+[[example]]
+name = "gfx1100_divide_cases_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "gfx1100_epilogue_intrinsic_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "gfx1100_intrinsic_keys_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_moe_epilogue_fixture_gfx1100_emit"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_moe_sym_gfx1100_p1"
+required-features = ["lab"]
+
 [features]
 # Opt-in research harnesses (examples). Not part of any product build; the
 # UNGATED example count is ratcheted, see scripts/leanup-ratchets.sh.

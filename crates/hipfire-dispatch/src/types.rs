@@ -124,10 +124,10 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         | MQ4CG256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd
         | MQ4G256Lloyd | MQ2G256GL | MQ3G256GL | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8
         | MFP4G32E8SOA | MFP3G32E8 | MFP2G32E8 => RotationPlan::FwhtG256,
-        // MQ-I4 (qt=131..=134) are typed-qwen4-only; their activation basis
+        // MQ-I4 (qt=131..=136) are typed-qwen4-only; their activation basis
         // is fixed by the profile's rotation width (R256 / R128).
-        MQ3I4G128R256 | MQ2I4G128R256 => RotationPlan::FwhtG256,
-        MQ3I4G128R128 | MQ2I4G128R128 => RotationPlan::FwhtG128,
+        MQ3I4G128R256 | MQ2I4G128R256 | E8PI4G128R256 => RotationPlan::FwhtG256,
+        MQ3I4G128R128 | MQ2I4G128R128 | E8PI4G128R128 => RotationPlan::FwhtG128,
         // MQ4G128 and MQ4G128V2 carry their own G128 activation basis.  V2
         // uses the qt53 68-byte row format; it must not fall through to the
         // natural-basis default.
@@ -169,9 +169,8 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
         | MQ4CG256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd
         | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8
         | MFP4G32E8SOA | MFP3G32E8 | MFP2G32E8 | MQ4G128 | MQ4G128V2 | MFP4G32E8G128
-        | MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 => {
-            GemvVariant::Prerotated
-        }
+        | MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
+        | E8PI4G128R128 => GemvVariant::Prerotated,
         _ => GemvVariant::Plain,
     }
 }
@@ -575,16 +574,16 @@ pub enum KernelKey {
     AttnQ8_0KvBatchedMaskedWindowed, // sliding-window batched Q8 (cohere2moe prefill)
     AttnBf16KvBatchedMaskedWindowed, // sliding-window batched BF16 (maple prefill)
     // Native fp8 E4M3 KV (gfx1201-only; see attention_table registrations).
-    AttnFp8E4m3Kv, // scalar decode / per-token fallback (Q0 format gate)
-    AttnFlashFp8E4m3, // flash tile decode
+    AttnFp8E4m3Kv,              // scalar decode / per-token fallback (Q0 format gate)
+    AttnFlashFp8E4m3,           // flash tile decode
     AttnFp8E4m3KvBatchedMasked, // batched prefill / tree-verify
     // Flat-BF16 KV for non-windowed (Qwen dense) caches. Maple keeps the
     // windowed keys above. `AttnBf16Kv{,_BatchedMasked}` lower to F's NEW
     // native bf16 kernels `attention_bf16_kv{,_batched}` (HIPFIRE_KV_BF16=1
     // in attention_q8_0_kv{,_batched}.hip); only `AttnFlashBf16` reuses the
     // existing `attention_flash_bf16_windowed` launcher with window=0.
-    AttnBf16Kv, // scalar decode; launches attention_bf16_kv
-    AttnFlashBf16, // flash tile decode via attention_flash_bf16_windowed, window=0
+    AttnBf16Kv,              // scalar decode; launches attention_bf16_kv
+    AttnFlashBf16,           // flash tile decode via attention_flash_bf16_windowed, window=0
     AttnBf16KvBatchedMasked, // batched prefill / tree-verify; launches attention_bf16_kv_batched
     // TODO(3.3): F32-batched key for models with F32 KV + batchable weights
     // Full attention (no KV cache — vision / dflash cross-attention)
@@ -840,9 +839,11 @@ impl KernelKey {
                 arch: "",
                 quant: "MQ4G128V2",
             }),
-            (MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128, _) => {
-                Err(reject_mq_i4(dtype, "gemv"))
-            }
+            (
+                MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
+                | E8PI4G128R128,
+                _,
+            ) => Err(reject_mq_i4(dtype, "gemv")),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "unknown",
@@ -900,9 +901,8 @@ impl KernelKey {
                 arch: "",
                 quant: "MQ4G128V2",
             }),
-            MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 => {
-                Err(reject_mq_i4(dtype, "gemv"))
-            }
+            MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
+            | E8PI4G128R128 => Err(reject_mq_i4(dtype, "gemv")),
             _ => {
                 if dtype_rotation_plan(dtype) == RotationPlan::None {
                     Self::for_gemv(dtype, GemvVariant::Plain, false)
@@ -945,9 +945,8 @@ impl KernelKey {
                 arch: "",
                 quant: "MQ4G128V2",
             }),
-            MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 => {
-                Err(reject_mq_i4(dtype, "gemv"))
-            }
+            MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
+            | E8PI4G128R128 => Err(reject_mq_i4(dtype, "gemv")),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "residual",
@@ -981,9 +980,8 @@ impl KernelKey {
                 arch: "",
                 quant: "MQ4G128V2",
             }),
-            MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 => {
-                Err(reject_mq_i4(dtype, "gemv"))
-            }
+            MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
+            | E8PI4G128R128 => Err(reject_mq_i4(dtype, "gemv")),
             // qt=52 shares the qt=44 key: the SwiGLU-residual variant is a
             // residual GEMV over caller-supplied silu(gate)*up (already
             // FWHT-rotated), and the family arm branches on the WEIGHT dtype to
@@ -1056,9 +1054,10 @@ impl KernelKey {
             // gfx942 FP8 MoE route reads qt=55; qt=56 is the PLE row store).
             // Explicit so a future generic route has to decide its arch gate.
             FP8E4M3B128 | FP8E4M3PT => ArchPredicate::Always,
-            // MQ-I4 (qt=131..=134): typed-qwen4-only, no generic kernel; same
+            // MQ-I4 (qt=131..=136): typed-qwen4-only, no generic kernel; same
             // explicit stance as qt=53.
-            MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 => ArchPredicate::Always,
+            MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
+            | E8PI4G128R128 => ArchPredicate::Always,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }

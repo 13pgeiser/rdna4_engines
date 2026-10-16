@@ -10,11 +10,11 @@
 //! is value-only: it owns validated declarations and a source seal, but never
 //! allocates GPU memory or starts a reader worker.
 
-use crate::gpu_forward::{qwen4_forward_scratch_mode, Qwen4ForwardScratchMode};
 use crate::config::{Qwen4Config, Qwen4PleConfig, ARCH_ID};
-use crate::expert_slab_table::{build_expert_slab_table, ExpertSlabTableError};
 use crate::expert_hotset::HOTSET_ENV;
+use crate::expert_slab_table::{build_expert_slab_table, ExpertSlabTableError};
 use crate::expert_slabs::{self, parse_expert_entry_name, ExpertSlabsError};
+use crate::gpu_forward::{qwen4_forward_scratch_mode, Qwen4ForwardScratchMode};
 use crate::ple::PleHashMetadata;
 use crate::weights::{
     is_ple_shard_name_within, Qwen4BandScope, Qwen4Manifest, Qwen4Placement, Qwen4TierRecipe,
@@ -205,9 +205,20 @@ pub enum Qwen4ArtifactError {
     Message(String),
     ExpertSlabsMetadata(ExpertSlabsError),
     ExpertSlabTable(ExpertSlabTableError),
-    ExpertSlabsMetadataRequired { name: String, quant_type: u8 },
-    ExpertSlabQuantTypeUnavailable { name: String, quant_type: u8 },
-    ExpertSlabKernelsUnavailable { w3: usize, w2: usize, mq4: usize },
+    ExpertSlabsMetadataRequired {
+        name: String,
+        quant_type: u8,
+    },
+    ExpertSlabQuantTypeUnavailable {
+        name: String,
+        quant_type: u8,
+    },
+    ExpertSlabKernelsUnavailable {
+        w3: usize,
+        w2: usize,
+        e8p: usize,
+        mq4: usize,
+    },
 }
 
 impl Qwen4ArtifactError {
@@ -232,11 +243,11 @@ impl fmt::Display for Qwen4ArtifactError {
                 "qwen4: tensor {name} qt={quant_type} is a planar I4 expert type; \
                  routed GPU kernels are unavailable in this build"
             ),
-            Self::ExpertSlabKernelsUnavailable { w3, w2, mq4 } => write!(
+            Self::ExpertSlabKernelsUnavailable { w3, w2, e8p, mq4 } => write!(
                 f,
                 "qwen4: per-expert slab artifact recognized and validated \
-                 (W3={w3}, W2={w2}, MQ4={mq4}); MQ3-I4/MQ2-I4/pointer-addressed MQ4 \
-                 routed kernels are not available on any GPU in this build, refusing to load"
+                 (W3={w3}, W2={w2}, E8P={e8p}, MQ4={mq4}); MQ3-I4/MQ2-I4/E8P-I4/pointer-addressed MQ4 \
+                 routed kernels are not available on this device in this build, refusing to load"
             ),
         }
     }
@@ -271,11 +282,12 @@ fn refuse_expert_slabs(
         return Err(Qwen4ArtifactError::ExpertSlabKernelsUnavailable {
             w3: counts.w3,
             w2: counts.w2,
+            e8p: counts.e8p,
             mq4: counts.mq4,
         });
     }
     if let Some(info) = tensors.iter().find(|info| {
-        matches!(info.quant_type, 131..=134) || parse_expert_entry_name(&info.name).is_some()
+        matches!(info.quant_type, 131..=136) || parse_expert_entry_name(&info.name).is_some()
     }) {
         return Err(Qwen4ArtifactError::ExpertSlabsMetadataRequired {
             name: info.name.clone(),
@@ -289,8 +301,11 @@ fn refuse_expert_slabs(
 /// `rcpt/`, both with 0 mismatches: K1 decode
 /// (`r5.k1.g1.L0-records.raw.json`, sha256 `2bb0cfa1…8239`) and K2 prefill
 /// (`g1.k2.real.json`, sha256 `bb1bde6b…c226`, with the A4 identity
-/// `g1.a4.identity.json`, sha256 `2e6f9643…a979`). gfx1201 only; see
-/// [`SLAB_ROUTE_GFX1151_RECEIPTS_LANDED`] for gfx1151.
+/// `g1.a4.identity.json`, sha256 `2e6f9643…a979`). The gfx1100 route (MQ4-only
+/// layers) is admitted by the same switch through
+/// [`rdna_compute::qwen4_slab_codec_admitted`]; see
+/// [`SLAB_ROUTE_GFX1151_RECEIPTS_LANDED`] for gfx1151. Every other architecture
+/// keeps refusing in [`slab_route_admitted`].
 pub const SLAB_ROUTE_RECEIPTS_LANDED: bool = true;
 
 /// gfx1151 twin of [`SLAB_ROUTE_RECEIPTS_LANDED`]. Set because the G1 receipts
@@ -307,15 +322,20 @@ pub const SLAB_ROUTE_RECEIPTS_LANDED: bool = true;
 /// every other architecture keeps the `ExpertSlabKernelsUnavailable` refusal.
 pub const SLAB_ROUTE_GFX1151_RECEIPTS_LANDED: bool = true;
 
-/// Whether the sealed expert-slab route may load on GPU architecture `arch`.
-/// gfx1201 and gfx1151, each only after its own G1 receipts landed; every
-/// other architecture keeps refusing.
+/// Whether the sealed expert-slab route may load on GPU architecture `arch`:
+/// the architecture serves at least the MQ4 codec
+/// ([`rdna_compute::qwen4_slab_codec_admitted`]: gfx1100, gfx1151 and gfx1201)
+/// and its own receipts flag is set ([`SLAB_ROUTE_RECEIPTS_LANDED`] for gfx1100
+/// and gfx1201, [`SLAB_ROUTE_GFX1151_RECEIPTS_LANDED`] for gfx1151). Which
+/// cold codec rides next to MQ4 is per architecture, checked per expert by
+/// [`crate::expert_arena::ExpertArenaPlan::check_executable`].
 pub fn slab_route_admitted(arch: &str) -> bool {
-    match arch {
-        "gfx1201" => SLAB_ROUTE_RECEIPTS_LANDED,
-        "gfx1151" => SLAB_ROUTE_GFX1151_RECEIPTS_LANDED,
-        _ => false,
-    }
+    rdna_compute::qwen4_slab_codec_admitted(arch, crate::expert_arena::CODEC_MQ4)
+        && match arch {
+            "gfx1151" => SLAB_ROUTE_GFX1151_RECEIPTS_LANDED,
+            "gfx1100" | "gfx1201" => SLAB_ROUTE_RECEIPTS_LANDED,
+            _ => false,
+        }
 }
 
 /// The arena plan of a version-1 expert-slab artifact when the route is
@@ -339,19 +359,23 @@ fn expert_slab_plan(
         refuse_expert_slabs(metadata_json, tensors)?;
         return Ok(None);
     };
-    let table = build_expert_slab_table(&metadata, tensors)
-        .map_err(Qwen4ArtifactError::ExpertSlabTable)?;
+    let table =
+        build_expert_slab_table(&metadata, tensors).map_err(Qwen4ArtifactError::ExpertSlabTable)?;
+    // W2 has no kernels on any architecture.
     let counts = table.counts();
     if counts.w2 != 0 {
         return Err(Qwen4ArtifactError::ExpertSlabKernelsUnavailable {
             w3: counts.w3,
             w2: counts.w2,
+            e8p: counts.e8p,
             mq4: counts.mq4,
         });
     }
+    // The arena plan names every expert's codec; the architecture's admitted codecs (gfx1100 MQ4 + E8P,
+    // gfx1151 MQ4 + W3, gfx1201 MQ4 + W3 + E8P) and one cold codec per layer refuse the rest.
     let plan = crate::expert_arena::ExpertArenaPlan::from_table(&table)
         .map_err(|error| Qwen4ArtifactError::new(format!("qwen4: expert slab arenas: {error}")))?;
-    plan.check_executable()
+    plan.check_executable(device.unwrap_or_default())
         .map_err(|error| Qwen4ArtifactError::new(format!("qwen4: expert slab arenas: {error}")))?;
     Ok(Some(Arc::new(plan)))
 }
@@ -380,7 +404,9 @@ fn slab_manifest(
             arenas: plan.clone(),
         },
     )
-    .map_err(|error| Qwen4ArtifactError::new(format!("qwen4: slab manifest admission failed: {error}")))
+    .map_err(|error| {
+        Qwen4ArtifactError::new(format!("qwen4: slab manifest admission failed: {error}"))
+    })
 }
 
 /// Escape hatch for deliberately loading an artifact whose manifest target is
@@ -476,7 +502,7 @@ fn validate_weight_geometry(
     entry: &WeightEntry,
     info: &HfqTensorInfo,
 ) -> Result<(), Qwen4ArtifactError> {
-    if matches!(info.quant_type, 131..=134) {
+    if matches!(info.quant_type, 131..=136) {
         return Err(Qwen4ArtifactError::ExpertSlabQuantTypeUnavailable {
             name: info.name.clone(),
             quant_type: info.quant_type,
@@ -645,8 +671,7 @@ fn validate_weight_geometry(
         // The stock-FP8 tiers declare exactly one representation: the tag must
         // be the declared dtype, never a BF16 or packed stand-in.
         DType::FP8E4M3B128 | DType::FP8E4M3PT => {
-            if source_dtype != Some(entry.dtype) || !entry.dtype_constraint.accepts(entry.dtype)
-            {
+            if source_dtype != Some(entry.dtype) || !entry.dtype_constraint.accepts(entry.dtype) {
                 return Err(Qwen4ArtifactError::new(format!(
                     "qwen4: tensor {} is declared {:?} by the manifest but carries quant_type={}",
                     entry.name, entry.dtype, info.quant_type
@@ -1129,9 +1154,12 @@ fn validate_manifest_inventory(
             expected.len()
         )));
     }
-    let hfq_declared = tensors.len().checked_sub(shadowed_ple_shards).ok_or_else(|| {
-        Qwen4ArtifactError::new("qwen4: more shadowed PLE shards than index records")
-    })?;
+    let hfq_declared = tensors
+        .len()
+        .checked_sub(shadowed_ple_shards)
+        .ok_or_else(|| {
+            Qwen4ArtifactError::new("qwen4: more shadowed PLE shards than index records")
+        })?;
     if hfq_declared != manifest_count {
         return Err(Qwen4ArtifactError::new(format!(
             "qwen4: HFQ source inventory has {hfq_declared} tensors but manifest declares {manifest_count}",
@@ -1144,8 +1172,7 @@ fn validate_manifest_inventory(
                 tensor.name
             )));
         }
-        if shadowed_ple_shards != 0 && is_ple_shard_name_within(&tensor.name, shadow_shard_count)
-        {
+        if shadowed_ple_shards != 0 && is_ple_shard_name_within(&tensor.name, shadow_shard_count) {
             // Shadowed by the attached sidecar: `HfqFile::attach_ple_rows`
             // already bound their geometry to the sidecar header.
             continue;
@@ -1187,12 +1214,15 @@ fn validate_manifest_inventory(
         validate_weight_geometry(entry, info)?;
     }
     for metadata in &manifest.metadata {
-        let info = by_name.get(metadata.name.as_str()).copied().ok_or_else(|| {
-            Qwen4ArtifactError::new(format!(
-                "qwen4: metadata tensor {} disappeared while validating geometry",
-                metadata.name
-            ))
-        })?;
+        let info = by_name
+            .get(metadata.name.as_str())
+            .copied()
+            .ok_or_else(|| {
+                Qwen4ArtifactError::new(format!(
+                    "qwen4: metadata tensor {} disappeared while validating geometry",
+                    metadata.name
+                ))
+            })?;
         validate_metadata_geometry(metadata, info)?;
     }
     Ok(manifest_count)
@@ -1249,7 +1279,9 @@ fn parse_artifact_config(metadata_json: &str) -> Result<Qwen4Config, Qwen4Artifa
     let parsed = Qwen4Config::from_developer_metadata_json(metadata_json);
     #[cfg(not(feature = "qwen4-dev-profiles"))]
     let parsed = Qwen4Config::from_metadata_json(metadata_json);
-    parsed.map_err(|error| Qwen4ArtifactError::new(format!("qwen4: config admission failed: {error}")))
+    parsed.map_err(|error| {
+        Qwen4ArtifactError::new(format!("qwen4: config admission failed: {error}"))
+    })
 }
 
 /// Receipt of a header-only inventory admission: no container, payload,
@@ -1290,9 +1322,7 @@ fn manifest_for_metadata(
         Some(recipe) => match recipe.get("id") {
             None => None,
             Some(id) => Some(id.as_str().ok_or_else(|| {
-                Qwen4ArtifactError::new(format!(
-                    "qwen4: {RECIPE_METADATA_KEY}.id must be a string"
-                ))
+                Qwen4ArtifactError::new(format!("qwen4: {RECIPE_METADATA_KEY}.id must be a string"))
             })?),
         },
     };
@@ -1572,7 +1602,8 @@ fn payloads_symmetric(jobs: &[(&[u8], usize)]) -> bool {
         for _ in 0..workers {
             scope.spawn(|| {
                 while symmetric.load(Ordering::Relaxed) {
-                    let Some(&(bytes, group_bytes)) = jobs.get(next.fetch_add(1, Ordering::Relaxed))
+                    let Some(&(bytes, group_bytes)) =
+                        jobs.get(next.fetch_add(1, Ordering::Relaxed))
                     else {
                         break;
                     };
@@ -1727,7 +1758,7 @@ pub fn hotset_source_preflight(hfq: &HfqFile) -> Result<(), String> {
                 info.name
             )));
         }
-        if matches!(info.quant_type, 131..=134) {
+        if matches!(info.quant_type, 131..=136) {
             return Err(hotset_refusal(format!(
                 "tensor {} is a planar I4 expert type (qt={}), not aggregate MQ4-XTS",
                 info.name, info.quant_type
@@ -1784,7 +1815,9 @@ pub fn hotset_aggregate_slabs(
     config: &Qwen4Config,
     manifest: &Qwen4Manifest,
 ) -> Result<Vec<crate::expert_slab_table::ExpertSlab>, String> {
-    use crate::expert_slab_aggregate::{slabs_from_aggregate_mq4, AggregateLayer, AggregateProjection};
+    use crate::expert_slab_aggregate::{
+        slabs_from_aggregate_mq4, AggregateLayer, AggregateProjection,
+    };
     use crate::expert_slabs::{ExpertFormat, EXPERTS_PER_LAYER, TRUNK_LAYERS};
 
     hotset_source_preflight(hfq)?;
@@ -1794,7 +1827,10 @@ pub fn hotset_aggregate_slabs(
             config.profile.id()
         )));
     }
-    if !matches!(manifest.identity.recipe, Qwen4TierRecipe::FlashNextPacked { .. }) {
+    if !matches!(
+        manifest.identity.recipe,
+        Qwen4TierRecipe::FlashNextPacked { .. }
+    ) {
         return Err(hotset_refusal(
             "the manifest recipe is not the packed Flash-Next recipe (stock-FP8 and slab-arena \
              recipes are not aggregate MQ4)",
@@ -1807,7 +1843,11 @@ pub fn hotset_aggregate_slabs(
         || config.num_experts_per_tok != 10
         || !matches!(
             config.ffn,
-            crate::config::Qwen4FfnConfig::Moe { num_experts: 512, top_k: 10, .. }
+            crate::config::Qwen4FfnConfig::Moe {
+                num_experts: 512,
+                top_k: 10,
+                ..
+            }
         )
     {
         return Err(hotset_refusal(format!(
@@ -1826,7 +1866,11 @@ pub fn hotset_aggregate_slabs(
                       len: usize|
      -> Result<AggregateProjection, String> {
         let name = format!("model.language_model.layers.{layer}.mlp{suffix}");
-        if !manifest.weights.iter().any(|entry| entry.name == name && entry.layer == Some(layer)) {
+        if !manifest
+            .weights
+            .iter()
+            .any(|entry| entry.name == name && entry.layer == Some(layer))
+        {
             return Err(hotset_refusal(format!(
                 "the manifest declares no aggregate routed tensor {name} (nonaggregate layout)"
             )));
@@ -1875,7 +1919,13 @@ pub fn hotset_aggregate_slabs(
                     [512, 1280, 2560],
                     gate_up_len,
                 )?,
-                down: projection(layer, ROUTED_DOWN_SUFFIX, down_qt, [512, 2560, 640], down_len)?,
+                down: projection(
+                    layer,
+                    ROUTED_DOWN_SUFFIX,
+                    down_qt,
+                    [512, 2560, 640],
+                    down_len,
+                )?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -2276,12 +2326,12 @@ fn validate_ple_records(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
-    use serde_json::json;
     use crate::weights::{
         Qwen4ManifestIdentity, Qwen4TierRecipe, PLE_ROW_WIDTH, PLE_SHARD_COUNT, PLE_SHARD_ROWS,
     };
+    use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
     use hipfire_runtime::ple_sidecar::ple_shard_name;
+    use serde_json::json;
     use std::path::{Path, PathBuf};
     fn slab_metadata() -> String {
         json!({
@@ -2315,7 +2365,7 @@ mod tests {
 
     #[test]
     fn slab_container_i4_without_metadata_refuses_each_new_qtype() {
-        for quant_type in 131..=134 {
+        for quant_type in 131..=136 {
             let tensor = HfqMemTensor {
                 name: "stray.weight".into(),
                 quant_type,
@@ -2353,7 +2403,8 @@ mod tests {
         assert!(matches!(
             container_refusal("slab-bad-key", &metadata.to_string(), &[]),
             Qwen4ArtifactError::ExpertSlabsMetadata(ExpertSlabsError::Mismatch {
-                field: "version", ..
+                field: "version",
+                ..
             })
         ));
     }
@@ -2362,9 +2413,10 @@ mod tests {
     fn slab_valid_full_inventory_refuses_unavailable_kernels_with_counts() {
         use expert_slabs::ExpertFormat;
         let headers = crate::expert_slab_table::full_fn_headers(|layer, expert| {
-            match (layer * 512 + expert) % 3 {
+            match (layer * 512 + expert) % 4 {
                 0 => ExpertFormat::Mq3I4,
                 1 => ExpertFormat::Mq2I4,
+                2 => ExpertFormat::E8pI4,
                 _ => ExpertFormat::Mq4Xts,
             }
         });
@@ -2372,18 +2424,155 @@ mod tests {
         assert_eq!(
             error,
             Qwen4ArtifactError::ExpertSlabKernelsUnavailable {
-                w3: 8192, w2: 8192, mq4: 8192,
+                w3: 6144,
+                w2: 6144,
+                e8p: 6144,
+                mq4: 6144,
             }
         );
-        assert!(error.to_string().contains("not available on any GPU"));
+        assert!(error.to_string().contains("not available on this device"));
+    }
+
+    /// The sealed route admits per (arch, cold codec): gfx1100 MQ4 + E8P,
+    /// gfx1151 MQ4 + W3, gfx1201 MQ4 + W3 + E8P, W2 nowhere, one cold codec per layer (layers may
+    /// differ), and every other architecture (or none) keeps the unchanged
+    /// fail-closed refusal.
+    #[test]
+    fn slab_plan_admits_only_the_arch_cold_codec_pair() {
+        use crate::expert_arena::{CODEC_E8P, CODEC_MQ4, CODEC_W3};
+        use expert_slabs::ExpertFormat::{self, E8pI4, Mq2I4, Mq3I4, Mq4Xts};
+        let headers = |cold: ExpertFormat| {
+            crate::expert_slab_table::full_fn_headers(move |layer, expert| {
+                if (layer * 512 + expert) % 2 == 0 {
+                    cold
+                } else {
+                    Mq4Xts
+                }
+            })
+        };
+        // Cold codec of one layer, MQ4 on the odd experts.
+        for (arch, cold, cold_codec) in [
+            ("gfx1201", Mq3I4, CODEC_W3),
+            ("gfx1201", E8pI4, CODEC_E8P),
+            ("gfx1100", E8pI4, CODEC_E8P),
+            ("gfx1151", Mq3I4, CODEC_W3),
+        ] {
+            assert!(slab_route_admitted(arch));
+            let plan = expert_slab_plan(&slab_metadata(), &headers(cold), Some(arch))
+                .unwrap()
+                .expect("mixture admitted");
+            for layer in plan.layers() {
+                let table = layer.codec_table().unwrap();
+                assert!(
+                    table.iter().all(|c| *c == CODEC_MQ4 || *c == cold_codec),
+                    "{arch}"
+                );
+                assert!(
+                    table.contains(&CODEC_MQ4) && table.contains(&cold_codec),
+                    "{arch}"
+                );
+                assert_eq!(layer.cold_codec(arch), Ok(cold_codec));
+            }
+        }
+        // W3 on gfx1100 is an arch refusal; W2 is refused everywhere (typed).
+        let error =
+            expert_slab_plan(&slab_metadata(), &headers(Mq3I4), Some("gfx1100")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no sealed-route kernels on gfx1100"),
+            "{error}"
+        );
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert!(matches!(
+                expert_slab_plan(&slab_metadata(), &headers(Mq2I4), Some(arch)),
+                Err(Qwen4ArtifactError::ExpertSlabKernelsUnavailable { .. })
+            ));
+        }
+        // MQ4-only: admitted on all three, no cold experts.
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            let plan = expert_slab_plan(&slab_metadata(), &headers(Mq4Xts), Some(arch))
+                .unwrap()
+                .expect("MQ4-only admitted");
+            assert!(plan
+                .layers()
+                .iter()
+                .all(|layer| layer.codec_counts() == (512, 0, 0)));
+        }
+        // One layer with both W3 and E8P is refused; layers choosing different cold codecs are not.
+        let mixed_layer = |layer_a: usize| {
+            crate::expert_slab_table::full_fn_headers(move |layer, expert| match expert % 3 {
+                0 => Mq4Xts,
+                1 => Mq3I4,
+                _ if layer == layer_a => E8pI4,
+                _ => Mq3I4,
+            })
+        };
+        let error =
+            expert_slab_plan(&slab_metadata(), &mixed_layer(0), Some("gfx1201")).unwrap_err();
+        assert!(error.to_string().contains("two cold codecs"), "{error}");
+        assert!(expert_slab_plan(&slab_metadata(), &mixed_layer(0), Some("gfx1100")).is_err());
+        let alternating = crate::expert_slab_table::full_fn_headers(|layer, expert| {
+            match (layer % 2, expert % 2) {
+                (_, 0) => Mq4Xts,
+                (0, _) => Mq3I4,
+                _ => E8pI4,
+            }
+        });
+        let plan = expert_slab_plan(&slab_metadata(), &alternating, Some("gfx1201"))
+            .unwrap()
+            .expect("per-layer cold codecs admitted");
+        assert_eq!(plan.layers()[0].cold_codec("gfx1201"), Ok(CODEC_W3));
+        assert_eq!(plan.layers()[1].cold_codec("gfx1201"), Ok(CODEC_E8P));
+        assert!(expert_slab_plan(&slab_metadata(), &alternating, Some("gfx1100")).is_err());
+        // gfx1151 admits MQ4 + W3 only: E8P is an arena arch refusal there, and so is a W3 + E8P layer.
+        let error =
+            expert_slab_plan(&slab_metadata(), &headers(E8pI4), Some("gfx1151")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no sealed-route kernels on gfx1151"),
+            "{error}"
+        );
+        assert!(expert_slab_plan(&slab_metadata(), &mixed_layer(0), Some("gfx1151")).is_err());
+        assert!(expert_slab_plan(&slab_metadata(), &alternating, Some("gfx1151")).is_err());
+        for arch in [Some("gfx942"), Some("gfx1200"), None] {
+            assert!(!arch.is_some_and(slab_route_admitted));
+            assert!(matches!(
+                expert_slab_plan(&slab_metadata(), &headers(E8pI4), arch),
+                Err(Qwen4ArtifactError::ExpertSlabKernelsUnavailable { .. })
+            ));
+        }
     }
 
     #[test]
     fn slab_route_admission_follows_each_arch_receipts() {
         assert_eq!(slab_route_admitted("gfx1201"), SLAB_ROUTE_RECEIPTS_LANDED);
-        assert_eq!(slab_route_admitted("gfx1151"), SLAB_ROUTE_GFX1151_RECEIPTS_LANDED);
-        for other in ["gfx1100", "gfx1200", "gfx942", ""] {
+        assert_eq!(
+            slab_route_admitted("gfx1151"),
+            SLAB_ROUTE_GFX1151_RECEIPTS_LANDED
+        );
+        assert_eq!(slab_route_admitted("gfx1100"), SLAB_ROUTE_RECEIPTS_LANDED);
+        for other in ["gfx1200", "gfx1101", "gfx1151x", "GFX1151", "gfx942", ""] {
             assert!(!slab_route_admitted(other), "{other:?}");
+        }
+    }
+
+    /// `slab_route_admitted` is the MQ4 matrix gate AND the arch's own receipts flag.
+    #[test]
+    fn slab_route_admission_is_the_mq4_matrix_gate_and_the_arch_receipts_flag() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx1200", "gfx942", ""] {
+            let flag = match arch {
+                "gfx1151" => SLAB_ROUTE_GFX1151_RECEIPTS_LANDED,
+                "gfx1100" | "gfx1201" => SLAB_ROUTE_RECEIPTS_LANDED,
+                _ => false,
+            };
+            assert_eq!(
+                slab_route_admitted(arch),
+                rdna_compute::qwen4_slab_codec_admitted(arch, crate::expert_arena::CODEC_MQ4)
+                    && flag,
+                "{arch:?}"
+            );
         }
     }
 
@@ -2398,7 +2587,7 @@ mod tests {
     fn weight_geometry_explicitly_refuses_each_planar_i4_qtype() {
         let manifest = Qwen4Manifest::build(&crate::config::compact_test_config()).unwrap();
         let entry = &manifest.weights[0];
-        for quant_type in 131..=134 {
+        for quant_type in 131..=136 {
             let info = HfqTensorInfo {
                 name: entry.name.clone(),
                 quant_type,
@@ -2415,7 +2604,6 @@ mod tests {
             ));
         }
     }
-
 
     const PLE_MULTIPLIERS_NAME: &str =
         "model.language_model.layers.1.ple.ple_embedding.layer_multipliers";
@@ -2508,8 +2696,8 @@ mod tests {
         multipliers[1] += 1;
         write_ple_fixture(&path, &multipliers);
         let hfq = HfqFile::open(&path).unwrap();
-        let error = validate_ple_records(&hfq, &canonical_ple(), &PleHashMetadata::qwen4())
-            .unwrap_err();
+        let error =
+            validate_ple_records(&hfq, &canonical_ple(), &PleHashMetadata::qwen4()).unwrap_err();
         assert!(
             error.to_string().contains("multipliers"),
             "payload mismatch must identify the signed I64 record: {error}"
@@ -2849,8 +3037,7 @@ mod tests {
         assert_eq!(manifest.source_tensor_count(), 3);
         // Split base: the index is exactly the trimmed manifest.
         with_base_fixture("inv-split", true, 0, |hfq| {
-            let shadowed =
-                validate_ple_shard_presence(hfq, true, Some(&canonical_ple())).unwrap();
+            let shadowed = validate_ple_shard_presence(hfq, true, Some(&canonical_ple())).unwrap();
             assert_eq!(
                 validate_manifest_inventory(hfq.tensors(), &manifest, shadowed, PLE_SHARD_COUNT)
                     .unwrap(),
@@ -2860,8 +3047,7 @@ mod tests {
         // Monolith + sidecar: the 128 shard tensors are in the index, shadowed
         // and ignored.
         with_base_fixture("inv-mono", false, PLE_SHARD_COUNT, |hfq| {
-            let shadowed =
-                validate_ple_shard_presence(hfq, true, Some(&canonical_ple())).unwrap();
+            let shadowed = validate_ple_shard_presence(hfq, true, Some(&canonical_ple())).unwrap();
             assert_eq!(shadowed, PLE_SHARD_COUNT);
             assert_eq!(
                 validate_manifest_inventory(hfq.tensors(), &manifest, shadowed, PLE_SHARD_COUNT)
@@ -2870,9 +3056,8 @@ mod tests {
             );
             // The same index against the trimmed manifest without the shadow
             // allowance is an inventory mismatch, never a silent pass.
-            let error =
-                validate_manifest_inventory(hfq.tensors(), &manifest, 0, PLE_SHARD_COUNT)
-                    .unwrap_err();
+            let error = validate_manifest_inventory(hfq.tensors(), &manifest, 0, PLE_SHARD_COUNT)
+                .unwrap_err();
             assert!(error.to_string().contains("131 tensors"), "{error}");
         });
     }
@@ -2945,8 +3130,12 @@ mod tests {
         let canonical = PleHashMetadata::qwen4();
         for encoding in [RowEncoding::Q8F16, RowEncoding::Q4Lm] {
             assert_eq!(
-                validate_sidecar_geometry(&sidecar_geometry(encoding), &canonical_ple(), &canonical)
-                    .unwrap(),
+                validate_sidecar_geometry(
+                    &sidecar_geometry(encoding),
+                    &canonical_ple(),
+                    &canonical
+                )
+                .unwrap(),
                 encoding
             );
         }
@@ -3106,7 +3295,9 @@ mod tests {
             512 * 2560 * (640 / 128) * 68
         );
         assert_eq!(
-            extent("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_127.weight"),
+            extent(
+                "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_127.weight"
+            ),
             2_500_012 * 170
         );
     }
@@ -3130,7 +3321,12 @@ mod tests {
         };
         let q = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
         let experts = "model.language_model.layers.3.mlp.experts.gate_up_proj";
-        refused(&|headers| { headers.remove(position(headers, q)); }, "tensors but manifest declares");
+        refused(
+            &|headers| {
+                headers.remove(position(headers, q));
+            },
+            "tensors but manifest declares",
+        );
         refused(
             &|headers| {
                 let index = position(headers, q);
@@ -3173,7 +3369,10 @@ mod tests {
         // be refused by the aligned-K rule.
         refused(
             &|headers| {
-                let index = position(headers, "model.language_model.layers.3.mlp.experts.down_proj");
+                let index = position(
+                    headers,
+                    "model.language_model.layers.3.mlp.experts.down_proj",
+                );
                 headers[index].quant_type = QWEN4_QT_MQ4G256V2;
                 headers[index].group_size = 256;
             },
@@ -3232,12 +3431,20 @@ mod tests {
         assert!(receipt.config.profile.is_ar_only() && receipt.config.profile.is_flash_next());
         assert!(receipt.config.mtp.is_none());
         assert_eq!(receipt.config.mtp_num_hidden_layers, 0);
-        assert_eq!(receipt.manifest.identity.profile_id, "qwen3.8-flash-next-ar");
+        assert_eq!(
+            receipt.manifest.identity.profile_id,
+            "qwen3.8-flash-next-ar"
+        );
         assert_eq!(receipt.ple, Some(PleHashMetadata::qwen4()));
         assert_eq!(receipt.source_tensor_count, headers.len());
-        assert!(headers.iter().all(|header| !header.name.starts_with("mtp.")));
+        assert!(headers
+            .iter()
+            .all(|header| !header.name.starts_with("mtp.")));
         let flash = flash_next_headers();
-        let mtp = flash.iter().filter(|header| header.name.starts_with("mtp.")).count();
+        let mtp = flash
+            .iter()
+            .filter(|header| header.name.starts_with("mtp."))
+            .count();
         assert!(mtp > 0);
         assert_eq!(headers.len(), flash.len() - mtp);
         let header = |name: &str| {
@@ -3252,8 +3459,9 @@ mod tests {
         assert_eq!(gate_up.data_size, 512 * 3_277_312);
         let down = header("model.language_model.layers.0.mlp.experts.down_proj");
         assert_eq!((down.quant_type, down.data_size), (55, 512 * 1_638_656));
-        let shard =
-            header("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_127.weight");
+        let shard = header(
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_127.weight",
+        );
         assert_eq!((shard.quant_type, shard.group_size), (56, 0));
         assert_eq!(shard.data_size, 16 + 2_500_012 * 160);
         for name in [
@@ -3297,7 +3505,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {name}"))
         };
         let gate_up = "model.language_model.layers.3.mlp.experts.gate_up_proj";
-        let shard = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_5.weight";
+        let shard =
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_5.weight";
         refused(
             &json,
             &|headers| {
@@ -3368,7 +3577,11 @@ mod tests {
         );
         // The same bytes under the packed (no id) or an unknown recipe id.
         refused(&flash_next_json(), &|_| {}, "manifest declares");
-        refused(&stock_fp8_json("stock-fp9"), &|_| {}, "not a Flash-Next recipe");
+        refused(
+            &stock_fp8_json("stock-fp9"),
+            &|_| {},
+            "not a Flash-Next recipe",
+        );
     }
 
     #[test]
@@ -3382,7 +3595,9 @@ mod tests {
             .expect_err("element count overflow")
             .to_string();
         assert!(error.contains("overflows usize"), "{error}");
-        let error = shape_elements(&[4, 0], "x").expect_err("zero dim").to_string();
+        let error = shape_elements(&[4, 0], "x")
+            .expect_err("zero dim")
+            .to_string();
         assert!(error.contains("zero-sized"), "{error}");
     }
 
@@ -3419,15 +3634,19 @@ mod tests {
 
         #[test]
         fn flash_next_is_admitted_identically_by_the_developer_path() {
-            let production = admit_inventory_headers(ARCH_ID, &flash_next_json(), &flash_next_headers())
-                .expect("production admission");
+            let production =
+                admit_inventory_headers(ARCH_ID, &flash_next_json(), &flash_next_headers())
+                    .expect("production admission");
             let developer = admit_developer_inventory_headers(
                 ARCH_ID,
                 &flash_next_json(),
                 &flash_next_headers(),
             )
             .expect("developer admission");
-            assert_eq!(developer.source_tensor_count, production.source_tensor_count);
+            assert_eq!(
+                developer.source_tensor_count,
+                production.source_tensor_count
+            );
             assert_eq!(developer.manifest, production.manifest);
             assert_eq!(developer.ple, production.ple);
         }
@@ -3435,8 +3654,7 @@ mod tests {
         #[test]
         fn dense_64_layer_hidden_5120_header_inventories_admit_with_and_without_ple_mtp() {
             for (ple, mtp) in [(false, false), (true, false), (false, true), (true, true)] {
-                let config =
-                    crate::config::synthetic_test_config(dense(), 5120, 64, ple, mtp);
+                let config = crate::config::synthetic_test_config(dense(), 5120, 64, ple, mtp);
                 let receipt = admit(&config).expect("exact dense inventory");
                 assert_eq!(receipt.manifest.identity.ffn_kind, "dense");
                 assert!(receipt.manifest.identity.developer_only);
@@ -3486,7 +3704,10 @@ mod tests {
             let config = crate::config::synthetic_test_config(dense(), 5120, 4, true, true);
             let manifest = packed_manifest(&config);
             assert_eq!(manifest.identity.recipe, Qwen4TierRecipe::SyntheticPacked);
-            assert!(manifest.weights.iter().any(|entry| entry.dtype != DType::BF16));
+            assert!(manifest
+                .weights
+                .iter()
+                .any(|entry| entry.dtype != DType::BF16));
             let headers = oracle_headers(&manifest);
 
             let error = admit_developer_inventory_headers(
@@ -3501,7 +3722,9 @@ mod tests {
                 ARCH_ID,
                 &metadata_with_recipe(
                     &config,
-                    Some(serde_json::json!(crate::weights::SYNTHETIC_PACKED_RECIPE_ID)),
+                    Some(serde_json::json!(
+                        crate::weights::SYNTHETIC_PACKED_RECIPE_ID
+                    )),
                 ),
                 &headers,
             )
@@ -3512,12 +3735,17 @@ mod tests {
                 ARCH_ID,
                 &metadata_with_recipe(
                     &config,
-                    Some(serde_json::json!(crate::weights::SYNTHETIC_SOURCE_BF16_RECIPE_ID)),
+                    Some(serde_json::json!(
+                        crate::weights::SYNTHETIC_SOURCE_BF16_RECIPE_ID
+                    )),
                 ),
                 &oracle_headers(&Qwen4Manifest::build(&config).unwrap()),
             )
             .expect("explicit source-exact id");
-            assert_eq!(source_exact.manifest.identity.recipe, Qwen4TierRecipe::SyntheticSourceBf16);
+            assert_eq!(
+                source_exact.manifest.identity.recipe,
+                Qwen4TierRecipe::SyntheticSourceBf16
+            );
 
             for bad in [
                 serde_json::json!("flash-next"),
@@ -3543,9 +3771,13 @@ mod tests {
             value[RECIPE_METADATA_KEY] = serde_json::json!({
                 "id": crate::weights::SYNTHETIC_PACKED_RECIPE_ID
             });
-            let error = admit_developer_inventory_headers(ARCH_ID, &value.to_string(), &flash_next_headers())
-                .expect_err("Flash-Next must not take a recipe selector")
-                .to_string();
+            let error = admit_developer_inventory_headers(
+                ARCH_ID,
+                &value.to_string(),
+                &flash_next_headers(),
+            )
+            .expect_err("Flash-Next must not take a recipe selector")
+            .to_string();
             assert!(error.contains("exactly one recipe"), "{error}");
         }
 
@@ -3564,31 +3796,60 @@ mod tests {
             // hidden 256, expert width 128: both routed matrices pack.
             let config = crate::config::synthetic_test_config(moe(128), 256, 4, true, true);
             let manifest = packed_manifest(&config);
-            assert_eq!(dtype_of(&manifest, &layer("experts.gate_up_proj")), DType::MQ4G256V2);
-            assert_eq!(dtype_of(&manifest, &layer("experts.down_proj")), DType::MQ4G128V2);
-            assert_eq!(dtype_of(&manifest, "model.language_model.embed_tokens.weight"), DType::Q8_0);
+            assert_eq!(
+                dtype_of(&manifest, &layer("experts.gate_up_proj")),
+                DType::MQ4G256V2
+            );
+            assert_eq!(
+                dtype_of(&manifest, &layer("experts.down_proj")),
+                DType::MQ4G128V2
+            );
+            assert_eq!(
+                dtype_of(&manifest, "model.language_model.embed_tokens.weight"),
+                DType::Q8_0
+            );
             assert_eq!(dtype_of(&manifest, "lm_head.weight"), DType::MQ6G256V2);
             // The router, shared expert and hyper-connection mixers stay BF16.
             assert_eq!(dtype_of(&manifest, &layer("gate.weight")), DType::BF16);
-            assert_eq!(dtype_of(&manifest, &layer("shared_expert.gate_proj.weight")), DType::BF16);
             assert_eq!(
-                dtype_of(&manifest, "model.language_model.hyper_connection_mixer.hc_norm.weight"),
+                dtype_of(&manifest, &layer("shared_expert.gate_proj.weight")),
+                DType::BF16
+            );
+            assert_eq!(
+                dtype_of(
+                    &manifest,
+                    "model.language_model.hyper_connection_mixer.hc_norm.weight"
+                ),
                 DType::BF16
             );
             assert_eq!(dtype_of(&manifest, "mtp.fc_embedding.weight"), DType::BF16);
             // Expert width 64 is not a MQ4G128V2 group: gate/up must not pack alone.
             let config = crate::config::synthetic_test_config(moe(64), 256, 4, true, true);
             let manifest = packed_manifest(&config);
-            assert_eq!(dtype_of(&manifest, &layer("experts.gate_up_proj")), DType::BF16);
-            assert_eq!(dtype_of(&manifest, &layer("experts.down_proj")), DType::BF16);
+            assert_eq!(
+                dtype_of(&manifest, &layer("experts.gate_up_proj")),
+                DType::BF16
+            );
+            assert_eq!(
+                dtype_of(&manifest, &layer("experts.down_proj")),
+                DType::BF16
+            );
             // Hidden 128 is not a MQ4G256V2 group: neither packs, down included.
             let config = crate::config::synthetic_test_config(moe(128), 128, 4, true, true);
             let manifest = packed_manifest(&config);
-            assert_eq!(dtype_of(&manifest, &layer("experts.gate_up_proj")), DType::BF16);
-            assert_eq!(dtype_of(&manifest, &layer("experts.down_proj")), DType::BF16);
+            assert_eq!(
+                dtype_of(&manifest, &layer("experts.gate_up_proj")),
+                DType::BF16
+            );
+            assert_eq!(
+                dtype_of(&manifest, &layer("experts.down_proj")),
+                DType::BF16
+            );
             // A dense FFN packs gate/up where K tiles Q8F16 and keeps a narrow down BF16.
             let config = crate::config::synthetic_test_config(
-                Qwen4FfnConfig::Dense { intermediate_size: 8 },
+                Qwen4FfnConfig::Dense {
+                    intermediate_size: 8,
+                },
                 256,
                 4,
                 false,
@@ -3602,7 +3863,10 @@ mod tests {
             let config = crate::config::synthetic_test_config(moe(8), 16, 4, true, true);
             let manifest = packed_manifest(&config);
             assert!(
-                manifest.weights.iter().all(|entry| entry.dtype == DType::BF16),
+                manifest
+                    .weights
+                    .iter()
+                    .all(|entry| entry.dtype == DType::BF16),
                 "no role of a width-16 profile can pack"
             );
         }
@@ -3635,7 +3899,12 @@ mod tests {
             let find = |headers: &[HfqTensorInfo], name: &str| {
                 headers.iter().position(|h| h.name == name).expect(name)
             };
-            refuse(&|h| { h.remove(find(h, down)); }, "tensors but manifest declares");
+            refuse(
+                &|h| {
+                    h.remove(find(h, down));
+                },
+                "tensors but manifest declares",
+            );
             refuse(
                 &|h| {
                     let index = find(h, down);
@@ -3751,7 +4020,10 @@ mod tests {
             false,
         );
         let json = config.developer_metadata_json();
-        assert!(json.contains("hipfire_profile"), "fixture must carry the marker");
+        assert!(
+            json.contains("hipfire_profile"),
+            "fixture must carry the marker"
+        );
         let headers = oracle_headers(&Qwen4Manifest::build(&config).expect("manifest"));
         let error = admit_inventory_headers(ARCH_ID, &json, &headers)
             .expect_err("production header admission must refuse the marker")

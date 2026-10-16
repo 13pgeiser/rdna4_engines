@@ -1474,6 +1474,8 @@ pub const SITES: &[Site] = &[
     Site { file: "rdna-compute/src/dispatch.rs", function: "prepare_mq4v2_fp8_x", occurrences: 6, decisions: &["eager-only-refusals", "scratch-launch-plumbing"] },
     Site { file: "rdna-compute/src/dispatch.rs", function: "refuse_vmm_prefix_op_while_armed", occurrences: 4, decisions: &["eager-only-refusals"] },
     Site { file: "rdna-compute/src/dispatch.rs", function: "refuse_qsa_gather_growth_while_armed", occurrences: 2, decisions: &["eager-only-refusals"] },
+    // Loader-independent E8P MoE decode launcher refuses before submission under recording/capture (e8p_moe_decode.rs:670).
+    Site { file: "rdna-compute/src/e8p_moe_decode.rs", function: "launch_kernargs", occurrences: 2, decisions: &["eager-only-refusals"] },
     Site { file: "rdna-compute/src/flash_attn_ck.rs", function: "<item>", occurrences: 2, decisions: &["flash-attn-ck-prefill"] },
     Site { file: "rdna-compute/src/flash_attn_ck.rs", function: "select_packed_prefill_capabilities", occurrences: 2, decisions: &["flash-attn-ck-prefill"] },
     Site { file: "rdna-compute/src/flash_attn_ck.rs", function: "try_flash_attn_ck_q8_d256_prefill", occurrences: 6, decisions: &["flash-attn-ck-prefill"] },
