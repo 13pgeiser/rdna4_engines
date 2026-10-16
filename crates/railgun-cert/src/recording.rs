@@ -1765,7 +1765,7 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-arch-qwen4/src/gpu_forward.rs",
         function: "ensure_cpu_splice_eager",
-        occurrences: 2,
+        occurrences: 5,
         decisions: &["qwen4-cpu-splice-eager-only"],
     },
     Site {
@@ -1871,6 +1871,18 @@ pub const SITES: &[Site] = &[
         decisions: &["redline-oracle-diagnostics"],
     },
     Site {
+        file: "hipfire-dispatch/src/cpu_split.rs",
+        function: "gate",
+        occurrences: 5,
+        decisions: &["qwen4-cpu-splice-eager-only"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "<item>",
+        occurrences: 1,
+        decisions: &["qwen4-cpu-splice-eager-only"],
+    },
+    Site {
         file: "hipfire-dispatch/src/pipeline/moe_program.rs",
         function: "absorbs_clear",
         occurrences: 2,
@@ -1881,6 +1893,18 @@ pub const SITES: &[Site] = &[
         function: "owner_assign",
         occurrences: 4,
         decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "observe",
+        occurrences: 6,
+        decisions: &["qwen4-cpu-splice-eager-only"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "refusal",
+        occurrences: 1,
+        decisions: &["qwen4-cpu-splice-eager-only"],
     },
     Site {
         file: "hipfire-dispatch/src/pipeline/moe_program.rs",
