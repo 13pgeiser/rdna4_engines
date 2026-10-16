@@ -765,8 +765,13 @@ Caveats that are part of the fixture, not trivia:
   0.4.1; `0` sends sampled requests to AR) verifies sampled requests by
   speculative rejection sampling against the AR sampler's distribution
   (oracle: `crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs`).
-  Sampled MTP output matches AR in distribution, not byte for byte; requests
-  with non-neutral penalties still run AR.** Each MTP
+  Sampled MTP output matches AR in distribution, not byte for byte.
+  Non-neutral penalties keep native MTP for sampled requests when
+  `supports_temp_swor` is true (since `9f1ea2171`, shipped in v0.4.1);
+  greedy requests with penalties run AR
+  (`crates/hipfire-generate/src/ar.rs:1715–1734`).
+  Flash-Next batch lanes refuse non-neutral repeat/presence/frequency penalties
+  (`crates/hipfire-generate/src/batch.rs:2767–2789`).** Each MTP
   window picks its verification route: a batched `(K+1)`-row verify at the
   draft depth `K` (up to the `mtp_k` cap; `auto` = 7 for native Qwen4 MTP on
   gfx1151, else 3) that maximizes expected emitted tokens per window cost
