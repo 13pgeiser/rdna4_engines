@@ -133,6 +133,73 @@ pub const fn k1_rows8_cold_codec(cold_codec: u8) -> bool {
     matches!(cold_codec, 0 | 1)
 }
 
+/// Module key of the embedded K1-Cn certified builder image (gfx1151 only).
+const MQ_I4_MOE_GEMV_CN_MODULE: &str = "mq_i4_moe_gemv_cn_pm_gfx1151";
+
+/// K1-Cn symbols in the K1 bucket order, `[bucket][kind]`: bucket 0 = W3 (`mq3i4`), 1 = MQ4
+/// (`mq4sym`), kind 0 = gate/up (R256), 1 = down (R128). Same kernarg ABI as the K1 symbols.
+pub const MQ_I4_MOE_GEMV_CN_SYMBOLS: [[&str; 2]; 2] = [
+    ["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up", "mq_i4_moe_gemv_cn_mq3i4_r128_down"],
+    ["mq_i4_moe_gemv_cn_mq4sym_r256_gate_up", "mq_i4_moe_gemv_cn_mq4sym_r128_down"],
+];
+/// Output rows per K1-Cn workgroup (one wave32 each).
+pub const MQ_I4_MOE_GEMV_CN_ROWS_PER_WG: usize = 8;
+/// Threads per K1-Cn workgroup.
+pub const MQ_I4_MOE_GEMV_CN_BLOCK: u32 = 256;
+
+/// Which of the two gfx1151 K1 schedules serves a [`Gpu::mq_i4_moe_gemv_slab`] launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlabK1Module {
+    /// One wave32 per output row (the bucket's [`SlabK1`] entry), any lane count 1..=8, every arch.
+    K1,
+    /// Eight rows per 256-thread workgroup with the expert's slots' X in LDS
+    /// (`mq_i4_moe_gemv_cn_pm_gfx1151`), bitwise K1; gfx1151 MQ4/W3 layers only.
+    Cn,
+}
+
+/// The module the default dispatch picks: Cn on gfx1151 when `2 <= lanes <= 8` and the switch is
+/// on, K1 in every other case.
+pub const fn slab_k1_default_module(gfx1151: bool, lanes: usize, cn_enabled: bool) -> SlabK1Module {
+    if gfx1151 && cn_enabled && lanes >= 2 && lanes <= SLAB_NARROW_MAX_LANES {
+        SlabK1Module::Cn
+    } else {
+        SlabK1Module::K1
+    }
+}
+
+/// Module, symbol and launch geometry of one K1 bucket launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlabK1Pick {
+    pub module_key: &'static str,
+    pub image: &'static [u8],
+    pub symbol: &'static str,
+    pub grid: [u32; 3],
+    pub block: [u32; 3],
+}
+
+/// The module/symbol/geometry of bucket `bucket` (0 = W3, 1 = MQ4) of a projection with `m` output
+/// rows over `slots` union slots. K1: the bucket's entry `k1`, grid `[m, slots, 1]`, block
+/// `[32, 1, 1]`; Cn (gfx1151 MQ4/W3 layers; `k1` unused): grid `[m / 8, slots, 1]`, block
+/// `[256, 1, 1]`.
+pub fn slab_k1_pick(k1: &SlabK1, module: SlabK1Module, bucket: usize, down: bool, m: usize, slots: usize) -> SlabK1Pick {
+    match module {
+        SlabK1Module::K1 => SlabK1Pick {
+            module_key: k1.module,
+            image: k1.image,
+            symbol: k1.symbols[down as usize],
+            grid: [m as u32, slots as u32, 1],
+            block: [32, 1, 1],
+        },
+        SlabK1Module::Cn => SlabK1Pick {
+            module_key: MQ_I4_MOE_GEMV_CN_MODULE,
+            image: kernels::MQ_I4_MOE_GEMV_CN_PM_GFX1151,
+            symbol: MQ_I4_MOE_GEMV_CN_SYMBOLS[bucket][down as usize],
+            grid: [(m / MQ_I4_MOE_GEMV_CN_ROWS_PER_WG) as u32, slots as u32, 1],
+            block: [MQ_I4_MOE_GEMV_CN_BLOCK, 1, 1],
+        },
+    }
+}
+
 /// Launch geometry and kernarg scalars of one K1-C1 projection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlabC1Launch {
@@ -560,6 +627,11 @@ impl Gpu {
                 self.ensure_embedded_kernel(MQ_I4_MOE_GEMV_C1_MODULE, kernels::MQ_I4_MOE_GEMV_C1_PM_GFX1151, symbol)?;
             }
         }
+        if self.slab_k1_cn() && k1_rows8_cold_codec(cold_codec) {
+            for symbol in MQ_I4_MOE_GEMV_CN_SYMBOLS.iter().flatten() {
+                self.ensure_embedded_kernel(MQ_I4_MOE_GEMV_CN_MODULE, kernels::MQ_I4_MOE_GEMV_CN_PM_GFX1151, symbol)?;
+            }
+        }
         Ok(())
     }
 
@@ -730,8 +802,45 @@ impl Gpu {
         lanes: usize,
         cold_codec: u8,
     ) -> HipResult<()> {
+        self.mq_i4_moe_gemv_slab_with(down, buckets, weight_ptrs, xrot, y0, y1, lanes, cold_codec, None)
+    }
+
+    /// [`Gpu::mq_i4_moe_gemv_slab`] with the K1 schedule optionally forced (`None` = the default
+    /// dispatch: [`SlabK1Module::Cn`] on gfx1151 for `2 <= lanes <= 8` of an MQ4/W3 layer
+    /// ([`k1_rows8_cold_codec`]) unless `HIPFIRE_QWEN4_SLAB_K1_CN=0`, else [`SlabK1Module::K1`]).
+    /// Forcing `Cn` is an error off gfx1151, above 8 lanes and for any other cold codec; the oracle
+    /// forces both modules over the same union plan to compare them bitwise.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mq_i4_moe_gemv_slab_with(
+        &mut self,
+        down: bool,
+        buckets: SlabBuckets<'_>,
+        weight_ptrs: &GpuTensor,
+        xrot: &GpuTensor,
+        y0: &GpuTensor,
+        y1: Option<&GpuTensor>,
+        lanes: usize,
+        cold_codec: u8,
+        force: Option<SlabK1Module>,
+    ) -> HipResult<()> {
         let arch = self.slab_kernels("mq_i4_moe_gemv_slab")?;
         let cold = self.slab_cold_opt("mq_i4_moe_gemv_slab", cold_codec)?;
+        let gfx1151 = arch.arch == "gfx1151";
+        let module = force.unwrap_or_else(|| {
+            slab_k1_default_module(gfx1151, lanes, self.slab_k1_cn() && k1_rows8_cold_codec(cold_codec))
+        });
+        if module == SlabK1Module::Cn && !gfx1151 {
+            return Err(hip_bridge::HipError::new(0, "mq_i4_moe_gemv_slab: the K1-Cn kernels are gfx1151-only"));
+        }
+        if module == SlabK1Module::Cn && lanes > SLAB_NARROW_MAX_LANES {
+            return Err(hip_bridge::HipError::new(0, "mq_i4_moe_gemv_slab: the K1-Cn kernels serve 1..=8 lanes"));
+        }
+        if module == SlabK1Module::Cn && !k1_rows8_cold_codec(cold_codec) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("mq_i4_moe_gemv_slab: the K1-Cn kernels serve MQ4/W3 layers only, got cold codec {cold_codec}"),
+            ));
+        }
         if lanes == 0 || lanes > SLAB_MAX_LANES {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -806,12 +915,19 @@ impl Gpu {
             } else {
                 &arch.mq4_k1
             };
-            let func = if wide {
-                MQ_I4_MOE_GEMV_WIDE_SYMBOLS[usize::from(lanes > 16)][bucket][down as usize]
+            let pick = if wide {
+                SlabK1Pick {
+                    module_key: k1.module,
+                    image: k1.image,
+                    symbol: MQ_I4_MOE_GEMV_WIDE_SYMBOLS[usize::from(lanes > 16)][bucket][down as usize],
+                    grid: [(m as u32).div_ceil(8), s as u32, 1],
+                    block: [256, 1, 1],
+                }
             } else {
-                k1.symbols[down as usize]
+                slab_k1_pick(k1, module, bucket, down, m, s)
             };
-            self.ensure_embedded_kernel(k1.module, k1.image, func)?;
+            let func = pick.symbol;
+            self.ensure_embedded_kernel(pick.module_key, pick.image, func)?;
             let ids = (union + bucket * s * 4) as *mut c_void;
             let offs = (union + (2 * s + bucket * (s + 1)) * 4) as *mut c_void;
             let slot_ids = (union + (2 * s + 2 * (s + 1) + bucket * s) * 4) as *mut c_void;
@@ -844,12 +960,7 @@ impl Gpu {
                 &nexp as *const _ as *mut c_void,
                 &reserved as *const _ as *mut c_void,
             ];
-            let (grid_m, block) = if wide {
-                (mv.div_ceil(8), 256)
-            } else {
-                (mv, 32)
-            };
-            self.launch_maybe_blob(func, [grid_m, uv, 1], [block, 1, 1], 0, &mut params, || {
+            self.launch_maybe_blob(func, pick.grid, pick.block, 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(wp);
                 b.push_ptr(ids);
@@ -872,6 +983,15 @@ impl Gpu {
     pub fn slab_k1_c1(&self) -> bool {
         static ENABLED: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_SLAB_K1_C1", true));
+        self.arch == "gfx1151" && *ENABLED
+    }
+
+    /// Whether the multi-lane slab decode (`2 <= lanes <= 8`, MTP verify) uses the K1-Cn kernels:
+    /// exact gfx1151 and `HIPFIRE_QWEN4_SLAB_K1_CN` not `0` (default on). The environment is read
+    /// once per process.
+    pub fn slab_k1_cn(&self) -> bool {
+        static ENABLED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_SLAB_K1_CN", true));
         self.arch == "gfx1151" && *ENABLED
     }
 
@@ -1762,6 +1882,100 @@ mod tests {
         assert_eq!(slab_bucket_of_codec_on("gfx1151", 3), None);
         // The historical gfx1201 byte mapping is unchanged.
         assert_eq!((slab_bucket_of_codec(1), slab_bucket_of_codec(0)), (0, 1));
+    }
+
+    /// K1-Cn: pinned symbol table (K1 bucket order), grid `[M / 8, slots, 1]`, block 256; K1 keeps
+    /// the one-wave-per-row geometry; the default dispatch picks Cn only on gfx1151 for 2..=8 lanes.
+    #[test]
+    fn cn_symbols_geometry_and_default_choice_are_pinned() {
+        assert_eq!(
+            MQ_I4_MOE_GEMV_CN_SYMBOLS,
+            [
+                ["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up", "mq_i4_moe_gemv_cn_mq3i4_r128_down"],
+                ["mq_i4_moe_gemv_cn_mq4sym_r256_gate_up", "mq_i4_moe_gemv_cn_mq4sym_r128_down"],
+            ]
+        );
+        for (bucket, codec) in ["mq3i4", "mq4sym"].into_iter().enumerate() {
+            assert_eq!(MQ_I4_MOE_GEMV_CN_SYMBOLS[bucket][0], format!("mq_i4_moe_gemv_cn_{codec}_r256_gate_up"));
+            assert_eq!(MQ_I4_MOE_GEMV_CN_SYMBOLS[bucket][1], format!("mq_i4_moe_gemv_cn_{codec}_r128_down"));
+        }
+        for lanes in 1..=SLAB_NARROW_MAX_LANES {
+            let slots = SLAB_TOP_K * lanes;
+            for (bucket, down, m) in [(0, false, SLAB_GATE_UP_M), (1, false, SLAB_GATE_UP_M), (0, true, SLAB_DOWN_M), (1, true, SLAB_DOWN_M)] {
+                assert_eq!(m % MQ_I4_MOE_GEMV_CN_ROWS_PER_WG, 0);
+                let mq4 = &slab_arch_kernels("gfx1151").unwrap().mq4_k1;
+                let cn = slab_k1_pick(mq4, SlabK1Module::Cn, bucket, down, m, slots);
+                assert_eq!(cn.module_key, "mq_i4_moe_gemv_cn_pm_gfx1151");
+                assert_eq!(cn.symbol, MQ_I4_MOE_GEMV_CN_SYMBOLS[bucket][down as usize]);
+                assert_eq!(cn.grid, [(m / 8) as u32, slots as u32, 1]);
+                assert_eq!(cn.block, [256, 1, 1]);
+                for arch in ["gfx1151", "gfx1201"] {
+                    let entry = if bucket == 0 {
+                        &slab_cold_k1_metadata(arch, 1).unwrap().k1
+                    } else {
+                        &slab_arch_kernels(arch).unwrap().mq4_k1
+                    };
+                    let k1 = slab_k1_pick(entry, SlabK1Module::K1, bucket, down, m, slots);
+                    assert_eq!((k1.module_key, k1.image.as_ptr()), (entry.module, entry.image.as_ptr()), "{arch}");
+                    assert_eq!(k1.symbol, MQ_I4_MOE_GEMV_SYMBOLS[bucket][down as usize]);
+                    assert_eq!(k1.grid, [m as u32, slots as u32, 1]);
+                    assert_eq!(k1.block, [32, 1, 1]);
+                }
+            }
+        }
+        for lanes in 0..=9 {
+            let cn_range = (2..=8).contains(&lanes);
+            assert_eq!(slab_k1_default_module(true, lanes, true) == SlabK1Module::Cn, cn_range);
+            assert_eq!(slab_k1_default_module(true, lanes, false), SlabK1Module::K1);
+            assert_eq!(slab_k1_default_module(false, lanes, true), SlabK1Module::K1);
+        }
+    }
+
+    /// The embedded K1-Cn metadata matches the bounded 96-byte K1 ABI (`n_experts` @88, zero
+    /// `reserved` @92) and the shared launcher's kernelParams count.
+    #[test]
+    fn cn_kernel_params_match_embedded_metadata() {
+        let (_, images) = Source::read(kernels::MQ_I4_MOE_GEMV_CN_PM_GFX1151, Arch::Gfx1151)
+            .expect("embedded K1-Cn metadata must parse");
+        let mut mismatches = Vec::new();
+        for symbol in MQ_I4_MOE_GEMV_CN_SYMBOLS.iter().flatten() {
+            let image = images
+                .iter()
+                .find(|image| image.name == *symbol)
+                .unwrap_or_else(|| panic!("missing K1-Cn symbol {symbol}"));
+            let metadata = &image.metadata.parsed;
+            assert_eq!(metadata.kernarg_segment_size, 96, "{symbol}");
+            let find = |name: &str| {
+                metadata
+                    .args
+                    .iter()
+                    .find(|arg| arg.name == name)
+                    .map(|arg| (arg.offset, arg.size, arg.value_kind.as_str()))
+            };
+            assert_eq!(find("n_experts"), Some((88, 4, "by_value")), "{symbol}");
+            let reserved = metadata.args.last().expect("K1-Cn arguments");
+            assert_eq!(
+                (
+                    reserved.name.as_str(),
+                    reserved.offset,
+                    reserved.size,
+                    reserved.value_kind.as_str()
+                ),
+                ("reserved", 92, 4, "by_value"),
+                "{symbol}"
+            );
+            let explicit = metadata
+                .args
+                .iter()
+                .filter(|arg| !arg.value_kind.starts_with("hidden_"))
+                .count();
+            if explicit != MQ_I4_MOE_GEMV_KERNARG_COUNT {
+                mismatches.push(format!(
+                    "{symbol}: kernelParams={MQ_I4_MOE_GEMV_KERNARG_COUNT}, declared={explicit}"
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     }
 
     #[test]

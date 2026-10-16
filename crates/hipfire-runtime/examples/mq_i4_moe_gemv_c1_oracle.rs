@@ -1,25 +1,43 @@
 // SPDX-License-Identifier: Apache-2.0
-//! K1-C1 slab decode GEMV GPU oracle: byte-exactness (G1) and timing against the incumbent K1 path.
-//! Never participates in runtime dispatch.
+//! K1-C1 / K1-Cn slab decode GEMV GPU oracle: byte-exactness (G1) and timing against the incumbent K1
+//! path, swept over decode lane counts. Never participates in runtime dispatch. gfx1151 only.
 //!
-//! The incumbent is today's `lanes == 1` slab K1 route, driven exactly as dispatch drives it:
-//! `Gpu::qwen4_slab_union_plan` once per layer step, then `Gpu::mq_i4_moe_gemv_slab(.., lanes = 1)`
-//! for gate/up and for down (union plan + per-codec-bucket one-wave-per-row GEMVs of the embedded
-//! `mq_i4_moe_gemv_pm_gfx1151` image). The candidate is `Gpu::mq_i4_moe_gemv_slab_c1` (one
-//! launch per projection, both codecs, no union plan; embedded `mq_i4_moe_gemv_c1_pm_gfx1151`
-//! image), called directly (independent of `HIPFIRE_QWEN4_SLAB_K1_C1`). gfx1151 only.
+//! The incumbent is today's K1 route, driven exactly as dispatch drives it: `Gpu::qwen4_slab_union_plan`
+//! once per layer step, then `Gpu::mq_i4_moe_gemv_slab_with(.., lanes, Some(SlabK1Module::K1))` for gate/up
+//! and for down (union plan + per-codec-bucket one-wave-per-row GEMVs of the embedded
+//! `mq_i4_moe_gemv_pm_gfx1151` image; K1 is FORCED, so `HIPFIRE_QWEN4_SLAB_K1_CN` plays no part).
+//! The candidate depends on `lanes`:
+//! * `lanes == 1`: K1-C1, `Gpu::mq_i4_moe_gemv_slab_c1` (one launch per projection, both codecs, no union
+//!   plan; embedded `mq_i4_moe_gemv_c1_pm_gfx1151` image), called directly (independent of
+//!   `HIPFIRE_QWEN4_SLAB_K1_C1`).
+//! * `2 <= lanes <= 8`: K1-Cn, the SAME union plan (run once, shared by both) then
+//!   `Gpu::mq_i4_moe_gemv_slab_with(.., lanes, Some(SlabK1Module::Cn))` (same per-codec bucket launches of the
+//!   embedded `mq_i4_moe_gemv_cn_pm_gfx1151` image), also independent of the env switch.
 //!
 //! # G1 mode (default)
-//! For every case and every topk draw both paths run on the same inputs into sentinel-filled
-//! output buffers (word `0x7fc0dead`) that are ONE SLOT-ROW LARGER than the written extent
-//! (gate/up Y0 and Y1: `10 * 640 + 640` words, down Y0: `10 * 2560 + 2560` words). Every F32 word
-//! of every buffer, the sentinel tail included, is compared BITWISE between K1 and C1 (signed
-//! zeros and NaN payloads are differences). Independently of the comparison a path is also a
-//! failure if it leaves a sentinel word inside the extent (unwritten) or disturbs a tail word.
+//! `--lanes LIST` (default `1,2,3,4,5,8`, values 1..=8, no duplicates). For every case, every lanes value and
+//! every draw both paths run on the same inputs into sentinel-filled output buffers (word `0x7fc0dead`).
+//! The buffers are allocated for the MAXIMUM lane count plus one slot row (gate/up Y0 and Y1:
+//! `(80 + 1) * 640` words, down Y0: `(80 + 1) * 2560` words), so past the written extent of `lanes` lanes
+//! (`10 * lanes` slot rows) there is always a sentinel tail of at least one slot row. Every F32 word of every
+//! buffer, the sentinel tail included, is compared BITWISE between K1 and the candidate (signed zeros and NaN
+//! payloads are differences). Independently of the comparison a path is also a failure if it leaves a
+//! sentinel word inside the extent (unwritten) or disturbs a tail word.
+//!
+//! Inputs per draw: topk `[lanes * 10]` i32 (slot = lane * 10 + rank, 10 distinct ids per lane). Lane 0 is the
+//! draw of the case (below); every later lane copies a subset of lane 0's ids (distinct within its lane, fresh
+//! ids from the layer's mapped experts for the rest, then shuffled so ranks differ). Overlap by draw index
+//! `d % 4`: 0 and 3 = 6 of 10 ids per lane (~60%, MTP-window-like expert overlap), 1 = all 10 ids in every lane
+//! (a permutation: up to `lanes` slots per routed expert, the K1 `n <= 8` extreme), 2 = per lane `[0, 6, 3, 8]`
+//! copied ids by `lane % 4`. X: gate `[lanes, 2560]` (lane row `style + lane`), down `[10 * lanes, 640]` (slot
+//! row `style + slot`); the unused rest of the max-size X buffers is zero. X rows past `x_src_rows` are NOT
+//! tested: the real dispatch cannot produce them (gate `x_src_rows = lanes` and every slot's row is
+//! `slot / 10 < lanes`; down `x_src_rows = 10 * lanes` and the row is the slot itself), so no case exists.
 //!
 //! Cases (all through the product geometry: one arena per layer, experts `[gate_up][down]` back to
 //! back at 256 B alignment, a 4096 B zero tail, a `[512]` u64 pointer table per projection and the
-//! `[512]` u8 codec table with 0 = MQ4, 1 = W3):
+//! `[512]` u8 codec table with 0 = MQ4, 1 = W3), each repeated for every `--lanes` value
+//! (case name suffix `/lanes<N>`):
 //! * `syn_uniform_w3`, `syn_uniform_mq4`: a pool of 24 experts of one codec (ids always include 0,
 //!   1, 510, 511); run as `SlabBuckets::Uniform` AND as a `SlabBuckets::Table` of all one codec.
 //! * `syn_mixed_a`, `syn_mixed_b`, `syn_mixed_stress_x`: a pool of 24 experts with random codecs
@@ -32,11 +50,10 @@
 //!   classes where the finite maximum is f16 `0x6fff` (`z = -65504`) / `0xefff`. Two of every
 //!   three experts are "special" (every class), the third is plain random scales only.
 //! * X rows rotate over six styles: normal-range, wide exponents, `+-2^24`, `+-0` / `+-1e-30`,
-//!   F32 subnormals with `+-0`, and near-overflow magnitudes. The down X is `[10, 640]`, every
-//!   slot row with its own style.
-//! * Per case 12 topk draws over the pool: draw 0 = ids {0, 511, ..} with 0 at rank 0 and 511 at
+//!   F32 subnormals with `+-0`, and near-overflow magnitudes.
+//! * Per case 12 lane-0 draws over the pool: draw 0 = ids {0, 511, ..} with 0 at rank 0 and 511 at
 //!   rank 9, draw 1 its reverse, then an all-first-codec / all-second-codec draw, a 5/5 draw and
-//!   random distinct draws. topk is always 10 distinct ids (slot = rank).
+//!   random distinct draws.
 //! * Real layers `real_L<l>` from `--artifact <sealed slab .mq3-xts> --layers L,L,..`: the layer's
 //!   arena is read with the product's own plan (`expert_slabs::parse` ->
 //!   `expert_slab_table::build_expert_slab_table` -> `expert_arena::ExpertArenaPlan::from_table`;
@@ -44,29 +61,32 @@
 //!   `codec_table()`), uploaded as ONE tensor plus `SLAB_ARENA_TAIL_PAD_BYTES` zeros exactly like the
 //!   resident slab upload, with pointer tables `arena + offset` and the layer's codec table.
 //!   Only the requested layers are read, one layer in host memory at a time. `--draws` (default
-//!   64, minimum 64) random distinct-top10 draws per layer (+ the special draws above, counted in
+//!   64, minimum 64) lane-0 draws per layer per lanes value (+ the special draws above, counted in
 //!   the total; `--hot-frac F` draws each slot from the MQ4 pool with probability F, default
 //!   uniform over the 512 experts). A layer that has a single codec is also run `Uniform`.
 //!
 //! # Timing mode (`--timing`, needs `--artifact` + `--layers`)
-//! Draw pool of `--draws` (default 256, >= 64) distinct-top10 routes assigned round-robin to the
-//! requested layers (pass several layers so the pool far exceeds the 32 MiB MALL; one draw already
-//! touches ~26 MiB of weights). First the first 16 draws are G1-checked (refuses to time a wrong
-//! kernel). Then, per rep, every sequence runs once as `--launches` (>= 64) back-to-back launches
-//! of consecutive draws between two device events (one `hipEventElapsedTime` pair, the draw cursor
-//! advances `--launches` per rep, all sequences of a rep use the same draws, sequence order
-//! rotates per rep); the first `--warmup` reps are discarded. Sequences:
-//! `k1_plan` (union plan only), `k1_plan_gate` (plan + gate/up buckets = what `k1_gate_up`
-//! launches), `k1_plan_gate_down` (plan + gate/up + down), `c1_gate`, `c1_down`, `c1_gate_down`.
-//! Median microseconds per launch of each sequence are reported; per projection:
-//! K1 gate/up = `k1_plan_gate`, K1 down = `k1_plan_gate_down - k1_plan_gate` (the plan is shared,
-//! derived), C1 gate/up = `c1_gate`, C1 down = `c1_down`; GB/s = mean unique weight bytes of the 10
-//! routed experts of that projection / median time.
+//! Per lanes value: a draw pool of `--draws` (default 256, >= 64) routes (lane 0 = a distinct-top10 draw
+//! assigned round-robin to the requested layers, later lanes derived as above; pass several layers so the
+//! pool far exceeds the 32 MiB MALL; one draw already touches ~26 MiB of weights). First the first 16 draws
+//! are G1-checked at that lanes value (refuses to time a wrong kernel; they appear as `timing_precheck/lanes<N>`
+//! cases). Then, per rep, every sequence runs once as `--launches` (>= 64) back-to-back launches of
+//! consecutive draws between two device events (one `hipEventElapsedTime` pair, the draw cursor advances
+//! `--launches` per rep, all sequences of a rep use the same draws, sequence order rotates per rep); the
+//! first `--warmup` reps are discarded. Sequences: `k1_plan` (union plan only), `k1_plan_gate` (plan +
+//! gate/up buckets), `k1_plan_gate_down` (plan + gate/up + down); then at `lanes == 1` `c1_gate`, `c1_down`,
+//! `c1_gate_down`, at `lanes >= 2` `cn_plan_gate` (the shared plan + Cn gate/up) and `cn_plan_gate_down`.
+//! Median microseconds per launch of each sequence are reported; per projection (`gate_up`, `down`):
+//! K1 gate/up = `k1_plan_gate`, K1 down = `k1_plan_gate_down - k1_plan_gate` (derived); `lanes == 1`: C1 gate/up =
+//! `c1_gate`, C1 down = `c1_down`; `lanes >= 2`: Cn gate/up = `cn_plan_gate`, Cn down = `cn_plan_gate_down -
+//! cn_plan_gate` (the union plan is shared and counted in both gate/up figures, as K1 always counted it).
+//! GB/s = mean unique weight bytes of the routed experts of the step (experts shared between lanes counted
+//! once) of that projection / median time.
 //!
 //! # CLI
 //! ```text
 //! mq_i4_moe_gemv_c1_oracle [--artifact ABS.mq3-xts --layers 0,1,23,47] [--draws N] [--hot-frac F]
-//!     [--seed N] [--skip-synthetic] [--only SUBSTR]...
+//!     [--lanes 1,2,3,4,5,8] [--seed N] [--skip-synthetic] [--only SUBSTR]...
 //!     [--timing --reps 30 --warmup 5 --launches 64]
 //!     [--device N] [--expect-arch gfx1151] [--expect-uuid GPU-..] [--expect-bdf 0000:..:..]
 //!     [--card NAME] [--fabric-owner OWNER] [--fabric-wrapper PATH] [--fabric-card NAME]
@@ -75,20 +95,25 @@
 //! `--card/--fabric-*` (env `FABRIC_CARD/FABRIC_OWNER/FABRIC_WRAPPER`) are recorded verbatim.
 //!
 //! # Output
-//! ONE JSON line on stdout, schema `mq-i4-moe-gemv-c1-oracle-v1`:
+//! ONE JSON line on stdout, schema `mq-i4-moe-gemv-c1-oracle-v2`:
 //! `{schema, mode: "g1"|"timing", command: {argv, build_command}, device: {index, uuid, bdf, arch,
-//! expected_*, identity_match}, modules: {k1: {module, symbols, sha256, bytes}, c1: {..}},
-//! config, artifact?, cases: [{name, origin, layer?, buckets, draws, words_compared,
-//! mismatch_count, first_mismatches: [{draw, part, word_index, slot, row, k1_bits, c1_bits,
-//! topk}], k1_unwritten_words, c1_unwritten_words, k1_tail_disturbed_words,
-//! c1_tail_disturbed_words, draws_with_both_codecs, pass}], case_counts, mismatch_count,
-//! byte_exact, pass, rc, timing?: {...}}`. Exit code 1 on any mismatch or error (the error text
-//! is then also on stderr and in `error`).
+//! expected_*, identity_match}, modules: {k1: {module, symbols, sha256, bytes}, c1: {..}, cn: {..}},
+//! config: {.., lanes: [..]}, artifact?, cases: [{name, origin, layer?, buckets, lanes, candidate: "c1"|"cn",
+//! draws, words_compared, mismatch_count, first_mismatches: [{draw, part, word_index, slot, lane, row,
+//! k1_bits, cand_bits, topk}], k1_unwritten_words, cand_unwritten_words, k1_tail_disturbed_words,
+//! cand_tail_disturbed_words, draws_with_both_codecs, pass}], case_counts, mismatch_count, byte_exact, pass,
+//! rc, timing?: {event_timing, layers, draws, reps, warmup, launches_per_sample, mall_bytes, fabric,
+//! timing_source, verified_byte_exact_before_timing, by_lanes: [{lanes, candidate, draws_per_sample,
+//! pool_unique_weight_bytes, min_sample_unique_weight_bytes, sample_working_set_exceeds_mall,
+//! median_us: {<sequence>: us}, projections: {gate_up: {unique_bytes_mean, k1_us, cand_us, k1_gbps,
+//! cand_gbps, cand_speedup}, down: {..}, k1_down_is, cand_down_is}, gate_down_total: {k1_us, cand_us,
+//! cand_speedup, unique_bytes_mean, k1_gbps, cand_gbps}, samples_us: {<sequence>: [us]}}]}}`. Exit code 1 on
+//! any mismatch or error (the error text is then also on stderr and in `error`).
 //!
 //! # Build / run
 //! ```text
 //! cargo build -p hipfire-runtime --release --features lab --example mq_i4_moe_gemv_c1_oracle
-//! # G1 (synthetic + real layers):
+//! # G1 (synthetic + real layers, lanes 1,2,3,4,5,8; add --lanes 1,2,3,4,5,6,7,8 for the full sweep):
 //! target/release/examples/mq_i4_moe_gemv_c1_oracle --artifact /abs/qwen3.8-flash-next-base.mq3-xts \
 //!   --layers 0,1,23,47 --draws 64 --expect-arch gfx1151 --expect-uuid GPU-<uuid> --expect-bdf 0000:<bdf>
 //! # Timing (separate run, after G1 passed):
@@ -104,8 +129,8 @@ use hipfire_arch_qwen4::expert_slabs::{self, ExpertFormat};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::weight_store::SLAB_ARENA_TAIL_PAD_BYTES;
 use rdna_compute::slab_moe::{
-    SlabBuckets, MQ_I4_MOE_GEMV_C1_SYMBOLS, MQ_I4_MOE_GEMV_SYMBOLS, SLAB_DOWN_K, SLAB_DOWN_M, SLAB_EXPERTS,
-    SLAB_GATE_UP_K, SLAB_GATE_UP_M, SLAB_TOP_K,
+    SlabBuckets, SlabK1Module, MQ_I4_MOE_GEMV_C1_SYMBOLS, MQ_I4_MOE_GEMV_CN_SYMBOLS, MQ_I4_MOE_GEMV_SYMBOLS,
+    SLAB_DOWN_K, SLAB_DOWN_M, SLAB_EXPERTS, SLAB_GATE_UP_K, SLAB_GATE_UP_M, SLAB_NARROW_MAX_LANES, SLAB_TOP_K,
 };
 use rdna_compute::{kernels, DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
@@ -119,18 +144,18 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-const SCHEMA: &str = "mq-i4-moe-gemv-c1-oracle-v1";
+const SCHEMA: &str = "mq-i4-moe-gemv-c1-oracle-v2";
 const BUILD_COMMAND: &str =
     "cargo build -p hipfire-runtime --release --features lab --example mq_i4_moe_gemv_c1_oracle";
 const K1_MODULE: &str = "mq_i4_moe_gemv_pm_gfx1151";
 const C1_MODULE: &str = "mq_i4_moe_gemv_c1_pm_gfx1151";
+const CN_MODULE: &str = "mq_i4_moe_gemv_cn_pm_gfx1151";
 const DEFAULT_ARCH: &str = "gfx1151";
+const DEFAULT_LANES: [usize; 6] = [1, 2, 3, 4, 5, 8];
 /// Unwritten output words (a quiet NaN with a payload no kernel produces).
 const SENTINEL_BITS: u32 = 0x7fc0_dead;
 const MALL_BYTES: u64 = 32 << 20;
-const GATE_Y_WORDS: usize = SLAB_TOP_K * (SLAB_GATE_UP_M / 2);
 const GATE_Y_ROW: usize = SLAB_GATE_UP_M / 2;
-const DOWN_Y_WORDS: usize = SLAB_TOP_K * SLAB_DOWN_M;
 const DOWN_Y_ROW: usize = SLAB_DOWN_M;
 const POOL: usize = 24;
 const SYNTH_DRAWS: usize = 12;
@@ -371,10 +396,15 @@ struct Xs {
     gate: Vec<f32>,
     down: Vec<f32>,
 }
-fn gen_xs(style: usize, rng: &mut Rng) -> Xs {
-    let gate = gen_x_row(style, SLAB_GATE_UP_K, rng);
-    let mut down = Vec::with_capacity(SLAB_TOP_K * SLAB_DOWN_K);
-    for u in 0..SLAB_TOP_K {
+/// X of `lanes` decode lanes: gate `[lanes, 2560]` (lane row `style + lane`), down `[10 * lanes, 640]`
+/// (slot row `style + slot`). At `lanes == 1` this is the one-lane X of the K1-C1 oracle.
+fn gen_xs(style: usize, lanes: usize, rng: &mut Rng) -> Xs {
+    let mut gate = Vec::with_capacity(lanes * SLAB_GATE_UP_K);
+    for lane in 0..lanes {
+        gate.extend(gen_x_row(style + lane, SLAB_GATE_UP_K, rng));
+    }
+    let mut down = Vec::with_capacity(SLAB_TOP_K * lanes * SLAB_DOWN_K);
+    for u in 0..SLAB_TOP_K * lanes {
         down.extend(gen_x_row(style + u, SLAB_DOWN_K, rng));
     }
     Xs { gate, down }
@@ -593,9 +623,62 @@ fn style_for(real: bool, case_idx: usize, draw: usize) -> usize {
     }
 }
 
+const LANE_KEEP_SPREAD: [usize; 4] = [0, 6, 3, 8];
+
+/// Ids a later lane copies from lane 0 at draw index `draw`: `d % 4` 0 and 3 -> 6 of 10 (~60%),
+/// 1 -> all 10 (a permutation), 2 -> `[0, 6, 3, 8][lane % 4]`.
+fn lane_keep(draw: usize, lane: usize) -> usize {
+    match draw % 4 {
+        1 => SLAB_TOP_K,
+        2 => LANE_KEEP_SPREAD[lane % 4],
+        _ => 6,
+    }
+}
+
+/// Flat topk `[lanes * 10]` (slot = lane * 10 + rank): lane 0 is `base`; every later lane keeps
+/// `lane_keep` random ids of `base`, fills up with distinct fresh ids of `all` (the mapped experts)
+/// and is shuffled, so every lane holds 10 distinct ids at its own ranks while experts repeat
+/// across lanes like an MTP window. `lanes == 1` returns `base`.
+fn lane_routes(rng: &mut Rng, all: &[u32], base: &[i32], lanes: usize, draw: usize) -> Vec<i32> {
+    let mut out = base.to_vec();
+    for lane in 1..lanes {
+        let keep = lane_keep(draw, lane);
+        let mut route = base.to_vec();
+        rng.shuffle(&mut route);
+        route.truncate(keep);
+        let fresh: Vec<u32> = all.iter().copied().filter(|e| !route.contains(&(*e as i32))).collect();
+        route.extend(pick_distinct(rng, &fresh, SLAB_TOP_K - keep).into_iter().map(|e| e as i32));
+        rng.shuffle(&mut route);
+        out.extend(route);
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------------------
 // Device IO and the two paths
 // ---------------------------------------------------------------------------------------
+
+/// The candidate under test: K1-C1 at one lane, K1-Cn at 2..=8.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cand {
+    C1,
+    Cn,
+}
+impl Cand {
+    fn for_lanes(lanes: usize) -> Cand {
+        if lanes == 1 {
+            Cand::C1
+        } else {
+            Cand::Cn
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Cand::C1 => "c1",
+            Cand::Cn => "cn",
+        }
+    }
+}
 
 struct Outs {
     g0: GpuTensor,
@@ -607,10 +690,14 @@ struct Io {
     xg: GpuTensor,
     xd: GpuTensor,
     k1: Outs,
-    c1: Outs,
+    cand: Outs,
 }
-const GATE_Y_ALLOC: usize = GATE_Y_WORDS + GATE_Y_ROW;
-const DOWN_Y_ALLOC: usize = DOWN_Y_WORDS + DOWN_Y_ROW;
+const MAX_SLOTS: usize = SLAB_TOP_K * SLAB_NARROW_MAX_LANES;
+/// Output allocations: the maximum-lane extent plus one slot row of sentinel tail.
+const GATE_Y_ALLOC: usize = (MAX_SLOTS + 1) * GATE_Y_ROW;
+const DOWN_Y_ALLOC: usize = (MAX_SLOTS + 1) * DOWN_Y_ROW;
+const GATE_X_ALLOC: usize = SLAB_NARROW_MAX_LANES * SLAB_GATE_UP_K;
+const DOWN_X_ALLOC: usize = MAX_SLOTS * SLAB_DOWN_K;
 
 fn alloc_outs(gpu: &mut Gpu) -> Result<Outs> {
     Ok(Outs {
@@ -621,21 +708,33 @@ fn alloc_outs(gpu: &mut Gpu) -> Result<Outs> {
 }
 fn alloc_io(gpu: &mut Gpu) -> Result<Io> {
     Ok(Io {
-        topk: gpu.alloc_tensor(&[SLAB_TOP_K * 4], DType::Raw).map_err(err)?,
-        xg: alloc_f32(gpu, SLAB_GATE_UP_K)?,
-        xd: alloc_f32(gpu, SLAB_TOP_K * SLAB_DOWN_K)?,
+        topk: gpu.alloc_tensor(&[MAX_SLOTS * 4], DType::Raw).map_err(err)?,
+        xg: alloc_f32(gpu, GATE_X_ALLOC)?,
+        xd: alloc_f32(gpu, DOWN_X_ALLOC)?,
         k1: alloc_outs(gpu)?,
-        c1: alloc_outs(gpu)?,
+        cand: alloc_outs(gpu)?,
     })
 }
 fn free_io(gpu: &mut Gpu, io: Io) -> Result<()> {
-    for t in [io.topk, io.xg, io.xd, io.k1.g0, io.k1.g1, io.k1.d0, io.c1.g0, io.c1.g1, io.c1.d0] {
+    for t in [io.topk, io.xg, io.xd, io.k1.g0, io.k1.g1, io.k1.d0, io.cand.g0, io.cand.g1, io.cand.d0] {
         gpu.free_tensor(t).map_err(err)?;
     }
     Ok(())
 }
 fn topk_bytes(topk: &[i32]) -> Vec<u8> {
     topk.iter().flat_map(|e| e.to_le_bytes()).collect()
+}
+/// F32 bytes of `v` zero-padded to `words` words.
+fn padded_f32_bytes(v: &[f32], words: usize) -> Vec<u8> {
+    assert!(v.len() <= words);
+    let mut b = f32_bytes(v);
+    b.resize(words * 4, 0);
+    b
+}
+/// Upload `xs` into the max-size X buffers (the rows past the lanes in use are zero).
+fn upload_xs(gpu: &Gpu, io: &Io, xs: &Xs) -> Result<()> {
+    gpu.hip.memcpy_htod(&io.xg.buf, &padded_f32_bytes(&xs.gate, GATE_X_ALLOC)).map_err(err)?;
+    gpu.hip.memcpy_htod(&io.xd.buf, &padded_f32_bytes(&xs.down, DOWN_X_ALLOC)).map_err(err)
 }
 fn sentinel_fill(gpu: &Gpu, t: &GpuTensor, words: usize) -> Result<()> {
     let host = vec![SENTINEL_BITS; words];
@@ -673,14 +772,18 @@ impl Mode {
     }
 }
 
-fn k1_plan(gpu: &mut Gpu, l: &Layer, mode: Mode, topk: &GpuTensor) -> Result<()> {
-    gpu.qwen4_slab_union_plan(topk, mode.buckets(l), 1).map_err(err)
+fn k1_plan(gpu: &mut Gpu, l: &Layer, mode: Mode, topk: &GpuTensor, lanes: usize) -> Result<()> {
+    gpu.qwen4_slab_union_plan(topk, mode.buckets(l), lanes).map_err(err)
 }
-fn k1_gate(gpu: &mut Gpu, l: &Layer, mode: Mode, xg: &GpuTensor, o: &Outs) -> Result<()> {
-    gpu.mq_i4_moe_gemv_slab(false, mode.buckets(l), &l.gate_ptrs, xg, &o.g0, Some(&o.g1), 1, COLD_W3).map_err(err)
+/// Gate/up through one forced K1-family module over the plan already run for `lanes`.
+fn slab_gate(gpu: &mut Gpu, l: &Layer, mode: Mode, xg: &GpuTensor, o: &Outs, lanes: usize, m: SlabK1Module) -> Result<()> {
+    gpu.mq_i4_moe_gemv_slab_with(false, mode.buckets(l), &l.gate_ptrs, xg, &o.g0, Some(&o.g1), lanes, COLD_W3, Some(m))
+        .map_err(err)
 }
-fn k1_down(gpu: &mut Gpu, l: &Layer, mode: Mode, xd: &GpuTensor, o: &Outs) -> Result<()> {
-    gpu.mq_i4_moe_gemv_slab(true, mode.buckets(l), &l.down_ptrs, xd, &o.d0, None, 1, COLD_W3).map_err(err)
+/// Down through one forced K1-family module over the plan already run for `lanes`.
+fn slab_down(gpu: &mut Gpu, l: &Layer, mode: Mode, xd: &GpuTensor, o: &Outs, lanes: usize, m: SlabK1Module) -> Result<()> {
+    gpu.mq_i4_moe_gemv_slab_with(true, mode.buckets(l), &l.down_ptrs, xd, &o.d0, None, lanes, COLD_W3, Some(m))
+        .map_err(err)
 }
 fn c1_gate(gpu: &mut Gpu, l: &Layer, mode: Mode, topk: &GpuTensor, xg: &GpuTensor, o: &Outs) -> Result<()> {
     gpu.mq_i4_moe_gemv_slab_c1(false, mode.buckets(l), &l.gate_ptrs, topk, xg, &o.g0, Some(&o.g1), COLD_W3)
@@ -700,17 +803,17 @@ struct Diff {
     mismatches: u64,
     first: Vec<Value>,
     k1_unwritten: u64,
-    c1_unwritten: u64,
+    cand_unwritten: u64,
     k1_tail_bad: u64,
-    c1_tail_bad: u64,
+    cand_tail_bad: u64,
 }
 impl Diff {
     fn clean(&self) -> bool {
         self.mismatches == 0
             && self.k1_unwritten == 0
-            && self.c1_unwritten == 0
+            && self.cand_unwritten == 0
             && self.k1_tail_bad == 0
-            && self.c1_tail_bad == 0
+            && self.cand_tail_bad == 0
     }
     fn merge(&mut self, o: Diff) {
         self.words += o.words;
@@ -721,57 +824,73 @@ impl Diff {
             }
         }
         self.k1_unwritten += o.k1_unwritten;
-        self.c1_unwritten += o.c1_unwritten;
+        self.cand_unwritten += o.cand_unwritten;
         self.k1_tail_bad += o.k1_tail_bad;
-        self.c1_tail_bad += o.c1_tail_bad;
+        self.cand_tail_bad += o.cand_tail_bad;
     }
 }
 
-/// Compare two oversize outputs; `extent` words are the written region, `row` the row length of a slot.
-fn compare_part(part: &str, k1: &[u32], c1: &[u32], extent: usize, row: usize, draw: usize, topk: &[i32]) -> Diff {
-    let mut d = Diff { words: k1.len().max(c1.len()) as u64, ..Diff::default() };
-    assert_eq!(k1.len(), c1.len());
-    for (i, (&a, &b)) in k1.iter().zip(c1).enumerate() {
+/// Compare two oversize outputs; the first `extent` words are the written region (`row` words per slot),
+/// everything after it must still be the sentinel.
+fn compare_part(part: &str, k1: &[u32], cand: &[u32], extent: usize, row: usize, draw: usize, topk: &[i32]) -> Diff {
+    let mut d = Diff { words: k1.len().max(cand.len()) as u64, ..Diff::default() };
+    assert_eq!(k1.len(), cand.len());
+    for (i, (&a, &b)) in k1.iter().zip(cand).enumerate() {
         if a != b {
             d.mismatches += 1;
             if d.first.len() < 8 {
-                d.first.push(json!({"draw": draw, "part": part, "word_index": i, "slot": i / row, "row": i % row,
-                    "k1_bits": bits_hex(a), "c1_bits": bits_hex(b), "topk": topk}));
+                d.first.push(json!({"draw": draw, "part": part, "word_index": i, "slot": i / row,
+                    "lane": i / row / SLAB_TOP_K, "row": i % row,
+                    "k1_bits": bits_hex(a), "cand_bits": bits_hex(b), "topk": topk}));
             }
         }
         if i < extent {
             d.k1_unwritten += (a == SENTINEL_BITS) as u64;
-            d.c1_unwritten += (b == SENTINEL_BITS) as u64;
+            d.cand_unwritten += (b == SENTINEL_BITS) as u64;
         } else {
             d.k1_tail_bad += (a != SENTINEL_BITS) as u64;
-            d.c1_tail_bad += (b != SENTINEL_BITS) as u64;
+            d.cand_tail_bad += (b != SENTINEL_BITS) as u64;
         }
     }
     d
 }
 
-/// One draw through both paths on `io`, compared bitwise.
-fn g1_draw(gpu: &mut Gpu, l: &Layer, mode: Mode, io: &Io, topk: &[i32], xs: &Xs, draw: usize) -> Result<Diff> {
+/// One draw (`topk` = `[lanes * 10]` routed ids) through K1 and the candidate of `lanes` on `io`, compared
+/// bitwise. The union plan runs ONCE; K1 gate/up and down are forced K1, the candidate is C1 (`lanes == 1`,
+/// no plan) or forced Cn (`lanes >= 2`) over the same plan.
+#[allow(clippy::too_many_arguments)]
+fn g1_draw(gpu: &mut Gpu, l: &Layer, mode: Mode, io: &Io, topk: &[i32], lanes: usize, xs: &Xs, draw: usize) -> Result<Diff> {
+    if topk.len() != lanes * SLAB_TOP_K {
+        return Err(format!("g1_draw: topk holds {} ids for {lanes} lanes", topk.len()));
+    }
     gpu.hip.memcpy_htod(&io.topk.buf, &topk_bytes(topk)).map_err(err)?;
-    gpu.hip.memcpy_htod(&io.xg.buf, &f32_bytes(&xs.gate)).map_err(err)?;
-    gpu.hip.memcpy_htod(&io.xd.buf, &f32_bytes(&xs.down)).map_err(err)?;
-    for o in [&io.k1, &io.c1] {
+    upload_xs(gpu, io, xs)?;
+    for o in [&io.k1, &io.cand] {
         sentinel_fill(gpu, &o.g0, GATE_Y_ALLOC)?;
         sentinel_fill(gpu, &o.g1, GATE_Y_ALLOC)?;
         sentinel_fill(gpu, &o.d0, DOWN_Y_ALLOC)?;
     }
     // Incumbent exactly as dispatch: one plan per layer step, then gate/up, then down.
-    k1_plan(gpu, l, mode, &io.topk)?;
-    k1_gate(gpu, l, mode, &io.xg, &io.k1)?;
-    k1_down(gpu, l, mode, &io.xd, &io.k1)?;
-    c1_gate(gpu, l, mode, &io.topk, &io.xg, &io.c1)?;
-    c1_down(gpu, l, mode, &io.topk, &io.xd, &io.c1)?;
+    k1_plan(gpu, l, mode, &io.topk, lanes)?;
+    slab_gate(gpu, l, mode, &io.xg, &io.k1, lanes, SlabK1Module::K1)?;
+    slab_down(gpu, l, mode, &io.xd, &io.k1, lanes, SlabK1Module::K1)?;
+    match Cand::for_lanes(lanes) {
+        Cand::C1 => {
+            c1_gate(gpu, l, mode, &io.topk, &io.xg, &io.cand)?;
+            c1_down(gpu, l, mode, &io.topk, &io.xd, &io.cand)?;
+        }
+        Cand::Cn => {
+            slab_gate(gpu, l, mode, &io.xg, &io.cand, lanes, SlabK1Module::Cn)?;
+            slab_down(gpu, l, mode, &io.xd, &io.cand, lanes, SlabK1Module::Cn)?;
+        }
+    }
     gpu.hip.device_synchronize().map_err(err)?;
+    let slots = lanes * SLAB_TOP_K;
     let mut diff = Diff::default();
     for (part, a, b, alloc, extent, row) in [
-        ("gate_y0", &io.k1.g0, &io.c1.g0, GATE_Y_ALLOC, GATE_Y_WORDS, GATE_Y_ROW),
-        ("gate_y1", &io.k1.g1, &io.c1.g1, GATE_Y_ALLOC, GATE_Y_WORDS, GATE_Y_ROW),
-        ("down_y0", &io.k1.d0, &io.c1.d0, DOWN_Y_ALLOC, DOWN_Y_WORDS, DOWN_Y_ROW),
+        ("gate_y0", &io.k1.g0, &io.cand.g0, GATE_Y_ALLOC, slots * GATE_Y_ROW, GATE_Y_ROW),
+        ("gate_y1", &io.k1.g1, &io.cand.g1, GATE_Y_ALLOC, slots * GATE_Y_ROW, GATE_Y_ROW),
+        ("down_y0", &io.k1.d0, &io.cand.d0, DOWN_Y_ALLOC, slots * DOWN_Y_ROW, DOWN_Y_ROW),
     ] {
         let (wa, wb) = (download_words(gpu, a, alloc)?, download_words(gpu, b, alloc)?);
         diff.merge(compare_part(part, &wa, &wb, extent, row, draw, topk));
@@ -784,6 +903,7 @@ struct CaseRow {
     origin: &'static str,
     layer: Option<usize>,
     mode: Mode,
+    lanes: usize,
     draws: usize,
     both_codecs: usize,
     diff: Diff,
@@ -795,10 +915,11 @@ impl CaseRow {
     fn json(&self) -> Value {
         let d = &self.diff;
         let mut v = json!({
-            "name": self.name, "origin": self.origin, "buckets": self.mode.label(), "draws": self.draws,
+            "name": self.name, "origin": self.origin, "buckets": self.mode.label(), "lanes": self.lanes,
+            "candidate": Cand::for_lanes(self.lanes).name(), "draws": self.draws,
             "words_compared": d.words, "mismatch_count": d.mismatches, "first_mismatches": d.first,
-            "k1_unwritten_words": d.k1_unwritten, "c1_unwritten_words": d.c1_unwritten,
-            "k1_tail_disturbed_words": d.k1_tail_bad, "c1_tail_disturbed_words": d.c1_tail_bad,
+            "k1_unwritten_words": d.k1_unwritten, "cand_unwritten_words": d.cand_unwritten,
+            "k1_tail_disturbed_words": d.k1_tail_bad, "cand_tail_disturbed_words": d.cand_tail_bad,
             "draws_with_both_codecs": self.both_codecs, "pass": self.pass(),
         });
         if let Some(l) = self.layer {
@@ -813,6 +934,7 @@ fn both_codecs(l: &Layer, topk: &[i32]) -> bool {
     w3 > 0 && w3 < topk.len()
 }
 
+/// One case at one lanes value: every lane-0 draw of `draws` extended to `lanes` lanes (`lane_routes`).
 #[allow(clippy::too_many_arguments)]
 fn run_case(
     gpu: &mut Gpu,
@@ -824,14 +946,18 @@ fn run_case(
     layer_no: Option<usize>,
     case_idx: usize,
     draws: &[Vec<i32>],
+    lanes: usize,
 ) -> Result<CaseRow> {
-    let mut row = CaseRow { name: name.to_string(), origin, layer: layer_no, mode, draws: 0, both_codecs: 0, diff: Diff::default() };
-    let mut rng = Rng::new(name_seed(name) ^ 0x7a11);
-    for (i, topk) in draws.iter().enumerate() {
-        let xs = gen_xs(style_for(origin == "real", case_idx, i), &mut rng);
-        let diff = g1_draw(gpu, l, mode, io, topk, &xs, i)?;
+    let name = format!("{name}/lanes{lanes}");
+    let mut row = CaseRow { name: name.clone(), origin, layer: layer_no, mode, lanes, draws: 0, both_codecs: 0, diff: Diff::default() };
+    let mut rng = Rng::new(name_seed(&name) ^ 0x7a11);
+    let mapped = l.ids_of(None);
+    for (i, base) in draws.iter().enumerate() {
+        let topk = lane_routes(&mut rng, &mapped, base, lanes, i);
+        let xs = gen_xs(style_for(origin == "real", case_idx, i), lanes, &mut rng);
+        let diff = g1_draw(gpu, l, mode, io, &topk, lanes, &xs, i)?;
         row.draws += 1;
-        row.both_codecs += both_codecs(l, topk) as usize;
+        row.both_codecs += both_codecs(l, &topk) as usize;
         row.diff.merge(diff);
     }
     Ok(row)
@@ -890,48 +1016,72 @@ fn synth_host_layer(name: &str) -> (HostLayer, Vec<Mode>) {
 // Timing
 // ---------------------------------------------------------------------------------------
 
+/// One timed launch sequence. `K1*` are the incumbent (plan + forced K1 buckets); `Cand{Gate,Down,GateDown}` are
+/// C1 (`lanes == 1`, no plan); `Cand{PlanGate,PlanGateDown}` are plan + forced Cn (`lanes >= 2`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Seq {
     K1Plan,
     K1PlanGate,
     K1PlanGateDown,
-    C1Gate,
-    C1Down,
-    C1GateDown,
+    CandGate,
+    CandDown,
+    CandGateDown,
+    CandPlanGate,
+    CandPlanGateDown,
 }
-const SEQS: [Seq; 6] =
-    [Seq::K1Plan, Seq::K1PlanGate, Seq::K1PlanGateDown, Seq::C1Gate, Seq::C1Down, Seq::C1GateDown];
+fn seqs_for(lanes: usize) -> Vec<Seq> {
+    let mut v = vec![Seq::K1Plan, Seq::K1PlanGate, Seq::K1PlanGateDown];
+    if lanes == 1 {
+        v.extend([Seq::CandGate, Seq::CandDown, Seq::CandGateDown]);
+    } else {
+        v.extend([Seq::CandPlanGate, Seq::CandPlanGateDown]);
+    }
+    v
+}
 impl Seq {
-    fn name(self) -> &'static str {
+    fn name(self, cand: Cand) -> String {
+        let c = cand.name();
         match self {
-            Seq::K1Plan => "k1_plan",
-            Seq::K1PlanGate => "k1_plan_gate",
-            Seq::K1PlanGateDown => "k1_plan_gate_down",
-            Seq::C1Gate => "c1_gate",
-            Seq::C1Down => "c1_down",
-            Seq::C1GateDown => "c1_gate_down",
+            Seq::K1Plan => "k1_plan".into(),
+            Seq::K1PlanGate => "k1_plan_gate".into(),
+            Seq::K1PlanGateDown => "k1_plan_gate_down".into(),
+            Seq::CandGate => format!("{c}_gate"),
+            Seq::CandDown => format!("{c}_down"),
+            Seq::CandGateDown => format!("{c}_gate_down"),
+            Seq::CandPlanGate => format!("{c}_plan_gate"),
+            Seq::CandPlanGateDown => format!("{c}_plan_gate_down"),
         }
     }
 }
 
-fn launch_seq(gpu: &mut Gpu, s: Seq, l: &Layer, topk: &GpuTensor, io: &Io) -> Result<()> {
+fn launch_seq(gpu: &mut Gpu, s: Seq, l: &Layer, topk: &GpuTensor, io: &Io, lanes: usize) -> Result<()> {
     let mode = Mode::Table;
+    let (k1, cn) = (SlabK1Module::K1, SlabK1Module::Cn);
     match s {
-        Seq::K1Plan => k1_plan(gpu, l, mode, topk),
+        Seq::K1Plan => k1_plan(gpu, l, mode, topk, lanes),
         Seq::K1PlanGate => {
-            k1_plan(gpu, l, mode, topk)?;
-            k1_gate(gpu, l, mode, &io.xg, &io.k1)
+            k1_plan(gpu, l, mode, topk, lanes)?;
+            slab_gate(gpu, l, mode, &io.xg, &io.k1, lanes, k1)
         }
         Seq::K1PlanGateDown => {
-            k1_plan(gpu, l, mode, topk)?;
-            k1_gate(gpu, l, mode, &io.xg, &io.k1)?;
-            k1_down(gpu, l, mode, &io.xd, &io.k1)
+            k1_plan(gpu, l, mode, topk, lanes)?;
+            slab_gate(gpu, l, mode, &io.xg, &io.k1, lanes, k1)?;
+            slab_down(gpu, l, mode, &io.xd, &io.k1, lanes, k1)
         }
-        Seq::C1Gate => c1_gate(gpu, l, mode, topk, &io.xg, &io.c1),
-        Seq::C1Down => c1_down(gpu, l, mode, topk, &io.xd, &io.c1),
-        Seq::C1GateDown => {
-            c1_gate(gpu, l, mode, topk, &io.xg, &io.c1)?;
-            c1_down(gpu, l, mode, topk, &io.xd, &io.c1)
+        Seq::CandGate => c1_gate(gpu, l, mode, topk, &io.xg, &io.cand),
+        Seq::CandDown => c1_down(gpu, l, mode, topk, &io.xd, &io.cand),
+        Seq::CandGateDown => {
+            c1_gate(gpu, l, mode, topk, &io.xg, &io.cand)?;
+            c1_down(gpu, l, mode, topk, &io.xd, &io.cand)
+        }
+        Seq::CandPlanGate => {
+            k1_plan(gpu, l, mode, topk, lanes)?;
+            slab_gate(gpu, l, mode, &io.xg, &io.cand, lanes, cn)
+        }
+        Seq::CandPlanGateDown => {
+            k1_plan(gpu, l, mode, topk, lanes)?;
+            slab_gate(gpu, l, mode, &io.xg, &io.cand, lanes, cn)?;
+            slab_down(gpu, l, mode, &io.xd, &io.cand, lanes, cn)
         }
     }
 }
@@ -942,9 +1092,10 @@ struct Draw {
     dev: GpuTensor,
 }
 
-/// `(gate_bytes, down_bytes)` of the 10 routed experts of `topk`.
+/// `(gate_bytes, down_bytes)` of the DISTINCT routed experts of `topk` (an expert repeated across lanes counts once).
 fn route_bytes(l: &Layer, topk: &[i32]) -> (u64, u64) {
-    topk.iter().fold((0, 0), |(g, d), &e| (g + l.gate_bytes(e) as u64, d + l.down_bytes(e) as u64))
+    let distinct: BTreeSet<i32> = topk.iter().copied().collect();
+    distinct.iter().fold((0, 0), |(g, d), &e| (g + l.gate_bytes(e) as u64, d + l.down_bytes(e) as u64))
 }
 
 /// Unique `(layer, expert)` weight bytes (gate + down) touched by `draws[start .. start + n)` (cyclic).
@@ -969,19 +1120,22 @@ struct TimingCfg {
     launches: usize,
 }
 
-fn timing_run(gpu: &mut Gpu, layers: &[Layer], draws: &[Draw], io: &Io, t: &TimingCfg) -> Result<Value> {
+/// Time the sequences of one `lanes` value over `draws` (routes of `lanes` lanes): the per-lanes JSON entry.
+fn timing_run(gpu: &mut Gpu, layers: &[Layer], draws: &[Draw], io: &Io, t: &TimingCfg, lanes: usize) -> Result<Value> {
+    let cand = Cand::for_lanes(lanes);
+    let seqs = seqs_for(lanes);
     let start = gpu.hip.event_create().map_err(err)?;
     let stop = gpu.hip.event_create().map_err(err)?;
-    let mut samples: Vec<Vec<f64>> = vec![Vec::new(); SEQS.len()];
+    let mut samples: Vec<Vec<f64>> = vec![Vec::new(); seqs.len()];
     for rep in 0..t.warmup + t.reps {
         let cursor = rep * t.launches;
-        for k in 0..SEQS.len() {
-            let si = (k + rep) % SEQS.len();
-            let seq = SEQS[si];
+        for k in 0..seqs.len() {
+            let si = (k + rep) % seqs.len();
+            let seq = seqs[si];
             gpu.hip.event_record(&start, gpu.active_stream.as_ref()).map_err(err)?;
             for i in 0..t.launches {
                 let d = &draws[(cursor + i) % draws.len()];
-                launch_seq(gpu, seq, &layers[d.layer], &d.dev, io)?;
+                launch_seq(gpu, seq, &layers[d.layer], &d.dev, io, lanes)?;
             }
             gpu.hip.event_record(&stop, gpu.active_stream.as_ref()).map_err(err)?;
             gpu.hip.event_synchronize(&stop).map_err(err)?;
@@ -994,11 +1148,18 @@ fn timing_run(gpu: &mut Gpu, layers: &[Layer], draws: &[Draw], io: &Io, t: &Timi
     let _ = gpu.hip.event_destroy(start);
     let _ = gpu.hip.event_destroy(stop);
 
-    let med = |s: Seq| median(&samples[SEQS.iter().position(|&x| x == s).unwrap()]);
+    let med = |s: Seq| median(&samples[seqs.iter().position(|&x| x == s).unwrap()]);
     let (plan, pg, pgd) = (med(Seq::K1Plan), med(Seq::K1PlanGate), med(Seq::K1PlanGateDown));
-    let (cg, cd, cgd) = (med(Seq::C1Gate), med(Seq::C1Down), med(Seq::C1GateDown));
-    let inc_gate = pg;
-    let inc_down = pgd - pg;
+    // Candidate gate/up, down and gate+down: C1 measures the projections directly, Cn derives down from
+    // the plan-inclusive sequences exactly as K1's down is derived.
+    let (cand_gate, cand_down, cand_total) = if lanes == 1 {
+        (med(Seq::CandGate), med(Seq::CandDown), med(Seq::CandGateDown))
+    } else {
+        let (cpg, cpgd) = (med(Seq::CandPlanGate), med(Seq::CandPlanGateDown));
+        (cpg, cpgd - cpg, cpgd)
+    };
+    let k1_gate = pg;
+    let k1_down = pgd - pg;
     let (mut gate_b, mut down_b) = (0u64, 0u64);
     for d in draws {
         let (g, dn) = route_bytes(&layers[d.layer], &d.host);
@@ -1012,31 +1173,39 @@ fn timing_run(gpu: &mut Gpu, layers: &[Layer], draws: &[Draw], io: &Io, t: &Timi
         .min()
         .unwrap_or(0);
     let pool_unique = window_unique_bytes(layers, draws, 0, draws.len());
-    let proj = |bytes: f64, inc_us: f64, c1_us: f64| {
-        json!({"unique_bytes_mean": bytes, "k1_us": inc_us, "c1_us": c1_us,
-            "k1_gbps": gbps(bytes, inc_us), "c1_gbps": gbps(bytes, c1_us), "c1_speedup": inc_us / c1_us})
+    let proj = |bytes: f64, k1_us: f64, cand_us: f64| {
+        json!({"unique_bytes_mean": bytes, "k1_us": k1_us, "cand_us": cand_us,
+            "k1_gbps": gbps(bytes, k1_us), "cand_gbps": gbps(bytes, cand_us), "cand_speedup": k1_us / cand_us})
     };
+    let names: Vec<String> = seqs.iter().map(|s| s.name(cand)).collect();
     let raw: serde_json::Map<String, Value> =
-        SEQS.iter().enumerate().map(|(i, s)| (s.name().to_string(), json!(samples[i]))).collect();
+        names.iter().zip(&samples).map(|(n, s)| (n.clone(), json!(s))).collect();
+    let medians: serde_json::Map<String, Value> =
+        names.iter().zip(&samples).map(|(n, s)| (n.clone(), json!(median(s)))).collect();
+    let cand_down_is = if lanes == 1 {
+        format!("median({}_down) (a standalone launch)", cand.name())
+    } else {
+        format!("median({0}_plan_gate_down) - median({0}_plan_gate) (derived; the union plan is shared)", cand.name())
+    };
     Ok(json!({
-        "event_timing": "hipEventElapsedTime over `launches_per_sample` back-to-back launches of consecutive draws, us per launch",
-        "layers": layers.iter().map(|l| l.name.clone()).collect::<Vec<_>>(),
-        "draws": draws.len(), "reps": t.reps, "warmup": t.warmup, "launches_per_sample": t.launches,
+        "lanes": lanes, "candidate": cand.name(),
+        "draws": draws.len(),
         "draws_per_sample": t.launches.min(draws.len()),
         "pool_unique_weight_bytes": pool_unique,
         "min_sample_unique_weight_bytes": window_min,
-        "mall_bytes": MALL_BYTES,
         "sample_working_set_exceeds_mall": window_min > MALL_BYTES,
-        "median_us": {"k1_plan": plan, "k1_plan_gate": pg, "k1_plan_gate_down": pgd,
-            "c1_gate": cg, "c1_down": cd, "c1_gate_down": cgd},
+        "plan_us": plan,
+        "median_us": Value::Object(medians),
         "projections": {
-            "gate_up": proj(gate_mean, inc_gate, cg),
-            "down": proj(down_mean, inc_down, cd),
+            "gate_up": proj(gate_mean, k1_gate, cand_gate),
+            "down": proj(down_mean, k1_down, cand_down),
             "k1_down_is": "median(k1_plan_gate_down) - median(k1_plan_gate) (derived; the union plan is shared)",
+            "cand_down_is": cand_down_is,
+            "gate_up_includes_plan": "k1 always; the candidate only at lanes >= 2 (it shares the union plan)",
         },
-        "gate_down_total": {"k1_us": pgd, "c1_us": cgd, "c1_speedup": pgd / cgd,
+        "gate_down_total": {"k1_us": pgd, "cand_us": cand_total, "cand_speedup": pgd / cand_total,
             "unique_bytes_mean": gate_mean + down_mean,
-            "k1_gbps": gbps(gate_mean + down_mean, pgd), "c1_gbps": gbps(gate_mean + down_mean, cgd)},
+            "k1_gbps": gbps(gate_mean + down_mean, pgd), "cand_gbps": gbps(gate_mean + down_mean, cand_total)},
         "samples_us": Value::Object(raw),
     }))
 }
@@ -1058,6 +1227,7 @@ struct Cfg {
     reps: usize,
     warmup: usize,
     launches: usize,
+    lanes: Vec<usize>,
     device: Option<i32>,
     expect_arch: String,
     expect_uuid: Option<String>,
@@ -1069,9 +1239,9 @@ struct Cfg {
 }
 
 const USAGE: &str = "usage: mq_i4_moe_gemv_c1_oracle [--artifact SLAB.mq3-xts --layers L,L,..] [--draws N(>=64)] \
-[--hot-frac F] [--seed N] [--skip-synthetic] [--only SUBSTR]... [--timing --reps N(>=20) --warmup N(>=3) \
---launches N(>=64)] [--device N] [--expect-arch A] [--expect-uuid U] [--expect-bdf B] [--card NAME] \
-[--fabric-owner OWNER] [--fabric-wrapper PATH] [--fabric-card NAME]";
+[--hot-frac F] [--lanes L,L,..(1..=8, default 1,2,3,4,5,8)] [--seed N] [--skip-synthetic] [--only SUBSTR]... \
+[--timing --reps N(>=20) --warmup N(>=3) --launches N(>=64)] [--device N] [--expect-arch A] [--expect-uuid U] \
+[--expect-bdf B] [--card NAME] [--fabric-owner OWNER] [--fabric-wrapper PATH] [--fabric-card NAME]";
 
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
@@ -1090,6 +1260,7 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
         reps: 30,
         warmup: 5,
         launches: 64,
+        lanes: DEFAULT_LANES.to_vec(),
         device: None,
         expect_arch: DEFAULT_ARCH.into(),
         expect_uuid: None,
@@ -1132,6 +1303,21 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
             "--reps" => cfg.reps = num(value(&mut i)?)?,
             "--warmup" => cfg.warmup = num(value(&mut i)?)?,
             "--launches" => cfg.launches = num(value(&mut i)?)?,
+            "--lanes" => {
+                let v = value(&mut i)?;
+                let lanes = v
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.trim().parse::<usize>().map_err(|e| format!("--lanes {s}: {e}")))
+                    .collect::<Result<Vec<_>>>()?;
+                if lanes.is_empty() || lanes.iter().any(|&l| !(1..=SLAB_NARROW_MAX_LANES).contains(&l)) {
+                    return Err(format!("--lanes takes values in 1..={SLAB_NARROW_MAX_LANES}\n{USAGE}"));
+                }
+                if lanes.iter().enumerate().any(|(i, l)| lanes[..i].contains(l)) {
+                    return Err("--lanes must not repeat a value".into());
+                }
+                cfg.lanes = lanes;
+            }
             "--device" => cfg.device = Some(num(value(&mut i)?)? as i32),
             "--expect-arch" => cfg.expect_arch = value(&mut i)?,
             "--expect-uuid" => cfg.expect_uuid = Some(value(&mut i)?),
@@ -1194,11 +1380,13 @@ fn run() -> Result<(Value, bool)> {
         "k1": module_json(K1_MODULE, &MQ_I4_MOE_GEMV_SYMBOLS.iter().flatten().copied().collect::<Vec<_>>(),
             kernels::MQ_I4_MOE_GEMV_PM_GFX1151),
         "c1": module_json(C1_MODULE, &MQ_I4_MOE_GEMV_C1_SYMBOLS, kernels::MQ_I4_MOE_GEMV_C1_PM_GFX1151),
+        "cn": module_json(CN_MODULE, &MQ_I4_MOE_GEMV_CN_SYMBOLS.iter().flatten().copied().collect::<Vec<_>>(),
+            kernels::MQ_I4_MOE_GEMV_CN_PM_GFX1151),
     });
     if !identity_match || gpu.arch != DEFAULT_ARCH {
         return Ok((
             json!({"schema": SCHEMA, "command": command, "device": device, "modules": modules,
-                "error": "K1-C1 oracle device identity mismatch (gfx1151 only)", "byte_exact": false, "pass": false, "rc": 1}),
+                "error": "K1-C1/Cn oracle device identity mismatch (gfx1151 only)", "byte_exact": false, "pass": false, "rc": 1}),
             false,
         ));
     }
@@ -1223,7 +1411,9 @@ fn run() -> Result<(Value, bool)> {
                 let multi = modes.len() > 1;
                 for mode in modes {
                     let label = if multi { format!("{name}/{}", mode.label()) } else { name.to_string() };
-                    rows.push(run_case(&mut gpu, &io, &layer, mode, &label, "synthetic", None, ci, &draws)?);
+                    for &lanes in &cfg.lanes {
+                        rows.push(run_case(&mut gpu, &io, &layer, mode, &label, "synthetic", None, ci, &draws, lanes)?);
+                    }
                 }
                 free_layer(&mut gpu, layer)?;
             }
@@ -1250,9 +1440,11 @@ fn run() -> Result<(Value, bool)> {
                     modes.push(Mode::Uniform(Codec::W3.k1_bucket()));
                 }
                 for mode in modes {
-                    eprintln!("[g1] {name} {} ({} draws)", mode.label(), draws.len());
+                    eprintln!("[g1] {name} {} ({} draws x lanes {:?})", mode.label(), draws.len(), cfg.lanes);
                     let label = if mode == Mode::Table { name.clone() } else { format!("{name}/{}", mode.label()) };
-                    rows.push(run_case(&mut gpu, &io, &layer, mode, &label, "real", Some(ln), 0, &draws)?);
+                    for &lanes in &cfg.lanes {
+                        rows.push(run_case(&mut gpu, &io, &layer, mode, &label, "real", Some(ln), 0, &draws, lanes)?);
+                    }
                 }
                 free_layer(&mut gpu, layer)?;
             }
@@ -1278,50 +1470,67 @@ fn run() -> Result<(Value, bool)> {
             let mut rng = Rng::new(mix64(cfg.layers[li] as u64) ^ cfg.seed ^ 0x71a1);
             per.push(gen_draws(&mut rng, l, per_layer, hot_frac, false));
         }
-        let mut draws: Vec<Draw> = Vec::new();
-        for d in 0..draws_n {
-            let layer = d % layers.len();
-            let host = per[layer][d / layers.len()].clone();
-            let dev = up_raw(&mut gpu, &topk_bytes(&host))?;
-            draws.push(Draw { layer, host, dev });
-        }
-        // Refuse to time a wrong kernel: G1 over the first draws, through the same tables.
-        let mut rng = Rng::new(cfg.seed ^ 0x71e0);
-        let mut verify = Diff::default();
-        let n_verify = TIMING_VERIFY_DRAWS.min(draws.len());
-        for (i, d) in draws.iter().take(n_verify).enumerate() {
-            let xs = gen_xs(style_for(true, 0, i), &mut rng);
-            let diff = g1_draw(&mut gpu, &layers[d.layer], Mode::Table, &io, &d.host, &xs, i)?;
-            verify.merge(diff);
-        }
-        rows.push(CaseRow {
-            name: "timing_precheck".into(),
-            origin: "real",
-            layer: None,
-            mode: Mode::Table,
-            draws: n_verify,
-            both_codecs: draws.iter().take(n_verify).filter(|d| both_codecs(&layers[d.layer], &d.host)).count(),
-            diff: verify,
-        });
-        if !rows[0].pass() {
-            return Err("K1-C1 is not byte-exact against K1 on the timing draws; refusing to time a wrong kernel".into());
-        }
-        // Timing inputs: one realistic X (the value path does not change the memory schedule).
-        let mut xr = Rng::new(cfg.seed ^ 0x71e1);
-        let xs = gen_xs(0, &mut xr);
-        gpu.hip.memcpy_htod(&io.xg.buf, &f32_bytes(&xs.gate)).map_err(err)?;
-        gpu.hip.memcpy_htod(&io.xd.buf, &f32_bytes(&xs.down)).map_err(err)?;
         let tcfg = TimingCfg { reps: cfg.reps, warmup: cfg.warmup, launches: cfg.launches };
-        eprintln!("[timing] {} draws over {} layers, {} reps", draws.len(), layers.len(), tcfg.reps);
-        timing = timing_run(&mut gpu, &layers, &draws, &io, &tcfg)?;
-        let card = cfg.card.clone().unwrap_or_default();
-        timing["fabric"] = json!({"class": "timing", "card": cfg.fabric_card.clone().unwrap_or(card),
-            "owner": cfg.fabric_owner, "wrapper": cfg.fabric_wrapper});
-        timing["timing_source"] = json!("device");
-        timing["verified_byte_exact_before_timing"] = json!(true);
-        for d in draws {
-            gpu.free_tensor(d.dev).map_err(err)?;
+        let mapped: Vec<Vec<u32>> = layers.iter().map(|l| l.ids_of(None)).collect();
+        let mut by_lanes: Vec<Value> = Vec::new();
+        for &lanes in &cfg.lanes {
+            let cand = Cand::for_lanes(lanes);
+            let mut route_rng = Rng::new(mix64(lanes as u64) ^ cfg.seed ^ 0x71a2);
+            let mut draws: Vec<Draw> = Vec::new();
+            for d in 0..draws_n {
+                let layer = d % layers.len();
+                let host = lane_routes(&mut route_rng, &mapped[layer], &per[layer][d / layers.len()], lanes, d);
+                let dev = up_raw(&mut gpu, &topk_bytes(&host))?;
+                draws.push(Draw { layer, host, dev });
+            }
+            // Refuse to time a wrong kernel: G1 over the first draws at this lanes value, through the same tables.
+            let mut rng = Rng::new(cfg.seed ^ 0x71e0 ^ mix64(lanes as u64));
+            let mut verify = Diff::default();
+            let n_verify = TIMING_VERIFY_DRAWS.min(draws.len());
+            for (i, d) in draws.iter().take(n_verify).enumerate() {
+                let xs = gen_xs(style_for(true, 0, i), lanes, &mut rng);
+                let diff = g1_draw(&mut gpu, &layers[d.layer], Mode::Table, &io, &d.host, lanes, &xs, i)?;
+                verify.merge(diff);
+            }
+            let precheck = CaseRow {
+                name: format!("timing_precheck/lanes{lanes}"),
+                origin: "real",
+                layer: None,
+                mode: Mode::Table,
+                lanes,
+                draws: n_verify,
+                both_codecs: draws.iter().take(n_verify).filter(|d| both_codecs(&layers[d.layer], &d.host)).count(),
+                diff: verify,
+            };
+            let ok = precheck.pass();
+            rows.push(precheck);
+            if !ok {
+                return Err(format!(
+                    "K1-{} is not byte-exact against K1 at {lanes} lanes on the timing draws; refusing to time a wrong kernel",
+                    cand.name().to_ascii_uppercase()
+                ));
+            }
+            // Timing inputs: one realistic X (the value path does not change the memory schedule).
+            let mut xr = Rng::new(cfg.seed ^ 0x71e1);
+            upload_xs(&gpu, &io, &gen_xs(0, lanes, &mut xr))?;
+            eprintln!("[timing] lanes {lanes} ({}): {} draws over {} layers, {} reps", cand.name(), draws.len(), layers.len(), tcfg.reps);
+            by_lanes.push(timing_run(&mut gpu, &layers, &draws, &io, &tcfg, lanes)?);
+            for d in draws {
+                gpu.free_tensor(d.dev).map_err(err)?;
+            }
         }
+        let card = cfg.card.clone().unwrap_or_default();
+        timing = json!({
+            "event_timing": "hipEventElapsedTime over `launches_per_sample` back-to-back launches of consecutive draws, us per launch",
+            "layers": layers.iter().map(|l| l.name.clone()).collect::<Vec<_>>(),
+            "draws": draws_n, "reps": tcfg.reps, "warmup": tcfg.warmup, "launches_per_sample": tcfg.launches,
+            "mall_bytes": MALL_BYTES,
+            "fabric": {"class": "timing", "card": cfg.fabric_card.clone().unwrap_or(card),
+                "owner": cfg.fabric_owner, "wrapper": cfg.fabric_wrapper},
+            "timing_source": "device",
+            "verified_byte_exact_before_timing": true,
+            "by_lanes": by_lanes,
+        });
         for l in layers {
             free_layer(&mut gpu, l)?;
         }
@@ -1339,7 +1548,8 @@ fn run() -> Result<(Value, bool)> {
         "modules": modules,
         "config": {"layers": cfg.layers, "draws": draws_n, "hot_frac": cfg.hot_frac, "seed": cfg.seed,
             "only": cfg.only, "skip_synthetic": cfg.skip_synthetic, "timing": cfg.timing, "reps": cfg.reps,
-            "warmup": cfg.warmup, "launches_per_sample": cfg.launches, "sentinel": bits_hex(SENTINEL_BITS)},
+            "warmup": cfg.warmup, "launches_per_sample": cfg.launches, "lanes": cfg.lanes,
+            "sentinel": bits_hex(SENTINEL_BITS)},
         "cases": rows.iter().map(CaseRow::json).collect::<Vec<_>>(),
         "case_counts": {"total": rows.len(), "synthetic": count("synthetic"), "real": count("real"),
             "draws": rows.iter().map(|r| r.draws).sum::<usize>()},
@@ -1362,7 +1572,7 @@ fn main() {
         Ok((v, pass)) => {
             println!("{v}");
             if !pass {
-                eprintln!("MQ-I4 K1-C1 oracle FAILED");
+                eprintln!("MQ-I4 K1-C1/Cn oracle FAILED");
                 std::process::exit(1);
             }
         }
@@ -1471,11 +1681,11 @@ mod tests {
         let mut e = a.clone();
         e[7] = 0;
         let d = compare_part("p", &e, &e, extent, 3, 0, &[0]);
-        assert_eq!((d.k1_tail_bad, d.c1_tail_bad), (1, 1));
+        assert_eq!((d.k1_tail_bad, d.cand_tail_bad), (1, 1));
         let mut f = a.clone();
         f[2] = SENTINEL_BITS;
         let d = compare_part("p", &f, &f, extent, 3, 0, &[0]);
-        assert_eq!((d.k1_unwritten, d.c1_unwritten), (1, 1));
+        assert_eq!((d.k1_unwritten, d.cand_unwritten), (1, 1));
         assert!(!d.clean());
     }
 
@@ -1496,5 +1706,62 @@ mod tests {
         assert!(a(&["--timing", "--artifact", "/x", "--layers", "0"]).is_ok());
         assert!(a(&["--draws", "63"]).is_err());
         assert_eq!(a(&["--artifact", "/x", "--layers", "0,1,23"]).unwrap().layers, vec![0, 1, 23]);
+    }
+
+    #[test]
+    fn lanes_flag_defaults_and_validates() {
+        let a = |s: &[&str]| parse_args(&s.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        assert_eq!(a(&[]).unwrap().lanes, vec![1, 2, 3, 4, 5, 8]);
+        assert_eq!(a(&["--lanes", "2,8,1"]).unwrap().lanes, vec![2, 8, 1]);
+        assert_eq!(a(&["--lanes", "1,2,3,4,5,6,7,8"]).unwrap().lanes.len(), 8);
+        assert!(a(&["--lanes", "0"]).is_err());
+        assert!(a(&["--lanes", "9"]).is_err());
+        assert!(a(&["--lanes", "2,2"]).is_err());
+        assert!(a(&["--lanes", ""]).is_err());
+    }
+
+    #[test]
+    fn lane_routes_are_distinct_per_lane_and_overlap_lane_zero() {
+        let all: Vec<u32> = (0..SLAB_EXPERTS as u32).collect();
+        let base: Vec<i32> = (100..100 + SLAB_TOP_K as i32).collect();
+        let mut rng = Rng::new(9);
+        for draw in 0..8 {
+            let r = lane_routes(&mut rng, &all, &base, SLAB_NARROW_MAX_LANES, draw);
+            assert_eq!(r.len(), SLAB_NARROW_MAX_LANES * SLAB_TOP_K);
+            assert_eq!(&r[..SLAB_TOP_K], &base[..]);
+            for lane in 0..SLAB_NARROW_MAX_LANES {
+                let route = &r[lane * SLAB_TOP_K..(lane + 1) * SLAB_TOP_K];
+                let set: BTreeSet<i32> = route.iter().copied().collect();
+                assert_eq!(set.len(), SLAB_TOP_K, "lane {lane} repeats an expert");
+                if lane > 0 {
+                    let shared = route.iter().filter(|e| base.contains(e)).count();
+                    assert!(shared >= lane_keep(draw, lane), "draw {draw} lane {lane}: {shared} shared");
+                }
+            }
+        }
+        // One lane is exactly the base route; draw % 4 == 1 makes every lane a permutation of it.
+        assert_eq!(lane_routes(&mut rng, &all, &base, 1, 0), base);
+        let perm = lane_routes(&mut rng, &all, &base, 4, 1);
+        for lane in 1..4 {
+            let mut v = perm[lane * SLAB_TOP_K..(lane + 1) * SLAB_TOP_K].to_vec();
+            v.sort_unstable();
+            assert_eq!(v, base);
+        }
+    }
+
+    #[test]
+    fn multi_lane_x_shapes_and_candidates() {
+        let mut rng = Rng::new(5);
+        for lanes in [1usize, 2, 8] {
+            let xs = gen_xs(0, lanes, &mut rng);
+            assert_eq!(xs.gate.len(), lanes * SLAB_GATE_UP_K);
+            assert_eq!(xs.down.len(), lanes * SLAB_TOP_K * SLAB_DOWN_K);
+        }
+        assert_eq!(Cand::for_lanes(1), Cand::C1);
+        assert!((2..=SLAB_NARROW_MAX_LANES).all(|l| Cand::for_lanes(l) == Cand::Cn));
+        assert_eq!(seqs_for(1).len(), 6);
+        assert_eq!(seqs_for(2).len(), 5);
+        assert_eq!(Seq::CandPlanGateDown.name(Cand::Cn), "cn_plan_gate_down");
+        assert_eq!(Seq::CandGate.name(Cand::C1), "c1_gate");
     }
 }

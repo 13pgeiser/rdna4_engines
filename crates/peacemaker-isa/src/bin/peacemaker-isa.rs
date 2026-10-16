@@ -733,6 +733,43 @@ fn mq_i4_moe_gemv_c1(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String>
         serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
     ))
 }
+/// gfx1151 K1-Cn multi-lane (2..8 lanes) slab decode GEMVs (`kernels::mq_i4_moe_gemv_cn`, one codec per symbol):
+/// `--epi <mq3i4|mq4sym>_<r256_gate_up|r128_down>` one entry, `all` (default) the four-entry module.
+fn mq_i4_moe_gemv_cn_specs(
+    epi: &str,
+    arch: Arch,
+) -> Result<Vec<peacemaker_isa::kernels::mq_i4_moe_gemv_cn::Spec>, String> {
+    use peacemaker_isa::kernels::mq_i4_moe_gemv_cn;
+    if arch != Arch::Gfx1151 {
+        return Err("mq_i4_moe_gemv_cn is gfx1151 only".into());
+    }
+    let all = mq_i4_moe_gemv_cn::module_specs();
+    if epi == "all" {
+        return Ok(all);
+    }
+    all.into_iter().find(|s|s.tag()==epi).map(|s|vec![s]).ok_or_else(||format!("mq_i4_moe_gemv_cn --epi {epi} (mq3i4_r256_gate_up|mq3i4_r128_down|mq4sym_r256_gate_up|mq4sym_r128_down|all)"))
+}
+fn mq_i4_moe_gemv_cn(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
+    use peacemaker_isa::kernels::mq_i4_moe_gemv_cn;
+    if arch != Arch::Gfx1151 {
+        return Err("mq_i4_moe_gemv_cn is gfx1151 only".into());
+    }
+    if epi == "all" {
+        let (_, text, proof) = mq_i4_moe_gemv_cn::emit_module()?;
+        return Ok((
+            text,
+            serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+        ));
+    }
+    let [spec] = mq_i4_moe_gemv_cn_specs(epi, arch)?[..] else {
+        return Err("mq_i4_moe_gemv_cn: one entry expected".into());
+    };
+    let e = mq_i4_moe_gemv_cn::emit(spec)?;
+    Ok((
+        e.s_text,
+        serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
+    ))
+}
 /// gfx1201 pointer-addressed E8P-I4 F4 read-once C1-C8 lane-union decode GEMVs (`kernels::e8p_i4_moe_gemv`):
 /// `--epi <r256_gate_up|r128_down>` one entry, `all` (default) the two-entry module.
 fn e8p_i4_moe_gemv_specs(
@@ -1213,6 +1250,7 @@ fn run() -> Result<(), String> {
         "mq_i4_moe_gemv" => mq_i4_moe_gemv(epi.as_deref().unwrap_or("all"), arch)?,
         "e8p_i4_moe_gemv" => e8p_i4_moe_gemv(epi.as_deref().unwrap_or("all"), arch)?,
         "mq_i4_moe_gemv_c1" => mq_i4_moe_gemv_c1(epi.as_deref().unwrap_or("all"), arch)?,
+        "mq_i4_moe_gemv_cn" => mq_i4_moe_gemv_cn(epi.as_deref().unwrap_or("all"), arch)?,
         "qwen4_shared_gu_gfx11" => qwen4_shared_gu_gfx11(epi.as_deref().unwrap_or("all"), arch)?,
         "mtp_dense_det_gfx11" => mtp_dense_det_gfx11(epi.as_deref().unwrap_or("all"), arch)?,
         "mtp_q8_det_gfx11" => mtp_q8_det_gfx11(epi.as_deref().unwrap_or("all"), arch)?,
@@ -1232,7 +1270,8 @@ fn run() -> Result<(), String> {
     let mqi4 = kernel == "mq_i4_rows"
         || kernel == "mq_i4_moe_gemv"
         || kernel == "e8p_i4_moe_gemv"
-        || kernel == "mq_i4_moe_gemv_c1";
+        || kernel == "mq_i4_moe_gemv_c1"
+        || kernel == "mq_i4_moe_gemv_cn";
     let mqia4 = kernel == "mq_i4_a4";
     let lane_rows =
         kernel == "qwen4_lane_rows" || kernel == "npu_trunk" || kernel == "npu_trunk_arena";
@@ -1668,6 +1707,39 @@ fn run() -> Result<(), String> {
                     &file,
                     serde_json::to_vec_pretty(
                         &peacemaker_isa::kernels::mq_i4_moe_gemv_c1::contract(spec, &e),
+                    )
+                    .map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| format!("{file}: {e}"))?;
+            }
+            receipts.insert(symbol, m7);
+        }
+        let receipts = serde_json::to_vec_pretty(&receipts).map_err(|e| e.to_string())?;
+        println!("{}", String::from_utf8_lossy(&receipts));
+        if let Some(file) = &m7 {
+            fs::write(file, &receipts).map_err(|e| format!("{file}: {e}"))?
+        }
+    }
+    // mq_i4_moe_gemv_cn: M7 on the linked object's four exports, plus their shape contracts (--shape DIR).
+    #[cfg(feature = "toolchain")]
+    if kernel == "mq_i4_moe_gemv_cn" && co.is_some() {
+        let path = co.as_deref().ok_or("missing --co")?;
+        let mut receipts = serde_json::Map::new();
+        for spec in mq_i4_moe_gemv_cn_specs(epi.as_deref().unwrap_or("all"), arch)? {
+            let symbol = spec.symbol();
+            let m7 =
+                peacemaker_isa::pm_check::m7(std::path::Path::new(path), arch.name(), &symbol)?;
+            if let Some(dir) = &shape {
+                let e = peacemaker_isa::kernels::mq_i4_moe_gemv_cn::emit(spec)?;
+                let file = format!(
+                    "{dir}/mq_i4_moe_gemv_cn.{}.{}.contract.json",
+                    arch.name(),
+                    spec.tag()
+                );
+                fs::write(
+                    &file,
+                    serde_json::to_vec_pretty(
+                        &peacemaker_isa::kernels::mq_i4_moe_gemv_cn::contract(spec, &e),
                     )
                     .map_err(|e| e.to_string())?,
                 )
