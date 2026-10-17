@@ -98,6 +98,8 @@ jobs:
         # Moved from peacemaker-isa: compares the builder device-accept kernel
         # with the rdna-compute host twin on the CPU interpreter.
         run: cargo test --locked -p rdna-compute --test dflash_accept_emu
+      - name: Run MoE launcher ABI test (no GPU)
+        run: cargo test --locked -p rdna-compute --test all_launcher_abi
       - name: Run serve fault-injection tests
         run: cargo test --locked -p hipfire-generate --features serve-fault-inject --test serve_fault_inject_tests
 
