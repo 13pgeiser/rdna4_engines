@@ -818,7 +818,7 @@ class EndToEndTests(TempCase):
         fx = Fixture(self.root, fake_kld=True)
         cfg = fx.config("quality", modes="q8,fp32,q8_ef", runs="2")
         cfg.dry_run = False
-        environ = {"PATH": os.environ.get("PATH", ""), "FABRIC_JOB": "1:2:halo", "HIPFIRE_LEAK": "1", "HIPFIRE_STATE_QUANT": "bogus"}
+        environ = {"PATH": os.environ.get("PATH", ""), "FABRIC_JOB": "1:2:halo", "HIPFIRE_KV_MODE": "bf16", "HIPFIRE_STATE_QUANT": "bogus"}
         with contextlib.redirect_stderr(io.StringIO()):
             rc = collect.run_stage(cfg, environ)
         self.assertEqual(rc, 0)
@@ -832,7 +832,7 @@ class EndToEndTests(TempCase):
                      "start.txt", "end.txt", "observations.json", "out.kldseq"):
             self.assertTrue((child_dir / name).is_file(), name)
         env = json.loads((child_dir / "env.json").read_text())
-        self.assertNotIn("HIPFIRE_LEAK", env)
+        self.assertNotIn("HIPFIRE_KV_MODE", env)
         self.assertEqual(env["HIPFIRE_STATE_QUANT"], "fp32")
         self.assertIn("--decode", (child_dir / "command.txt").read_text())
         ident = json.loads((child_dir / "identity.json").read_text())
