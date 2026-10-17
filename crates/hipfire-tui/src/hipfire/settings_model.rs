@@ -722,7 +722,7 @@ fn lock_text(origin: &Origin) -> Option<String> {
 }
 
 /// Plain title when the knob tables have one, else the canonical key.
-fn row_title(key: &str) -> String {
+pub(crate) fn row_title(key: &str) -> String {
     if let Some(knob) = knobs::curated_knob(key) {
         return knob.title.to_owned();
     }
@@ -733,7 +733,7 @@ fn row_title(key: &str) -> String {
 
 /// A value in plain words. The offload and context labels are the easy view's
 /// own ([`super::config`]).
-fn value_text(key: &str, value: &ConfigValue) -> String {
+pub(crate) fn value_text(key: &str, value: &ConfigValue) -> String {
     let raw = match value {
         ConfigValue::Null => String::new(),
         ConfigValue::String(text) => text.clone(),

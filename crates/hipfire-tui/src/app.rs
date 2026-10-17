@@ -28,6 +28,7 @@ use crate::hipfire::{
     model_actions::{self, PullEvent, PullHandle, RmOutcome},
     pull_choice::PullChoice,
     registry::{RegistryAction, RegistryState},
+    scope_view::ScopeState,
     serve_ctrl::{self, ServeAction, ServeOutcome},
     settings_model::{self, SettingsModel},
     status::{start_background_serve, StatusState},
@@ -36,6 +37,7 @@ use crate::hipfire::{
     writer, HipfirePaths,
 };
 
+mod scope;
 mod settings;
 mod tuning;
 
@@ -239,6 +241,8 @@ pub struct App {
     hermetic: bool,
     /// Settings rows (intent groups, effective values, origins, locks).
     pub settings: SettingsModel,
+    /// Per-model scope: what Settings edits, `models.toml`, the `m` / `o` screens.
+    pub scope: ScopeState,
     pub registry: RegistryState,
     pub status: StatusState,
     pub active_model: String,
@@ -399,6 +403,8 @@ impl App {
         let arch = arch
             .unwrap_or_else(|| settings_model::arch_ctx(&paths.root, &registry_v1, &active_model));
         let settings = SettingsModel::build(&paths, &active_model, &registry_v1, &arch, &env_layer);
+        let mut scope = ScopeState::default();
+        scope.reload(&hipfire_config::ConfigPaths::under(&paths.root), &env_layer);
         let dashboard_worker = DashboardWorker::spawn(config.clone());
         let log_tailer = LogTailer::spawn(paths.serve_log.clone());
 
@@ -417,6 +423,7 @@ impl App {
             env_layer,
             hermetic,
             settings,
+            scope,
             registry,
             status,
             active_model,
@@ -465,13 +472,14 @@ impl App {
     /// change).
     pub fn rebuild_settings(&mut self) {
         let registry_v1 = settings_model::registry_v1(&self.registry);
-        self.settings = SettingsModel::build(
-            &self.paths,
-            &self.active_model,
-            &registry_v1,
-            &self.arch,
+        self.scope.reload(
+            &hipfire_config::ConfigPaths::under(&self.paths.root),
             &self.env_layer,
         );
+        let (subject, arch) = self.settings_subject(&registry_v1);
+        self.settings =
+            SettingsModel::build(&self.paths, &subject, &registry_v1, &arch, &self.env_layer);
+        self.refresh_scope_screen();
         self.clamp_settings_selection();
     }
 
@@ -958,6 +966,10 @@ impl App {
     }
 
     pub fn handle_tab_key(&mut self, key: KeyEvent) {
+        if self.scope_screen_open() {
+            self.handle_scope_key(key);
+            return;
+        }
         match self.tab {
             Tab::Dashboard => self.handle_dashboard_key(key),
             Tab::Chat => self.handle_chat_key(key),
@@ -1054,6 +1066,10 @@ impl App {
             },
             KeyCode::Char('c') => self.cancel_pull(),
             KeyCode::Char('d') => self.request_delete(),
+            KeyCode::Char('o') => {
+                let model = self.registry.selected_model().map(|(tag, _)| tag);
+                self.open_overrides(model.as_deref());
+            }
             _ => {}
         }
     }

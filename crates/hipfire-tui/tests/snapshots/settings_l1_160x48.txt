@@ -4,7 +4,7 @@
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  ┌ Settings ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
- │Tuning: Balanced (p)    GPU: gfx1151 (install.json)    Model: qwen3.8:27b (default)    Editing: all models                                                  │
+ │Tuning: Balanced (p)    GPU: gfx1151 (install.json)    Model: qwen3.8:27b (default)    Editing: all models (m)                                              │
  └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
  ┌──────────────────────┐┌ Quality ─────────────────────────────────────────────────────────────────────────────────┐┌ Prompt processing ─────────────────────┐
  │Groups                ││  Setting                       Using now               From                Applies       ││How the model reads your prompt before  │
@@ -44,5 +44,5 @@
  │                      ││ full-precision model, and it usually costs speed. Speed and speculation settings are     ││              process                   │
  │                      ││ designed not to change answers.                                                          ││                                        │
  └──────────────────────┘└──────────────────────────────────────────────────────────────────────────────────────────┘└────────────────────────────────────────┘
-↑↓ move · ←→ change · Del default · / search · p tuning · 1-6 group · ? help · Enter save · R reset-all · c changed · h hide unused · r refresh · q quit
+↑↓ move · ←→ change · Del default · / search · ? help · p tuning · m scope · o overrides · R reset-all · 1-6 group · Enter save · c changed · h hide unused
 

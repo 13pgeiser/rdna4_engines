@@ -3,7 +3,7 @@
  Home  |  Dashboard  |  Chat  |  Models  |  Settings  |  System  |  Logs
 
 ────────────────────────────────────────────────────────────────────────────────
- Tuning: Balanced  p    GPU: gfx1151    Editing: all models
+ Tuning: Balanced  p    GPU: gfx1151    Editing: all models  m
  [Quality]  Speed  Memory  Speculation  Hardware  Advanced             / search
  ┌ Quality — changes the answers; better is usually slower ───────────────────┐
  │  Setting                       Using now               From                │
@@ -20,5 +20,5 @@
  │Built-in default for gfx1151. Applies: serve restart.                       │
  │kernel.gfx11_a8_prefill · HIPFIRE_GFX11_A8_PREFILL · ←/→ choose, Enter saves│
  └────────────────────────────────────────────────────────────────────────────┘
-↑↓ move · ←→ change · Del default · / search · p tuning · 1-6 group · ? help
+↑↓ move · ←→ change · Del default · / search · ? help · p tuning · m scope
 

@@ -50,14 +50,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .split(area);
 
     draw_header(frame, app, root[0]);
-    match app.tab {
-        Tab::Home => draw_home(frame, app, root[1]),
-        Tab::Dashboard => draw_dashboard(frame, app, root[1]),
-        Tab::Chat => draw_chat(frame, app, root[1]),
-        Tab::Models => draw_models(frame, app, root[1]),
-        Tab::Settings => crate::ui_settings::draw_settings(frame, app, root[1]),
-        Tab::System => draw_system(frame, app, root[1]),
-        Tab::Logs => draw_logs(frame, app, root[1]),
+    if crate::ui_scope::draws_screen(app, root[1]) {
+        crate::ui_scope::draw_screen(frame, app, root[1]);
+    } else {
+        match app.tab {
+            Tab::Home => draw_home(frame, app, root[1]),
+            Tab::Dashboard => draw_dashboard(frame, app, root[1]),
+            Tab::Chat => draw_chat(frame, app, root[1]),
+            Tab::Models => draw_models(frame, app, root[1]),
+            Tab::Settings => crate::ui_settings::draw_settings(frame, app, root[1]),
+            Tab::System => draw_system(frame, app, root[1]),
+            Tab::Logs => draw_logs(frame, app, root[1]),
+        }
+        crate::ui_scope::draw_picker_popup(frame, app, root[1]);
     }
     draw_footer(frame, app, root[2]);
 
@@ -226,6 +231,9 @@ fn footer_segments(app: &App) -> Vec<String> {
     if app.confirm_quit {
         return vec![quit_confirm_prompt(app)];
     }
+    if let Some(segments) = crate::ui_scope::footer_segments(app) {
+        return segments;
+    }
     match app.tab {
         Tab::Home => segs(&["? help", "r refresh", "Tab/Shift+Tab switch", "q quit"]),
         Tab::Dashboard => {
@@ -292,6 +300,7 @@ fn footer_segments(app: &App) -> Vec<String> {
                     "Up/Down select",
                     "Enter open/expand",
                     "d delete",
+                    "o overrides",
                     "? help",
                     "r refresh",
                     "Tab/Shift+Tab switch",
@@ -303,6 +312,7 @@ fn footer_segments(app: &App) -> Vec<String> {
                     "Enter open/expand",
                     "p pull",
                     "d delete",
+                    "o overrides",
                     "? help",
                     "r refresh",
                     "Tab/Shift+Tab switch",
@@ -314,11 +324,18 @@ fn footer_segments(app: &App) -> Vec<String> {
             if let Some(view) = &app.tuning_view {
                 crate::ui_tuning::footer_segments(app, view)
             } else if app.confirm_reset_all {
-                segs(&[
-                    "Reset ALL settings to defaults?",
-                    "y confirm",
-                    "n / Esc cancel",
-                ])
+                match app.scope_model() {
+                    Some(model) => vec![
+                        format!("Remove all of {model}'s own values?"),
+                        "y confirm".to_owned(),
+                        "n / Esc cancel".to_owned(),
+                    ],
+                    None => segs(&[
+                        "Reset ALL settings to defaults?",
+                        "y confirm",
+                        "n / Esc cancel",
+                    ]),
+                }
             } else if app.settings_pending.is_some() {
                 segs(&[
                     "Preview: Left/Right/Space change",
@@ -351,17 +368,37 @@ fn footer_segments(app: &App) -> Vec<String> {
                     "Tab/Shift+Tab switch",
                     "q quit",
                 ])
+            } else if app.scope_model().is_some() {
+                segs(&[
+                    "↑↓ move",
+                    "←→ change",
+                    "Del follow all-models",
+                    "m scope",
+                    "o overrides",
+                    "? help",
+                    "Enter save",
+                    "1-6 group",
+                    "/ search",
+                    "c changed",
+                    "h hide unused",
+                    "R remove all values",
+                    "r refresh",
+                    "Tab/Shift+Tab switch",
+                    "q quit",
+                ])
             } else {
                 segs(&[
                     "↑↓ move",
                     "←→ change",
                     "Del default",
                     "/ search",
-                    "p tuning",
-                    "1-6 group",
                     "? help",
-                    "Enter save",
+                    "p tuning",
+                    "m scope",
+                    "o overrides",
                     "R reset-all",
+                    "1-6 group",
+                    "Enter save",
                     "c changed",
                     "h hide unused",
                     "r refresh",
@@ -1303,10 +1340,20 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
                     };
                     let have = if row.downloaded { "local" } else { "remote" };
                     let mtp = if row.has_mtp { "[mtp] " } else { "" };
-                    let notes = if row.entry.repo.is_empty() {
-                        format!("{mtp}{} (no remote repo)", row.entry.desc)
+                    let own = crate::hipfire::scope_view::own_count(
+                        &app.scope.catalog,
+                        &row.tag,
+                        &row.entry.file,
+                    );
+                    let own = if own > 0 {
+                        format!("{} · ", crate::hipfire::scope_view::own_values_text(own))
                     } else {
-                        format!("{mtp}{}", row.entry.desc)
+                        String::new()
+                    };
+                    let notes = if row.entry.repo.is_empty() {
+                        format!("{own}{mtp}{} (no remote repo)", row.entry.desc)
+                    } else {
+                        format!("{own}{mtp}{}", row.entry.desc)
                     };
                     Row::new([
                         format!("  {active} {}", row.tag),

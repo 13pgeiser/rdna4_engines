@@ -6,6 +6,7 @@ mod app;
 mod hipfire;
 mod ui;
 mod ui_chat;
+mod ui_scope;
 mod ui_settings;
 mod ui_tuning;
 
@@ -286,6 +287,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
+    // The scope picker and the per-model overrides list are modal: every key
+    // goes to them (Esc closes), so q / r / ? / Tab cannot act underneath.
+    if app.scope_screen_open() {
+        app.handle_tab_key(key);
+        return false;
+    }
+
     // A Models delete-confirmation is modal: route every key to the tab handler
     // (which acts only on y / n / Esc) so a global `q` or `r` cannot quit or
     // reload while the confirm is armed.
@@ -402,6 +410,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                     // And an open pull chooser (modal; must not reopen on return).
                     app.pull_choice = None;
                 }
+                app.close_scope_screen();
                 app.tab = tab;
             }
         }

@@ -116,6 +116,14 @@ impl Fixture {
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    pub fn models_toml_path(&self) -> PathBuf {
+        self.root.join("models.toml")
+    }
+
+    pub fn models_toml_bytes(&self) -> Vec<u8> {
+        std::fs::read(self.models_toml_path()).unwrap_or_default()
+    }
 }
 
 impl Drop for Fixture {
@@ -132,6 +140,10 @@ pub struct FixtureBuilder {
     env: ConfigLayer,
     card_kv_mode: Option<String>,
     flash_next_split: bool,
+    /// Further registry models `(tag, downloaded)` besides the active one.
+    extra_models: Vec<(String, bool)>,
+    /// Per-model values written to `models.toml` before the app loads.
+    model_values: Vec<(String, String, String)>,
 }
 
 /// Split-base file of the Flash-Next fixture card (no `.ple-q8` beside it).
@@ -146,6 +158,8 @@ impl FixtureBuilder {
             env: ConfigLayer::default(),
             card_kv_mode: None,
             flash_next_split: false,
+            extra_models: Vec::new(),
+            model_values: Vec::new(),
         }
     }
 
@@ -157,6 +171,19 @@ impl FixtureBuilder {
         self
     }
 
+    /// Another model in the registry (`downloaded`: its file is installed).
+    pub fn model(mut self, tag: &str, downloaded: bool) -> Self {
+        self.extra_models.push((tag.to_owned(), downloaded));
+        self
+    }
+
+    /// One per-model value in `models.toml`, written through the CLI's own
+    /// `set_model_override` (a catalog id outside the registry works too).
+    pub fn model_value(mut self, model: &str, key: &str, raw: &str) -> Self {
+        self.model_values
+            .push((model.to_owned(), key.to_owned(), raw.to_owned()));
+        self
+    }
     /// The PR #902 state to inject (a gfx1151 fixture mirroring mockup S1
     /// injects [`A8Prefill::OptIn`]).
     pub fn a8(mut self, a8: A8Prefill) -> Self {
@@ -211,6 +238,18 @@ impl FixtureBuilder {
         )
         .expect("write fixture config");
 
+        for (model, key, raw) in &self.model_values {
+            hipfire_config::set_model_override(
+                &hipfire_config::ConfigPaths::under(&root),
+                Some(model),
+                None,
+                model,
+                key,
+                raw,
+            )
+            .expect("write fixture models.toml");
+        }
+
         let arch = ArchCtx {
             gpu_arch: Some(self.gpu),
             gpu_count: 1,
@@ -251,6 +290,21 @@ impl FixtureBuilder {
                     ..ModelEntry::default()
                 },
                 downloaded: true,
+                has_mtp: false,
+            });
+        }
+        for (tag, downloaded) in &self.extra_models {
+            app.registry.models.push(ModelRow {
+                tag: tag.clone(),
+                entry: ModelEntry {
+                    repo: format!("hipfire-models/{}", tag.replace(':', "-")),
+                    file: format!("{}.mq4", tag.replace(':', "-")),
+                    size_gb: 5.0,
+                    min_vram_gb: 6.0,
+                    desc: tag.clone(),
+                    ..ModelEntry::default()
+                },
+                downloaded: *downloaded,
                 has_mtp: false,
             });
         }

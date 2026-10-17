@@ -156,6 +156,17 @@ Process and diagnostic keys are global-only. `hipfire config <model> set ...`
 rejects them because the daemon snapshots these values once; claiming a
 per-model override inside a long-lived serve process would be misleading.
 
+The TUI Settings tab edits per-model values with the same functions
+(`hipfire_config::set_model_override` / `remove_model_override`): `m` picks
+what Settings edits (all models, or one model), and in a model's scope every
+change writes that model's entry in `models.toml`, byte-identical to
+`hipfire config <model> set KEY VALUE`. `Del` removes that model's value (the
+row follows "all models" again, like `hipfire config <model> reset KEY`) and
+`R` removes all of its values. Global-only keys read `all models only
+(locked)` there. `o` lists every per-model value next to the all-models value
+(the screen form of `hipfire config overrides`); the Models tab shows the
+count as `N own values`.
+
 This page is the normative **key/default/enum** table. CASK/TriAttention is
 deprecated (removal in 0.5.0) and PFlash is retained legacy research (see their
 sections); multi-GPU topology

@@ -1022,7 +1022,7 @@ pub fn env_name(key: &str) -> Option<String> {
         .or_else(|| developer_env_for_key(key))
 }
 
-fn fit(text: String) -> String {
+pub fn fit(text: String) -> String {
     if text.chars().count() <= EXPLAINER_COLS {
         return text;
     }

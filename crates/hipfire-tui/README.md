@@ -48,8 +48,27 @@ Tabs:
   deprecated keys are read-only. Rows come from `SettingsModel`
   (`src/hipfire/settings_model.rs`), drawn by `src/ui_settings.rs`. Golden
   layouts live in `tests/snapshots/`; regenerate them with
-  `UPDATE_SNAPSHOTS=1 cargo test -p hipfire-tui golden_`. Per-model overlays
-  stay with `hipfire config <tag> set ...`.
+  `UPDATE_SNAPSHOTS=1 cargo test -p hipfire-tui golden_`.
+  **Per-model scope** (`src/hipfire/scope_view.rs`, `src/app/scope.rs`,
+  `src/ui_scope.rs`): the header reads `Editing: all models  m`; `m` opens the
+  scope picker (All models, the active model, every other installed model,
+  each with its own-value count from `models.toml`). In a model's scope the
+  group box reads `<Group> · values for <model> only`, rows resolve for that
+  model, and writes go through `hipfire_config::set_model_override` /
+  `remove_model_override`, the code behind `hipfire config <model> set` /
+  `reset` (so `models.toml` is byte-identical either way). `Del` removes that
+  model's value, `R` removes all of its values (y/n). Process- and
+  Diagnostic-scoped keys, `developer.*` keys and the Prompt processing row read
+  `all models only (locked)`; `←/→/Del/Enter` on them say why and write
+  nothing. In the all-models scope a row the active model has its own value
+  for reads `this model` and the explainer warns the change won't affect it.
+  `o` opens **Per-model overrides** (also from the Models tab, focused on the
+  selected model): every model × setting × value next to the all-models value;
+  `Enter` opens Settings in that model's scope on the row, `Del` removes the
+  value, `Esc` goes back. At 160×48 the same screen is a models list (with
+  own-value counts and loaded / on disk state) beside that model's values, with
+  `←→` choosing a value and `D` removing all of the model's values. The Models
+  tab shows `N own values` before each model's notes.
 - **System**: GPU, HIP and path diagnostics; `d` runs `hipfire diag`.
 - **Logs**: the tail of `serve.log`.
 

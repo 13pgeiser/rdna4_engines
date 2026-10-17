@@ -24,16 +24,16 @@ use crate::{
     app::{App, EditState, PendingEnum},
     hipfire::{
         knobs::{self, Tradeoff, PREDICTION_NOTE},
-        settings_model::{value_string, RowId, SettingsRow, VirtualRow},
+        settings_model::{value_string, RowId, SettingsRow, VirtualRow, MODEL_SCOPE_LOCK},
         writer::{self, FieldKind, SYM_IU4_KEY},
     },
     ui::{block, pad, ACCENT, MUTED, PANEL, PANEL_2, RED, TEXT, YELLOW},
 };
 
 /// Terminal width from which the rail, Applies column and why pane show.
-const WIDE_COLS: u16 = 160;
+pub(crate) const WIDE_COLS: u16 = 160;
 /// ... and the height they need.
-const WIDE_ROWS: u16 = 24;
+pub(crate) const WIDE_ROWS: u16 = 24;
 /// Rail and pane widths at the wide layout.
 const RAIL_W: u16 = 24;
 const PANE_W: u16 = 42;
@@ -186,7 +186,10 @@ fn option_label(key: &str, value: &str) -> String {
         .map_or_else(|| value.to_owned(), |(_, label)| (*label).to_owned())
 }
 
-fn from_label(row: &SettingsRow) -> String {
+fn from_label(app: &App, row: &SettingsRow) -> String {
+    if app.scope_lock_reason(row).is_some() {
+        return MODEL_SCOPE_LOCK.to_owned();
+    }
     let flash_next_only = matches!(row.id.key(), Some(SYM_IU4_KEY | "memory.ple_format"))
         && row.effective.used_by_model == Some(false);
     if flash_next_only {
@@ -209,7 +212,7 @@ fn cells(app: &App, row: &SettingsRow) -> Cells {
     let (using, from, preview) = match pending_for(app, row) {
         Some(pending) => (
             format!("→ {}", pending_label(row, pending)),
-            from_label(row),
+            from_label(app, row),
             true,
         ),
         None => match app.live_value(row) {
@@ -218,7 +221,11 @@ fn cells(app: &App, row: &SettingsRow) -> Cells {
                 "live from serve".to_owned(),
                 false,
             ),
-            None => (format!("{marker}{}", row.display), from_label(row), false),
+            None => (
+                format!("{marker}{}", row.display),
+                from_label(app, row),
+                false,
+            ),
         },
     };
     Cells {
@@ -226,7 +233,7 @@ fn cells(app: &App, row: &SettingsRow) -> Cells {
         preview,
         marked,
         from,
-        locked: row.locked.is_some(),
+        locked: row.locked.is_some() || app.scope_lock_reason(row).is_some(),
         dim: row.is_unused(),
     }
 }
@@ -267,6 +274,25 @@ impl Columns {
             tail_title: if searching { "Group" } else { "Applies" },
             wide,
         }
+    }
+
+    /// In a model's scope the From column must hold `all models only (locked)`.
+    fn for_scope(mut self, app: &App) -> Self {
+        if app.scope_model().is_none() || self.tail_title == "Group" {
+            return self;
+        }
+        let body = self.setting + self.using + self.from + self.tail;
+        (self.setting, self.using, self.from) = if self.wide {
+            (26, 24, 25)
+        } else {
+            (25, 24, body.saturating_sub(49).max(25))
+        };
+        self.tail = if self.wide {
+            body.saturating_sub(75)
+        } else {
+            0
+        };
+        self
     }
 
     fn header(&self) -> Line<'static> {
@@ -478,12 +504,17 @@ fn header_line(app: &App, wide: bool) -> Line<'static> {
     let model_note = app.serve_loaded_config().map_or("default", |_| "loaded");
     let mut text = if wide {
         format!(
-            "GPU: {}    Model: {} ({model_note})    Editing: all models",
+            "GPU: {}    Model: {} ({model_note})    {}",
             gpu_text(app, true),
-            app.active_model
+            app.active_model,
+            crate::ui_scope::editing_text(app, true)
         )
     } else {
-        format!("GPU: {}    Editing: all models", gpu_text(app, false))
+        format!(
+            "GPU: {}    {}",
+            gpu_text(app, false),
+            crate::ui_scope::editing_text(app, false)
+        )
     };
     if let Some(profile) = app.settings.profile.as_deref().filter(|_| wide) {
         text.push_str(&format!("    Profile: {profile}"));
@@ -565,8 +596,16 @@ fn draw_tabs_or_search(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn confirm_box(frame: &mut Frame, area: Rect, one_line: bool) {
-    let lines = if one_line {
+fn confirm_box(frame: &mut Frame, area: Rect, one_line: bool, model: Option<&str>) {
+    let lines = if let Some(model) = model {
+        let ask = format!("Remove ALL of {model}'s own values?");
+        let keys = "They follow \"all models\" again.  y = confirm · n / Esc = cancel";
+        if one_line {
+            vec![Line::from(format!("{ask}  {keys}"))]
+        } else {
+            vec![Line::from(ask), Line::from(keys)]
+        }
+    } else if one_line {
         vec![Line::from(
             "Reset ALL settings to defaults? This clears ~/.hipfire/config.toml.  y = confirm · n / Esc = cancel",
         )]
@@ -582,7 +621,11 @@ fn confirm_box(frame: &mut Frame, area: Rect, one_line: bool) {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(RED))
-                    .title(" Confirm reset-all "),
+                    .title(if model.is_some() {
+                        " Confirm remove all "
+                    } else {
+                        " Confirm reset-all "
+                    }),
             )
             .style(Style::default().fg(TEXT).bg(PANEL)),
         area,
@@ -615,6 +658,8 @@ fn draw_compact(frame: &mut Frame, app: &App, area: Rect) {
     let searching = app.settings_search.is_some();
     let title = if searching {
         "Search results — name, key, env var or description".to_owned()
+    } else if let Some(model) = app.scope_model() {
+        format!("{} · values for {model} only", app.settings_group.title())
     } else {
         format!(
             "{} — {}",
@@ -627,7 +672,7 @@ fn draw_compact(frame: &mut Frame, app: &App, area: Rect) {
         .saturating_sub(1)
         .max(1);
     let start = window(app.settings_selected, capacity);
-    let columns = Columns::new(inner_w, false, searching);
+    let columns = Columns::new(inner_w, false, searching).for_scope(app);
     let mut list_block = block(&title);
     if let Some(note) = scroll_note(start, capacity, rows.len()) {
         list_block = list_block.title_bottom(note);
@@ -640,16 +685,12 @@ fn draw_compact(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     if app.confirm_reset_all {
-        confirm_box(frame, chunks[3], false);
+        confirm_box(frame, chunks[3], false, app.scope_model());
         return;
     }
     let (title, lines) = match app.selected_row() {
         Some(row) => {
-            let lines = app.settings.explainer(
-                row,
-                app.live_value(row).as_deref(),
-                app.row_needs_restart(row),
-            );
+            let lines = app.row_explainer(row);
             (row.title.clone(), lines.to_vec())
         }
         None => ("Nothing selected".to_owned(), Vec::new()),
@@ -673,7 +714,7 @@ fn draw_wide(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Length(3), Constraint::Min(10)])
         .split(area);
     if app.confirm_reset_all {
-        confirm_box(frame, rows_area[0], true);
+        confirm_box(frame, rows_area[0], true, app.scope_model());
     } else {
         frame.render_widget(
             Paragraph::new(header_line(app, true))
@@ -747,12 +788,14 @@ fn draw_wide_list(frame: &mut Frame, app: &App, area: Rect) {
     let searching = app.settings_search.is_some();
     let title = if searching {
         "Search results".to_owned()
+    } else if let Some(model) = app.scope_model() {
+        format!("{} · values for {model} only", app.settings_group.title())
     } else {
         app.settings_group.title().to_owned()
     };
     let inner_w = area.width.saturating_sub(2) as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
-    let columns = Columns::new(inner_w, true, searching);
+    let columns = Columns::new(inner_w, true, searching).for_scope(app);
 
     // Under the rows: the "also affects quality" link and what the group means.
     let blurb = if searching {
@@ -818,18 +861,18 @@ fn draw_wide_list(frame: &mut Frame, app: &App, area: Rect) {
 // The "why this value" pane
 // ---------------------------------------------------------------------------
 
-fn heading(text: &str) -> Line<'static> {
+pub(crate) fn heading(text: &str) -> Line<'static> {
     Line::from(Span::styled(
         text.to_owned(),
         Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
     ))
 }
 
-fn plain(text: impl Into<String>) -> Line<'static> {
+pub(crate) fn plain(text: impl Into<String>) -> Line<'static> {
     Line::from(Span::styled(text.into(), Style::default().fg(TEXT)))
 }
 
-fn muted(text: impl Into<String>) -> Line<'static> {
+pub(crate) fn muted(text: impl Into<String>) -> Line<'static> {
     Line::from(Span::styled(text.into(), Style::default().fg(MUTED)))
 }
 
@@ -1099,6 +1142,12 @@ fn why_lines(app: &App, row: &SettingsRow, width: usize) -> Vec<Line<'static>> {
     };
 
     let mut lines: Vec<Line<'static>> = wrap(&what, width).into_iter().map(plain).collect();
+    if let Some(text) = app.scope_text(row) {
+        lines.push(Line::from(""));
+        for note in text.values.iter().chain(std::iter::once(&text.hint)) {
+            lines.extend(wrap(note, width).into_iter().map(plain));
+        }
+    }
     let options = options_section(app, row, width);
     if !options.is_empty() {
         lines.push(Line::from(""));
@@ -1651,12 +1700,12 @@ mod tests {
             "Hide unused (h)",
             "Applies",
             "next message",
-            "Editing: all models",
+            "Editing: all models (m)",
             "Tuning: Balanced (p)",
         ] {
             assert!(text.contains(want), "missing {want:?}:\n{text}");
         }
-        for gone in ["(m)", "(o)", "(u)", "Profiles", "Per-model (o)"] {
+        for gone in ["(u)", "Profiles", "Per-model (o)"] {
             assert!(
                 !text.contains(gone),
                 "deferred item {gone:?} advertised:\n{text}"

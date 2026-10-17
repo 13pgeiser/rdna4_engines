@@ -14,6 +14,7 @@ pub mod model_actions;
 pub mod profile_wizard;
 pub mod pull_choice;
 pub mod registry;
+pub mod scope_view;
 pub mod search;
 pub mod serve_ctrl;
 pub mod settings_model;

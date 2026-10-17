@@ -87,6 +87,15 @@ impl App {
     /// serve's `/stats` `loaded_config`, when serve is online and its resident
     /// model is the active model.
     pub fn serve_loaded_config(&self) -> Option<&LoadedConfig> {
+        // Settings edits another model: serve's resident one is not its subject.
+        if self
+            .scope
+            .model
+            .as_deref()
+            .is_some_and(|model| model != self.active_model)
+        {
+            return None;
+        }
         let dashboard = self.dashboard.as_ref().filter(|dash| dash.serve_up)?;
         let loaded = dashboard.stats.as_ref()?.loaded_config.as_ref()?;
         let active = loaded.model == self.active_model
@@ -114,9 +123,15 @@ impl App {
         else {
             return false;
         };
-        std::fs::metadata(&self.paths.config)
-            .and_then(|meta| meta.modified())
-            .is_ok_and(|modified| modified > started)
+        // `models.toml` counts too: a model's own values load with the model.
+        [&self.paths.config, &self.paths.models_catalog]
+            .into_iter()
+            .filter_map(|path| {
+                std::fs::metadata(path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+            })
+            .any(|modified| modified > started)
     }
 
     /// `row` is read at load or start and `config.toml` is newer than serve.
@@ -133,7 +148,7 @@ impl App {
     }
 
     /// Put the cursor back on `id` (it may have moved or left the list).
-    fn restore_selection(&mut self, id: Option<RowId>) {
+    pub(super) fn restore_selection(&mut self, id: Option<RowId>) {
         let position =
             id.and_then(|id| self.settings_visible().iter().position(|row| row.id == id));
         match position {
@@ -156,6 +171,9 @@ impl App {
     /// Persist a validated value for `key`. Returns `(ok, status)`; `ok` is
     /// false on a validation or write error so the editor keeps its buffer.
     fn persist_setting(&mut self, key: &str, raw: &str) -> (bool, String) {
+        if let Some(model) = self.scope.model.clone() {
+            return self.persist_model_setting(&model, key, raw);
+        }
         match writer::write_value(&self.paths.config, key, raw) {
             Ok(value) => {
                 let shown = match &value {
@@ -178,12 +196,12 @@ impl App {
     }
 
     /// An environment variable owns the row: say so, write nothing.
-    fn locked_notice(&mut self, text: &str) {
+    pub(super) fn locked_notice(&mut self, text: &str) {
         self.last_reload = text.to_owned();
         self.toast_info(text.to_owned());
     }
 
-    fn settings_goto_group(&mut self, group: Intent) {
+    pub(super) fn settings_goto_group(&mut self, group: Intent) {
         self.discard_settings_preview();
         self.settings_search = None;
         self.settings_group = group;
@@ -240,6 +258,10 @@ impl App {
     /// Reset the selected setting to its inherited value by removing it from
     /// config.toml. Single-key reset is reversible, so it needs no confirm.
     fn reset_selected_setting(&mut self) {
+        if let Some(model) = self.scope.model.clone() {
+            self.reset_selected_for_model(&model);
+            return;
+        }
         // A corrupt config.toml loads as all-defaults, so a per-key reset would
         // wrongly say "already default" (and the writer refuses to clobber it).
         // R (reset-all) is the recovery hatch.
@@ -328,7 +350,12 @@ impl App {
     /// file is destructive, so it waits for an explicit y.
     fn arm_reset_all(&mut self) {
         self.confirm_reset_all = true;
-        self.last_reload = "reset ALL settings to defaults? y to confirm, n / Esc to cancel".into();
+        self.last_reload = match self.scope.model.as_deref() {
+            Some(model) => {
+                format!("remove ALL of {model}'s own values? y to confirm, n / Esc to cancel")
+            }
+            None => "reset ALL settings to defaults? y to confirm, n / Esc to cancel".into(),
+        };
     }
 
     fn cancel_reset_all(&mut self) {
@@ -343,6 +370,10 @@ impl App {
     /// layer, reload, and keep the cursor in range.
     fn confirm_reset_all_yes(&mut self) {
         self.confirm_reset_all = false;
+        if let Some(model) = self.scope.model.clone() {
+            self.remove_all_for_model(&model);
+            return;
+        }
         match writer::reset_all(&self.paths.config) {
             Ok(()) => {
                 self.after_config_write();
@@ -406,6 +437,8 @@ impl App {
                 self.discard_settings_preview();
                 self.open_tuning_undo();
             }
+            KeyCode::Char('m') => self.open_scope_picker(),
+            KeyCode::Char('o') => self.open_overrides(None),
             KeyCode::Char('c') => {
                 self.discard_settings_preview();
                 self.settings_changed_only = !self.settings_changed_only;
@@ -497,6 +530,11 @@ impl App {
         let Some(row) = self.selected_row().cloned() else {
             return;
         };
+        if let Some(reason) = self.scope_lock_reason(&row) {
+            self.discard_settings_preview();
+            self.locked_notice(&reason);
+            return;
+        }
         if let Some(lock) = row.locked.clone() {
             self.discard_settings_preview();
             self.locked_notice(&lock);
@@ -598,6 +636,10 @@ impl App {
         let Some(row) = self.selected_row().cloned() else {
             return;
         };
+        if let Some(reason) = self.scope_lock_reason(&row) {
+            self.locked_notice(&reason);
+            return;
+        }
         if let Some(lock) = row.locked.clone() {
             self.locked_notice(&lock);
             return;
