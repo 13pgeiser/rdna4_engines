@@ -204,11 +204,11 @@ group=32 scale=u6 scale2=f16 group2=256`; a ternary BitNet weight is `table=tern
 A container can hold only what some kernel reads. The converter checks every planned encoding
 against the layout hooks of the kernels declare resolved and refuses one that no kernel accepts,
 so a grid libquant can write is usable only once a kernel library takes it. libr4d reads the plain
-floats; block-scaled fp8 and fp8 rows; int8 block rows (the W8A8 trunk and lm_head); the routed
-experts as fp8, int4 (`i4*bf16[1x128]/fwht128`) or the `w4nl`/`w5nl` codebooks under E4M3 scales
-([MOE-W4.md](MOE-W4.md)); the dense w4, w8 and mxfp4 GEMM rows; and the 2-bit draft head. Every
-encoding also decodes through the core, which the converter's error report, the oracle and the
-quantisers' tests use.
+floats; block-scaled fp8 and fp8 rows; int8 block rows (the W8A8 trunk and lm_head), plain or
+rotated (`i8*bf16[1x128]/fwht128`); the routed experts as fp8, int4 (`i4*bf16[1x128]/fwht128`) or
+the `w4nl`/`w5nl` codebooks under E4M3 scales ([MOE-W4.md](MOE-W4.md)); the dense w4, w8 and mxfp4
+GEMM rows; and the 2-bit draft head. Every encoding also decodes through the core, which the
+converter's error report, the oracle and the quantisers' tests use.
 
 The recipes for the containers this tree serves are in `data/recipes/`. `scripts/convfn.sh` and
 `scripts/convdspark.sh` are the reference conversions.

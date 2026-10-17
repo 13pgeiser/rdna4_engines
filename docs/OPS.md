@@ -40,11 +40,14 @@ here is such a choice.
   otherwise; strides are the kernel's business, not the schema's.
 - Where an op takes `dtype`, it is a string naming the operand combination, so a weight format and
   an activation format share one key: `bf16`, `f16`/`fp16`, `f32`/`fp32`, `u8`, `fp8_e4m3`,
-  `fp8a8`, `fp8a16`, `i8a8`, `w4`, `w4a8`, `w4a8_asym`, `w4a8h`, `w8a8`, `w4a16`, `w8a16`, `w2a8`,
-  `mxfp4a8`, `w5a16`, `w4a16_asym`, `w5a8i8`, `w4a8i8_asym`, and the codebook expert forms
-  `w4nla8h`, `w4nl64a8h`, `w4nl32a8h`, `w5nl64a8h` (`docs/MOE-W4.md`).
+  `fp8a8`, `fp8a16`, `i8a8`, `i8a8h`, `w4`, `w4a8`, `w4a8_asym`, `w4a8h`, `w8a8`, `w4a16`,
+  `w8a16`, `w2a8`, `mxfp4a8`, `w5a16`, `w4a16_asym`, `w5a8i8`, `w4a8i8_asym`, and the codebook
+  expert forms `w4nla8h`, `w4nl64a8h`, `w4nl32a8h`, `w5nl64a8h` (`docs/MOE-W4.md`).
   - `w4a8h` is `w4a8` with a `group`-wide Walsh–Hadamard along K baked into the stored weight
     (`docs/MOE-W4.md`).
+  - `i8a8` is an i8 weight with a bf16 scale per (row, 128 of K) against an int8 activation on
+    the same grid; `i8a8h` is that weight rotated by a 128-wide Walsh–Hadamard along K, its scale
+    carrying the 1/128 (libquant's `transform=fwht128`), met by `had_quant_act_i8g`.
   - `w4a8_asym` is the unsigned-nibble-minus-zero-point grid instead of the symmetric one.
   - `fp8a8` and `fp8a16` say whether a block-scaled E4M3 weight meets an fp8 or a bf16 activation.
   - `w5a16` and `w4a16_asym` are ParoQuant's int5 and z-lab's int4 (u5 / u4 codes, an f16 scale and
@@ -470,8 +473,11 @@ not slow. `libref/ref_quant.cpp` is the definition.
   (`group <= 0` or `group >= n` is one per row). The scale is `amax / 127` (1 for a zero group) and
   each code the value over it rounded to nearest even and clamped to ±127, row-major. They feed the
   int8 trunk GEMM (`gemm_nt_q` at `dtype=i8a8`), which folds a scale per K block. The `had_` form
-  rotates first. `dequant` inverts `quant_act_i8g`: the scale stream's extent gives the group count
-  and `group` each group's width.
+  rotates first and, like `had_quant_act_fp8`, folds nothing: its consumer is a weight at
+  `dtype=i8a8h`, whose scale carries the whole 1/`group`. It is not interchangeable with the
+  per-row `had_*` int8 forms, which fold 1/sqrt(`group`) into the activation's scale. `dequant`
+  inverts `quant_act_i8g`: the scale stream's extent gives the group count and `group` each group's
+  width.
 
 The rotation is unnormalised butterflies at ascending strides `1, 2, 4, ... group/2`, pairing `i`
 with `i + h` where `(i & h) == 0`. The `1/sqrt(group)` is folded into the scale rather than applied
