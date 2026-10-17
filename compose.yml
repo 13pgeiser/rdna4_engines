@@ -17,7 +17,7 @@ x-hipfire-engine: &hipfire-engine
   build:
     context: .
     dockerfile: Containerfile
-    target: ${HIPFIRE_IMAGE_TARGET:-runtime}
+    target: ${HIPFIRE_IMAGE_TARGET:-full}
   devices:
     - /dev/kfd
     - /dev/dri
@@ -120,7 +120,7 @@ services:
     build:
       context: .
       dockerfile: Containerfile
-      target: ${HIPFIRE_IMAGE_TARGET:-runtime}
+      target: ${HIPFIRE_IMAGE_TARGET:-full}
     profiles: [halo-tune]
     entrypoint: ["hipfire-halo-tune"]
     command: ["apply"]

@@ -36,9 +36,9 @@ on:
         required: false
         type: choice
         options:
-          - runtime
           - full
-        default: runtime
+          - runtime
+        default: full
 
 permissions:
   contents: read
@@ -82,10 +82,11 @@ jobs:
         run: |
           version="${TAG#v}"
           revision="$(git rev-parse HEAD)"
+          # full is the compose default (ghcr.io/warpfront/hipfire:latest).
           if [ "$TARGET" = full ]; then
-            suffix="-full"; moving="full"
-          else
             suffix=""; moving="latest"
+          else
+            suffix="-runtime"; moving="runtime"
           fi
           {
             echo "VERSION=$version"
