@@ -1316,6 +1316,7 @@ pub fn execute_pipeline(
                         givens_theta: None,
                         givens_scales: None,
                         givens_krot: None,
+                        givens_group_size: None,
                     },
                 )
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
@@ -3359,6 +3360,7 @@ fn prefill_shared_gate_up_stage(
                 n,
                 gate.k,
                 gate_rot.krot,
+                128,
             )
             .map_err(|e| DispatchError::Hip(e.to_string()))?;
             let gate_key = prefill_shared_gemm_key(gate.dtype)
@@ -3383,6 +3385,7 @@ fn prefill_shared_gate_up_stage(
                 n,
                 up.k,
                 up_rot.krot,
+                128,
             )
             .map_err(|e| DispatchError::Hip(e.to_string()))?;
             gemm.run_key(
@@ -5105,6 +5108,7 @@ fn decode_input_basis_stage(
                 1,
                 p.hidden,
                 paro.krot,
+                128,
             ))?;
         } else if res.gate_side_mq4 {
             if let Some(awq) = p.router.awq_scale {
@@ -5454,6 +5458,7 @@ fn prefill_input_basis_stage(
         p.batch_size,
         p.gate_up_k,
         paro.krot,
+        128,
     ))?;
     Ok(())
 }
