@@ -6029,10 +6029,33 @@ fn bench_prompt_tokens_from_done(done: &serde_json::Value) -> Option<u64> {
     }
 }
 
+/// Exit status of a `hipfire bench` stopped by SIGINT/SIGTERM/SIGHUP (the
+/// conventional 128 + SIGINT; `ctrlc` does not report which signal arrived).
+const BENCH_INTERRUPTED_EXIT: i32 = 130;
+
+/// Make an interrupted bench take its daemon with it. A process stopped by a
+/// signal never runs `Drop`, so the default disposition would leave the daemon
+/// (spawned through `Engine`) running: still loading or compiling kernels, and
+/// holding the machine-wide GPU `flock`, so the next claim of those cards
+/// fails with "already reserved by holder PID …". A harness timeout that
+/// SIGTERMs only this process is exactly that case. The handler kills and
+/// reaps every daemon *this process* spawned (never an unrelated one) before
+/// exiting; reaping returns only after the daemon's teardown has released the
+/// lock, so once `hipfire bench` has exited the cards are claimable again.
+/// An already-installed process handler is left in place (`AlreadyExists`).
+fn install_bench_interrupt_handler() {
+    let _ = ctrlc::set_handler(|| {
+        let reaped = Engine::terminate_spawned();
+        eprintln!("hipfire bench: interrupted; terminated {reaped} owned daemon(s)");
+        std::process::exit(BENCH_INTERRUPTED_EXIT);
+    });
+}
+
 fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     // An explicit `--emu` is validated before anything else (model lookup, pull,
     // daemon spawn): an unknown id or a UMA-knob conflict is a hard error here.
     emu::preflight_bench(paths, args.emu.as_deref())?;
+    install_bench_interrupt_handler();
     if args.runs == 0 {
         bail!("--runs must be positive");
     }

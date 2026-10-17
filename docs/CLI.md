@@ -518,6 +518,12 @@ The `--matrix` JSON gains a `topology` object, taken from the daemon's own `pref
 
 A single-card load is `{"pp":1,"tp":1,"ep":1,"cards":["0"]}`; a PP3 load `{"pp":3,"tp":1,"ep":1,"cards":["0","1","2"]}`; `tp` and `ep` are reported separately, never merged. All rows of one run must report the same topology (including the card list), and `topology.pp` must equal the report's `pp` (the loaded value), otherwise the bench fails instead of labeling the run. A daemon that reports no topology yields `"topology": null`, never an assumed single card. Every other `--matrix` field is unchanged.
 
+### Bench daemon lifetime
+
+`hipfire bench` owns the daemon it spawns (and, through it, the machine-wide per-GPU `flock` of the cards the load reserves). The daemon is killed and reaped when the bench returns or fails, and when the bench receives SIGINT, SIGTERM or SIGHUP; an interrupted bench prints `hipfire bench: interrupted; terminated N owned daemon(s)` and exits 130. Reaping completes before the CLI exits, so a harness that waits for `hipfire bench` can start the next arm on the same cards immediately. Only daemons this bench process spawned are touched. `SIGKILL` of the CLI itself cannot be intercepted and leaves the daemon running, so harnesses should send SIGTERM to the CLI first and escalate to SIGKILL (on the whole process group) only after a grace period.
+
+There is no load timeout in the CLI, the client or the daemon: a cold multi-GPU load (first-use kernel compilation, 100+ GB of weights) runs until it finishes, and any deadline is the caller's. Size one for a cold kernel cache, or warm `kcache` with an earlier run first.
+
 ### Bench power and memory state
 
 `hipfire bench` samples the GPU every 0.5 s during each measured run (`--ttft` and `--matrix` too; not `--exp` or `--concurrency`). It reads only world-readable sysfs, so it needs no root, and it never fails a bench: whatever it cannot read is reported as the string `"unavailable"`.

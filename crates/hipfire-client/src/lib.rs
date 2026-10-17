@@ -8,6 +8,7 @@
 //! Python tooling can share this Rust transport instead of duplicating process
 //! management and line framing.
 
+use hipfire_config::secret::BearerToken;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -16,12 +17,11 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Mutex, Weak,
     },
     thread,
     time::Duration,
 };
-use hipfire_config::secret::BearerToken;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,7 +164,10 @@ impl ServiceEndpoint {
         }
         let port = &authority.as_str()[authority.host().len()..];
         if !port.is_empty()
-            && port.strip_prefix(':').and_then(|p| p.parse::<u16>().ok()).is_none()
+            && port
+                .strip_prefix(':')
+                .and_then(|p| p.parse::<u16>().ok())
+                .is_none()
         {
             return Err(invalid_endpoint("port must be an integer from 0 to 65535"));
         }
@@ -176,7 +179,9 @@ impl ServiceEndpoint {
             .map(|token| {
                 let mut value =
                     ureq::http::HeaderValue::from_str(&format!("Bearer {}", token.as_str()))
-                        .map_err(|_| invalid_endpoint("bearer token is not a valid header value"))?;
+                        .map_err(|_| {
+                            invalid_endpoint("bearer token is not a valid header value")
+                        })?;
                 value.set_sensitive(true);
                 Ok::<_, ClientError>(value)
             })
@@ -558,6 +563,28 @@ struct EngineInner {
     stdout_closed: Arc<AtomicBool>,
 }
 
+/// Every daemon this process spawned and still owns. `Weak` so registration
+/// never extends an engine's lifetime; entries die with their last `Engine`
+/// clone. [`Engine::terminate_spawned`] walks it, which is what lets a signal
+/// handler (that has no `Engine` in hand) reap exactly the daemons this
+/// process owns and nothing else on the machine.
+static OWNED_DAEMONS: Mutex<Vec<Weak<EngineInner>>> = Mutex::new(Vec::new());
+
+impl EngineInner {
+    /// Kill the daemon if it still runs and reap it. `wait` returns only once
+    /// the kernel has finished tearing the process down, and the daemon's
+    /// machine-wide GPU `flock` is released as part of that teardown, so a
+    /// return from here means the lock is free.
+    fn terminate(&self) -> String {
+        let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = child.kill();
+        child
+            .wait()
+            .map(|status| status.to_string())
+            .unwrap_or_else(|error| format!("unknown ({error})"))
+    }
+}
+
 #[derive(Clone)]
 pub struct Engine {
     inner: Arc<EngineInner>,
@@ -691,9 +718,13 @@ impl Engine {
             last_retry_reset_eligible: Mutex::new(None),
             stdout_closed,
         };
-        Ok(Self {
-            inner: Arc::new(inner),
-        })
+        let inner = Arc::new(inner);
+        {
+            let mut owned = OWNED_DAEMONS.lock().unwrap_or_else(|e| e.into_inner());
+            owned.retain(|weak| weak.strong_count() > 0);
+            owned.push(Arc::downgrade(&inner));
+        }
+        Ok(Self { inner })
     }
 
     /// Start the engine daemon and install validated process policy before the
@@ -1531,12 +1562,25 @@ impl Engine {
     /// Kill the daemon if it still runs and reap it, so its GPU memory is
     /// released before a replacement starts. Returns the exit status.
     pub fn terminate(&self) -> String {
-        let mut child = self.inner.child.lock().unwrap();
-        let _ = child.kill();
-        child
-            .wait()
-            .map(|status| status.to_string())
-            .unwrap_or_else(|error| format!("unknown ({error})"))
+        self.inner.terminate()
+    }
+
+    /// Kill and reap every daemon this process spawned that is still alive,
+    /// returning how many were terminated. Daemons owned by other processes
+    /// are never touched. For interrupt handlers: a process killed by a signal
+    /// never runs `Drop`, so without this its daemon outlives it, keeps the
+    /// GPU `flock`, and blocks the next claim of the same card.
+    pub fn terminate_spawned() -> usize {
+        let live: Vec<Arc<EngineInner>> = OWNED_DAEMONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for inner in &live {
+            inner.terminate();
+        }
+        live.len()
     }
 }
 
@@ -3302,6 +3346,52 @@ done
         let _ = fs::remove_dir_all(root);
     }
 
+    /// A SIGTERM-immune daemon (a loader stuck in a long cold load) must still
+    /// be killed *and reaped* by `terminate`, and every spawned engine must be
+    /// visible to `terminate_spawned`. The process-wide `terminate_spawned` is
+    /// not called here: unit tests share one process and would kill each
+    /// other's fake daemons; the CLI integration test exercises it end to end.
+    #[cfg(unix)]
+    #[test]
+    fn terminate_kills_and_reaps_a_sigterm_immune_daemon_and_registers_it() {
+        let root = env::temp_dir().join(format!(
+            "hipfire-client-terminate-{}-{}",
+            std::process::id(),
+            "t"
+        ));
+        let daemon = write_fake_daemon(
+            &root,
+            "#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n",
+        );
+        let engine = spawn_fake_engine(&daemon);
+        let pid = engine.child_id();
+        let pid_alive = |pid: u32| {
+            Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(pid_alive(pid), "daemon runs before terminate");
+        assert!(
+            OWNED_DAEMONS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(Weak::upgrade)
+                .any(|inner| Arc::ptr_eq(&inner, &engine.inner)),
+            "spawned daemon is registered as owned"
+        );
+        let status = engine.terminate();
+        assert!(
+            !pid_alive(pid),
+            "terminate must reap, not leave a zombie ({status})"
+        );
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn generate_requires_request_id_and_keeps_active_until_terminal() {
@@ -4265,11 +4355,17 @@ done
     #[test]
     fn endpoint_accepts_http_https_ipv6_and_base_path() {
         let plain = ServiceEndpoint::new("http://127.0.0.1:11435", None).unwrap();
-        assert_eq!(service_url(&plain, "/health"), "http://127.0.0.1:11435/health");
+        assert_eq!(
+            service_url(&plain, "/health"),
+            "http://127.0.0.1:11435/health"
+        );
         assert_eq!(service_url(&plain, ""), "http://127.0.0.1:11435");
 
         let tls = ServiceEndpoint::new("https://example.test:8443/", None).unwrap();
-        assert_eq!(service_url(&tls, "/health"), "https://example.test:8443/health");
+        assert_eq!(
+            service_url(&tls, "/health"),
+            "https://example.test:8443/health"
+        );
 
         let v6 = ServiceEndpoint::new("http://[::1]:11435", None).unwrap();
         assert_eq!(service_url(&v6, "/stats"), "http://[::1]:11435/stats");
@@ -4309,8 +4405,11 @@ done
                 "{bad:?}: {err}"
             );
         }
-        let err = ServiceEndpoint::new("http://user:hunter2secret@example.test", Some(test_bearer()))
-            .expect_err("userinfo rejected");
+        let err = ServiceEndpoint::new(
+            "http://user:hunter2secret@example.test",
+            Some(test_bearer()),
+        )
+        .expect_err("userinfo rejected");
         let text = err.to_string();
         assert!(text.contains("userinfo"), "{text}");
         assert!(!text.contains("hunter2secret"), "{text}");
@@ -4321,7 +4420,10 @@ done
     #[test]
     fn local_endpoint_maps_wildcards_brackets_ipv6_and_rejects_smuggling() {
         let any = ServiceEndpoint::local("0.0.0.0", 11435, None).unwrap();
-        assert_eq!(service_url(&any, "/health"), "http://127.0.0.1:11435/health");
+        assert_eq!(
+            service_url(&any, "/health"),
+            "http://127.0.0.1:11435/health"
+        );
         let v6_any = ServiceEndpoint::local("::", 11435, None).unwrap();
         assert_eq!(service_url(&v6_any, "/health"), "http://[::1]:11435/health");
         let v6 = ServiceEndpoint::local("fe80::1", 80, None).unwrap();
@@ -4331,7 +4433,13 @@ done
         let empty = ServiceEndpoint::local("", 1, None).unwrap();
         assert_eq!(service_url(&empty, ""), "http://127.0.0.1:1");
 
-        for bad in ["evil.test/path", "user@evil.test", "evil.test?x", "a b", "evil.test#x"] {
+        for bad in [
+            "evil.test/path",
+            "user@evil.test",
+            "evil.test?x",
+            "a b",
+            "evil.test#x",
+        ] {
             assert!(ServiceEndpoint::local(bad, 80, None).is_err(), "{bad}");
         }
     }
@@ -4341,7 +4449,9 @@ done
         let endpoint = ServiceEndpoint::local("127.0.0.1", 1, Some(test_bearer())).unwrap();
         let debug = format!("{endpoint:?}");
         assert!(!debug.contains(TEST_TOKEN), "{debug}");
-        assert!(endpoint.bearer().is_some_and(|token| token.matches(TEST_TOKEN)));
+        assert!(endpoint
+            .bearer()
+            .is_some_and(|token| token.matches(TEST_TOKEN)));
     }
 
     /// One recorded HTTP request: request line, lowercase-named headers, body.
@@ -4594,9 +4704,11 @@ done
     #[test]
     fn base_path_prefixes_every_helper_request() {
         let (port, server) = serve_once(json_response("200 OK", "{}"));
-        let endpoint =
-            ServiceEndpoint::new(&format!("http://127.0.0.1:{port}/api/"), Some(test_bearer()))
-                .unwrap();
+        let endpoint = ServiceEndpoint::new(
+            &format!("http://127.0.0.1:{port}/api/"),
+            Some(test_bearer()),
+        )
+        .unwrap();
         assert!(service_ready(&endpoint, Duration::from_secs(5)));
         let seen = server.join().unwrap();
         assert_eq!(seen.request_line, "GET /api/health HTTP/1.1");
