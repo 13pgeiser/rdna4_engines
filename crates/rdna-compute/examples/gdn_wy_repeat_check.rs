@@ -14,7 +14,9 @@
 //! each compared with an f64 CPU reference of the same recurrence plus the gated RMSNorm, fed the BF16
 //! normalized q/k the chunk kernel reads (so the error is the chunk kernel's own).
 //!
-//! Usage: cargo run --release -p rdna-compute --example gdn_wy_repeat_check [-- --rows N]
+//! Usage: cargo run --release -p rdna-compute --example gdn_wy_repeat_check [-- --rows N] [--dump-dir DIR]
+//! `--dump-dir DIR` also writes each case's raw GPU output and final state as little-endian f32 files
+//! `DIR/case_<a|b|c>_rows<N>_{y,s}.f32le` (`y` = `[rows][VALUE_WIDTH]`, `s` = `[value head][key][value]`).
 //! Exit 0: all outputs finite and case (c) rms rel error <= 1e-2.  Exit 1: gate failed.  Exit 2: could
 //! not run (no supported GPU, route not taken, GPU error).
 
@@ -148,7 +150,19 @@ fn to_bytes_bf16(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|&x| bf16::from_f32(x
 
 struct Outcome { nonfinite: usize, max_rel: f64, rms_rel: f64, s_gpu: f64, s_ref: f64, s_rel: f64 }
 
-fn run_case(gpu: &mut Gpu, case: &Case, rows: usize, norm_w: &[f32]) -> Result<Outcome, String> {
+/// Write `v` to `path` as little-endian f32, converting through a fixed 64 KiB buffer.
+fn dump_f32le(path: &std::path::Path, v: &[f32]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    let mut buf = [0u8; 1 << 16];
+    for chunk in v.chunks(buf.len() / 4) {
+        for (dst, &x) in buf.chunks_exact_mut(4).zip(chunk) { dst.copy_from_slice(&x.to_le_bytes()); }
+        f.write_all(&buf[..chunk.len() * 4])?;
+    }
+    f.flush()
+}
+
+fn run_case(gpu: &mut Gpu, case: &Case, tag: &str, rows: usize, norm_w: &[f32], dump_dir: Option<&std::path::Path>) -> Result<Outcome, String> {
     let err = |what: &str, e: &dyn std::fmt::Display| format!("{}: {what}: {e}", case.name);
     let mut projection = gpu.upload_raw(&to_bytes_bf16(&case.projection), &[rows * QKV_WIDTH]).map_err(|e| err("upload projection", &e))?;
     projection.dtype = DType::BF16;
@@ -174,6 +188,12 @@ fn run_case(gpu: &mut Gpu, case: &Case, rows: usize, norm_w: &[f32]) -> Result<O
     let y_gpu = gpu.download_f32(&output).map_err(|e| err("download output", &e))?;
     let s_gpu = gpu.download_f32(&state).map_err(|e| err("download state", &e))?;
     for t in [projection, norm, gate, beta, z, state, output] { gpu.free_tensor(t).map_err(|e| err("free tensor", &e))?; }
+    if let Some(dir) = dump_dir {
+        for (suffix, data) in [("y", &y_gpu), ("s", &s_gpu)] {
+            let path = dir.join(format!("case_{tag}_rows{rows}_{suffix}.f32le"));
+            dump_f32le(&path, data).map_err(|e| err(&format!("dump {}", path.display()), &e))?;
+        }
+    }
 
     // f64 reference, one rayon task per value head.
     let mut qn = Vec::with_capacity(rows * KEY_HEADS);
@@ -226,12 +246,17 @@ fn run_case(gpu: &mut Gpu, case: &Case, rows: usize, norm_w: &[f32]) -> Result<O
 
 fn main() {
     let mut rows = 2048usize;
+    let mut dump_dir: Option<std::path::PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--rows" => rows = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| { eprintln!("--rows needs an integer"); std::process::exit(2) }),
-            other => { eprintln!("usage: gdn_wy_repeat_check [--rows N]  (unknown argument {other})"); std::process::exit(2) }
+            "--dump-dir" => dump_dir = Some(args.next().map(std::path::PathBuf::from).unwrap_or_else(|| { eprintln!("--dump-dir needs a directory"); std::process::exit(2) })),
+            other => { eprintln!("usage: gdn_wy_repeat_check [--rows N] [--dump-dir DIR]  (unknown argument {other})"); std::process::exit(2) }
         }
+    }
+    if let Some(dir) = &dump_dir {
+        if let Err(e) = std::fs::create_dir_all(dir) { eprintln!("--dump-dir {}: {e}", dir.display()); std::process::exit(2); }
     }
     if rows < 512 {
         eprintln!("--rows must be at least 512 (the chunked WY route's minimum)");
@@ -251,8 +276,8 @@ fn main() {
     println!("gdn_wy_repeat_check arch={} rows={rows} value_heads={VALUE_HEADS} key_heads={KEY_HEADS} dim={DIM} (BF16 projection, F32 state/output)", gpu.arch);
     println!("{:<52} {:>10} {:>11} {:>11} {:>10} {:>10} {:>10}", "case", "non-finite", "max rel err", "rms rel err", "max|S|", "max|S|ref", "max|dS|/|S|");
     let mut failed = false;
-    for case in &cases {
-        match run_case(&mut gpu, case, rows, &norm_w) {
+    for (case, tag) in cases.iter().zip(["a", "b", "c"]) {
+        match run_case(&mut gpu, case, tag, rows, &norm_w, dump_dir.as_deref()) {
             Ok(o) => {
                 println!("{:<52} {:>10} {:>11.3e} {:>11.3e} {:>10.4e} {:>10.4e} {:>10.3e}", case.name, o.nonfinite, o.max_rel, o.rms_rel, o.s_gpu, o.s_ref, o.s_rel);
                 if o.nonfinite != 0 || !o.s_gpu.is_finite() {

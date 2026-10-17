@@ -30,13 +30,18 @@ typedef _Float16 __attribute__((ext_vector_type(2))) gc_h2;
 // __syncthreads also waits for every outstanding global access (WGP-mode
 // workgroup fence), which would drain the prefetch.
 #define GC_BARRIER() asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory")
-// Wave-private LDS handoff: order this wave's stores before its loads.
-#define GC_WAVE_SYNC() do { __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront"); __builtin_amdgcn_wave_barrier(); __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront"); } while (0)
 #define GC_WMMA(a, b, c) __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c)
 static __device__ __forceinline__ float gc_bf16r(float v) { return (float)(hip_bfloat16)v; }
 static __device__ __forceinline__ unsigned int gc_pack(float a, float b) {
     return __builtin_bit_cast(unsigned int, gc_h2{(_Float16)a, (_Float16)b});
 }
+// Lane `src`'s value of `v`, as a wave-uniform (scalar) operand.
+static __device__ __forceinline__ float gc_lane(float v, int src) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, v), src));
+}
+// `v` unchanged but opaque, so rounding it to F16 stays F32-then-F16 (cvt) instead of folding
+// the fma that produced it into one F16-rounded v_fma_mix.
+static __device__ __forceinline__ float gc_opaque(float v) { asm("" : "+v"(v)); return v; }
 // C-layout tile (lane: column l16, rows 2r + hi) -> the B operand of that
 // matrix (lane: column l16, all 16 rows), by swapping half-waves.
 static __device__ __forceinline__ gc_h16 gc_c_to_b(const gc_f8 c, int hi) {
@@ -51,7 +56,14 @@ static __device__ __forceinline__ gc_h16 gc_c_to_b(const gc_f8 c, int hi) {
     }
     return __builtin_bit_cast(gc_h16, out);
 }
+// gfx1151: six waves per SIMD (<= 240 VGPRs: 1536-VGPR files, 24-VGPR granules) keeps three
+// 8-wave blocks per WGP, so its 20 WGPs hold all 48 value-head blocks at once; at five waves
+// only 40 fit and the other 8 heads run as a second serial pass over every chunk.  gfx1100's
+// 24 WGPs hold all 48 at two blocks per WGP, so it is not pinned.
 __launch_bounds__(256)
+#if defined(__gfx1151__)
+__attribute__((amdgpu_waves_per_eu(6)))
+#endif
 extern "C" __global__ void gated_delta_chunk_gate_wmma(
     const unsigned short* __restrict__ projection, const unsigned short* __restrict__ qn, const unsigned short* __restrict__ kn,
     const float* __restrict__ gate, const float* __restrict__ beta, float* __restrict__ state,
@@ -73,7 +85,6 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
     __shared__ __align__(16) _Float16 kdT[128][16];    // (k e^{GL-G})^T
     __shared__ float vb_s[16][132];                    // v beta rows (F32)
     __shared__ __align__(16) _Float16 t_s[16][16];
-    __shared__ float l_s[16][16];                      // L (F32) for the T forward substitution
     __shared__ __align__(16) _Float16 p_s[16][16];
     __shared__ float g_s[16], bt_s[16], inv_s[16];
     __shared__ __align__(16) unsigned short out_s[16][136];
@@ -193,25 +204,29 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
 #pragma unroll
             for (int s = 0; s < 8; ++s)
                 c = GC_WMMA(*(const gc_h16*)&k_s[l16][16 * s], *(const gc_h16*)&k_s[l16][16 * s], c);
-            // L strictly lower, F32, staged through LDS.  T = (I - L)^-1 by F32 forward
-            // substitution T_i = e_i + sum_{m<i} L_im T_m, m ascending (T_m[j] = 0 for
-            // m < j); lane l16 owns column j, both half-waves compute it and store the
-            // rows of their parity.  The F16 WMMA product form overflowed F16 partial
+            // L strictly lower, F32, in registers (C layout: lane l16 = column j, rows 2r + hi).
+            // T = (I - L)^-1 by F32 forward substitution T_i = e_i + sum_{m<i} L_im T_m, m
+            // ascending (T_m[j] = 0 for m < j); lane l16 owns column j, both half-waves compute
+            // and store it (the same value).  L_im is lane m + 16 (i & 1) of register i / 2, read
+            // as a scalar operand: no LDS round trip per row, and row i waits only on the T_m it
+            // consumes, so rows overlap.  The F16 WMMA product form overflowed F16 partial
             // products when k_i . k_j ~ 1 (repeated tokens).
+            float Lr[8];
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 const int i = 2 * r + hi, j = l16;
-                l_s[i][j] = j < i ? -bt_s[i] * c[r] * expf(g_s[i] - g_s[j]) : 0.f;
+                Lr[r] = j < i ? -bt_s[i] * c[r] * expf(g_s[i] - g_s[j]) : 0.f;
             }
-            GC_WAVE_SYNC();
             float Tc[16];
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
                 float acc = i == l16 ? 1.f : 0.f;
 #pragma unroll
-                for (int m = 0; m < i; ++m) acc = fmaf(l_s[i][m], Tc[m], acc);
+                for (int m = 0; m < i; ++m) acc = fmaf(gc_lane(Lr[i >> 1], m + 16 * (i & 1)), Tc[m], acc);
                 Tc[i] = acc;
-                if ((i & 1) == hi) t_s[i][l16] = (_Float16)acc;
+                // Rows 0..14 round F32 then F16; row 15's last fma has no other use and rounds
+                // straight to F16 (v_fma_mix), exactly as the landed per-row-store kernel did.
+                t_s[i][l16] = (_Float16)(i < 15 ? gc_opaque(acc) : acc);
             }
         } else if (wave == 1) {
             gc_f8 c = {0, 0, 0, 0, 0, 0, 0, 0};
