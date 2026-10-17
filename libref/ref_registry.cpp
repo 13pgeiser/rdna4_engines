@@ -1062,6 +1062,12 @@ static const RadOpSchema kSchemas[] = {
   "amax(rotated) / 448, shaped [M, n/group] in f32. n must be a multiple of `group` -- a rotation "
   "block cannot straddle the end of a row. NOT interchangeable with quant_act_fp8 in either "
   "direction: the consumer must be a weight that was rotated the same way." },
+/* Its int8 twin, the activation of the i8a8h GEMMs; the factor of `group` is the weight's here
+ * too. */
+{ "had_quant_act_i8g", ARR(pQuant), ARR(oQuantFp8),
+  "quant_act_i8g with a Walsh-Hadamard rotation of width `group` along n first: scale = "
+  "amax(rotated) / 127 per group, [M, n/group] in f32, n a multiple of `group`. Pairs with an i8 "
+  "weight rotated the same way, its scale carrying the factor of `group` (dtype i8a8h)." },
 /* The calibration op, the only one no forward pass issues: it runs under a calibration flag and
  * its output is read at convert time, in another process, through a file. `dtype` is the input's:
  * fp8a8 where the tap is a quantiser's output, bf16 without `a_scale` for a plain activation. */
@@ -1788,6 +1794,10 @@ SIMPLE("ref_had_quant_act_fp8", "had_quant_act_fp8", "quant",
        "width-`group` Hadamard, then the same symmetric block-scaled E4M3 quantiser",
        "float in, fp8_e4m3 out, f32 scale per group; n a multiple of group",
        ref_had_quant_act_fp8),
+SIMPLE("ref_had_quant_act_i8g", "had_quant_act_i8g", "quant",
+       "width-`group` Hadamard, then the symmetric int8 quantiser, one scale per group",
+       "float in, i8 out, f32 scale per group; n a multiple of group",
+       ref_had_quant_act_i8g),
 SIMPLE("ref_gram_accum", "gram_accum", "quant",
        "h += x^T x over a dequantised E4M3 activation, or a plain bf16 one -- the Gram matrix "
        "GPTQ calibrates on",

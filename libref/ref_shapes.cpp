@@ -863,6 +863,18 @@ int ref_had_quant_act_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdD
     return o.finish("had_quant_act_fp8", operand, out);
 }
 
+/* quant_act_i8g's extents: the rotation changes the values, not the shapes. */
+int ref_had_quant_act_i8g_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t ng = scale_groups(n, gi(p, n_p, "group", 0));
+    Opd o;
+    o.t(D, { M, n });                       /* x */
+    o.t((uint32_t)RAD_I8, { M, n });        /* q */
+    o.t((uint32_t)RAD_F32, { M, ng });      /* scale (amax / 127) */
+    return o.finish("had_quant_act_i8g", operand, out);
+}
+
 /* The int8 rotated forms: `group` is the Walsh-Hadamard rotation width (libr4d's `had`) and the
  * scale is one per row, carrying the 1/sqrt(group) normalisation (ref_quant.cpp). Describing it as
  * [M, n/group] would leave the tail of every scale buffer unwritten by both sides, comparing two
@@ -960,7 +972,8 @@ static int gemm_q_shape(const RadParam* p, int n_p, int operand, bool bias, RadO
     const char* q = gs(p, n_p, "dtype");
     auto is = [&](const char* s) { return q && std::strcmp(q, s) == 0; };
     const bool a8 = is("fp8a8"), a16 = is("fp8a16"), w4 = is("w4a8"), w8 = is("w8a8");
-    const bool i8 = is("i8a8"), mx = is("mxfp4a8");
+    /* i8a8h is i8a8's operands; its rotation is in the values. */
+    const bool i8 = is("i8a8") || is("i8a8h"), mx = is("mxfp4a8");
     if ((!a8 && !a16 && !w4 && !w8 && !i8 && !mx) || N <= 0 || K <= 0 || group <= 0)
         return RAD_E_UNSUPPORTED;
     /* Neither has a bias form in any architecture. */

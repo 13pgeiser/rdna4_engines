@@ -153,6 +153,8 @@ std::vector<Case> build_cases() {
                                     HS("dtype", "bf16") }, EB(5, 256, 2, 1.5));
         add("had_quant_act_fp8",  { HI("M", 5), HI("n", 256), HI("group", group),
                                     HS("dtype", "bf16") });
+        add("had_quant_act_i8g",  { HI("M", 5), HI("n", 256), HI("group", group),
+                                    HS("dtype", "bf16") });
         add("had_quant_act_i8",   { HI("M", 5), HI("n", 256), HI("group", group),
                                     HS("dtype", "bf16") });
         add("dequant",            { HI("M", 5), HI("n", 256), HI("group", group),
@@ -221,11 +223,14 @@ std::vector<Case> build_cases() {
                 add("gemm_nt_q_bias", { HI("M", M), HI("N", 96), HI("K", 256), HI("group", 128),
                                         HS("dtype", dt) }, 0, fl);
         }
-    /* The int8 trunk (row-major codes, a scale per row per 128 of K on both sides) and OCP-MXFP4
-     * (e2m1 codes with an E8M0 exponent per 32 of K against the E4M3 activation). */
+    /* The int8 trunk (row-major codes, a scale per row per 128 of K on both sides; i8a8h is the
+     * same operands over a rotated weight) and OCP-MXFP4 (e2m1 codes with an E8M0 exponent per 32
+     * of K against the E4M3 activation). */
     for (int M : { 1, 65 }) {
         add("gemm_nt_q", { HI("M", M), HI("N", 96), HI("K", 256), HI("group", 128),
                            HS("dtype", "i8a8") }, 0, 2.0 * M * 96 * 256);
+        add("gemm_nt_q", { HI("M", M), HI("N", 96), HI("K", 256), HI("group", 128),
+                           HS("dtype", "i8a8h") }, 0, 2.0 * M * 96 * 256);
         add("gemm_nt_q", { HI("M", M), HI("N", 96), HI("K", 256), HI("group", 32),
                            HS("dtype", "mxfp4a8") }, 0, 2.0 * M * 96 * 256);
     }
@@ -961,6 +966,8 @@ std::vector<Case> build_cases() {
                                 HS("dtype", "bf16") }, (double)M * 2048 * 3, 0);
         speed("quant_act_i8g", { HI("M", M), HI("n", 2048), HI("group", 128),
                                  HS("dtype", "bf16") }, (double)M * 2048 * 3, 0);
+        speed("had_quant_act_i8g", { HI("M", M), HI("n", 2048), HI("group", 128),
+                                     HS("dtype", "bf16") }, (double)M * 2048 * 3, 0);
         speed("had_quant_act_i8", { HI("M", M), HI("n", 2048), HI("group", 128),
                                     HS("dtype", "bf16") }, (double)M * 2048 * 3, 0);
     }
