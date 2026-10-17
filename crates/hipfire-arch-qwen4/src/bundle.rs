@@ -5234,7 +5234,11 @@ mod tests {
             for p in [0usize, 1, 1536, 4096] {
                 let q8_bytes = session_snapshot_bytes(&config, q8, native, p).unwrap();
                 let f32_bytes = session_snapshot_bytes(&config, f32, native, p).unwrap();
-                assert_eq!(f32_bytes - q8_bytes, recurrent_delta, "native {native} p {p}");
+                assert_eq!(
+                    f32_bytes - q8_bytes,
+                    recurrent_delta,
+                    "native {native} p {p}"
+                );
             }
         }
     }
