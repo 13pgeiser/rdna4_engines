@@ -1314,7 +1314,7 @@ ranges are the schema's; every key also appears in the generated
 | `attention.ck_runtime_lib` | `null` | `null` or path; optional exact-architecture CK runtime sidecar (load or capability failure keeps native attention). |
 | `attention.ck_workspace_bytes` | `0` | int 0–17179869184; preallocated bytes for the optional CK staged attention path. |
 | `experimental.graph.forward` | `"auto"` | `auto` \| bool; hipGraph forward capture (`auto` follows architecture policy). Env `HIPFIRE_GRAPH`. |
-| `experimental.graph.ar` | `true` | bool; allow autoregressive forward graph capture when otherwise eligible. Env `HIPFIRE_AR_GRAPH`. |
+| `experimental.graph.ar` | `true` | bool; allow autoregressive forward graph capture when otherwise eligible. **Windows gfx1100 default is off (opt-in)**: AR graph replay silently produced wrong output there (token soup, #655), so an unset value resolves to `false` on Windows exact gfx1100 only; Linux gfx1100 and every other architecture keep `true`. An explicit `true`/`false` (config, `hipfire config set`, or env `HIPFIRE_AR_GRAPH`) always wins. Env `HIPFIRE_AR_GRAPH`. |
 | `experimental.graph.moe` | `true` | bool; allow graph capture for supported MoE forward paths. Env `HIPFIRE_GRAPH_MOE`. |
 | `kernel.calib_force_bf16` | `false` | bool; keep native-BF16 calibration teachers in BF16 (calibration only). |
 | `kernel.gemma4_q8_fused_prefill` | `false` | bool; fuse eligible Gemma 4 Q8 prefill projections on gfx1100. |

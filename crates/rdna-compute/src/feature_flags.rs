@@ -270,6 +270,9 @@ pub struct FeatureFlags {
 
     // ── Graph / capture / deterministic ─────────────────────────────
     pub graph_forward: Option<bool>,
+    /// Autoregressive-forward hipGraph capture (`experimental.graph.ar`,
+    /// `HIPFIRE_AR_GRAPH`). Default on, except on Windows exact gfx1100, where
+    /// it defaults off (#655); see [`graph_ar_default`].
     pub graph_ar: bool,
     pub graph_moe: bool,
     pub force_blob_path: bool,
@@ -665,6 +668,27 @@ pub struct FeatureFlags {
     pub qwen4_qsa_code_check: bool,
 }
 
+/// Built-in default of `experimental.graph.ar` for an architecture on a host
+/// platform. On, except Windows exact gfx1100 (#655): there AR-forward graph
+/// capture/replay silently produces wrong output (token soup on an RX 7900 XTX
+/// until the replay is fixed), so the default is off. Linux gfx1100 and every
+/// other architecture on every platform keep the default on.
+pub fn graph_ar_default(arch: &str, windows: bool) -> bool {
+    !(windows && arch == "gfx1100")
+}
+
+/// Resolve `experimental.graph.ar` from the process-config compatibility value
+/// of `HIPFIRE_AR_GRAPH`. Absence (the built-in default is never carried in
+/// the process config) selects [`graph_ar_default`]; an explicit value from the
+/// user, the environment or a one-shot argument always wins, and only the exact
+/// value `0` (a rendered `false`) turns capture off.
+pub fn resolve_graph_ar(raw: Option<&str>, arch: &str, windows: bool) -> bool {
+    match raw {
+        None => graph_ar_default(arch, windows),
+        Some(raw) => raw != "0",
+    }
+}
+
 impl FeatureFlags {
     pub fn from_process_config(arch: &str, config: &ProcessConfig) -> Self {
         Self::from_lookup(arch, |name| config.legacy_value(name).ok_or(()))
@@ -675,6 +699,16 @@ impl FeatureFlags {
     }
 
     fn from_lookup(arch: &str, value: impl Fn(&str) -> std::result::Result<String, ()>) -> Self {
+        Self::from_lookup_on_host(arch, cfg!(windows), value)
+    }
+
+    /// [`Self::from_lookup`] with the host platform passed in, so CPU tests can
+    /// exercise the Windows-only defaults on any build host.
+    fn from_lookup_on_host(
+        arch: &str,
+        windows: bool,
+        value: impl Fn(&str) -> std::result::Result<String, ()>,
+    ) -> Self {
         let parse_bool = |name: &str| -> Option<bool> {
             match value(name).ok().as_deref() {
                 Some("1") | Some("true") | Some("TRUE") | Some("on") | Some("ON") => Some(true),
@@ -960,7 +994,7 @@ impl FeatureFlags {
 
             // Graph / capture / deterministic
             graph_forward: parse_bool("HIPFIRE_GRAPH"),
-            graph_ar: value("HIPFIRE_AR_GRAPH").ok().as_deref() != Some("0"),
+            graph_ar: resolve_graph_ar(value("HIPFIRE_AR_GRAPH").ok().as_deref(), arch, windows),
             graph_moe: value("HIPFIRE_GRAPH_MOE").ok().as_deref() != Some("0"),
             force_blob_path: value("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
             residual_ksplit_off: value("HIPFIRE_RESIDUAL_KSPLIT_OFF").ok().as_deref() == Some("1"),
@@ -1647,6 +1681,125 @@ mod tests {
                 }
             });
             assert_eq!(flags.qwen4_qsa_code_check, enabled, "{value:?}");
+        }
+    }
+
+    const GRAPH_AR_ARCHES: [&str; 9] = [
+        "gfx906", "gfx1030", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        "gfx942",
+    ];
+
+    /// #655: the built-in `experimental.graph.ar` default is off for Windows
+    /// exact gfx1100 only; Linux gfx1100 and every other arch/platform stay on.
+    #[test]
+    fn graph_ar_default_is_off_only_on_windows_exact_gfx1100() {
+        for arch in GRAPH_AR_ARCHES {
+            for windows in [false, true] {
+                assert_eq!(
+                    graph_ar_default(arch, windows),
+                    !(windows && arch == "gfx1100"),
+                    "{arch} windows={windows}"
+                );
+            }
+        }
+        // Exact match: a different gfx11 part or a suffixed spelling is not gfx1100.
+        assert!(graph_ar_default("gfx1101", true));
+        assert!(graph_ar_default("gfx1100:xnack-", true));
+        assert!(graph_ar_default("", true));
+    }
+
+    /// An explicit value always wins over the Windows gfx1100 default, in both
+    /// directions and on every platform; only the exact value `0` is off.
+    #[test]
+    fn graph_ar_explicit_value_overrides_the_windows_gfx1100_default() {
+        for arch in GRAPH_AR_ARCHES {
+            for windows in [false, true] {
+                assert!(!resolve_graph_ar(Some("0"), arch, windows), "{arch} windows={windows}: 0");
+                for raw in ["1", "true", "on", ""] {
+                    assert!(
+                        resolve_graph_ar(Some(raw), arch, windows),
+                        "{arch} windows={windows}: {raw:?}"
+                    );
+                }
+                assert_eq!(
+                    resolve_graph_ar(None, arch, windows),
+                    graph_ar_default(arch, windows),
+                    "{arch} windows={windows}: unset"
+                );
+            }
+        }
+    }
+
+    /// The full `FeatureFlags` lookup path honours the platform matrix and the
+    /// `HIPFIRE_AR_GRAPH` override, simulating Windows on any build host.
+    #[test]
+    fn graph_ar_flag_platform_matrix_through_feature_flags() {
+        for arch in GRAPH_AR_ARCHES {
+            for windows in [false, true] {
+                let flags = |raw: Option<&str>| {
+                    FeatureFlags::from_lookup_on_host(arch, windows, |name| match raw {
+                        Some(v) if name == "HIPFIRE_AR_GRAPH" => Ok(v.into()),
+                        _ => Err(()),
+                    })
+                };
+                let default_on = !(windows && arch == "gfx1100");
+                assert_eq!(flags(None).graph_ar, default_on, "{arch} windows={windows}: unset");
+                assert!(!flags(Some("0")).graph_ar, "{arch} windows={windows}: 0");
+                assert!(flags(Some("1")).graph_ar, "{arch} windows={windows}: 1");
+                // The sibling graph switches are not touched by the platform.
+                assert!(flags(None).graph_moe, "{arch} windows={windows}: graph_moe");
+                assert_eq!(flags(None).graph_forward, None, "{arch} windows={windows}: graph_forward");
+            }
+        }
+    }
+
+    /// Through the typed process config: the built-in default is carried as
+    /// absence (so the arch/platform default applies), and an explicit
+    /// `experimental.graph.ar` — by TOML key or legacy key — wins on Windows gfx1100.
+    #[test]
+    fn graph_ar_process_config_default_is_absence_and_explicit_wins() {
+        let defaults = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
+        assert_eq!(defaults.legacy_value("HIPFIRE_AR_GRAPH"), None);
+        let from = |arch: &str, windows: bool, config: &ProcessConfig| {
+            FeatureFlags::from_lookup_on_host(arch, windows, |name| {
+                config.legacy_value(name).ok_or(())
+            })
+            .graph_ar
+        };
+        assert!(!from("gfx1100", true, &defaults));
+        assert!(from("gfx1100", false, &defaults));
+        assert!(from("gfx1201", true, &defaults));
+        // The host build agrees with the simulated platform.
+        assert_eq!(
+            FeatureFlags::from_process_config("gfx1100", &defaults).graph_ar,
+            !cfg!(windows)
+        );
+        for key in ["experimental.graph.ar", "graph_ar"] {
+            for (value, enabled) in [("true", true), ("false", false)] {
+                let mut layer = ConfigLayer::default();
+                layer.set_cli(key, value).unwrap();
+                let resolved = resolve([NamedLayer {
+                    source: ConfigSource::GlobalUser { path: "config.toml".into() },
+                    layer,
+                }])
+                .unwrap();
+                let config = ProcessConfig::from_resolved(&resolved).unwrap();
+                let config: ProcessConfig =
+                    serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+                assert_eq!(
+                    config.legacy_value("HIPFIRE_AR_GRAPH"),
+                    Some(if enabled { "1" } else { "0" }.to_string())
+                );
+                for arch in GRAPH_AR_ARCHES {
+                    for windows in [false, true] {
+                        assert_eq!(
+                            from(arch, windows, &config),
+                            enabled,
+                            "{key}={value} {arch} windows={windows}"
+                        );
+                    }
+                }
+            }
         }
     }
 

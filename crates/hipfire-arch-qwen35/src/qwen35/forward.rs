@@ -1805,7 +1805,8 @@ pub fn forward_scratch(
     // AR-forward hipGraph RE-ENABLED (2026-06-16) — the kernarg-snapshot attractor
     // is re-verified GONE on current ROCm (HIP 7.x, coherence-gate clean, fluent at
     // decode pos 1-4 on gfx12 A3B mq4). Opt out with
-    // `experimental.graph.ar = false`. The prior
+    // `experimental.graph.ar = false` (default off on Windows gfx1100, #655,
+    // where replay silently emitted wrong output; opt in with `= true`). The prior
     // 2026-05-15 disable rationale is retained below; it SUPERSEDED the
     // arch-default re-enable merged from master (`graph_enabled` above is kept
     // live so the graph policy and kill switch stay wired for when the

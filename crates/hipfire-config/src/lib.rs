@@ -3446,7 +3446,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         "HIPFIRE_AR_GRAPH",
-        "Allow autoregressive forward graph capture when otherwise eligible."
+        "Allow autoregressive forward graph capture when otherwise eligible. Default on, except Windows gfx1100, where it defaults off (opt-in) because graph replay silently produced wrong output (#655); an explicit true/false or HIPFIRE_AR_GRAPH always wins."
     ),
     process_bool_field!(
         "experimental.graph.moe",
